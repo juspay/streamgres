@@ -5,3 +5,6 @@ edition = "2024"
 license = "Apache-2.0"
 
 [dependencies]
+# Only `NaiveDate` / `NaiveDateTime` are used (see `Value` in src/model/value.rs).
+# Default features pull in a timezone database and wasm bindings we do not need.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
