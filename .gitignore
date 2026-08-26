@@ -17,3 +17,9 @@ Thumbs.db
 # Environment
 .env
 .env.local
+
+# Local linker workaround for a Mac with no Xcode command line tools.
+# Machine-specific; teammates with the CLT need neither.
+.cargo/
+.stublibs/
+zigcc

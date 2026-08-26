@@ -8,3 +8,7 @@ license = "Apache-2.0"
 # Only `NaiveDate` / `NaiveDateTime` are used (see `Value` in src/model/value.rs).
 # Default features pull in a timezone database and wasm bindings we do not need.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+# The server (`src/ws.rs`, and the `server` binary).
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }

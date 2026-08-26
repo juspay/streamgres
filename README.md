@@ -101,6 +101,59 @@ evaluations, emitted operations. These counters are the yardstick for every
 future optimization of the routing strategy — change the strategy, rerun the
 demo, compare.
 
+## The server
+
+[`src/ws.rs`](src/ws.rs) is the axum setup — routes, the WebSocket upgrade, and
+one connection loop. Base only: the connection loop echoes, and wiring it to
+the engine is the next step.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /health` | Liveness check. |
+| `GET /ws` | The WebSocket. A socket starts life as an ordinary `GET`, which is why it is registered with `get(..)`. |
+
+### Check it works
+
+**1. Start it**
+
+```bash
+cargo run --bin server
+```
+
+```text
+listening on http://127.0.0.1:8080
+  GET /health   liveness check
+  GET /ws       websocket (ws://127.0.0.1:8080/ws)
+```
+
+**2. HTTP** — in another terminal
+
+```bash
+curl -i http://127.0.0.1:8080/health
+```
+
+Expect `HTTP/1.1 200 OK` and the body `ok`.
+
+**3. WebSocket**
+
+```bash
+brew install websocat          # once
+websocat ws://127.0.0.1:8080/ws
+```
+
+Type a line and press enter; it comes back echoed:
+
+```text
+hello sync
+echo: hello sync
+```
+
+The reply prefix is set in [`handle_socket`](src/ws.rs) — that function is the
+seam the engine replaces, so the echo is only a placeholder.
+
+Set `JUS_SYNC_ADDR` to bind elsewhere (`JUS_SYNC_ADDR=127.0.0.1:9000 cargo run
+--bin server`).
+
 ## v1 semantics and restrictions
 
 Deliberate simplifications, each enforced with a loud error rather than silently
@@ -185,7 +238,8 @@ genuinely "first declared pkey column" (pinned by
    read-before-write for partial updates, `ORDER BY`/`LIMIT` enforcement,
    change feed
 4. **WebSocket** subscription transport — register/unregister, push
-   `(uuid, DataFrameOperation)` streams, reconnect/catch-up
+   `(uuid, DataFrameOperation)` streams, reconnect/catch-up.
+   *Server setup landed ([`src/ws.rs`](src/ws.rs)); engine wiring is next.*
 5. Perf — per-table condition indexing (design note 1), range-friendly
    condition indexing, benchmarks driven by `IvmStats`
 
@@ -208,6 +262,9 @@ src/
     stats.rs          IvmStats counters + per-write diffing
   parser/
     mod.rs            lexer + recursive-descent parser + Catalog (schema-aware)
+  ws.rs               axum setup: routes, WebSocket upgrade, connection loop
+  bin/
+    server.rs         the server binary
 tests/
   ivm_scenarios.rs    end-to-end routing scenarios (the assertable demo)
 ```
