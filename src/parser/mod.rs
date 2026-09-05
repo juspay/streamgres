@@ -1,10 +1,11 @@
 //! SQL text → query model.
 //!
 //! Clients speak SQL-shaped text; the engine speaks [`crate::model`]. This
-//! module is the boundary. Parsing is schema-aware — the model embeds
-//! [`DbTable`]s and splits primary-key values from row data, so every entry
-//! point takes a [`Catalog`] to resolve tables, validate column names, and
-//! know which columns form the primary key.
+//! module is the boundary. Parsing is schema-aware — queries reference
+//! tables by name and writes split primary-key values from row data, so
+//! every entry point takes a [`Catalog`] (the single home of the schema) to
+//! resolve tables, validate column names, coerce literal types, and know
+//! which columns form the primary key.
 //!
 //! ```text
 //! query     := read | write
@@ -113,14 +114,18 @@ pub fn parse_write(sql: &str, catalog: &Catalog) -> Result<WriteQuery, ParseErro
     }
 }
 
+/// A lex or parse failure, positioned for caret rendering by [`point_at`].
+///
+/// - `message`: what went wrong, phrased for the human who typed the query.
+/// - `position`: byte offset into the input where the offending token starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError {
     pub message: String,
-    /// Byte offset into the input where the offending token starts.
     pub position: usize,
 }
 
 impl fmt::Display for ParseError {
+    /// Renders as `message (at byte N)`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} (at byte {})", self.message, self.position)
     }
@@ -141,27 +146,33 @@ pub fn point_at(source: &str, error: &ParseError) -> String {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Lexer
-// ---------------------------------------------------------------------------
-
+/// One lexed token.
+///
+/// - `Word`: identifiers and keywords alike; keywords match case-insensitively.
+/// - `Str`: the unquoted content of a single-quoted string literal.
+/// - `Num`: raw numeric text; the parser decides int vs float.
+/// - `Sym`: operators and punctuation, normalised (`<>` lexes as `!=`).
+/// - `Eof`: end of input; always the final token.
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
-    /// Identifiers and keywords alike; keywords match case-insensitively.
     Word(String),
     Str(String),
-    /// Raw numeric text; the parser decides int vs float.
     Num(String),
-    /// Operators and punctuation, normalised (`<>` lexes as `!=`).
     Sym(&'static str),
     Eof,
 }
 
+/// A token plus the byte offset where it starts, for error positions.
 struct Spanned {
     tok: Tok,
     at: usize,
 }
 
+/// Tokenise `source`; the result always ends with [`Tok::Eof`].
+///
+/// A `.` only continues a number when a digit follows, so `1.5` lexes as
+/// one number without capturing a stray dot. Inside a string literal a
+/// doubled quote is an escaped one; a lone quote ends the string.
 fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
     let mut tokens = Vec::new();
     let mut chars = source.char_indices().peekable();
@@ -186,8 +197,6 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
         } else if c.is_ascii_digit() {
             let mut number = String::new();
             take_digits(&mut chars, &mut number);
-            // A '.' only continues the number when a digit follows, so
-            // `1.5` lexes as one number without capturing a stray dot.
             if peek_at_is(&chars, 0, '.') && next_is_digit(&chars, 1) {
                 number.push('.');
                 chars.next();
@@ -202,7 +211,6 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
             let mut text = String::new();
             loop {
                 match chars.next() {
-                    // A doubled quote is an escaped one; a lone quote ends it.
                     Some((_, '\'')) => {
                         if peek_at_is(&chars, 0, '\'') {
                             text.push('\'');
@@ -283,8 +291,10 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
     Ok(tokens)
 }
 
+/// The lexer's cursor: a peekable char-indices iterator over the input.
 type Chars<'a> = std::iter::Peekable<std::str::CharIndices<'a>>;
 
+/// Append the maximal run of ASCII digits at the cursor to `out`.
 fn take_digits(chars: &mut Chars<'_>, out: &mut String) {
     while let Some(&(_, c)) = chars.peek() {
         if c.is_ascii_digit() {
@@ -296,10 +306,12 @@ fn take_digits(chars: &mut Chars<'_>, out: &mut String) {
     }
 }
 
+/// Whether the character `ahead` positions past the cursor is `want`.
 fn peek_at_is(chars: &Chars<'_>, ahead: usize, want: char) -> bool {
     chars.clone().nth(ahead).is_some_and(|(_, c)| c == want)
 }
 
+/// Whether the character `ahead` positions past the cursor is an ASCII digit.
 fn next_is_digit(chars: &Chars<'_>, ahead: usize) -> bool {
     chars
         .clone()
@@ -307,18 +319,19 @@ fn next_is_digit(chars: &Chars<'_>, ahead: usize) -> bool {
         .is_some_and(|(_, c)| c.is_ascii_digit())
 }
 
-// ---------------------------------------------------------------------------
-// Parser
-// ---------------------------------------------------------------------------
-
+/// Recursive-descent parser over the lexed token stream.
+///
+/// - `tokens`: the lexed input, always ending with [`Tok::Eof`].
+/// - `pos`: index of the current token.
+/// - `depth`: current `(` / `[` nesting depth, bounded by [`MAX_NESTING_DEPTH`].
 struct Parser {
     tokens: Vec<Spanned>,
     pos: usize,
-    /// Current `(` / `[` nesting depth, bounded by [`MAX_NESTING_DEPTH`].
     depth: usize,
 }
 
 impl Parser {
+    /// The current token.
     fn peek(&self) -> &Tok {
         &self.tokens[self.pos].tok
     }
@@ -337,16 +350,19 @@ impl Parser {
         }
     }
 
+    /// Byte offset of the current token, for error positions.
     fn at(&self) -> usize {
         self.tokens[self.pos].at
     }
 
+    /// Advance one token, never past the trailing [`Tok::Eof`].
     fn bump(&mut self) {
         if self.pos + 1 < self.tokens.len() {
             self.pos += 1;
         }
     }
 
+    /// Build an `Err` positioned at the current token.
     fn err<T>(&self, message: impl Into<String>) -> Result<T, ParseError> {
         Err(ParseError {
             message: message.into(),
@@ -354,6 +370,7 @@ impl Parser {
         })
     }
 
+    /// Human-readable rendering of the current token for error messages.
     fn describe(&self) -> String {
         match self.peek() {
             Tok::Word(word) => format!("`{word}`"),
@@ -364,10 +381,12 @@ impl Parser {
         }
     }
 
+    /// Whether the current token is the keyword `word` (case-insensitive).
     fn is_word(&self, word: &str) -> bool {
         matches!(self.peek(), Tok::Word(found) if found.eq_ignore_ascii_case(word))
     }
 
+    /// Consume the keyword `word` if it is current; reports whether it did.
     fn eat_word(&mut self, word: &str) -> bool {
         let found = self.is_word(word);
         if found {
@@ -376,6 +395,7 @@ impl Parser {
         found
     }
 
+    /// Require and consume the keyword `word`.
     fn expect_word(&mut self, word: &str) -> Result<(), ParseError> {
         if self.eat_word(word) {
             Ok(())
@@ -384,10 +404,12 @@ impl Parser {
         }
     }
 
+    /// Whether the current token is the symbol `symbol`.
     fn is_sym(&self, symbol: &str) -> bool {
         matches!(self.peek(), Tok::Sym(found) if *found == symbol)
     }
 
+    /// Consume the symbol `symbol` if it is current; reports whether it did.
     fn eat_sym(&mut self, symbol: &str) -> bool {
         let found = self.is_sym(symbol);
         if found {
@@ -396,6 +418,7 @@ impl Parser {
         found
     }
 
+    /// Require and consume the symbol `symbol`.
     fn expect_sym(&mut self, symbol: &str) -> Result<(), ParseError> {
         if self.eat_sym(symbol) {
             Ok(())
@@ -404,6 +427,7 @@ impl Parser {
         }
     }
 
+    /// A bare-word identifier.
     fn ident(&mut self) -> Result<String, ParseError> {
         match self.peek().clone() {
             Tok::Word(word) => {
@@ -438,6 +462,7 @@ impl Parser {
         }
     }
 
+    /// Dispatch on the leading keyword to a read or a write.
     fn query(&mut self, catalog: &Catalog) -> Result<ParsedQuery, ParseError> {
         if self.is_word("SELECT") {
             Ok(ParsedQuery::Read(self.read(catalog)?))
@@ -451,8 +476,12 @@ impl Parser {
         }
     }
 
-    // -- reads -------------------------------------------------------------
-
+    /// `SELECT * FROM …` with optional WHERE / ORDER BY / LIMIT.
+    ///
+    /// A missing WHERE subscribes to the whole table (the vacuously true
+    /// `AND(vec![])`). A missing ORDER BY defaults via [`default_order`],
+    /// and a missing LIMIT becomes `u32::MAX` — the model makes `limit`
+    /// mandatory, so absent means "no bound".
     fn read(&mut self, catalog: &Catalog) -> Result<ReadQuery, ParseError> {
         self.expect_word("SELECT")?;
         self.expect_sym("*")?;
@@ -466,7 +495,6 @@ impl Parser {
         let filter = if self.eat_word("WHERE") {
             self.filter(table)?
         } else {
-            // No WHERE: subscribe to the whole table (vacuously true).
             Where::AND(Vec::new())
         };
 
@@ -508,15 +536,19 @@ impl Parser {
                 _ => return self.err(format!("expected a limit, found {}", self.describe())),
             }
         } else {
-            // The model makes `limit` mandatory; absent means "no bound".
             u32::MAX
         };
 
         Ok(ReadQuery::new(table.name.clone(), filter, order_by, limit))
     }
 
-    // -- writes ------------------------------------------------------------
-
+    /// `INSERT` / `UPDATE` / `DELETE`, enforcing the v1 write restrictions.
+    ///
+    /// INSERT coerces each value while it still lines up with a named
+    /// column; a value/column count mismatch is reported only after the
+    /// whole row is read. UPDATE must SET every non-pkey column because
+    /// the engine evaluates predicates against `record.data` as the
+    /// complete new row — a partial SET would corrupt the views.
     fn write(&mut self, catalog: &Catalog) -> Result<WriteQuery, ParseError> {
         if self.eat_word("INSERT") {
             self.expect_word("INTO")?;
@@ -538,8 +570,6 @@ impl Parser {
             loop {
                 let value_at = self.at();
                 let value = self.value()?;
-                // Coerce while the value still lines up with a named column;
-                // a count mismatch is reported after the whole row is read.
                 values.push(match columns.get(values.len()) {
                     Some(column) => coerce_to_column_type(value, table, column, value_at)?,
                     None => value,
@@ -612,8 +642,6 @@ impl Parser {
                     });
                 }
             }
-            // The engine evaluates predicates against `record.data` as the
-            // complete new row, so a partial SET would corrupt the views.
             let missing: Vec<&str> = table
                 .columns
                 .values()
@@ -699,8 +727,6 @@ impl Parser {
         Ok(pkey_value)
     }
 
-    // -- filters -----------------------------------------------------------
-
     /// `OR` is the loosest binder, so it sits at the top of the chain.
     fn filter(&mut self, table: &DbTable) -> Result<Where, ParseError> {
         let mut parts = vec![self.conjunct(table)?];
@@ -710,6 +736,7 @@ impl Parser {
         Ok(collapse(parts, Where::OR))
     }
 
+    /// `AND` chain of primaries; binds tighter than `OR`.
     fn conjunct(&mut self, table: &DbTable) -> Result<Where, ParseError> {
         let mut parts = vec![self.primary(table)?];
         while self.eat_word("AND") {
@@ -718,6 +745,10 @@ impl Parser {
         Ok(collapse(parts, Where::AND))
     }
 
+    /// A parenthesised filter, a `TRUE` / `FALSE` literal, or one condition.
+    ///
+    /// `TRUE` / `FALSE` parse to the identities: an empty `AND` is true, an
+    /// empty `OR` is false.
     fn primary(&mut self, table: &DbTable) -> Result<Where, ParseError> {
         if self.eat_sym("(") {
             self.descend()?;
@@ -726,7 +757,6 @@ impl Parser {
             self.depth -= 1;
             return Ok(filter);
         }
-        // The identities: an empty AND is true, an empty OR is false.
         if self.eat_word("TRUE") {
             return Ok(Where::AND(Vec::new()));
         }
@@ -787,6 +817,8 @@ impl Parser {
         Ok(Value::List(items))
     }
 
+    /// One literal: `NULL`, `TRUE` / `FALSE`, a (possibly `-`-negated)
+    /// number, a single-quoted string, or a `[`-bracketed list.
     fn value(&mut self) -> Result<Value, ParseError> {
         let at = self.at();
 
@@ -848,10 +880,7 @@ impl Parser {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Semantic helpers
-// ---------------------------------------------------------------------------
-
+/// Unwrap a lone part; otherwise group `parts` under `group`.
 fn collapse(mut parts: Vec<Where>, group: fn(Vec<Where>) -> Where) -> Where {
     if parts.len() == 1 {
         parts.pop().expect("just checked the length")
@@ -860,9 +889,10 @@ fn collapse(mut parts: Vec<Where>, group: fn(Vec<Where>) -> Where) -> Where {
     }
 }
 
+/// The implicit ORDER BY: the first declared pkey column, ascending. A
+/// (degenerate) pkey-less table falls back to the alphabetically first
+/// column name for determinism; a column-less table is an error.
 fn default_order(table: &DbTable, at: usize) -> Result<OrderBy, ParseError> {
-    // First declared pkey column; a (degenerate) pkey-less table falls back
-    // to the alphabetically first column name for determinism.
     let column = table
         .pkey_columns()
         .next()
@@ -894,6 +924,8 @@ fn split_pkey(
     (pkey_value, data)
 }
 
+/// Error unless `pkey_value` covers every primary-key column of `table`;
+/// `verb` prefixes the message ("INSERT must provide" / "WHERE must pin").
 fn ensure_full_pkey(
     table: &DbTable,
     pkey_value: &HashMap<String, Value>,
@@ -921,6 +953,8 @@ fn ensure_full_pkey(
     }
 }
 
+/// Reject `NULL` primary-key values — a NULL-keyed row could never be
+/// matched or addressed again.
 fn ensure_pkey_not_null(
     pkey_value: &HashMap<String, Value>,
     at: usize,
@@ -963,6 +997,10 @@ fn coerce_to_column_type(
     coerce_to_type(value, declared, column, at)
 }
 
+/// Recursive worker for [`coerce_to_column_type`], matching a value (and
+/// list elements) against a declared [`ValueType`]. `NULL` fits any column
+/// here — primary-key columns reject it separately via
+/// [`ensure_pkey_not_null`].
 fn coerce_to_type(
     value: Value,
     declared: &ValueType,
@@ -970,7 +1008,6 @@ fn coerce_to_type(
     at: usize,
 ) -> Result<Value, ParseError> {
     Ok(match (value, declared) {
-        // NULL fits any nullable column; pkey columns reject it separately.
         (Value::Null, _) => Value::Null,
         (value @ Value::Int(_), ValueType::Int) => value,
         (value @ Value::Float(_), ValueType::Float) => value,
@@ -1009,6 +1046,7 @@ fn coerce_to_type(
     })
 }
 
+/// Error if any column name appears more than once.
 fn ensure_no_duplicates(columns: &[String], at: usize) -> Result<(), ParseError> {
     let mut seen = HashSet::new();
     for column in columns {
@@ -1044,15 +1082,12 @@ fn collect_pkey_equalities(filter: &Where, out: &mut Vec<(String, Value)>) -> Re
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{DbColumn, ValueType};
 
+    /// A one-table catalog (`tickets`, pkey `id`) shared by most tests.
     fn catalog() -> Catalog {
         Catalog::new(vec![DbTable::new(
             "tickets",
@@ -1066,22 +1101,27 @@ mod tests {
         )])
     }
 
+    /// Parse `sql` as a read against the shared catalog, panicking on error.
     fn read(sql: &str) -> ReadQuery {
         parse_read(sql, &catalog()).expect("should parse")
     }
 
+    /// Parse `sql` as a write against the shared catalog, panicking on error.
     fn write(sql: &str) -> WriteQuery {
         parse_write(sql, &catalog()).expect("should parse")
     }
 
+    /// The error from parsing `sql` as a read, panicking on success.
     fn read_err(sql: &str) -> ParseError {
         parse_read(sql, &catalog()).expect_err("should fail")
     }
 
+    /// The error from parsing `sql` as a write, panicking on success.
     fn write_err(sql: &str) -> ParseError {
         parse_write(sql, &catalog()).expect_err("should fail")
     }
 
+    /// A SELECT with WHERE, ORDER BY and LIMIT fills every [`ReadQuery`] field.
     #[test]
     fn select_with_all_clauses() {
         let q = read(
@@ -1101,6 +1141,8 @@ mod tests {
         assert_eq!(q.limit, 10);
     }
 
+    /// A bare SELECT defaults to a vacuous filter, pkey-ascending order,
+    /// and an unbounded limit.
     #[test]
     fn select_defaults_no_filter_pkey_order_unbounded_limit() {
         let q = read("SELECT * FROM tickets");
@@ -1110,10 +1152,10 @@ mod tests {
         assert_eq!(q.limit, u32::MAX);
     }
 
+    /// Pkey declaration order (`ts`, `actor`) picks the default ORDER BY —
+    /// not column order, not alphabetical order.
     #[test]
     fn default_order_uses_first_declared_pkey_column() {
-        // pkey declaration order (ts, actor) wins — not column order, not
-        // alphabetical order.
         let catalog = Catalog::new(vec![DbTable::new(
             "events",
             ["ts", "actor"],
@@ -1126,6 +1168,7 @@ mod tests {
         assert_eq!(q.order_by.column.name, "ts");
     }
 
+    /// `AND` groups before `OR`, and parentheses override that precedence.
     #[test]
     fn and_binds_tighter_than_or_and_parens_override() {
         let q = read("SELECT * FROM tickets WHERE status = 'a' AND points > 1 OR status = 'b'");
@@ -1138,6 +1181,8 @@ mod tests {
         assert!(matches!(parts.as_slice(), [_, Where::OR(_)]));
     }
 
+    /// `IN` / `NOT IN` parse to list conditions, and `<>` is the same
+    /// operator as `!=`.
     #[test]
     fn in_not_in_and_operator_spellings() {
         let q = read("SELECT * FROM tickets WHERE priority IN ('HIGH', 'URGENT')");
@@ -1156,13 +1201,14 @@ mod tests {
             Where::Condition(c) if c.comparison_operator == ComparisonOperator::NOT_IN
         ));
 
-        // `<>` is the same operator as `!=`.
         assert_eq!(
             read("SELECT * FROM tickets WHERE points <> 1").filter,
             read("SELECT * FROM tickets WHERE points != 1").filter,
         );
     }
 
+    /// `TRUE` / `FALSE` filters parse to the vacuous AND / OR, and keywords
+    /// match in any case.
     #[test]
     fn true_false_filters_and_keyword_case() {
         assert_eq!(read("SELECT * FROM tickets WHERE TRUE").filter, Where::AND(vec![]));
@@ -1173,6 +1219,8 @@ mod tests {
         );
     }
 
+    /// Literals carry their spelled types: negative ints, floats, `NULL`,
+    /// and `''`-escaped strings.
     #[test]
     fn values_parse_with_types() {
         let q = read("SELECT * FROM tickets WHERE points = -3");
@@ -1185,6 +1233,8 @@ mod tests {
         assert!(matches!(&q.filter, Where::Condition(c) if c.value == Value::String("it's".into())));
     }
 
+    /// INSERT routes pkey columns into `pkey_value` and the rest into
+    /// `record.data`.
     #[test]
     fn insert_splits_pkey_from_data() {
         let WriteQuery::INSERT(insert) =
@@ -1198,6 +1248,7 @@ mod tests {
         assert_eq!(insert.record.data["points"], Value::Int(3));
     }
 
+    /// UPDATE carries the full non-pkey row image, addressed by the pkey.
     #[test]
     fn update_builds_full_row_image_addressed_by_pkey() {
         let WriteQuery::UPDATE(update) = write(
@@ -1209,6 +1260,7 @@ mod tests {
         assert_eq!(update.record.data.len(), 3);
     }
 
+    /// DELETE resolves its WHERE to the primary-key value.
     #[test]
     fn delete_is_pkey_addressed() {
         let WriteQuery::DELETE(delete) = write("DELETE FROM tickets WHERE id = 7") else {
@@ -1217,6 +1269,7 @@ mod tests {
         assert_eq!(delete.pkey_value["id"], Value::Int(7));
     }
 
+    /// Each v1 restriction is refused with its documented error message.
     #[test]
     fn v1_restrictions_are_rejected_loudly() {
         let cases = [
@@ -1265,9 +1318,10 @@ mod tests {
         }
     }
 
+    /// Cross-spelled numerics coerce: `1.0` spelled as a float narrows into
+    /// an Int pkey column, and an Int literal into a Float column widens.
     #[test]
     fn write_values_coerce_to_declared_column_types() {
-        // `1.0` is spelled as a float but the pkey column is Int.
         let WriteQuery::INSERT(insert) =
             write("INSERT INTO tickets (id, status) VALUES (1.0, 'OPEN')")
         else {
@@ -1283,7 +1337,6 @@ mod tests {
         assert_eq!(update.pkey_value["id"], Value::Int(7));
         assert_eq!(update.record.data["points"], Value::Int(3));
 
-        // An Int literal into a Float column widens.
         let float_catalog = Catalog::new(vec![DbTable::new(
             "metrics",
             ["id"],
@@ -1301,10 +1354,11 @@ mod tests {
         assert_eq!(insert.record.data["score"], Value::Float(2.0));
     }
 
+    /// Type mismatches and NULL pkeys are rejected — a string-spelled pkey
+    /// would silently miss the Int-keyed row.
     #[test]
     fn mistyped_or_null_write_values_are_rejected() {
         let cases = [
-            // A string-spelled pkey would silently miss the Int-keyed row.
             ("DELETE FROM tickets WHERE id = '7'", "declared Int"),
             ("INSERT INTO tickets (id, points) VALUES (1, 'many')", "declared Int"),
             ("INSERT INTO tickets (id, status) VALUES (1.5, 'x')", "declared Int"),
@@ -1324,6 +1378,8 @@ mod tests {
         }
     }
 
+    /// Nesting past [`MAX_NESTING_DEPTH`] errors for both `(` and `[`,
+    /// while reasonable nesting still parses.
     #[test]
     fn deep_nesting_errors_instead_of_overflowing_the_stack() {
         let parens = format!(
@@ -1342,7 +1398,6 @@ mod tests {
         let error = read_err(&brackets);
         assert!(error.message.contains("nesting deeper than"));
 
-        // Reasonable nesting still parses.
         let shallow = format!(
             "SELECT * FROM tickets WHERE {}status = 'x'{}",
             "(".repeat(20),
@@ -1351,6 +1406,7 @@ mod tests {
         assert!(parse_read(&shallow, &catalog()).is_ok());
     }
 
+    /// Lexer errors report the byte position of the offending character.
     #[test]
     fn lex_errors_carry_positions() {
         let error = read_err("SELECT * FROM tickets WHERE status = 'oops");
@@ -1361,6 +1417,7 @@ mod tests {
         assert!(error.message.contains("expected `=` after `!`"));
     }
 
+    /// [`parse_read`] refuses writes and [`parse_write`] refuses reads.
     #[test]
     fn wrong_kind_is_an_error() {
         assert!(read_err("DELETE FROM tickets WHERE id = 1")
@@ -1371,6 +1428,7 @@ mod tests {
             .contains("expected a write statement"));
     }
 
+    /// Tokens after a complete statement error at their byte position.
     #[test]
     fn trailing_input_is_rejected() {
         let error = read_err("SELECT * FROM tickets LIMIT 1 garbage");

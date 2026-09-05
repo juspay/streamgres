@@ -30,7 +30,8 @@
 //! 3. Postgres connector via Diesel — initial result sets, full row images
 //!    for partial updates, `order_by`/`limit` enforcement
 //! 4. WebSocket subscription transport (register / unregister / push ops)
-//! 5. Performance: smarter reverse index, benchmarks against the counters
+//! 5. Performance: `(column, op, value)` condition indexing, a row-to-holders
+//!    index for the membership path, benchmarks against the counters
 
 pub mod ivm;
 pub mod model;

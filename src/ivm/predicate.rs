@@ -27,6 +27,12 @@ pub fn evaluate(filter: &Where, row: &HashMap<String, Value>, evaluated: &mut u6
 }
 
 /// Evaluate a single leaf condition against a row image.
+///
+/// `IN` / `NOT_IN` expect the condition value to be a [`Value::List`];
+/// anything else matches nothing (the parser's job is to reject it earlier).
+/// A `Null` inside the list makes `NOT_IN` unsatisfiable, per the
+/// module-level NULL rule (SQL agrees: `x NOT IN (a, NULL)` is never true);
+/// `IN` needs no such guard — a `Null` element simply never matches.
 pub fn eval_condition(cond: &Condition, row: &HashMap<String, Value>, evaluated: &mut u64) -> bool {
     *evaluated += 1;
 
@@ -51,17 +57,11 @@ pub fn eval_condition(cond: &Condition, row: &HashMap<String, Value>, evaluated:
             actual.compare(&cond.value),
             Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
         ),
-        // IN / NOT_IN expect the condition value to be a List; anything else
-        // matches nothing (parser's job to reject it earlier).
         IN => match &cond.value {
             Value::List(items) => items.iter().any(|item| actual.loose_eq(item)),
             _ => false,
         },
         NOT_IN => match &cond.value {
-            // A NULL inside the list makes NOT_IN unsatisfiable, per the
-            // NULL rule above (SQL agrees: `x NOT IN (a, NULL)` is never
-            // true). IN needs no such guard — a NULL element simply never
-            // matches.
             Value::List(items) => {
                 !items.iter().any(Value::is_null)
                     && !items.iter().any(|item| actual.loose_eq(item))
@@ -76,14 +76,18 @@ mod tests {
     use super::*;
     use crate::model::ComparisonOperator::*;
 
+    /// Build a row image from `(column, value)` pairs.
     fn row(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
         pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
     }
 
+    /// Evaluate `filter` against `row`, discarding the evaluated counter.
     fn check(filter: &Where, row: &HashMap<String, Value>) -> bool {
         evaluate(filter, row, &mut 0)
     }
 
+    /// All six comparison operators match and reject as expected on int and
+    /// string columns.
     #[test]
     fn comparison_operators() {
         let r = row(vec![("points", Value::Int(5)), ("status", "OPEN".into())]);
@@ -97,6 +101,8 @@ mod tests {
         assert!(check(&Where::condition("status", EQ, "OPEN"), &r));
     }
 
+    /// An `Int` column value compares against `Float` condition values via
+    /// loose numeric coercion.
     #[test]
     fn int_float_coercion_in_comparisons() {
         let r = row(vec![("points", Value::Int(5))]);
@@ -104,6 +110,8 @@ mod tests {
         assert!(check(&Where::condition("points", GT, 4.5), &r));
     }
 
+    /// `IN` matches list membership and `NOT_IN` its complement for
+    /// NULL-free lists.
     #[test]
     fn in_and_not_in() {
         let r = row(vec![("priority", Value::String("HIGH".into()))]);
@@ -115,20 +123,21 @@ mod tests {
         assert!(check(&Where::condition("priority", NOT_IN, cold), &r));
     }
 
+    /// NULL semantics: a `Null` row value is `false` for every operator
+    /// (`NEQ` and `NOT_IN` included), and a missing column behaves the same;
+    /// a `Null` *inside* an IN/NOT_IN list is never matched by `IN` and
+    /// makes `NOT_IN` unsatisfiable; a `Null` condition value is also always
+    /// `false`.
     #[test]
     fn null_and_missing_columns_never_match() {
         let r = row(vec![("status", Value::Null)]);
-        // Null value: false for every operator, NEQ and NOT_IN included.
         assert!(!check(&Where::condition("status", EQ, "OPEN"), &r));
         assert!(!check(&Where::condition("status", NEQ, "OPEN"), &r));
         assert!(!check(
             &Where::condition("status", NOT_IN, Value::List(vec!["OPEN".into()])),
             &r
         ));
-        // Missing column behaves the same.
         assert!(!check(&Where::condition("ghost", NEQ, "anything"), &r));
-        // A NULL *inside* an IN/NOT_IN list: never matched by IN, makes
-        // NOT_IN unsatisfiable.
         let r3 = row(vec![("status", Value::String("OPEN".into()))]);
         let with_null = Value::List(vec!["OPEN".into(), Value::Null]);
         let with_null_other = Value::List(vec!["CLOSED".into(), Value::Null]);
@@ -136,12 +145,13 @@ mod tests {
         assert!(!check(&Where::condition("status", IN, with_null_other.clone()), &r3));
         assert!(!check(&Where::condition("status", NOT_IN, with_null), &r3));
         assert!(!check(&Where::condition("status", NOT_IN, with_null_other), &r3));
-        // Comparing against a Null condition value is also always false.
         let r2 = row(vec![("status", Value::String("OPEN".into()))]);
         assert!(!check(&Where::condition("status", EQ, Value::Null), &r2));
         assert!(!check(&Where::condition("status", NEQ, Value::Null), &r2));
     }
 
+    /// AND/OR trees combine leaf results, and the vacuous cases hold:
+    /// `AND(vec![])` is `true`, `OR(vec![])` is `false`.
     #[test]
     fn and_or_trees_and_vacuous_cases() {
         let r = row(vec![("a", Value::Int(1)), ("b", Value::Int(2))]);
@@ -164,12 +174,14 @@ mod tests {
         assert!(!check(&Where::OR(vec![]), &r));
     }
 
+    /// The first AND child fails, so the second is never evaluated and the
+    /// `evaluated` counter stays at 1.
     #[test]
     fn short_circuit_counts_only_evaluated_conditions() {
         let r = row(vec![("a", Value::Int(1)), ("b", Value::Int(2))]);
         let tree = Where::AND(vec![
-            Where::condition("a", EQ, 99), // fails ...
-            Where::condition("b", EQ, 2),  // ... so this is never evaluated
+            Where::condition("a", EQ, 99),
+            Where::condition("b", EQ, 2),
         ]);
         let mut evaluated = 0;
         assert!(!evaluate(&tree, &r, &mut evaluated));

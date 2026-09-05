@@ -46,6 +46,7 @@ pub enum ValueType {
 }
 
 impl Value {
+    /// Whether this value is [`Value::Null`].
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -80,6 +81,10 @@ impl Value {
 }
 
 impl PartialEq for Value {
+    /// Strict, variant-exact equality (no `Int` / `Float` coercion — that is
+    /// [`Value::loose_eq`]). `Float` deviates from raw `f64` semantics by
+    /// treating `NaN == NaN` as true, keeping equality a proper equivalence
+    /// relation so `Value` can serve as a hash-map key.
     fn eq(&self, other: &Self) -> bool {
         use Value::*;
         match (self, other) {
@@ -100,6 +105,9 @@ impl PartialEq for Value {
 impl Eq for Value {}
 
 impl Hash for Value {
+    /// Hashes the variant discriminant plus a payload consistent with
+    /// [`Value::eq`]: floats go through `canonical_f64_bits`, maps through
+    /// `unordered_map_hash`, so equal values always hash identically.
     fn hash<H: Hasher>(&self, state: &mut H) {
         use Value::*;
         std::mem::discriminant(self).hash(state);
@@ -145,30 +153,35 @@ pub(crate) fn unordered_map_hash<K: Hash, V: Hash>(map: &HashMap<K, V>) -> u64 {
 }
 
 impl From<&str> for Value {
+    /// Wraps a borrowed string as [`Value::String`], copying it.
     fn from(s: &str) -> Self {
         Value::String(s.to_owned())
     }
 }
 
 impl From<String> for Value {
+    /// Wraps an owned string as [`Value::String`].
     fn from(s: String) -> Self {
         Value::String(s)
     }
 }
 
 impl From<i32> for Value {
+    /// Wraps an `i32` as [`Value::Int`].
     fn from(i: i32) -> Self {
         Value::Int(i)
     }
 }
 
 impl From<f64> for Value {
+    /// Wraps an `f64` as [`Value::Float`].
     fn from(f: f64) -> Self {
         Value::Float(f)
     }
 }
 
 impl From<bool> for Value {
+    /// Wraps a `bool` as [`Value::Bool`].
     fn from(b: bool) -> Self {
         Value::Bool(b)
     }
@@ -179,12 +192,15 @@ mod tests {
     use super::*;
     use std::collections::hash_map::DefaultHasher;
 
+    /// Hashes a [`Value`] with the std `DefaultHasher`.
     fn hash_of(v: &Value) -> u64 {
         let mut h = DefaultHasher::new();
         v.hash(&mut h);
         h.finish()
     }
 
+    /// The `Float` special cases (`NaN == NaN`, `0.0 == -0.0`) hash
+    /// identically, keeping the `Eq` / `Hash` contract intact.
     #[test]
     fn float_nan_and_zero_equality_matches_hash() {
         let nan_a = Value::Float(f64::NAN);
@@ -198,13 +214,16 @@ mod tests {
         assert_eq!(hash_of(&pos_zero), hash_of(&neg_zero));
     }
 
+    /// `Int` / `Float` coercion applies only to [`Value::loose_eq`]; strict
+    /// equality (and therefore hashing) stays variant-exact.
     #[test]
     fn int_float_coercion_is_loose_only() {
         assert!(Value::Int(5).loose_eq(&Value::Float(5.0)));
-        // Strict equality (and therefore hashing) stays variant-exact.
         assert_ne!(Value::Int(5), Value::Float(5.0));
     }
 
+    /// [`Value::compare`] returns `None` for anything involving `Null`,
+    /// including `Null` vs `Null`.
     #[test]
     fn null_compares_with_nothing() {
         assert_eq!(Value::Null.compare(&Value::Null), None);

@@ -44,16 +44,24 @@ The pipeline is `SQL text → query model → IVM routing`:
 
 | Field | Type | Purpose |
 | --- | --- | --- |
-| `select_queries` | `uuid -> ReadQuery` | The registered subscriptions; the uuid is the client-facing handle. |
-| `forward_index` | `uuid -> DataFrame` | Each subscription's own materialized result set. |
-| `reverse_index` | `Condition -> Vec<uuid>` | Leaf predicate conditions with all their subscribers, probed against a write's row image to find candidate queries without scanning every subscription. |
+| `select_queries` | `QueryId -> ReadQuery` | The registered subscriptions; the id is the client-facing handle. |
+| `forward_index` | `QueryId -> DataFrame` | Each subscription's own materialized result set. |
+| `tables` | `table -> TableIndex` | Per-table routing: each condition points at the *shared* counters of the disjuncts containing it; identical disjunct shapes reuse one counter across subscriptions, and vacuously-true subscribers are listed separately. |
 
-A write can affect a subscription in exactly two ways, and `IVM` checks both:
+At registration, a query's `Where` is normalized to **disjunctive normal
+form** (`Where::to_dnf`): an OR of *disjuncts*, each an AND of leaf
+conditions. A write can then affect a subscription in exactly two ways, and
+`IVM` checks both:
 
 1. **The new row matches the query** (insert / update-in / change-in-place) —
-   found by probing the reverse index with the row image, then verifying each
-   candidate's full `Where` tree. Condition-less queries (full-table
-   subscriptions) are never in the index and become candidates directly.
+   decided by *counting*: each distinct same-table condition is evaluated
+   against the row image exactly once; every match bumps the shared counter
+   of each disjunct containing that condition, and a counter reaching its
+   size fires every subscription whose filter contains that disjunct.
+   Firing is exact (no verification pass), and the bookkeeping is
+   proportional to the *matching* links — a write that concerns nobody
+   costs almost nothing beyond the evaluations. Counters are epoch-stamped
+   per write, so there is no reset sweep either.
 2. **The query currently holds the row** (delete / update-out) — found by
    checking same-table frames for the row's key. A delete carries no column
    values, so predicate matching cannot find these.
@@ -91,15 +99,15 @@ routing cost:
    op       : q-mine-active  <- Add(id=1)
    op       : q-open         <- Add(id=1)
    op       : q-open-dup     <- Add(id=1)
-   cost     : index 3/5 hit, membership 0/6 hit, 4 full evals, 9 condition evals, 4 impacted, ops +4/-0
-   note     : one index probe of status = 'OPEN' routes to both of its subscribers
+   cost     : 5 cond evals (3 hit), 3 disjunct bumps, 2 fired, membership 0/6 hit, 4 impacted, ops +4/-0
+   note     : q-open and q-open-dup share one status = 'OPEN' counter — a single bump fires both
 ```
 
-Every routing step is counted ([`IvmStats`](src/ivm/stats.rs)): index probes and
-hits, membership probes and hits, full predicate evaluations, per-condition
-evaluations, emitted operations. These counters are the yardstick for every
-future optimization of the routing strategy — change the strategy, rerun the
-demo, compare.
+Every routing step is counted ([`IvmStats`](src/ivm/stats.rs)): condition
+evaluations and hits, disjunct increments and firings, membership probes and
+hits, emitted operations. These counters are the yardstick for every future
+optimization of the routing strategy — change the strategy, rerun the demo,
+compare.
 
 ## The server
 
@@ -182,17 +190,20 @@ narrowed:
   `false`, for every operator including `NEQ`/`NOT_IN` — SQL three-valued
   logic collapsed to two values.
 - **Inserts are upserts:** inserting an existing key replaces the row.
+- **Single-threaded by design (for now).** One `IVM` runs on one thread,
+  enforced at compile time — the routing index's shared counter handles are
+  not `Send`. Multithreading is a later, deliberate step; the sketch on
+  record is sharding by table (nothing is shared between two tables' state).
 
 ## Design notes (open questions on the data structures)
 
 Known consequences of the current shapes — kept as-is on purpose, documented so
 they can be discussed rather than discovered:
 
-1. **`Condition` carries no table**, so the same condition on two different
-   tables shares one index entry and its subscriber list mixes tables.
-   Verification keeps the *results* correct (a candidate is confirmed against
-   its own table + full predicate), but an index shaped
-   `table -> Condition -> subscribers` would probe less.
+1. **`Where::to_dnf` has no size cap.** DNF is exponential for adversarial
+   filters (`(a1 OR b1) AND … AND (an OR bn)` → 2^n disjuncts); typical
+   subscription filters stay tiny, so a cap + tree-evaluation fallback is
+   deliberately deferred until real workloads show the need.
 2. **`ReadQuery` has no projection** — every query is `SELECT *`. Fine for v1;
    a `columns` field changes what `DataFrameRow` holds per query.
 3. **`limit: u32` and mandatory `order_by`** cannot express "no limit" /
@@ -216,8 +227,12 @@ they can be discussed rather than discovered:
    as "replace". Clients cannot distinguish a row entering from a row
    changing, and there is no ordering position for `ORDER BY` maintenance.
 
-Resolved so far: the one-subscriber-per-condition reverse index (now
-`HashMap<Condition, Vec<String>>`, pinned by
+Resolved so far: the one-subscriber-per-condition reverse index and the
+condition-without-table collision (routing is now per-table `TableIndex`es
+of shared DNF disjunct counters — each condition points at the counters of
+the disjuncts containing it, identical shapes share one counter across
+subscriptions, and counting is exact with no verification pass — pinned by
+`counting_agrees_with_tree_evaluation` and
 `duplicate_condition_routes_to_every_subscriber`); the `ReadQuery`-keyed
 forward index (now keyed by subscription uuid, pinned by
 `identical_queries_maintain_independent_frames` /
@@ -240,8 +255,10 @@ genuinely "first declared pkey column" (pinned by
 4. **WebSocket** subscription transport — register/unregister, push
    `(uuid, DataFrameOperation)` streams, reconnect/catch-up.
    *Server setup landed ([`src/ws.rs`](src/ws.rs)); engine wiring is next.*
-5. Perf — per-table condition indexing (design note 1), range-friendly
-   condition indexing, benchmarks driven by `IvmStats`
+5. Perf — condition indexing by `(column, op, value)` so matches are *found*
+   (hash/interval lookup) instead of every condition being evaluated;
+   selectivity-ordered evaluation; a `row key -> holders` index for the
+   membership path; benchmarks driven by `IvmStats`
 
 ## Layout
 
@@ -257,7 +274,8 @@ src/
     query.rs          ReadQuery / WriteQuery, Where / Condition, operators
     frame.rs          DataFrame / DataFrameKey / DataFrameRow / DataFrameOperation
   ivm/
-    mod.rs            IVM: register_query, search_impacted_queries, incremental_update
+    mod.rs            IVM: register/unregister, search_impacted_queries, incremental_update
+    index.rs          TableIndex: shared DNF disjunct counters keyed by condition
     predicate.rs      Where-tree evaluation, NULL semantics
     stats.rs          IvmStats counters + per-write diffing
   parser/

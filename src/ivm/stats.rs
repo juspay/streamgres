@@ -1,47 +1,57 @@
 //! Operation counters for the IVM engine.
 //!
-//! The whole point of the reverse index is to make routing a write cheaper
-//! than re-checking every registered query. These counters make that
-//! claim measurable: how many conditions were probed, how many candidates
-//! survived, how many full predicate evaluations were actually paid for.
-//! The demo binary (`src/main.rs`) prints a per-write diff of them.
+//! The whole point of the DNF counting index is that a write's routing cost
+//! scales with how *relevant* the write is (conditions matched, counters
+//! bumped), not with how many subscriptions exist. These counters make that
+//! claim measurable. The demo binary (`src/main.rs`) prints a per-write diff
+//! of them.
 
 use std::fmt;
 
 /// Cumulative counters, monotonically increasing over an [`crate::ivm::IVM`]'s
 /// lifetime. Use [`IvmStats::diff`] to isolate the cost of a single write.
+///
+/// Registration:
+/// - `queries_registered`: calls to `register_query` — including identical
+///   re-registrations, which are otherwise no-ops.
+/// - `disjuncts_registered`: DNF disjuncts created across all registrations.
+/// - `conditions_indexed`: (condition → disjunct) links added to the reverse
+///   index.
+///
+/// Write routing:
+/// - `writes_processed`: writes processed by `incremental_update`.
+/// - `conditions_evaluated`: leaf conditions evaluated against a write's row
+///   image — each distinct same-table condition exactly once per write.
+/// - `index_hits`: evaluated conditions that matched the row image.
+/// - `disjunct_increments`: disjunct counter bumps performed for matching
+///   conditions — the output-sensitive part of routing (work ∝ matching
+///   links, not subscriptions).
+/// - `disjuncts_fired`: disjuncts whose counter reached its size — each
+///   firing impacts *every* subscription sharing that disjunct shape, so
+///   this can be smaller than the subscriptions found by counting.
+/// - `membership_probes`: registered same-table queries checked for
+///   currently holding the written row.
+/// - `membership_hits`: membership checks that found the row.
+/// - `queries_impacted`: subscriptions confirmed impacted.
+///
+/// Emitted operations:
+/// - `ops_add`: `Add` operations emitted (row entered a result set, or
+///   changed in place).
+/// - `ops_delete`: `Delete` operations emitted (row left a result set).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IvmStats {
-    // -- registration ----------------------------------------------------
-    /// Queries registered via `register_query`.
     pub queries_registered: u64,
-    /// Leaf conditions inserted into the reverse index (one per condition
-    /// per subscribing query).
+    pub disjuncts_registered: u64,
     pub conditions_indexed: u64,
-
-    // -- write routing ---------------------------------------------------
-    /// Writes processed by `incremental_update`.
     pub writes_processed: u64,
-    /// Reverse-index conditions probed against a write's row image.
-    pub index_probes: u64,
-    /// Probes that matched, promoting their query to candidate.
-    pub index_hits: u64,
-    /// Registered queries checked for currently holding the written row.
-    pub membership_probes: u64,
-    /// Membership checks that found the row, promoting the query to candidate.
-    pub membership_hits: u64,
-    /// Candidates whose full `Where` tree was then evaluated.
-    pub full_evaluations: u64,
-    /// Total leaf conditions evaluated (index probes + full evaluations;
-    /// short-circuiting means this can be less than tree size).
     pub conditions_evaluated: u64,
-    /// Candidates confirmed as impacted.
+    pub index_hits: u64,
+    pub disjunct_increments: u64,
+    pub disjuncts_fired: u64,
+    pub membership_probes: u64,
+    pub membership_hits: u64,
     pub queries_impacted: u64,
-
-    // -- emitted operations ----------------------------------------------
-    /// `Add` operations emitted (row entered a result set, or changed in place).
     pub ops_add: u64,
-    /// `Delete` operations emitted (row left a result set).
     pub ops_delete: u64,
 }
 
@@ -51,14 +61,15 @@ impl IvmStats {
     pub fn diff(&self, earlier: &IvmStats) -> IvmStats {
         IvmStats {
             queries_registered: self.queries_registered - earlier.queries_registered,
+            disjuncts_registered: self.disjuncts_registered - earlier.disjuncts_registered,
             conditions_indexed: self.conditions_indexed - earlier.conditions_indexed,
             writes_processed: self.writes_processed - earlier.writes_processed,
-            index_probes: self.index_probes - earlier.index_probes,
+            conditions_evaluated: self.conditions_evaluated - earlier.conditions_evaluated,
             index_hits: self.index_hits - earlier.index_hits,
+            disjunct_increments: self.disjunct_increments - earlier.disjunct_increments,
+            disjuncts_fired: self.disjuncts_fired - earlier.disjuncts_fired,
             membership_probes: self.membership_probes - earlier.membership_probes,
             membership_hits: self.membership_hits - earlier.membership_hits,
-            full_evaluations: self.full_evaluations - earlier.full_evaluations,
-            conditions_evaluated: self.conditions_evaluated - earlier.conditions_evaluated,
             queries_impacted: self.queries_impacted - earlier.queries_impacted,
             ops_add: self.ops_add - earlier.ops_add,
             ops_delete: self.ops_delete - earlier.ops_delete,
@@ -69,13 +80,13 @@ impl IvmStats {
     /// demo for per-write output.
     pub fn routing_summary(&self) -> String {
         format!(
-            "index {}/{} hit, membership {}/{} hit, {} full evals, {} condition evals, {} impacted, ops +{}/-{}",
+            "{} cond evals ({} hit), {} disjunct bumps, {} fired, membership {}/{} hit, {} impacted, ops +{}/-{}",
+            self.conditions_evaluated,
             self.index_hits,
-            self.index_probes,
+            self.disjunct_increments,
+            self.disjuncts_fired,
             self.membership_hits,
             self.membership_probes,
-            self.full_evaluations,
-            self.conditions_evaluated,
             self.queries_impacted,
             self.ops_add,
             self.ops_delete,
@@ -84,14 +95,17 @@ impl IvmStats {
 }
 
 impl fmt::Display for IvmStats {
+    /// Multi-line, dot-aligned rendering of every counter.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "queries registered ......... {}", self.queries_registered)?;
-        writeln!(f, "conditions indexed ......... {}", self.conditions_indexed)?;
+        writeln!(f, "disjuncts registered ....... {}", self.disjuncts_registered)?;
+        writeln!(f, "condition links indexed .... {}", self.conditions_indexed)?;
         writeln!(f, "writes processed ........... {}", self.writes_processed)?;
-        writeln!(f, "index probes / hits ........ {} / {}", self.index_probes, self.index_hits)?;
-        writeln!(f, "membership probes / hits ... {} / {}", self.membership_probes, self.membership_hits)?;
-        writeln!(f, "full evaluations ........... {}", self.full_evaluations)?;
         writeln!(f, "conditions evaluated ....... {}", self.conditions_evaluated)?;
+        writeln!(f, "condition hits ............. {}", self.index_hits)?;
+        writeln!(f, "disjunct increments ........ {}", self.disjunct_increments)?;
+        writeln!(f, "disjuncts fired ............ {}", self.disjuncts_fired)?;
+        writeln!(f, "membership probes / hits ... {} / {}", self.membership_probes, self.membership_hits)?;
         writeln!(f, "queries impacted ........... {}", self.queries_impacted)?;
         write!(f, "ops emitted ................ {} adds, {} deletes", self.ops_add, self.ops_delete)
     }

@@ -14,7 +14,7 @@ use super::value::{unordered_map_hash, Value};
 ///
 /// Used as a `HashMap` key, hence the manual `Hash` (a `HashMap` field has
 /// order-independent equality, so the hash must be order-independent too —
-/// see [`unordered_map_hash`]).
+/// see `unordered_map_hash` in `model::value`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataFrameKey {
     pub pkey_value: HashMap<String, Value>,
@@ -23,6 +23,8 @@ pub struct DataFrameKey {
 impl Eq for DataFrameKey {}
 
 impl Hash for DataFrameKey {
+    /// Hashes the primary-key map order-independently so equal keys hash
+    /// identically regardless of `HashMap` iteration order.
     fn hash<H: Hasher>(&self, state: &mut H) {
         unordered_map_hash(&self.pkey_value).hash(state);
     }
@@ -54,20 +56,24 @@ pub enum DataFrameOperation {
 }
 
 impl DataFrameKey {
+    /// Builds a row identity from primary-key column name → value.
     pub fn new(pkey_value: HashMap<String, Value>) -> Self {
         DataFrameKey { pkey_value }
     }
 }
 
 impl DataFrame {
+    /// Number of rows in the result set.
     pub fn len(&self) -> usize {
         self.records.len()
     }
 
+    /// Whether the result set holds no rows.
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
 
+    /// Whether a row with this identity is present.
     pub fn contains(&self, key: &DataFrameKey) -> bool {
         self.records.contains_key(key)
     }

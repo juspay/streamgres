@@ -21,8 +21,8 @@ pub mod value;
 
 pub use frame::{DataFrame, DataFrameKey, DataFrameOperation, DataFrameRow};
 pub use query::{
-    ComparisonOperator, Condition, DeleteQuery, InsertQuery, Order, OrderBy, ReadQuery,
+    ComparisonOperator, Condition, DeleteQuery, Disjunct, InsertQuery, Order, OrderBy, ReadQuery,
     UpdateQuery, Where, WriteQuery,
 };
-pub use schema::{Catalog, DbColumn, DbRecord, DbTable};
+pub use schema::{Catalog, DbColumn, DbRecord, DbTable, TableName};
 pub use value::{Value, ValueType};
