@@ -4,6 +4,7 @@
 //! condition edit the join layer uses for its `IN` lists.
 
 use super::index::TableIndex;
+use super::window::Window;
 use super::{window, QueryId, SingleTableIVM};
 use crate::model::{Condition, DataFrameKey, DataFrameOperation, DataFrameRow, SingleTableReadQuery};
 
@@ -52,26 +53,40 @@ impl SingleTableIVM {
                 .or_default()
                 .register(&query_uuid, dnf, &mut self.stats);
         }
+        let mut twin_of = None;
         let records = match initial {
             Some(records) => records,
             None => match self.identical_subscription(&select_query, &query_uuid) {
                 Some(twin) => {
                     self.stats.snapshots_shared += 1;
-                    self.rows_of(&twin)
+                    let rows = self.rows_of(&twin);
+                    twin_of = Some(twin);
+                    rows
                 }
                 None => self.storage.select(&Self::storage_query(&select_query)),
             },
         };
+        let requested = window::storage_limit(&select_query) as usize;
         self.select_queries
             .insert(query_uuid.clone(), select_query);
 
         let mut ops = Vec::new();
-        for (key, row) in records {
-            if let Some(op) = self.upsert_row(query_uuid.as_str(), &key, &row) {
+        for (key, row) in &records {
+            if let Some(op) = self.upsert_row(query_uuid.as_str(), key, row) {
                 ops.push(op);
             }
         }
         self.rebuild_window(query_uuid.as_str());
+        let inherited = twin_of
+            .as_ref()
+            .and_then(|twin| self.windows.get(twin.as_str()))
+            .and_then(Window::frontier);
+        if let Some(window) = self.windows.get_mut(query_uuid.as_str()) {
+            match twin_of {
+                Some(_) => window.set_frontier(inherited),
+                None => window.note_fetch(requested, &records),
+            }
+        }
         ops.extend(self.evict_overflow(query_uuid.as_str()));
         self.sync_boundary(query_uuid.as_str());
         ops

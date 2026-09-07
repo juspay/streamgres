@@ -677,8 +677,8 @@ fn late_identical_registration_inherits_the_twins_rows() {
 }
 
 /// ORDER BY + LIMIT: the engine buffers twice the requested limit, admits
-/// past a full buffer only rows strictly better than the worst held value
-/// (evicting the worst), keeps a held row that worsens in place until a
+/// only rows strictly better than the storage frontier (evicting the
+/// worst past capacity), keeps a held row that worsens in place until a
 /// better arrival evicts it, and refills from storage when a removal
 /// drains the buffer to the requested limit.
 #[test]
@@ -740,7 +740,7 @@ fn limit_window_admits_evicts_and_refills() {
     assert_eq!(ops.len(), 2);
     assert_eq!(ivm.rows_for("w").unwrap().len(), 4);
 
-    let better = insert(&tickets, 9, &[("points", 60.into())]);
+    let better = insert(&tickets, 9, &[("points", 45.into())]);
     storage.apply(&better);
     let ops = ivm.incremental_update(&better);
     assert_eq!(ops.len(), 2);
@@ -996,4 +996,132 @@ fn identical_registration_skips_storage() {
 
     let snapshot = ivm.register_query("q-c", query(&tickets, Where::AND(vec![])), None);
     assert_eq!(snapshot.len(), 2, "no twin — storage is consulted");
+}
+
+/// Regression (review): the admission boundary is anchored at the storage
+/// frontier, not at the worst held row. After a delete leaves the buffer
+/// below capacity, an arrival beyond the frontier is still rejected (the
+/// rows still in storage are better), a twin inherits the same frontier,
+/// and the refill that follows a drain fetches from the frontier so the
+/// held top-L stays exact.
+#[test]
+fn window_boundary_survives_a_deletion() {
+    let tickets = table("tickets");
+    let storage = Rc::new(MemoryStorage::new());
+    let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    for id in 1..=8 {
+        storage.apply(&insert(&tickets, id, &[("points", (id * 10).into())]));
+    }
+    let windowed = SingleTableReadQuery::new(
+        tickets.name.clone(),
+        Where::AND(vec![]),
+        OrderBy::new("points", Order::ASC),
+        2,
+    );
+    assert_eq!(ivm.register_query("w", windowed.clone(), None).len(), 4);
+    assert_eq!(ivm.register_query("twin", windowed, None).len(), 4);
+
+    let removal = delete(&tickets, 1);
+    storage.apply(&removal);
+    ivm.incremental_update(&removal);
+    assert_eq!(ivm.rows_for("w").unwrap().len(), 3, "below capacity, above the limit: no refill");
+
+    let beyond = insert(&tickets, 9, &[("points", 1000.into())]);
+    storage.apply(&beyond);
+    assert!(
+        ivm.incremental_update(&beyond).is_empty(),
+        "beyond the frontier (40): rejected for both subscriptions even with room in the buffer"
+    );
+
+    let within = insert(&tickets, 10, &[("points", 35.into())]);
+    storage.apply(&within);
+    let ops = ivm.incremental_update(&within);
+    assert_eq!(impacted(&ops), vec!["twin", "w"], "inside the frontier: admitted, got {ops:?}");
+    assert_eq!(ops.len(), 2, "no eviction while the buffer has room");
+
+    for id in [2, 3] {
+        let removal = delete(&tickets, id);
+        storage.apply(&removal);
+        ivm.incremental_update(&removal);
+    }
+    let mut held: Vec<i64> = ivm
+        .rows_for("w")
+        .unwrap()
+        .values()
+        .map(|row| match row.data["points"] {
+            Value::Int(points) => points,
+            _ => unreachable!(),
+        })
+        .collect();
+    held.sort_unstable();
+    assert_eq!(
+        held,
+        vec![35, 40, 50, 60],
+        "the refill walked storage from the frontier; the top-2 is exact"
+    );
+}
+
+/// Regression (review): rows tying the frontier are reachable. With four
+/// rows sharing the boundary value and two of them held, refills fetch
+/// from the frontier inclusive and dedup the held ties, so the held top-L
+/// never contains a strictly worse row while a tied one sits in storage.
+#[test]
+fn window_refill_reaches_rows_tying_the_frontier() {
+    let tickets = table("tickets");
+    let storage = Rc::new(MemoryStorage::new());
+    let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    for (id, points) in [(1, 1), (2, 2), (3, 3), (4, 3), (5, 3), (6, 3), (7, 5)] {
+        storage.apply(&insert(&tickets, id, &[("points", points.into())]));
+    }
+    let windowed = SingleTableReadQuery::new(
+        tickets.name.clone(),
+        Where::AND(vec![]),
+        OrderBy::new("points", Order::ASC),
+        2,
+    );
+    assert_eq!(ivm.register_query("w", windowed, None).len(), 4);
+
+    for id in [1, 2] {
+        let removal = delete(&tickets, id);
+        storage.apply(&removal);
+        ivm.incremental_update(&removal);
+    }
+    let points_of = |ivm: &SingleTableIVM| -> Vec<i64> {
+        let mut held: Vec<i64> = ivm
+            .rows_for("w")
+            .unwrap()
+            .values()
+            .map(|row| match row.data["points"] {
+                Value::Int(points) => points,
+                _ => unreachable!(),
+            })
+            .collect();
+        held.sort_unstable();
+        held
+    };
+    assert_eq!(points_of(&ivm), vec![3, 3, 3, 3], "the refill fetched the unheld ties, not the 5");
+
+    let held_ids: Vec<i64> = ivm
+        .rows_for("w")
+        .unwrap()
+        .keys()
+        .map(|key| match key.pkey_value["id"] {
+            Value::Int(id) => id,
+            _ => unreachable!(),
+        })
+        .collect();
+    for id in held_ids.into_iter().take(2) {
+        let removal = delete(&tickets, id);
+        storage.apply(&removal);
+        ivm.incremental_update(&removal);
+    }
+    assert_eq!(
+        points_of(&ivm),
+        vec![3, 3, 5],
+        "storage exhausted: the two remaining ties and the 5 are all held"
+    );
+    assert!(
+        ivm.incremental_update(&insert(&tickets, 8, &[("points", 4.into())])).len() == 1,
+        "with storage exhausted there is no boundary: a matching arrival is admitted"
+    );
 }

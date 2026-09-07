@@ -29,6 +29,7 @@ impl SingleTableIVM {
         let Some(query) = self.select_queries.get(query_uuid) else {
             return Vec::new();
         };
+        let limit = window::storage_limit(query);
         let narrowed = SingleTableReadQuery {
             filter: Where::AND(vec![
                 query.filter.clone(),
@@ -38,23 +39,22 @@ impl SingleTableIVM {
                     Value::List(values.to_vec()),
                 )),
             ]),
-            limit: window::storage_limit(query),
+            limit,
             ..query.clone()
         };
         let records = self.storage.select(&narrowed);
         let mut ops = Vec::new();
-        for (key, row) in records {
-            if let Some(op) = self.upsert_row(query_uuid, &key, &row) {
+        for (key, row) in &records {
+            if let Some(op) = self.upsert_row(query_uuid, key, row) {
                 ops.push(op);
             }
             if let Some(window) = self.windows.get_mut(query_uuid) {
-                let value = row
-                    .data
-                    .get(window.column.as_str())
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                window.insert(value, key);
+                let value = window.order_value(row);
+                window.insert(value, key.clone());
             }
+        }
+        if let Some(window) = self.windows.get_mut(query_uuid) {
+            window.note_narrowed_fetch(limit as usize, &records);
         }
         ops.extend(self.evict_overflow(query_uuid));
         self.sync_boundary(query_uuid);

@@ -44,7 +44,7 @@ the number that **actually match**, and then patches only the affected views.
 | Typed query/row model, self-contained ops (`Delete` carries its image; replace = `Delete(old)` + `Add(new)`) | ✅ done | `src/model/` |
 | DNF counting index: each distinct condition evaluated once per write, shared epoch-stamped counters fire exactly | ✅ done | `src/ivm/index.rs` |
 | Shared frames: one frame per table, rows tagged with holders; held-key mirror; twin registration served from the frame | ✅ done | `src/ivm/frames.rs`, `src/ivm/registry.rs` |
-| `ORDER BY` / `LIMIT` windows: doubled buffer, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
+| `ORDER BY` / `LIMIT` windows: doubled buffer, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
 | In-place condition edit (a join's `IN` list gains/loses a value without re-registration) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
 | `LEFT JOIN`, one level: a root with any number of left-joined leaf tables, per-value left/right counts, self-joins | ✅ done | `src/ivm/multi.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
@@ -54,7 +54,6 @@ the number that **actually match**, and then patches only the affected views.
 | **PostgreSQL ingester**: permanent `pgoutput` slot + rotating exported snapshots + per-subscription catch-up | ⏳ pending | paper §7; `PgStorage` is a stub |
 | **WebSocket protocol**: subscribe / unsubscribe / op stream, connection & subscription lifecycle | ⏳ pending | `src/ws.rs` is an axum echo base |
 | `O(columns · log n)` condition matching (per-column hash maps + interval search) | ⏳ pending | paper §8.2 |
-| Window frontier: boundary and refill threshold anchored at the worst value covered from storage (today both use the worst *held* row, so a withdrawn boundary or a tie can leave a better storage row unfetched) | ⏳ pending | paper §5.2; first item of §12.1 |
 | Set-valued join edge (the `IN` list as a per-column set, one edge shared by identical multi-table subscriptions), the measured slow path | ⏳ pending | paper §9.5, §12.1 |
 | Query-keyed twin index; interned subscription ids and compact keys in tags / held index | ⏳ pending | paper §9.3, §9.6 |
 | Parser `JOIN` syntax | ⏳ pending | multi-table queries are built programmatically |
@@ -122,13 +121,17 @@ A write can affect a subscription two ways, and both are checked:
   during which the subscription is not a twin donor until the caller's
   `mark_reconciled`.
 - **Windows** (`window.rs`). A finite `LIMIT L` keeps a buffer of `2L` rows
-  (storage queried with the doubled limit). When full, the admission boundary
-  (`col < worst` for ASC, `>` for DESC, strict) is **published into the
-  index's `boundaries` side table** and checked inside `matched()`; admission
-  only; a held row that worsens keeps its slot until evicted. Past capacity the
-  worst row is evicted (`Delete`); when a removal drains the buffer to `L`, one
-  storage query refills it. `NULL`/`NaN` sort largest; an unenforceable
-  boundary is dropped rather than rejecting everything; `LIMIT 0` is
+  (storage queried with the doubled limit) and a **frontier**: the worst order
+  value known to be covered from storage (every matching row better than it
+  is held). A full storage read sets the frontier to its worst value, a short
+  one clears it (storage exhausted), an eviction pulls it in. The admission
+  boundary (`col < frontier` for ASC, `>` for DESC, strict) is **published
+  into the index's `boundaries` side table** and checked inside `matched()`;
+  admission only; a held row that worsens keeps its slot until evicted. Past
+  capacity the worst row is evicted (`Delete`); when a removal drains the
+  buffer to `L`, one storage query refills from the frontier inclusive
+  (held ties dedup). `NULL`/`NaN` sort largest; an unenforceable frontier
+  publishes no boundary rather than rejecting everything; `LIMIT 0` is
   permanently empty.
 
 ### 3. Multi-table layer (`src/ivm/multi.rs`)
@@ -242,10 +245,10 @@ writes alone; raw output in
 
 | Scenario | Result |
 | --- | --- |
-| Routing, 100 → 10 000 subscriptions | conditions evaluated per write saturate at the vocabulary size (67 at N = 100, 85 from N = 1 000); route-only cost ≈ 2 µs fixed + 0.35 µs per impacted subscription; delivery ≈ 1.3 µs per emitted op |
-| Twin registration (400-row snapshot) | 966 µs from the shared frame vs 2 389 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
-| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.5 µs; targeted writes ≈ 13 µs net of the storage double's refill scans |
-| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | user updates are pure fan-out (2.3 µs per op); ticket inserts cost 10 ms because every twin edits its `O(\|IN\|)` join edge at each zero crossing, the slow path the set-valued shared edge removes |
+| Routing, 100 → 10 000 subscriptions | conditions evaluated per write saturate at the vocabulary size (67 at N = 100, 85 from N = 1 000); route-only cost ≈ 2 µs fixed + 0.35 µs per impacted subscription; delivery ≈ 1.2 µs per emitted op |
+| Twin registration (400-row snapshot) | 953 µs from the shared frame vs 1 968 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
+| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.5 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~90 ms across 10 000 writes) |
+| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | user updates are pure fan-out (2.6 µs per op); ticket inserts cost 10 ms because every twin edits its `O(\|IN\|)` join edge at each zero crossing, the slow path the set-valued shared edge removes |
 
 ### Using the engine programmatically
 
@@ -312,6 +315,7 @@ Cargo.toml
 paper/
   xyne-sync.tex / .pdf     the design paper (algorithms, join tree, ingestion, evaluation)
   bench-2026-09-07.txt     raw output of the benchmark run reported in the paper
+  bench-2026-09-07-before-frontier.txt   the same run before the window frontier fix
 docs/
   pg-lsn-cdc-lab.md        hands-on lab: LSNs, MVCC snapshots, the CDC handoff
 src/
