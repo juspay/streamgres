@@ -1,7 +1,7 @@
 //! The server binary.
 //!
 //! ```bash
-//! cargo run --bin server --features ws
+//! cargo run --bin server
 //! ```
 
 #[tokio::main]

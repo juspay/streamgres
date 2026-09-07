@@ -1,16 +1,15 @@
-//! Table schema: the catalog, tables, columns, and a single materialized row.
+//! Table schema: the catalog, tables, and columns.
 //!
 //! The schema has one authoritative home — the [`Catalog`] — and resolves by
 //! name at every level: the catalog maps table names to [`DbTable`]s, and
-//! each table maps column names to [`DbColumn`]s. Queries and records
-//! reference their table **by name**; nothing else carries schema copies, so
-//! a migration cannot leave two halves of the engine disagreeing about what
-//! a table looks like.
+//! each table maps column names to [`DbColumn`]s. Queries reference their
+//! table **by name**; nothing else carries schema copies, so a migration
+//! cannot leave two halves of the engine disagreeing about what a table
+//! looks like.
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 
-use super::value::{unordered_map_hash, Value, ValueType};
+use super::value::ValueType;
 
 /// The name of a table, as its own type so it can never be confused with
 /// the other strings the engine passes around (subscription ids, column
@@ -72,6 +71,66 @@ impl std::fmt::Display for TableName {
     }
 }
 
+/// The name of a column, as its own type so it can never be confused with
+/// the other strings the engine passes around (table names, subscription
+/// ids).
+///
+/// Constructed from any string-ish value; compares, orders, and hashes
+/// exactly like the underlying name, maps keyed by `ColumnName` accept a
+/// plain `&str` for lookups, and it compares directly against string
+/// literals.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ColumnName(String);
+
+impl ColumnName {
+    /// The name as a borrowed string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for ColumnName {
+    /// Wraps a borrowed name.
+    fn from(name: &str) -> Self {
+        ColumnName(name.to_owned())
+    }
+}
+
+impl From<String> for ColumnName {
+    /// Wraps an owned name.
+    fn from(name: String) -> Self {
+        ColumnName(name)
+    }
+}
+
+impl std::borrow::Borrow<str> for ColumnName {
+    /// Lets maps keyed by [`ColumnName`] be queried with a plain `&str`.
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for ColumnName {
+    /// Compares against a bare string name.
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for ColumnName {
+    /// Compares against a bare string name.
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl std::fmt::Display for ColumnName {
+    /// Renders as the bare name, honoring width/alignment format flags.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(&self.0)
+    }
+}
+
 /// A column: the table it belongs to, its name, and its static type.
 ///
 /// `table` is stamped by [`DbTable::new`] when the column joins a table —
@@ -80,7 +139,7 @@ impl std::fmt::Display for TableName {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DbColumn {
     pub table: TableName,
-    pub name: String,
+    pub name: ColumnName,
     pub r#type: ValueType,
 }
 
@@ -94,28 +153,8 @@ pub struct DbColumn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbTable {
     pub name: TableName,
-    pub pkey: Vec<String>,
-    pub columns: HashMap<String, DbColumn>,
-}
-
-/// A single full row of a table: primary-key values plus the remaining data.
-#[derive(Debug, Clone, PartialEq)]
-pub struct DbRecord {
-    pub table: TableName,
-    pub pkey_value: HashMap<String, Value>,
-    pub data: HashMap<String, Value>,
-}
-
-impl Eq for DbRecord {}
-
-impl Hash for DbRecord {
-    /// Hashes the table name plus order-independent hashes of the pkey and
-    /// data maps (via `unordered_map_hash`), consistent with `PartialEq`.
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.table.hash(state);
-        unordered_map_hash(&self.pkey_value).hash(state);
-        unordered_map_hash(&self.data).hash(state);
-    }
+    pub pkey: Vec<ColumnName>,
+    pub columns: HashMap<ColumnName, DbColumn>,
 }
 
 /// The authoritative set of table schemas, by name.
@@ -147,7 +186,7 @@ impl Catalog {
 
 impl DbColumn {
     /// An unqualified column definition; [`DbTable::new`] fills in `table`.
-    pub fn new(name: impl Into<String>, r#type: ValueType) -> Self {
+    pub fn new(name: impl Into<ColumnName>, r#type: ValueType) -> Self {
         DbColumn {
             table: TableName(String::new()),
             name: name.into(),
@@ -166,13 +205,13 @@ impl DbTable {
     /// programming error, not a runtime condition.
     pub fn new(
         name: impl Into<TableName>,
-        pkey: impl IntoIterator<Item = impl Into<String>>,
+        pkey: impl IntoIterator<Item = impl Into<ColumnName>>,
         columns: Vec<DbColumn>,
     ) -> Self {
         let name = name.into();
-        let pkey: Vec<String> = pkey.into_iter().map(Into::into).collect();
+        let pkey: Vec<ColumnName> = pkey.into_iter().map(Into::into).collect();
 
-        let mut by_name: HashMap<String, DbColumn> = HashMap::with_capacity(columns.len());
+        let mut by_name: HashMap<ColumnName, DbColumn> = HashMap::with_capacity(columns.len());
         for mut column in columns {
             column.table = name.clone();
             let column_name = column.name.clone();
@@ -211,7 +250,7 @@ impl DbTable {
 
     /// The primary-key columns' definitions, in declaration order.
     pub fn pkey_columns(&self) -> impl Iterator<Item = &DbColumn> {
-        self.pkey.iter().filter_map(|key| self.column(key))
+        self.pkey.iter().filter_map(|key| self.column(key.as_str()))
     }
 }
 

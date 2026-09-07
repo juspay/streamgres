@@ -6,30 +6,113 @@
 //! (to route writes), neither of which text allows. The SQL parser
 //! (`crate::parser`) produces these types from query text.
 
-use std::collections::HashMap;
-
-use super::schema::{DbColumn, DbRecord, TableName};
+use super::frame::{DataFrameKey, DataFrameRow};
+use super::schema::{ColumnName, TableName};
 use super::value::Value;
+
+/// The client-facing handle of one registered subscription.
+///
+/// A dedicated type rather than a bare `String`, so a subscription id can
+/// never be confused with the other strings the engine passes around
+/// (table names, column names). Constructed from any string-ish value;
+/// compares, orders, and hashes exactly like the underlying id, and maps
+/// keyed by `QueryId` accept a plain `&str` for lookups.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QueryId(String);
+
+impl QueryId {
+    /// The id as a borrowed string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for QueryId {
+    /// Wraps a borrowed id.
+    fn from(id: &str) -> Self {
+        QueryId(id.to_owned())
+    }
+}
+
+impl From<String> for QueryId {
+    /// Wraps an owned id.
+    fn from(id: String) -> Self {
+        QueryId(id)
+    }
+}
+
+impl std::borrow::Borrow<str> for QueryId {
+    /// Lets maps keyed by [`QueryId`] be queried with a plain `&str`.
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for QueryId {
+    /// Renders as the bare id, honoring width/alignment format flags.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad(&self.0)
+    }
+}
 
 /// A subscription query: `SELECT * FROM table WHERE … ORDER BY … LIMIT …`.
 ///
 /// `Eq` + `Hash` let structurally identical queries be compared and deduped
-/// (e.g. for a future shared-materialization step); the IVM forward index
-/// itself is keyed by subscription uuid.
+/// — registration uses this to serve an identical already-registered query
+/// straight from the shared frame instead of re-running it; the IVM
+/// forward index itself is keyed by subscription uuid.
 ///
 /// - `table`: table name, resolved against the [`super::schema::Catalog`].
 /// - `filter`: the `WHERE` predicate tree.
-/// - `order_by`: the `ORDER BY` clause.
-/// - `limit`: the `LIMIT` row cap.
+/// - `order_by`: the `ORDER BY` clause; the parser defaults it to the
+///   first declared pkey column, ascending.
+/// - `limit`: the `LIMIT` row cap; `u32::MAX` is the parser's spelling of
+///   "no limit".
+///
+/// `order_by` and `limit` take part in the structural equality that twin
+/// sharing matches on, so programmatic queries must reproduce the parser's
+/// conventions exactly to share materialization with parsed ones.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ReadQuery {
+pub struct SingleTableReadQuery {
     pub table: TableName,
     pub filter: Where,
     pub order_by: OrderBy,
     pub limit: u32,
 }
 
+/// A LEFT JOIN edge of a [`MultiTableReadQuery`]: rows of `sub_table`
+/// attach to main rows where
+/// `sub_table.<sub_table_column> = main.<main_table_column>`.
+///
+/// `sub_table` carries the sub side's own `WHERE`; its `order_by` /
+/// `limit` are unused — a `LIMIT` on a join's sub side has no SQL meaning
+/// (it would cap the whole side across every referenced value), so the
+/// engine normalizes it away at registration. A `NULL` (or missing) join
+/// value never matches, consistent with the engine's NULL semantics —
+/// such a main row simply shows an empty sub side.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeftJoin {
+    pub sub_table: SingleTableReadQuery,
+    pub main_table_column: ColumnName,
+    pub sub_table_column: ColumnName,
+}
+
+/// A multi-table subscription: a main query LEFT JOINed to sub queries.
+///
+/// Main rows are visible purely by the main `WHERE` — a join value with no
+/// matching sub rows renders as an empty sub side, never hides the main
+/// row. `order_by` / `limit` (not yet enforced) live on `main_table`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultiTableReadQuery {
+    pub main_table: SingleTableReadQuery,
+    pub left_joins: Vec<LeftJoin>,
+}
+
 /// A write against a table — exactly one of insert / update / delete.
+///
+/// Writes speak the same vocabulary as the operations the engine emits: the
+/// affected row is identified by a [`DataFrameKey`] and its new image
+/// carried as a [`DataFrameRow`] — there is no separate record type.
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum WriteQuery {
@@ -40,16 +123,17 @@ pub enum WriteQuery {
 
 /// Update the row identified by `pkey_value`.
 ///
-/// v1 constraint: `record.data` must carry the **complete new row image**,
-/// not just the changed columns. Predicates are evaluated against it, so a
-/// partial image would silently mis-evaluate conditions on omitted columns.
-/// Supporting partial updates needs a read-before-write against storage
-/// (see the roadmap in the README).
+/// v1 constraint: `record` must carry the **complete new row image** —
+/// every column, primary-key columns included, never just the changed
+/// ones. Predicates are evaluated against it, so a partial image would
+/// silently mis-evaluate conditions on omitted columns. Supporting partial
+/// updates needs a read-before-write against storage (see the roadmap in
+/// the README).
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateQuery {
     pub table: TableName,
-    pub pkey_value: HashMap<String, Value>,
-    pub record: DbRecord,
+    pub pkey_value: DataFrameKey,
+    pub record: DataFrameRow,
 }
 
 /// Delete the row identified by `pkey_value`. Carries no row data — only
@@ -57,16 +141,17 @@ pub struct UpdateQuery {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeleteQuery {
     pub table: TableName,
-    pub pkey_value: HashMap<String, Value>,
+    pub pkey_value: DataFrameKey,
 }
 
 /// Insert a new row (upsert semantics in v1: inserting an existing key
-/// replaces the row).
+/// replaces the row). `record` carries the complete row image — every
+/// column, primary-key columns included.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertQuery {
     pub table: TableName,
-    pub pkey_value: HashMap<String, Value>,
-    pub record: DbRecord,
+    pub pkey_value: DataFrameKey,
+    pub record: DataFrameRow,
 }
 
 /// A leaf predicate: `column <op> value`.
@@ -74,7 +159,7 @@ pub struct InsertQuery {
 /// This is the key of the IVM reverse index, hence `Eq` + `Hash`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Condition {
-    pub column: String,
+    pub column: ColumnName,
     pub comparison_operator: ComparisonOperator,
     pub value: Value,
 }
@@ -125,7 +210,7 @@ pub enum ComparisonOperator {
 /// `ORDER BY column ASC|DESC`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OrderBy {
-    pub column: DbColumn,
+    pub column: ColumnName,
     pub direction: Order,
 }
 
@@ -140,7 +225,7 @@ pub enum Order {
 impl Condition {
     /// Builds a `column <op> value` leaf condition.
     pub fn new(
-        column: impl Into<String>,
+        column: impl Into<ColumnName>,
         comparison_operator: ComparisonOperator,
         value: impl Into<Value>,
     ) -> Self {
@@ -155,7 +240,7 @@ impl Condition {
 impl Where {
     /// Convenience for a single-condition filter.
     pub fn condition(
-        column: impl Into<String>,
+        column: impl Into<ColumnName>,
         op: ComparisonOperator,
         value: impl Into<Value>,
     ) -> Self {
@@ -184,6 +269,24 @@ impl Where {
             Where::AND(children) | Where::OR(children) => {
                 for child in children {
                     child.collect_leaves(out);
+                }
+            }
+        }
+    }
+
+    /// Replace every leaf equal to `old` with `new`, in place — the seam
+    /// for editing one condition's value list (a join's `IN`) without
+    /// rebuilding the tree.
+    pub fn replace_condition(&mut self, old: &Condition, new: &Condition) {
+        match self {
+            Where::Condition(condition) => {
+                if condition == old {
+                    *condition = new.clone();
+                }
+            }
+            Where::AND(children) | Where::OR(children) => {
+                for child in children {
+                    child.replace_condition(old, new);
                 }
             }
         }
@@ -254,15 +357,18 @@ impl Where {
 
 impl OrderBy {
     /// Builds an `ORDER BY column direction` clause.
-    pub fn new(column: DbColumn, direction: Order) -> Self {
-        OrderBy { column, direction }
+    pub fn new(column: impl Into<ColumnName>, direction: Order) -> Self {
+        OrderBy {
+            column: column.into(),
+            direction,
+        }
     }
 }
 
-impl ReadQuery {
+impl SingleTableReadQuery {
     /// Builds a subscription query from its four clauses.
     pub fn new(table: impl Into<TableName>, filter: Where, order_by: OrderBy, limit: u32) -> Self {
-        ReadQuery {
+        SingleTableReadQuery {
             table: table.into(),
             filter,
             order_by,
@@ -281,8 +387,8 @@ impl WriteQuery {
         }
     }
 
-    /// The primary-key values identifying the affected row.
-    pub fn pkey_value(&self) -> &HashMap<String, Value> {
+    /// The identity of the affected row.
+    pub fn pkey_value(&self) -> &DataFrameKey {
         match self {
             WriteQuery::UPDATE(q) => &q.pkey_value,
             WriteQuery::DELETE(q) => &q.pkey_value,
@@ -290,22 +396,19 @@ impl WriteQuery {
         }
     }
 
-    /// The complete row image *after* this write: primary-key values merged
-    /// over the record payload. `None` for deletes, which carry no row data.
+    /// The complete row image *after* this write — the record exactly as
+    /// carried, which must hold every column, primary-key columns included
+    /// (see [`UpdateQuery`]); nothing is merged in here. `None` for
+    /// deletes, which carry no row data.
     ///
-    /// Predicates are evaluated against this image, so for updates it relies
-    /// on the full-row-image constraint documented on [`UpdateQuery`].
-    pub fn new_row_image(&self) -> Option<HashMap<String, Value>> {
-        let record = match self {
-            WriteQuery::UPDATE(q) => &q.record,
-            WriteQuery::INSERT(q) => &q.record,
-            WriteQuery::DELETE(_) => return None,
-        };
-        let mut row = record.data.clone();
-        for (col, val) in self.pkey_value() {
-            row.insert(col.clone(), val.clone());
+    /// Predicates are evaluated against this image, so a record missing a
+    /// column would silently mis-evaluate conditions on it.
+    pub fn new_row_image(&self) -> Option<&DataFrameRow> {
+        match self {
+            WriteQuery::UPDATE(q) => Some(&q.record),
+            WriteQuery::INSERT(q) => Some(&q.record),
+            WriteQuery::DELETE(_) => None,
         }
-        Some(row)
     }
 }
 

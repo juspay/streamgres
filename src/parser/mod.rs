@@ -58,8 +58,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::model::{
-    ComparisonOperator, Condition, DbRecord, DbTable, DeleteQuery, InsertQuery, Order,
-    OrderBy, ReadQuery, UpdateQuery, Value, ValueType, Where, WriteQuery,
+    ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameRow, DbTable, DeleteQuery,
+    InsertQuery, Order, OrderBy, SingleTableReadQuery, UpdateQuery, Value, ValueType, Where,
+    WriteQuery,
 };
 
 /// Hard cap on `(` / `[` nesting depth. The parser descends recursively, so
@@ -74,7 +75,7 @@ pub use crate::model::Catalog;
 /// A successfully parsed statement — either side of the read/write split.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedQuery {
-    Read(ReadQuery),
+    Read(SingleTableReadQuery),
     Write(WriteQuery),
 }
 
@@ -93,7 +94,7 @@ pub fn parse(sql: &str, catalog: &Catalog) -> Result<ParsedQuery, ParseError> {
 }
 
 /// Parse a statement that must be a `SELECT`.
-pub fn parse_read(sql: &str, catalog: &Catalog) -> Result<ReadQuery, ParseError> {
+pub fn parse_read(sql: &str, catalog: &Catalog) -> Result<SingleTableReadQuery, ParseError> {
     match parse(sql, catalog)? {
         ParsedQuery::Read(read) => Ok(read),
         ParsedQuery::Write(_) => Err(ParseError {
@@ -482,7 +483,7 @@ impl Parser {
     /// `AND(vec![])`). A missing ORDER BY defaults via [`default_order`],
     /// and a missing LIMIT becomes `u32::MAX` — the model makes `limit`
     /// mandatory, so absent means "no bound".
-    fn read(&mut self, catalog: &Catalog) -> Result<ReadQuery, ParseError> {
+    fn read(&mut self, catalog: &Catalog) -> Result<SingleTableReadQuery, ParseError> {
         self.expect_word("SELECT")?;
         self.expect_sym("*")?;
         self.expect_word("FROM")?;
@@ -501,11 +502,7 @@ impl Parser {
         let order_by = if self.eat_word("ORDER") {
             self.expect_word("BY")?;
             let at = self.at();
-            let name = self.column_name(table)?;
-            let column = table
-                .column(&name)
-                .expect("column_name validated existence")
-                .clone();
+            let column = self.column_name(table)?;
             let direction = if self.eat_word("DESC") {
                 Order::DESC
             } else {
@@ -539,7 +536,7 @@ impl Parser {
             u32::MAX
         };
 
-        Ok(ReadQuery::new(table.name.clone(), filter, order_by, limit))
+        Ok(SingleTableReadQuery::new(table.name.clone(), filter, order_by, limit))
     }
 
     /// `INSERT` / `UPDATE` / `DELETE`, enforcing the v1 write restrictions.
@@ -547,8 +544,8 @@ impl Parser {
     /// INSERT coerces each value while it still lines up with a named
     /// column; a value/column count mismatch is reported only after the
     /// whole row is read. UPDATE must SET every non-pkey column because
-    /// the engine evaluates predicates against `record.data` as the
-    /// complete new row — a partial SET would corrupt the views.
+    /// the engine evaluates predicates against `record` as the complete
+    /// new row image — a partial SET would corrupt the views.
     fn write(&mut self, catalog: &Catalog) -> Result<WriteQuery, ParseError> {
         if self.eat_word("INSERT") {
             self.expect_word("INTO")?;
@@ -593,19 +590,15 @@ impl Parser {
                 });
             }
 
-            let assignments: Vec<(String, Value)> = columns.into_iter().zip(values).collect();
-            let (pkey_value, data) = split_pkey(table, assignments);
+            let data: HashMap<String, Value> = columns.into_iter().zip(values).collect();
+            let pkey_value = pkey_of(table, &data);
             ensure_full_pkey(table, &pkey_value, "INSERT must provide", row_at)?;
             ensure_pkey_not_null(&pkey_value, row_at)?;
 
             Ok(WriteQuery::INSERT(InsertQuery {
                 table: table.name.clone(),
-                pkey_value: pkey_value.clone(),
-                record: DbRecord {
-                    table: table.name.clone(),
-                    pkey_value,
-                    data,
-                },
+                pkey_value: DataFrameKey::new(pkey_value),
+                record: DataFrameRow { data },
             }))
         } else if self.eat_word("UPDATE") {
             let table = self.table(catalog)?;
@@ -645,8 +638,8 @@ impl Parser {
             let missing: Vec<&str> = table
                 .columns
                 .values()
-                .filter(|column| !table.is_pkey(&column.name))
-                .filter(|column| !assignments.iter().any(|(name, _)| name == &column.name))
+                .filter(|column| !table.is_pkey(column.name.as_str()))
+                .filter(|column| !assignments.iter().any(|(name, _)| column.name == name.as_str()))
                 .map(|column| column.name.as_str())
                 .collect();
             if !missing.is_empty() {
@@ -663,14 +656,14 @@ impl Parser {
             }
 
             let pkey_value = self.write_pkey_filter(table)?;
+            let mut data: HashMap<String, Value> = assignments.into_iter().collect();
+            for (column, value) in &pkey_value {
+                data.insert(column.clone(), value.clone());
+            }
             Ok(WriteQuery::UPDATE(UpdateQuery {
                 table: table.name.clone(),
-                pkey_value: pkey_value.clone(),
-                record: DbRecord {
-                    table: table.name.clone(),
-                    pkey_value,
-                    data: assignments.into_iter().collect(),
-                },
+                pkey_value: DataFrameKey::new(pkey_value),
+                record: DataFrameRow { data },
             }))
         } else {
             self.expect_word("DELETE")?;
@@ -679,7 +672,7 @@ impl Parser {
             let pkey_value = self.write_pkey_filter(table)?;
             Ok(WriteQuery::DELETE(DeleteQuery {
                 table: table.name.clone(),
-                pkey_value,
+                pkey_value: DataFrameKey::new(pkey_value),
             }))
         }
     }
@@ -779,14 +772,14 @@ impl Parser {
             ComparisonOperator::LT
         } else if self.eat_word("IN") {
             return Ok(Where::Condition(Condition {
-                column,
+                column: column.into(),
                 comparison_operator: ComparisonOperator::IN,
                 value: self.value_list()?,
             }));
         } else if self.eat_word("NOT") {
             self.expect_word("IN")?;
             return Ok(Where::Condition(Condition {
-                column,
+                column: column.into(),
                 comparison_operator: ComparisonOperator::NOT_IN,
                 value: self.value_list()?,
             }));
@@ -797,7 +790,7 @@ impl Parser {
             ));
         };
         Ok(Where::Condition(Condition {
-            column,
+            column: column.into(),
             comparison_operator,
             value: self.value()?,
         }))
@@ -848,7 +841,7 @@ impl Parser {
                 let parsed = if text.contains('.') {
                     text.parse::<f64>().map(Value::Float).ok()
                 } else {
-                    text.parse::<i32>().map(Value::Int).ok()
+                    text.parse::<i64>().map(Value::Int).ok()
                 };
                 parsed.ok_or(ParseError {
                     message: format!("`{text}` is out of range"),
@@ -904,24 +897,15 @@ fn default_order(table: &DbTable, at: usize) -> Result<OrderBy, ParseError> {
             ),
             position: at,
         })?;
-    Ok(OrderBy::new(column.clone(), Order::ASC))
+    Ok(OrderBy::new(column.name.clone(), Order::ASC))
 }
 
-/// Split `(column, value)` assignments into pkey values and row data.
-fn split_pkey(
-    table: &DbTable,
-    assignments: Vec<(String, Value)>,
-) -> (HashMap<String, Value>, HashMap<String, Value>) {
-    let mut pkey_value = HashMap::new();
-    let mut data = HashMap::new();
-    for (column, value) in assignments {
-        if table.is_pkey(&column) {
-            pkey_value.insert(column, value);
-        } else {
-            data.insert(column, value);
-        }
-    }
-    (pkey_value, data)
+/// The primary-key values of one full row image, by pkey column name.
+fn pkey_of(table: &DbTable, data: &HashMap<String, Value>) -> HashMap<String, Value> {
+    data.iter()
+        .filter(|(column, _)| table.is_pkey(column))
+        .map(|(column, value)| (column.clone(), value.clone()))
+        .collect()
 }
 
 /// Error unless `pkey_value` covers every primary-key column of `table`;
@@ -935,8 +919,8 @@ fn ensure_full_pkey(
     let mut missing: Vec<&str> = table
         .pkey
         .iter()
-        .filter(|pk| !pkey_value.contains_key(*pk))
-        .map(String::as_str)
+        .filter(|pk| !pkey_value.contains_key(pk.as_str()))
+        .map(ColumnName::as_str)
         .collect();
     if missing.is_empty() {
         Ok(())
@@ -1013,12 +997,12 @@ fn coerce_to_type(
         (value @ Value::Float(_), ValueType::Float) => value,
         (value @ Value::String(_), ValueType::String) => value,
         (value @ Value::Bool(_), ValueType::Bool) => value,
-        (Value::Int(int), ValueType::Float) => Value::Float(f64::from(int)),
+        (Value::Int(int), ValueType::Float) => Value::Float(int as f64),
         (Value::Float(float), ValueType::Int)
             if float.fract() == 0.0
-                && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&float) =>
+                && ((i64::MIN as f64)..(i64::MAX as f64)).contains(&float) =>
         {
-            Value::Int(float as i32)
+            Value::Int(float as i64)
         }
         (Value::List(items), ValueType::List(inner)) => Value::List(
             items
@@ -1066,7 +1050,7 @@ fn collect_pkey_equalities(filter: &Where, out: &mut Vec<(String, Value)>) -> Re
     match filter {
         Where::Condition(condition) => {
             if condition.comparison_operator == ComparisonOperator::EQ {
-                out.push((condition.column.clone(), condition.value.clone()));
+                out.push((condition.column.to_string(), condition.value.clone()));
                 Ok(())
             } else {
                 Err(())
@@ -1102,7 +1086,7 @@ mod tests {
     }
 
     /// Parse `sql` as a read against the shared catalog, panicking on error.
-    fn read(sql: &str) -> ReadQuery {
+    fn read(sql: &str) -> SingleTableReadQuery {
         parse_read(sql, &catalog()).expect("should parse")
     }
 
@@ -1121,7 +1105,7 @@ mod tests {
         parse_write(sql, &catalog()).expect_err("should fail")
     }
 
-    /// A SELECT with WHERE, ORDER BY and LIMIT fills every [`ReadQuery`] field.
+    /// A SELECT with WHERE, ORDER BY and LIMIT fills every [`SingleTableReadQuery`] field.
     #[test]
     fn select_with_all_clauses() {
         let q = read(
@@ -1136,7 +1120,7 @@ mod tests {
                 Where::condition("points", ComparisonOperator::GTE, 8),
             ])
         );
-        assert_eq!(q.order_by.column.name, "points");
+        assert_eq!(q.order_by.column, "points");
         assert_eq!(q.order_by.direction, Order::DESC);
         assert_eq!(q.limit, 10);
     }
@@ -1147,7 +1131,7 @@ mod tests {
     fn select_defaults_no_filter_pkey_order_unbounded_limit() {
         let q = read("SELECT * FROM tickets");
         assert_eq!(q.filter, Where::AND(vec![]));
-        assert_eq!(q.order_by.column.name, "id");
+        assert_eq!(q.order_by.column, "id");
         assert_eq!(q.order_by.direction, Order::ASC);
         assert_eq!(q.limit, u32::MAX);
     }
@@ -1165,7 +1149,7 @@ mod tests {
             ],
         )]);
         let q = parse_read("SELECT * FROM events", &catalog).expect("should parse");
-        assert_eq!(q.order_by.column.name, "ts");
+        assert_eq!(q.order_by.column, "ts");
     }
 
     /// `AND` groups before `OR`, and parentheses override that precedence.
@@ -1233,22 +1217,23 @@ mod tests {
         assert!(matches!(&q.filter, Where::Condition(c) if c.value == Value::String("it's".into())));
     }
 
-    /// INSERT routes pkey columns into `pkey_value` and the rest into
-    /// `record.data`.
+    /// INSERT extracts the pkey identity into `pkey_value` and carries the
+    /// complete row image — pkey columns included — in `record`.
     #[test]
-    fn insert_splits_pkey_from_data() {
+    fn insert_extracts_pkey_and_keeps_the_full_image() {
         let WriteQuery::INSERT(insert) =
             write("INSERT INTO tickets (id, status, points) VALUES (7, 'OPEN', 3)")
         else {
             panic!("expected an INSERT");
         };
-        assert_eq!(insert.pkey_value["id"], Value::Int(7));
-        assert!(!insert.record.data.contains_key("id"));
+        assert_eq!(insert.pkey_value.pkey_value["id"], Value::Int(7));
+        assert_eq!(insert.record.data["id"], Value::Int(7));
         assert_eq!(insert.record.data["status"], Value::String("OPEN".into()));
         assert_eq!(insert.record.data["points"], Value::Int(3));
     }
 
-    /// UPDATE carries the full non-pkey row image, addressed by the pkey.
+    /// UPDATE carries the complete new row image (WHERE's pkey overlaid
+    /// onto the SET columns), addressed by the pkey.
     #[test]
     fn update_builds_full_row_image_addressed_by_pkey() {
         let WriteQuery::UPDATE(update) = write(
@@ -1256,8 +1241,9 @@ mod tests {
         ) else {
             panic!("expected an UPDATE");
         };
-        assert_eq!(update.pkey_value["id"], Value::Int(7));
-        assert_eq!(update.record.data.len(), 3);
+        assert_eq!(update.pkey_value.pkey_value["id"], Value::Int(7));
+        assert_eq!(update.record.data.len(), 4);
+        assert_eq!(update.record.data["id"], Value::Int(7));
     }
 
     /// DELETE resolves its WHERE to the primary-key value.
@@ -1266,7 +1252,7 @@ mod tests {
         let WriteQuery::DELETE(delete) = write("DELETE FROM tickets WHERE id = 7") else {
             panic!("expected a DELETE");
         };
-        assert_eq!(delete.pkey_value["id"], Value::Int(7));
+        assert_eq!(delete.pkey_value.pkey_value["id"], Value::Int(7));
     }
 
     /// Each v1 restriction is refused with its documented error message.
@@ -1327,14 +1313,14 @@ mod tests {
         else {
             panic!("expected an INSERT");
         };
-        assert_eq!(insert.pkey_value["id"], Value::Int(1));
+        assert_eq!(insert.pkey_value.pkey_value["id"], Value::Int(1));
 
         let WriteQuery::UPDATE(update) = write(
             "UPDATE tickets SET status = 'DONE', priority = 'LOW', points = 3.0 WHERE id = 7.0",
         ) else {
             panic!("expected an UPDATE");
         };
-        assert_eq!(update.pkey_value["id"], Value::Int(7));
+        assert_eq!(update.pkey_value.pkey_value["id"], Value::Int(7));
         assert_eq!(update.record.data["points"], Value::Int(3));
 
         let float_catalog = Catalog::new(vec![DbTable::new(
@@ -1354,12 +1340,41 @@ mod tests {
         assert_eq!(insert.record.data["score"], Value::Float(2.0));
     }
 
+    /// 64-bit integers parse and coerce: Postgres bigint-scale ids fit,
+    /// both as bare literals and float-spelled ones that round-trip
+    /// exactly.
+    #[test]
+    fn bigint_ids_parse_and_coerce() {
+        let WriteQuery::INSERT(insert) =
+            write("INSERT INTO tickets (id, status) VALUES (3000000000, 'x')")
+        else {
+            panic!("expected an INSERT");
+        };
+        assert_eq!(
+            insert.pkey_value.pkey_value["id"],
+            Value::Int(3_000_000_000)
+        );
+
+        let WriteQuery::DELETE(delete) = write("DELETE FROM tickets WHERE id = 3000000000.0")
+        else {
+            panic!("expected a DELETE");
+        };
+        assert_eq!(
+            delete.pkey_value.pkey_value["id"],
+            Value::Int(3_000_000_000)
+        );
+    }
+
     /// Type mismatches and NULL pkeys are rejected — a string-spelled pkey
     /// would silently miss the Int-keyed row.
     #[test]
     fn mistyped_or_null_write_values_are_rejected() {
         let cases = [
             ("DELETE FROM tickets WHERE id = '7'", "declared Int"),
+            (
+                "DELETE FROM tickets WHERE id = 9223372036854775808.0",
+                "declared Int",
+            ),
             ("INSERT INTO tickets (id, points) VALUES (1, 'many')", "declared Int"),
             ("INSERT INTO tickets (id, status) VALUES (1.5, 'x')", "declared Int"),
             ("INSERT INTO tickets (id, status) VALUES (NULL, 'x')", "cannot be NULL"),

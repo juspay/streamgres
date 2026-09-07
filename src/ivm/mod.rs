@@ -1,10 +1,29 @@
 //! Incremental View Maintenance (IVM) — the core of the engine.
 //!
-//! Clients subscribe with [`ReadQuery`]s; every incoming [`WriteQuery`] is
-//! routed to the subscriptions it affects, and each affected subscription
-//! receives the minimal [`DataFrameOperation`]s that bring its result set up
-//! to date. The engine applies the same operations to its own materialized
-//! [`DataFrame`]s, so engine and client views stay in lockstep.
+//! Clients subscribe with [`SingleTableReadQuery`]s; every incoming
+//! [`WriteQuery`] is routed to the subscriptions it affects, and each
+//! affected subscription receives the minimal [`DataFrameOperation`]s that
+//! bring its result set up to date.
+//!
+//! # Shared frames
+//!
+//! The engine keeps **one materialized frame per table**, not per
+//! subscription: each row carries the set of subscriptions currently
+//! holding it. A row wanted by many queries is stored once; a new
+//! subscriber to data already present just tags itself onto the rows. A
+//! subscription's own view (what its client holds) is exactly the rows
+//! tagged with its id — mirrored in a per-subscription **held-key index**
+//! (subscription → row keys), so a view is enumerated in time proportional
+//! to its own size, never by scanning the table. Every tag change reaches
+//! that client as an `Add` or `Delete` — engine tags and client frames
+//! stay in lockstep.
+//!
+//! Registration exploits the sharing: a query **structurally identical**
+//! to one already registered is served straight from the shared frame —
+//! the twin's current rows are tagged for the new subscription and
+//! returned as its snapshot, with no storage query. A subscription midway
+//! through a [`SingleTableIVM::replace_query`] maintenance window (filter
+//! swapped, rows not yet reconciled) is skipped as a donor.
 //!
 //! # How a write is routed
 //!
@@ -26,30 +45,58 @@
 //!    A disjunct with no conditions (no `WHERE` at all, or shapes like
 //!    `x OR TRUE`) is invisible to the condition index and fires on every
 //!    same-table row write. The machinery lives in one `TableIndex` per
-//!    table (see the `index` module).
+//!    table (see the `index` module). A single condition whose value list
+//!    changes — the join layer's `IN` gaining or losing a value — is
+//!    edited **in place**, in the stored filter and inside this
+//!    subscription's indexed disjuncts alone
+//!    ([`SingleTableIVM::replace_condition`]; shared counters split
+//!    correctly), with no DNF re-normalization. Windowed candidates not
+//!    already holding the row are additionally checked against the
+//!    window's admission boundary (see the `window` module) — admission
+//!    only, never residence: a held row worsening in place keeps its slot
+//!    until a better arrival evicts it.
 //! 2. **The query currently holds the row** (delete, or update moving a row
-//!    out) — found by checking each same-table query's materialized frame
-//!    for the row's key. A delete carries no column values, so predicate
+//!    out) — found by checking whether the shared row is tagged with the
+//!    subscription. A delete carries no column values, so predicate
 //!    matching cannot find these.
 //!
 //! From `matches_after` (1) and `present_before` (2) the operation follows:
 //!
-//! | `matches_after` | `present_before` | emitted operation      |
-//! |-----------------|------------------|------------------------|
-//! | yes             | no               | `Add` (row enters)     |
-//! | yes             | yes              | `Add` (row refreshed)  |
-//! | no              | yes              | `Delete` (row leaves)  |
-//! | no              | no               | not impacted           |
+//! | `matches_after` | `present_before` | emitted operation(s)                           |
+//! |-----------------|------------------|------------------------------------------------|
+//! | yes             | no               | `Add` (row enters)                             |
+//! | yes             | yes              | `Delete(old)` + `Add(new)` (replaced in place) |
+//! | no              | yes              | `Delete(old)` (row leaves)                     |
+//! | no              | no               | not impacted                                   |
+//!
+//! Every emitted operation is self-contained: a `Delete` carries the row
+//! image it removed, and an in-place replacement is the adjacent
+//! `Delete(old)` + `Add(new)` pair — there is no pre-image side channel.
 //!
 //! # Scope notes
 //!
-//! - `order_by` and `limit` are **not yet enforced** — every matching row is
-//!   kept. Maintaining a `LIMIT` window incrementally needs an ordered
-//!   per-subscription structure plus storage access for refills; this lands
-//!   with the Diesel/Postgres connector on the roadmap.
-//! - Frames fill only from writes seen after registration; `register_query`
-//!   returns the subscription's starting frame (empty until the storage
-//!   connector can serve real initial result sets).
+//! - A finite `limit` is enforced through a per-subscription **window**
+//!   (see the `window` module): the engine buffers twice the requested
+//!   limit (storage queries are issued with the doubled limit), admits new
+//!   rows past a full buffer only when they beat the worst held value,
+//!   evicts past capacity, and refills from storage when a removal drains
+//!   the buffer to the requested limit. `order_by` decides *which* rows
+//!   the window keeps — it does not order the operation stream (clients
+//!   sort their own frames; the replace pair is the stream's only ordering
+//!   contract). A query without a finite limit keeps every matching row;
+//!   a `LIMIT 0` subscription is permanently empty (its registration
+//!   snapshot is empty and later writes never admit).
+//! - Frames fill three ways: the initial [`Storage`] query run at
+//!   registration (or rows the caller pre-fetched and passed in), writes
+//!   seen afterwards, and explicit [`SingleTableIVM::fetch`]es (how the
+//!   join layer pulls the other side of a join in). [`PgStorage`] is still
+//!   a stub, so against Postgres the initial load is empty until the
+//!   Diesel connector lands.
+//! - A fetch can refresh a shared row's data for every holder while only
+//!   the fetching subscription receives an op — harmless while frames are
+//!   maintained from the write stream (all holders are refreshed by
+//!   writes), noted here because it is where storage/frame drift would
+//!   surface.
 //! - DNF can blow up exponentially for adversarial filters; a size cap with
 //!   a tree-evaluation fallback is deliberately deferred (see
 //!   [`crate::model::Where::to_dnf`]).
@@ -58,81 +105,83 @@
 //!   Multithreading is a later, deliberate step — see the `index` module
 //!   header.
 
+mod frames;
 mod index;
+mod multi;
 mod predicate;
+mod registry;
 mod stats;
+mod storage;
+mod window;
 
+pub use crate::model::QueryId;
+pub use multi::{MultiTableIVM, MultiTableUpdate, QueryPart};
 pub use predicate::{eval_condition, evaluate};
 pub use stats::IvmStats;
+pub use storage::{MemoryStorage, PgStorage, Storage};
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
+use crate::model::frame::{SharedRow, TableFrame};
 use crate::model::{
-    DataFrame, DataFrameKey, DataFrameOperation, DataFrameRow, ReadQuery, TableName, WriteQuery,
+    DataFrameKey, DataFrameOperation, DataFrameRow, SingleTableReadQuery, TableName, WriteQuery,
 };
 use index::TableIndex;
+use window::Window;
 
-/// The client-facing handle of one registered subscription.
+/// One operation for one single-table subscription — what
+/// [`SingleTableIVM::incremental_update`] emits and the transport pushes
+/// to the subscribed client.
 ///
-/// A dedicated type rather than a bare `String`, so a subscription id can
-/// never be confused with the other strings routing code passes around
-/// (table names, column names). Constructed from any string-ish value;
-/// compares, orders, and hashes exactly like the underlying id, and maps
-/// keyed by `QueryId` accept a plain `&str` for lookups.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct QueryId(String);
-
-impl QueryId {
-    /// The id as a borrowed string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for QueryId {
-    /// Wraps a borrowed id.
-    fn from(id: &str) -> Self {
-        QueryId(id.to_owned())
-    }
-}
-
-impl From<String> for QueryId {
-    /// Wraps an owned id.
-    fn from(id: String) -> Self {
-        QueryId(id)
-    }
-}
-
-impl std::borrow::Borrow<str> for QueryId {
-    /// Lets maps keyed by [`QueryId`] be queried with a plain `&str`.
-    fn borrow(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for QueryId {
-    /// Renders as the bare id, honoring width/alignment format flags.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(&self.0)
-    }
+/// - `query`: which subscription (the id the client registered).
+/// - `table`: the table the operation lands on — the written table, which
+///   is also the subscription's table.
+/// - `op`: the delta itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SingleTableUpdate {
+    pub query: QueryId,
+    pub table: TableName,
+    pub op: DataFrameOperation,
 }
 
 /// The engine. One instance maintains all subscriptions over one logical
-/// database (single-table queries only for now; joins are future work).
+/// database, one subscription per single-table query; multi-table joins
+/// are layered on top by [`MultiTableIVM`].
 ///
 /// - `select_queries`: subscription handle → its query; the [`QueryId`] is
 ///   what the WebSocket layer will use to address a client's subscription.
-/// - `forward_index`: materialized result set per subscription.
+/// - `frames`: ONE shared frame per table, rows tagged with their
+///   subscribers (see the module header).
+/// - `held`: subscription → the keys of the shared rows it currently
+///   holds — the forward mirror of the rows' subscriber tags, kept in
+///   lockstep with them, so a subscription's view is enumerable without
+///   scanning its table's frame.
+/// - `windows`: subscription → its ORDER BY / LIMIT window (finite-limit
+///   queries only): the order-value → row-key map whose worst entry is
+///   the admission boundary, published into the table's routing index
+///   whenever it moves (see the `window` module).
+/// - `stale_views`: subscriptions midway through a `replace_query` /
+///   `replace_condition` maintenance window — filter already swapped,
+///   held rows not yet reconciled — excluded as twin donors until the
+///   caller declares the reconciliation complete
+///   ([`SingleTableIVM::mark_reconciled`]).
 /// - `tables`: one routing index per table — the condition →
 ///   shared-disjunct-counter machinery (see the `index` module).
+/// - `storage`: where registration loads initial result sets and
+///   [`SingleTableIVM::fetch`] reads rows the frames do not yet hold.
 /// - `write_epoch`: monotonic write number; disjunct counters are lazily
 ///   invalidated by comparing against it, so no per-write reset sweep is
 ///   needed.
 /// - `stats`: operation counters; not part of the sync state.
-pub struct IVM {
-    select_queries: HashMap<QueryId, ReadQuery>,
-    forward_index: HashMap<QueryId, DataFrame>,
+pub struct SingleTableIVM {
+    select_queries: HashMap<QueryId, SingleTableReadQuery>,
+    frames: HashMap<TableName, TableFrame>,
+    held: HashMap<QueryId, HashSet<DataFrameKey>>,
+    windows: HashMap<QueryId, Window>,
+    stale_views: HashSet<QueryId>,
     tables: HashMap<TableName, TableIndex>,
+    storage: Rc<dyn Storage>,
     write_epoch: u64,
     stats: IvmStats,
 }
@@ -142,92 +191,34 @@ pub struct IVM {
 ///
 /// - `matches_after`: does the post-write row image satisfy the query's
 ///   `Where`? Always `false` for deletes.
-/// - `present_before`: did the query's materialized frame hold the row
-///   before this write?
+/// - `present_before`: was the shared row tagged with this subscription
+///   before the write?
 struct Impact {
     uuid: QueryId,
     matches_after: bool,
     present_before: bool,
 }
 
-impl IVM {
-    /// Create an empty engine with no subscriptions and zeroed stats.
-    pub fn new() -> Self {
-        IVM {
+impl SingleTableIVM {
+    /// An empty engine reading initial data and fetches from `storage`.
+    pub fn new(storage: Rc<dyn Storage>) -> Self {
+        SingleTableIVM {
             select_queries: HashMap::new(),
-            forward_index: HashMap::new(),
+            frames: HashMap::new(),
+            held: HashMap::new(),
+            windows: HashMap::new(),
+            stale_views: HashSet::new(),
             tables: HashMap::new(),
+            storage,
             write_epoch: 0,
             stats: IvmStats::default(),
         }
     }
 
-    /// Register a client subscription under `query_uuid`, returning the
-    /// subscription's starting result set.
-    ///
-    /// Normalizes the query's `Where` to DNF and indexes it in the table's
-    /// routing index (a `WHERE FALSE` query has no disjuncts and touches no
-    /// index at all). The returned frame is the snapshot to hand the client
-    /// before streaming operations — empty until initial result sets arrive
-    /// with the storage connector.
-    ///
-    /// Re-registering a uuid with the identical query is a no-op — the index
-    /// already routes to it, and re-adding it would double-count its
-    /// conditions. Re-registering with a changed query replaces the
-    /// subscription (old index entries removed, frame reset). Stale entries
-    /// are never left behind: counting fires on exact counts, so a leftover
-    /// link would corrupt the replacement's counters.
-    pub fn register_query(
-        &mut self,
-        query_uuid: impl Into<QueryId>,
-        select_query: ReadQuery,
-    ) -> &DataFrame {
-        let query_uuid = query_uuid.into();
-        self.stats.queries_registered += 1;
-
-        if self.select_queries.get(&query_uuid) == Some(&select_query) {
-            return self.forward_index.entry(query_uuid).or_default();
-        }
-        if self.select_queries.contains_key(&query_uuid) {
-            self.unregister_query(query_uuid.as_str());
-        }
-
-        let dnf = select_query.filter.to_dnf();
-        if !dnf.is_empty() {
-            self.tables
-                .entry(select_query.table.clone())
-                .or_default()
-                .register(&query_uuid, dnf, &mut self.stats);
-        }
-        self.select_queries
-            .insert(query_uuid.clone(), select_query);
-        self.forward_index.entry(query_uuid).or_default()
-    }
-
-    /// Remove a subscription: its routing-index entries and its materialized
-    /// frame. A table index that routes nothing afterwards is dropped.
-    /// Unknown uuids are a no-op.
-    pub fn unregister_query(&mut self, query_uuid: &str) {
-        let Some(query) = self.select_queries.remove(query_uuid) else {
-            return;
-        };
-        if let Some(table_index) = self.tables.get_mut(&query.table) {
-            table_index.unregister(query_uuid);
-        }
-        if self
-            .tables
-            .get(&query.table)
-            .is_some_and(TableIndex::is_empty)
-        {
-            self.tables.remove(&query.table);
-        }
-        self.forward_index.remove(query_uuid);
-    }
-
     /// Which registered subscriptions does this write affect?
     ///
     /// Returns subscription ids in deterministic (sorted) order. Records
-    /// routing counters in [`IVM::stats`].
+    /// routing counters in [`SingleTableIVM::stats`].
     pub fn search_impacted_queries(&mut self, write_query: &WriteQuery) -> Vec<QueryId> {
         self.analyze(write_query)
             .into_iter()
@@ -236,52 +227,99 @@ impl IVM {
     }
 
     /// Route a write: find the impacted subscriptions, emit one
-    /// [`DataFrameOperation`] per impacted subscription, and apply those
-    /// operations to the engine's own materialized frames.
+    /// [`SingleTableUpdate`] per self-contained operation, and bring the
+    /// shared frame's data and tags in line.
     ///
-    /// The returned `(subscription id, operation)` pairs are exactly what
-    /// the WebSocket layer will push to clients. `analyze` only reports
-    /// impacts where `matches_after` or `present_before` holds, so every
-    /// impact maps to exactly one operation.
-    pub fn incremental_update(
-        &mut self,
-        write_query: &WriteQuery,
-    ) -> Vec<(QueryId, DataFrameOperation)> {
+    /// Per impacted subscription: a holder of the row's pre-image gets
+    /// `Delete(key, old)`, a subscription the new image fires gets
+    /// `Add(key, new)`, and one in both camps gets the adjacent pair — the
+    /// in-place replacement row of the module header's table. The shared
+    /// row's data is written once; each firing subscription tags itself,
+    /// each no-longer-matching holder untags itself, and the row is
+    /// dropped when its last tag goes.
+    pub fn incremental_update(&mut self, write_query: &WriteQuery) -> Vec<SingleTableUpdate> {
         self.stats.writes_processed += 1;
 
         let impacts = self.analyze(write_query);
-        let key = DataFrameKey::new(write_query.pkey_value().clone());
+        let table = write_query.table().clone();
+        let key = write_query.pkey_value().clone();
         let row_image = write_query.new_row_image();
+        let old_data = self
+            .frames
+            .get(&table)
+            .and_then(|frame| frame.rows.get(&key))
+            .map(|row| row.data.clone());
 
-        let mut ops: Vec<(QueryId, DataFrameOperation)> = Vec::new();
-        for impact in impacts {
-            let op = if impact.matches_after {
-                let data = row_image
+        let mut ops: Vec<SingleTableUpdate> = Vec::new();
+        for impact in &impacts {
+            if impact.present_before {
+                let data = old_data
                     .clone()
-                    .expect("matches_after is only true when the write has a row image");
-                self.stats.ops_add += 1;
-                DataFrameOperation::Add(key.clone(), DataFrameRow { data })
-            } else if impact.present_before {
+                    .expect("present_before is only true when the shared row is materialized");
                 self.stats.ops_delete += 1;
-                DataFrameOperation::Delete(key.clone())
-            } else {
-                continue;
-            };
-            ops.push((impact.uuid, op));
-        }
-
-        for (uuid, op) in &ops {
-            if let Some(frame) = self.forward_index.get_mut(uuid) {
-                frame.apply(op);
+                ops.push(SingleTableUpdate {
+                    query: impact.uuid.clone(),
+                    table: table.clone(),
+                    op: DataFrameOperation::Delete(key.clone(), DataFrameRow { data }),
+                });
+            }
+            if impact.matches_after {
+                let row = row_image
+                    .expect("matches_after is only true when the write has a row image")
+                    .clone();
+                self.stats.ops_add += 1;
+                ops.push(SingleTableUpdate {
+                    query: impact.uuid.clone(),
+                    table: table.clone(),
+                    op: DataFrameOperation::Add(key.clone(), row),
+                });
             }
         }
 
-        ops
-    }
+        if !impacts.is_empty() {
+            let frame = self.frames.entry(table).or_default();
+            for impact in &impacts {
+                if impact.matches_after {
+                    let data = row_image.expect("checked above").data.clone();
+                    let row = frame.rows.entry(key.clone()).or_insert_with(|| SharedRow {
+                        data: data.clone(),
+                        subscribers: BTreeSet::new(),
+                    });
+                    row.data = data;
+                    row.subscribers.insert(impact.uuid.clone());
+                    self.held
+                        .entry(impact.uuid.clone())
+                        .or_default()
+                        .insert(key.clone());
+                } else if let Some(row) = frame.rows.get_mut(&key) {
+                    row.subscribers.remove(impact.uuid.as_str());
+                    if let Some(keys) = self.held.get_mut(impact.uuid.as_str()) {
+                        keys.remove(&key);
+                    }
+                }
+            }
+            if frame
+                .rows
+                .get(&key)
+                .is_some_and(|row| row.subscribers.is_empty())
+            {
+                frame.rows.remove(&key);
+            }
+        }
 
-    /// The materialized result set currently held for a subscription.
-    pub fn dataframe_for(&self, query_uuid: &str) -> Option<&DataFrame> {
-        self.forward_index.get(query_uuid)
+        let mut window_ops = Vec::new();
+        for impact in &impacts {
+            window_ops.extend(self.maintain_window(
+                &impact.uuid,
+                &key,
+                row_image,
+                impact.matches_after,
+                impact.present_before,
+            ));
+        }
+        ops.append(&mut window_ops);
+
+        ops
     }
 
     /// Number of registered subscriptions.
@@ -290,7 +328,7 @@ impl IVM {
     }
 
     /// The engine's operation counters, accumulated since creation or the
-    /// last [`IVM::reset_stats`].
+    /// last [`SingleTableIVM::reset_stats`].
     pub fn stats(&self) -> &IvmStats {
         &self.stats
     }
@@ -304,37 +342,45 @@ impl IVM {
     /// how" — both public routing entry points build on it.
     ///
     /// Way 1 (row matches after the write) delegates to the table's routing
-    /// index under a freshly bumped write epoch; deletes carry no row image
-    /// and skip it entirely. Way 2 (row held before the write) scans each
-    /// same-table subscription's frame for the row's key — catches updates
-    /// moving a row out, and deletes. Every returned [`Impact`] has at
-    /// least one of the two facts set.
+    /// index under a freshly bumped write epoch — the index itself also
+    /// applies each candidate's admission boundary, exempting holders;
+    /// deletes carry no row image and skip it entirely. Way 2 (row held
+    /// before the write) checks the shared row's subscriber tags per
+    /// same-table subscription — catches updates moving a row out, and
+    /// deletes. Every returned [`Impact`] has at least one of the two
+    /// facts set.
     fn analyze(&mut self, write_query: &WriteQuery) -> Vec<Impact> {
         let table_name = write_query.table().clone();
-        let key = DataFrameKey::new(write_query.pkey_value().clone());
+        let key = write_query.pkey_value().clone();
         let row_image = write_query.new_row_image();
 
-        let mut matched: BTreeSet<QueryId> = BTreeSet::new();
-        if let Some(row) = &row_image {
-            self.write_epoch += 1;
-            if let Some(table_index) = self.tables.get(&table_name) {
-                matched = table_index.matched(row, self.write_epoch, &mut self.stats);
+        let mut holding: BTreeSet<QueryId> = BTreeSet::new();
+        let holders = self
+            .frames
+            .get(&table_name)
+            .and_then(|frame| frame.rows.get(&key))
+            .map(|row| row.subscribers.clone())
+            .unwrap_or_default();
+        for uuid in holders {
+            if self.select_queries.contains_key(&uuid) {
+                self.stats.membership_probes += 1;
+                self.stats.membership_hits += 1;
+                holding.insert(uuid);
             }
         }
 
-        let mut holding: BTreeSet<QueryId> = BTreeSet::new();
-        for (uuid, query) in &self.select_queries {
-            if query.table != table_name {
-                continue;
-            }
-            self.stats.membership_probes += 1;
-            if self
-                .forward_index
-                .get(uuid)
-                .is_some_and(|frame| frame.contains(&key))
-            {
-                self.stats.membership_hits += 1;
-                holding.insert(uuid.clone());
+        let mut matched: BTreeSet<QueryId> = BTreeSet::new();
+        if let Some(row) = row_image {
+            debug_assert!(
+                key.pkey_value
+                    .iter()
+                    .all(|(column, value)| row.data.get(column) == Some(value)),
+                "a write's record must carry its own primary-key values"
+            );
+            self.write_epoch += 1;
+            if let Some(table_index) = self.tables.get(&table_name) {
+                matched =
+                    table_index.matched(&row.data, self.write_epoch, &holding, &mut self.stats);
             }
         }
 
@@ -348,12 +394,5 @@ impl IVM {
             });
         }
         impacts
-    }
-}
-
-impl Default for IVM {
-    /// Same as [`IVM::new`].
-    fn default() -> Self {
-        Self::new()
     }
 }

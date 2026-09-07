@@ -3,8 +3,9 @@
 
 use std::collections::HashMap;
 
-use jus_sync::ivm::{QueryId, IVM};
+use jus_sync::ivm::{MemoryStorage, PgStorage, QueryId, SingleTableIVM, SingleTableUpdate, Storage};
 use jus_sync::model::*;
+use std::rc::Rc;
 
 /// Builds the standard five-column test table (`id` pkey, plus `status`,
 /// `priority`, `assigned_to`, `points`) under the given name.
@@ -22,74 +23,70 @@ fn table(name: &str) -> DbTable {
     )
 }
 
-/// Wraps a filter into a [`ReadQuery`] on `table`, ordered by `id` ASC with
+/// Wraps a filter into a [`SingleTableReadQuery`] on `table`, ordered by `id` ASC with
 /// a limit of 100.
-fn query(table: &DbTable, filter: Where) -> ReadQuery {
-    ReadQuery::new(
+fn query(table: &DbTable, filter: Where) -> SingleTableReadQuery {
+    SingleTableReadQuery::new(
         table.name.clone(),
         filter,
-        OrderBy::new(DbColumn::new("id", ValueType::Int), Order::ASC),
+        OrderBy::new("id", Order::ASC),
         100,
     )
 }
 
 /// Builds the single-column primary-key map `{"id": id}`.
-fn pkey(id: i32) -> HashMap<String, Value> {
+fn pkey(id: i64) -> HashMap<String, Value> {
     HashMap::from([("id".to_owned(), Value::Int(id))])
 }
 
-/// Collects `(column, value)` pairs into a row map.
-fn row(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
-    pairs
+/// Collects `(column, value)` pairs plus the `id` primary key into a full
+/// row image — records must carry every column, pkey included.
+fn full_row(id: i64, pairs: &[(&str, Value)]) -> DataFrameRow {
+    let mut data: HashMap<String, Value> = pairs
         .iter()
         .map(|(col, val)| ((*col).to_owned(), val.clone()))
-        .collect()
+        .collect();
+    data.insert("id".to_owned(), Value::Int(id));
+    DataFrameRow { data }
 }
 
 /// Builds an INSERT [`WriteQuery`] for row `id` with the given column data.
-fn insert(table: &DbTable, id: i32, pairs: &[(&str, Value)]) -> WriteQuery {
+fn insert(table: &DbTable, id: i64, pairs: &[(&str, Value)]) -> WriteQuery {
     WriteQuery::INSERT(InsertQuery {
         table: table.name.clone(),
-        pkey_value: pkey(id),
-        record: DbRecord {
-            table: table.name.clone(),
-            pkey_value: pkey(id),
-            data: row(pairs),
-        },
+        pkey_value: DataFrameKey::new(pkey(id)),
+        record: full_row(id, pairs),
     })
 }
 
 /// Builds an UPDATE [`WriteQuery`] carrying the full new row image for `id`.
-fn update(table: &DbTable, id: i32, pairs: &[(&str, Value)]) -> WriteQuery {
+fn update(table: &DbTable, id: i64, pairs: &[(&str, Value)]) -> WriteQuery {
     WriteQuery::UPDATE(UpdateQuery {
         table: table.name.clone(),
-        pkey_value: pkey(id),
-        record: DbRecord {
-            table: table.name.clone(),
-            pkey_value: pkey(id),
-            data: row(pairs),
-        },
+        pkey_value: DataFrameKey::new(pkey(id)),
+        record: full_row(id, pairs),
     })
 }
 
 /// Builds a DELETE [`WriteQuery`] for row `id`.
-fn delete(table: &DbTable, id: i32) -> WriteQuery {
+fn delete(table: &DbTable, id: i64) -> WriteQuery {
     WriteQuery::DELETE(DeleteQuery {
         table: table.name.clone(),
-        pkey_value: pkey(id),
+        pkey_value: DataFrameKey::new(pkey(id)),
     })
 }
 
 /// The standard fixture: four distinct-condition subscriptions plus a
 /// full-table one, on `tickets`.
-fn standard_ivm(tickets: &DbTable) -> IVM {
-    let mut ivm = IVM::new();
+fn standard_ivm(tickets: &DbTable) -> SingleTableIVM {
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
     ivm.register_query(
         "q-open",
         query(
             tickets,
             Where::condition("status", ComparisonOperator::EQ, "OPEN"),
         ),
+        None,
     );
     ivm.register_query(
         "q-mine-active",
@@ -100,6 +97,7 @@ fn standard_ivm(tickets: &DbTable) -> IVM {
                 Where::condition("status", ComparisonOperator::NEQ, "DONE"),
             ]),
         ),
+        None,
     );
     ivm.register_query(
         "q-hot",
@@ -111,6 +109,7 @@ fn standard_ivm(tickets: &DbTable) -> IVM {
                 Value::List(vec!["HIGH".into(), "URGENT".into()]),
             ),
         ),
+        None,
     );
     ivm.register_query(
         "q-big",
@@ -118,8 +117,9 @@ fn standard_ivm(tickets: &DbTable) -> IVM {
             tickets,
             Where::condition("points", ComparisonOperator::GTE, 8),
         ),
+        None,
     );
-    ivm.register_query("q-all", query(tickets, Where::AND(vec![])));
+    ivm.register_query("q-all", query(tickets, Where::AND(vec![])), None);
     ivm
 }
 
@@ -134,9 +134,17 @@ fn open_ticket_row() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// Extracts the impacted subscription uuids from an operation batch.
-fn impacted(ops: &[(QueryId, DataFrameOperation)]) -> Vec<&str> {
-    ops.iter().map(|(uuid, _)| uuid.as_str()).collect()
+/// Extracts the impacted subscription uuids from an update batch,
+/// deduplicated in emission order — an in-place replace contributes an
+/// adjacent `Delete` + `Add` pair under one uuid.
+fn impacted(ops: &[SingleTableUpdate]) -> Vec<&str> {
+    let mut uuids: Vec<&str> = Vec::new();
+    for update in ops {
+        if !uuids.contains(&update.query.as_str()) {
+            uuids.push(update.query.as_str());
+        }
+    }
+    uuids
 }
 
 /// An insert produces `Add`s only for the subscriptions whose filters the
@@ -151,9 +159,10 @@ fn insert_routes_to_matching_queries_only() {
     assert_eq!(impacted(&ops), vec!["q-all", "q-mine-active", "q-open"]);
     assert!(ops
         .iter()
-        .all(|(_, op)| matches!(op, DataFrameOperation::Add(..))));
-    assert_eq!(ivm.dataframe_for("q-open").unwrap().len(), 1);
-    assert_eq!(ivm.dataframe_for("q-hot").unwrap().len(), 0);
+        .all(|update| matches!(update.op, DataFrameOperation::Add(..))));
+    assert!(ops.iter().all(|update| update.table == "tickets"));
+    assert_eq!(ivm.rows_for("q-open").unwrap().len(), 1);
+    assert_eq!(ivm.rows_for("q-hot").unwrap().len(), 0);
 }
 
 /// A disjunct that only partially matches never fires: `status != 'DONE'`
@@ -181,9 +190,10 @@ fn partial_disjunct_does_not_fire() {
     assert!(ivm.stats().disjunct_increments > ivm.stats().disjuncts_fired);
 }
 
-/// An update that stops a held row from matching emits `Delete` for the
-/// subscriptions it leaves; the row still matches the unfiltered
-/// subscription (`q-all`), which is refreshed in place with an `Add`.
+/// An update that stops a held row from matching emits `Delete` — carrying
+/// the removed image — for the subscriptions it leaves; the row still
+/// matching the unfiltered subscription (`q-all`) is replaced in place with
+/// an adjacent `Delete(old)` + `Add(new)` pair.
 #[test]
 fn update_moves_row_out_with_delete() {
     let tickets = table("tickets");
@@ -195,21 +205,36 @@ fn update_moves_row_out_with_delete() {
     let ops = ivm.incremental_update(&update(&tickets, 1, &done_row));
 
     assert_eq!(impacted(&ops), vec!["q-all", "q-mine-active", "q-open"]);
-    let by_uuid: HashMap<&str, &DataFrameOperation> =
-        ops.iter().map(|(u, op)| (u.as_str(), op)).collect();
-    assert!(matches!(by_uuid["q-open"], DataFrameOperation::Delete(_)));
+    let ops_for = |uuid: &str| -> Vec<&DataFrameOperation> {
+        ops.iter()
+            .filter(|update| update.query.as_str() == uuid)
+            .map(|update| &update.op)
+            .collect()
+    };
+    let q_open = ops_for("q-open");
+    let [DataFrameOperation::Delete(_, removed)] = q_open.as_slice() else {
+        panic!("q-open expects exactly one Delete, got {q_open:?}");
+    };
+    assert_eq!(removed.data["status"], Value::String("OPEN".into()));
     assert!(matches!(
-        by_uuid["q-mine-active"],
-        DataFrameOperation::Delete(_)
+        ops_for("q-mine-active").as_slice(),
+        [DataFrameOperation::Delete(..)]
     ));
-    assert!(matches!(by_uuid["q-all"], DataFrameOperation::Add(..)));
+    let q_all = ops_for("q-all");
+    let [DataFrameOperation::Delete(_, old), DataFrameOperation::Add(_, new)] = q_all.as_slice()
+    else {
+        panic!("q-all expects the replace pair, got {q_all:?}");
+    };
+    assert_eq!(old.data["status"], Value::String("OPEN".into()));
+    assert_eq!(new.data["status"], Value::String("DONE".into()));
 
-    assert_eq!(ivm.dataframe_for("q-open").unwrap().len(), 0);
-    assert_eq!(ivm.dataframe_for("q-all").unwrap().len(), 1);
+    assert_eq!(ivm.rows_for("q-open").unwrap().len(), 0);
+    assert_eq!(ivm.rows_for("q-all").unwrap().len(), 1);
 }
 
-/// An update whose row keeps matching replaces the stored record's data in
-/// the frame rather than duplicating or dropping it.
+/// An update whose row keeps matching replaces the stored row's data in
+/// the shared frame rather than duplicating or dropping it, and the row's
+/// subscriber tags name exactly the subscriptions holding it.
 #[test]
 fn update_refreshes_row_in_place_with_new_data() {
     let tickets = table("tickets");
@@ -220,9 +245,13 @@ fn update_refreshes_row_in_place_with_new_data() {
     renamed[3] = ("points", 4.into());
     ivm.incremental_update(&update(&tickets, 1, &renamed));
 
-    let frame = ivm.dataframe_for("q-open").unwrap();
+    let rows = ivm.rows_for("q-open").unwrap();
     let key = DataFrameKey::new(pkey(1));
-    assert_eq!(frame.records[&key].data["points"], Value::Int(4));
+    assert_eq!(rows[&key].data["points"], Value::Int(4));
+    assert_eq!(
+        ivm.holders_of(&TableName::from("tickets"), &key),
+        ["q-all", "q-mine-active", "q-open"].map(QueryId::from)
+    );
 }
 
 /// A delete emits `Delete` only to the subscriptions actually holding the
@@ -238,8 +267,8 @@ fn delete_reaches_only_queries_holding_the_row() {
     assert_eq!(impacted(&ops), vec!["q-all", "q-mine-active", "q-open"]);
     assert!(ops
         .iter()
-        .all(|(_, op)| matches!(op, DataFrameOperation::Delete(_))));
-    assert!(ivm.dataframe_for("q-all").unwrap().is_empty());
+        .all(|update| matches!(update.op, DataFrameOperation::Delete(..))));
+    assert!(ivm.rows_for("q-all").unwrap().is_empty());
 
     let ops = ivm.incremental_update(&delete(&tickets, 99));
     assert!(ops.is_empty());
@@ -260,7 +289,7 @@ fn conditionless_query_sees_every_write_on_its_table() {
         ));
         assert!(impacted(&ops).contains(&"q-all"));
     }
-    assert_eq!(ivm.dataframe_for("q-all").unwrap().len(), 3);
+    assert_eq!(ivm.rows_for("q-all").unwrap().len(), 3);
 }
 
 /// `status = 'NOPE' OR TRUE` is always true, but its only leaf condition
@@ -269,7 +298,7 @@ fn conditionless_query_sees_every_write_on_its_table() {
 #[test]
 fn vacuously_true_filter_is_found_even_when_its_leaf_fails() {
     let tickets = table("tickets");
-    let mut ivm = IVM::new();
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
     ivm.register_query(
         "q-weird",
         query(
@@ -279,6 +308,7 @@ fn vacuously_true_filter_is_found_even_when_its_leaf_fails() {
                 Where::AND(vec![]),
             ]),
         ),
+        None,
     );
 
     let ops = ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
@@ -299,6 +329,7 @@ fn writes_on_other_tables_are_isolated() {
             &calls,
             Where::condition("status", ComparisonOperator::EQ, "ACTIVE"),
         ),
+        None,
     );
 
     let ops = ivm.incremental_update(&insert(&calls, 1, &[("status", "ACTIVE".into())]));
@@ -337,6 +368,7 @@ fn duplicate_condition_routes_to_every_subscriber() {
             &tickets,
             Where::condition("status", ComparisonOperator::EQ, "OPEN"),
         ),
+        None,
     );
 
     let ops = ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
@@ -360,7 +392,7 @@ fn duplicate_condition_routes_to_every_subscriber() {
 #[test]
 fn or_of_ands_routes_by_either_disjunct() {
     let tickets = table("tickets");
-    let mut ivm = IVM::new();
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
     ivm.register_query(
         "q-either",
         query(
@@ -373,6 +405,7 @@ fn or_of_ands_routes_by_either_disjunct() {
                 Where::condition("points", ComparisonOperator::GTE, 8),
             ]),
         ),
+        None,
     );
 
     let ops = ivm.incremental_update(&insert(
@@ -401,12 +434,12 @@ fn or_of_ands_routes_by_either_disjunct() {
 #[test]
 fn where_false_never_matches() {
     let tickets = table("tickets");
-    let mut ivm = IVM::new();
-    ivm.register_query("q-never", query(&tickets, Where::OR(vec![])));
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
+    ivm.register_query("q-never", query(&tickets, Where::OR(vec![])), None);
 
     let ops = ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
     assert!(ops.is_empty());
-    assert!(ivm.dataframe_for("q-never").unwrap().is_empty());
+    assert!(ivm.rows_for("q-never").unwrap().is_empty());
 }
 
 /// Re-registering a uuid with a different query must fully replace its
@@ -418,19 +451,21 @@ fn where_false_never_matches() {
 #[test]
 fn reregistration_replaces_routing_and_unregister_removes_it() {
     let tickets = table("tickets");
-    let mut ivm = IVM::new();
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
     ivm.register_query(
         "q",
         query(&tickets, Where::condition("status", ComparisonOperator::EQ, "OPEN")),
+        None,
     );
     ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
-    assert_eq!(ivm.dataframe_for("q").unwrap().len(), 1);
+    assert_eq!(ivm.rows_for("q").unwrap().len(), 1);
 
     ivm.register_query(
         "q",
         query(&tickets, Where::condition("points", ComparisonOperator::GTE, 8)),
+        None,
     );
-    assert!(ivm.dataframe_for("q").unwrap().is_empty());
+    assert!(ivm.rows_for("q").unwrap().is_empty());
 
     let ops = ivm.incremental_update(&insert(&tickets, 2, &open_ticket_row()));
     assert!(ops.is_empty(), "an OPEN low-points row no longer matches");
@@ -441,7 +476,7 @@ fn reregistration_replaces_routing_and_unregister_removes_it() {
     assert_eq!(impacted(&ops), vec!["q"]);
 
     ivm.unregister_query("q");
-    assert!(ivm.dataframe_for("q").is_none());
+    assert!(ivm.rows_for("q").is_none());
     let ops = ivm.incremental_update(&insert(&tickets, 4, &big));
     assert!(ops.is_empty());
 }
@@ -462,9 +497,9 @@ fn interleaved_writes_across_tables_keep_counters_independent() {
             Where::condition("points", ComparisonOperator::GTE, 5),
         ])
     };
-    let mut ivm = IVM::new();
-    ivm.register_query("q-tickets", query(&tickets, filter()));
-    ivm.register_query("q-calls", query(&calls, filter()));
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
+    ivm.register_query("q-tickets", query(&tickets, filter()), None);
+    ivm.register_query("q-calls", query(&calls, filter()), None);
 
     let ops = ivm.incremental_update(&insert(
         &tickets,
@@ -504,10 +539,10 @@ fn interleaved_writes_across_tables_keep_counters_independent() {
 #[test]
 fn shared_counter_survives_partial_unregistration() {
     let tickets = table("tickets");
-    let mut ivm = IVM::new();
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
     let filter = Where::condition("status", ComparisonOperator::EQ, "OPEN");
-    ivm.register_query("q-a", query(&tickets, filter.clone()));
-    ivm.register_query("q-b", query(&tickets, filter));
+    ivm.register_query("q-a", query(&tickets, filter.clone()), None);
+    ivm.register_query("q-b", query(&tickets, filter), None);
 
     let ops = ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
     assert_eq!(impacted(&ops), vec!["q-a", "q-b"]);
@@ -574,18 +609,18 @@ fn counting_agrees_with_tree_evaluation() {
         vec![("status", "NOPE".into()), ("points", 1.into())],
     ];
 
-    let mut ivm = IVM::new();
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
     for (index, filter) in filters.iter().enumerate() {
-        ivm.register_query(format!("q{index:02}"), query(&tickets, filter.clone()));
+        ivm.register_query(format!("q{index:02}"), query(&tickets, filter.clone()), None);
     }
 
     for (row_index, pairs) in rows.iter().enumerate() {
-        let write = insert(&tickets, row_index as i32, pairs);
+        let write = insert(&tickets, row_index as i64, pairs);
         let image = write.new_row_image().expect("inserts carry a row image");
         let expected: Vec<String> = filters
             .iter()
             .enumerate()
-            .filter(|(_, filter)| evaluate(filter, &image, &mut 0))
+            .filter(|(_, filter)| evaluate(filter, &image.data, &mut 0))
             .map(|(index, _)| format!("q{index:02}"))
             .collect();
         let ops = ivm.incremental_update(&write);
@@ -594,47 +629,371 @@ fn counting_agrees_with_tree_evaluation() {
     }
 }
 
-/// Every subscription owns its frame (the forward index is keyed by uuid),
-/// so identical queries under different uuids track the same rows in
-/// independent frames — same contents, separate frames.
+/// Identical queries under different uuids share the stored rows but keep
+/// independently tagged views — same contents, separate subscriptions,
+/// each receiving its own operations.
 #[test]
 fn identical_queries_maintain_independent_frames() {
     let tickets = table("tickets");
-    let mut ivm = IVM::new();
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
     let filter = Where::condition("status", ComparisonOperator::EQ, "OPEN");
-    let snapshot = ivm.register_query("q-a", query(&tickets, filter.clone()));
+    let snapshot = ivm.register_query("q-a", query(&tickets, filter.clone()), None);
     assert!(snapshot.is_empty());
-    ivm.register_query("q-b", query(&tickets, filter));
+    ivm.register_query("q-b", query(&tickets, filter), None);
 
     let ops = ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
     assert_eq!(impacted(&ops), vec!["q-a", "q-b"]);
 
-    assert_eq!(ivm.dataframe_for("q-a"), ivm.dataframe_for("q-b"));
-    assert_eq!(ivm.dataframe_for("q-a").unwrap().len(), 1);
+    assert_eq!(ivm.rows_for("q-a"), ivm.rows_for("q-b"));
+    assert_eq!(ivm.rows_for("q-a").unwrap().len(), 1);
 }
 
-/// A subscription registered late starts from its own empty frame — it is
-/// never handed rows (or membership-routed `Delete`s) for writes that
-/// happened before it existed: a delete of a pre-registration row reaches
-/// only the subscription that actually holds it, while new writes reach
-/// both.
+/// A subscription registered late with a query structurally identical to
+/// an existing one is served from the shared frame: the twin's current
+/// rows come back as its snapshot `Add`s — storage is a stub here, so the
+/// rows can only have come from the frame — and from then on both twins
+/// route together.
 #[test]
-fn late_identical_registration_starts_empty() {
+fn late_identical_registration_inherits_the_twins_rows() {
     let tickets = table("tickets");
-    let mut ivm = IVM::new();
-    ivm.register_query("early", query(&tickets, Where::AND(vec![])));
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
+    ivm.register_query("early", query(&tickets, Where::AND(vec![])), None);
     for id in 1..=3 {
         ivm.incremental_update(&insert(&tickets, id, &open_ticket_row()));
     }
 
-    let snapshot = ivm.register_query("late", query(&tickets, Where::AND(vec![])));
-    assert!(snapshot.is_empty(), "no inherited rows from the earlier twin");
+    let snapshot = ivm.register_query("late", query(&tickets, Where::AND(vec![])), None);
+    assert_eq!(snapshot.len(), 3, "the twin's three rows arrive as Adds");
+    assert!(snapshot
+        .iter()
+        .all(|op| matches!(op, DataFrameOperation::Add(..))));
+    assert_eq!(ivm.rows_for("late"), ivm.rows_for("early"));
+    assert_eq!(ivm.stats().snapshots_shared, 1);
 
     let ops = ivm.incremental_update(&delete(&tickets, 1));
-    assert_eq!(impacted(&ops), vec!["early"]);
-
-    let ops = ivm.incremental_update(&insert(&tickets, 4, &open_ticket_row()));
     assert_eq!(impacted(&ops), vec!["early", "late"]);
-    assert_eq!(ivm.dataframe_for("early").unwrap().len(), 3);
-    assert_eq!(ivm.dataframe_for("late").unwrap().len(), 1);
+    assert_eq!(ivm.rows_for("early").unwrap().len(), 2);
+    assert_eq!(ivm.rows_for("late").unwrap().len(), 2);
+}
+
+/// ORDER BY + LIMIT: the engine buffers twice the requested limit, admits
+/// past a full buffer only rows strictly better than the worst held value
+/// (evicting the worst), keeps a held row that worsens in place until a
+/// better arrival evicts it, and refills from storage when a removal
+/// drains the buffer to the requested limit.
+#[test]
+fn limit_window_admits_evicts_and_refills() {
+    let tickets = table("tickets");
+    let storage = Rc::new(MemoryStorage::new());
+    let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    for (id, points) in [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)] {
+        storage.apply(&insert(&tickets, id, &[("points", points.into())]));
+    }
+    let windowed = SingleTableReadQuery::new(
+        tickets.name.clone(),
+        Where::AND(vec![]),
+        OrderBy::new("points", Order::ASC),
+        2,
+    );
+    let snapshot = ivm.register_query("w", windowed, None);
+    assert_eq!(snapshot.len(), 4, "the buffer holds twice the limit");
+
+    let admit = insert(&tickets, 7, &[("points", 5.into())]);
+    storage.apply(&admit);
+    let ops = ivm.incremental_update(&admit);
+    assert_eq!(ops.len(), 2, "admission plus eviction, got {ops:?}");
+    assert!(
+        matches!(&ops[0].op, DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(7))
+    );
+    assert!(
+        matches!(&ops[1].op, DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(4))
+    );
+
+    let reject = insert(&tickets, 8, &[("points", 100.into())]);
+    storage.apply(&reject);
+    assert!(
+        ivm.incremental_update(&reject).is_empty(),
+        "worse than the boundary — the admission guard rejects it"
+    );
+
+    for id in [7, 1] {
+        let removal = delete(&tickets, id);
+        storage.apply(&removal);
+        ivm.incremental_update(&removal);
+    }
+    assert_eq!(
+        ivm.rows_for("w").unwrap().len(),
+        4,
+        "draining to the limit refilled the buffer from storage"
+    );
+    assert_eq!(ivm.stats().window_evictions, 1);
+    assert!(ivm.stats().window_refills >= 1);
+
+    let worsen = update(&tickets, 2, &[("points", 999.into())]);
+    storage.apply(&worsen);
+    let ops = ivm.incremental_update(&worsen);
+    assert_eq!(
+        impacted(&ops),
+        vec!["w"],
+        "a held row worsening keeps its slot (replace pair), got {ops:?}"
+    );
+    assert_eq!(ops.len(), 2);
+    assert_eq!(ivm.rows_for("w").unwrap().len(), 4);
+
+    let better = insert(&tickets, 9, &[("points", 60.into())]);
+    storage.apply(&better);
+    let ops = ivm.incremental_update(&better);
+    assert_eq!(ops.len(), 2);
+    assert!(
+        matches!(&ops[1].op, DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(2)),
+        "the worsened row is the one a better arrival evicts, got {ops:?}"
+    );
+}
+
+/// Regression (review): a subscription between `replace_query` and the
+/// caller's declared reconciliation has a filter ahead of its held rows.
+/// Registering an identical query in that window must NOT be served from
+/// the stale view — it falls back to storage — and only the caller's
+/// explicit `mark_reconciled` (a fetch alone might be half of a swap)
+/// re-enables twin donation.
+#[test]
+fn replaced_query_is_not_a_twin_donor_until_reconciled() {
+    let tickets = table("tickets");
+    let storage = Rc::new(MemoryStorage::new());
+    let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    let narrow = query(
+        &tickets,
+        Where::condition(
+            "points",
+            ComparisonOperator::IN,
+            Value::List(vec![Value::Int(10)]),
+        ),
+    );
+    let wide = query(
+        &tickets,
+        Where::condition(
+            "points",
+            ComparisonOperator::IN,
+            Value::List(vec![Value::Int(10), Value::Int(20)]),
+        ),
+    );
+    storage.apply(&insert(&tickets, 1, &[("points", 10.into())]));
+    storage.apply(&insert(&tickets, 2, &[("points", 20.into())]));
+    let snapshot = ivm.register_query("s", narrow, None);
+    assert_eq!(snapshot.len(), 1);
+
+    ivm.replace_query("s", wide.clone());
+    let snapshot = ivm.register_query("t", wide.clone(), None);
+    assert_eq!(
+        snapshot.len(),
+        2,
+        "mid-maintenance `s` must not donate; storage serves the full set"
+    );
+
+    ivm.unregister_query("t");
+    ivm.fetch("s", "points", &[Value::Int(20)]);
+    assert_eq!(ivm.rows_for("s").unwrap().len(), 2);
+    let snapshot = ivm.register_query("u", wide.clone(), None);
+    assert_eq!(
+        snapshot.len(),
+        2,
+        "a fetch alone might be half of a swap — still no donation (served by storage)"
+    );
+    assert_eq!(ivm.stats().snapshots_shared, 0);
+
+    ivm.unregister_query("u");
+    ivm.mark_reconciled("s");
+    let snapshot = ivm.register_query("v", wide, None);
+    assert_eq!(snapshot.len(), 2, "a declared-reconciled twin donates");
+    assert_eq!(ivm.stats().snapshots_shared, 1);
+}
+
+/// Regression (review): `replace_condition` opens the same maintenance
+/// window as `replace_query` — until the caller declares reconciliation,
+/// a registration with the identical (post-edit) query must be served by
+/// storage, not by the half-reconciled subscription. And the edit itself
+/// must not re-register anything: only `conditions_replaced` moves.
+#[test]
+fn replaced_condition_view_is_not_a_twin_donor_until_reconciled() {
+    let tickets = table("tickets");
+    let storage = Rc::new(MemoryStorage::new());
+    let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    let in_points = |points: i64| {
+        Condition::new(
+            "points",
+            ComparisonOperator::IN,
+            Value::List(vec![Value::Int(points)]),
+        )
+    };
+    let with = |points: i64| query(&tickets, Where::Condition(in_points(points)));
+    storage.apply(&insert(&tickets, 1, &[("points", 10.into())]));
+    storage.apply(&insert(&tickets, 2, &[("points", 20.into())]));
+    let snapshot = ivm.register_query("a", with(10), None);
+    assert_eq!(snapshot.len(), 1);
+
+    let before = ivm.stats().clone();
+    ivm.replace_condition("a", &in_points(10), in_points(20));
+    let after = ivm.stats();
+    assert_eq!(after.disjuncts_registered, before.disjuncts_registered);
+    assert_eq!(after.conditions_indexed, before.conditions_indexed);
+    assert!(after.conditions_replaced > before.conditions_replaced);
+
+    let snapshot = ivm.register_query("b", with(20), None);
+    assert_eq!(snapshot.len(), 1, "served by storage, not the stale view");
+    assert_eq!(snapshot[0].key(), &DataFrameKey::new(pkey(2)));
+    assert_eq!(ivm.stats().snapshots_shared, 0);
+
+    ivm.unregister_query("b");
+    ivm.fetch("a", "points", &[Value::Int(20)]);
+    ivm.delete_rows("a", "points", &[Value::Int(10)]);
+    ivm.mark_reconciled("a");
+    let snapshot = ivm.register_query("c", with(20), None);
+    assert_eq!(snapshot.len(), 1, "a declared-reconciled twin donates");
+    assert_eq!(ivm.stats().snapshots_shared, 1);
+
+    let admitted = insert(&tickets, 3, &[("points", 20.into())]);
+    storage.apply(&admitted);
+    assert_eq!(
+        impacted(&ivm.incremental_update(&admitted)),
+        vec!["a", "c"],
+        "the edited IN condition routes new writes"
+    );
+    let ignored = insert(&tickets, 4, &[("points", 10.into())]);
+    storage.apply(&ignored);
+    assert!(ivm.incremental_update(&ignored).is_empty());
+}
+
+/// A `LIMIT 0` subscription is permanently empty: an empty registration
+/// snapshot, and later matching writes never admit.
+#[test]
+fn limit_zero_subscription_stays_empty() {
+    let tickets = table("tickets");
+    let storage = Rc::new(MemoryStorage::new());
+    let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    storage.apply(&insert(&tickets, 1, &[("points", 10.into())]));
+    let zero = SingleTableReadQuery::new(
+        tickets.name.clone(),
+        Where::AND(vec![]),
+        OrderBy::new("points", Order::ASC),
+        0,
+    );
+    assert!(ivm.register_query("z", zero, None).is_empty());
+
+    let w = insert(&tickets, 2, &[("points", 20.into())]);
+    storage.apply(&w);
+    assert!(ivm.incremental_update(&w).is_empty());
+    assert!(ivm.rows_for("z").unwrap().is_empty());
+}
+
+/// A DESC window mirrors the ASC behaviors: the snapshot loads the top
+/// rows, admission requires strictly beating the smallest held value,
+/// eviction drops the smallest, and refills walk downward.
+#[test]
+fn desc_window_admits_evicts_and_refills() {
+    let tickets = table("tickets");
+    let storage = Rc::new(MemoryStorage::new());
+    let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    for (id, points) in [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60)] {
+        storage.apply(&insert(&tickets, id, &[("points", points.into())]));
+    }
+    let windowed = SingleTableReadQuery::new(
+        tickets.name.clone(),
+        Where::AND(vec![]),
+        OrderBy::new("points", Order::DESC),
+        2,
+    );
+    let snapshot = ivm.register_query("w", windowed, None);
+    assert_eq!(snapshot.len(), 4);
+    let mut held: Vec<Value> = ivm
+        .rows_for("w")
+        .unwrap()
+        .values()
+        .map(|row| row.data["points"].clone())
+        .collect();
+    held.sort_by_key(|value| match value {
+        Value::Int(i) => *i,
+        _ => 0,
+    });
+    assert_eq!(
+        held,
+        vec![Value::Int(30), Value::Int(40), Value::Int(50), Value::Int(60)],
+        "DESC loads the four LARGEST"
+    );
+
+    let admit = insert(&tickets, 7, &[("points", 100.into())]);
+    storage.apply(&admit);
+    let ops = ivm.incremental_update(&admit);
+    assert_eq!(ops.len(), 2, "the best row is admitted and 30 evicted, got {ops:?}");
+    assert!(
+        matches!(&ops[1].op, DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(3))
+    );
+
+    let reject = insert(&tickets, 8, &[("points", 5.into())]);
+    storage.apply(&reject);
+    assert!(ivm.incremental_update(&reject).is_empty());
+
+    for id in [7, 6] {
+        let removal = delete(&tickets, id);
+        storage.apply(&removal);
+        ivm.incremental_update(&removal);
+    }
+    assert_eq!(
+        ivm.rows_for("w").unwrap().len(),
+        4,
+        "drained to the limit — refilled downward from storage"
+    );
+}
+
+/// A fetch into a windowed subscription maintains the window: fetched
+/// rows enter it and overflow evicts the worst, so the buffer never
+/// silently overruns.
+#[test]
+fn fetch_respects_the_window() {
+    let tickets = table("tickets");
+    let storage = Rc::new(MemoryStorage::new());
+    let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    for (id, points) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+        storage.apply(&insert(&tickets, id, &[("points", points.into())]));
+    }
+    let windowed = SingleTableReadQuery::new(
+        tickets.name.clone(),
+        Where::AND(vec![]),
+        OrderBy::new("points", Order::ASC),
+        2,
+    );
+    assert_eq!(ivm.register_query("w", windowed, None).len(), 4);
+    storage.apply(&insert(&tickets, 5, &[("points", 1.into())]));
+
+    let ops = ivm.fetch("w", "points", &[Value::Int(1)]);
+    assert_eq!(ops.len(), 2, "fetched Add plus overflow eviction, got {ops:?}");
+    assert!(matches!(&ops[0], DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(5)));
+    assert!(
+        matches!(&ops[1], DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(4))
+    );
+    assert_eq!(ivm.rows_for("w").unwrap().len(), 4);
+}
+
+/// The identical-query snapshot happens WITHOUT a storage round-trip: a
+/// row committed to storage but not yet routed through the engine is
+/// invisible to a twin's snapshot, while a registration with no twin
+/// still reads storage and sees it.
+#[test]
+fn identical_registration_skips_storage() {
+    let tickets = table("tickets");
+    let storage = Rc::new(MemoryStorage::new());
+    let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    let open = Where::condition("status", ComparisonOperator::EQ, "OPEN");
+    ivm.register_query("q-a", query(&tickets, open.clone()), None);
+
+    let routed = insert(&tickets, 1, &open_ticket_row());
+    storage.apply(&routed);
+    ivm.incremental_update(&routed);
+    storage.apply(&insert(&tickets, 2, &open_ticket_row()));
+
+    let snapshot = ivm.register_query("q-b", query(&tickets, open), None);
+    assert_eq!(snapshot.len(), 1, "served from q-a's rows, not storage");
+    assert_eq!(snapshot[0].key(), &DataFrameKey::new(pkey(1)));
+
+    let snapshot = ivm.register_query("q-c", query(&tickets, Where::AND(vec![])), None);
+    assert_eq!(snapshot.len(), 2, "no twin — storage is consulted");
 }

@@ -3,8 +3,8 @@
 //! [`Value`] is the single dynamic value representation used everywhere in
 //! the engine: in query predicates, in write payloads, and in materialized
 //! rows. The engine keys hash maps by types that embed `Value` (the reverse
-//! index is keyed by `Condition`, a `DataFrame` is keyed by `DataFrameKey`),
-//! so `Value` must implement `Eq` and `Hash`. `f64` and `HashMap` do not
+//! index is keyed by `Condition`, the shared table frames by
+//! `DataFrameKey`), so `Value` must implement `Eq` and `Hash`. `f64` and `HashMap` do not
 //! provide those out of the box, hence the manual implementations in this
 //! file:
 //!
@@ -19,11 +19,14 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 /// A dynamically-typed database value.
+///
+/// `Int` is `i64` so Postgres `bigint` / `bigserial` identifiers fit
+/// natively (decided ahead of the Diesel connector).
 #[derive(Debug, Clone)]
 pub enum Value {
     Null,
     String(String),
-    Int(i32),
+    Int(i64),
     Float(f64),
     Bool(bool),
     Date(NaiveDate),
@@ -54,7 +57,9 @@ impl Value {
     /// Ordering comparison backing the `GT` / `GTE` / `LT` / `LTE` operators.
     ///
     /// Values compare only within the same variant, except `Int` / `Float`
-    /// which coerce to `f64`. Everything else — including anything involving
+    /// which coerce to `f64` (lossy above 2⁵³ — mixed-type comparisons of
+    /// such magnitudes may tie spuriously; same-variant comparisons are
+    /// always exact). Everything else — including anything involving
     /// `Null` — returns `None`, which predicate evaluation treats as
     /// "does not match" (SQL three-valued logic collapsed to `false`).
     pub fn compare(&self, other: &Value) -> Option<Ordering> {
@@ -167,8 +172,16 @@ impl From<String> for Value {
 }
 
 impl From<i32> for Value {
-    /// Wraps an `i32` as [`Value::Int`].
+    /// Widens an `i32` into [`Value::Int`] — a convenience for literals and
+    /// narrow ids.
     fn from(i: i32) -> Self {
+        Value::Int(i64::from(i))
+    }
+}
+
+impl From<i64> for Value {
+    /// Wraps an `i64` as [`Value::Int`].
+    fn from(i: i64) -> Self {
         Value::Int(i)
     }
 }

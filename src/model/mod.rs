@@ -4,11 +4,13 @@
 //! full vocabulary:
 //!
 //! - [`value`] — [`Value`] / [`ValueType`], the dynamic value representation
-//! - [`schema`] — [`Catalog`] / [`DbTable`] / [`DbColumn`] / [`DbRecord`]:
-//!   the single authoritative schema home; queries and records reference
-//!   tables by name and resolve them in the catalog
-//! - [`query`] — [`ReadQuery`] / [`WriteQuery`] and the `Where` predicate tree
-//! - [`frame`] — [`DataFrame`] and the [`DataFrameOperation`] delta unit
+//! - [`schema`] — [`Catalog`] / [`DbTable`] / [`DbColumn`]: the single
+//!   authoritative schema home; queries reference tables by name and
+//!   resolve them in the catalog
+//! - [`query`] — [`SingleTableReadQuery`] / [`WriteQuery`], the `Where`
+//!   predicate tree, and the [`QueryId`] subscription handle
+//! - [`frame`] — row identities, images, the [`DataFrameOperation`] delta
+//!   unit, and the engine's shared [`frame::TableFrame`] materialization
 //!
 //! Structure changes here ripple through the whole engine (these types are
 //! index keys in `crate::ivm`), so keep field changes deliberate and discuss
@@ -19,10 +21,10 @@ pub mod query;
 pub mod schema;
 pub mod value;
 
-pub use frame::{DataFrame, DataFrameKey, DataFrameOperation, DataFrameRow};
+pub use frame::{DataFrameKey, DataFrameOperation, DataFrameRow};
 pub use query::{
-    ComparisonOperator, Condition, DeleteQuery, Disjunct, InsertQuery, Order, OrderBy, ReadQuery,
-    UpdateQuery, Where, WriteQuery,
+    ComparisonOperator, Condition, DeleteQuery, Disjunct, InsertQuery, LeftJoin, MultiTableReadQuery,
+    Order, OrderBy, QueryId, SingleTableReadQuery, UpdateQuery, Where, WriteQuery,
 };
-pub use schema::{Catalog, DbColumn, DbRecord, DbTable, TableName};
+pub use schema::{Catalog, ColumnName, DbColumn, DbTable, TableName};
 pub use value::{Value, ValueType};

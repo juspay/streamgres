@@ -4,7 +4,7 @@
 //! engine can be wired in on top. The connection loop currently echoes.
 //!
 //! ```bash
-//! cargo run --bin server --features ws
+//! cargo run --bin server
 //! ```
 
 use axum::Router;

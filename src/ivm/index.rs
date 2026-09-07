@@ -71,11 +71,18 @@ struct DisjunctCounter {
 /// - `unconditional`: subscriptions owning an empty (vacuously true)
 ///   disjunct; they match every row write on the table and never appear in
 ///   `by_condition`.
+/// - `boundaries`: per-subscription ORDER BY / LIMIT admission boundary —
+///   an extra condition a fired candidate must also satisfy (unless it
+///   already holds the row), published and re-published by the engine's
+///   window maintenance as the boundary value moves. Kept beside the
+///   disjuncts, never inside them: it changes with every admission and
+///   would otherwise churn the counting structures.
 #[derive(Default)]
 pub(super) struct TableIndex {
     by_condition: HashMap<Condition, Vec<SharedCounter>>,
     by_disjunct: HashMap<Disjunct, SharedCounter>,
     unconditional: Vec<QueryId>,
+    boundaries: HashMap<QueryId, Condition>,
 }
 
 impl TableIndex {
@@ -94,42 +101,135 @@ impl TableIndex {
     ) {
         for disjunct in disjuncts {
             stats.disjuncts_registered += 1;
-            if disjunct.conditions.is_empty() {
-                if !self.unconditional.contains(subscriber) {
-                    self.unconditional.push(subscriber.clone());
+            let links = self.attach(subscriber, disjunct);
+            stats.conditions_indexed += links;
+        }
+    }
+
+    /// Attach `subscriber` to one disjunct, creating or reusing its shared
+    /// counter (an empty disjunct goes to `unconditional`); returns how
+    /// many condition links were actually added.
+    fn attach(&mut self, subscriber: &QueryId, disjunct: Disjunct) -> u64 {
+        if disjunct.conditions.is_empty() {
+            if !self.unconditional.contains(subscriber) {
+                self.unconditional.push(subscriber.clone());
+            }
+            return 0;
+        }
+        if let Some(existing) = self.by_disjunct.get(&disjunct) {
+            let mut counter = existing.borrow_mut();
+            if !counter.subscribers.contains(subscriber) {
+                counter.subscribers.push(subscriber.clone());
+            }
+            return 0;
+        }
+        let counter = Rc::new(RefCell::new(DisjunctCounter {
+            size: disjunct.conditions.len(),
+            epoch: 0,
+            satisfied: 0,
+            subscribers: vec![subscriber.clone()],
+        }));
+        let mut links = 0;
+        for condition in &disjunct.conditions {
+            self.by_condition
+                .entry(condition.clone())
+                .or_default()
+                .push(Rc::clone(&counter));
+            links += 1;
+        }
+        self.by_disjunct.insert(disjunct, counter);
+        links
+    }
+
+    /// Detach `subscriber` from one disjunct, dropping the counter and its
+    /// condition links once no subscriber remains.
+    fn detach(&mut self, disjunct: &Disjunct, subscriber: &str) {
+        let Some(shared) = self.by_disjunct.get(disjunct) else {
+            return;
+        };
+        shared
+            .borrow_mut()
+            .subscribers
+            .retain(|candidate| candidate.as_str() != subscriber);
+        if !shared.borrow().subscribers.is_empty() {
+            return;
+        }
+        let Some(dead) = self.by_disjunct.remove(disjunct) else {
+            return;
+        };
+        for condition in &disjunct.conditions {
+            if let Some(counters) = self.by_condition.get_mut(condition) {
+                counters.retain(|candidate| !Rc::ptr_eq(candidate, &dead));
+                if counters.is_empty() {
+                    self.by_condition.remove(condition);
                 }
-                continue;
             }
-            if let Some(existing) = self.by_disjunct.get(&disjunct) {
-                let mut counter = existing.borrow_mut();
-                if !counter.subscribers.contains(subscriber) {
-                    counter.subscribers.push(subscriber.clone());
-                }
-                continue;
+        }
+    }
+
+    /// Edit one condition of one subscriber's disjuncts **in place** — the
+    /// value-list change of a join `IN`, without re-normalizing anything.
+    ///
+    /// Shared counters split correctly: for each of its disjuncts
+    /// containing `old`, the subscriber leaves the old shape (which other
+    /// subscribers keep, and which is dropped if it was the last holder)
+    /// and joins — or creates — the disjunct with `new` swapped in.
+    /// Counted in `conditions_replaced`; the caller owns keeping the
+    /// stored filter and the held rows in step. Sound whenever the edit
+    /// preserves the filter's DNF shape, which holds for a plain leaf
+    /// condition.
+    pub(super) fn update_condition(
+        &mut self,
+        subscriber: &QueryId,
+        old: &Condition,
+        new: &Condition,
+        stats: &mut IvmStats,
+    ) {
+        let affected: Vec<Disjunct> = self
+            .by_disjunct
+            .iter()
+            .filter(|(disjunct, shared)| {
+                disjunct.conditions.contains(old)
+                    && shared.borrow().subscribers.contains(subscriber)
+            })
+            .map(|(disjunct, _)| disjunct.clone())
+            .collect();
+        for old_disjunct in affected {
+            stats.conditions_replaced += 1;
+            self.detach(&old_disjunct, subscriber.as_str());
+            let mut conditions: Vec<Condition> = old_disjunct
+                .conditions
+                .iter()
+                .filter(|condition| *condition != old)
+                .cloned()
+                .collect();
+            if !conditions.contains(new) {
+                conditions.push(new.clone());
             }
-            let counter = Rc::new(RefCell::new(DisjunctCounter {
-                size: disjunct.conditions.len(),
-                epoch: 0,
-                satisfied: 0,
-                subscribers: vec![subscriber.clone()],
-            }));
-            for condition in &disjunct.conditions {
-                self.by_condition
-                    .entry(condition.clone())
-                    .or_default()
-                    .push(Rc::clone(&counter));
-                stats.conditions_indexed += 1;
+            self.attach(subscriber, Disjunct { conditions });
+        }
+    }
+
+    /// Publish, move, or clear `subscriber`'s admission boundary.
+    pub(super) fn set_boundary(&mut self, subscriber: &QueryId, boundary: Option<Condition>) {
+        match boundary {
+            Some(condition) => {
+                self.boundaries.insert(subscriber.clone(), condition);
             }
-            self.by_disjunct.insert(disjunct, counter);
+            None => {
+                self.boundaries.remove(subscriber.as_str());
+            }
         }
     }
 
     /// Remove every trace of `subscriber`: its unconditional entry, its
-    /// membership in shared counters, and — once a counter has no
-    /// subscribers left — the counter itself and all its condition links.
+    /// boundary, its membership in shared counters, and — once a counter
+    /// has no subscribers left — the counter itself and all its condition
+    /// links.
     pub(super) fn unregister(&mut self, subscriber: &str) {
         self.unconditional
             .retain(|candidate| candidate.as_str() != subscriber);
+        self.boundaries.remove(subscriber);
         let mut dead_disjuncts: Vec<Disjunct> = Vec::new();
         for (disjunct, counter) in &self.by_disjunct {
             let mut counter = counter.borrow_mut();
@@ -155,21 +255,26 @@ impl TableIndex {
 
     /// Whether the index routes nothing anymore (so the engine can drop it).
     pub(super) fn is_empty(&self) -> bool {
-        self.by_disjunct.is_empty() && self.unconditional.is_empty()
+        self.by_disjunct.is_empty() && self.unconditional.is_empty() && self.boundaries.is_empty()
     }
 
-    /// The subscriptions whose filters the row image satisfies.
+    /// The subscriptions whose filters the row image satisfies **and**
+    /// whose admission boundary (if any) it passes.
     ///
     /// Evaluates each distinct condition exactly once; every match bumps the
     /// shared counters of the disjuncts containing it, and a counter
     /// reaching its size fires all of its subscribers. `epoch` must be a
     /// fresh, monotonically increased write number — it is what lazily
     /// invalidates counts left over from earlier writes. Unconditional
-    /// subscribers are always included.
+    /// subscribers are always included. Fired candidates are then filtered
+    /// through their `boundaries` entry — except subscribers in `holders`,
+    /// which already hold the written row: the boundary gates admission,
+    /// not residence.
     pub(super) fn matched(
         &self,
         row: &HashMap<String, Value>,
         epoch: u64,
+        holders: &BTreeSet<QueryId>,
         stats: &mut IvmStats,
     ) -> BTreeSet<QueryId> {
         let mut fired = BTreeSet::new();
@@ -195,6 +300,13 @@ impl TableIndex {
         for subscriber in &self.unconditional {
             fired.insert(subscriber.clone());
         }
+        fired.retain(|uuid| {
+            holders.contains(uuid)
+                || self
+                    .boundaries
+                    .get(uuid.as_str())
+                    .is_none_or(|boundary| eval_condition(boundary, row, &mut 0))
+        });
         fired
     }
 }

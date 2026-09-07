@@ -36,7 +36,7 @@ pub fn evaluate(filter: &Where, row: &HashMap<String, Value>, evaluated: &mut u6
 pub fn eval_condition(cond: &Condition, row: &HashMap<String, Value>, evaluated: &mut u64) -> bool {
     *evaluated += 1;
 
-    let Some(actual) = row.get(&cond.column) else {
+    let Some(actual) = row.get(cond.column.as_str()) else {
         return false;
     };
     if actual.is_null() || cond.value.is_null() {

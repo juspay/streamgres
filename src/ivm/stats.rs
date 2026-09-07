@@ -8,7 +8,7 @@
 
 use std::fmt;
 
-/// Cumulative counters, monotonically increasing over an [`crate::ivm::IVM`]'s
+/// Cumulative counters, monotonically increasing over an [`crate::ivm::SingleTableIVM`]'s
 /// lifetime. Use [`IvmStats::diff`] to isolate the cost of a single write.
 ///
 /// Registration:
@@ -17,6 +17,12 @@ use std::fmt;
 /// - `disjuncts_registered`: DNF disjuncts created across all registrations.
 /// - `conditions_indexed`: (condition → disjunct) links added to the reverse
 ///   index.
+/// - `snapshots_shared`: registrations whose initial result set was served
+///   from an identical already-registered query's rows instead of a storage
+///   query.
+/// - `conditions_replaced`: in-place condition edits applied to indexed
+///   disjuncts (a join `IN` list gaining or losing a value), one per
+///   affected disjunct — the cheap alternative to re-registration.
 ///
 /// Write routing:
 /// - `writes_processed`: writes processed by `incremental_update`.
@@ -29,10 +35,15 @@ use std::fmt;
 /// - `disjuncts_fired`: disjuncts whose counter reached its size — each
 ///   firing impacts *every* subscription sharing that disjunct shape, so
 ///   this can be smaller than the subscriptions found by counting.
-/// - `membership_probes`: registered same-table queries checked for
-///   currently holding the written row.
-/// - `membership_hits`: membership checks that found the row.
+/// - `membership_probes`: holder tags read off the written row's shared
+///   frame entry — O(1) per holder, no subscription scan, so probes equal
+///   hits.
+/// - `membership_hits`: subscriptions found holding the row.
 /// - `queries_impacted`: subscriptions confirmed impacted.
+///
+/// Window maintenance:
+/// - `window_evictions`: rows evicted past a window's doubled buffer.
+/// - `window_refills`: storage refill queries run for drained windows.
 ///
 /// Emitted operations:
 /// - `ops_add`: `Add` operations emitted (row entered a result set, or
@@ -43,6 +54,8 @@ pub struct IvmStats {
     pub queries_registered: u64,
     pub disjuncts_registered: u64,
     pub conditions_indexed: u64,
+    pub snapshots_shared: u64,
+    pub conditions_replaced: u64,
     pub writes_processed: u64,
     pub conditions_evaluated: u64,
     pub index_hits: u64,
@@ -51,6 +64,8 @@ pub struct IvmStats {
     pub membership_probes: u64,
     pub membership_hits: u64,
     pub queries_impacted: u64,
+    pub window_evictions: u64,
+    pub window_refills: u64,
     pub ops_add: u64,
     pub ops_delete: u64,
 }
@@ -63,6 +78,8 @@ impl IvmStats {
             queries_registered: self.queries_registered - earlier.queries_registered,
             disjuncts_registered: self.disjuncts_registered - earlier.disjuncts_registered,
             conditions_indexed: self.conditions_indexed - earlier.conditions_indexed,
+            snapshots_shared: self.snapshots_shared - earlier.snapshots_shared,
+            conditions_replaced: self.conditions_replaced - earlier.conditions_replaced,
             writes_processed: self.writes_processed - earlier.writes_processed,
             conditions_evaluated: self.conditions_evaluated - earlier.conditions_evaluated,
             index_hits: self.index_hits - earlier.index_hits,
@@ -71,6 +88,8 @@ impl IvmStats {
             membership_probes: self.membership_probes - earlier.membership_probes,
             membership_hits: self.membership_hits - earlier.membership_hits,
             queries_impacted: self.queries_impacted - earlier.queries_impacted,
+            window_evictions: self.window_evictions - earlier.window_evictions,
+            window_refills: self.window_refills - earlier.window_refills,
             ops_add: self.ops_add - earlier.ops_add,
             ops_delete: self.ops_delete - earlier.ops_delete,
         }
@@ -100,6 +119,8 @@ impl fmt::Display for IvmStats {
         writeln!(f, "queries registered ......... {}", self.queries_registered)?;
         writeln!(f, "disjuncts registered ....... {}", self.disjuncts_registered)?;
         writeln!(f, "condition links indexed .... {}", self.conditions_indexed)?;
+        writeln!(f, "snapshots shared ........... {}", self.snapshots_shared)?;
+        writeln!(f, "conditions replaced ........ {}", self.conditions_replaced)?;
         writeln!(f, "writes processed ........... {}", self.writes_processed)?;
         writeln!(f, "conditions evaluated ....... {}", self.conditions_evaluated)?;
         writeln!(f, "condition hits ............. {}", self.index_hits)?;
@@ -107,6 +128,7 @@ impl fmt::Display for IvmStats {
         writeln!(f, "disjuncts fired ............ {}", self.disjuncts_fired)?;
         writeln!(f, "membership probes / hits ... {} / {}", self.membership_probes, self.membership_hits)?;
         writeln!(f, "queries impacted ........... {}", self.queries_impacted)?;
+        writeln!(f, "window evictions / refills . {} / {}", self.window_evictions, self.window_refills)?;
         write!(f, "ops emitted ................ {} adds, {} deletes", self.ops_add, self.ops_delete)
     }
 }

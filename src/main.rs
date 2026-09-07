@@ -2,7 +2,7 @@
 //!
 //! Registers a handful of subscriptions on a `tickets` table, then plays an
 //! insert / insert / update / delete sequence through
-//! [`IVM::incremental_update`]. For every write it prints which
+//! [`SingleTableIVM::incremental_update`]. For every write it prints which
 //! subscriptions the engine found, the operations it emitted, and what the
 //! routing actually cost (condition evaluations, disjunct bumps and
 //! firings, membership probes) — the counters to watch while iterating on
@@ -16,19 +16,20 @@
 //! `tests/ivm_scenarios.rs`; the parser's own tests live in
 //! `src/parser/mod.rs`.
 
-use jus_sync::ivm::{IvmStats, IVM};
+use jus_sync::ivm::{IvmStats, PgStorage, SingleTableIVM};
 use jus_sync::model::*;
 use jus_sync::parser::{parse_read, parse_write, point_at, Catalog};
+use std::rc::Rc;
 
 /// Runs the demo end to end: registers the six subscriptions against the
 /// `tickets` catalog, plays the insert / insert / update / delete sequence
 /// through [`run_write`], then prints each subscription's final frame size
 /// and the engine's cumulative counters.
 fn main() {
-    println!("== jus_sync IVM demo ==================================================");
+    println!("== jus_sync SingleTableIVM demo ==================================================");
 
     let catalog = Catalog::new(vec![tickets_table()]);
-    let mut ivm = IVM::new();
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
 
     let subscriptions = [
         ("q-open", "SELECT * FROM tickets WHERE status = 'OPEN'"),
@@ -50,7 +51,7 @@ fn main() {
         println!("  {uuid:<14} {sql}");
         let query = parse_read(sql, &catalog)
             .unwrap_or_else(|error| panic!("{}", point_at(sql, &error)));
-        ivm.register_query(uuid.to_owned(), query);
+        ivm.register_query(uuid.to_owned(), query, None);
     }
     println!(
         "  -> {} disjuncts, {} condition links indexed (q-open and q-open-dup both subscribe to status = 'OPEN')",
@@ -87,8 +88,8 @@ fn main() {
          points = 3 WHERE id = 1",
         &["q-all", "q-mine-active", "q-open", "q-open-dup"],
         Some(
-            "row moves OUT of q-open, q-open-dup and q-mine-active (Delete), refreshes \
-             in place for q-all (Add)",
+            "row moves OUT of q-open, q-open-dup and q-mine-active (Delete), and is \
+             replaced in place for q-all (Delete of the old image + Add of the new)",
         ),
     );
 
@@ -102,8 +103,8 @@ fn main() {
 
     println!("\n== final materialized frames ==========================================");
     for (uuid, _) in subscriptions {
-        let frame = ivm.dataframe_for(uuid).expect("registered above");
-        println!("  {uuid:<14} {} row(s)", frame.len());
+        let rows = ivm.rows_for(uuid).expect("registered above");
+        println!("  {uuid:<14} {} row(s)", rows.len());
     }
 
     println!("\n== cumulative counters ================================================");
@@ -113,7 +114,7 @@ fn main() {
 /// Parse one write, feed it through the engine, then print found-vs-expected
 /// impacted subscriptions, the emitted operations, and the routing-cost delta.
 fn run_write(
-    ivm: &mut IVM,
+    ivm: &mut SingleTableIVM,
     catalog: &Catalog,
     sql: &str,
     expected_impacted: &[&str],
@@ -127,7 +128,12 @@ fn run_write(
     let ops = ivm.incremental_update(&write);
     let cost = ivm.stats().diff(&before);
 
-    let found: Vec<&str> = ops.iter().map(|(uuid, _)| uuid.as_str()).collect();
+    let mut found: Vec<&str> = Vec::new();
+    for update in &ops {
+        if !found.contains(&update.query.as_str()) {
+            found.push(update.query.as_str());
+        }
+    }
     let verdict = if found == expected_impacted {
         "PASS"
     } else {
@@ -136,8 +142,8 @@ fn run_write(
 
     println!("   expected : {expected_impacted:?}");
     println!("   impacted : {found:?}   [{verdict}]");
-    for (uuid, op) in &ops {
-        println!("   op       : {uuid:<14} <- {}", fmt_op(op));
+    for update in &ops {
+        println!("   op       : {:<14} <- {}", update.query, fmt_op(&update.op));
     }
     println!("   cost     : {}", cost.routing_summary());
     if let Some(note) = note {
@@ -162,11 +168,11 @@ fn tickets_table() -> DbTable {
 }
 
 /// Renders a [`DataFrameOperation`] as `Add(key)` or `Delete(key)`, showing
-/// only the primary-key values (Add payloads are elided).
+/// only the primary-key values (the carried row images are elided).
 fn fmt_op(op: &DataFrameOperation) -> String {
     match op {
         DataFrameOperation::Add(key, _) => format!("Add({})", fmt_key(key)),
-        DataFrameOperation::Delete(key) => format!("Delete({})", fmt_key(key)),
+        DataFrameOperation::Delete(key, _) => format!("Delete({})", fmt_key(key)),
     }
 }
 

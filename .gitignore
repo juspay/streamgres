@@ -23,3 +23,6 @@ Thumbs.db
 .cargo/
 .stublibs/
 zigcc
+
+# Paper build logs
+paper/*.log
