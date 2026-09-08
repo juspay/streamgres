@@ -45,7 +45,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use jus_sync::ivm::{
-    evaluate, IvmStats, MultiTableIVM, PgStorage, QueryPart, SingleTableIVM,
+    evaluate, IvmStats, MultiTableIVM, PgStorage, SingleTableIVM,
     Storage,
 };
 use jus_sync::model::ComparisonOperator::{EQ, GTE};
@@ -1015,9 +1015,10 @@ impl JoinBench {
             let updates = self.ivm.incremental_update(write);
             elapsed += started.elapsed();
             for update in &updates {
-                match update.part {
-                    QueryPart::Main => main_ops += 1,
-                    QueryPart::Join(_) => join_ops += 1,
+                if update.part.is_main() {
+                    main_ops += 1;
+                } else {
+                    join_ops += 1;
                 }
             }
         }
@@ -1073,11 +1074,12 @@ impl JoinBench {
 fn join_spec(main: Where) -> MultiTableReadQuery {
     MultiTableReadQuery {
         main_table: unbounded(&tickets_table(), main),
-        left_joins: vec![LeftJoin {
-            sub_table: unbounded(&users_table(), Where::AND(vec![])),
-            main_table_column: "assigned_to".into(),
-            sub_table_column: "id".into(),
-        }],
+        left_joins: vec![Join::new(
+            MultiTableReadQuery::single(unbounded(&users_table(), Where::AND(vec![]))),
+            "assigned_to",
+            "id",
+        )],
+        right_joins: Vec::new(),
     }
 }
 

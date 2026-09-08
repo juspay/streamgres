@@ -47,11 +47,11 @@ the number that **actually match**, and then patches only the affected views.
 | Shared frames: one frame per table, rows tagged with holders; held-key mirror; twin registration served from the frame | ✅ done | `src/ivm/frames.rs`, `src/ivm/registry.rs` |
 | `ORDER BY` / `LIMIT` windows: doubled buffer, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
 | In-place condition edit (a join's `IN` list gains/loses a value without re-registration) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
-| `LEFT JOIN`, one level: a root with any number of left-joined leaf tables, per-value left/right counts, self-joins | ✅ done | `src/ivm/multi.rs` |
+| Join tree: `LEFT` and `RIGHT` edges at any depth, per-value left/right counts, cascades, self-joins, intersection on shared driven columns | ✅ done | `src/ivm/multi.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
 | In-memory storage double honoring `ORDER BY` + `LIMIT`; commit-first test harness | ✅ done | `src/ivm/storage.rs` |
 | Routing counters + benchmark harness | ✅ done | `src/ivm/stats.rs`, `src/bin/bench.rs` |
-| **Join tree**: nested multi-table children, `RIGHT` and `INNER` joins, visibility propagation | ⏳ pending | paper §6; one level of `LEFT` today |
+| `INNER` joins: visibility gate on the driven parent | ⏳ pending | paper §6.5 |
 | **PostgreSQL ingester**: permanent `pgoutput` slot + rotating exported snapshots + per-subscription catch-up | ⏳ pending | paper §7; `PgStorage` is a stub |
 | **WebSocket protocol**: subscribe / unsubscribe / op stream, connection & subscription lifecycle | ⏳ pending | `src/ws.rs` is an axum echo base |
 | Set-valued join edge (the `IN` list as a per-column set, one edge shared by identical multi-table subscriptions), the measured slow path | ⏳ pending | paper §9.5, §12.1 |
@@ -141,22 +141,35 @@ A write can affect a subscription two ways, and both are checked:
 
 ### 3. Multi-table layer (`src/ivm/multi.rs`)
 
-A multi-table query registers one inner subscription per part
-(`{uuid}_0` main, `{uuid}_k` per join). Each sub part is registered as
-`sub WHERE AND sub_col IN (referenced values)`: **the join condition lives
-inside the inner filter**, so sub-table writes route natively. Per join value
-the layer keeps `left` (main rows carrying it) and `right` (sub rows held);
-only left zero-crossings act: `0→1` edits the `IN` list in place and fetches
-that value's sub rows in one narrowed query; `→0` edits it and prunes held rows
-with no storage trip. Sub-part ops are forwarded before main-part ops (the
-self-join rule); a main-row replace pair is recognized and its join values
-diffed so a kept value never churns through zero. Updates arrive as
-`MultiTableUpdate { query, table, part, op }`.
+A multi-table query is a **tree**: every node a single-table query, every
+edge a `LEFT` or `RIGHT` join with a column pair, and a child itself a full
+multi-table query (`MultiTableReadQuery { main_table, left_joins, right_joins }`,
+`Join { sub, main_table_column, sub_table_column }`). Each node registers as
+one inner subscription, a *part* addressed by its path of join indices
+(`QueryPart`, root = `[]`); inner ids are looked up in a map, never parsed.
 
-The paper generalizes this to a **tree**: every node a single-table query,
-every edge `LEFT` / `RIGHT` / `INNER` with a column pair, referenced values
-flowing down driver→driven edges and visibility flowing up `INNER` edges.
-Only the one-level `LEFT` form is implemented.
+Every edge has a **driver** side, whose rows decide which join values are
+referenced, and a **driven** side, whose part carries
+`driven_col IN (referenced values)` inside its filter: `LEFT` keeps the
+parent, so the parent drives; `RIGHT` keeps the child, so the child drives.
+Because the restriction lives inside the driven filter, driven-table writes
+route natively. A node driven on one column from both sides (a `LEFT` parent
+above, a `RIGHT` child below, both on `id`) holds the **intersection** of the
+driving edges' referenced values in one leaf.
+
+Per edge and per value the layer keeps `left` (driver rows carrying it) and
+`right` (driven rows held); only `left` zero-crossings that change a leaf act:
+`0→1` edits the leaf in place and fetches that value's driven rows in one
+narrowed query; `→0` edits it and prunes held rows with no storage trip. The
+rows a fetch brings in are arrivals at the driven node and a prune's rows are
+departures, and the driven node may drive further edges, so the same handling
+cascades through the tree. Registration is a post-order walk (right children,
+node, left children); within a write every driven part is forwarded before its
+driver, and a replace pair is diffed per edge so a kept value never churns
+through zero. Updates arrive as `MultiTableUpdate { query, table, part, op }`.
+
+`INNER` edges (a visibility gate on the driven parent) are specified in the
+paper and pending.
 
 ### 4. Storage seam (`src/ivm/storage.rs`)
 
@@ -250,10 +263,10 @@ writes alone; raw output in
 
 | Scenario | Result |
 | --- | --- |
-| Routing, 100 → 10 000 subscriptions | a write touches only the 3 to 4 conditions it satisfies (one probe per column) while the table carries 67 to 85; route-only cost ≈ 1.5 µs fixed + 0.35 µs per impacted subscription; delivery ≈ 1.3 µs per emitted op |
-| Twin registration (400-row snapshot) | 939 µs from the shared frame vs 2 215 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
-| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.5 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~120 ms across 10 000 writes) |
-| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | user updates are pure fan-out (2.4 µs per op; a user write reaches only the ~30 `IN` lists naming it, not all 108); ticket inserts cost 10 ms because every twin edits its `O(\|IN\|)` join edge at each zero crossing, the slow path the set-valued shared edge removes |
+| Routing, 100 → 10 000 subscriptions | a write touches only the 3 to 4 conditions it satisfies (one probe per column) while the table carries 67 to 85; route-only cost ≈ 1 µs fixed + 0.25 µs per impacted subscription; delivery ≈ 0.9 µs per emitted op |
+| Twin registration (400-row snapshot) | 709 µs from the shared frame vs 1 530 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
+| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.4 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~70 ms across 10 000 writes) |
+| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | user updates are pure fan-out (1.8 µs per op; a user write reaches only the ~31 `IN` lists naming it, not all 108); ticket inserts cost 7 ms because every twin edits its `O(\|IN\|)` join edge at each zero crossing, the slow path the set-valued shared edge removes |
 
 ### Using the engine programmatically
 
@@ -297,9 +310,9 @@ silently narrowed:
   TOASTed columns; paper §7.6).
 - **`LIMIT L` is a doubled window**; **`ORDER BY` decides which rows a window
   keeps**, never the order operations arrive in.
-- **`LEFT JOIN`** semantics: main rows visible purely by the main `WHERE`; an
-  empty sub side is null. A finite limit on a join's sub side is normalized
-  away.
+- **Join semantics**: `LEFT` keeps every parent row (an empty child side is
+  null); `RIGHT` keeps every child row and shows a parent row only while a
+  child matches it. A finite limit below the root is normalized away.
 - **NULL semantics**: any comparison touching `NULL` (or a missing column) is
   false, for every operator; three-valued logic collapsed to two.
 - **Inserts are upserts**; **write literals are coerced** to declared column
@@ -337,7 +350,7 @@ src/
     frames.rs              frame surgery + inspection: fetch/upsert/remove rows, rows_for
     index.rs               TableIndex: shared DNF disjunct counters, boundaries, in-place edits
     window.rs              ORDER BY / LIMIT: doubled buffer, boundary publishing, evict/refill
-    multi.rs               MultiTableIVM: LEFT JOIN maintenance over the single engine
+    multi.rs               MultiTableIVM: the join tree (LEFT / RIGHT edges) over the single engine
     storage.rs             Storage seam: PgStorage stub + MemoryStorage
     predicate.rs           Where-tree evaluation, NULL semantics
     stats.rs               IvmStats counters + per-write diffing

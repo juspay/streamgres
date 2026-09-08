@@ -23,7 +23,7 @@ pub mod value;
 
 pub use frame::{DataFrameKey, DataFrameOperation, DataFrameRow};
 pub use query::{
-    ComparisonOperator, Condition, DeleteQuery, Disjunct, InsertQuery, LeftJoin, MultiTableReadQuery,
+    ComparisonOperator, Condition, DeleteQuery, Disjunct, InsertQuery, Join, MultiTableReadQuery,
     Order, OrderBy, QueryId, SingleTableReadQuery, UpdateQuery, Where, WriteQuery,
 };
 pub use schema::{Catalog, ColumnName, DbColumn, DbTable, TableName};

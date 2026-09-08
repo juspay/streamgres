@@ -1,73 +1,120 @@
-//! Multi-table subscriptions: LEFT JOINs maintained over the single-table
-//! engine.
+//! Multi-table subscriptions: a tree of single-table parts joined by LEFT
+//! and RIGHT edges, maintained over the single-table engine.
 //!
-//! A [`MultiTableReadQuery`] registers one inner single-table subscription
-//! per part — `{uuid}_0` for the main table, `{uuid}_{k}` for left join `k`
-//! (1-based); stripping the suffix recovers the external id. Main rows are
-//! visible purely by the main `WHERE` (left join: an empty sub side renders
-//! as null, it never hides the main row), so there is no admission,
-//! exclusion, or reverse-admission — main-part operations forward directly.
+//! A [`MultiTableReadQuery`] is a tree: every node is a single-table query,
+//! every edge a join, and a child is itself a full multi-table query. Each
+//! node registers as one inner single-table subscription — a *part*,
+//! addressed by its [`QueryPart`] path — and the client receives every
+//! operation tagged with its part, keeps one frame per part, and composes
+//! the join itself.
 //!
-//! # The registered `IN` condition
+//! # Driver and driven
 //!
-//! Each sub part is registered as `sub WHERE AND sub_col IN (referenced
-//! values)` — the join condition lives *inside* the inner subscription's
-//! filter, so sub-table writes route natively: a row matching the filter
-//! (join condition included) fires an `Add`, a held row moving out fires
-//! a `Delete` via membership, and unreferenced rows never fire at all.
-//! A reference change edits that one `IN` condition **in place** — in the
-//! stored filter and inside the sub part's indexed disjuncts
-//! ([`SingleTableIVM::replace_condition`]) — with no unregister /
-//! re-register churn. The join layer's only sub-side work is forwarding
-//! operations and keeping its `right` counts current.
+//! Every edge has a **driver** side, whose rows decide which join values
+//! are *referenced*, and a **driven** side, whose part carries the
+//! restriction `driven_column IN (referenced values)` inside its filter.
+//! A LEFT edge preserves the parent, so the parent drives and the child is
+//! driven; a RIGHT edge preserves the child, so the child drives and the
+//! parent is driven. Because the restriction lives inside the driven
+//! part's filter, writes on the driven table route natively through the
+//! single engine: a row matching the filter (restriction included) fires
+//! an `Add`, a held row moving out fires a `Delete` via membership, and an
+//! unreferenced row never fires at all. The join layer never inspects
+//! driven-side writes; it forwards them and keeps its counts.
 //!
-//! # Counts and zero crossings
+//! A node can be driven by several edges on one column — a LEFT parent
+//! above it and a RIGHT child below it, both on `id` — and its filter then
+//! carries one `IN` leaf per driven column holding the **intersection** of
+//! the driving edges' referenced values, recomputed on every change.
 //!
-//! Per query and per join, `left` counts each join value over the main
-//! rows and `right` over the held sub rows. Only **left** crossings act:
+//! # Counts, crossings, cascades
 //!
-//! - `left` 0 → >0: the value joins the `IN` list
-//!   ([`SingleTableIVM::replace_condition`]) and its sub rows are fetched.
-//! - `left` >0 → 0: the value leaves the `IN` list and its held sub rows
-//!   are pruned from the current data — no storage round-trip.
+//! Per edge and per join value the layer keeps `left` (driver rows
+//! carrying the value), `right` (driven rows held for it; observational),
+//! and the referenced list in first-referenced order. Only zero crossings
+//! of `left` act, and only when they change the driven part's `IN` leaf:
+//! the leaf is edited in place ([`SingleTableIVM::replace_condition`]) and
+//! the value's driven rows are fetched (one narrowed storage query) or
+//! pruned from current data. Rows a fetch brings in are **arrivals** at
+//! the driven node and rows a prune removes are **departures**, and the
+//! driven node may itself drive further edges, so the same handling
+//! cascades down the tree — the recursion that makes nesting work with
+//! one code path.
 //!
-//! `right` crossings change nothing (left join): `right == 0` with
-//! `left > 0` is simply a null sub side. The invariant to hold is the
-//! other direction — `left == 0` implies the value has no rows on the
-//! right. Registration runs one storage query for the main part and then
-//! **one** query per sub part with the full `IN` list (no per-value
-//! loops), returning the whole snapshot as operations.
+//! # Order
 //!
-//! Clients keep one frame per part plus the join spec and compose the
-//! joined view themselves; updates arrive as
-//! `(query, table, part, operation)` — the table names where the delta
-//! lands, the part disambiguates self-joins.
+//! Registration is a post-order walk: a node's RIGHT children register
+//! first (their rows supply its `IN` values), then the node, then its LEFT
+//! children (restricted by the node's rows); during that walk crossings
+//! only record counts, since every part is registered with its full list.
+//! Within one write, each part's native operations are forwarded with
+//! every **driven part before its driver** — LEFT children before their
+//! parent, a RIGHT child after its parent — because handling a driver's
+//! operation may fetch into or prune the driven frame, and a stale driven
+//! operation forwarded after that prune would resurrect a row on the
+//! client. An in-place replacement arrives as an adjacent `Delete(old)` +
+//! `Add(new)` pair and is diffed per edge, so a rewrite that keeps a join
+//! value never swings its count through zero.
+//!
+//! Part ids are `{uuid}_r` for the root and `{uuid}_r_{i}_{j}…` down the
+//! path; they are looked up in a map, never parsed.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use super::stats::IvmStats;
 use super::storage::Storage;
-use super::{IvmStats, QueryId, SingleTableIVM};
+use super::{QueryId, SingleTableIVM, SingleTableUpdate};
 use crate::model::{
     ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow,
-    LeftJoin, MultiTableReadQuery, SingleTableReadQuery, TableName, Value, Where, WriteQuery,
+    MultiTableReadQuery, SingleTableReadQuery, TableName, Value, Where, WriteQuery,
 };
 
-/// Which part of a multi-table subscription an operation belongs to — the
-/// client patches the corresponding frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum QueryPart {
-    Main,
-    Join(usize),
+/// Which node of a subscription's join tree a part is: the path of join
+/// indices from the root, a node's left joins numbered first and its right
+/// joins after them. The root is the empty path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct QueryPart(pub Vec<usize>);
+
+impl QueryPart {
+    /// The root part.
+    pub fn main() -> Self {
+        QueryPart(Vec::new())
+    }
+
+    /// The root's `index`-th join.
+    pub fn join(index: usize) -> Self {
+        QueryPart(vec![index])
+    }
+
+    /// Whether this is the root.
+    pub fn is_main(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The join index of a first-level part; `None` for the root and for
+    /// nested parts.
+    pub fn join_index(&self) -> Option<usize> {
+        match self.0.as_slice() {
+            [index] => Some(*index),
+            _ => None,
+        }
+    }
+
+    /// The `index`-th child of this part.
+    fn child(&self, index: usize) -> Self {
+        let mut path = self.0.clone();
+        path.push(index);
+        QueryPart(path)
+    }
 }
 
 /// One operation for one part of one multi-table subscription — the unit
 /// the transport pushes to the subscribed client.
 ///
 /// - `query`: which subscription (the external id the client registered).
-/// - `table`: the table the operation lands on — what a client keying its
-///   local frames by table applies it to.
-/// - `part`: which part of the query produced it — kept beside the table
+/// - `table`: the table the operation lands on.
+/// - `part`: which node of the tree produced it — kept beside the table
 ///   because a self-join makes the table alone ambiguous.
 /// - `op`: the delta itself.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,39 +125,22 @@ pub struct MultiTableUpdate {
     pub op: DataFrameOperation,
 }
 
-impl MultiTableUpdate {
-    /// Assemble one update, deriving the destination table from the
-    /// part's position in the spec.
-    fn new(
-        spec: &MultiTableReadQuery,
-        query: QueryId,
-        part: QueryPart,
-        op: DataFrameOperation,
-    ) -> Self {
-        let table = match part {
-            QueryPart::Main => spec.main_table.table.clone(),
-            QueryPart::Join(index) => spec.left_joins[index].sub_table.table.clone(),
-        };
-        MultiTableUpdate {
-            query,
-            table,
-            part,
-            op,
-        }
-    }
+/// Which side of an edge is preserved: LEFT keeps the parent (the parent
+/// drives), RIGHT keeps the child (the child drives).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinKind {
+    Left,
+    Right,
 }
 
-/// Per-join reference state of one subscription.
+/// Per-edge reference state.
 ///
-/// - `left`: how many main rows carry each join value.
-/// - `right`: how many sub rows the join's part holds per value; purely
-///   observational under left-join semantics (zero is a valid steady
-///   state), kept for the `left == 0 ⇒ right == 0` invariant and for
-///   future join flavors.
-/// - `referenced`: the values with `left > 0`, in first-referenced order —
-///   the deterministic `IN` list registered into the sub part's filter.
+/// - `left`: how many driver rows carry each join value.
+/// - `right`: how many driven rows the driven part holds per value;
+///   observational, kept for the `left == 0 ⇒ right == 0` invariant.
+/// - `referenced`: the values with `left > 0`, in first-referenced order.
 ///
-/// Entries leave `left`/`right` when they reach zero, so the maps only
+/// Entries leave `left` / `right` when they reach zero, so the maps only
 /// hold live values.
 #[derive(Default)]
 struct JoinKeyCounts {
@@ -119,36 +149,94 @@ struct JoinKeyCounts {
     referenced: Vec<Value>,
 }
 
-/// The join layer. Owns the inner [`SingleTableIVM`] exclusively, so the
-/// deterministic `{uuid}_{part}` id scheme cannot collide with anything
-/// registered from outside; storage lives inside the inner engine.
+/// One join edge of a registered tree, with its direction made explicit
+/// through [`Edge::driven`].
+struct Edge {
+    kind: JoinKind,
+    parent: QueryPart,
+    child: QueryPart,
+    parent_column: ColumnName,
+    child_column: ColumnName,
+    counts: JoinKeyCounts,
+}
+
+impl Edge {
+    /// The part whose filter carries this edge's `IN` leaf.
+    fn driven(&self) -> &QueryPart {
+        match self.kind {
+            JoinKind::Left => &self.child,
+            JoinKind::Right => &self.parent,
+        }
+    }
+
+    /// The column the `IN` leaf is on.
+    fn driven_column(&self) -> &ColumnName {
+        match self.kind {
+            JoinKind::Left => &self.child_column,
+            JoinKind::Right => &self.parent_column,
+        }
+    }
+
+    /// The join column of `part`, which must be one end of the edge.
+    fn column_of(&self, part: &QueryPart) -> &ColumnName {
+        if *part == self.parent {
+            &self.parent_column
+        } else {
+            &self.child_column
+        }
+    }
+}
+
+/// One node of a registered tree: its inner part and its place among the
+/// edges.
+struct Node {
+    part_id: QueryId,
+    query: SingleTableReadQuery,
+    parent: Option<usize>,
+    children: Vec<usize>,
+    registered: bool,
+}
+
+/// One registered multi-table subscription.
+///
+/// - `spec`: the tree as registered.
+/// - `nodes`: every part by path.
+/// - `edges`: every join edge; nodes refer to them by index.
+/// - `rank`: forwarding order of the parts, every driven part before its
+///   driver (see the module docs).
+struct Tree {
+    spec: Rc<MultiTableReadQuery>,
+    nodes: HashMap<QueryPart, Node>,
+    edges: Vec<Edge>,
+    rank: HashMap<QueryPart, usize>,
+}
+
+/// The join layer. Owns the inner [`SingleTableIVM`] exclusively, so its
+/// part ids cannot collide with anything registered from outside; storage
+/// lives inside the inner engine.
 ///
 /// - `single`: the inner engine holding every part's routing and the
 ///   shared per-table frames.
-/// - `select_queries`: external id → the multi-table spec (shared, cheap
-///   to clone per update).
-/// - `join_state`: external id → one `JoinKeyCounts` per join, parallel to
-///   the spec's `left_joins`.
+/// - `trees`: external id → the registered tree.
+/// - `parts`: inner part id → (external id, part), the reverse map every
+///   routed operation goes through.
 pub struct MultiTableIVM {
     single: SingleTableIVM,
-    select_queries: HashMap<QueryId, Rc<MultiTableReadQuery>>,
-    join_state: HashMap<QueryId, Vec<JoinKeyCounts>>,
+    trees: HashMap<QueryId, Tree>,
+    parts: HashMap<QueryId, (QueryId, QueryPart)>,
 }
 
-/// The internal id of part `part` of subscription `uuid`.
-fn part_id(uuid: &QueryId, part: usize) -> QueryId {
-    QueryId::from(format!("{uuid}_{part}"))
-}
-
-/// Recover `(external id, part index)` from an internal part id.
-///
-/// Unambiguous even for external ids that themselves contain underscores:
-/// `part_id` appends exactly one `_{part}` suffix and this strips exactly
-/// one (`rsplit_once`), and the join layer owns its inner engine
-/// exclusively, so every inner id was built by `part_id`.
-fn split_part_id(internal: &QueryId) -> Option<(QueryId, usize)> {
-    let (base, suffix) = internal.as_str().rsplit_once('_')?;
-    Some((QueryId::from(base), suffix.parse().ok()?))
+/// The inner id of part `part` of subscription `uuid`: the external id, a
+/// `_r` marker, then one `_{index}` per step of the path. Distinct
+/// (subscription, part) pairs never collide, whatever the external ids
+/// contain, because the path segments are digits only.
+fn part_id(uuid: &QueryId, part: &QueryPart) -> QueryId {
+    let mut id = format!("{uuid}_r");
+    for index in &part.0 {
+        id.push('_');
+        id.push_str(&index.to_string());
+    }
+    QueryId::from(id)
 }
 
 /// The row's value in `column`; a missing column joins like `NULL` (never).
@@ -156,30 +244,143 @@ fn join_value(row: &DataFrameRow, column: &ColumnName) -> Value {
     row.data.get(column.as_str()).cloned().unwrap_or(Value::Null)
 }
 
-/// The sub part's join condition: rows attach only while their join value
-/// is among the currently referenced ones. An empty list matches nothing.
-fn in_condition(join: &LeftJoin, referenced: &[Value]) -> Condition {
+/// The `IN` leaf restricting a driven part to the referenced values; an
+/// empty list matches nothing.
+fn in_condition(column: &ColumnName, values: &[Value]) -> Condition {
     Condition::new(
-        join.sub_table_column.clone(),
+        column.clone(),
         ComparisonOperator::IN,
-        Value::List(referenced.to_vec()),
+        Value::List(values.to_vec()),
     )
 }
 
-/// The sub part's registered query: the join's own `WHERE` narrowed to
-/// the currently referenced values — the join condition made part of the
-/// filter, so sub-table writes route natively — with the limit normalized
-/// away (a `LIMIT` on a join's sub side has no SQL meaning: it would cap
-/// the whole side across every referenced value).
-fn sub_query_for(join: &LeftJoin, referenced: &[Value]) -> SingleTableReadQuery {
-    SingleTableReadQuery {
-        filter: Where::AND(vec![
-            join.sub_table.filter.clone(),
-            Where::Condition(in_condition(join, referenced)),
-        ]),
-        limit: u32::MAX,
-        ..join.sub_table.clone()
+/// Build the node and edge tables of a spec.
+fn build_tree(uuid: &QueryId, spec: &MultiTableReadQuery) -> Tree {
+    let mut tree = Tree {
+        spec: Rc::new(spec.clone()),
+        nodes: HashMap::new(),
+        edges: Vec::new(),
+        rank: HashMap::new(),
+    };
+    add_node(&mut tree, uuid, spec, QueryPart::main(), None);
+    let mut order = Vec::new();
+    forwarding_order(&tree, &QueryPart::main(), &mut order);
+    tree.rank = order
+        .into_iter()
+        .enumerate()
+        .map(|(rank, part)| (part, rank))
+        .collect();
+    tree
+}
+
+/// Add `spec`'s node at `part` and, recursively, its children.
+fn add_node(
+    tree: &mut Tree,
+    uuid: &QueryId,
+    spec: &MultiTableReadQuery,
+    part: QueryPart,
+    parent: Option<usize>,
+) {
+    let mut node = Node {
+        part_id: part_id(uuid, &part),
+        query: spec.main_table.clone(),
+        parent,
+        children: Vec::new(),
+        registered: false,
+    };
+    let joins = spec
+        .left_joins
+        .iter()
+        .map(|join| (JoinKind::Left, join))
+        .chain(spec.right_joins.iter().map(|join| (JoinKind::Right, join)));
+    for (index, (kind, join)) in joins.enumerate() {
+        let child = part.child(index);
+        let edge = tree.edges.len();
+        tree.edges.push(Edge {
+            kind,
+            parent: part.clone(),
+            child: child.clone(),
+            parent_column: join.main_table_column.clone(),
+            child_column: join.sub_table_column.clone(),
+            counts: JoinKeyCounts::default(),
+        });
+        node.children.push(edge);
+        add_node(tree, uuid, &join.sub, child, Some(edge));
     }
+    tree.nodes.insert(part, node);
+}
+
+/// Append the subtree at `part` in forwarding order: LEFT subtrees (driven
+/// by this node) first, the node, then RIGHT subtrees (which drive it).
+fn forwarding_order(tree: &Tree, part: &QueryPart, out: &mut Vec<QueryPart>) {
+    let node = &tree.nodes[part];
+    for &edge in &node.children {
+        if tree.edges[edge].kind == JoinKind::Left {
+            forwarding_order(tree, &tree.edges[edge].child, out);
+        }
+    }
+    out.push(part.clone());
+    for &edge in &node.children {
+        if tree.edges[edge].kind == JoinKind::Right {
+            forwarding_order(tree, &tree.edges[edge].child, out);
+        }
+    }
+}
+
+/// The edges driving `part` on `column`, in edge order.
+fn driving_edges(tree: &Tree, part: &QueryPart, column: &ColumnName) -> Vec<usize> {
+    tree.edges
+        .iter()
+        .enumerate()
+        .filter(|(_, edge)| edge.driven() == part && edge.driven_column() == column)
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// The values of `part`'s `IN` leaf on `column`: the intersection of the
+/// referenced lists of every edge driving it there, in the first edge's
+/// order.
+fn leaf_values(tree: &Tree, part: &QueryPart, column: &ColumnName) -> Vec<Value> {
+    let driving = driving_edges(tree, part, column);
+    let Some((first, rest)) = driving.split_first() else {
+        return Vec::new();
+    };
+    tree.edges[*first]
+        .counts
+        .referenced
+        .iter()
+        .filter(|value| {
+            rest.iter()
+                .all(|edge| tree.edges[*edge].counts.left.contains_key(*value))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The distinct columns on which `part` is driven, in edge order.
+fn driven_columns(tree: &Tree, part: &QueryPart) -> Vec<ColumnName> {
+    let mut columns: Vec<ColumnName> = Vec::new();
+    for edge in &tree.edges {
+        if edge.driven() == part && !columns.contains(edge.driven_column()) {
+            columns.push(edge.driven_column().clone());
+        }
+    }
+    columns
+}
+
+/// What `part` does on each edge it touches: `(edge, drives, column)`
+/// where `drives` says whether the part is the edge's driver and `column`
+/// is the part's own join column on that edge.
+fn edge_steps(tree: &Tree, part: &QueryPart) -> Vec<(usize, bool, ColumnName)> {
+    let node = &tree.nodes[part];
+    node.children
+        .iter()
+        .chain(node.parent.iter())
+        .map(|&edge| {
+            let e = &tree.edges[edge];
+            (edge, e.driven() != part, e.column_of(part).clone())
+        })
+        .collect()
 }
 
 impl MultiTableIVM {
@@ -188,18 +389,14 @@ impl MultiTableIVM {
     pub fn new(storage: Rc<dyn Storage>) -> Self {
         MultiTableIVM {
             single: SingleTableIVM::new(storage),
-            select_queries: HashMap::new(),
-            join_state: HashMap::new(),
+            trees: HashMap::new(),
+            parts: HashMap::new(),
         }
     }
 
     /// Register a multi-table subscription under `query_uuid`, returning
-    /// its initial snapshot as operations.
-    ///
-    /// The main part registers first and loads its result set from
-    /// storage; its rows seed the `left` counts and the per-join `IN`
-    /// lists; each sub part then registers with its narrowed filter and
-    /// loads its rows in a single storage query. Re-registering the
+    /// its initial snapshot as operations, parts in registration order
+    /// (post-order over the tree; see the module docs). Re-registering the
     /// identical spec is a no-op returning no operations; a changed spec
     /// replaces the subscription.
     pub fn register_query(
@@ -209,147 +406,159 @@ impl MultiTableIVM {
     ) -> Vec<MultiTableUpdate> {
         let query_uuid = query_uuid.into();
         if self
-            .select_queries
+            .trees
             .get(&query_uuid)
-            .is_some_and(|existing| **existing == query)
+            .is_some_and(|tree| *tree.spec == query)
         {
             return Vec::new();
         }
-        if self.select_queries.contains_key(&query_uuid) {
+        if self.trees.contains_key(&query_uuid) {
             self.unregister_query(query_uuid.as_str());
         }
-
-        let main_ops =
-            self.single
-                .register_query(part_id(&query_uuid, 0), query.main_table.clone(), None);
-        self.join_state.insert(
-            query_uuid.clone(),
-            query
-                .left_joins
-                .iter()
-                .map(|_| JoinKeyCounts::default())
-                .collect(),
-        );
-
+        let tree = build_tree(&query_uuid, &query);
+        for (part, node) in &tree.nodes {
+            self.parts
+                .insert(node.part_id.clone(), (query_uuid.clone(), part.clone()));
+        }
+        self.trees.insert(query_uuid.clone(), tree);
         let mut out = Vec::new();
-        for op in main_ops {
-            if let DataFrameOperation::Add(_, row) = &op {
-                for (index, join) in query.left_joins.iter().enumerate() {
-                    let value = join_value(row, &join.main_table_column);
-                    if self.left_bump(&query_uuid, index, value.clone()) {
-                        self.push_reference(&query_uuid, index, value);
-                    }
-                }
-            }
-            out.push(MultiTableUpdate::new(
-                &query,
-                query_uuid.clone(),
-                QueryPart::Main,
-                op,
-            ));
-        }
-        for (index, join) in query.left_joins.iter().enumerate() {
-            let referenced = self.referenced(&query_uuid, index);
-            let sub_ops = self.single.register_query(
-                part_id(&query_uuid, index + 1),
-                sub_query_for(join, &referenced),
-                None,
-            );
-            for op in sub_ops {
-                if let DataFrameOperation::Add(_, row) = &op {
-                    self.right_bump(
-                        &query_uuid,
-                        index,
-                        join_value(row, &join.sub_table_column),
-                    );
-                }
-                out.push(MultiTableUpdate::new(
-                    &query,
-                    query_uuid.clone(),
-                    QueryPart::Join(index),
-                    op,
-                ));
-            }
-        }
-
-        self.select_queries.insert(query_uuid, Rc::new(query));
+        self.register_part(&query_uuid, QueryPart::main(), &mut out);
         out
+    }
+
+    /// Register the subtree at `part` in post-order: RIGHT children, the
+    /// node itself with its full `IN` restrictions, then LEFT children.
+    fn register_part(&mut self, uuid: &QueryId, part: QueryPart, out: &mut Vec<MultiTableUpdate>) {
+        let (right_children, left_children, own, part_id) = {
+            let tree = &self.trees[uuid];
+            let node = &tree.nodes[&part];
+            let children = |kind: JoinKind| -> Vec<QueryPart> {
+                node.children
+                    .iter()
+                    .filter(|&&edge| tree.edges[edge].kind == kind)
+                    .map(|&edge| tree.edges[edge].child.clone())
+                    .collect()
+            };
+            (
+                children(JoinKind::Right),
+                children(JoinKind::Left),
+                node.query.clone(),
+                node.part_id.clone(),
+            )
+        };
+        for child in right_children {
+            self.register_part(uuid, child, out);
+        }
+        let limit = if part.is_main() { own.limit } else { u32::MAX };
+        let query = SingleTableReadQuery {
+            filter: self.restricted_filter(uuid, &part),
+            limit,
+            ..own.clone()
+        };
+        let ops = self.single.register_query(part_id, query, None);
+        if let Some(node) = self
+            .trees
+            .get_mut(uuid)
+            .and_then(|tree| tree.nodes.get_mut(&part))
+        {
+            node.registered = true;
+        }
+        for op in ops {
+            out.push(MultiTableUpdate {
+                query: uuid.clone(),
+                table: own.table.clone(),
+                part: part.clone(),
+                op: op.clone(),
+            });
+            if let DataFrameOperation::Add(_, row) = &op {
+                self.arrived(uuid, &part, row, out);
+            }
+        }
+        for child in left_children {
+            self.register_part(uuid, child, out);
+        }
+    }
+
+    /// A part's registered filter: its own `WHERE` plus one `IN` leaf per
+    /// column it is driven on.
+    fn restricted_filter(&self, uuid: &QueryId, part: &QueryPart) -> Where {
+        let tree = &self.trees[uuid];
+        let mut parts = vec![tree.nodes[part].query.filter.clone()];
+        for column in driven_columns(tree, part) {
+            let values = leaf_values(tree, part, &column);
+            parts.push(Where::Condition(in_condition(&column, &values)));
+        }
+        Where::AND(parts)
     }
 
     /// Remove a multi-table subscription: every inner part and its join
     /// state. Unknown ids are a no-op.
     pub fn unregister_query(&mut self, query_uuid: &str) {
-        let Some(spec) = self.select_queries.remove(query_uuid) else {
+        let Some(tree) = self.trees.remove(query_uuid) else {
             return;
         };
-        let uuid = QueryId::from(query_uuid);
-        for part in 0..=spec.left_joins.len() {
-            self.single.unregister_query(part_id(&uuid, part).as_str());
+        for node in tree.nodes.values() {
+            self.single.unregister_query(node.part_id.as_str());
+            self.parts.remove(&node.part_id);
         }
-        self.join_state.remove(query_uuid);
     }
 
     /// Route one write through the inner engine and forward the resulting
-    /// per-part operations, maintaining the join state on the way: main
-    /// operations adjust `left` counts (zero crossings widen or narrow the
-    /// sub parts' `IN` lists, fetching or pruning their rows); sub
-    /// operations only adjust `right` counts, because the registered `IN`
-    /// condition already routed them correctly.
-    ///
-    /// An in-place main-row replacement arrives from the inner engine as
-    /// an adjacent `Delete(old)` + `Add(new)` pair for the same key; the
-    /// pair is recognized and its join values *diffed*, so a rewrite that
-    /// keeps a join value does not swing that value's `left` count through
-    /// zero (which would prune and refetch its sub rows for nothing).
-    ///
-    /// Sub-part operations are forwarded **before** main-part ones: they
-    /// were captured against the pre-write `IN` lists, while handling a
-    /// main operation can mutate the very same sub frames (fetch on a new
-    /// reference, prune on a released one). In a self-join — the same
-    /// table as main and sub — one write produces both kinds, and
-    /// forwarding a stale sub `Add` after the prune's `Delete` would
-    /// resurrect the row on the client; sub-first keeps every emission
-    /// consistent with the frame at its moment.
+    /// per-part operations, maintaining the join state on the way (see the
+    /// module docs for the order and the replace-pair diffing).
     pub fn incremental_update(&mut self, write: &WriteQuery) -> Vec<MultiTableUpdate> {
         let applied = self.single.incremental_update(write);
-        let (sub_ops, main_ops): (Vec<_>, Vec<_>) = applied
-            .into_iter()
-            .partition(|update| {
-                split_part_id(&update.query).is_some_and(|(_, part)| part != 0)
-            });
+        let mut tagged: Vec<(QueryId, usize, QueryPart, SingleTableUpdate)> = Vec::new();
+        for update in applied {
+            let Some((uuid, part)) = self.parts.get(&update.query).cloned() else {
+                continue;
+            };
+            let Some(rank) = self
+                .trees
+                .get(&uuid)
+                .and_then(|tree| tree.rank.get(&part).copied())
+            else {
+                continue;
+            };
+            tagged.push((uuid, rank, part, update));
+        }
+        tagged.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
         let mut out = Vec::new();
-        for update in sub_ops {
-            let Some((uuid, part)) = split_part_id(&update.query) else {
-                continue;
-            };
-            let Some(spec) = self.select_queries.get(&uuid).cloned() else {
-                continue;
-            };
-            if part - 1 < spec.left_joins.len() {
-                self.handle_sub_op(&uuid, &spec, part - 1, update.op, &mut out);
-            }
-        }
-        let mut main_ops = main_ops.into_iter().peekable();
-        while let Some(update) = main_ops.next() {
-            let Some((uuid, _)) = split_part_id(&update.query) else {
-                continue;
-            };
-            let Some(spec) = self.select_queries.get(&uuid).cloned() else {
-                continue;
-            };
-            let paired_add = match (&update.op, main_ops.peek()) {
-                (DataFrameOperation::Delete(key, _), Some(next))
+        let mut updates = tagged.into_iter().peekable();
+        while let Some((uuid, _, part, update)) = updates.next() {
+            let paired_add = match (&update.op, updates.peek()) {
+                (DataFrameOperation::Delete(key, _), Some((_, _, _, next)))
                     if next.query == update.query
                         && matches!(&next.op, DataFrameOperation::Add(next_key, _) if next_key == key) =>
                 {
-                    Some(main_ops.next().expect("peeked just above").op)
+                    Some(updates.next().expect("peeked just above").3.op)
                 }
                 _ => None,
             };
-            match paired_add {
-                Some(add) => self.handle_main_replace(&uuid, &spec, update.op, add, &mut out),
-                None => self.handle_main_op(&uuid, &spec, update.op, &mut out),
+            let forward = |op: DataFrameOperation| MultiTableUpdate {
+                query: uuid.clone(),
+                table: update.table.clone(),
+                part: part.clone(),
+                op,
+            };
+            match (update.op.clone(), paired_add) {
+                (DataFrameOperation::Delete(key, old), Some(add)) => {
+                    let new = add.row().clone();
+                    out.push(forward(DataFrameOperation::Delete(key, old.clone())));
+                    out.push(forward(add));
+                    self.replaced(&uuid, &part, &old, &new, &mut out);
+                }
+                (op @ DataFrameOperation::Add(_, _), _) => {
+                    let row = op.row().clone();
+                    out.push(forward(op));
+                    self.arrived(&uuid, &part, &row, &mut out);
+                }
+                (op @ DataFrameOperation::Delete(_, _), None) => {
+                    let row = op.row().clone();
+                    out.push(forward(op));
+                    self.departed(&uuid, &part, &row, &mut out);
+                }
             }
         }
         out
@@ -357,18 +566,14 @@ impl MultiTableIVM {
 
     /// The rows currently held for one part of a subscription — key →
     /// image, an inspection view for tests and debugging. `None` for
-    /// unknown ids.
+    /// unknown ids or parts.
     pub fn rows_for(
         &self,
         query_uuid: &str,
         part: QueryPart,
     ) -> Option<HashMap<DataFrameKey, DataFrameRow>> {
-        let index = match part {
-            QueryPart::Main => 0,
-            QueryPart::Join(join_index) => join_index + 1,
-        };
-        self.single
-            .rows_for(part_id(&QueryId::from(query_uuid), index).as_str())
+        let node = self.trees.get(query_uuid)?.nodes.get(&part)?;
+        self.single.rows_for(node.part_id.as_str())
     }
 
     /// The inner engine's routing counters.
@@ -376,302 +581,239 @@ impl MultiTableIVM {
         self.single.stats()
     }
 
-    /// A standalone main-part change: forward it as-is (left join —
-    /// visibility is the main `WHERE` alone), then reference the new
-    /// image's join values on an `Add` or release the removed image's on a
-    /// `Delete`.
-    fn handle_main_op(
-        &mut self,
-        uuid: &QueryId,
-        spec: &Rc<MultiTableReadQuery>,
-        op: DataFrameOperation,
-        out: &mut Vec<MultiTableUpdate>,
-    ) {
-        match op {
-            DataFrameOperation::Add(key, row) => {
-                out.push(MultiTableUpdate::new(
-                    spec,
-                    uuid.clone(),
-                    QueryPart::Main,
-                    DataFrameOperation::Add(key, row.clone()),
-                ));
-                for (index, join) in spec.left_joins.iter().enumerate() {
-                    let value = join_value(&row, &join.main_table_column);
-                    self.reference_value(uuid, spec, index, value, out);
-                }
-            }
-            DataFrameOperation::Delete(key, row) => {
-                out.push(MultiTableUpdate::new(
-                    spec,
-                    uuid.clone(),
-                    QueryPart::Main,
-                    DataFrameOperation::Delete(key, row.clone()),
-                ));
-                for (index, join) in spec.left_joins.iter().enumerate() {
-                    let old = join_value(&row, &join.main_table_column);
-                    self.release_value(uuid, spec, index, &old, out);
-                }
+    /// A row now held by `part`: reference its join value on every edge
+    /// the part drives, count it on every edge the part is driven by.
+    fn arrived(&mut self, uuid: &QueryId, part: &QueryPart, row: &DataFrameRow, out: &mut Vec<MultiTableUpdate>) {
+        for (edge, drives, column) in edge_steps(&self.trees[uuid], part) {
+            let value = join_value(row, &column);
+            if drives {
+                self.reference(uuid, edge, value, out);
+            } else {
+                self.right_bump(uuid, edge, value);
             }
         }
     }
 
-    /// An in-place main-row replacement (`Delete(old)` + `Add(new)`, same
-    /// key): forward both operations, then move `left` references only for
-    /// joins whose value actually changed — the new value referenced
-    /// first, the old released after.
-    fn handle_main_replace(
+    /// A row no longer held by `part`: the mirror of [`Self::arrived`].
+    fn departed(&mut self, uuid: &QueryId, part: &QueryPart, row: &DataFrameRow, out: &mut Vec<MultiTableUpdate>) {
+        for (edge, drives, column) in edge_steps(&self.trees[uuid], part) {
+            let value = join_value(row, &column);
+            if drives {
+                self.release(uuid, edge, &value, out);
+            } else {
+                self.right_drop(uuid, edge, &value);
+            }
+        }
+    }
+
+    /// A row of `part` replaced in place: move references only on edges
+    /// whose join value actually changed — the new value referenced first,
+    /// the old released after — so a kept value never crosses zero.
+    fn replaced(
         &mut self,
         uuid: &QueryId,
-        spec: &Rc<MultiTableReadQuery>,
-        delete: DataFrameOperation,
-        add: DataFrameOperation,
+        part: &QueryPart,
+        old: &DataFrameRow,
+        new: &DataFrameRow,
         out: &mut Vec<MultiTableUpdate>,
     ) {
-        let old_row = delete.row().clone();
-        let new_row = add.row().clone();
-        out.push(MultiTableUpdate::new(
-            spec,
-            uuid.clone(),
-            QueryPart::Main,
-            delete,
-        ));
-        out.push(MultiTableUpdate::new(
-            spec,
-            uuid.clone(),
-            QueryPart::Main,
-            add,
-        ));
-        for (index, join) in spec.left_joins.iter().enumerate() {
-            let new_value = join_value(&new_row, &join.main_table_column);
-            let old_value = join_value(&old_row, &join.main_table_column);
+        for (edge, drives, column) in edge_steps(&self.trees[uuid], part) {
+            let old_value = join_value(old, &column);
+            let new_value = join_value(new, &column);
             if old_value == new_value {
                 continue;
             }
-            self.reference_value(uuid, spec, index, new_value, out);
-            self.release_value(uuid, spec, index, &old_value, out);
+            if drives {
+                self.reference(uuid, edge, new_value, out);
+                self.release(uuid, edge, &old_value, out);
+            } else {
+                self.right_drop(uuid, edge, &old_value);
+                self.right_bump(uuid, edge, new_value);
+            }
         }
     }
 
-    /// A sub-part change: forward it as-is — the registered `IN` condition
-    /// already decided relevance — and keep the `right` counts current: an
-    /// `Add` bumps its image's join value, a `Delete` drops its removed
-    /// image's (a replacement's adjacent pair nets to a move between
-    /// values).
-    fn handle_sub_op(
-        &mut self,
-        uuid: &QueryId,
-        spec: &Rc<MultiTableReadQuery>,
-        join_index: usize,
-        op: DataFrameOperation,
-        out: &mut Vec<MultiTableUpdate>,
-    ) {
-        let column = &spec.left_joins[join_index].sub_table_column;
-        match &op {
-            DataFrameOperation::Add(_, row) => {
-                self.right_bump(uuid, join_index, join_value(row, column));
-            }
-            DataFrameOperation::Delete(_, row) => {
-                self.right_drop(uuid, join_index, &join_value(row, column));
-            }
-        }
-        out.push(MultiTableUpdate::new(
-            spec,
-            uuid.clone(),
-            QueryPart::Join(join_index),
-            op,
-        ));
-    }
-
-    /// A main row now carries `value` on join `join_index`: bump `left`,
-    /// and on a 0 → 1 crossing widen the sub part's `IN` condition in
-    /// place and fetch the value's sub rows (one narrowed storage query),
-    /// forwarding their `Add`s.
-    fn reference_value(
-        &mut self,
-        uuid: &QueryId,
-        spec: &Rc<MultiTableReadQuery>,
-        join_index: usize,
-        value: Value,
-        out: &mut Vec<MultiTableUpdate>,
-    ) {
-        let before = self.referenced(uuid, join_index);
-        if !self.left_bump(uuid, join_index, value.clone()) {
+    /// A driver row now carries `value` on `edge`: bump `left`, and when
+    /// that is the 0 → 1 crossing and it changes the driven part's `IN` leaf, widen the leaf in place,
+    /// fetch the value's driven rows (one narrowed storage query), forward
+    /// them, and let them arrive at the driven node. During registration
+    /// the driven part may not exist yet; only the counts are kept then.
+    fn reference(&mut self, uuid: &QueryId, edge: usize, value: Value, out: &mut Vec<MultiTableUpdate>) {
+        if self.left_count(uuid, edge, &value) > 0 {
+            self.left_bump(uuid, edge, value);
             return;
         }
-        let join = &spec.left_joins[join_index];
-        self.push_reference(uuid, join_index, value.clone());
-        let referenced = self.referenced(uuid, join_index);
-        let sub_part = part_id(uuid, join_index + 1);
-        self.single.replace_condition(
-            sub_part.as_str(),
-            &in_condition(join, &before),
-            in_condition(join, &referenced),
-        );
-        let adds = self.single.fetch(
-            sub_part.as_str(),
-            join.sub_table_column.as_str(),
-            std::slice::from_ref(&value),
-        );
-        self.single.mark_reconciled(sub_part.as_str());
-        for op in adds {
-            if let DataFrameOperation::Add(_, row) = &op {
-                self.right_bump(uuid, join_index, join_value(row, &join.sub_table_column));
-            }
-            out.push(MultiTableUpdate::new(
-                spec,
-                uuid.clone(),
-                QueryPart::Join(join_index),
-                op,
-            ));
-        }
-    }
-
-    /// A main row no longer carries `value` on join `join_index`: drop
-    /// `left`, and on a crossing to 0 narrow the sub part's `IN` condition
-    /// in place and prune its held rows from the current data — no storage
-    /// round-trip — forwarding their `Delete`s.
-    fn release_value(
-        &mut self,
-        uuid: &QueryId,
-        spec: &Rc<MultiTableReadQuery>,
-        join_index: usize,
-        value: &Value,
-        out: &mut Vec<MultiTableUpdate>,
-    ) {
-        let before = self.referenced(uuid, join_index);
-        if !self.left_drop(uuid, join_index, value) {
+        let (driven, column) = self.driven_end(uuid, edge);
+        let before = leaf_values(&self.trees[uuid], &driven, &column);
+        self.left_bump(uuid, edge, value.clone());
+        self.push_reference(uuid, edge, value.clone());
+        let after = leaf_values(&self.trees[uuid], &driven, &column);
+        let Some((part_id, table)) = self.registered_part(uuid, &driven) else {
             return;
-        }
-        let join = &spec.left_joins[join_index];
-        self.pull_reference(uuid, join_index, value);
-        let referenced = self.referenced(uuid, join_index);
-        let sub_part = part_id(uuid, join_index + 1);
-        self.single.replace_condition(
-            sub_part.as_str(),
-            &in_condition(join, &before),
-            in_condition(join, &referenced),
-        );
-        let deletes = self.single.delete_rows(
-            sub_part.as_str(),
-            join.sub_table_column.as_str(),
-            std::slice::from_ref(value),
-        );
-        self.single.mark_reconciled(sub_part.as_str());
-        for op in deletes {
-            self.right_drop(uuid, join_index, value);
-            out.push(MultiTableUpdate::new(
-                spec,
-                uuid.clone(),
-                QueryPart::Join(join_index),
-                op,
-            ));
-        }
-    }
-
-    /// The current `IN` list of join `join_index`, in first-referenced
-    /// order.
-    fn referenced(&self, uuid: &QueryId, join_index: usize) -> Vec<Value> {
-        self.join_state
-            .get(uuid)
-            .and_then(|joins| joins.get(join_index))
-            .map(|join| {
-                debug_assert!(
-                    join.referenced.len() == join.left.len(),
-                    "the IN list must mirror exactly the values with left > 0"
-                );
-                join.referenced.clone()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Append a newly referenced value to join `join_index`'s `IN` list.
-    fn push_reference(&mut self, uuid: &QueryId, join_index: usize, value: Value) {
-        if let Some(join) = self
-            .join_state
-            .get_mut(uuid)
-            .and_then(|joins| joins.get_mut(join_index))
-            && !join.referenced.contains(&value) {
-                join.referenced.push(value);
-            }
-    }
-
-    /// Remove a no-longer-referenced value from join `join_index`'s `IN`
-    /// list.
-    fn pull_reference(&mut self, uuid: &QueryId, join_index: usize, value: &Value) {
-        if let Some(join) = self
-            .join_state
-            .get_mut(uuid)
-            .and_then(|joins| joins.get_mut(join_index))
-        {
-            join.referenced.retain(|candidate| candidate != value);
-        }
-    }
-
-    /// Increment `value`'s `left` count on join `join_index`; reports
-    /// whether this was the 0 → 1 crossing.
-    fn left_bump(&mut self, uuid: &QueryId, join_index: usize, value: Value) -> bool {
-        let Some(join) = self
-            .join_state
-            .get_mut(uuid)
-            .and_then(|joins| joins.get_mut(join_index))
-        else {
-            return false;
         };
-        let count = join.left.entry(value).or_insert(0);
-        *count += 1;
-        *count == 1
-    }
-
-    /// Decrement `value`'s `left` count on join `join_index`; reports
-    /// whether it reached zero (the entry is removed when it does).
-    fn left_drop(&mut self, uuid: &QueryId, join_index: usize, value: &Value) -> bool {
-        Self::drop_in(
-            self.join_state
-                .get_mut(uuid)
-                .and_then(|joins| joins.get_mut(join_index))
-                .map(|join| &mut join.left),
-            value,
-        )
-    }
-
-    /// Increment `value`'s `right` count on join `join_index`.
-    fn right_bump(&mut self, uuid: &QueryId, join_index: usize, value: Value) {
-        if let Some(join) = self
-            .join_state
-            .get_mut(uuid)
-            .and_then(|joins| joins.get_mut(join_index))
-        {
-            *join.right.entry(value).or_insert(0) += 1;
+        if before == after {
+            return;
+        }
+        self.single.replace_condition(
+            part_id.as_str(),
+            &in_condition(&column, &before),
+            in_condition(&column, &after),
+        );
+        let adds = self
+            .single
+            .fetch(part_id.as_str(), column.as_str(), std::slice::from_ref(&value));
+        self.single.mark_reconciled(part_id.as_str());
+        for op in adds {
+            out.push(MultiTableUpdate {
+                query: uuid.clone(),
+                table: table.clone(),
+                part: driven.clone(),
+                op: op.clone(),
+            });
+            if let DataFrameOperation::Add(_, row) = &op {
+                self.arrived(uuid, &driven, row, out);
+            }
         }
     }
 
-    /// Decrement `value`'s `right` count on join `join_index`; reports
-    /// whether it reached zero (the entry is removed when it does).
-    fn right_drop(&mut self, uuid: &QueryId, join_index: usize, value: &Value) -> bool {
-        Self::drop_in(
-            self.join_state
-                .get_mut(uuid)
-                .and_then(|joins| joins.get_mut(join_index))
-                .map(|join| &mut join.right),
-            value,
-        )
+    /// A driver row no longer carries `value` on `edge`: drop `left`, and
+    /// when that changes the driven part's `IN` leaf, narrow the leaf in
+    /// place, prune the value's held driven rows from current data (no
+    /// storage round-trip), forward the `Delete`s, and let them depart
+    /// from the driven node.
+    fn release(&mut self, uuid: &QueryId, edge: usize, value: &Value, out: &mut Vec<MultiTableUpdate>) {
+        if self.left_count(uuid, edge, value) != 1 {
+            self.left_drop(uuid, edge, value);
+            return;
+        }
+        let (driven, column) = self.driven_end(uuid, edge);
+        let before = leaf_values(&self.trees[uuid], &driven, &column);
+        self.left_drop(uuid, edge, value);
+        self.pull_reference(uuid, edge, value);
+        let after = leaf_values(&self.trees[uuid], &driven, &column);
+        let Some((part_id, table)) = self.registered_part(uuid, &driven) else {
+            return;
+        };
+        if before == after {
+            return;
+        }
+        self.single.replace_condition(
+            part_id.as_str(),
+            &in_condition(&column, &before),
+            in_condition(&column, &after),
+        );
+        let deletes = self
+            .single
+            .delete_rows(part_id.as_str(), column.as_str(), std::slice::from_ref(value));
+        self.single.mark_reconciled(part_id.as_str());
+        for op in deletes {
+            out.push(MultiTableUpdate {
+                query: uuid.clone(),
+                table: table.clone(),
+                part: driven.clone(),
+                op: op.clone(),
+            });
+            if let DataFrameOperation::Delete(_, row) = &op {
+                self.departed(uuid, &driven, row, out);
+            }
+        }
+    }
+
+    /// The driven part of `edge` and the column its `IN` leaf is on.
+    fn driven_end(&self, uuid: &QueryId, edge: usize) -> (QueryPart, ColumnName) {
+        let edge = &self.trees[uuid].edges[edge];
+        (edge.driven().clone(), edge.driven_column().clone())
+    }
+
+    /// The inner id and table of `part` once it is registered; `None`
+    /// while registration has not reached it yet.
+    fn registered_part(&self, uuid: &QueryId, part: &QueryPart) -> Option<(QueryId, TableName)> {
+        let node = self.trees.get(uuid)?.nodes.get(part)?;
+        node.registered
+            .then(|| (node.part_id.clone(), node.query.table.clone()))
+    }
+
+    /// `value`'s current `left` count on `edge` (zero when absent) — read
+    /// before a bump or drop to know whether it will cross zero, so the
+    /// leaf is only recomputed when it can change.
+    fn left_count(&self, uuid: &QueryId, edge: usize, value: &Value) -> u64 {
+        self.trees
+            .get(uuid)
+            .and_then(|tree| tree.edges.get(edge))
+            .and_then(|edge| edge.counts.left.get(value).copied())
+            .unwrap_or(0)
+    }
+
+    /// Mutable access to one edge's counts.
+    fn counts_mut(&mut self, uuid: &QueryId, edge: usize) -> Option<&mut JoinKeyCounts> {
+        self.trees
+            .get_mut(uuid)
+            .and_then(|tree| tree.edges.get_mut(edge))
+            .map(|edge| &mut edge.counts)
+    }
+
+    /// Append a newly referenced value to `edge`'s list.
+    fn push_reference(&mut self, uuid: &QueryId, edge: usize, value: Value) {
+        if let Some(counts) = self.counts_mut(uuid, edge)
+            && !counts.referenced.contains(&value)
+        {
+            counts.referenced.push(value);
+            debug_assert!(
+                counts.referenced.len() == counts.left.len(),
+                "the referenced list must mirror exactly the values with left > 0"
+            );
+        }
+    }
+
+    /// Remove a no-longer-referenced value from `edge`'s list.
+    fn pull_reference(&mut self, uuid: &QueryId, edge: usize, value: &Value) {
+        if let Some(counts) = self.counts_mut(uuid, edge) {
+            counts.referenced.retain(|candidate| candidate != value);
+            debug_assert!(
+                counts.referenced.len() == counts.left.len(),
+                "the referenced list must mirror exactly the values with left > 0"
+            );
+        }
+    }
+
+    /// Increment `value`'s `left` count on `edge`.
+    fn left_bump(&mut self, uuid: &QueryId, edge: usize, value: Value) {
+        if let Some(counts) = self.counts_mut(uuid, edge) {
+            *counts.left.entry(value).or_insert(0) += 1;
+        }
+    }
+
+    /// Decrement `value`'s `left` count on `edge`, removing the entry at
+    /// zero.
+    fn left_drop(&mut self, uuid: &QueryId, edge: usize, value: &Value) {
+        Self::drop_in(self.counts_mut(uuid, edge).map(|counts| &mut counts.left), value);
+    }
+
+    /// Increment `value`'s `right` count on `edge`.
+    fn right_bump(&mut self, uuid: &QueryId, edge: usize, value: Value) {
+        if let Some(counts) = self.counts_mut(uuid, edge) {
+            *counts.right.entry(value).or_insert(0) += 1;
+        }
+    }
+
+    /// Decrement `value`'s `right` count on `edge`, removing the entry at
+    /// zero.
+    fn right_drop(&mut self, uuid: &QueryId, edge: usize, value: &Value) {
+        Self::drop_in(self.counts_mut(uuid, edge).map(|counts| &mut counts.right), value);
     }
 
     /// Decrement `value` in one count map, removing the entry at zero;
-    /// reports whether it reached zero. Absent values report `false`.
-    fn drop_in(counts: Option<&mut HashMap<Value, u64>>, value: &Value) -> bool {
+    /// absent values are left alone.
+    fn drop_in(counts: Option<&mut HashMap<Value, u64>>, value: &Value) {
         let Some(counts) = counts else {
-            return false;
+            return;
         };
         let Some(count) = counts.get_mut(value) else {
-            return false;
+            return;
         };
         *count -= 1;
         if *count == 0 {
             counts.remove(value);
-            true
-        } else {
-            false
         }
     }
 }

@@ -80,32 +80,64 @@ pub struct SingleTableReadQuery {
     pub limit: u32,
 }
 
-/// A LEFT JOIN edge of a [`MultiTableReadQuery`]: rows of `sub_table`
-/// attach to main rows where
-/// `sub_table.<sub_table_column> = main.<main_table_column>`.
+/// One join edge of a [`MultiTableReadQuery`]: rows of `sub`'s main table
+/// attach to rows of the enclosing node where
+/// `sub.<sub_table_column> = enclosing.<main_table_column>`.
 ///
-/// `sub_table` carries the sub side's own `WHERE`; its `order_by` /
-/// `limit` are unused — a `LIMIT` on a join's sub side has no SQL meaning
-/// (it would cap the whole side across every referenced value), so the
-/// engine normalizes it away at registration. A `NULL` (or missing) join
-/// value never matches, consistent with the engine's NULL semantics —
-/// such a main row simply shows an empty sub side.
+/// `sub` is a full multi-table query, so a leaf is a node whose two join
+/// vectors are empty and nesting costs nothing. Whether the enclosing node
+/// lists the edge under `left_joins` or `right_joins` decides which side
+/// is preserved: a LEFT edge keeps every enclosing row and attaches the
+/// matching sub rows; a RIGHT edge keeps every sub row and shows enclosing
+/// rows only while a sub row matches them. Below the root, a node's
+/// `order_by` / `limit` are unused — a `LIMIT` on a join's sub side has no
+/// SQL meaning (it would cap the whole side across every referenced
+/// value), so the engine normalizes it away at registration. A `NULL` (or
+/// missing) join value never matches, consistent with the engine's NULL
+/// semantics.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LeftJoin {
-    pub sub_table: SingleTableReadQuery,
+pub struct Join {
+    pub sub: MultiTableReadQuery,
     pub main_table_column: ColumnName,
     pub sub_table_column: ColumnName,
 }
 
-/// A multi-table subscription: a main query LEFT JOINed to sub queries.
-///
-/// Main rows are visible purely by the main `WHERE` — a join value with no
-/// matching sub rows renders as an empty sub side, never hides the main
-/// row. `order_by` / `limit` (not yet enforced) live on `main_table`.
+impl Join {
+    /// Builds an edge attaching `sub` on
+    /// `enclosing.<main_table_column> = sub.<sub_table_column>`.
+    pub fn new(
+        sub: MultiTableReadQuery,
+        main_table_column: impl Into<ColumnName>,
+        sub_table_column: impl Into<ColumnName>,
+    ) -> Self {
+        Join {
+            sub,
+            main_table_column: main_table_column.into(),
+            sub_table_column: sub_table_column.into(),
+        }
+    }
+}
+
+/// A multi-table subscription: a tree whose every node is a single-table
+/// query and every edge a LEFT or RIGHT join. The root is the query the
+/// client subscribed to; its `order_by` / `limit` apply to the root's
+/// rows. Structurally identical trees compare equal, the basis of sharing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultiTableReadQuery {
     pub main_table: SingleTableReadQuery,
-    pub left_joins: Vec<LeftJoin>,
+    pub left_joins: Vec<Join>,
+    pub right_joins: Vec<Join>,
+}
+
+impl MultiTableReadQuery {
+    /// A tree of one node: `main_table` with no joins.
+    pub fn single(main_table: SingleTableReadQuery) -> Self {
+        MultiTableReadQuery {
+            main_table,
+            left_joins: Vec::new(),
+            right_joins: Vec::new(),
+        }
+    }
 }
 
 /// A write against a table — exactly one of insert / update / delete.
