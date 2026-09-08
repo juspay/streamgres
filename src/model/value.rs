@@ -85,6 +85,69 @@ impl Value {
     }
 }
 
+impl Value {
+    /// A total order over values consistent with [`Value::eq`] (equal values
+    /// compare `Equal`, different variants never do), used to keep the
+    /// conditions of a disjunct in one canonical sequence so that two
+    /// filters naming the same conditions in a different order normalize
+    /// to the same disjunct. Variants are ranked in declaration order; within
+    /// a variant the natural order applies, with every `NaN` treated as one
+    /// value and `-0.0` as `0.0`, lists compared lexicographically and maps
+    /// by their key-sorted entries.
+    pub fn canonical_cmp(&self, other: &Value) -> Ordering {
+        use Value::*;
+        fn rank(value: &Value) -> u8 {
+            match value {
+                Null => 0,
+                String(_) => 1,
+                Int(_) => 2,
+                Float(_) => 3,
+                Bool(_) => 4,
+                Date(_) => 5,
+                Datetime(_) => 6,
+                List(_) => 7,
+                Map(_) => 8,
+            }
+        }
+        fn canonical_f64(f: f64) -> f64 {
+            if f.is_nan() {
+                f64::NAN
+            } else if f == 0.0 {
+                0.0
+            } else {
+                f
+            }
+        }
+        match (self, other) {
+            (Null, Null) => Ordering::Equal,
+            (String(a), String(b)) => a.cmp(b),
+            (Int(a), Int(b)) => a.cmp(b),
+            (Float(a), Float(b)) => canonical_f64(*a).total_cmp(&canonical_f64(*b)),
+            (Bool(a), Bool(b)) => a.cmp(b),
+            (Date(a), Date(b)) => a.cmp(b),
+            (Datetime(a), Datetime(b)) => a.cmp(b),
+            (List(a), List(b)) => a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| x.canonical_cmp(y))
+                .find(|ordering| *ordering != Ordering::Equal)
+                .unwrap_or_else(|| a.len().cmp(&b.len())),
+            (Map(a), Map(b)) => {
+                let mut left: Vec<_> = a.iter().collect();
+                let mut right: Vec<_> = b.iter().collect();
+                left.sort_by(|x, y| x.0.canonical_cmp(y.0));
+                right.sort_by(|x, y| x.0.canonical_cmp(y.0));
+                left.iter()
+                    .zip(&right)
+                    .map(|((ka, va), (kb, vb))| ka.canonical_cmp(kb).then_with(|| va.canonical_cmp(vb)))
+                    .find(|ordering| *ordering != Ordering::Equal)
+                    .unwrap_or_else(|| left.len().cmp(&right.len()))
+            }
+            _ => rank(self).cmp(&rank(other)),
+        }
+    }
+}
+
 impl PartialEq for Value {
     /// Strict, variant-exact equality (no `Int` / `Float` coercion — that is
     /// [`Value::loose_eq`]). `Float` deviates from raw `f64` semantics by

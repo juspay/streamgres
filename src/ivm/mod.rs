@@ -105,6 +105,7 @@
 //!   Multithreading is a later, deliberate step — see the `index` module
 //!   header.
 
+mod columns;
 mod frames;
 mod index;
 mod multi;

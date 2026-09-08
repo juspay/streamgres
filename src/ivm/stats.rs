@@ -26,9 +26,12 @@ use std::fmt;
 ///
 /// Write routing:
 /// - `writes_processed`: writes processed by `incremental_update`.
-/// - `conditions_evaluated`: leaf conditions evaluated against a write's row
-///   image — each distinct same-table condition exactly once per write.
-/// - `index_hits`: evaluated conditions that matched the row image.
+/// - `columns_probed`: row columns looked up in the per-column value
+///   index — the `O(columns)` term of routing.
+/// - `conditions_evaluated`: conditions the column index produced for the
+///   row image; every one is a match, so this equals `index_hits`, and it
+///   is independent of how many conditions the table carries.
+/// - `index_hits`: conditions that matched the row image.
 /// - `disjunct_increments`: disjunct counter bumps performed for matching
 ///   conditions — the output-sensitive part of routing (work ∝ matching
 ///   links, not subscriptions).
@@ -57,6 +60,7 @@ pub struct IvmStats {
     pub snapshots_shared: u64,
     pub conditions_replaced: u64,
     pub writes_processed: u64,
+    pub columns_probed: u64,
     pub conditions_evaluated: u64,
     pub index_hits: u64,
     pub disjunct_increments: u64,
@@ -81,6 +85,7 @@ impl IvmStats {
             snapshots_shared: self.snapshots_shared - earlier.snapshots_shared,
             conditions_replaced: self.conditions_replaced - earlier.conditions_replaced,
             writes_processed: self.writes_processed - earlier.writes_processed,
+            columns_probed: self.columns_probed - earlier.columns_probed,
             conditions_evaluated: self.conditions_evaluated - earlier.conditions_evaluated,
             index_hits: self.index_hits - earlier.index_hits,
             disjunct_increments: self.disjunct_increments - earlier.disjunct_increments,
@@ -99,9 +104,9 @@ impl IvmStats {
     /// demo for per-write output.
     pub fn routing_summary(&self) -> String {
         format!(
-            "{} cond evals ({} hit), {} disjunct bumps, {} fired, membership {}/{} hit, {} impacted, ops +{}/-{}",
+            "{} columns probed, {} conds matched, {} disjunct bumps, {} fired, membership {}/{} hit, {} impacted, ops +{}/-{}",
+            self.columns_probed,
             self.conditions_evaluated,
-            self.index_hits,
             self.disjunct_increments,
             self.disjuncts_fired,
             self.membership_hits,
@@ -122,7 +127,8 @@ impl fmt::Display for IvmStats {
         writeln!(f, "snapshots shared ........... {}", self.snapshots_shared)?;
         writeln!(f, "conditions replaced ........ {}", self.conditions_replaced)?;
         writeln!(f, "writes processed ........... {}", self.writes_processed)?;
-        writeln!(f, "conditions evaluated ....... {}", self.conditions_evaluated)?;
+        writeln!(f, "columns probed ............. {}", self.columns_probed)?;
+        writeln!(f, "conditions matched ......... {}", self.conditions_evaluated)?;
         writeln!(f, "condition hits ............. {}", self.index_hits)?;
         writeln!(f, "disjunct increments ........ {}", self.disjunct_increments)?;
         writeln!(f, "disjuncts fired ............ {}", self.disjuncts_fired)?;

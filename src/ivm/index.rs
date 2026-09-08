@@ -1,4 +1,5 @@
-//! Per-table routing index: DNF disjunct counters keyed by their conditions.
+//! Per-table routing index: DNF disjunct counters keyed by their conditions,
+//! reached through a per-column value index.
 //!
 //! One [`TableIndex`] holds everything needed to answer "which subscriptions
 //! does this row image match" for one table. Each DNF disjunct is a single
@@ -7,7 +8,11 @@
 //! an AND-disjunct must bump the *same* counter for it to ever reach its
 //! size. The same sharing also deduplicates across subscriptions: filters
 //! that normalize to an identical [`Disjunct`] reuse one counter, and a
-//! single firing fans out to every subscriber.
+//! single firing fans out to every subscriber. A write reaches its matching
+//! conditions by looking each of its column values up in the column's
+//! [`ColumnIndex`] (`O(columns · log n)`), never by evaluating the table's
+//! conditions one by one; the conditions found are then counted exactly as
+//! before.
 //!
 //! # Single-threaded by design (for now)
 //!
@@ -32,10 +37,11 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
+use super::columns::{ColumnIndex, CondRef};
 use super::predicate::eval_condition;
 use super::stats::IvmStats;
 use super::QueryId;
-use crate::model::{Condition, Disjunct, Value};
+use crate::model::{ColumnName, Condition, Disjunct, Value};
 
 /// Shared handle to one disjunct's counting state; cloned under every
 /// condition key the disjunct contains.
@@ -58,16 +64,26 @@ struct DisjunctCounter {
     subscribers: Vec<QueryId>,
 }
 
+/// One indexed condition: the shared handle it is filed under in its
+/// column's [`ColumnIndex`], and the counters of the disjuncts containing
+/// it.
+struct Linked {
+    handle: CondRef,
+    counters: Vec<SharedCounter>,
+}
+
 /// The routing index for one table.
 ///
 /// - `by_condition`: condition → the shared counters of every disjunct
-///   containing it; the probe path of a write.
+///   containing it, plus the handle the column index files it under.
+/// - `columns`: column → the value index over that column's conditions;
+///   the probe path of a write.
 /// - `by_disjunct`: [`Disjunct`] (as produced by
 ///   [`crate::model::Where::to_dnf`], its conditions carried inside) → its
 ///   shared counter, so an identical disjunct registered again reuses the
-///   counter instead of duplicating it. Disjuncts that differ only in
-///   condition order are not merged — harmless, they just keep separate
-///   counters.
+///   counter instead of duplicating it. Disjuncts are canonical
+///   ([`Disjunct::new`] sorts and dedups their conditions), so the order a
+///   filter names its conditions in never splits a counter.
 /// - `unconditional`: subscriptions owning an empty (vacuously true)
 ///   disjunct; they match every row write on the table and never appear in
 ///   `by_condition`.
@@ -79,7 +95,8 @@ struct DisjunctCounter {
 ///   would otherwise churn the counting structures.
 #[derive(Default)]
 pub(super) struct TableIndex {
-    by_condition: HashMap<Condition, Vec<SharedCounter>>,
+    by_condition: HashMap<Condition, Linked>,
+    columns: HashMap<ColumnName, ColumnIndex>,
     by_disjunct: HashMap<Disjunct, SharedCounter>,
     unconditional: Vec<QueryId>,
     boundaries: HashMap<QueryId, Condition>,
@@ -131,14 +148,50 @@ impl TableIndex {
         }));
         let mut links = 0;
         for condition in &disjunct.conditions {
-            self.by_condition
-                .entry(condition.clone())
-                .or_default()
-                .push(Rc::clone(&counter));
-            links += 1;
+            if !self.by_condition.contains_key(condition) {
+                let handle = CondRef(Rc::new(condition.clone()));
+                self.columns
+                    .entry(condition.column.clone())
+                    .or_default()
+                    .file(&handle);
+                self.by_condition.insert(
+                    condition.clone(),
+                    Linked {
+                        handle,
+                        counters: Vec::new(),
+                    },
+                );
+            }
+            if let Some(linked) = self.by_condition.get_mut(condition) {
+                linked.counters.push(Rc::clone(&counter));
+                links += 1;
+            }
         }
         self.by_disjunct.insert(disjunct, counter);
         links
+    }
+
+    /// Drop `dead`'s link from `condition`; a condition no counter needs
+    /// anymore is unfiled from its column index and forgotten.
+    fn unlink(&mut self, condition: &Condition, dead: &SharedCounter) {
+        let Some(linked) = self.by_condition.get_mut(condition) else {
+            return;
+        };
+        linked
+            .counters
+            .retain(|candidate| !Rc::ptr_eq(candidate, dead));
+        if !linked.counters.is_empty() {
+            return;
+        }
+        let Some(linked) = self.by_condition.remove(condition) else {
+            return;
+        };
+        if let Some(column) = self.columns.get_mut(&condition.column) {
+            column.unfile(&linked.handle);
+            if column.is_empty() {
+                self.columns.remove(&condition.column);
+            }
+        }
     }
 
     /// Detach `subscriber` from one disjunct, dropping the counter and its
@@ -158,12 +211,7 @@ impl TableIndex {
             return;
         };
         for condition in &disjunct.conditions {
-            if let Some(counters) = self.by_condition.get_mut(condition) {
-                counters.retain(|candidate| !Rc::ptr_eq(candidate, &dead));
-                if counters.is_empty() {
-                    self.by_condition.remove(condition);
-                }
-            }
+            self.unlink(condition, &dead);
         }
     }
 
@@ -197,16 +245,14 @@ impl TableIndex {
         for old_disjunct in affected {
             stats.conditions_replaced += 1;
             self.detach(&old_disjunct, subscriber.as_str());
-            let mut conditions: Vec<Condition> = old_disjunct
+            let conditions: Vec<Condition> = old_disjunct
                 .conditions
                 .iter()
                 .filter(|condition| *condition != old)
                 .cloned()
+                .chain(std::iter::once(new.clone()))
                 .collect();
-            if !conditions.contains(new) {
-                conditions.push(new.clone());
-            }
-            self.attach(subscriber, Disjunct { conditions });
+            self.attach(subscriber, Disjunct::new(conditions));
         }
     }
 
@@ -245,12 +291,9 @@ impl TableIndex {
                 continue;
             };
             for condition in &disjunct.conditions {
-                if let Some(counters) = self.by_condition.get_mut(condition) {
-                    counters.retain(|candidate| !Rc::ptr_eq(candidate, &dead));
-                }
+                self.unlink(condition, &dead);
             }
         }
-        self.by_condition.retain(|_, counters| !counters.is_empty());
     }
 
     /// Whether the index routes nothing anymore (so the engine can drop it).
@@ -261,9 +304,11 @@ impl TableIndex {
     /// The subscriptions whose filters the row image satisfies **and**
     /// whose admission boundary (if any) it passes.
     ///
-    /// Evaluates each distinct condition exactly once; every match bumps the
-    /// shared counters of the disjuncts containing it, and a counter
-    /// reaching its size fires all of its subscribers. `epoch` must be a
+    /// Looks each column value of the row up in that column's index, which
+    /// yields exactly the conditions the value satisfies (each at most
+    /// once); every one bumps the shared counters of the disjuncts
+    /// containing it, and a counter reaching its size fires all of its
+    /// subscribers. `epoch` must be a
     /// fresh, monotonically increased write number — it is what lazily
     /// invalidates counts left over from earlier writes. Unconditional
     /// subscribers are always included. Fired candidates are then filtered
@@ -278,12 +323,20 @@ impl TableIndex {
         stats: &mut IvmStats,
     ) -> BTreeSet<QueryId> {
         let mut fired = BTreeSet::new();
-        for (condition, counters) in &self.by_condition {
-            if !eval_condition(condition, row, &mut stats.conditions_evaluated) {
-                continue;
+        let mut candidates: Vec<CondRef> = Vec::new();
+        for (column, value) in row {
+            if let Some(index) = self.columns.get(column.as_str()) {
+                stats.columns_probed += 1;
+                index.candidates(value, &mut candidates);
             }
+        }
+        for candidate in candidates {
+            stats.conditions_evaluated += 1;
             stats.index_hits += 1;
-            for shared in counters {
+            let Some(linked) = self.by_condition.get(&*candidate.0) else {
+                continue;
+            };
+            for shared in &linked.counters {
                 let mut counter = shared.borrow_mut();
                 if counter.epoch != epoch {
                     counter.epoch = epoch;

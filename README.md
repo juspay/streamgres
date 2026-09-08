@@ -42,7 +42,8 @@ the number that **actually match**, and then patches only the affected views.
 | Area | Status | Where |
 | --- | --- | --- |
 | Typed query/row model, self-contained ops (`Delete` carries its image; replace = `Delete(old)` + `Add(new)`) | ✅ done | `src/model/` |
-| DNF counting index: each distinct condition evaluated once per write, shared epoch-stamped counters fire exactly | ✅ done | `src/ivm/index.rs` |
+| DNF counting index: canonical disjuncts, shared epoch-stamped counters fire exactly | ✅ done | `src/ivm/index.rs` |
+| Per-column value index: a write reaches only the conditions it satisfies, `O(columns · log n)` lookups (equality maps, inequality by set difference, range maps per comparison class) | ✅ done | `src/ivm/columns.rs` |
 | Shared frames: one frame per table, rows tagged with holders; held-key mirror; twin registration served from the frame | ✅ done | `src/ivm/frames.rs`, `src/ivm/registry.rs` |
 | `ORDER BY` / `LIMIT` windows: doubled buffer, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
 | In-place condition edit (a join's `IN` list gains/loses a value without re-registration) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
@@ -53,7 +54,6 @@ the number that **actually match**, and then patches only the affected views.
 | **Join tree**: nested multi-table children, `RIGHT` and `INNER` joins, visibility propagation | ⏳ pending | paper §6; one level of `LEFT` today |
 | **PostgreSQL ingester**: permanent `pgoutput` slot + rotating exported snapshots + per-subscription catch-up | ⏳ pending | paper §7; `PgStorage` is a stub |
 | **WebSocket protocol**: subscribe / unsubscribe / op stream, connection & subscription lifecycle | ⏳ pending | `src/ws.rs` is an axum echo base |
-| `O(columns · log n)` condition matching (per-column hash maps + interval search) | ⏳ pending | paper §8.2 |
 | Set-valued join edge (the `IN` list as a per-column set, one edge shared by identical multi-table subscriptions), the measured slow path | ⏳ pending | paper §9.5, §12.1 |
 | Query-keyed twin index; interned subscription ids and compact keys in tags / held index | ⏳ pending | paper §9.3, §9.6 |
 | Parser `JOIN` syntax | ⏳ pending | multi-table queries are built programmatically |
@@ -101,14 +101,19 @@ A write can affect a subscription two ways, and both are checked:
 | no | yes | `Delete(old)` |
 | no | no | nothing |
 
-- **Way 1, counting** (`index.rs`). At registration a filter is normalized to
-  DNF. Per table, `by_condition: Condition → [shared counter]` and
-  `by_disjunct: Disjunct → counter`; identical disjunct shapes share one
-  counter across subscriptions. Routing evaluates each distinct condition
-  **once**, bumps the counters of matching ones, and fires a disjunct when its
-  counter reaches its size. Counters are epoch-stamped per write, no reset
-  sweep. Cost: `O(distinct conditions) + O(matching links)`, independent of
-  subscription count.
+- **Way 1, counting** (`index.rs`, `columns.rs`). At registration a filter is
+  normalized to DNF (disjuncts canonical: sorted and deduplicated, so
+  condition order never splits a counter). Per table, `by_condition:
+  Condition → [shared counter]`, `by_disjunct: Disjunct → counter` (identical
+  shapes share one counter across subscriptions), and `columns: column →
+  value index`. Routing looks each written column value up in its column's
+  index, which yields exactly the conditions the value satisfies (equality
+  maps with numeric folding, `IN` filed under each list value, `<>` / `NOT IN`
+  by set difference, range operators by ordered maps per comparison class),
+  bumps their counters, and fires a disjunct when its counter reaches its
+  size. Counters are epoch-stamped per write, no reset sweep. Cost:
+  `O(columns · log n) + O(matching links)`, independent of how many
+  conditions or subscriptions exist.
 - **Way 2, membership** (`frames.rs`). One shared `TableFrame` per table;
   each `SharedRow` carries its `subscribers`. Deletes and updates-out are
   found in O(1) off the tags. `held: QueryId → keys` mirrors the tags so a
@@ -241,14 +246,14 @@ yardstick for every optimization: change the strategy, rerun, compare.
 one thread; scenarios 2 to 4 use a bench-local in-memory storage double,
 scenario 1 registers against the empty `PgStorage` stub so frames fill from
 writes alone; raw output in
-[paper/bench-2026-09-07.txt](paper/bench-2026-09-07.txt), analysis in paper §9):
+[paper/bench-2026-09-08.txt](paper/bench-2026-09-08.txt), analysis in paper §9):
 
 | Scenario | Result |
 | --- | --- |
-| Routing, 100 → 10 000 subscriptions | conditions evaluated per write saturate at the vocabulary size (67 at N = 100, 85 from N = 1 000); route-only cost ≈ 2 µs fixed + 0.35 µs per impacted subscription; delivery ≈ 1.2 µs per emitted op |
-| Twin registration (400-row snapshot) | 953 µs from the shared frame vs 1 968 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
-| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.5 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~90 ms across 10 000 writes) |
-| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | user updates are pure fan-out (2.6 µs per op); ticket inserts cost 10 ms because every twin edits its `O(\|IN\|)` join edge at each zero crossing, the slow path the set-valued shared edge removes |
+| Routing, 100 → 10 000 subscriptions | a write touches only the 3 to 4 conditions it satisfies (one probe per column) while the table carries 67 to 85; route-only cost ≈ 1.5 µs fixed + 0.35 µs per impacted subscription; delivery ≈ 1.3 µs per emitted op |
+| Twin registration (400-row snapshot) | 939 µs from the shared frame vs 2 215 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
+| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.5 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~120 ms across 10 000 writes) |
+| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | user updates are pure fan-out (2.4 µs per op; a user write reaches only the ~30 `IN` lists naming it, not all 108); ticket inserts cost 10 ms because every twin edits its `O(\|IN\|)` join edge at each zero crossing, the slow path the set-valued shared edge removes |
 
 ### Using the engine programmatically
 
@@ -314,7 +319,7 @@ silently narrowed:
 Cargo.toml
 paper/
   xyne-sync.tex / .pdf     the design paper (algorithms, join tree, ingestion, evaluation)
-  bench-2026-09-07.txt     raw output of the benchmark run reported in the paper
+  bench-2026-09-08.txt     raw output of the benchmark run reported in the paper
   bench-2026-09-07-before-frontier.txt   the same run before the window frontier fix
 docs/
   pg-lsn-cdc-lab.md        hands-on lab: LSNs, MVCC snapshots, the CDC handoff

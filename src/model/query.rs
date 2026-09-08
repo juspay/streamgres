@@ -164,6 +164,24 @@ pub struct Condition {
     pub value: Value,
 }
 
+impl PartialOrd for Condition {
+    /// Delegates to [`Ord`].
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Condition {
+    /// The canonical order of conditions inside a [`Disjunct`]: by column,
+    /// then operator, then [`Value::canonical_cmp`]; consistent with `Eq`.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.column
+            .cmp(&other.column)
+            .then_with(|| self.comparison_operator.cmp(&other.comparison_operator))
+            .then_with(|| self.value.canonical_cmp(&other.value))
+    }
+}
+
 /// A predicate tree of [`Condition`]s combined with `AND` / `OR`.
 ///
 /// `AND(vec![])` is vacuously true (a query with no filter — a full-table
@@ -191,11 +209,23 @@ pub struct Disjunct {
     pub conditions: Vec<Condition>,
 }
 
+impl Disjunct {
+    /// A disjunct from its conditions in **canonical form**: duplicates
+    /// removed and the rest sorted by [`Condition`]'s order, so two filters
+    /// naming the same conditions in any order produce equal disjuncts and
+    /// share one counter in the routing index.
+    pub fn new(mut conditions: Vec<Condition>) -> Self {
+        conditions.sort();
+        conditions.dedup();
+        Disjunct { conditions }
+    }
+}
+
 /// The comparison operator of a leaf [`Condition`]: equality, ordering, and
 /// set-membership tests. Negation lives here (`NEQ`, `NOT_IN`) — the
 /// [`Where`] tree has no `NOT` node.
 #[allow(non_camel_case_types)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ComparisonOperator {
     EQ,
     NEQ,
@@ -319,32 +349,26 @@ impl Where {
     /// subscription filters (ANDs with small OR/IN sprinkles) stay tiny;
     /// a size cap with a tree-evaluation fallback is deliberately deferred
     /// until real workloads show the need.
+    /// Every disjunct comes out in canonical form ([`Disjunct::new`]), so
+    /// condition order in the source filter never affects identity.
     ///
     /// The `AND` arm folds the cross product starting from TRUE (one empty
     /// disjunct); an always-false child empties the accumulator, making the
     /// whole AND false.
     pub fn to_dnf(&self) -> Vec<Disjunct> {
         match self {
-            Where::Condition(condition) => vec![Disjunct {
-                conditions: vec![condition.clone()],
-            }],
+            Where::Condition(condition) => vec![Disjunct::new(vec![condition.clone()])],
             Where::OR(children) => children.iter().flat_map(Where::to_dnf).collect(),
             Where::AND(children) => {
-                let mut accumulated = vec![Disjunct {
-                    conditions: Vec::new(),
-                }];
+                let mut accumulated = vec![Disjunct::new(Vec::new())];
                 for child in children {
                     let child_dnf = child.to_dnf();
                     let mut next = Vec::with_capacity(accumulated.len() * child_dnf.len());
                     for left in &accumulated {
                         for right in &child_dnf {
                             let mut conditions = left.conditions.clone();
-                            for condition in &right.conditions {
-                                if !conditions.contains(condition) {
-                                    conditions.push(condition.clone());
-                                }
-                            }
-                            next.push(Disjunct { conditions });
+                            conditions.extend(right.conditions.iter().cloned());
+                            next.push(Disjunct::new(conditions));
                         }
                     }
                     accumulated = next;

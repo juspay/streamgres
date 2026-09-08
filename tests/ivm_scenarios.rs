@@ -1125,3 +1125,102 @@ fn window_refill_reaches_rows_tying_the_frontier() {
         "with storage exhausted there is no boundary: a matching arrival is admitted"
     );
 }
+
+/// Disjunct identity is canonical: the same conditions in a different
+/// order, whether written that way or reached by an in-place edit, map to
+/// one shared counter rather than a duplicate.
+#[test]
+fn disjuncts_are_canonical_regardless_of_condition_order() {
+    let tickets = table("tickets");
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage) as Rc<dyn Storage>);
+    let open = Where::condition("status", ComparisonOperator::EQ, "OPEN");
+    let mine = Where::condition("assigned_to", ComparisonOperator::IN, Value::List(vec!["a".into()]));
+    ivm.register_query("ab", query(&tickets, Where::AND(vec![open.clone(), mine.clone()])), None);
+    let links = ivm.stats().conditions_indexed;
+    assert_eq!(links, 2, "two conditions linked to one counter");
+
+    ivm.register_query("ba", query(&tickets, Where::AND(vec![mine.clone(), open.clone()])), None);
+    assert_eq!(
+        ivm.stats().conditions_indexed,
+        links,
+        "the reversed filter shares the counter: no new links"
+    );
+
+    let widened = Condition::new("assigned_to", ComparisonOperator::IN, Value::List(vec!["a".into(), "b".into()]));
+    let Where::Condition(narrow) = mine.clone() else { unreachable!() };
+    ivm.replace_condition("ab", &narrow, widened.clone());
+    let links_after_edit = ivm.stats().conditions_indexed;
+    ivm.register_query(
+        "fresh",
+        query(&tickets, Where::AND(vec![Where::Condition(widened), open.clone()])),
+        None,
+    );
+    assert_eq!(
+        ivm.stats().conditions_indexed,
+        links_after_edit,
+        "a fresh registration of the edited shape shares the edited counter"
+    );
+}
+
+/// The column index reaches every operator family with the predicate
+/// semantics of tree evaluation: equality with numeric coercion, `IN`,
+/// the negated forms (a `NOT IN` holding `NULL` never matches), each range
+/// operator at and around its threshold, and `NULL`, `NaN` and mixed-type
+/// writes.
+#[test]
+fn column_index_matches_every_operator_family() {
+    use ComparisonOperator::*;
+    let tickets = table("tickets");
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage) as Rc<dyn Storage>);
+    let subscriptions: Vec<(&str, Where)> = vec![
+        ("eq", Where::condition("points", EQ, 5)),
+        ("eq-float", Where::condition("points", EQ, 5.0)),
+        ("in", Where::condition("points", IN, Value::List(vec![1.into(), 2.into()]))),
+        ("neq", Where::condition("points", NEQ, 5)),
+        ("not-in", Where::condition("points", NOT_IN, Value::List(vec![1.into(), 2.into()]))),
+        ("not-in-null", Where::condition("points", NOT_IN, Value::List(vec![1.into(), Value::Null]))),
+        ("gt", Where::condition("points", GT, 5)),
+        ("gte", Where::condition("points", GTE, 5)),
+        ("lt", Where::condition("points", LT, 5)),
+        ("lte", Where::condition("points", LTE, 5)),
+        ("str", Where::condition("points", EQ, "5")),
+    ];
+    for (uuid, filter) in &subscriptions {
+        ivm.register_query(*uuid, query(&tickets, filter.clone()), None);
+    }
+    let cases: Vec<(Value, Vec<&str>)> = vec![
+        (5.into(), vec!["eq", "eq-float", "gte", "lte", "not-in"]),
+        (Value::Float(5.0), vec!["eq", "eq-float", "gte", "lte", "not-in"]),
+        (4.into(), vec!["lt", "lte", "neq", "not-in"]),
+        (6.into(), vec!["gt", "gte", "neq", "not-in"]),
+        (1.into(), vec!["in", "lt", "lte", "neq"]),
+        (Value::String("5".into()), vec!["neq", "not-in", "str"]),
+        (Value::Null, vec![]),
+        (Value::Float(f64::NAN), vec!["neq", "not-in"]),
+    ];
+    for (id, (value, expected)) in cases.into_iter().enumerate() {
+        let write = insert(&tickets, id as i64 + 1, &[("points", value.clone())]);
+        let ops = ivm.incremental_update(&write);
+        assert_eq!(impacted(&ops), expected, "points = {value:?}");
+    }
+}
+
+/// Routing cost follows the matches, not the vocabulary: fifty distinct
+/// equality conditions on one column cost one matched condition per write.
+#[test]
+fn routing_probes_columns_instead_of_evaluating_every_condition() {
+    use ComparisonOperator::*;
+    let tickets = table("tickets");
+    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage) as Rc<dyn Storage>);
+    for points in 0..50 {
+        let uuid = format!("points-{points}");
+        ivm.register_query(uuid.as_str(), query(&tickets, Where::condition("points", EQ, points)), None);
+    }
+    let before = ivm.stats().clone();
+    let ops = ivm.incremental_update(&insert(&tickets, 1, &[("points", 7.into())]));
+    let cost = ivm.stats().diff(&before);
+    assert_eq!(impacted(&ops), vec!["points-7"]);
+    assert_eq!(cost.conditions_evaluated, 1, "one candidate, not fifty evaluations");
+    assert_eq!(cost.index_hits, 1);
+    assert!(cost.columns_probed >= 1);
+}
