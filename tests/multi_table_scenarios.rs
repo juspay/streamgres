@@ -936,3 +936,93 @@ fn unregister_removes_nested_parts() {
     }
     assert!(write(&mut ivm, &storage, user(3, "c")).is_empty());
 }
+
+/// Identical multi-table subscriptions share one tree: a zero crossing is
+/// handled once (one set edit, one fetch) and its result is emitted to
+/// every subscriber; unregistering one subscriber leaves the tree intact
+/// for the others, and the last one takes the parts with it.
+#[test]
+fn identical_subscriptions_share_one_edge() {
+    let (mut ivm, storage) = engine();
+    storage.apply(&user(1, "a"));
+    for uuid in ["a", "b", "c"] {
+        ivm.register_query(uuid, tickets_users_query());
+    }
+    let before = ivm.stats().clone();
+    let ops = write(&mut ivm, &storage, ticket(10, "OPEN", 1));
+    let cost = ivm.stats().diff(&before);
+    assert_eq!(
+        tags(&ops),
+        vec![
+            "a/join0/add:Int(1)",
+            "a/main/add:Int(10)",
+            "b/join0/add:Int(1)",
+            "b/main/add:Int(10)",
+            "c/join0/add:Int(1)",
+            "c/main/add:Int(10)"
+        ]
+    );
+    assert_eq!(cost.conditions_replaced, 1, "one set edit for the shared edge, not one per subscriber");
+    assert_eq!(cost.queries_impacted, 1, "one inner root part serves all three");
+
+    ivm.unregister_query("a");
+    let ops = write(&mut ivm, &storage, ticket(11, "OPEN", 1));
+    assert_eq!(tags(&ops), vec!["b/main/add:Int(11)", "c/main/add:Int(11)"]);
+    assert_eq!(frame_len(&ivm, "b", QueryPart::join(0)), 1);
+
+    ivm.unregister_query("b");
+    ivm.unregister_query("c");
+    assert!(ivm.rows_for("c", QueryPart::main()).is_none());
+    assert!(write(&mut ivm, &storage, ticket(12, "OPEN", 1)).is_empty());
+}
+
+/// A later identical registration is served from the shared parts and
+/// sees exactly the shared state, including rows that arrived through
+/// crossings after the first registration.
+#[test]
+fn later_identical_registration_is_served_from_the_shared_tree() {
+    let (mut ivm, storage) = engine();
+    for w in [user(1, "a"), user(2, "b")] {
+        storage.apply(&w);
+    }
+    ivm.register_query("first", tickets_users_query());
+    write(&mut ivm, &storage, ticket(10, "OPEN", 1));
+    write(&mut ivm, &storage, ticket(11, "OPEN", 2));
+    let before = ivm.stats().clone();
+    let snapshot = ivm.register_query("second", tickets_users_query());
+    assert_eq!(
+        tags(&snapshot),
+        vec![
+            "second/join0/add:Int(1)",
+            "second/join0/add:Int(2)",
+            "second/main/add:Int(10)",
+            "second/main/add:Int(11)"
+        ]
+    );
+    let cost = ivm.stats().diff(&before);
+    assert_eq!(cost.snapshots_shared, 2, "both parts served without storage");
+    assert_eq!(cost.queries_registered, 0, "no inner registration happened");
+}
+
+/// The join leaf is a set with a stable identity: many crossings never
+/// create new index links or counters, only file and unfile members.
+#[test]
+fn set_valued_leaf_keeps_its_identity_across_crossings() {
+    let (mut ivm, storage) = engine();
+    for id in 1..=5 {
+        storage.apply(&user(id, "u"));
+    }
+    ivm.register_query("q", tickets_users_query());
+    let before = ivm.stats().clone();
+    for id in 1..=5 {
+        write(&mut ivm, &storage, ticket(10 + id, "OPEN", id));
+    }
+    for id in 1..=5 {
+        write(&mut ivm, &storage, delete("tickets", 10 + id));
+    }
+    let cost = ivm.stats().diff(&before);
+    assert_eq!(cost.conditions_replaced, 10, "five members added, five removed");
+    assert_eq!(cost.conditions_indexed, 0, "the leaf condition itself never changed");
+    assert_eq!(cost.disjuncts_registered, 0);
+    assert_eq!(frame_len(&ivm, "q", QueryPart::join(0)), 0);
+}

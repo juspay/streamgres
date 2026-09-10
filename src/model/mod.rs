@@ -27,4 +27,4 @@ pub use query::{
     Order, OrderBy, QueryId, SingleTableReadQuery, UpdateQuery, Where, WriteQuery,
 };
 pub use schema::{Catalog, ColumnName, DbColumn, DbTable, TableName};
-pub use value::{Value, ValueType};
+pub use value::{Value, ValueType, SharedSet};

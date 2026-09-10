@@ -392,6 +392,7 @@ fn pkey_restrictions(filter: &Where, out: &mut Vec<Vec<Value>>) {
         Where::Condition(condition) if condition.column == "id" => {
             match (&condition.comparison_operator, &condition.value) {
                 (ComparisonOperator::IN, Value::List(values)) => out.push(values.clone()),
+                (ComparisonOperator::IN, Value::Set(set)) => out.push(set.members()),
                 (ComparisonOperator::EQ, value) => out.push(vec![value.clone()]),
                 _ => {}
             }

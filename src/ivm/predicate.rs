@@ -59,6 +59,7 @@ pub fn eval_condition(cond: &Condition, row: &HashMap<String, Value>, evaluated:
         ),
         IN => match &cond.value {
             Value::List(items) => items.iter().any(|item| actual.loose_eq(item)),
+            Value::Set(set) => set.contains(actual),
             _ => false,
         },
         NOT_IN => match &cond.value {
@@ -66,6 +67,7 @@ pub fn eval_condition(cond: &Condition, row: &HashMap<String, Value>, evaluated:
                 !items.iter().any(Value::is_null)
                     && !items.iter().any(|item| actual.loose_eq(item))
             }
+            Value::Set(set) => !set.contains(actual),
             _ => false,
         },
     }

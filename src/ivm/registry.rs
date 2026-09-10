@@ -6,7 +6,7 @@
 use super::index::TableIndex;
 use super::window::Window;
 use super::{window, QueryId, SingleTableIVM};
-use crate::model::{Condition, DataFrameKey, DataFrameOperation, DataFrameRow, SingleTableReadQuery};
+use crate::model::{Condition, DataFrameKey, DataFrameOperation, DataFrameRow, SingleTableReadQuery, Value};
 
 impl SingleTableIVM {
     /// Register a client subscription under `query_uuid`, returning its
@@ -118,6 +118,64 @@ impl SingleTableIVM {
             table_index.update_condition(&QueryId::from(query_uuid), old, &new, &mut self.stats);
         }
         self.stale_views.insert(QueryId::from(query_uuid));
+    }
+
+    /// Add `value` to the set behind `condition`, a set-valued `IN` leaf of
+    /// `query_uuid`'s filter, and file the leaf under it in the index: the
+    /// O(1) form of a join edge gaining a value. The stored filter needs no
+    /// rewrite, since it holds the same set. As with
+    /// [`SingleTableIVM::replace_condition`], the caller fetches the
+    /// value's rows and then calls [`SingleTableIVM::mark_reconciled`].
+    /// Reports whether the set changed; a member already present, an
+    /// unknown uuid, or a condition that is not set-valued changes nothing.
+    pub fn set_insert(&mut self, query_uuid: &str, condition: &Condition, value: &Value) -> bool {
+        let Value::Set(set) = &condition.value else {
+            return false;
+        };
+        let Some(query) = self.select_queries.get(query_uuid) else {
+            return false;
+        };
+        if !set.insert(value) {
+            return false;
+        }
+        let table = query.table.clone();
+        if let Some(table_index) = self.tables.get_mut(&table) {
+            table_index.set_insert(condition, value);
+        }
+        self.stats.conditions_replaced += 1;
+        self.stale_views.insert(QueryId::from(query_uuid));
+        true
+    }
+
+    /// Remove `value` from the set behind `condition` and unfile the leaf
+    /// from it: the O(1) form of a join edge losing a value. The caller
+    /// prunes the value's held rows and then calls
+    /// [`SingleTableIVM::mark_reconciled`]. Reports whether the set changed.
+    pub fn set_remove(&mut self, query_uuid: &str, condition: &Condition, value: &Value) -> bool {
+        let Value::Set(set) = &condition.value else {
+            return false;
+        };
+        let Some(query) = self.select_queries.get(query_uuid) else {
+            return false;
+        };
+        if !set.remove(value) {
+            return false;
+        }
+        let table = query.table.clone();
+        if let Some(table_index) = self.tables.get_mut(&table) {
+            table_index.set_remove(condition, value);
+        }
+        self.stats.conditions_replaced += 1;
+        self.stale_views.insert(QueryId::from(query_uuid));
+        true
+    }
+
+    /// Count `count` snapshots served by an outer layer from rows this
+    /// engine already holds (the join layer serving an identical tree from
+    /// its shared parts), so `snapshots_shared` stays the one number for
+    /// "registrations that touched no storage".
+    pub(super) fn note_shared_snapshots(&mut self, count: u64) {
+        self.stats.snapshots_shared += count;
     }
 
     /// Declare a `replace_query` / `replace_condition` reconciliation

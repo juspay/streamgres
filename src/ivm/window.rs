@@ -329,7 +329,7 @@ fn rank(value: &Value) -> u8 {
         Value::Date(_) => 3,
         Value::Datetime(_) => 4,
         Value::List(_) => 5,
-        Value::Map(_) => 6,
+        Value::Map(_) | Value::Set(_) => 6,
         Value::Null => 7,
     }
 }

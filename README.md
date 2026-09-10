@@ -46,15 +46,14 @@ the number that **actually match**, and then patches only the affected views.
 | Per-column value index: a write reaches only the conditions it satisfies, `O(columns · log n)` lookups (equality maps, inequality by set difference, range maps per comparison class) | ✅ done | `src/ivm/columns.rs` |
 | Shared frames: one frame per table, rows tagged with holders; held-key mirror; twin registration served from the frame | ✅ done | `src/ivm/frames.rs`, `src/ivm/registry.rs` |
 | `ORDER BY` / `LIMIT` windows: doubled buffer, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
-| In-place condition edit (a join's `IN` list gains/loses a value without re-registration) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
-| Join tree: `LEFT` and `RIGHT` edges at any depth, per-value left/right counts, cascades, self-joins, intersection on shared driven columns | ✅ done | `src/ivm/multi.rs` |
+| In-place condition edits: a literal `IN` swapped inside its disjuncts, or a set-valued `IN` (`Value::Set`) gaining/losing one member in O(1) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
+| Join tree: `LEFT` and `RIGHT` edges at any depth, set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns | ✅ done | `src/ivm/multi.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
 | In-memory storage double honoring `ORDER BY` + `LIMIT`; commit-first test harness | ✅ done | `src/ivm/storage.rs` |
 | Routing counters + benchmark harness | ✅ done | `src/ivm/stats.rs`, `src/bin/bench.rs` |
 | `INNER` joins: visibility gate on the driven parent | ⏳ pending | paper §6.5 |
 | **PostgreSQL ingester**: permanent `pgoutput` slot + rotating exported snapshots + per-subscription catch-up | ⏳ pending | paper §7; `PgStorage` is a stub |
 | **WebSocket protocol**: subscribe / unsubscribe / op stream, connection & subscription lifecycle | ⏳ pending | `src/ws.rs` is an axum echo base |
-| Set-valued join edge (the `IN` list as a per-column set, one edge shared by identical multi-table subscriptions), the measured slow path | ⏳ pending | paper §9.5, §12.1 |
 | Query-keyed twin index; interned subscription ids and compact keys in tags / held index | ⏳ pending | paper §9.3, §9.6 |
 | Parser `JOIN` syntax | ⏳ pending | multi-table queries are built programmatically |
 | Table-sharded multithreading | ⏳ pending | paper §10.3; engine is single-threaded by design |
@@ -149,18 +148,27 @@ one inner subscription, a *part* addressed by its path of join indices
 (`QueryPart`, root = `[]`); inner ids are looked up in a map, never parsed.
 
 Every edge has a **driver** side, whose rows decide which join values are
-referenced, and a **driven** side, whose part carries
-`driven_col IN (referenced values)` inside its filter: `LEFT` keeps the
-parent, so the parent drives; `RIGHT` keeps the child, so the child drives.
-Because the restriction lives inside the driven filter, driven-table writes
-route natively. A node driven on one column from both sides (a `LEFT` parent
-above, a `RIGHT` child below, both on `id`) holds the **intersection** of the
-driving edges' referenced values in one leaf.
+referenced, and a **driven** side, whose part carries `driven_col IN <set>`
+inside its filter: `LEFT` keeps the parent, so the parent drives; `RIGHT`
+keeps the child, so the child drives. The operand is a **shared set**
+(`Value::Set`, compared by identity) owned by the tree, so the restriction
+lives inside the driven filter and driven-table writes route natively, while
+a change to the set never rewrites the filter or the index's counters. A node
+driven on one column from both sides (a `LEFT` parent above, a `RIGHT` child
+below, both on `id`) holds the **intersection** of the driving edges'
+referenced values in one set.
+
+Subscriptions that register an identical spec **share one tree**: one inner
+part per node, one set of edges and counts, one crossing per event; each
+part's operations are emitted once per subscriber, a later identical
+registration is served from the shared parts, and the tree goes with its
+last subscriber.
 
 Per edge and per value the layer keeps `left` (driver rows carrying it) and
-`right` (driven rows held); only `left` zero-crossings that change a leaf act:
-`0→1` edits the leaf in place and fetches that value's driven rows in one
-narrowed query; `→0` edits it and prunes held rows with no storage trip. The
+`right` (driven rows held); only `left` zero-crossings that change a set act:
+`0→1` inserts the member, files the leaf under it in the column index (O(1)),
+and fetches that value's driven rows in one narrowed query; `→0` removes it
+and prunes held rows with no storage trip. The
 rows a fetch brings in are arrivals at the driven node and a prune's rows are
 departures, and the driven node may drive further edges, so the same handling
 cascades through the tree. Registration is a post-order walk (right children,
@@ -259,14 +267,14 @@ yardstick for every optimization: change the strategy, rerun, compare.
 one thread; scenarios 2 to 4 use a bench-local in-memory storage double,
 scenario 1 registers against the empty `PgStorage` stub so frames fill from
 writes alone; raw output in
-[paper/bench-2026-09-08.txt](paper/bench-2026-09-08.txt), analysis in paper §9):
+[paper/bench-2026-09-11.txt](paper/bench-2026-09-11.txt), analysis in paper §9):
 
 | Scenario | Result |
 | --- | --- |
-| Routing, 100 → 10 000 subscriptions | a write touches only the 3 to 4 conditions it satisfies (one probe per column) while the table carries 67 to 85; route-only cost ≈ 1 µs fixed + 0.25 µs per impacted subscription; delivery ≈ 0.9 µs per emitted op |
-| Twin registration (400-row snapshot) | 709 µs from the shared frame vs 1 530 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
-| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.4 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~70 ms across 10 000 writes) |
-| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | user updates are pure fan-out (1.8 µs per op; a user write reaches only the ~31 `IN` lists naming it, not all 108); ticket inserts cost 7 ms because every twin edits its `O(\|IN\|)` join edge at each zero crossing, the slow path the set-valued shared edge removes |
+| Routing, 100 → 10 000 subscriptions | a write touches only the 3 to 4 conditions it satisfies (one probe per column) while the table carries 67 to 85; route-only cost ≈ 1.5 µs fixed + 0.35 µs per impacted subscription; delivery ≈ 1.3 µs per emitted op |
+| Twin registration (400-row snapshot) | 961 µs from the shared frame vs 2 001 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
+| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.5 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~90 ms across 10 000 writes) |
+| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | identical subscriptions share one tree, so a ticket insert costs 66 µs for all 1 000 (7.4 ms before the shared set-valued edge), with 1.8 set edits per write instead of 52.5; the remaining cost is delivery, ≈ 0.3 to 0.4 µs per operation per subscriber |
 
 ### Using the engine programmatically
 
@@ -332,8 +340,9 @@ silently narrowed:
 Cargo.toml
 paper/
   xyne-sync.tex / .pdf     the design paper (algorithms, join tree, ingestion, evaluation)
-  bench-2026-09-08.txt     raw output of the benchmark run reported in the paper
-  bench-2026-09-07-before-frontier.txt   the same run before the window frontier fix
+  bench-2026-09-11.txt     raw output of the benchmark run reported in the paper
+  bench-2026-09-07-before-frontier.txt   the run before the window frontier fix
+  bench-2026-09-08-list-edges.txt        the run before join edges became shared sets
 docs/
   pg-lsn-cdc-lab.md        hands-on lab: LSNs, MVCC snapshots, the CDC handoff
 src/

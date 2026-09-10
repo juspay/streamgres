@@ -20,9 +20,10 @@ use std::fmt;
 /// - `snapshots_shared`: registrations whose initial result set was served
 ///   from an identical already-registered query's rows instead of a storage
 ///   query.
-/// - `conditions_replaced`: in-place condition edits applied to indexed
-///   disjuncts (a join `IN` list gaining or losing a value), one per
-///   affected disjunct — the cheap alternative to re-registration.
+/// - `conditions_replaced`: in-place edits of indexed conditions — one per
+///   value added to or removed from a set-valued `IN` leaf (a join edge
+///   crossing zero), or per disjunct rewritten by `replace_condition` —
+///   the cheap alternative to re-registration.
 ///
 /// Write routing:
 /// - `writes_processed`: writes processed by `incremental_update`.

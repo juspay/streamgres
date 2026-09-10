@@ -1,0 +1,5 @@
+# `Value::Set` wraps a `SharedSet`, whose `Hash` and `Eq` are pointer
+# identity, never the mutable contents, so a `Value` stays a stable map key
+# while the set behind it changes (that stability is the point: a join
+# edge's `IN` leaf keeps its identity as members come and go).
+ignore-interior-mutability = ["jus_sync::model::value::SharedSet"]

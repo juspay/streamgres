@@ -15,7 +15,9 @@
 
 use chrono::{NaiveDate, NaiveDateTime};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::hash::{Hash, Hasher};
 
 /// A dynamically-typed database value.
@@ -33,6 +35,7 @@ pub enum Value {
     Datetime(NaiveDateTime),
     List(Vec<Value>),
     Map(std::collections::HashMap<Value, Value>),
+    Set(SharedSet),
 }
 
 /// The static type of a [`Value`], used to describe columns in a schema.
@@ -107,6 +110,7 @@ impl Value {
                 Datetime(_) => 6,
                 List(_) => 7,
                 Map(_) => 8,
+                Set(_) => 9,
             }
         }
         fn canonical_f64(f: f64) -> f64 {
@@ -132,6 +136,7 @@ impl Value {
                 .map(|(x, y)| x.canonical_cmp(y))
                 .find(|ordering| *ordering != Ordering::Equal)
                 .unwrap_or_else(|| a.len().cmp(&b.len())),
+            (Set(a), Set(b)) => a.address().cmp(&b.address()),
             (Map(a), Map(b)) => {
                 let mut left: Vec<_> = a.iter().collect();
                 let mut right: Vec<_> = b.iter().collect();
@@ -144,6 +149,103 @@ impl Value {
                     .unwrap_or_else(|| left.len().cmp(&right.len()))
             }
             _ => rank(self).cmp(&rank(other)),
+        }
+    }
+}
+
+/// Floats up to this magnitude are exact integers, so an integral float
+/// within it equates to the integer under [`Value::equality_key`].
+const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
+
+/// A shared, mutable set of values: the operand of a set-valued `IN`, the
+/// membership list of a join edge, held by the edge and referenced by the
+/// driven part's filter. Two `SharedSet`s are equal only when they are the
+/// same set (identity), which keeps a leaf's identity stable while its
+/// contents change and lets identical subscriptions share one edge.
+/// Members are stored by [`Value::equality_key`], so `Int(5)` and
+/// `Float(5.0)` are one member.
+#[derive(Clone, Debug, Default)]
+pub struct SharedSet(Rc<RefCell<HashSet<Value>>>);
+
+impl SharedSet {
+    /// An empty set.
+    pub fn new() -> Self {
+        SharedSet::default()
+    }
+
+    /// Whether `value` is a member (`NULL` never is).
+    pub fn contains(&self, value: &Value) -> bool {
+        value
+            .equality_key()
+            .is_some_and(|key| self.0.borrow().contains(&key))
+    }
+
+    /// Add `value`; reports whether it was new (`NULL` is never added).
+    pub fn insert(&self, value: &Value) -> bool {
+        match value.equality_key() {
+            Some(key) => self.0.borrow_mut().insert(key),
+            None => false,
+        }
+    }
+
+    /// Remove `value`; reports whether it was a member.
+    pub fn remove(&self, value: &Value) -> bool {
+        match value.equality_key() {
+            Some(key) => self.0.borrow_mut().remove(&key),
+            None => false,
+        }
+    }
+
+    /// The current members, as their equality keys, in no particular order.
+    pub fn members(&self) -> Vec<Value> {
+        self.0.borrow().iter().cloned().collect()
+    }
+
+    /// How many members the set holds.
+    pub fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+
+    /// Whether the set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
+
+    /// The set's identity, for ordering and hashing.
+    fn address(&self) -> usize {
+        Rc::as_ptr(&self.0) as *const () as usize
+    }
+}
+
+impl PartialEq for SharedSet {
+    /// Identity: the same set, not equal contents.
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for SharedSet {}
+
+impl Hash for SharedSet {
+    /// Hashes the identity, never the contents.
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.address().hash(state);
+    }
+}
+
+impl Value {
+    /// The key under which a value takes part in equality tests: `None` for
+    /// `NULL` (which equals nothing), the integer for an integral float
+    /// within exact range (the coercion of [`Value::loose_eq`]), the value
+    /// itself otherwise. Two values are `loose_eq` iff their keys are equal,
+    /// which is what lets hash maps and sets stand in for equality tests.
+    pub fn equality_key(&self) -> Option<Value> {
+        match self {
+            Value::Null => None,
+            Value::Float(f) if f.fract() == 0.0 && f.abs() <= EXACT_INTEGER_LIMIT => {
+                Some(Value::Int(*f as i64))
+            }
+            other => Some(other.clone()),
         }
     }
 }
@@ -165,6 +267,7 @@ impl PartialEq for Value {
             (Datetime(a), Datetime(b)) => a == b,
             (List(a), List(b)) => a == b,
             (Map(a), Map(b)) => a == b,
+            (Set(a), Set(b)) => a == b,
             _ => false,
         }
     }
@@ -189,6 +292,7 @@ impl Hash for Value {
             Datetime(dt) => dt.hash(state),
             List(items) => items.hash(state),
             Map(entries) => unordered_map_hash(entries).hash(state),
+            Set(set) => set.hash(state),
         }
     }
 }

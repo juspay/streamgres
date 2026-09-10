@@ -6,7 +6,9 @@
 //! family so that one written value reaches exactly its matches:
 //!
 //! - **Equality** (`=`, `IN`): a hash map from value to conditions; an
-//!   `IN` is filed under each of its list values. Keys fold in the numeric
+//!   `IN` is filed under each of its list values (or, for a set-valued
+//!   `IN`, its current members, with [`ColumnIndex::file_key`] and
+//!   [`ColumnIndex::unfile_key`] following the set one member at a time). Keys fold in the numeric
 //!   coercion of [`Value::loose_eq`] (an integral float files as the
 //!   integer), so `Int(5)` finds `= 5.0`.
 //! - **Inequality** (`<>`, `NOT IN`): the mirror map records where each
@@ -35,10 +37,6 @@ use std::rc::Rc;
 
 use super::window::order_cmp;
 use crate::model::{ComparisonOperator, Condition, Value};
-
-/// Floats up to this magnitude are exact integers, so an integral float
-/// within it files under the integer key `loose_eq` would equate it with.
-const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
 
 /// A shared handle to an indexed condition, hashed and compared by pointer
 /// identity: the same condition object under every key it is filed at.
@@ -108,26 +106,24 @@ impl ColumnIndex {
         let value = &condition.0.value;
         match condition.0.comparison_operator {
             EQ => {
-                if let Some(key) = eq_key(value) {
+                if let Some(key) = value.equality_key() {
                     self.equal.entry(key).or_default().insert(condition.clone());
                 }
             }
             IN => {
-                for key in list_keys(value) {
+                for key in member_keys(value) {
                     self.equal.entry(key).or_default().insert(condition.clone());
                 }
             }
             NEQ => {
-                if let Some(key) = eq_key(value) {
+                if let Some(key) = value.equality_key() {
                     self.unequal.entry(key).or_default().insert(condition.clone());
                     self.unequal_all.insert(condition.clone());
                 }
             }
             NOT_IN => {
-                if let Value::List(items) = value
-                    && !items.iter().any(Value::is_null)
-                {
-                    for key in list_keys(value) {
+                if negation_is_satisfiable(value) {
+                    for key in member_keys(value) {
                         self.unequal.entry(key).or_default().insert(condition.clone());
                     }
                     self.unequal_all.insert(condition.clone());
@@ -161,18 +157,18 @@ impl ColumnIndex {
         use ComparisonOperator::*;
         let value = &condition.0.value;
         match condition.0.comparison_operator {
-            EQ => remove_under(&mut self.equal, eq_key(value), condition),
+            EQ => remove_under(&mut self.equal, value.equality_key(), condition),
             IN => {
-                for key in list_keys(value) {
+                for key in member_keys(value) {
                     remove_under(&mut self.equal, Some(key), condition);
                 }
             }
             NEQ => {
-                remove_under(&mut self.unequal, eq_key(value), condition);
+                remove_under(&mut self.unequal, value.equality_key(), condition);
                 self.unequal_all.remove(condition);
             }
             NOT_IN => {
-                for key in list_keys(value) {
+                for key in member_keys(value) {
                     remove_under(&mut self.unequal, Some(key), condition);
                 }
                 self.unequal_all.remove(condition);
@@ -180,6 +176,19 @@ impl ColumnIndex {
             GT | GTE => remove_threshold(&mut self.above, value, condition),
             LT | LTE => remove_threshold(&mut self.below, value, condition),
         }
+    }
+
+    /// File an already-indexed set-valued `IN` condition under one more
+    /// member: the O(1) edit of a join edge gaining a value.
+    pub(super) fn file_key(&mut self, condition: &CondRef, value: &Value) {
+        if let Some(key) = value.equality_key() {
+            self.equal.entry(key).or_default().insert(condition.clone());
+        }
+    }
+
+    /// Unfile a set-valued `IN` condition from one member it lost.
+    pub(super) fn unfile_key(&mut self, condition: &CondRef, value: &Value) {
+        remove_under(&mut self.equal, value.equality_key(), condition);
     }
 
     /// Whether nothing is filed on the column anymore.
@@ -193,7 +202,7 @@ impl ColumnIndex {
     /// Append the conditions a written value satisfies to `out`.
     pub(super) fn candidates(&self, value: &Value, out: &mut Vec<CondRef>) {
         use ComparisonOperator::*;
-        let Some(key) = eq_key(value) else {
+        let Some(key) = value.equality_key() else {
             return;
         };
         if let Some(matching) = self.equal.get(&key) {
@@ -275,25 +284,23 @@ fn remove_threshold(
     }
 }
 
-/// The equality-bucket key of a value: `None` for `NULL` (which equals
-/// nothing), the integer for an integral float within exact range (the
-/// coercion of [`Value::loose_eq`]), the value itself otherwise.
-fn eq_key(value: &Value) -> Option<Value> {
+/// The equality keys of an `IN` / `NOT IN` operand: one per non-null list
+/// item, or the current members of a shared set; empty for anything else.
+fn member_keys(value: &Value) -> Vec<Value> {
     match value {
-        Value::Null => None,
-        Value::Float(f) if f.fract() == 0.0 && f.abs() <= EXACT_INTEGER_LIMIT => {
-            Some(Value::Int(*f as i64))
-        }
-        other => Some(other.clone()),
+        Value::List(items) => items.iter().filter_map(Value::equality_key).collect(),
+        Value::Set(set) => set.members(),
+        _ => Vec::new(),
     }
 }
 
-/// The equality keys of an `IN` / `NOT IN` list: one per non-null item;
-/// empty for anything that is not a list.
-fn list_keys(value: &Value) -> Vec<Value> {
+/// Whether a `NOT IN` operand can ever be true: a list holding `NULL`
+/// cannot; a shared set never holds `NULL`.
+fn negation_is_satisfiable(value: &Value) -> bool {
     match value {
-        Value::List(items) => items.iter().filter_map(eq_key).collect(),
-        _ => Vec::new(),
+        Value::List(items) => !items.iter().any(Value::is_null),
+        Value::Set(_) => true,
+        _ => false,
     }
 }
 
