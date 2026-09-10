@@ -51,10 +51,10 @@
 
 use std::cmp::Ordering;
 
-use super::{QueryId, SingleTableIVM, SingleTableUpdate};
+use super::{SingleTableIVM, SingleTableUpdate};
 use crate::model::{
     ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow,
-    Order, SingleTableReadQuery, Value, Where,
+    Order, SingleTableReadQuery, SubId, Value, Where,
 };
 
 /// The ORDER BY / LIMIT state of one subscription: its held rows' order
@@ -340,8 +340,8 @@ impl SingleTableIVM {
     /// filters candidates through. Called after every change that can
     /// move the boundary; a `LIMIT 0` query publishes the always-false
     /// `IN ()`.
-    pub(super) fn sync_boundary(&mut self, query_uuid: &str) {
-        let Some(query) = self.select_queries.get(query_uuid) else {
+    pub(super) fn sync_boundary(&mut self, sub: SubId) {
+        let Some(query) = self.select_queries.get(&sub) else {
             return;
         };
         let table = query.table.clone();
@@ -353,55 +353,55 @@ impl SingleTableIVM {
             ))
         } else {
             self.windows
-                .get(query_uuid)
+                .get(&sub)
                 .and_then(|window| window.boundary_condition())
         };
         self.tables
             .entry(table)
             .or_default()
-            .set_boundary(&QueryId::from(query_uuid), boundary);
+            .set_boundary(sub, boundary);
     }
 
     /// (Re)derive a subscription's window entries from the rows it
     /// currently holds, with no frontier yet — the caller records the
     /// storage read or twin the rows came from; queries without a finite
     /// positive limit carry no window.
-    pub(super) fn rebuild_window(&mut self, query_uuid: &str) {
-        let Some(query) = self.select_queries.get(query_uuid) else {
-            self.windows.remove(query_uuid);
+    pub(super) fn rebuild_window(&mut self, sub: SubId) {
+        let Some(query) = self.select_queries.get(&sub) else {
+            self.windows.remove(&sub);
             return;
         };
         let Some(mut window) = Window::for_query(query) else {
-            self.windows.remove(query_uuid);
+            self.windows.remove(&sub);
             return;
         };
-        if let Some(keys) = self.held.get(query_uuid)
+        if let Some(ids) = self.held.get(&sub)
             && let Some(frame) = self.frames.get(&query.table)
         {
-            for key in keys {
-                if let Some(row) = frame.rows.get(key) {
+            for id in ids {
+                if let Some(row) = frame.row(*id) {
                     let value = window.order_value(&DataFrameRow {
                         data: row.data.clone(),
                     });
-                    window.insert(value, key.clone());
+                    window.insert(value, row.key.clone());
                 }
             }
         }
-        self.windows.insert(QueryId::from(query_uuid), window);
+        self.windows.insert(sub, window);
     }
 
     /// Untag worst-held rows until the subscription is back at buffer
     /// capacity, returning their `Delete`s; each eviction pulls the
     /// frontier in to the evicted value.
-    pub(super) fn evict_overflow(&mut self, query_uuid: &str) -> Vec<DataFrameOperation> {
+    pub(super) fn evict_overflow(&mut self, sub: SubId) -> Vec<DataFrameOperation> {
         let mut ops = Vec::new();
         while let Some(evicted) = self
             .windows
-            .get_mut(query_uuid)
+            .get_mut(&sub)
             .and_then(|window| window.pop_overflow())
         {
             self.stats.window_evictions += 1;
-            if let Some(op) = self.remove_row(query_uuid, &evicted) {
+            if let Some(op) = self.remove_row(sub, &evicted) {
                 ops.push(op);
             }
         }
@@ -414,13 +414,13 @@ impl SingleTableIVM {
     /// window's refill plan, tagged in and returned as `Add`s, with the
     /// frontier moved to the worst value fetched and any overshoot
     /// evicted.
-    fn refill(&mut self, query_uuid: &str) -> Vec<DataFrameOperation> {
-        let Some(query) = self.select_queries.get(query_uuid).cloned() else {
+    fn refill(&mut self, sub: SubId) -> Vec<DataFrameOperation> {
+        let Some(query) = self.select_queries.get(&sub).cloned() else {
             return Vec::new();
         };
         let Some((limit, threshold)) = self
             .windows
-            .get(query_uuid)
+            .get(&sub)
             .and_then(Window::refill_plan)
         else {
             return Vec::new();
@@ -440,18 +440,18 @@ impl SingleTableIVM {
         let records = self.storage.select(&refill_query);
         let mut ops = Vec::new();
         for (key, row) in &records {
-            if let Some(op) = self.upsert_row(query_uuid, key, row) {
+            if let Some(op) = self.upsert_row(sub, key, row) {
                 ops.push(op);
             }
-            if let Some(window) = self.windows.get_mut(query_uuid) {
+            if let Some(window) = self.windows.get_mut(&sub) {
                 let value = window.order_value(row);
                 window.insert(value, key.clone());
             }
         }
-        if let Some(window) = self.windows.get_mut(query_uuid) {
+        if let Some(window) = self.windows.get_mut(&sub) {
             window.note_fetch(limit as usize, &records);
         }
-        ops.extend(self.evict_overflow(query_uuid));
+        ops.extend(self.evict_overflow(sub));
         ops
     }
 
@@ -462,14 +462,14 @@ impl SingleTableIVM {
     /// without a window.
     pub(super) fn maintain_window(
         &mut self,
-        uuid: &QueryId,
+        sub: SubId,
         key: &DataFrameKey,
         row_image: Option<&DataFrameRow>,
         matches_after: bool,
         present_before: bool,
     ) -> Vec<SingleTableUpdate> {
         let drained = {
-            let Some(window) = self.windows.get_mut(uuid.as_str()) else {
+            let Some(window) = self.windows.get_mut(&sub) else {
                 return Vec::new();
             };
             if present_before {
@@ -482,18 +482,18 @@ impl SingleTableIVM {
             }
             present_before && !matches_after && window.needs_refill()
         };
-        let table = match self.select_queries.get(uuid.as_str()) {
+        let table = match self.select_queries.get(&sub) {
             Some(query) => query.table.clone(),
             None => return Vec::new(),
         };
-        let mut ops = self.evict_overflow(uuid.as_str());
+        let mut ops = self.evict_overflow(sub);
         if drained {
-            ops.extend(self.refill(uuid.as_str()));
+            ops.extend(self.refill(sub));
         }
-        self.sync_boundary(uuid.as_str());
+        self.sync_boundary(sub);
         ops.into_iter()
             .map(|op| SingleTableUpdate {
-                query: uuid.clone(),
+                query: sub,
                 table: table.clone(),
                 op,
             })

@@ -1,6 +1,7 @@
 //! Incremental View Maintenance (IVM) — the core of the engine.
 //!
-//! Clients subscribe with [`SingleTableReadQuery`]s; every incoming
+//! Clients subscribe with [`SingleTableReadQuery`]s and get back an engine
+//! id ([`SubId`]) the layer above maps their own ids to; every incoming
 //! [`WriteQuery`] is routed to the subscriptions it affects, and each
 //! affected subscription receives the minimal [`DataFrameOperation`]s that
 //! bring its result set up to date.
@@ -87,8 +88,8 @@
 //!   a `LIMIT 0` subscription is permanently empty (its registration
 //!   snapshot is empty and later writes never admit).
 //! - Frames fill three ways: the initial [`Storage`] query run at
-//!   registration (or rows the caller pre-fetched and passed in), writes
-//!   seen afterwards, and explicit [`SingleTableIVM::fetch`]es (how the
+//!   registration, writes seen afterwards, and explicit
+//!   [`SingleTableIVM::fetch`]es (how the
 //!   join layer pulls the other side of a join in). [`PgStorage`] is still
 //!   a stub, so against Postgres the initial load is empty until the
 //!   Diesel connector lands.
@@ -115,7 +116,7 @@ mod stats;
 mod storage;
 mod window;
 
-pub use crate::model::QueryId;
+pub use crate::model::SubId;
 pub use multi::{MultiTableIVM, MultiTableUpdate, QueryPart};
 pub use predicate::{eval_condition, evaluate};
 pub use stats::IvmStats;
@@ -124,10 +125,8 @@ pub use storage::{MemoryStorage, PgStorage, Storage};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::model::frame::{SharedRow, TableFrame};
-use crate::model::{
-    DataFrameKey, DataFrameOperation, DataFrameRow, SingleTableReadQuery, TableName, WriteQuery,
-};
+use crate::model::frame::{RowId, TableFrame};
+use crate::model::{DataFrameOperation, DataFrameRow, SingleTableReadQuery, TableName, WriteQuery};
 use index::TableIndex;
 use window::Window;
 
@@ -135,13 +134,13 @@ use window::Window;
 /// [`SingleTableIVM::incremental_update`] emits and the transport pushes
 /// to the subscribed client.
 ///
-/// - `query`: which subscription (the id the client registered).
+/// - `query`: which subscription (the engine id `register_query` returned).
 /// - `table`: the table the operation lands on — the written table, which
 ///   is also the subscription's table.
 /// - `op`: the delta itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SingleTableUpdate {
-    pub query: QueryId,
+    pub query: SubId,
     pub table: TableName,
     pub op: DataFrameOperation,
 }
@@ -150,14 +149,19 @@ pub struct SingleTableUpdate {
 /// database, one subscription per single-table query; multi-table joins
 /// are layered on top by [`MultiTableIVM`].
 ///
-/// - `select_queries`: subscription handle → its query; the [`QueryId`] is
-///   what the WebSocket layer will use to address a client's subscription.
+/// - `select_queries`: subscription id → its query. Ids are `u64`s the
+///   engine hands out at registration; the transport maps client ids to
+///   them.
+/// - `by_query`: query → the subscriptions registered with exactly that
+///   query, the one-lookup twin index; re-keyed whenever a stored query
+///   changes shape.
 /// - `frames`: ONE shared frame per table, rows tagged with their
-///   subscribers (see the module header).
-/// - `held`: subscription → the keys of the shared rows it currently
+///   subscribers' ids (see the module header).
+/// - `held`: subscription → the row ids of the shared rows it currently
 ///   holds — the forward mirror of the rows' subscriber tags, kept in
 ///   lockstep with them, so a subscription's view is enumerable without
-///   scanning its table's frame.
+///   scanning its table's frame. A (subscription, row) pair is two small
+///   integers, one in each direction.
 /// - `windows`: subscription → its ORDER BY / LIMIT window (finite-limit
 ///   queries only): the order-value → row-key map whose worst entry is
 ///   the admission boundary, published into the table's routing index
@@ -174,16 +178,19 @@ pub struct SingleTableUpdate {
 /// - `write_epoch`: monotonic write number; disjunct counters are lazily
 ///   invalidated by comparing against it, so no per-write reset sweep is
 ///   needed.
+/// - `next_sub`: the next subscription id to hand out; never reused.
 /// - `stats`: operation counters; not part of the sync state.
 pub struct SingleTableIVM {
-    select_queries: HashMap<QueryId, SingleTableReadQuery>,
+    select_queries: HashMap<SubId, SingleTableReadQuery>,
+    by_query: HashMap<SingleTableReadQuery, BTreeSet<SubId>>,
     frames: HashMap<TableName, TableFrame>,
-    held: HashMap<QueryId, HashSet<DataFrameKey>>,
-    windows: HashMap<QueryId, Window>,
-    stale_views: HashSet<QueryId>,
+    held: HashMap<SubId, HashSet<RowId>>,
+    windows: HashMap<SubId, Window>,
+    stale_views: HashSet<SubId>,
     tables: HashMap<TableName, TableIndex>,
     storage: Rc<dyn Storage>,
     write_epoch: u64,
+    next_sub: u64,
     stats: IvmStats,
 }
 
@@ -195,7 +202,7 @@ pub struct SingleTableIVM {
 /// - `present_before`: was the shared row tagged with this subscription
 ///   before the write?
 struct Impact {
-    uuid: QueryId,
+    sub: SubId,
     matches_after: bool,
     present_before: bool,
 }
@@ -205,6 +212,7 @@ impl SingleTableIVM {
     pub fn new(storage: Rc<dyn Storage>) -> Self {
         SingleTableIVM {
             select_queries: HashMap::new(),
+            by_query: HashMap::new(),
             frames: HashMap::new(),
             held: HashMap::new(),
             windows: HashMap::new(),
@@ -212,6 +220,7 @@ impl SingleTableIVM {
             tables: HashMap::new(),
             storage,
             write_epoch: 0,
+            next_sub: 0,
             stats: IvmStats::default(),
         }
     }
@@ -220,10 +229,10 @@ impl SingleTableIVM {
     ///
     /// Returns subscription ids in deterministic (sorted) order. Records
     /// routing counters in [`SingleTableIVM::stats`].
-    pub fn search_impacted_queries(&mut self, write_query: &WriteQuery) -> Vec<QueryId> {
+    pub fn search_impacted_queries(&mut self, write_query: &WriteQuery) -> Vec<SubId> {
         self.analyze(write_query)
             .into_iter()
-            .map(|impact| impact.uuid)
+            .map(|impact| impact.sub)
             .collect()
     }
 
@@ -248,7 +257,7 @@ impl SingleTableIVM {
         let old_data = self
             .frames
             .get(&table)
-            .and_then(|frame| frame.rows.get(&key))
+            .and_then(|frame| frame.get(&key))
             .map(|row| row.data.clone());
 
         let mut ops: Vec<SingleTableUpdate> = Vec::new();
@@ -259,7 +268,7 @@ impl SingleTableIVM {
                     .expect("present_before is only true when the shared row is materialized");
                 self.stats.ops_delete += 1;
                 ops.push(SingleTableUpdate {
-                    query: impact.uuid.clone(),
+                    query: impact.sub,
                     table: table.clone(),
                     op: DataFrameOperation::Delete(key.clone(), DataFrameRow { data }),
                 });
@@ -270,7 +279,7 @@ impl SingleTableIVM {
                     .clone();
                 self.stats.ops_add += 1;
                 ops.push(SingleTableUpdate {
-                    query: impact.uuid.clone(),
+                    query: impact.sub,
                     table: table.clone(),
                     op: DataFrameOperation::Add(key.clone(), row),
                 });
@@ -282,36 +291,28 @@ impl SingleTableIVM {
             for impact in &impacts {
                 if impact.matches_after {
                     let data = row_image.expect("checked above").data.clone();
-                    let row = frame.rows.entry(key.clone()).or_insert_with(|| SharedRow {
-                        data: data.clone(),
-                        subscribers: BTreeSet::new(),
-                    });
+                    let (id, row) = frame.entry(&key, || data.clone());
                     row.data = data;
-                    row.subscribers.insert(impact.uuid.clone());
-                    self.held
-                        .entry(impact.uuid.clone())
-                        .or_default()
-                        .insert(key.clone());
-                } else if let Some(row) = frame.rows.get_mut(&key) {
-                    row.subscribers.remove(impact.uuid.as_str());
-                    if let Some(keys) = self.held.get_mut(impact.uuid.as_str()) {
-                        keys.remove(&key);
+                    row.subscribers.insert(impact.sub);
+                    self.held.entry(impact.sub).or_default().insert(id);
+                } else if let Some(id) = frame.id_of(&key) {
+                    if let Some(row) = frame.row_mut(id) {
+                        row.subscribers.remove(&impact.sub);
+                    }
+                    if let Some(ids) = self.held.get_mut(&impact.sub) {
+                        ids.remove(&id);
                     }
                 }
             }
-            if frame
-                .rows
-                .get(&key)
-                .is_some_and(|row| row.subscribers.is_empty())
-            {
-                frame.rows.remove(&key);
+            if let Some(id) = frame.id_of(&key) {
+                frame.drop_if_unheld(id);
             }
         }
 
         let mut window_ops = Vec::new();
         for impact in &impacts {
             window_ops.extend(self.maintain_window(
-                &impact.uuid,
+                impact.sub,
                 &key,
                 row_image,
                 impact.matches_after,
@@ -355,22 +356,22 @@ impl SingleTableIVM {
         let key = write_query.pkey_value().clone();
         let row_image = write_query.new_row_image();
 
-        let mut holding: BTreeSet<QueryId> = BTreeSet::new();
+        let mut holding: BTreeSet<SubId> = BTreeSet::new();
         let holders = self
             .frames
             .get(&table_name)
-            .and_then(|frame| frame.rows.get(&key))
+            .and_then(|frame| frame.get(&key))
             .map(|row| row.subscribers.clone())
             .unwrap_or_default();
-        for uuid in holders {
-            if self.select_queries.contains_key(&uuid) {
+        for sub in holders {
+            if self.select_queries.contains_key(&sub) {
                 self.stats.membership_probes += 1;
                 self.stats.membership_hits += 1;
-                holding.insert(uuid);
+                holding.insert(sub);
             }
         }
 
-        let mut matched: BTreeSet<QueryId> = BTreeSet::new();
+        let mut matched: BTreeSet<SubId> = BTreeSet::new();
         if let Some(row) = row_image {
             debug_assert!(
                 key.pkey_value
@@ -386,12 +387,12 @@ impl SingleTableIVM {
         }
 
         let mut impacts = Vec::new();
-        for uuid in matched.union(&holding) {
+        for sub in matched.union(&holding) {
             self.stats.queries_impacted += 1;
             impacts.push(Impact {
-                uuid: uuid.clone(),
-                matches_after: matched.contains(uuid),
-                present_before: holding.contains(uuid),
+                sub: *sub,
+                matches_after: matched.contains(sub),
+                present_before: holding.contains(sub),
             });
         }
         impacts

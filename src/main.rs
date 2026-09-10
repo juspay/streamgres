@@ -16,7 +16,7 @@
 //! `tests/ivm_scenarios.rs`; the parser's own tests live in
 //! `src/parser/mod.rs`.
 
-use jus_sync::ivm::{IvmStats, PgStorage, SingleTableIVM};
+use jus_sync::ivm::{IvmStats, PgStorage, SingleTableIVM, SubId};
 use jus_sync::model::*;
 use jus_sync::parser::{parse_read, parse_write, point_at, Catalog};
 use std::rc::Rc;
@@ -47,11 +47,13 @@ fn main() {
     ];
 
     println!("\nregistering {} subscriptions:", subscriptions.len());
+    let mut names: Vec<(SubId, &str)> = Vec::new();
     for (uuid, sql) in subscriptions {
         println!("  {uuid:<14} {sql}");
         let query = parse_read(sql, &catalog)
             .unwrap_or_else(|error| panic!("{}", point_at(sql, &error)));
-        ivm.register_query(uuid.to_owned(), query, None);
+        let (id, _) = ivm.register_query(query);
+        names.push((id, uuid));
     }
     println!(
         "  -> {} disjuncts, {} condition links indexed (q-open and q-open-dup both subscribe to status = 'OPEN')",
@@ -61,6 +63,7 @@ fn main() {
 
     run_write(
         &mut ivm,
+        &names,
         &catalog,
         "INSERT INTO tickets (id, status, priority, assigned_to, points) \
          VALUES (1, 'OPEN', 'LOW', 'aniket', 3)",
@@ -70,6 +73,7 @@ fn main() {
 
     run_write(
         &mut ivm,
+        &names,
         &catalog,
         "INSERT INTO tickets (id, status, priority, assigned_to, points) \
          VALUES (2, 'TODO', 'URGENT', 'vipul', 9)",
@@ -83,6 +87,7 @@ fn main() {
 
     run_write(
         &mut ivm,
+        &names,
         &catalog,
         "UPDATE tickets SET status = 'DONE', priority = 'LOW', assigned_to = 'aniket', \
          points = 3 WHERE id = 1",
@@ -95,6 +100,7 @@ fn main() {
 
     run_write(
         &mut ivm,
+        &names,
         &catalog,
         "DELETE FROM tickets WHERE id = 2",
         &["q-all", "q-big", "q-hot"],
@@ -102,8 +108,8 @@ fn main() {
     );
 
     println!("\n== final materialized frames ==========================================");
-    for (uuid, _) in subscriptions {
-        let rows = ivm.rows_for(uuid).expect("registered above");
+    for (id, uuid) in &names {
+        let rows = ivm.rows_for(*id).expect("registered above");
         println!("  {uuid:<14} {} row(s)", rows.len());
     }
 
@@ -115,11 +121,18 @@ fn main() {
 /// impacted subscriptions, the emitted operations, and the routing-cost delta.
 fn run_write(
     ivm: &mut SingleTableIVM,
+    names: &[(SubId, &str)],
     catalog: &Catalog,
     sql: &str,
     expected_impacted: &[&str],
     note: Option<&str>,
 ) {
+    let name_of = |id: SubId| -> &str {
+        names
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .map_or("?", |(_, name)| name)
+    };
     println!("\n-- {sql}");
     let write = parse_write(sql, catalog)
         .unwrap_or_else(|error| panic!("{}", point_at(sql, &error)));
@@ -130,10 +143,12 @@ fn run_write(
 
     let mut found: Vec<&str> = Vec::new();
     for update in &ops {
-        if !found.contains(&update.query.as_str()) {
-            found.push(update.query.as_str());
+        let name = name_of(update.query);
+        if !found.contains(&name) {
+            found.push(name);
         }
     }
+    found.sort_unstable();
     let verdict = if found == expected_impacted {
         "PASS"
     } else {
@@ -143,7 +158,7 @@ fn run_write(
     println!("   expected : {expected_impacted:?}");
     println!("   impacted : {found:?}   [{verdict}]");
     for update in &ops {
-        println!("   op       : {:<14} <- {}", update.query, fmt_op(&update.op));
+        println!("   op       : {:<14} <- {}", name_of(update.query), fmt_op(&update.op));
     }
     println!("   cost     : {}", cost.routing_summary());
     if let Some(note) = note {

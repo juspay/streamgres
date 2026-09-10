@@ -1,138 +1,119 @@
 //! Subscription lifecycle: registering, replacing, and removing
 //! subscriptions on the [`SingleTableIVM`], including twin sharing (an
-//! identical query served from the shared frame) and the in-place
-//! condition edit the join layer uses for its `IN` lists.
+//! identical query served from the shared frame, found through a
+//! query-keyed index) and the in-place condition edits the join layer
+//! uses for its set-valued `IN` leaves.
 
 use super::index::TableIndex;
 use super::window::Window;
-use super::{window, QueryId, SingleTableIVM};
-use crate::model::{Condition, DataFrameKey, DataFrameOperation, DataFrameRow, SingleTableReadQuery, Value};
+use super::{window, SingleTableIVM};
+use crate::model::{
+    Condition, DataFrameKey, DataFrameOperation, DataFrameRow, SingleTableReadQuery, SubId, Value,
+};
 
 impl SingleTableIVM {
-    /// Register a client subscription under `query_uuid`, returning its
-    /// initial result set as `Add` operations.
+    /// Register a subscription, returning its engine id and its initial
+    /// result set as `Add` operations. Ids are handed out by the engine
+    /// and never reused; the layer above maps a client's own ids to them.
     ///
     /// The query's `Where` is normalized to DNF and indexed in the table's
     /// routing index (a `WHERE FALSE` query has no disjuncts and touches no
-    /// index at all). The initial rows come from `initial` when the caller
-    /// already fetched them (the join layer narrows sub queries itself) —
-    /// `initial` must be the query's **complete** current result set, since
-    /// twin sharing may serve later identical registrations from it;
-    /// otherwise, a query **structurally identical** to one already
-    /// registered under another uuid is served from the shared frame — the
-    /// twin's current rows, no storage query, counted in
-    /// `snapshots_shared` — and only a query with no twin runs against
-    /// [`super::Storage`]. Rows already shared with other subscriptions
-    /// are tagged rather than duplicated.
-    ///
-    /// Re-registering a uuid with the identical query is a no-op returning
-    /// no operations (the client already holds its state). Re-registering
-    /// with a changed query replaces the subscription: old index entries
-    /// and row tags removed first — counting fires on exact counts, so a
-    /// leftover link would corrupt the replacement's counters.
-    pub fn register_query(
-        &mut self,
-        query_uuid: impl Into<QueryId>,
-        select_query: SingleTableReadQuery,
-        initial: Option<Vec<(DataFrameKey, DataFrameRow)>>,
-    ) -> Vec<DataFrameOperation> {
-        let query_uuid = query_uuid.into();
+    /// index at all). A query **structurally identical** to one already
+    /// registered is served from the shared frame — the twin's current
+    /// rows, no storage query, counted in `snapshots_shared` — found
+    /// through the query-keyed index in one lookup; only a query with no
+    /// twin runs against [`super::Storage`]. Rows already shared with other
+    /// subscriptions are tagged rather than duplicated.
+    pub fn register_query(&mut self, select_query: SingleTableReadQuery) -> (SubId, Vec<DataFrameOperation>) {
+        let sub = SubId(self.next_sub);
+        self.next_sub += 1;
         self.stats.queries_registered += 1;
-
-        if self.select_queries.get(&query_uuid) == Some(&select_query) {
-            return Vec::new();
-        }
-        if self.select_queries.contains_key(&query_uuid) {
-            self.unregister_query(query_uuid.as_str());
-        }
 
         let dnf = select_query.filter.to_dnf();
         if !dnf.is_empty() {
             self.tables
                 .entry(select_query.table.clone())
                 .or_default()
-                .register(&query_uuid, dnf, &mut self.stats);
+                .register(sub, dnf, &mut self.stats);
         }
-        let mut twin_of = None;
-        let records = match initial {
-            Some(records) => records,
-            None => match self.identical_subscription(&select_query, &query_uuid) {
-                Some(twin) => {
-                    self.stats.snapshots_shared += 1;
-                    let rows = self.rows_of(&twin);
-                    twin_of = Some(twin);
-                    rows
-                }
-                None => self.storage.select(&Self::storage_query(&select_query)),
-            },
+        let twin = self.identical_subscription(&select_query, sub);
+        let records = match twin {
+            Some(twin) => {
+                self.stats.snapshots_shared += 1;
+                self.rows_of(twin)
+            }
+            None => self.storage.select(&Self::storage_query(&select_query)),
         };
         let requested = window::storage_limit(&select_query) as usize;
-        self.select_queries
-            .insert(query_uuid.clone(), select_query);
+        self.by_query
+            .entry(select_query.clone())
+            .or_default()
+            .insert(sub);
+        self.select_queries.insert(sub, select_query);
 
         let mut ops = Vec::new();
         for (key, row) in &records {
-            if let Some(op) = self.upsert_row(query_uuid.as_str(), key, row) {
+            if let Some(op) = self.upsert_row(sub, key, row) {
                 ops.push(op);
             }
         }
-        self.rebuild_window(query_uuid.as_str());
-        let inherited = twin_of
-            .as_ref()
-            .and_then(|twin| self.windows.get(twin.as_str()))
+        self.rebuild_window(sub);
+        let inherited = twin
+            .and_then(|twin| self.windows.get(&twin))
             .and_then(Window::frontier);
-        if let Some(window) = self.windows.get_mut(query_uuid.as_str()) {
-            match twin_of {
+        if let Some(window) = self.windows.get_mut(&sub) {
+            match twin {
                 Some(_) => window.set_frontier(inherited),
                 None => window.note_fetch(requested, &records),
             }
         }
-        ops.extend(self.evict_overflow(query_uuid.as_str()));
-        self.sync_boundary(query_uuid.as_str());
-        ops
+        ops.extend(self.evict_overflow(sub));
+        self.sync_boundary(sub);
+        (sub, ops)
     }
 
-    /// Edit one condition of a subscription's filter **in place** — the
-    /// value-list change of a join `IN` gaining or losing a value. The
-    /// stored filter's matching leaves are rewritten and the routing
-    /// index swaps the condition inside this subscription's disjuncts
-    /// only ([`index`-module `update_condition`], splitting shared
-    /// counters correctly) — no DNF re-normalization, no
+    /// Edit one condition of a subscription's filter **in place**: the
+    /// stored filter's matching leaves are rewritten and the routing index
+    /// swaps the condition inside this subscription's disjuncts only
+    /// (splitting shared counters correctly) — no DNF re-normalization, no
     /// unregister/re-register churn.
     ///
     /// As with [`SingleTableIVM::replace_query`], the caller owns
     /// reconciling held rows with the new condition (fetch what widened
     /// in, prune what narrowed out), and the subscription is skipped as a
     /// twin donor until [`SingleTableIVM::mark_reconciled`]. Unknown
-    /// uuids and identical conditions are no-ops.
-    pub fn replace_condition(&mut self, query_uuid: &str, old: &Condition, new: Condition) {
-        let Some(query) = self.select_queries.get_mut(query_uuid) else {
+    /// subscriptions and identical conditions are no-ops.
+    pub fn replace_condition(&mut self, sub: SubId, old: &Condition, new: Condition) {
+        let Some(query) = self.select_queries.get_mut(&sub) else {
             return;
         };
         if *old == new {
             return;
         }
+        let before = query.clone();
         query.filter.replace_condition(old, &new);
-        let table = query.table.clone();
-        if let Some(table_index) = self.tables.get_mut(&table) {
-            table_index.update_condition(&QueryId::from(query_uuid), old, &new, &mut self.stats);
+        let after = query.clone();
+        self.move_query_key(sub, &before, after);
+        if let Some(table_index) = self.tables.get_mut(&before.table) {
+            table_index.update_condition(sub, old, &new, &mut self.stats);
         }
-        self.stale_views.insert(QueryId::from(query_uuid));
+        self.stale_views.insert(sub);
     }
 
     /// Add `value` to the set behind `condition`, a set-valued `IN` leaf of
-    /// `query_uuid`'s filter, and file the leaf under it in the index: the
-    /// O(1) form of a join edge gaining a value. The stored filter needs no
-    /// rewrite, since it holds the same set. As with
-    /// [`SingleTableIVM::replace_condition`], the caller fetches the
-    /// value's rows and then calls [`SingleTableIVM::mark_reconciled`].
-    /// Reports whether the set changed; a member already present, an
-    /// unknown uuid, or a condition that is not set-valued changes nothing.
-    pub fn set_insert(&mut self, query_uuid: &str, condition: &Condition, value: &Value) -> bool {
+    /// `sub`'s filter, and file the leaf under it in the index: the O(1)
+    /// form of a join edge gaining a value. The stored filter needs no
+    /// rewrite, since it holds the same set, and the query's identity does
+    /// not change. As with [`SingleTableIVM::replace_condition`], the
+    /// caller fetches the value's rows and then calls
+    /// [`SingleTableIVM::mark_reconciled`]. Reports whether the set
+    /// changed; a member already present, an unknown subscription, or a
+    /// condition that is not set-valued changes nothing.
+    pub fn set_insert(&mut self, sub: SubId, condition: &Condition, value: &Value) -> bool {
         let Value::Set(set) = &condition.value else {
             return false;
         };
-        let Some(query) = self.select_queries.get(query_uuid) else {
+        let Some(query) = self.select_queries.get(&sub) else {
             return false;
         };
         if !set.insert(value) {
@@ -143,7 +124,7 @@ impl SingleTableIVM {
             table_index.set_insert(condition, value);
         }
         self.stats.conditions_replaced += 1;
-        self.stale_views.insert(QueryId::from(query_uuid));
+        self.stale_views.insert(sub);
         true
     }
 
@@ -151,11 +132,11 @@ impl SingleTableIVM {
     /// from it: the O(1) form of a join edge losing a value. The caller
     /// prunes the value's held rows and then calls
     /// [`SingleTableIVM::mark_reconciled`]. Reports whether the set changed.
-    pub fn set_remove(&mut self, query_uuid: &str, condition: &Condition, value: &Value) -> bool {
+    pub fn set_remove(&mut self, sub: SubId, condition: &Condition, value: &Value) -> bool {
         let Value::Set(set) = &condition.value else {
             return false;
         };
-        let Some(query) = self.select_queries.get(query_uuid) else {
+        let Some(query) = self.select_queries.get(&sub) else {
             return false;
         };
         if !set.remove(value) {
@@ -166,7 +147,7 @@ impl SingleTableIVM {
             table_index.set_remove(condition, value);
         }
         self.stats.conditions_replaced += 1;
-        self.stale_views.insert(QueryId::from(query_uuid));
+        self.stale_views.insert(sub);
         true
     }
 
@@ -178,15 +159,16 @@ impl SingleTableIVM {
         self.stats.snapshots_shared += count;
     }
 
-    /// Declare a `replace_query` / `replace_condition` reconciliation
-    /// complete: the caller has finished every fetch and prune the change
-    /// required, so the subscription's held rows again match its filter
-    /// and it may donate twin snapshots. Only the caller can know when
-    /// that point is reached — a widened filter needs a fetch, a narrowed
-    /// one a prune, a swapped one both — so nothing clears the flag
-    /// implicitly. A no-op for unknown or already-reconciled uuids.
-    pub fn mark_reconciled(&mut self, query_uuid: &str) {
-        self.stale_views.remove(query_uuid);
+    /// Declare a `replace_query` / `replace_condition` / set edit
+    /// reconciliation complete: the caller has finished every fetch and
+    /// prune the change required, so the subscription's held rows again
+    /// match its filter and it may donate twin snapshots. Only the caller
+    /// can know when that point is reached — a widened filter needs a
+    /// fetch, a narrowed one a prune, a swapped one both — so nothing
+    /// clears the flag implicitly. A no-op for unknown or already
+    /// reconciled subscriptions.
+    pub fn mark_reconciled(&mut self, sub: SubId) {
+        self.stale_views.remove(&sub);
     }
 
     /// The storage-facing form of a subscription's query: identical except
@@ -200,16 +182,22 @@ impl SingleTableIVM {
     }
 
     /// Remove a subscription: its routing-index entries and its tag on
-    /// every shared row it holds — walked off its held-key index, not by
+    /// every shared row it holds — walked off its held index, not by
     /// scanning the table — dropping rows nobody holds anymore. A table
-    /// index that routes nothing afterwards is dropped too. Unknown uuids
-    /// are a no-op.
-    pub fn unregister_query(&mut self, query_uuid: &str) {
-        let Some(query) = self.select_queries.remove(query_uuid) else {
+    /// index that routes nothing afterwards is dropped too. Unknown
+    /// subscriptions are a no-op.
+    pub fn unregister_query(&mut self, sub: SubId) {
+        let Some(query) = self.select_queries.remove(&sub) else {
             return;
         };
+        if let Some(twins) = self.by_query.get_mut(&query) {
+            twins.remove(&sub);
+            if twins.is_empty() {
+                self.by_query.remove(&query);
+            }
+        }
         if let Some(table_index) = self.tables.get_mut(&query.table) {
-            table_index.unregister(query_uuid);
+            table_index.unregister(sub);
         }
         if self
             .tables
@@ -218,60 +206,60 @@ impl SingleTableIVM {
         {
             self.tables.remove(&query.table);
         }
-        self.stale_views.remove(query_uuid);
-        self.windows.remove(query_uuid);
-        let keys = self.held.remove(query_uuid).unwrap_or_default();
+        self.stale_views.remove(&sub);
+        self.windows.remove(&sub);
+        let ids = self.held.remove(&sub).unwrap_or_default();
         if let Some(frame) = self.frames.get_mut(&query.table) {
-            for key in keys {
-                if let Some(row) = frame.rows.get_mut(&key) {
-                    row.subscribers.remove(query_uuid);
-                    if row.subscribers.is_empty() {
-                        frame.rows.remove(&key);
-                    }
+            for id in ids {
+                if let Some(row) = frame.row_mut(id) {
+                    row.subscribers.remove(&sub);
                 }
+                frame.drop_if_unheld(id);
             }
         }
         if self
             .frames
             .get(&query.table)
-            .is_some_and(|frame| frame.rows.is_empty())
+            .is_some_and(|frame| frame.is_empty())
         {
             self.frames.remove(&query.table);
         }
     }
 
-    /// Swap the registered query of `query_uuid` for `select_query`,
-    /// reindexing its routing while leaving its frame tags untouched.
+    /// Swap the registered query of `sub` for `select_query`, reindexing
+    /// its routing while leaving its frame tags untouched.
     ///
     /// The caller owns keeping held rows consistent with the new filter —
-    /// this is the general reseat seam (for a single `IN` value change,
-    /// [`SingleTableIVM::replace_condition`] is the cheap edit). Until the
-    /// caller declares that reconciliation complete
+    /// this is the general reseat seam (for a single value change of a
+    /// set-valued leaf, [`SingleTableIVM::set_insert`] is the cheap edit).
+    /// Until the caller declares that reconciliation complete
     /// ([`SingleTableIVM::mark_reconciled`], after however many fetches
     /// and prunes the change needs — a swap needs both), the subscription
     /// is skipped as a twin donor: its filter is ahead of its held rows,
     /// and a registration served from it would inherit the gap
     /// permanently. The table must stay the same (a cross-table swap is
-    /// refused); unknown uuids and identical queries are no-ops.
-    pub fn replace_query(&mut self, query_uuid: &str, select_query: SingleTableReadQuery) {
-        let Some(existing) = self.select_queries.get_mut(query_uuid) else {
+    /// refused); unknown subscriptions and identical queries are no-ops.
+    pub fn replace_query(&mut self, sub: SubId, select_query: SingleTableReadQuery) {
+        let Some(existing) = self.select_queries.get_mut(&sub) else {
             return;
         };
         if *existing == select_query || existing.table != select_query.table {
             return;
         }
         let table = select_query.table.clone();
+        let before = existing.clone();
         *existing = select_query.clone();
-        self.stale_views.insert(QueryId::from(query_uuid));
+        self.move_query_key(sub, &before, select_query.clone());
+        self.stale_views.insert(sub);
         if let Some(table_index) = self.tables.get_mut(&table) {
-            table_index.unregister(query_uuid);
+            table_index.unregister(sub);
         }
         let dnf = select_query.filter.to_dnf();
         if !dnf.is_empty() {
             self.tables
                 .entry(table.clone())
                 .or_default()
-                .register(&QueryId::from(query_uuid), dnf, &mut self.stats);
+                .register(sub, dnf, &mut self.stats);
         }
         if self
             .tables
@@ -280,56 +268,56 @@ impl SingleTableIVM {
         {
             self.tables.remove(&table);
         }
-        self.rebuild_window(query_uuid);
-        self.sync_boundary(query_uuid);
+        self.rebuild_window(sub);
+        self.sync_boundary(sub);
+    }
+
+    /// Re-key `sub` in the query-keyed index after its stored query
+    /// changed shape (a swap or a literal in-place edit).
+    fn move_query_key(&mut self, sub: SubId, before: &SingleTableReadQuery, after: SingleTableReadQuery) {
+        if let Some(twins) = self.by_query.get_mut(before) {
+            twins.remove(&sub);
+            if twins.is_empty() {
+                self.by_query.remove(before);
+            }
+        }
+        self.by_query.entry(after).or_default().insert(sub);
     }
 
     /// Another registered subscription with a structurally identical
-    /// query, if any — the sharing seam of registration. Skips
-    /// subscriptions in a `replace_query` / `replace_condition`
-    /// maintenance window, whose rows lag their filter.
-    ///
-    /// A linear scan: registration is rare. A future query-keyed index
-    /// must also be maintained inside `replace_query` and
-    /// `replace_condition`, which rewrite stored queries in place.
-    fn identical_subscription(
-        &self,
-        select_query: &SingleTableReadQuery,
-        exclude: &QueryId,
-    ) -> Option<QueryId> {
-        self.select_queries
+    /// query, if any — the sharing seam of registration, one lookup in the
+    /// query-keyed index. Skips subscriptions in a maintenance window,
+    /// whose rows lag their filter.
+    fn identical_subscription(&self, select_query: &SingleTableReadQuery, exclude: SubId) -> Option<SubId> {
+        self.by_query
+            .get(select_query)?
             .iter()
-            .find(|(uuid, query)| {
-                *query == select_query
-                    && *uuid != exclude
-                    && !self.stale_views.contains(uuid.as_str())
-            })
-            .map(|(uuid, _)| uuid.clone())
+            .find(|twin| **twin != exclude && !self.stale_views.contains(twin))
+            .copied()
     }
 
     /// The (key, image) pairs a subscription currently holds, materialized
-    /// from its held-key index — what a twin registration is served
-    /// instead of a storage result.
-    fn rows_of(&self, query_uuid: &QueryId) -> Vec<(DataFrameKey, DataFrameRow)> {
-        let Some(query) = self.select_queries.get(query_uuid) else {
+    /// from its held index — what a twin registration is served instead of
+    /// a storage result.
+    fn rows_of(&self, sub: SubId) -> Vec<(DataFrameKey, DataFrameRow)> {
+        let Some(query) = self.select_queries.get(&sub) else {
             return Vec::new();
         };
         let Some(frame) = self.frames.get(&query.table) else {
             return Vec::new();
         };
-        let Some(keys) = self.held.get(query_uuid) else {
+        let Some(ids) = self.held.get(&sub) else {
             return Vec::new();
         };
-        keys.iter()
-            .filter_map(|key| {
-                frame.rows.get(key).map(|row| {
-                    (
-                        key.clone(),
-                        DataFrameRow {
-                            data: row.data.clone(),
-                        },
-                    )
-                })
+        ids.iter()
+            .filter_map(|id| frame.row(*id))
+            .map(|row| {
+                (
+                    row.key.clone(),
+                    DataFrameRow {
+                        data: row.data.clone(),
+                    },
+                )
             })
             .collect()
     }

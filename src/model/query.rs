@@ -80,6 +80,20 @@ pub struct SingleTableReadQuery {
     pub limit: u32,
 }
 
+/// The engine's handle for one registered subscription: a `u64` handed out
+/// by `register_query`, unique for the life of the engine and never reused.
+/// The layer above the engine (the transport) maps a client's own
+/// subscription ids to it; the engine never sees client ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SubId(pub u64);
+
+impl std::fmt::Display for SubId {
+    /// The bare number.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// One join edge of a [`MultiTableReadQuery`]: rows of `sub`'s main table
 /// attach to rows of the enclosing node where
 /// `sub.<sub_table_column> = enclosing.<main_table_column>`.

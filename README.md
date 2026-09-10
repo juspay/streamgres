@@ -44,7 +44,7 @@ the number that **actually match**, and then patches only the affected views.
 | Typed query/row model, self-contained ops (`Delete` carries its image; replace = `Delete(old)` + `Add(new)`) | ✅ done | `src/model/` |
 | DNF counting index: canonical disjuncts, shared epoch-stamped counters fire exactly | ✅ done | `src/ivm/index.rs` |
 | Per-column value index: a write reaches only the conditions it satisfies, `O(columns · log n)` lookups (equality maps, inequality by set difference, range maps per comparison class) | ✅ done | `src/ivm/columns.rs` |
-| Shared frames: one frame per table, rows tagged with holders; held-key mirror; twin registration served from the frame | ✅ done | `src/ivm/frames.rs`, `src/ivm/registry.rs` |
+| Shared frames: one frame per table, rows tagged with holders as compact ids (`RowId`, `SubId`); held mirror; twin registration served from the frame through a query-keyed index | ✅ done | `src/ivm/frames.rs`, `src/ivm/registry.rs` |
 | `ORDER BY` / `LIMIT` windows: doubled buffer, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
 | In-place condition edits: a literal `IN` swapped inside its disjuncts, or a set-valued `IN` (`Value::Set`) gaining/losing one member in O(1) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
 | Join tree: `LEFT` and `RIGHT` edges at any depth, set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns | ✅ done | `src/ivm/multi.rs` |
@@ -54,7 +54,6 @@ the number that **actually match**, and then patches only the affected views.
 | `INNER` joins: visibility gate on the driven parent | ⏳ pending | paper §6.5 |
 | **PostgreSQL ingester**: permanent `pgoutput` slot + rotating exported snapshots + per-subscription catch-up | ⏳ pending | paper §7; `PgStorage` is a stub |
 | **WebSocket protocol**: subscribe / unsubscribe / op stream, connection & subscription lifecycle | ⏳ pending | `src/ws.rs` is an axum echo base |
-| Query-keyed twin index; interned subscription ids and compact keys in tags / held index | ⏳ pending | paper §9.3, §9.6 |
 | Parser `JOIN` syntax | ⏳ pending | multi-table queries are built programmatically |
 | Table-sharded multithreading | ⏳ pending | paper §10.3; engine is single-threaded by design |
 
@@ -71,8 +70,11 @@ The pipeline is `SQL text → typed query model → IVM routing → operations`.
 ### 1. Model (`src/model/`)
 
 - `Value`: the dynamic cell type (`Int` is `i64`; manual `Eq`/`Hash` for
-  floats and maps). `TableName`, `ColumnName`, `QueryId` are newtypes so the
-  three kinds of string can never be confused.
+  floats and maps; `Set` is the engine's identity-compared shared set).
+  `TableName` and `ColumnName` are newtypes; a subscription is addressed by
+  `SubId`, a `u64` the engine hands out at registration and never reuses.
+  The client's own subscription names (`QueryId`) live in the transport
+  layer, which maps them to `SubId`s and back.
 - `DataFrameKey` (primary-key values, identity only), `DataFrameRow` (a
   **full** row image, every column including the key), `DataFrameOperation`
   (`Add(key, row)` / `Delete(key, row)`).
@@ -113,13 +115,17 @@ A write can affect a subscription two ways, and both are checked:
   size. Counters are epoch-stamped per write, no reset sweep. Cost:
   `O(columns · log n) + O(matching links)`, independent of how many
   conditions or subscriptions exist.
-- **Way 2, membership** (`frames.rs`). One shared `TableFrame` per table;
-  each `SharedRow` carries its `subscribers`. Deletes and updates-out are
-  found in O(1) off the tags. `held: QueryId → keys` mirrors the tags so a
-  subscription's view is enumerable without scanning the table.
-- **Registration** (`registry.rs`). Index the DNF; serve the initial rows from
-  storage or, for a structurally identical query, from the twin's rows with
-  no storage query (`snapshots_shared`). `replace_condition` edits one leaf in
+- **Way 2, membership** (`frames.rs`). One shared `TableFrame` per table:
+  key → `RowId` (a `u64` handed out when the row enters the frame, retired
+  when its last holder leaves) → `SharedRow` with its `subscribers` as
+  `SubId`s. Deletes and updates-out are found in O(1) off the tags.
+  `held: SubId → RowIds` mirrors the tags so a subscription's view is
+  enumerable without scanning the table; a (subscription, row) pair costs
+  two small integers, not a copied key and a copied name.
+- **Registration** (`registry.rs`). Hand out a `SubId`, index the DNF; serve
+  the initial rows from storage or, for a structurally identical query found
+  through a query-keyed index in one lookup, from the twin's rows with no
+  storage query (`snapshots_shared`). `replace_condition` edits one leaf in
   place (stored filter + indexed disjuncts, splitting shared counters
   correctly). `replace_query` / `replace_condition` open a maintenance window
   during which the subscription is not a twin donor until the caller's
@@ -271,10 +277,11 @@ writes alone; raw output in
 
 | Scenario | Result |
 | --- | --- |
-| Routing, 100 → 10 000 subscriptions | a write touches only the 3 to 4 conditions it satisfies (one probe per column) while the table carries 67 to 85; route-only cost ≈ 1.5 µs fixed + 0.35 µs per impacted subscription; delivery ≈ 1.3 µs per emitted op |
-| Twin registration (400-row snapshot) | 961 µs from the shared frame vs 2 001 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
-| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.5 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~90 ms across 10 000 writes) |
-| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | identical subscriptions share one tree, so a ticket insert costs 66 µs for all 1 000 (7.4 ms before the shared set-valued edge), with 1.8 set edits per write instead of 52.5; the remaining cost is delivery, ≈ 0.3 to 0.4 µs per operation per subscriber |
+| Routing, 100 → 10 000 subscriptions | a write touches only the 3 to 4 conditions it satisfies (one probe per column) while the table carries 67 to 85; route-only cost ≈ 1.3 µs fixed + 0.15 µs per impacted subscription; delivery ≈ 0.9 µs per emitted op |
+| Registration, 100 → 10 000 subscriptions | 4.8 / 1.9 / 1.5 µs, flat: the twin lookup is one probe of the query-keyed index (17 µs at 10 000 with the earlier linear scan); peak memory of the whole run 0.53 GB (2.2 GB before shared join trees and compact ids) |
+| Twin registration (400-row snapshot) | 752 µs from the shared frame vs 1 844 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
+| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.5 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~100 ms across 10 000 writes) |
+| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | identical subscriptions share one tree, so a ticket insert costs 62 µs for all 1 000 (7.4 ms before the shared set-valued edge), with 1.8 set edits per write instead of 52.5; the remaining cost is delivery, ≈ 0.3 to 0.4 µs per operation per subscriber |
 
 ### Using the engine programmatically
 
@@ -292,12 +299,12 @@ let storage = Rc::new(MemoryStorage::new());
 let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
 
 let query = parse_read("SELECT * FROM tickets WHERE status = 'OPEN'", &catalog).unwrap();
-let snapshot = ivm.register_query("q-open", query, None);     // Vec<DataFrameOperation>
+let (q_open, snapshot) = ivm.register_query(query);          // (SubId, Vec<DataFrameOperation>)
 
 let write = parse_write("INSERT INTO tickets (id, status) VALUES (1, 'OPEN')", &catalog).unwrap();
 storage.apply(&write);                                       // commit first …
 let updates = ivm.incremental_update(&write);                // … notify second
-// updates: Vec<SingleTableUpdate { query, table, op }>
+// updates: Vec<SingleTableUpdate { query: SubId, table, op }>; q_open names ours
 ```
 
 ---
@@ -351,7 +358,7 @@ src/
   model/
     value.rs               Value / ValueType, manual Eq+Hash (floats, maps)
     schema.rs              Catalog / DbTable / DbColumn, TableName + ColumnName newtypes
-    query.rs               SingleTableReadQuery / WriteQuery, Where / Condition, QueryId
+    query.rs               SingleTableReadQuery / WriteQuery, Where / Condition, SubId, QueryId
     frame.rs               DataFrameKey / DataFrameRow / DataFrameOperation + the shared TableFrame
   ivm/
     mod.rs                 SingleTableIVM: the routing core (analyze + incremental_update)

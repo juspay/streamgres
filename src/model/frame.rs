@@ -20,7 +20,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 
-use super::query::QueryId;
+use super::query::SubId;
 use super::value::{unordered_map_hash, Value};
 
 /// The identity of a row: its primary-key values — deliberately nothing
@@ -76,24 +76,105 @@ pub enum DataFrameOperation {
     Add(DataFrameKey, DataFrameRow),
 }
 
-/// One shared, materialized row of a table frame.
-///
-/// - `data`: the full row image, stored once no matter how many
-///   subscriptions hold the row.
-/// - `subscribers`: every subscription whose result set currently contains
-///   the row; the row is dropped when this empties.
+/// The engine's compact id for one row of one table's frame: handed out
+/// once when the row first enters the frame and retired, never reused,
+/// when its last holder leaves. Per table, so never globally unique.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RowId(pub u64);
+
+/// One row of a shared frame: its identity, its current image, and the
+/// subscriptions holding it — the "which query sets is this row subscribed
+/// to" index that membership routing reads.
 pub struct SharedRow {
+    pub key: DataFrameKey,
     pub data: HashMap<String, Value>,
-    pub subscribers: BTreeSet<QueryId>,
+    pub subscribers: BTreeSet<SubId>,
 }
 
-/// The one shared frame of a table: row identity → shared row.
+/// The one shared frame of a table: row identity → row id → shared row.
 ///
 /// Engine state, not wire vocabulary — a subscription's view of it is the
 /// rows tagged with its id, and reaches the client only as operations.
+/// Every (subscription, row) pair is stored as two small integers (a tag
+/// on the row, an entry in the subscription's held index), never as a
+/// copy of the key or the subscription's name.
 #[derive(Default)]
 pub struct TableFrame {
-    pub rows: HashMap<DataFrameKey, SharedRow>,
+    ids: HashMap<DataFrameKey, RowId>,
+    rows: HashMap<RowId, SharedRow>,
+    next_id: u64,
+}
+
+impl TableFrame {
+    /// The row id of `key`, if the frame holds the row.
+    pub fn id_of(&self, key: &DataFrameKey) -> Option<RowId> {
+        self.ids.get(key).copied()
+    }
+
+    /// The shared row of `key`.
+    pub fn get(&self, key: &DataFrameKey) -> Option<&SharedRow> {
+        self.rows.get(self.ids.get(key)?)
+    }
+
+    /// The shared row under `id`.
+    pub fn row(&self, id: RowId) -> Option<&SharedRow> {
+        self.rows.get(&id)
+    }
+
+    /// The shared row under `id`, mutably.
+    pub fn row_mut(&mut self, id: RowId) -> Option<&mut SharedRow> {
+        self.rows.get_mut(&id)
+    }
+
+    /// The row for `key`, materialized with `data` and no holders if the
+    /// frame did not hold it yet; returns its id and the row.
+    pub fn entry(
+        &mut self,
+        key: &DataFrameKey,
+        data: impl FnOnce() -> HashMap<String, Value>,
+    ) -> (RowId, &mut SharedRow) {
+        let id = match self.ids.get(key) {
+            Some(id) => *id,
+            None => {
+                let id = RowId(self.next_id);
+                self.next_id += 1;
+                self.ids.insert(key.clone(), id);
+                self.rows.insert(
+                    id,
+                    SharedRow {
+                        key: key.clone(),
+                        data: data(),
+                        subscribers: BTreeSet::new(),
+                    },
+                );
+                id
+            }
+        };
+        (id, self.rows.get_mut(&id).expect("inserted or found above"))
+    }
+
+    /// Drop the row under `id` if no subscription holds it; reports
+    /// whether it was dropped. The id is retired.
+    pub fn drop_if_unheld(&mut self, id: RowId) -> bool {
+        let unheld = self
+            .rows
+            .get(&id)
+            .is_some_and(|row| row.subscribers.is_empty());
+        if unheld && let Some(row) = self.rows.remove(&id) {
+            self.ids.remove(&row.key);
+        }
+        unheld
+    }
+
+    /// Whether the frame holds no rows.
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// How many rows the frame holds.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
 }
 
 impl DataFrameKey {

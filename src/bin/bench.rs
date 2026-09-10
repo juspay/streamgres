@@ -608,8 +608,8 @@ fn routing_scale(n: usize) -> RoutingReport {
         vocabulary.note(filter);
     }
     let started = Instant::now();
-    for (index, filter) in filters.into_iter().enumerate() {
-        ivm.register_query(format!("s{index}"), unbounded(&tickets_table, filter), None);
+    for filter in filters {
+        ivm.register_query(unbounded(&tickets_table, filter));
     }
     let registration = started.elapsed();
     let registered = ivm.stats().clone();
@@ -735,15 +735,15 @@ fn twin_sharing() {
     for _ in 0..TWIN_STORAGE_SAMPLES {
         let mut fresh = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
         let started = Instant::now();
-        snapshot_rows = fresh.register_query("first", query.clone(), None).len();
+        snapshot_rows = fresh.register_query(query.clone()).1.len();
         storage_path += started.elapsed();
     }
 
     let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
-    ivm.register_query("first", query.clone(), None);
+    let (first, _) = ivm.register_query(query.clone());
     let started = Instant::now();
-    for index in 0..TWIN_COPIES {
-        ivm.register_query(format!("twin{index}"), query.clone(), None);
+    for _ in 0..TWIN_COPIES {
+        ivm.register_query(query.clone());
     }
     let twin_path = started.elapsed();
 
@@ -762,7 +762,7 @@ fn twin_sharing() {
             one(twin_path.as_secs_f64() * 1e6 / TWIN_COPIES as f64),
             TWIN_COPIES.to_string(),
             ivm.stats().snapshots_shared.to_string(),
-            ivm.rows_for("first").map_or(0, |rows| rows.len()).to_string(),
+            ivm.rows_for(first).map_or(0, |rows| rows.len()).to_string(),
         ]],
     );
 }
@@ -924,7 +924,7 @@ fn window() {
         WINDOW_LIMIT,
     );
     let started = Instant::now();
-    let snapshot = ivm.register_query("w", query, None);
+    let (_window_sub, snapshot) = ivm.register_query(query);
     let registration = started.elapsed();
     let mut mirror = Mirror::default();
     mirror.apply(&snapshot);
@@ -1104,19 +1104,17 @@ fn left_join() {
 
     let started = Instant::now();
     let mut twin_ops = 0;
-    for index in 0..JOIN_TWINS {
+    for _ in 0..JOIN_TWINS {
         twin_ops += ivm
-            .register_query(
-                format!("j{index}"),
-                join_spec(Where::condition("status", EQ, "OPEN")),
-            )
+            .register_query(join_spec(Where::condition("status", EQ, "OPEN")))
+            .1
             .len();
     }
     let twins = started.elapsed();
     let after_twins = ivm.stats().clone();
     let started = Instant::now();
     for index in 0..JOIN_DISTINCT {
-        ivm.register_query(format!("d{index}"), join_spec(distinct_join_filter(index)));
+        ivm.register_query(join_spec(distinct_join_filter(index)));
     }
     let distinct = started.elapsed();
     let after_distinct = ivm.stats().clone();

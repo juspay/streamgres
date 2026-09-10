@@ -24,7 +24,7 @@ pub mod value;
 pub use frame::{DataFrameKey, DataFrameOperation, DataFrameRow};
 pub use query::{
     ComparisonOperator, Condition, DeleteQuery, Disjunct, InsertQuery, Join, MultiTableReadQuery,
-    Order, OrderBy, QueryId, SingleTableReadQuery, UpdateQuery, Where, WriteQuery,
+    Order, OrderBy, QueryId, SingleTableReadQuery, SubId, UpdateQuery, Where, WriteQuery,
 };
 pub use schema::{Catalog, ColumnName, DbColumn, DbTable, TableName};
 pub use value::{Value, ValueType, SharedSet};

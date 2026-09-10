@@ -40,7 +40,7 @@ use std::rc::Rc;
 use super::columns::{ColumnIndex, CondRef};
 use super::predicate::eval_condition;
 use super::stats::IvmStats;
-use super::QueryId;
+use crate::model::SubId;
 use crate::model::{ColumnName, Condition, Disjunct, Value};
 
 /// Shared handle to one disjunct's counting state; cloned under every
@@ -61,7 +61,7 @@ struct DisjunctCounter {
     size: usize,
     epoch: u64,
     satisfied: usize,
-    subscribers: Vec<QueryId>,
+    subscribers: Vec<SubId>,
 }
 
 /// One indexed condition: the shared handle it is filed under in its
@@ -98,8 +98,8 @@ pub(super) struct TableIndex {
     by_condition: HashMap<Condition, Linked>,
     columns: HashMap<ColumnName, ColumnIndex>,
     by_disjunct: HashMap<Disjunct, SharedCounter>,
-    unconditional: Vec<QueryId>,
-    boundaries: HashMap<QueryId, Condition>,
+    unconditional: Vec<SubId>,
+    boundaries: HashMap<SubId, Condition>,
 }
 
 impl TableIndex {
@@ -112,7 +112,7 @@ impl TableIndex {
     /// added.
     pub(super) fn register(
         &mut self,
-        subscriber: &QueryId,
+        subscriber: SubId,
         disjuncts: Vec<Disjunct>,
         stats: &mut IvmStats,
     ) {
@@ -126,17 +126,17 @@ impl TableIndex {
     /// Attach `subscriber` to one disjunct, creating or reusing its shared
     /// counter (an empty disjunct goes to `unconditional`); returns how
     /// many condition links were actually added.
-    fn attach(&mut self, subscriber: &QueryId, disjunct: Disjunct) -> u64 {
+    fn attach(&mut self, subscriber: SubId, disjunct: Disjunct) -> u64 {
         if disjunct.conditions.is_empty() {
-            if !self.unconditional.contains(subscriber) {
-                self.unconditional.push(subscriber.clone());
+            if !self.unconditional.contains(&subscriber) {
+                self.unconditional.push(subscriber);
             }
             return 0;
         }
         if let Some(existing) = self.by_disjunct.get(&disjunct) {
             let mut counter = existing.borrow_mut();
-            if !counter.subscribers.contains(subscriber) {
-                counter.subscribers.push(subscriber.clone());
+            if !counter.subscribers.contains(&subscriber) {
+                counter.subscribers.push(subscriber);
             }
             return 0;
         }
@@ -144,7 +144,7 @@ impl TableIndex {
             size: disjunct.conditions.len(),
             epoch: 0,
             satisfied: 0,
-            subscribers: vec![subscriber.clone()],
+            subscribers: vec![subscriber],
         }));
         let mut links = 0;
         for condition in &disjunct.conditions {
@@ -196,14 +196,14 @@ impl TableIndex {
 
     /// Detach `subscriber` from one disjunct, dropping the counter and its
     /// condition links once no subscriber remains.
-    fn detach(&mut self, disjunct: &Disjunct, subscriber: &str) {
+    fn detach(&mut self, disjunct: &Disjunct, subscriber: SubId) {
         let Some(shared) = self.by_disjunct.get(disjunct) else {
             return;
         };
         shared
             .borrow_mut()
             .subscribers
-            .retain(|candidate| candidate.as_str() != subscriber);
+            .retain(|candidate| *candidate != subscriber);
         if !shared.borrow().subscribers.is_empty() {
             return;
         }
@@ -228,7 +228,7 @@ impl TableIndex {
     /// condition.
     pub(super) fn update_condition(
         &mut self,
-        subscriber: &QueryId,
+        subscriber: SubId,
         old: &Condition,
         new: &Condition,
         stats: &mut IvmStats,
@@ -238,13 +238,13 @@ impl TableIndex {
             .iter()
             .filter(|(disjunct, shared)| {
                 disjunct.conditions.contains(old)
-                    && shared.borrow().subscribers.contains(subscriber)
+                    && shared.borrow().subscribers.contains(&subscriber)
             })
             .map(|(disjunct, _)| disjunct.clone())
             .collect();
         for old_disjunct in affected {
             stats.conditions_replaced += 1;
-            self.detach(&old_disjunct, subscriber.as_str());
+            self.detach(&old_disjunct, subscriber);
             let conditions: Vec<Condition> = old_disjunct
                 .conditions
                 .iter()
@@ -277,13 +277,13 @@ impl TableIndex {
     }
 
     /// Publish, move, or clear `subscriber`'s admission boundary.
-    pub(super) fn set_boundary(&mut self, subscriber: &QueryId, boundary: Option<Condition>) {
+    pub(super) fn set_boundary(&mut self, subscriber: SubId, boundary: Option<Condition>) {
         match boundary {
             Some(condition) => {
-                self.boundaries.insert(subscriber.clone(), condition);
+                self.boundaries.insert(subscriber, condition);
             }
             None => {
-                self.boundaries.remove(subscriber.as_str());
+                self.boundaries.remove(&subscriber);
             }
         }
     }
@@ -292,16 +292,16 @@ impl TableIndex {
     /// boundary, its membership in shared counters, and — once a counter
     /// has no subscribers left — the counter itself and all its condition
     /// links.
-    pub(super) fn unregister(&mut self, subscriber: &str) {
+    pub(super) fn unregister(&mut self, subscriber: SubId) {
         self.unconditional
-            .retain(|candidate| candidate.as_str() != subscriber);
-        self.boundaries.remove(subscriber);
+            .retain(|candidate| *candidate != subscriber);
+        self.boundaries.remove(&subscriber);
         let mut dead_disjuncts: Vec<Disjunct> = Vec::new();
         for (disjunct, counter) in &self.by_disjunct {
             let mut counter = counter.borrow_mut();
             counter
                 .subscribers
-                .retain(|candidate| candidate.as_str() != subscriber);
+                .retain(|candidate| *candidate != subscriber);
             if counter.subscribers.is_empty() {
                 dead_disjuncts.push(disjunct.clone());
             }
@@ -339,9 +339,9 @@ impl TableIndex {
         &self,
         row: &HashMap<String, Value>,
         epoch: u64,
-        holders: &BTreeSet<QueryId>,
+        holders: &BTreeSet<SubId>,
         stats: &mut IvmStats,
-    ) -> BTreeSet<QueryId> {
+    ) -> BTreeSet<SubId> {
         let mut fired = BTreeSet::new();
         let mut candidates: Vec<CondRef> = Vec::new();
         for (column, value) in row {
@@ -366,18 +366,18 @@ impl TableIndex {
                 stats.disjunct_increments += 1;
                 if counter.satisfied == counter.size {
                     stats.disjuncts_fired += 1;
-                    fired.extend(counter.subscribers.iter().cloned());
+                    fired.extend(counter.subscribers.iter().copied());
                 }
             }
         }
         for subscriber in &self.unconditional {
-            fired.insert(subscriber.clone());
+            fired.insert(*subscriber);
         }
         fired.retain(|uuid| {
             holders.contains(uuid)
                 || self
                     .boundaries
-                    .get(uuid.as_str())
+                    .get(uuid)
                     .is_none_or(|boundary| eval_condition(boundary, row, &mut 0))
         });
         fired

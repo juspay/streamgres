@@ -71,18 +71,18 @@
 //! `Delete(old)` + `Add(new)` pair and is diffed per edge, so a rewrite
 //! that keeps a join value never swings its count through zero.
 //!
-//! Inner part ids are `t{tree}_r` for a tree's root and `t{tree}_r_{i}_{j}…`
-//! down the path; they are looked up in a map, never parsed.
+//! Inner parts are ordinary subscriptions of the inner engine, addressed by
+//! the ids it hands out and looked up in a map.
 
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::stats::IvmStats;
 use super::storage::Storage;
-use super::{QueryId, SingleTableIVM, SingleTableUpdate};
+use super::{SingleTableIVM, SingleTableUpdate};
 use crate::model::{
     ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow,
-    MultiTableReadQuery, SharedSet, SingleTableReadQuery, TableName, Value, Where, WriteQuery,
+    MultiTableReadQuery, SharedSet, SingleTableReadQuery, SubId, TableName, Value, Where, WriteQuery,
 };
 
 /// Which node of a subscription's join tree a part is: the path of join
@@ -127,14 +127,14 @@ impl QueryPart {
 /// One operation for one part of one multi-table subscription — the unit
 /// the transport pushes to the subscribed client.
 ///
-/// - `query`: which subscription (the external id the client registered).
+/// - `query`: which subscription (the engine id `register_query` returned).
 /// - `table`: the table the operation lands on.
 /// - `part`: which node of the tree produced it — kept beside the table
 ///   because a self-join makes the table alone ambiguous.
 /// - `op`: the delta itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultiTableUpdate {
-    pub query: QueryId,
+    pub query: SubId,
     pub table: TableName,
     pub part: QueryPart,
     pub op: DataFrameOperation,
@@ -200,20 +200,19 @@ impl Edge {
     }
 }
 
-/// One node of a registered tree: its inner part and its place among the
-/// edges.
+/// One node of a registered tree: its inner part (once registered) and
+/// its place among the edges.
 struct Node {
-    part_id: QueryId,
+    part: Option<SubId>,
     query: SingleTableReadQuery,
     parent: Option<usize>,
     children: Vec<usize>,
-    registered: bool,
 }
 
 /// One registered spec and every subscription sharing it.
 ///
 /// - `spec`: the tree as registered.
-/// - `subscribers`: the external ids sharing it, in registration order.
+/// - `subscribers`: the subscription ids sharing it, in registration order.
 /// - `nodes`: every part by path.
 /// - `edges`: every join edge; nodes refer to them by index.
 /// - `leaves`: the shared set behind each (driven part, column) leaf.
@@ -223,7 +222,7 @@ struct Node {
 ///   subscriber's snapshot.
 struct Tree {
     spec: Rc<MultiTableReadQuery>,
-    subscribers: Vec<QueryId>,
+    subscribers: Vec<SubId>,
     nodes: HashMap<QueryPart, Node>,
     edges: Vec<Edge>,
     leaves: HashMap<(QueryPart, ColumnName), SharedSet>,
@@ -238,26 +237,17 @@ struct Tree {
 /// - `single`: the inner engine holding every part's routing and the
 ///   shared per-table frames.
 /// - `trees`: tree id → the shared tree.
-/// - `by_uuid`: external id → the tree it subscribes to.
+/// - `by_sub`: subscription id → the tree it subscribes to.
+/// - `next_sub`: the next subscription id to hand out; never reused.
 /// - `parts`: inner part id → (tree id, part), the reverse map every
 ///   routed operation goes through.
 pub struct MultiTableIVM {
     single: SingleTableIVM,
     trees: HashMap<usize, Tree>,
     next_tree: usize,
-    by_uuid: HashMap<QueryId, usize>,
-    parts: HashMap<QueryId, (usize, QueryPart)>,
-}
-
-/// The inner id of part `part` of tree `tree`: a tree marker, an `_r`
-/// marker, then one `_{index}` per step of the path.
-fn part_id(tree: usize, part: &QueryPart) -> QueryId {
-    let mut id = format!("t{tree}_r");
-    for index in &part.0 {
-        id.push('_');
-        id.push_str(&index.to_string());
-    }
-    QueryId::from(id)
+    by_sub: HashMap<SubId, usize>,
+    next_sub: u64,
+    parts: HashMap<SubId, (usize, QueryPart)>,
 }
 
 /// The row's value in `column`; a missing column joins like `NULL` (never).
@@ -271,7 +261,7 @@ fn leaf_condition(column: &ColumnName, set: &SharedSet) -> Condition {
 }
 
 /// Build the node, edge and leaf tables of a spec.
-fn build_tree(tree_id: usize, spec: &MultiTableReadQuery) -> Tree {
+fn build_tree(spec: &MultiTableReadQuery) -> Tree {
     let mut tree = Tree {
         spec: Rc::new(spec.clone()),
         subscribers: Vec::new(),
@@ -281,7 +271,7 @@ fn build_tree(tree_id: usize, spec: &MultiTableReadQuery) -> Tree {
         rank: HashMap::new(),
         post_order: Vec::new(),
     };
-    add_node(&mut tree, tree_id, spec, QueryPart::main(), None);
+    add_node(&mut tree, spec, QueryPart::main(), None);
     for edge in &tree.edges {
         tree.leaves
             .entry((edge.driven().clone(), edge.driven_column().clone()))
@@ -303,17 +293,15 @@ fn build_tree(tree_id: usize, spec: &MultiTableReadQuery) -> Tree {
 /// Add `spec`'s node at `part` and, recursively, its children.
 fn add_node(
     tree: &mut Tree,
-    tree_id: usize,
     spec: &MultiTableReadQuery,
     part: QueryPart,
     parent: Option<usize>,
 ) {
     let mut node = Node {
-        part_id: part_id(tree_id, &part),
+        part: None,
         query: spec.main_table.clone(),
         parent,
         children: Vec::new(),
-        registered: false,
     };
     let joins = spec
         .left_joins
@@ -332,7 +320,7 @@ fn add_node(
             counts: JoinKeyCounts::default(),
         });
         node.children.push(edge);
-        add_node(tree, tree_id, &join.sub, child, Some(edge));
+        add_node(tree, &join.sub, child, Some(edge));
     }
     tree.nodes.insert(part, node);
 }
@@ -414,42 +402,34 @@ impl MultiTableIVM {
             single: SingleTableIVM::new(storage),
             trees: HashMap::new(),
             next_tree: 0,
-            by_uuid: HashMap::new(),
+            by_sub: HashMap::new(),
+            next_sub: 0,
             parts: HashMap::new(),
         }
     }
 
-    /// Register a multi-table subscription under `query_uuid`, returning
-    /// its initial snapshot as operations. A spec already registered by
-    /// another subscription is shared: the new subscriber joins that tree
-    /// and is served the shared parts' current rows, touching no storage.
-    /// Re-registering the identical spec under the same id is a no-op
-    /// returning no operations; a changed spec replaces the subscription.
-    pub fn register_query(
-        &mut self,
-        query_uuid: impl Into<QueryId>,
-        query: MultiTableReadQuery,
-    ) -> Vec<MultiTableUpdate> {
-        let query_uuid = query_uuid.into();
-        if let Some(&tree) = self.by_uuid.get(&query_uuid) {
-            if *self.trees[&tree].spec == query {
-                return Vec::new();
-            }
-            self.unregister_query(query_uuid.as_str());
-        }
+    /// Register a multi-table subscription, returning its engine id and its
+    /// initial snapshot as operations. Ids are handed out by the join layer
+    /// and never reused; the layer above maps a client's own ids to them.
+    /// A spec already registered by another subscription is shared: the new
+    /// subscriber joins that tree and is served the shared parts' current
+    /// rows, touching no storage.
+    pub fn register_query(&mut self, query: MultiTableReadQuery) -> (SubId, Vec<MultiTableUpdate>) {
+        let sub = SubId(self.next_sub);
+        self.next_sub += 1;
         let mut out = Vec::new();
         if let Some((&tree_id, _)) = self.trees.iter().find(|(_, tree)| *tree.spec == query) {
-            self.by_uuid.insert(query_uuid.clone(), tree_id);
+            self.by_sub.insert(sub, tree_id);
             let tree = self.trees.get_mut(&tree_id).expect("found just above");
-            tree.subscribers.push(query_uuid.clone());
+            tree.subscribers.push(sub);
             for part in &tree.post_order {
                 let node = &tree.nodes[part];
-                let Some(rows) = self.single.rows_for(node.part_id.as_str()) else {
+                let Some(rows) = node.part.and_then(|inner| self.single.rows_for(inner)) else {
                     continue;
                 };
                 for (key, row) in rows {
                     out.push(MultiTableUpdate {
-                        query: query_uuid.clone(),
+                        query: sub,
                         table: node.query.table.clone(),
                         part: part.clone(),
                         op: DataFrameOperation::Add(key, row),
@@ -458,26 +438,22 @@ impl MultiTableIVM {
             }
             let parts = tree.nodes.len() as u64;
             self.single.note_shared_snapshots(parts);
-            return out;
+            return (sub, out);
         }
         let tree_id = self.next_tree;
         self.next_tree += 1;
-        let mut tree = build_tree(tree_id, &query);
-        tree.subscribers.push(query_uuid.clone());
-        for (part, node) in &tree.nodes {
-            self.parts
-                .insert(node.part_id.clone(), (tree_id, part.clone()));
-        }
+        let mut tree = build_tree(&query);
+        tree.subscribers.push(sub);
         self.trees.insert(tree_id, tree);
-        self.by_uuid.insert(query_uuid, tree_id);
+        self.by_sub.insert(sub, tree_id);
         self.register_part(tree_id, QueryPart::main(), &mut out);
-        out
+        (sub, out)
     }
 
     /// Register the subtree at `part` in post-order: RIGHT children, the
     /// node itself with its full set restrictions, then LEFT children.
     fn register_part(&mut self, tree_id: usize, part: QueryPart, out: &mut Vec<MultiTableUpdate>) {
-        let (right_children, left_children, own, part_id) = {
+        let (right_children, left_children, own) = {
             let tree = &self.trees[&tree_id];
             let node = &tree.nodes[&part];
             let children = |kind: JoinKind| -> Vec<QueryPart> {
@@ -491,7 +467,6 @@ impl MultiTableIVM {
                 children(JoinKind::Right),
                 children(JoinKind::Left),
                 node.query.clone(),
-                node.part_id.clone(),
             )
         };
         for child in right_children {
@@ -503,14 +478,15 @@ impl MultiTableIVM {
             limit,
             ..own.clone()
         };
-        let ops = self.single.register_query(part_id, query, None);
+        let (inner, ops) = self.single.register_query(query);
         if let Some(node) = self
             .trees
             .get_mut(&tree_id)
             .and_then(|tree| tree.nodes.get_mut(&part))
         {
-            node.registered = true;
+            node.part = Some(inner);
         }
+        self.parts.insert(inner, (tree_id, part.clone()));
         for op in ops {
             self.emit(tree_id, &part, &own.table, op.clone(), out);
             if let DataFrameOperation::Add(_, row) = &op {
@@ -537,15 +513,14 @@ impl MultiTableIVM {
     /// Remove a subscription. Its tree lives on while other subscriptions
     /// share it; with the last one gone, every inner part and the join
     /// state go too. Unknown ids are a no-op.
-    pub fn unregister_query(&mut self, query_uuid: &str) {
-        let Some(tree_id) = self.by_uuid.remove(query_uuid) else {
+    pub fn unregister_query(&mut self, sub: SubId) {
+        let Some(tree_id) = self.by_sub.remove(&sub) else {
             return;
         };
         let Some(tree) = self.trees.get_mut(&tree_id) else {
             return;
         };
-        tree.subscribers
-            .retain(|subscriber| subscriber.as_str() != query_uuid);
+        tree.subscribers.retain(|subscriber| *subscriber != sub);
         if !tree.subscribers.is_empty() {
             return;
         }
@@ -553,8 +528,10 @@ impl MultiTableIVM {
             return;
         };
         for node in tree.nodes.values() {
-            self.single.unregister_query(node.part_id.as_str());
-            self.parts.remove(&node.part_id);
+            if let Some(inner) = node.part {
+                self.single.unregister_query(inner);
+                self.parts.remove(&inner);
+            }
         }
     }
 
@@ -618,14 +595,10 @@ impl MultiTableIVM {
     /// The rows currently held for one part of a subscription — key →
     /// image, an inspection view for tests and debugging. `None` for
     /// unknown ids or parts.
-    pub fn rows_for(
-        &self,
-        query_uuid: &str,
-        part: QueryPart,
-    ) -> Option<HashMap<DataFrameKey, DataFrameRow>> {
-        let tree = self.trees.get(self.by_uuid.get(query_uuid)?)?;
+    pub fn rows_for(&self, sub: SubId, part: QueryPart) -> Option<HashMap<DataFrameKey, DataFrameRow>> {
+        let tree = self.trees.get(self.by_sub.get(&sub)?)?;
         let node = tree.nodes.get(&part)?;
-        self.single.rows_for(node.part_id.as_str())
+        self.single.rows_for(node.part?)
     }
 
     /// The inner engine's routing counters.
@@ -647,7 +620,7 @@ impl MultiTableIVM {
         };
         for subscriber in &tree.subscribers {
             out.push(MultiTableUpdate {
-                query: subscriber.clone(),
+                query: *subscriber,
                 table: table.clone(),
                 part: part.clone(),
                 op: op.clone(),
@@ -724,20 +697,17 @@ impl MultiTableIVM {
             return;
         }
         let set = self.trees[&tree_id].leaves[&(driven.clone(), column.clone())].clone();
-        let Some((part_id, table)) = self.registered_part(tree_id, &driven) else {
+        let Some((inner, table)) = self.registered_part(tree_id, &driven) else {
             set.insert(&value);
             return;
         };
-        if !self
-            .single
-            .set_insert(part_id.as_str(), &leaf_condition(&column, &set), &value)
-        {
+        if !self.single.set_insert(inner, &leaf_condition(&column, &set), &value) {
             return;
         }
         let adds = self
             .single
-            .fetch(part_id.as_str(), column.as_str(), std::slice::from_ref(&value));
-        self.single.mark_reconciled(part_id.as_str());
+            .fetch(inner, column.as_str(), std::slice::from_ref(&value));
+        self.single.mark_reconciled(inner);
         for op in adds {
             self.emit(tree_id, &driven, &table, op.clone(), out);
             if let DataFrameOperation::Add(_, row) = &op {
@@ -762,20 +732,17 @@ impl MultiTableIVM {
         if !set.contains(value) {
             return;
         }
-        let Some((part_id, table)) = self.registered_part(tree_id, &driven) else {
+        let Some((inner, table)) = self.registered_part(tree_id, &driven) else {
             set.remove(value);
             return;
         };
-        if !self
-            .single
-            .set_remove(part_id.as_str(), &leaf_condition(&column, &set), value)
-        {
+        if !self.single.set_remove(inner, &leaf_condition(&column, &set), value) {
             return;
         }
         let deletes = self
             .single
-            .delete_rows(part_id.as_str(), column.as_str(), std::slice::from_ref(value));
-        self.single.mark_reconciled(part_id.as_str());
+            .delete_rows(inner, column.as_str(), std::slice::from_ref(value));
+        self.single.mark_reconciled(inner);
         for op in deletes {
             self.emit(tree_id, &driven, &table, op.clone(), out);
             if let DataFrameOperation::Delete(_, row) = &op {
@@ -792,10 +759,9 @@ impl MultiTableIVM {
 
     /// The inner id and table of `part` once it is registered; `None`
     /// while registration has not reached it yet.
-    fn registered_part(&self, tree_id: usize, part: &QueryPart) -> Option<(QueryId, TableName)> {
+    fn registered_part(&self, tree_id: usize, part: &QueryPart) -> Option<(SubId, TableName)> {
         let node = self.trees.get(&tree_id)?.nodes.get(part)?;
-        node.registered
-            .then(|| (node.part_id.clone(), node.query.table.clone()))
+        node.part.map(|inner| (inner, node.query.table.clone()))
     }
 
     /// `value`'s current `left` count on `edge` (zero when absent).
