@@ -16,10 +16,15 @@
 //! `tests/ivm_scenarios.rs`; the parser's own tests live in
 //! `src/parser/mod.rs`.
 
-use jus_sync::ivm::{IvmStats, PgStorage, SingleTableIVM, SubId};
+use jus_sync::ivm::{IvmStats, SingleTableIVM, SubId};
 use jus_sync::model::*;
 use jus_sync::parser::{parse_read, parse_write, point_at, Catalog};
+use jus_sync::sync::{Local, MemoryStorage};
 use std::rc::Rc;
+
+/// The engine under the synchronous driver over an (empty) in-process
+/// store: every write is routed from the stream alone.
+type Demo = Local<SingleTableIVM, MemoryStorage>;
 
 /// Runs the demo end to end: registers the six subscriptions against the
 /// `tickets` catalog, plays the insert / insert / update / delete sequence
@@ -29,7 +34,7 @@ fn main() {
     println!("== jus_sync SingleTableIVM demo ==================================================");
 
     let catalog = Catalog::new(vec![tickets_table()]);
-    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
+    let mut ivm: Demo = Local::new(SingleTableIVM::new(), Rc::new(MemoryStorage::new()));
 
     let subscriptions = [
         ("q-open", "SELECT * FROM tickets WHERE status = 'OPEN'"),
@@ -57,8 +62,8 @@ fn main() {
     }
     println!(
         "  -> {} disjuncts, {} condition links indexed (q-open and q-open-dup both subscribe to status = 'OPEN')",
-        ivm.stats().disjuncts_registered,
-        ivm.stats().conditions_indexed
+        ivm.engine().stats().disjuncts_registered,
+        ivm.engine().stats().conditions_indexed
     );
 
     run_write(
@@ -109,18 +114,18 @@ fn main() {
 
     println!("\n== final materialized frames ==========================================");
     for (id, uuid) in &names {
-        let rows = ivm.rows_for(*id).expect("registered above");
+        let rows = ivm.engine().rows_for(*id).expect("registered above");
         println!("  {uuid:<14} {} row(s)", rows.len());
     }
 
     println!("\n== cumulative counters ================================================");
-    println!("{}", ivm.stats());
+    println!("{}", ivm.engine().stats());
 }
 
 /// Parse one write, feed it through the engine, then print found-vs-expected
 /// impacted subscriptions, the emitted operations, and the routing-cost delta.
 fn run_write(
-    ivm: &mut SingleTableIVM,
+    ivm: &mut Demo,
     names: &[(SubId, &str)],
     catalog: &Catalog,
     sql: &str,
@@ -137,9 +142,9 @@ fn run_write(
     let write = parse_write(sql, catalog)
         .unwrap_or_else(|error| panic!("{}", point_at(sql, &error)));
 
-    let before: IvmStats = ivm.stats().clone();
+    let before: IvmStats = ivm.engine().stats().clone();
     let ops = ivm.incremental_update(&write);
-    let cost = ivm.stats().diff(&before);
+    let cost = ivm.engine().stats().diff(&before);
 
     let mut found: Vec<&str> = Vec::new();
     for update in &ops {

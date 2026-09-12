@@ -45,9 +45,14 @@ use std::fmt;
 /// - `membership_hits`: subscriptions found holding the row.
 /// - `queries_impacted`: subscriptions confirmed impacted.
 ///
+/// Storage reads:
+/// - `storage_reads`: reads asked for — registration snapshots, narrowed
+///   join fetches, and window refills together; each is one storage
+///   round trip the runtime runs.
+///
 /// Window maintenance:
 /// - `window_evictions`: rows evicted past a window's doubled buffer.
-/// - `window_refills`: storage refill queries run for drained windows.
+/// - `window_refills`: refill reads asked for by drained windows.
 ///
 /// Emitted operations:
 /// - `ops_add`: `Add` operations emitted (row entered a result set, or
@@ -69,6 +74,7 @@ pub struct IvmStats {
     pub membership_probes: u64,
     pub membership_hits: u64,
     pub queries_impacted: u64,
+    pub storage_reads: u64,
     pub window_evictions: u64,
     pub window_refills: u64,
     pub ops_add: u64,
@@ -94,6 +100,7 @@ impl IvmStats {
             membership_probes: self.membership_probes - earlier.membership_probes,
             membership_hits: self.membership_hits - earlier.membership_hits,
             queries_impacted: self.queries_impacted - earlier.queries_impacted,
+            storage_reads: self.storage_reads - earlier.storage_reads,
             window_evictions: self.window_evictions - earlier.window_evictions,
             window_refills: self.window_refills - earlier.window_refills,
             ops_add: self.ops_add - earlier.ops_add,
@@ -135,6 +142,7 @@ impl fmt::Display for IvmStats {
         writeln!(f, "disjuncts fired ............ {}", self.disjuncts_fired)?;
         writeln!(f, "membership probes / hits ... {} / {}", self.membership_probes, self.membership_hits)?;
         writeln!(f, "queries impacted ........... {}", self.queries_impacted)?;
+        writeln!(f, "storage reads asked ........ {}", self.storage_reads)?;
         writeln!(f, "window evictions / refills . {} / {}", self.window_evictions, self.window_refills)?;
         write!(f, "ops emitted ................ {} adds, {} deletes", self.ops_add, self.ops_delete)
     }

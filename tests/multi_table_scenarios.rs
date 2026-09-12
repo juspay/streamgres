@@ -6,8 +6,13 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use jus_sync::ivm::{MemoryStorage, MultiTableIVM, MultiTableUpdate, QueryPart, Storage, SubId};
+use jus_sync::ivm::{MultiTableIVM, MultiTableUpdate, QueryPart, SubId};
 use jus_sync::model::*;
+use jus_sync::sync::{Local, MemoryStorage};
+
+/// The join layer under the synchronous driver, over in-process storage:
+/// every read a registration or a crossing asks for is landed inline.
+type Ivm = Local<MultiTableIVM, MemoryStorage>;
 
 /// A `tickets(id, status, assigned_to, reviewer, project, team_id)` table.
 fn tickets_table() -> DbTable {
@@ -188,7 +193,7 @@ fn team_ticket(id: i64, team: i64) -> WriteQuery {
 /// Mirror the write into storage, then route it — commit first, notify
 /// second, like a real database.
 fn write(
-    ivm: &mut MultiTableIVM,
+    ivm: &mut Ivm,
     storage: &MemoryStorage,
     w: WriteQuery,
 ) -> Vec<MultiTableUpdate> {
@@ -197,9 +202,9 @@ fn write(
 }
 
 /// A fresh engine, a shared storage handle, and an empty name directory.
-fn engine() -> (MultiTableIVM, Rc<MemoryStorage>, Names) {
+fn engine() -> (Ivm, Rc<MemoryStorage>, Names) {
     let storage = Rc::new(MemoryStorage::new());
-    let ivm = MultiTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    let ivm = Local::new(MultiTableIVM::new(), storage.clone());
     (ivm, storage, Names::default())
 }
 
@@ -215,7 +220,7 @@ impl Names {
     /// Register `spec` under `name`, returning its snapshot.
     fn register(
         &self,
-        ivm: &mut MultiTableIVM,
+        ivm: &mut Ivm,
         name: impl Into<String>,
         spec: MultiTableReadQuery,
     ) -> Vec<MultiTableUpdate> {
@@ -260,8 +265,8 @@ impl Names {
     }
 }
 
-fn frame_len(ivm: &MultiTableIVM, names: &Names, name: &str, part: QueryPart) -> usize {
-    ivm.rows_for(names.id(name), part).map_or(0, |rows| rows.len())
+fn frame_len(ivm: &Ivm, names: &Names, name: &str, part: QueryPart) -> usize {
+    ivm.engine().rows_for(names.id(name), part).map_or(0, |rows| rows.len())
 }
 
 /// Registration loads the whole snapshot from storage: every main row
@@ -416,7 +421,7 @@ fn main_update_moves_join_reference() {
     names.register(&mut ivm, "q", tickets_users_query());
     write(&mut ivm, &storage, ticket(1, "OPEN", 7));
 
-    let before = ivm.stats().clone();
+    let before = ivm.engine().stats().clone();
     let ops = write(&mut ivm, &storage, update_ticket(1, "OPEN", 8));
     assert_eq!(
         names.tags(&ops),
@@ -428,7 +433,7 @@ fn main_update_moves_join_reference() {
         ]
     );
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 1);
-    let after = ivm.stats();
+    let after = ivm.engine().stats();
     assert_eq!(
         after.disjuncts_registered, before.disjuncts_registered,
         "a reference move swaps the IN guard in place — no re-registration"
@@ -703,8 +708,8 @@ fn unregister_removes_all_parts() {
     write(&mut ivm, &storage, ticket(1, "OPEN", 7));
 
     ivm.unregister_query(names.id("q"));
-    assert!(ivm.rows_for(names.id("q"), QueryPart::main()).is_none());
-    assert!(ivm.rows_for(names.id("q"), QueryPart::join(0)).is_none());
+    assert!(ivm.engine().rows_for(names.id("q"), QueryPart::main()).is_none());
+    assert!(ivm.engine().rows_for(names.id("q"), QueryPart::join(0)).is_none());
     let ops = write(&mut ivm, &storage, ticket(2, "OPEN", 7));
     assert!(ops.is_empty());
 }
@@ -967,7 +972,7 @@ fn unregister_removes_nested_parts() {
     names.register(&mut ivm, "q", tickets_right_users_query(users_with_profiles()));
     ivm.unregister_query(names.id("q"));
     for part in [QueryPart::main(), QueryPart::join(0), QueryPart(vec![0, 0])] {
-        assert!(ivm.rows_for(names.id("q"), part).is_none());
+        assert!(ivm.engine().rows_for(names.id("q"), part).is_none());
     }
     assert!(write(&mut ivm, &storage, user(3, "c")).is_empty());
 }
@@ -983,9 +988,9 @@ fn identical_subscriptions_share_one_edge() {
     for uuid in ["a", "b", "c"] {
         names.register(&mut ivm, uuid, tickets_users_query());
     }
-    let before = ivm.stats().clone();
+    let before = ivm.engine().stats().clone();
     let ops = write(&mut ivm, &storage, ticket(10, "OPEN", 1));
-    let cost = ivm.stats().diff(&before);
+    let cost = ivm.engine().stats().diff(&before);
     assert_eq!(
         names.tags(&ops),
         vec![
@@ -1007,7 +1012,7 @@ fn identical_subscriptions_share_one_edge() {
 
     ivm.unregister_query(names.id("b"));
     ivm.unregister_query(names.id("c"));
-    assert!(ivm.rows_for(names.id("c"), QueryPart::main()).is_none());
+    assert!(ivm.engine().rows_for(names.id("c"), QueryPart::main()).is_none());
     assert!(write(&mut ivm, &storage, ticket(12, "OPEN", 1)).is_empty());
 }
 
@@ -1023,7 +1028,7 @@ fn later_identical_registration_is_served_from_the_shared_tree() {
     names.register(&mut ivm, "first", tickets_users_query());
     write(&mut ivm, &storage, ticket(10, "OPEN", 1));
     write(&mut ivm, &storage, ticket(11, "OPEN", 2));
-    let before = ivm.stats().clone();
+    let before = ivm.engine().stats().clone();
     let snapshot = names.register(&mut ivm, "second", tickets_users_query());
     assert_eq!(
         names.tags(&snapshot),
@@ -1034,7 +1039,7 @@ fn later_identical_registration_is_served_from_the_shared_tree() {
             "second/main/add:Int(11)"
         ]
     );
-    let cost = ivm.stats().diff(&before);
+    let cost = ivm.engine().stats().diff(&before);
     assert_eq!(cost.snapshots_shared, 2, "both parts served without storage");
     assert_eq!(cost.queries_registered, 0, "no inner registration happened");
 }
@@ -1048,14 +1053,14 @@ fn set_valued_leaf_keeps_its_identity_across_crossings() {
         storage.apply(&user(id, "u"));
     }
     names.register(&mut ivm, "q", tickets_users_query());
-    let before = ivm.stats().clone();
+    let before = ivm.engine().stats().clone();
     for id in 1..=5 {
         write(&mut ivm, &storage, ticket(10 + id, "OPEN", id));
     }
     for id in 1..=5 {
         write(&mut ivm, &storage, delete("tickets", 10 + id));
     }
-    let cost = ivm.stats().diff(&before);
+    let cost = ivm.engine().stats().diff(&before);
     assert_eq!(cost.conditions_replaced, 10, "five members added, five removed");
     assert_eq!(cost.conditions_indexed, 0, "the leaf condition itself never changed");
     assert_eq!(cost.disjuncts_registered, 0);

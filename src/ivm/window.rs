@@ -27,15 +27,28 @@
 //!   capacity are untagged worst-first, each emitting its `Delete` and
 //!   becoming the frontier.
 //! - **refill** ([`SingleTableIVM::refill`]): when a removal drains the
-//!   buffer to `L`, one storage query fetches from the frontier
+//!   buffer to `L`, one storage read is asked for from the frontier
 //!   *inclusive* (`>=` for ASC, `<=` for DESC), sized for the missing rows
 //!   plus the held rows the threshold returns again (they dedup on
-//!   upsert), back up to capacity; the frontier then moves to the worst
-//!   value fetched. Anchoring both the boundary and the refill at the
-//!   frontier rather than at the worst *held* row is what keeps the
-//!   top-`L` exact: a row admitted while the buffer had room can never
-//!   push the refill threshold past storage rows that were never fetched,
-//!   and rows tying the frontier stay reachable.
+//!   upsert), back up to capacity; when it lands the frontier moves to
+//!   the worst value fetched. Anchoring both the boundary and the refill
+//!   at the frontier rather than at the worst *held* row is what keeps
+//!   the top-`L` exact: a row admitted while the buffer had room can
+//!   never push the refill threshold past storage rows that were never
+//!   fetched, and rows tying the frontier stay reachable.
+//!
+//! A storage read lands some time after it is asked for, and writes route
+//! in between. While one is out the window publishes **no boundary** (so
+//! no write the read will not return is turned away; arrivals are
+//! admitted and, past capacity, evicted, each eviction pulling the
+//! frontier in as usual) and asks for no further refill; a read that
+//! covers the whole filter (a registration's snapshot, a refill) also
+//! clears the frontier when asked for, since what storage holds beyond
+//! the held rows is unknown until it lands. Landing then re-derives the
+//! frontier: a full result covers up to its worst value, pulled in by any
+//! eviction that happened meanwhile; a short result leaves it where the
+//! evictions put it (absent if there were none, meaning storage is
+//! exhausted).
 //!
 //! Rows are ordered with [`order_cmp`], a total order extending
 //! [`crate::model::Value::compare`]: `NaN` sorts above every other
@@ -165,27 +178,14 @@ impl Window {
             })
     }
 
-    /// Record a storage read of the subscription's whole filter that asked
-    /// for `requested` rows: a full result sets the frontier to the worst
-    /// value fetched (storage may hold more beyond it); a short result
-    /// clears it (every matching row is now held).
+    /// Record a landed storage read that asked for `requested` rows: a
+    /// full result proves rows beyond its worst value exist unheld, so the
+    /// frontier pulls in to it (from absent, it is set); a short result
+    /// says nothing beyond what evictions already recorded. A read of the
+    /// whole filter cleared the frontier when it was asked for, so for it
+    /// a full result sets the frontier to its worst value (pulled in by
+    /// any eviction meanwhile) and a short one leaves storage exhausted.
     pub(super) fn note_fetch(&mut self, requested: usize, fetched: &[(DataFrameKey, DataFrameRow)]) {
-        self.frontier = if fetched.len() >= requested {
-            self.worst_of(fetched)
-        } else {
-            None
-        };
-    }
-
-    /// Record a storage read narrowed to a subset of the filter: a full
-    /// result proves rows beyond its worst value exist unheld, so the
-    /// frontier pulls in to it; a short result says nothing about the
-    /// rest of the filter.
-    pub(super) fn note_narrowed_fetch(
-        &mut self,
-        requested: usize,
-        fetched: &[(DataFrameKey, DataFrameRow)],
-    ) {
         if fetched.len() >= requested
             && let Some(worst) = self.worst_of(fetched)
         {
@@ -302,7 +302,7 @@ fn is_worse(existing: &Value, candidate: &Value, ascending: bool) -> bool {
 /// convention — and remaining incomparable pairs fall back to a fixed
 /// variant rank. Deterministic and transitive, if semantically arbitrary
 /// across types.
-pub(super) fn order_cmp(a: &Value, b: &Value) -> Ordering {
+pub fn order_cmp(a: &Value, b: &Value) -> Ordering {
     if let Some(ordering) = a.compare(b) {
         return ordering;
     }
@@ -339,7 +339,8 @@ impl SingleTableIVM {
     /// table's routing index — the `boundaries` side table `matched()`
     /// filters candidates through. Called after every change that can
     /// move the boundary; a `LIMIT 0` query publishes the always-false
-    /// `IN ()`.
+    /// `IN ()`, and a subscription with a storage read out publishes
+    /// none.
     pub(super) fn sync_boundary(&mut self, sub: SubId) {
         let Some(query) = self.select_queries.get(&sub) else {
             return;
@@ -351,6 +352,8 @@ impl SingleTableIVM {
                 ComparisonOperator::IN,
                 Value::List(Vec::new()),
             ))
+        } else if self.is_pending(sub) {
+            None
         } else {
             self.windows
                 .get(&sub)
@@ -380,9 +383,7 @@ impl SingleTableIVM {
         {
             for id in ids {
                 if let Some(row) = frame.row(*id) {
-                    let value = window.order_value(&DataFrameRow {
-                        data: row.data.clone(),
-                    });
+                    let value = window.order_value(&row.data);
                     window.insert(value, row.key.clone());
                 }
             }
@@ -408,25 +409,28 @@ impl SingleTableIVM {
         ops
     }
 
-    /// Refill a drained buffer back to capacity: one storage query from
-    /// the frontier inclusive (unthresholded for an unenforceable one;
-    /// nothing at all when storage is exhausted), ordered, sized by the
-    /// window's refill plan, tagged in and returned as `Add`s, with the
-    /// frontier moved to the worst value fetched and any overshoot
-    /// evicted.
-    fn refill(&mut self, sub: SubId) -> Vec<DataFrameOperation> {
+    /// Ask for a drained buffer's refill back to capacity: one storage
+    /// read from the frontier inclusive (unthresholded for an
+    /// unenforceable one; nothing at all when storage is exhausted, or
+    /// while another read is out), ordered, sized by the window's refill
+    /// plan. The frontier is cleared until it lands (see the module
+    /// header); landing tags the rows in and re-derives it.
+    pub(super) fn refill(&mut self, sub: SubId) {
+        if self.is_pending(sub) {
+            return;
+        }
         let Some(query) = self.select_queries.get(&sub).cloned() else {
-            return Vec::new();
+            return;
         };
         let Some((limit, threshold)) = self
             .windows
             .get(&sub)
             .and_then(Window::refill_plan)
         else {
-            return Vec::new();
+            return;
         };
         if limit == 0 {
-            return Vec::new();
+            return;
         }
         let mut parts = vec![query.filter.clone()];
         parts.extend(threshold.map(Where::Condition));
@@ -436,30 +440,18 @@ impl SingleTableIVM {
             order_by: query.order_by.clone(),
             limit,
         };
-        self.stats.window_refills += 1;
-        let records = self.storage.select(&refill_query);
-        let mut ops = Vec::new();
-        for (key, row) in &records {
-            if let Some(op) = self.upsert_row(sub, key, row) {
-                ops.push(op);
-            }
-            if let Some(window) = self.windows.get_mut(&sub) {
-                let value = window.order_value(row);
-                window.insert(value, key.clone());
-            }
-        }
         if let Some(window) = self.windows.get_mut(&sub) {
-            window.note_fetch(limit as usize, &records);
+            window.set_frontier(None);
         }
-        ops.extend(self.evict_overflow(sub));
-        ops
+        self.stats.window_refills += 1;
+        self.issue(sub, refill_query, super::FetchKind::Refill);
     }
 
     /// Window bookkeeping for one impacted subscription after a routed
     /// write: track the row's arrival/departure in the window, evict past
-    /// capacity, refill when a removal drained the buffer to the user's
-    /// limit, and republish the boundary. A no-op for subscriptions
-    /// without a window.
+    /// capacity, ask for a refill when a removal drained the buffer to
+    /// the user's limit, and republish the boundary. A no-op for
+    /// subscriptions without a window.
     pub(super) fn maintain_window(
         &mut self,
         sub: SubId,
@@ -486,9 +478,9 @@ impl SingleTableIVM {
             Some(query) => query.table.clone(),
             None => return Vec::new(),
         };
-        let mut ops = self.evict_overflow(sub);
+        let ops = self.evict_overflow(sub);
         if drained {
-            ops.extend(self.refill(sub));
+            self.refill(sub);
         }
         self.sync_boundary(sub);
         ops.into_iter()

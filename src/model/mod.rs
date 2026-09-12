@@ -11,17 +11,22 @@
 //!   predicate tree, and the [`QueryId`] subscription handle
 //! - [`frame`] — row identities, images, the [`DataFrameOperation`] delta
 //!   unit, and the engine's shared [`frame::TableFrame`] materialization
+//! - [`position`] — where a write, a read, or a frame row sits in the
+//!   source's history: one WAL location ([`Lsn`]; [`position::RowAt`] for
+//!   frame rows, [`Snapshot`] for a read's result)
 //!
 //! Structure changes here ripple through the whole engine (these types are
 //! index keys in `crate::ivm`), so keep field changes deliberate and discuss
 //! them in an issue first — see "Design notes" in the README.
 
 pub mod frame;
+pub mod position;
 pub mod query;
 pub mod schema;
 pub mod value;
 
 pub use frame::{DataFrameKey, DataFrameOperation, DataFrameRow};
+pub use position::{Lsn, Snapshot};
 pub use query::{
     ComparisonOperator, Condition, DeleteQuery, Disjunct, InsertQuery, Join, MultiTableReadQuery,
     Order, OrderBy, QueryId, SingleTableReadQuery, SubId, UpdateQuery, Where, WriteQuery,

@@ -78,21 +78,43 @@
 //!
 //! - A finite `limit` is enforced through a per-subscription **window**
 //!   (see the `window` module): the engine buffers twice the requested
-//!   limit (storage queries are issued with the doubled limit), admits new
+//!   limit (storage reads are issued with the doubled limit), admits new
 //!   rows past a full buffer only when they beat the worst held value,
-//!   evicts past capacity, and refills from storage when a removal drains
-//!   the buffer to the requested limit. `order_by` decides *which* rows
-//!   the window keeps — it does not order the operation stream (clients
-//!   sort their own frames; the replace pair is the stream's only ordering
-//!   contract). A query without a finite limit keeps every matching row;
-//!   a `LIMIT 0` subscription is permanently empty (its registration
-//!   snapshot is empty and later writes never admit).
-//! - Frames fill three ways: the initial [`Storage`] query run at
-//!   registration, writes seen afterwards, and explicit
-//!   [`SingleTableIVM::fetch`]es (how the
-//!   join layer pulls the other side of a join in). [`PgStorage`] is still
-//!   a stub, so against Postgres the initial load is empty until the
-//!   Diesel connector lands.
+//!   evicts past capacity, and asks for a refill from storage when a
+//!   removal drains the buffer to the requested limit. `order_by` decides
+//!   *which* rows the window keeps — it does not order the operation
+//!   stream (clients sort their own frames; the replace pair is the
+//!   stream's only ordering contract). A query without a finite limit
+//!   keeps every matching row; a `LIMIT 0` subscription is permanently
+//!   empty (its registration reads nothing and later writes never admit).
+//! - The engine **never reads storage itself**. Frames fill three ways:
+//!   the initial result set of a registration, writes seen afterwards,
+//!   and the narrowed reads the join layer asks for when a join value
+//!   becomes referenced ([`SingleTableIVM::fetch`]). Each read is
+//!   recorded as a [`Fetch`] request (see the `engine` module) and landed
+//!   later by the runtime through [`Engine::land`]; between the two the
+//!   subscription's routing is live, its window publishes no admission
+//!   boundary (so nothing the read will miss is turned away), and it is
+//!   skipped as a twin donor.
+//! - **Positions.** Every write arrives with the WAL location of its
+//!   commit ([`Lsn`]) and every read lands with the location its snapshot
+//!   reflects every commit up to; a read lands the moment it returns,
+//!   ahead of the stream or not. Each frame row remembers how current its
+//!   image is ([`crate::model::position::RowAt`]: the write that produced
+//!   it, or the read it landed from) and, per holder, the location of the
+//!   image that holder has ([`crate::model::frame::Hold`]). A landing
+//!   serves only the subscription that asked: a row the frame does not
+//!   hold is inserted with the read's image and stamped with the read;
+//!   for a row it does hold, the reader gets the newer of the frame's
+//!   image and the read's. When that is the read's, the reader goes
+//!   **ahead of the frame** on the row (its `Hold` keeps the read's
+//!   location and image) while every other holder keeps the frame's image
+//!   and hears about the write when it arrives; the write then leaves the
+//!   reader alone, and the first write past the reader's location ends
+//!   its lead. A write whose effect the frame row itself already reflects
+//!   leaves image and holders alone and only tells the queries the
+//!   frame's image newly matches. Rows the stream removed after a read's
+//!   snapshot are dropped from the result by the runtime before landing.
 //! - A fetch can refresh a shared row's data for every holder while only
 //!   the fetching subscription receives an op — harmless while frames are
 //!   maintained from the write stream (all holders are refreshed by
@@ -107,26 +129,30 @@
 //!   header.
 
 mod columns;
+mod engine;
 mod frames;
 mod index;
 mod multi;
 mod predicate;
 mod registry;
 mod stats;
-mod storage;
 mod window;
 
 pub use crate::model::SubId;
+pub use engine::{Engine, Fetch, FetchId, FetchKind};
 pub use multi::{MultiTableIVM, MultiTableUpdate, QueryPart};
 pub use predicate::{eval_condition, evaluate};
 pub use stats::IvmStats;
-pub use storage::{MemoryStorage, PgStorage, Storage};
+pub use window::order_cmp;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::rc::Rc;
 
-use crate::model::frame::{RowId, TableFrame};
-use crate::model::{DataFrameOperation, DataFrameRow, SingleTableReadQuery, TableName, WriteQuery};
+use crate::model::frame::{Hold, RowId, TableFrame};
+use crate::model::position::RowAt;
+use crate::model::{
+    DataFrameKey, DataFrameOperation, DataFrameRow, Lsn, SingleTableReadQuery, TableName,
+    WriteQuery,
+};
 use index::TableIndex;
 use window::Window;
 
@@ -173,12 +199,15 @@ pub struct SingleTableUpdate {
 ///   ([`SingleTableIVM::mark_reconciled`]).
 /// - `tables`: one routing index per table — the condition →
 ///   shared-disjunct-counter machinery (see the `index` module).
-/// - `storage`: where registration loads initial result sets and
-///   [`SingleTableIVM::fetch`] reads rows the frames do not yet hold.
+/// - `pending`: subscription → how many of its storage reads are still
+///   out; while nonzero the subscription publishes no admission boundary,
+///   asks for no refill, and donates no twin snapshot.
+/// - `requests`: the reads asked for since the runtime last took them.
 /// - `write_epoch`: monotonic write number; disjunct counters are lazily
 ///   invalidated by comparing against it, so no per-write reset sweep is
 ///   needed.
 /// - `next_sub`: the next subscription id to hand out; never reused.
+/// - `next_fetch`: the next read id to hand out; never reused.
 /// - `stats`: operation counters; not part of the sync state.
 pub struct SingleTableIVM {
     select_queries: HashMap<SubId, SingleTableReadQuery>,
@@ -188,9 +217,11 @@ pub struct SingleTableIVM {
     windows: HashMap<SubId, Window>,
     stale_views: HashSet<SubId>,
     tables: HashMap<TableName, TableIndex>,
-    storage: Rc<dyn Storage>,
+    pending: HashMap<SubId, u32>,
+    requests: Vec<Fetch>,
     write_epoch: u64,
     next_sub: u64,
+    next_fetch: u64,
     stats: IvmStats,
 }
 
@@ -207,9 +238,16 @@ struct Impact {
     present_before: bool,
 }
 
+impl Default for SingleTableIVM {
+    /// [`SingleTableIVM::new`].
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SingleTableIVM {
-    /// An empty engine reading initial data and fetches from `storage`.
-    pub fn new(storage: Rc<dyn Storage>) -> Self {
+    /// An empty engine.
+    pub fn new() -> Self {
         SingleTableIVM {
             select_queries: HashMap::new(),
             by_query: HashMap::new(),
@@ -218,11 +256,23 @@ impl SingleTableIVM {
             windows: HashMap::new(),
             stale_views: HashSet::new(),
             tables: HashMap::new(),
-            storage,
+            pending: HashMap::new(),
+            requests: Vec::new(),
             write_epoch: 0,
             next_sub: 0,
+            next_fetch: 0,
             stats: IvmStats::default(),
         }
+    }
+
+    /// Take the storage reads recorded since the last call, oldest first.
+    pub fn take_requests(&mut self) -> Vec<Fetch> {
+        std::mem::take(&mut self.requests)
+    }
+
+    /// Whether a storage read for `sub` is still out.
+    pub fn is_pending(&self, sub: SubId) -> bool {
+        self.pending.get(&sub).is_some_and(|count| *count > 0)
     }
 
     /// Which registered subscriptions does this write affect?
@@ -230,30 +280,70 @@ impl SingleTableIVM {
     /// Returns subscription ids in deterministic (sorted) order. Records
     /// routing counters in [`SingleTableIVM::stats`].
     pub fn search_impacted_queries(&mut self, write_query: &WriteQuery) -> Vec<SubId> {
-        self.analyze(write_query)
-            .into_iter()
-            .map(|impact| impact.sub)
-            .collect()
+        self.analyze(
+            write_query.table(),
+            write_query.pkey_value(),
+            write_query.new_row_image(),
+        )
+        .into_iter()
+        .map(|impact| impact.sub)
+        .collect()
     }
 
-    /// Route a write: find the impacted subscriptions, emit one
-    /// [`SingleTableUpdate`] per self-contained operation, and bring the
-    /// shared frame's data and tags in line.
+    /// Route a write committed at `at`: find the impacted subscriptions,
+    /// emit one [`SingleTableUpdate`] per self-contained operation, and
+    /// bring the shared frame's data and tags in line.
     ///
     /// Per impacted subscription: a holder of the row's pre-image gets
     /// `Delete(key, old)`, a subscription the new image fires gets
     /// `Add(key, new)`, and one in both camps gets the adjacent pair — the
     /// in-place replacement row of the module header's table. The shared
-    /// row's data is written once; each firing subscription tags itself,
-    /// each no-longer-matching holder untags itself, and the row is
-    /// dropped when its last tag goes.
-    pub fn incremental_update(&mut self, write_query: &WriteQuery) -> Vec<SingleTableUpdate> {
+    /// row's data is written once and stamped with the write's position;
+    /// each firing subscription tags itself, each no-longer-matching
+    /// holder untags itself, and the row is dropped when its last tag
+    /// goes. When the frame row already reflects the write (it landed from
+    /// a read that saw it), image and holders stay as they are and only
+    /// the queries the frame's image newly matches are told, with that
+    /// image. A holder **ahead of the frame** on the row (a read gave it a
+    /// newer image, see [`crate::model::frame::Hold`]) is left alone if
+    /// its image already reflects the write; otherwise the write ends its
+    /// lead: it is told like every holder, its `Delete` carrying the image
+    /// it actually held.
+    pub fn incremental_update(&mut self, write_query: &WriteQuery, at: Lsn) -> Vec<SingleTableUpdate> {
         self.stats.writes_processed += 1;
-
-        let impacts = self.analyze(write_query);
         let table = write_query.table().clone();
         let key = write_query.pkey_value().clone();
+        let reflected = self
+            .frames
+            .get(&table)
+            .and_then(|frame| frame.get(&key))
+            .filter(|row| row.at.reflects(at))
+            .map(|row| row.data.clone());
+        if let Some(image) = reflected {
+            return self.tag_matchers(&table, &key, &image);
+        }
+
         let row_image = write_query.new_row_image();
+        let mut impacts = self.analyze(&table, &key, row_image);
+        let mut own_old: HashMap<SubId, DataFrameRow> = HashMap::new();
+        if let Some(row) = self
+            .frames
+            .get_mut(&table)
+            .and_then(|frame| frame.id_of(&key).and_then(|id| frame.row_mut(id)))
+        {
+            let mut skip = Vec::new();
+            for (sub, hold) in row.subscribers.iter_mut() {
+                if hold.ahead.is_none() {
+                    continue;
+                }
+                if at <= hold.at {
+                    skip.push(*sub);
+                } else if let Some(image) = hold.ahead.take() {
+                    own_old.insert(*sub, image);
+                }
+            }
+            impacts.retain(|impact| !skip.contains(&impact.sub));
+        }
         let old_data = self
             .frames
             .get(&table)
@@ -263,14 +353,15 @@ impl SingleTableIVM {
         let mut ops: Vec<SingleTableUpdate> = Vec::new();
         for impact in &impacts {
             if impact.present_before {
-                let data = old_data
-                    .clone()
+                let data = own_old
+                    .remove(&impact.sub)
+                    .or_else(|| old_data.clone())
                     .expect("present_before is only true when the shared row is materialized");
                 self.stats.ops_delete += 1;
                 ops.push(SingleTableUpdate {
                     query: impact.sub,
                     table: table.clone(),
-                    op: DataFrameOperation::Delete(key.clone(), DataFrameRow { data }),
+                    op: DataFrameOperation::Delete(key.clone(), data),
                 });
             }
             if impact.matches_after {
@@ -290,10 +381,11 @@ impl SingleTableIVM {
             let frame = self.frames.entry(table).or_default();
             for impact in &impacts {
                 if impact.matches_after {
-                    let data = row_image.expect("checked above").data.clone();
-                    let (id, row) = frame.entry(&key, || data.clone());
+                    let data = row_image.expect("checked above").clone();
+                    let (id, row) = frame.entry(&key, || (data.clone(), RowAt::Written(at)));
                     row.data = data;
-                    row.subscribers.insert(impact.sub);
+                    row.at = RowAt::Written(at);
+                    row.subscribers.insert(impact.sub, Hold { at, ahead: None });
                     self.held.entry(impact.sub).or_default().insert(id);
                 } else if let Some(id) = frame.id_of(&key) {
                     if let Some(row) = frame.row_mut(id) {
@@ -324,6 +416,79 @@ impl SingleTableIVM {
         ops
     }
 
+    /// The frame's row already reflects the write: tell only the
+    /// subscriptions its current `image` matches that do not hold it yet,
+    /// giving them that image.
+    fn tag_matchers(
+        &mut self,
+        table: &TableName,
+        key: &DataFrameKey,
+        image: &DataFrameRow,
+    ) -> Vec<SingleTableUpdate> {
+        let newcomers: Vec<SubId> = self
+            .analyze(table, key, Some(image))
+            .into_iter()
+            .filter(|impact| impact.matches_after && !impact.present_before)
+            .map(|impact| impact.sub)
+            .collect();
+        let mut ops = Vec::new();
+        for sub in newcomers {
+            if let Some(update) = self.tag_row(sub, table, key, image) {
+                ops.push(update);
+                ops.extend(self.maintain_window(sub, key, Some(image), true, false));
+            }
+        }
+        ops
+    }
+
+    /// Tag `sub` onto the frame row `key` of `table` (which must be
+    /// materialized) at the frame's own location, emitting its `Add` with
+    /// `image` (the frame's image); nothing when it already holds the
+    /// row. The caller maintains the window.
+    pub(super) fn tag_row(
+        &mut self,
+        sub: SubId,
+        table: &TableName,
+        key: &DataFrameKey,
+        image: &DataFrameRow,
+    ) -> Option<SingleTableUpdate> {
+        let frame = self.frames.get_mut(table)?;
+        let id = frame.id_of(key)?;
+        let row = frame.row_mut(id)?;
+        if row.held_by(sub) {
+            return None;
+        }
+        row.subscribers.insert(
+            sub,
+            Hold {
+                at: row.at.lsn(),
+                ahead: None,
+            },
+        );
+        self.held.entry(sub).or_default().insert(id);
+        self.stats.ops_add += 1;
+        Some(SingleTableUpdate {
+            query: sub,
+            table: table.clone(),
+            op: DataFrameOperation::Add(key.clone(), image.clone()),
+        })
+    }
+
+    /// Wrap bare operations of `sub` into updates, for the runtime seam.
+    fn tagged(&self, sub: SubId, ops: Vec<DataFrameOperation>) -> Vec<SingleTableUpdate> {
+        let Some(query) = self.select_queries.get(&sub) else {
+            return Vec::new();
+        };
+        let table = query.table.clone();
+        ops.into_iter()
+            .map(|op| SingleTableUpdate {
+                query: sub,
+                table: table.clone(),
+                op,
+            })
+            .collect()
+    }
+
     /// Number of registered subscriptions.
     pub fn query_count(&self) -> usize {
         self.select_queries.len()
@@ -341,7 +506,9 @@ impl SingleTableIVM {
     }
 
     /// The single source of truth for "is this subscription impacted, and
-    /// how" — both public routing entry points build on it.
+    /// how" by a row of `table_name` identified by `key` taking the image
+    /// `row_image` (`None` for a delete) — every routing entry point
+    /// builds on it.
     ///
     /// Way 1 (row matches after the write) delegates to the table's routing
     /// index under a freshly bumped write epoch — the index itself also
@@ -351,17 +518,21 @@ impl SingleTableIVM {
     /// same-table subscription — catches updates moving a row out, and
     /// deletes. Every returned [`Impact`] has at least one of the two
     /// facts set.
-    fn analyze(&mut self, write_query: &WriteQuery) -> Vec<Impact> {
-        let table_name = write_query.table().clone();
-        let key = write_query.pkey_value().clone();
-        let row_image = write_query.new_row_image();
+    fn analyze(
+        &mut self,
+        table_name: &TableName,
+        key: &DataFrameKey,
+        row_image: Option<&DataFrameRow>,
+    ) -> Vec<Impact> {
+        let table_name = table_name.clone();
+        let key = key.clone();
 
         let mut holding: BTreeSet<SubId> = BTreeSet::new();
-        let holders = self
+        let holders: Vec<SubId> = self
             .frames
             .get(&table_name)
             .and_then(|frame| frame.get(&key))
-            .map(|row| row.subscribers.clone())
+            .map(|row| row.subscribers.keys().copied().collect())
             .unwrap_or_default();
         for sub in holders {
             if self.select_queries.contains_key(&sub) {
@@ -396,5 +567,37 @@ impl SingleTableIVM {
             });
         }
         impacts
+    }
+}
+
+impl Engine for SingleTableIVM {
+    type Query = SingleTableReadQuery;
+    type Update = SingleTableUpdate;
+
+    /// [`SingleTableIVM::register_query`], its snapshot tagged.
+    fn subscribe(&mut self, query: SingleTableReadQuery) -> (SubId, Vec<SingleTableUpdate>) {
+        let (sub, ops) = self.register_query(query);
+        let updates = self.tagged(sub, ops);
+        (sub, updates)
+    }
+
+    /// [`SingleTableIVM::unregister_query`].
+    fn unsubscribe(&mut self, sub: SubId) {
+        self.unregister_query(sub);
+    }
+
+    /// [`SingleTableIVM::incremental_update`].
+    fn route(&mut self, write: &WriteQuery, at: Lsn) -> Vec<SingleTableUpdate> {
+        self.incremental_update(write, at)
+    }
+
+    /// [`SingleTableIVM::land_fetch`].
+    fn land(&mut self, fetch: &Fetch, rows: &[(DataFrameKey, DataFrameRow)], at: Lsn) -> Vec<SingleTableUpdate> {
+        self.land_fetch(fetch, rows, at)
+    }
+
+    /// [`SingleTableIVM::take_requests`].
+    fn requests(&mut self) -> Vec<Fetch> {
+        self.take_requests()
     }
 }

@@ -6,23 +6,27 @@
 
 use super::index::TableIndex;
 use super::window::Window;
-use super::{window, SingleTableIVM};
+use super::{window, FetchKind, SingleTableIVM};
 use crate::model::{
-    Condition, DataFrameKey, DataFrameOperation, DataFrameRow, SingleTableReadQuery, SubId, Value,
+    Condition, DataFrameKey, DataFrameOperation, SingleTableReadQuery, SubId, Value,
 };
 
 impl SingleTableIVM {
-    /// Register a subscription, returning its engine id and its initial
-    /// result set as `Add` operations. Ids are handed out by the engine
-    /// and never reused; the layer above maps a client's own ids to them.
+    /// Register a subscription, returning its engine id and whatever of
+    /// its initial result set is available at once, as `Add` operations.
+    /// Ids are handed out by the engine and never reused; the layer above
+    /// maps a client's own ids to them.
     ///
     /// The query's `Where` is normalized to DNF and indexed in the table's
     /// routing index (a `WHERE FALSE` query has no disjuncts and touches no
-    /// index at all). A query **structurally identical** to one already
-    /// registered is served from the shared frame — the twin's current
-    /// rows, no storage query, counted in `snapshots_shared` — found
-    /// through the query-keyed index in one lookup; only a query with no
-    /// twin runs against [`super::Storage`]. Rows already shared with other
+    /// index at all), so the subscription routes from this moment on. A
+    /// query **structurally identical** to one already registered is
+    /// served from the shared frame — the twin's current rows, no storage
+    /// read, counted in `snapshots_shared` — found through the query-keyed
+    /// index in one lookup. A query with no twin records one storage read
+    /// ([`super::FetchKind::Snapshot`]) that the runtime runs and lands
+    /// later through [`SingleTableIVM::land_fetch`]; until then the
+    /// returned operations are empty. Rows already shared with other
     /// subscriptions are tagged rather than duplicated.
     pub fn register_query(&mut self, select_query: SingleTableReadQuery) -> (SubId, Vec<DataFrameOperation>) {
         let sub = SubId(self.next_sub);
@@ -37,14 +41,7 @@ impl SingleTableIVM {
                 .register(sub, dnf, &mut self.stats);
         }
         let twin = self.identical_subscription(&select_query, sub);
-        let records = match twin {
-            Some(twin) => {
-                self.stats.snapshots_shared += 1;
-                self.rows_of(twin)
-            }
-            None => self.storage.select(&Self::storage_query(&select_query)),
-        };
-        let requested = window::storage_limit(&select_query) as usize;
+        let storage_query = Self::storage_query(&select_query);
         self.by_query
             .entry(select_query.clone())
             .or_default()
@@ -52,19 +49,24 @@ impl SingleTableIVM {
         self.select_queries.insert(sub, select_query);
 
         let mut ops = Vec::new();
-        for (key, row) in &records {
-            if let Some(op) = self.upsert_row(sub, key, row) {
-                ops.push(op);
+        match twin {
+            Some(twin) => {
+                self.stats.snapshots_shared += 1;
+                let table = self.select_queries[&sub].table.clone();
+                for key in self.keys_of(twin) {
+                    if let Some(update) = self.share_view(sub, twin, &table, &key) {
+                        ops.push(update.op);
+                    }
+                }
+                self.rebuild_window(sub);
+                let inherited = self.windows.get(&twin).and_then(Window::frontier);
+                if let Some(window) = self.windows.get_mut(&sub) {
+                    window.set_frontier(inherited);
+                }
             }
-        }
-        self.rebuild_window(sub);
-        let inherited = twin
-            .and_then(|twin| self.windows.get(&twin))
-            .and_then(Window::frontier);
-        if let Some(window) = self.windows.get_mut(&sub) {
-            match twin {
-                Some(_) => window.set_frontier(inherited),
-                None => window.note_fetch(requested, &records),
+            None => {
+                self.rebuild_window(sub);
+                self.issue(sub, storage_query, FetchKind::Snapshot);
             }
         }
         ops.extend(self.evict_overflow(sub));
@@ -174,7 +176,7 @@ impl SingleTableIVM {
     /// The storage-facing form of a subscription's query: identical except
     /// that a windowed (finite-limit) query is issued with its limit
     /// doubled, to fill the window's buffer.
-    pub(super) fn storage_query(query: &SingleTableReadQuery) -> SingleTableReadQuery {
+    fn storage_query(query: &SingleTableReadQuery) -> SingleTableReadQuery {
         SingleTableReadQuery {
             limit: window::storage_limit(query),
             ..query.clone()
@@ -184,12 +186,15 @@ impl SingleTableIVM {
     /// Remove a subscription: its routing-index entries and its tag on
     /// every shared row it holds — walked off its held index, not by
     /// scanning the table — dropping rows nobody holds anymore. A table
-    /// index that routes nothing afterwards is dropped too. Unknown
-    /// subscriptions are a no-op.
+    /// index that routes nothing afterwards is dropped too; reads not yet
+    /// taken by the runtime are withdrawn and reads already out land as
+    /// no-ops. Unknown subscriptions are a no-op.
     pub fn unregister_query(&mut self, sub: SubId) {
         let Some(query) = self.select_queries.remove(&sub) else {
             return;
         };
+        self.pending.remove(&sub);
+        self.requests.retain(|fetch| fetch.sub != sub);
         if let Some(twins) = self.by_query.get_mut(&query) {
             twins.remove(&sub);
             if twins.is_empty() {
@@ -286,20 +291,22 @@ impl SingleTableIVM {
 
     /// Another registered subscription with a structurally identical
     /// query, if any — the sharing seam of registration, one lookup in the
-    /// query-keyed index. Skips subscriptions in a maintenance window,
-    /// whose rows lag their filter.
+    /// query-keyed index. Skips subscriptions in a maintenance window or
+    /// with a storage read still out, whose rows lag their filter.
     fn identical_subscription(&self, select_query: &SingleTableReadQuery, exclude: SubId) -> Option<SubId> {
         self.by_query
             .get(select_query)?
             .iter()
-            .find(|twin| **twin != exclude && !self.stale_views.contains(twin))
+            .find(|twin| {
+                **twin != exclude && !self.stale_views.contains(twin) && !self.is_pending(**twin)
+            })
             .copied()
     }
 
-    /// The (key, image) pairs a subscription currently holds, materialized
-    /// from its held index — what a twin registration is served instead of
-    /// a storage result.
-    fn rows_of(&self, sub: SubId) -> Vec<(DataFrameKey, DataFrameRow)> {
+    /// The keys a subscription currently holds, from its held index — what
+    /// a twin registration is served, view by view, instead of a storage
+    /// result.
+    fn keys_of(&self, sub: SubId) -> Vec<DataFrameKey> {
         let Some(query) = self.select_queries.get(&sub) else {
             return Vec::new();
         };
@@ -311,14 +318,7 @@ impl SingleTableIVM {
         };
         ids.iter()
             .filter_map(|id| frame.row(*id))
-            .map(|row| {
-                (
-                    row.key.clone(),
-                    DataFrameRow {
-                        data: row.data.clone(),
-                    },
-                )
-            })
+            .map(|row| row.key.clone())
             .collect()
     }
 }

@@ -29,14 +29,23 @@
 //! 4. **LEFT JOIN** — `tickets LEFT JOIN users ON assigned_to = users.id`
 //!    with 1_000 identical subscriptions plus 100 distinct ones over 1_000
 //!    users: ticket inserts, ticket reassignments, and user updates.
+//! 5. **Postgres** (only when `JUS_SYNC_PG_DSN` names a database with
+//!    `wal_level = logical`) — the same join over real tables: a
+//!    registration's end-to-end latency (two positioned reads), writes
+//!    committed in Postgres and streamed through the `test_decoding`
+//!    poller into the runtime, and a registration whose snapshot is held
+//!    open while writes flow, in both positioning modes.
 //!
 //! Storage is a bench-local [`Storage`] implementation with hashed row
 //! lookup: the crate's `MemoryStorage` finds rows by linear scan on every
 //! `apply`, which would make loading 100_000 rows quadratic. Its `select`
 //! scans and evaluates the same predicates, with one shortcut a real
 //! database has too — a primary-key `IN` / `=` conjunct narrows the scan
-//! to those keys. Every write is mirrored into storage *before* it is
-//! routed, and only the engine call is timed.
+//! to those keys. It answers at once, so the engines run under the
+//! synchronous [`Local`] driver and every read a registration or a join
+//! crossing asks for is landed inside the timed call. Every write is
+//! mirrored into storage *before* it is routed, and only the engine call
+//! is timed.
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -44,12 +53,17 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use jus_sync::ivm::{
-    evaluate, IvmStats, MultiTableIVM, PgStorage, SingleTableIVM,
-    Storage,
-};
+use jus_sync::ivm::{evaluate, Fetch, IvmStats, MultiTableIVM, SingleTableIVM};
 use jus_sync::model::ComparisonOperator::{EQ, GTE};
 use jus_sync::model::*;
+use jus_sync::sync::pg::{PgStorage, PgStream, SnapshotMode, XidLedger};
+use jus_sync::sync::{Local, Lsn, Runtime, Snapshot, Storage, StorageError};
+
+/// The single-table engine under the synchronous driver over bench storage.
+type Single = Local<SingleTableIVM, BenchStorage>;
+
+/// The join layer under the synchronous driver over bench storage.
+type Multi = Local<MultiTableIVM, BenchStorage>;
 
 const STATUSES: [&str; 10] = [
     "NEW",
@@ -84,6 +98,12 @@ const WINDOW_ROWS: usize = 100_000;
 const WINDOW_LIMIT: u32 = 50;
 const WINDOW_WRITES: usize = 10_000;
 const WINDOW_POINTS_RANGE: u64 = 1_000_000;
+
+const PG_TICKETS: usize = 2_000;
+const PG_WRITES: usize = 5_000;
+const PG_WRITES_PER_TXN: usize = 100;
+const PG_LOAD_WRITES: usize = 500;
+const PG_SLOT: &str = "jus_sync_bench";
 
 const JOIN_TWINS: usize = 1_000;
 const JOIN_DISTINCT: usize = 100;
@@ -423,11 +443,11 @@ fn order_of(
     }
 }
 
-impl Storage for BenchStorage {
+impl BenchStorage {
     /// Scan the table (narrowed to the smallest primary-key conjunct when
     /// the filter has one), evaluate the filter on every candidate, and
     /// for a finite limit keep the best rows in `order_by` order.
-    fn select(&self, query: &SingleTableReadQuery) -> Vec<(DataFrameKey, DataFrameRow)> {
+    fn rows(&self, query: &SingleTableReadQuery) -> Vec<(DataFrameKey, DataFrameRow)> {
         let tables = self.tables.borrow();
         let Some(table) = tables.get(&query.table) else {
             return Vec::new();
@@ -457,6 +477,16 @@ impl Storage for BenchStorage {
             selected.sort_by(|a, b| order_of(query, a, b));
         }
         selected
+    }
+}
+
+impl Storage for BenchStorage {
+    /// [`BenchStorage::rows`], positioned at zero; ready at once.
+    async fn select(&self, query: &SingleTableReadQuery, _at_least: Option<Lsn>) -> Result<Snapshot, StorageError> {
+        Ok(Snapshot {
+            rows: self.rows(query),
+            at: Lsn(0),
+        })
     }
 }
 
@@ -490,8 +520,8 @@ impl Run {
 
 /// Route every write through `incremental_update`, timing the engine call
 /// alone.
-fn route_all(ivm: &mut SingleTableIVM, label: &str, writes: &[WriteQuery]) -> Run {
-    let before = ivm.stats().clone();
+fn route_all(ivm: &mut Single, label: &str, writes: &[WriteQuery]) -> Run {
+    let before = ivm.engine().stats().clone();
     let mut returned = 0u64;
     let started = Instant::now();
     for write in writes {
@@ -501,25 +531,25 @@ fn route_all(ivm: &mut SingleTableIVM, label: &str, writes: &[WriteQuery]) -> Ru
         label: label.to_owned(),
         writes: writes.len() as u64,
         elapsed: started.elapsed(),
-        stats: ivm.stats().diff(&before),
+        stats: ivm.engine().stats().diff(&before),
         returned,
     }
 }
 
 /// Route every write through `search_impacted_queries` — routing only, no
 /// frame or window change — timing the engine call alone.
-fn search_all(ivm: &mut SingleTableIVM, label: &str, writes: &[WriteQuery]) -> Run {
-    let before = ivm.stats().clone();
+fn search_all(ivm: &mut Single, label: &str, writes: &[WriteQuery]) -> Run {
+    let before = ivm.engine().stats().clone();
     let mut returned = 0u64;
     let started = Instant::now();
     for write in writes {
-        returned += ivm.search_impacted_queries(write).len() as u64;
+        returned += ivm.engine_mut().search_impacted_queries(write).len() as u64;
     }
     Run {
         label: label.to_owned(),
         writes: writes.len() as u64,
         elapsed: started.elapsed(),
-        stats: ivm.stats().diff(&before),
+        stats: ivm.engine().stats().diff(&before),
         returned,
     }
 }
@@ -599,7 +629,7 @@ fn routing_scale(n: usize) -> RoutingReport {
     let mut subscription_rng = XorShift64::new(SEED);
     let mut data_rng = XorShift64::new(SEED ^ 1);
     let tickets_table = tickets_table();
-    let mut ivm = SingleTableIVM::new(Rc::new(PgStorage));
+    let mut ivm: Single = Local::new(SingleTableIVM::new(), Rc::new(BenchStorage::default()));
     let filters: Vec<Where> = (0..n)
         .map(|_| random_filter(&mut subscription_rng))
         .collect();
@@ -612,7 +642,7 @@ fn routing_scale(n: usize) -> RoutingReport {
         ivm.register_query(unbounded(&tickets_table, filter));
     }
     let registration = started.elapsed();
-    let registered = ivm.stats().clone();
+    let registered = ivm.engine().stats().clone();
 
     let mut tickets: Vec<Ticket> = (0..ROUTING_INSERTS)
         .map(|id| Ticket::random(&mut data_rng, id as i64))
@@ -643,7 +673,7 @@ fn routing_scale(n: usize) -> RoutingReport {
 /// Scenarios 1 and 2a: run [`routing_scale`] at every N and print the
 /// registration and routing tables.
 fn routing_and_registration() {
-    println!("\n== 1. single-table routing scale ({ROUTING_INSERTS} inserts + {ROUTING_UPDATES} updates per N; storage: PgStorage stub) ==");
+    println!("\n== 1. single-table routing scale ({ROUTING_INSERTS} inserts + {ROUTING_UPDATES} updates per N; storage: empty) ==");
     let reports: Vec<RoutingReport> = ROUTING_SIZES.into_iter().map(routing_scale).collect();
 
     println!("\nregistration (scenario 2a):");
@@ -733,13 +763,13 @@ fn twin_sharing() {
     let mut storage_path = Duration::ZERO;
     let mut snapshot_rows = 0;
     for _ in 0..TWIN_STORAGE_SAMPLES {
-        let mut fresh = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+        let mut fresh: Single = Local::new(SingleTableIVM::new(), storage.clone());
         let started = Instant::now();
         snapshot_rows = fresh.register_query(query.clone()).1.len();
         storage_path += started.elapsed();
     }
 
-    let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    let mut ivm: Single = Local::new(SingleTableIVM::new(), storage.clone());
     let (first, _) = ivm.register_query(query.clone());
     let started = Instant::now();
     for _ in 0..TWIN_COPIES {
@@ -761,8 +791,8 @@ fn twin_sharing() {
             one(storage_path.as_secs_f64() * 1e6 / TWIN_STORAGE_SAMPLES as f64),
             one(twin_path.as_secs_f64() * 1e6 / TWIN_COPIES as f64),
             TWIN_COPIES.to_string(),
-            ivm.stats().snapshots_shared.to_string(),
-            ivm.rows_for(first).map_or(0, |rows| rows.len()).to_string(),
+            ivm.engine().stats().snapshots_shared.to_string(),
+            ivm.engine().rows_for(first).map_or(0, |rows| rows.len()).to_string(),
         ]],
     );
 }
@@ -835,7 +865,7 @@ impl Mirror {
 /// Scenario 3 state: the engine, storage, the client mirror, and the ids
 /// alive in storage.
 struct WindowBench {
-    ivm: SingleTableIVM,
+    ivm: Single,
     storage: Rc<BenchStorage>,
     rng: XorShift64,
     mirror: Mirror,
@@ -851,7 +881,7 @@ impl WindowBench {
     /// admitted at first), victims drawn from the rows the window holds.
     fn run(&mut self, label: &str, targeted: bool) -> (Run, u64, u64) {
         let tickets_table = tickets_table();
-        let before = self.ivm.stats().clone();
+        let before = self.ivm.engine().stats().clone();
         let mut elapsed = Duration::ZERO;
         let mut adds = 0;
         let mut deletes = 0;
@@ -895,7 +925,7 @@ impl WindowBench {
             label: label.to_owned(),
             writes: WINDOW_WRITES as u64,
             elapsed,
-            stats: self.ivm.stats().diff(&before),
+            stats: self.ivm.engine().stats().diff(&before),
             returned,
         };
         (run, adds, deletes)
@@ -916,7 +946,7 @@ fn window() {
         storage.apply(&ticket.insert());
         alive.push(ticket.id);
     }
-    let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    let mut ivm: Single = Local::new(SingleTableIVM::new(), storage.clone());
     let query = SingleTableReadQuery::new(
         tickets_table.name.clone(),
         Where::AND(vec![]),
@@ -926,6 +956,7 @@ fn window() {
     let started = Instant::now();
     let (_window_sub, snapshot) = ivm.register_query(query);
     let registration = started.elapsed();
+    let snapshot: Vec<DataFrameOperation> = snapshot.into_iter().map(|update| update.op).collect();
     let mut mirror = Mirror::default();
     mirror.apply(&snapshot);
     let initial_boundary = mirror.worst_points();
@@ -994,7 +1025,7 @@ fn window() {
 /// Scenario 4 state: the join layer, storage, and the bench's own copy of
 /// the ticket and user rows it mutates.
 struct JoinBench {
-    ivm: MultiTableIVM,
+    ivm: Multi,
     storage: Rc<BenchStorage>,
     rng: XorShift64,
     tickets: Vec<Ticket>,
@@ -1006,7 +1037,7 @@ impl JoinBench {
     /// first and timing the engine call alone; returns the run plus the
     /// main-part / join-part operation split.
     fn route(&mut self, label: &str, writes: &[WriteQuery]) -> (Run, u64, u64) {
-        let before = self.ivm.stats().clone();
+        let before = self.ivm.engine().stats().clone();
         let mut main_ops = 0;
         let mut join_ops = 0;
         let mut elapsed = Duration::ZERO;
@@ -1027,7 +1058,7 @@ impl JoinBench {
             label: label.to_owned(),
             writes: writes.len() as u64,
             elapsed,
-            stats: self.ivm.stats().diff(&before),
+            stats: self.ivm.engine().stats().diff(&before),
             returned: main_ops + join_ops,
         };
         (run, main_ops, join_ops)
@@ -1100,7 +1131,7 @@ fn left_join() {
     for ticket in &tickets {
         storage.apply(&ticket.insert());
     }
-    let mut ivm = MultiTableIVM::new(storage.clone() as Rc<dyn Storage>);
+    let mut ivm: Multi = Local::new(MultiTableIVM::new(), storage.clone());
 
     let started = Instant::now();
     let mut twin_ops = 0;
@@ -1111,13 +1142,13 @@ fn left_join() {
             .len();
     }
     let twins = started.elapsed();
-    let after_twins = ivm.stats().clone();
+    let after_twins = ivm.engine().stats().clone();
     let started = Instant::now();
     for index in 0..JOIN_DISTINCT {
         ivm.register_query(join_spec(distinct_join_filter(index)));
     }
     let distinct = started.elapsed();
-    let after_distinct = ivm.stats().clone();
+    let after_distinct = ivm.engine().stats().clone();
 
     println!("\nregistration:");
     print_table(
@@ -1215,5 +1246,321 @@ fn main() {
     twin_sharing();
     window();
     left_join();
+    match std::env::var("JUS_SYNC_PG_DSN") {
+        Ok(dsn) => postgres(&dsn),
+        Err(_) => println!("\n== 5. postgres: skipped (set JUS_SYNC_PG_DSN to a database with wal_level = logical) =="),
+    }
     println!("\ntotal wall time: {}s", one(started.elapsed().as_secs_f64()));
+}
+
+/// The SQL literal of one ticket row.
+fn ticket_values(ticket: &Ticket) -> String {
+    format!(
+        "({}, '{}', '{}', '{}', {}, {})",
+        ticket.id,
+        STATUSES[ticket.status],
+        PRIORITIES[ticket.priority],
+        user_id(ticket.assigned_to),
+        ticket.points,
+        ticket.team
+    )
+}
+
+/// Where the wall time of one drain went.
+///
+/// - `poll`: awaiting the feed (the slot query plus text decoding).
+/// - `reads` / `reads_run`: awaiting storage reads, and how many.
+/// - `route`: inside the runtime (routing writes, landing reads).
+/// - `delivered`: writes the feed delivered.
+#[derive(Default)]
+struct DrainCost {
+    poll: Duration,
+    reads: Duration,
+    reads_run: usize,
+    route: Duration,
+    delivered: usize,
+}
+
+/// One scenario-5 measurement row.
+struct PgRow {
+    mode: &'static str,
+    registration: Duration,
+    registration_cost: DrainCost,
+    twin: Duration,
+    commit: Duration,
+    stream: Duration,
+    stream_cost: DrainCost,
+    load_settle: Duration,
+    load_rows: usize,
+    load_refreshed: u64,
+    load_dropped: u64,
+}
+
+/// Run every read out against `storage`, poll `stream` to move the feed,
+/// and repeat until nothing is out and `expect_writes` have been
+/// delivered; returns where the time went.
+async fn pg_drain(
+    runtime: &mut Runtime<MultiTableIVM>,
+    storage: &PgStorage,
+    stream: &mut PgStream,
+    mut pending: Vec<Fetch>,
+    expect_writes: usize,
+) -> DrainCost {
+    let mut cost = DrainCost::default();
+    loop {
+        while !pending.is_empty() {
+            let mut next = Vec::new();
+            for fetch in pending.drain(..) {
+                let started = Instant::now();
+                let snapshot = storage
+                    .select(&fetch.query, runtime.stream_position())
+                    .await
+                    .expect("select");
+                cost.reads += started.elapsed();
+                cost.reads_run += 1;
+                let started = Instant::now();
+                let step = runtime.fetched(fetch.id, snapshot);
+                cost.route += started.elapsed();
+                next.extend(step.selects);
+            }
+            pending = next;
+        }
+        if runtime.outstanding() == 0 && cost.delivered >= expect_writes {
+            return cost;
+        }
+        let started = Instant::now();
+        let batch = stream.poll().await.expect("poll");
+        cost.poll += started.elapsed();
+        for (write, at) in batch.writes {
+            cost.delivered += 1;
+            let started = Instant::now();
+            let step = runtime.write(&write, at);
+            cost.route += started.elapsed();
+            pending.extend(step.selects);
+        }
+        let started = Instant::now();
+        let step = runtime.progress(batch.progress);
+        cost.route += started.elapsed();
+        pending.extend(step.selects);
+        if pending.is_empty() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+/// Load the scenario's tables afresh: `USERS` users and `PG_TICKETS`
+/// random tickets, the same rows for every mode.
+async fn pg_load(admin: &tokio_postgres::Client) {
+    admin
+        .batch_execute(
+            "DROP TABLE IF EXISTS tickets; DROP TABLE IF EXISTS users;
+             CREATE TABLE users (id text PRIMARY KEY, name text, team int8);
+             CREATE TABLE tickets (id int8 PRIMARY KEY, status text, priority text, assigned_to text, points int8, team int8);",
+        )
+        .await
+        .expect("create tables");
+    let users: Vec<String> = (0..USERS)
+        .map(|n| format!("('{}', 'user {n} v0', {})", user_id(n), n % TEAMS))
+        .collect();
+    admin
+        .batch_execute(&format!("INSERT INTO users VALUES {}", users.join(", ")))
+        .await
+        .expect("load users");
+    let mut rng = XorShift64::new(SEED ^ 5);
+    let tickets: Vec<String> = (0..PG_TICKETS)
+        .map(|id| ticket_values(&Ticket::random(&mut rng, id as i64)))
+        .collect();
+    admin
+        .batch_execute(&format!("INSERT INTO tickets VALUES {}", tickets.join(", ")))
+        .await
+        .expect("load tickets");
+}
+
+/// Scenario 5 in one positioning mode (see [`postgres`]), over freshly
+/// loaded tables.
+async fn pg_mode(dsn: &str, mode: SnapshotMode, label: &'static str) -> PgRow {
+    let catalog = Rc::new(Catalog::new(vec![tickets_table(), users_table()]));
+    let (admin, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls).await.expect("connect");
+    tokio::task::spawn_local(async move {
+        let _ = connection.await;
+    });
+    pg_load(&admin).await;
+    let mut rng = XorShift64::new(SEED ^ 6);
+    let mut next_id = PG_TICKETS as i64;
+    let (rng, next_id) = (&mut rng, &mut next_id);
+    PgStream::drop_slot(dsn, PG_SLOT).await.expect("drop slot");
+    let ledger = match &mode {
+        SnapshotMode::Xid(ledger) => Some(ledger.clone()),
+        SnapshotMode::Wal => None,
+    };
+    let mut stream = PgStream::open(dsn, PG_SLOT, catalog.clone(), ledger).await.expect("open stream");
+    let storage = PgStorage::connect(dsn, catalog.clone(), mode.clone()).await.expect("connect");
+    let mut runtime = Runtime::new(MultiTableIVM::new());
+
+    let started = Instant::now();
+    let (_, step) = runtime.register(join_spec(Where::condition("status", EQ, "OPEN")));
+    let registration_cost = pg_drain(&mut runtime, &storage, &mut stream, step.selects, 0).await;
+    let registration = started.elapsed();
+    let started = Instant::now();
+    for _ in 0..JOIN_TWINS {
+        runtime.register(join_spec(Where::condition("status", EQ, "OPEN")));
+    }
+    let twin = started.elapsed() / JOIN_TWINS as u32;
+
+    let started = Instant::now();
+    for _ in 0..PG_WRITES / PG_WRITES_PER_TXN {
+        let values: Vec<String> = (0..PG_WRITES_PER_TXN)
+            .map(|_| {
+                let ticket = Ticket::random(rng, *next_id);
+                *next_id += 1;
+                ticket_values(&ticket)
+            })
+            .collect();
+        admin
+            .batch_execute(&format!("INSERT INTO tickets VALUES {}", values.join(", ")))
+            .await
+            .expect("insert");
+    }
+    let commit = started.elapsed();
+    let started = Instant::now();
+    let stream_cost = pg_drain(&mut runtime, &storage, &mut stream, Vec::new(), PG_WRITES).await;
+    let stream_time = started.elapsed();
+
+    let slow = PgStorage::connect(dsn, catalog.clone(), mode.clone())
+        .await
+        .expect("connect")
+        .with_read_delay(Duration::from_millis(300));
+    let before = runtime.stats().clone();
+    let started = Instant::now();
+    let (_, step) = runtime.register(join_spec(Where::condition("team", EQ, 7i64)));
+    let main = step.selects.into_iter().next().expect("the main part's read");
+    let query = main.query.clone();
+    let floor = runtime.stream_position();
+    let select = tokio::task::spawn_local(async move { slow.select(&query, floor).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let values: Vec<String> = (0..PG_LOAD_WRITES)
+        .map(|_| {
+            let mut ticket = Ticket::random(rng, *next_id);
+            ticket.team = 7;
+            *next_id += 1;
+            ticket_values(&ticket)
+        })
+        .collect();
+    admin
+        .batch_execute(&format!(
+            "INSERT INTO tickets VALUES {}; UPDATE tickets SET points = points + 1 WHERE team = 7 AND id < {};",
+            values.join(", "),
+            PG_TICKETS
+        ))
+        .await
+        .expect("load writes");
+    let behind = stream.poll().await.expect("poll");
+    let mut pending = Vec::new();
+    for (write, at) in behind.writes {
+        pending.extend(runtime.write(&write, at).selects);
+    }
+    pending.extend(runtime.progress(behind.progress).selects);
+    let snapshot = select.await.expect("join").expect("select");
+    let snapshot_rows = snapshot.rows.len();
+    pending.extend(runtime.fetched(main.id, snapshot).selects);
+    pg_drain(&mut runtime, &storage, &mut stream, pending, 0).await;
+    let load_settle = started.elapsed();
+    let after = runtime.stats();
+
+    PgStream::drop_slot(dsn, PG_SLOT).await.expect("drop slot");
+    PgRow {
+        mode: label,
+        registration,
+        registration_cost,
+        twin,
+        commit,
+        stream: stream_time,
+        stream_cost,
+        load_settle,
+        load_rows: snapshot_rows,
+        load_refreshed: after.rows_refreshed - before.rows_refreshed,
+        load_dropped: after.rows_dropped - before.rows_dropped,
+    }
+}
+
+/// Scenario 5: the runtime over Postgres, in both positioning modes.
+fn postgres(dsn: &str) {
+    println!("\n== 5. postgres: tickets LEFT JOIN users over real tables ({USERS} users, {PG_TICKETS} tickets loaded; {PG_WRITES} inserts streamed in transactions of {PG_WRITES_PER_TXN}; {PG_LOAD_WRITES} writes behind an open snapshot) ==");
+    let tokio = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let rows = tokio::task::LocalSet::new().block_on(&tokio, async {
+        let lsn = pg_mode(dsn, SnapshotMode::Wal, "wal").await;
+        let xid = pg_mode(dsn, SnapshotMode::Xid(XidLedger::shared()), "xid").await;
+        vec![lsn, xid]
+    });
+    println!("\nregistration (first subscription of a spec: two reads; then {JOIN_TWINS} identical ones from the shared tree):");
+    print_table(
+        &[
+            "mode",
+            "end to end ms",
+            "reads",
+            "in storage ms",
+            "in runtime us",
+            "twin us/register",
+        ],
+        &rows
+            .iter()
+            .map(|row| {
+                vec![
+                    row.mode.to_owned(),
+                    one(row.registration.as_secs_f64() * 1e3),
+                    row.registration_cost.reads_run.to_string(),
+                    one(row.registration_cost.reads.as_secs_f64() * 1e3),
+                    one(row.registration_cost.route.as_secs_f64() * 1e6),
+                    one(row.twin.as_secs_f64() * 1e6),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    );
+    println!("\nstreamed writes ({PG_WRITES} inserts committed in transactions of {PG_WRITES_PER_TXN}, then polled, decoded and routed to {} subscribers):", JOIN_TWINS + 1);
+    print_table(
+        &[
+            "mode",
+            "commit ms",
+            "stream ms",
+            "poll+decode ms",
+            "narrowed reads",
+            "reads ms",
+            "route us/write",
+            "end-to-end writes/s",
+        ],
+        &rows
+            .iter()
+            .map(|row| {
+                vec![
+                    row.mode.to_owned(),
+                    one(row.commit.as_secs_f64() * 1e3),
+                    one(row.stream.as_secs_f64() * 1e3),
+                    one(row.stream_cost.poll.as_secs_f64() * 1e3),
+                    row.stream_cost.reads_run.to_string(),
+                    one(row.stream_cost.reads.as_secs_f64() * 1e3),
+                    two(row.stream_cost.route.as_secs_f64() * 1e6 / row.stream_cost.delivered.max(1) as f64),
+                    whole(row.stream_cost.delivered as f64 / (row.commit + row.stream).as_secs_f64()),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    );
+    println!("\nregistration under load (snapshot held open 300 ms while {PG_LOAD_WRITES} inserts and updates of the matching rows commit and are delivered behind it):");
+    print_table(
+        &["mode", "settle ms", "snapshot rows", "rows refreshed", "rows dropped"],
+        &rows
+            .iter()
+            .map(|row| {
+                vec![
+                    row.mode.to_owned(),
+                    one(row.load_settle.as_secs_f64() * 1e3),
+                    row.load_rows.to_string(),
+                    row.load_refreshed.to_string(),
+                    row.load_dropped.to_string(),
+                ]
+            })
+            .collect::<Vec<_>>(),
+    );
 }

@@ -15,7 +15,8 @@
 //! | Module | What lives there |
 //! |--------|------------------|
 //! | [`model`] | The data model: values, schema, queries, and the row/operation wire vocabulary. What everything else speaks. |
-//! | [`ivm`] | The engine: query registration, write routing (`search_impacted_queries`), delta computation (`incremental_update`), operation counters — plus the multi-table LEFT JOIN layer ([`ivm::MultiTableIVM`]) and the [`ivm::Storage`] seam it fetches through. |
+//! | [`ivm`] | The engine: query registration, write routing (`search_impacted_queries`), delta computation (`incremental_update`), operation counters — plus the multi-table join layer ([`ivm::MultiTableIVM`]) and the read requests ([`ivm::Fetch`]) it records instead of reading storage itself. |
+//! | [`sync`] | Running an engine against a source: positions, the asynchronous [`sync::Storage`] seam, the single-owner [`sync::Runtime`] that lands reads against the write stream, the two drivers, and PostgreSQL ([`sync::pg`]). |
 //! | [`parser`] | SQL text → query model: schema-aware parsing against a [`parser::Catalog`]. |
 //! | [`ws`] | The axum server: routes, WebSocket upgrade, one connection loop (engine wiring pending). |
 //!
@@ -33,15 +34,18 @@
 //!    still pending)
 //! 4. ✅ `ORDER BY` / `LIMIT` windows, twin sharing, in-place condition
 //!    edits, and the benchmark harness (`src/bin/bench.rs`)
-//! 5. PostgreSQL ingester: one permanent logical replication slot for the
-//!    change stream plus rotating exported snapshots for initial result
-//!    sets (paper §7); a real [`ivm::Storage`] backend comes with it
+//! 5. ✅ Asynchronous storage and the runtime: the engine records reads,
+//!    the runtime lands them against the write stream by one rule
+//!    ([`sync::Runtime`]); PostgreSQL storage positioned by WAL location
+//!    or transaction id and a `test_decoding` change-feed poller
+//!    ([`sync::pg`]), with live tests and a bench scenario
 //! 6. WebSocket subscription protocol (subscribe / unsubscribe / push ops)
-//! 7. Join tree with `RIGHT` and `INNER` edges, parser `JOIN` syntax
-//! 8. Performance: set-valued shared join edges, `(column, op, value)`
-//!    condition indexing, interned ids; each measured against the counters
+//! 7. `INNER` edges, parser `JOIN` syntax
+//! 8. Streaming `pgoutput` consumer, batching of one write's narrowed reads,
+//!    table sharding
 
 pub mod ivm;
 pub mod model;
 pub mod parser;
+pub mod sync;
 pub mod ws;

@@ -17,9 +17,10 @@
 //! in any order and still converge, because a receiver applies `Add` as
 //! insert-or-replace and `Delete` as remove.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 
+use super::position::{Lsn, RowAt};
 use super::query::SubId;
 use super::value::{unordered_map_hash, Value};
 
@@ -82,13 +83,46 @@ pub enum DataFrameOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RowId(pub u64);
 
-/// One row of a shared frame: its identity, its current image, and the
-/// subscriptions holding it — the "which query sets is this row subscribed
-/// to" index that membership routing reads.
+/// What one subscription holds for a row it is tagged on: the location
+/// of the image it has (`at`), and, only while it is **ahead of the
+/// frame**, that image itself (`ahead`). A read can give a subscription
+/// an image the stream has not delivered yet; until the frame catches up
+/// its view differs from the frame's, and the image is kept so that its
+/// next `Delete` carries what it actually holds and the join layer diffs
+/// the right join values. Every holder without an `ahead` image holds
+/// the frame's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hold {
+    pub at: Lsn,
+    pub ahead: Option<DataFrameRow>,
+}
+
+/// One row of a shared frame: its identity, its current image, how
+/// current that image is ([`RowAt`]: the write that produced it, or the
+/// read it landed from), and the subscriptions holding it with what each
+/// holds ([`Hold`]) — the "which query sets is this row subscribed to"
+/// index that membership routing reads.
 pub struct SharedRow {
     pub key: DataFrameKey,
-    pub data: HashMap<String, Value>,
-    pub subscribers: BTreeSet<SubId>,
+    pub data: DataFrameRow,
+    pub at: RowAt,
+    pub subscribers: BTreeMap<SubId, Hold>,
+}
+
+impl SharedRow {
+    /// The image `sub` holds for this row: its own while it is ahead of
+    /// the frame, the frame's otherwise.
+    pub fn view(&self, sub: SubId) -> &DataFrameRow {
+        match self.subscribers.get(&sub).and_then(|hold| hold.ahead.as_ref()) {
+            Some(image) => image,
+            None => &self.data,
+        }
+    }
+
+    /// Whether `sub` holds this row.
+    pub fn held_by(&self, sub: SubId) -> bool {
+        self.subscribers.contains_key(&sub)
+    }
 }
 
 /// The one shared frame of a table: row identity → row id → shared row.
@@ -126,12 +160,12 @@ impl TableFrame {
         self.rows.get_mut(&id)
     }
 
-    /// The row for `key`, materialized with `data` and no holders if the
-    /// frame did not hold it yet; returns its id and the row.
+    /// The row for `key`, materialized with `data` at `at` and no holders
+    /// if the frame did not hold it yet; returns its id and the row.
     pub fn entry(
         &mut self,
         key: &DataFrameKey,
-        data: impl FnOnce() -> HashMap<String, Value>,
+        data: impl FnOnce() -> (DataFrameRow, RowAt),
     ) -> (RowId, &mut SharedRow) {
         let id = match self.ids.get(key) {
             Some(id) => *id,
@@ -139,12 +173,14 @@ impl TableFrame {
                 let id = RowId(self.next_id);
                 self.next_id += 1;
                 self.ids.insert(key.clone(), id);
+                let (data, at) = data();
                 self.rows.insert(
                     id,
                     SharedRow {
                         key: key.clone(),
-                        data: data(),
-                        subscribers: BTreeSet::new(),
+                        data,
+                        at,
+                        subscribers: BTreeMap::new(),
                     },
                 );
                 id

@@ -10,6 +10,16 @@ license = "Apache-2.0"
 # Default features pull in a timezone database and wasm bindings we do not need.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
-# The server (`src/ws.rs`, and the `server` binary).
+# The server (`src/ws.rs`, and the `server` binary) and the asynchronous
+# sync driver (`src/sync/service.rs`).
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
+
+# The Postgres storage backend and change-stream poller (`src/sync/pg`).
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+# The replication-protocol connection that mints exported snapshots
+# (`src/sync/pg/replication.rs`): tokio-postgres cannot open one, so the
+# startup, authentication and simple-query messages are spoken directly.
+postgres-protocol = "0.6"
+fallible-iterator = "0.2"
+bytes = "1"

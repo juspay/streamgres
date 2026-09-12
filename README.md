@@ -49,11 +49,13 @@ the number that **actually match**, and then patches only the affected views.
 | In-place condition edits: a literal `IN` swapped inside its disjuncts, or a set-valued `IN` (`Value::Set`) gaining/losing one member in O(1) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
 | Join tree: `LEFT` and `RIGHT` edges at any depth, set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns | ✅ done | `src/ivm/multi.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
-| In-memory storage double honoring `ORDER BY` + `LIMIT`; commit-first test harness | ✅ done | `src/ivm/storage.rs` |
+| Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; a read lands the moment it returns, its result first brought up to the engine, every landed row stamped with the read so the writes it already saw are recognized when they arrive; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
+| In-memory storage answering at once, honoring `ORDER BY` + `LIMIT`; commit-first test harness | ✅ done | `src/sync/storage.rs` |
+| **PostgreSQL**: positioned snapshot reads in two methods (WAL: the exported snapshot of a rotating temporary replication slot, exact at its consistent point; XID: `pg_current_snapshot()` transaction ids), a `test_decoding` change-feed poller that positions every write, a minimal replication-protocol connection, live tests and a bench scenario against a real server | ✅ done | `src/sync/pg/` |
 | Routing counters + benchmark harness | ✅ done | `src/ivm/stats.rs`, `src/bin/bench.rs` |
 | `INNER` joins: visibility gate on the driven parent | ⏳ pending | paper §6.5 |
-| **PostgreSQL ingester**: permanent `pgoutput` slot + rotating exported snapshots + per-subscription catch-up | ⏳ pending | paper §7; `PgStorage` is a stub |
 | **WebSocket protocol**: subscribe / unsubscribe / op stream, connection & subscription lifecycle | ⏳ pending | `src/ws.rs` is an axum echo base |
+| Streaming `pgoutput` consumer (the poller consumes the slot by SQL today), batching of one write's narrowed reads | ⏳ pending | paper §7, §13 |
 | Parser `JOIN` syntax | ⏳ pending | multi-table queries are built programmatically |
 | Table-sharded multithreading | ⏳ pending | paper §10.3; engine is single-threaded by design |
 
@@ -185,38 +187,87 @@ through zero. Updates arrive as `MultiTableUpdate { query, table, part, op }`.
 `INNER` edges (a visibility gate on the driven parent) are specified in the
 paper and pending.
 
-### 4. Storage seam (`src/ivm/storage.rs`)
+### 4. Runtime and storage (`src/sync/`)
 
-`trait Storage { fn select(&self, &SingleTableReadQuery) -> Vec<(DataFrameKey, DataFrameRow)> }`.
-`MemoryStorage` implements it for tests (honoring order + limit when the limit
-is finite; writes mirrored via `apply` **before** routing: commit first,
-notify second). `PgStorage` is a stub until the connector lands.
+The engine never reads storage. Where it needs rows it does not hold, it
+records a `Fetch` request (`src/ivm/engine.rs`) and carries on: a
+registration's initial result set, a join edge's newly referenced value, a
+drained window's refill. Until the request lands, the subscription routes
+natively (its filter is indexed, the join leaf already holds the value), a
+windowed subscription publishes no admission boundary, and it donates no twin
+snapshot.
 
-### 5. PostgreSQL ingestion (*designed, pending*)
+`Storage` is asynchronous: `select(query, at_least)` returns the rows of one
+consistent snapshot **and the WAL location it reflects every commit up to**.
+The engine sees nothing but locations (`Lsn`): every write carries its commit
+location, every read its snapshot's, every frame row its image's. How a source
+arrives at a read's location is its own business (below).
 
-- One **permanent logical replication slot** (`pgoutput`) created at service
-  start; its commit-LSN-ordered stream is the engine's write input, buffered in
-  memory keyed by LSN; the highest applied LSN is the watermark.
-- Every ~100 ms a **temporary slot with `SNAPSHOT 'export'`** mints the
-  current *alias* `(snapshot_name, consistent_lsn)`.
-- A new subscription runs its initial `SELECT`s under
-  `SET TRANSACTION SNAPSHOT <alias>` on the server that exported it (a snapshot
-  cannot be imported on another server; on a replica the alias is a replay LSN
-  taken before and after the transaction, retried until equal), registers with
-  those rows, and then the buffered changes with `lsn > consistent_lsn` are
-  replayed to **that subscription alone** (a `catch_up(uuid, write)` entry
-  point, pending). The snapshot and the stream meet at one LSN.
-- Rotation swaps snapshot + LSN atomically under a lock; each alias keeps its
-  replication connection open until the last registration using it finishes
-  (closing it drops the temporary slot); the buffer is trimmed below the oldest
-  alias still in use.
-- Logical decoding delivers new images for inserts/updates and the key for
-  deletes; with `REPLICA IDENTITY FULL` the ingester completes an update's
-  unchanged TOASTed columns from the old tuple, giving exactly the engine's
-  write model. See
-  [`docs/pg-lsn-cdc-lab.md`](docs/pg-lsn-cdc-lab.md) for the hands-on lab that
-  established these facts (exported snapshots, xid vs commit order, the
-  replica `L1 = L2` sandwich).
+`Runtime` is the single owner of an engine and pure state (no I/O, no clock):
+it hands the engine's requests to a driver, remembers the writes routed while
+reads are out, and lands each result **the moment it returns**. If the engine
+is ahead of the snapshot, the result is first brought up to the engine: a row
+that a delivered write the snapshot does not reflect deleted or moved out of
+the read's filter is dropped, one it rewrote takes the newer image. If the
+snapshot is ahead of the feed, the frame absorbs the difference by currency:
+every frame row remembers how current its image is (`RowAt`: the write that
+produced it, or the read it landed from) and, per holder, the location of the
+image that holder has (`Hold`). A landing inserts rows the frame
+lacks stamped with the read and serves only the query that asked; for a row
+the frame already holds, the reader gets the newer of the frame's image and
+the read's, and when that is the read's it goes *ahead of the frame* on that
+row (its `Hold` keeps the read's location and image) while the other
+holders keep the frame's image and hear about the write when it arrives. That
+write then leaves the reader alone; the first write past the reader's snapshot
+ends its lead, its `Delete` carrying the image the reader actually held. When
+a write arrives that the frame row itself already reflects, image and holders
+are left alone and only the queries the frame's image newly matches are
+tagged. No read ever waits for the feed and nothing stalls the stream. Two drivers share the runtime: `Local` (a storage that answers at
+once, every read landed before the call returns; what the tests, demo and
+bench use) and `Service` (a tokio command loop on one `LocalSet`, one task per
+read). Each read is passed the stream position the runtime has seen, which the
+WAL method uses to mint a fresh alias when the current one is older.
+
+### 5. PostgreSQL (`src/sync/pg/`)
+
+- `PgStorage::connect(dsn, catalog, mode)` runs each read in its own read-only
+  `REPEATABLE READ` transaction, positioned by one of two methods.
+  **WAL** (`SnapshotMode::Wal`): a background task mints an *alias* every
+  250 ms (configurable), and on demand when a read finds it older than the
+  engine's position, by opening a replication-protocol connection
+  (`replication.rs`; tokio-postgres cannot) and creating a temporary logical
+  slot with `EXPORT_SNAPSHOT`, which returns a snapshot name and the
+  consistent point it was built at, exactly paired by Postgres. Each read's
+  first statement is `SET TRANSACTION SNAPSHOT '<alias>'` and its location is
+  the alias's consistent point; an alias lives as long as its connection,
+  held until the last read that adopted it finishes. **XID**
+  (`SnapshotMode::Xid(ledger)`): no temporary slot and no location asked of
+  Postgres; the first statement returns `pg_current_snapshot()`
+  (`xmin:xmax:xip`), and that account is converted through the `XidLedger`
+  (`ledger.rs`) the poller fills with every delivered transaction's id and
+  commit location: the read's location is just below the earliest delivered
+  transaction the snapshot does not see, or the newest delivered location
+  when it sees them all. Queries are rendered from the model with the
+  catalog's types cast on the way out (`sql.rs`), every leaf wrapped in
+  `IS TRUE` so `NULL` semantics match the engine's. One connection per read
+  in flight, pooled.
+- `PgStream::open(dsn, slot, catalog, ledger)` polls a `test_decoding` logical
+  replication slot (`pg_logical_slot_get_changes`), turns each committed change
+  into a full-image insert/update or a key-only delete positioned at its
+  transaction's commit location, records every transaction in the ledger when
+  one is attached, and ends every batch with a progress mark (the flush
+  location read before consuming). A primary-key change becomes delete +
+  insert; tables with large TOASTed columns need `REPLICA IDENTITY FULL`.
+  `PgStream::run` feeds a `Service`'s command channel.
+- Both methods are exact. The WAL method needs `max_replication_slots` and
+  `max_wal_senders` headroom for the live aliases (two per storage instance at
+  a rotation boundary) and delays a mint while a long transaction is open (the
+  reads keep the current alias). The XID method needs neither, but positions
+  a read no further than the feed has delivered.
+- Live scenarios (`tests/pg_live.rs`) hold a snapshot open while writes commit
+  behind it, in both modes, and run the async service end to end; they need
+  `JUS_SYNC_PG_DSN` pointing at a database with `wal_level = logical` and
+  otherwise report themselves skipped.
 
 ### 6. WebSocket API (*base only, pending*)
 
@@ -240,9 +291,14 @@ tables, reconnect/catch-up, and back-pressure are part of this work item.
 
 ```bash
 cargo run --bin jus_sync      # scripted demo: SQL in, routed operations + cost counters out
-cargo test                    # model, parser, routing, window and join scenarios
+cargo test                    # model, parser, routing, window, join and read/write interleaving scenarios
 cargo run --release --bin bench   # routing / registration / window / join benchmarks
 cargo run --bin server        # the WebSocket base (echo) on 127.0.0.1:8080
+
+# against a real Postgres (wal_level = logical, a free replication slot):
+export JUS_SYNC_PG_DSN=postgresql://postgres@localhost:5499/jus_sync
+cargo test --test pg_live     # snapshot held open while writes commit behind it; async service end to end
+cargo run --release --bin bench   # adds scenario 5: registration, streamed writes, registration under load
 ```
 
 The demo registers six subscriptions on a `tickets` table and plays an
@@ -271,9 +327,11 @@ yardstick for every optimization: change the strategy, rerun, compare.
 
 `cargo run --release --bin bench` on an Apple M4 Max (rustc 1.89, release,
 one thread; scenarios 2 to 4 use a bench-local in-memory storage double,
-scenario 1 registers against the empty `PgStorage` stub so frames fill from
-writes alone; raw output in
-[paper/bench-2026-09-11.txt](paper/bench-2026-09-11.txt), analysis in paper §9):
+scenario 1 registers against an empty store so frames fill from writes alone,
+scenario 5 runs against PostgreSQL 15 on the same machine; raw output in
+[paper/bench-2026-09-11.txt](paper/bench-2026-09-11.txt) and
+[paper/bench-2026-09-12-row-currency.txt](paper/bench-2026-09-12-row-currency.txt),
+analysis in paper §9):
 
 | Scenario | Result |
 | --- | --- |
@@ -282,30 +340,36 @@ writes alone; raw output in
 | Twin registration (400-row snapshot) | 752 µs from the shared frame vs 1 844 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
 | Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.5 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~100 ms across 10 000 writes) |
 | `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | identical subscriptions share one tree, so a ticket insert costs 62 µs for all 1 000 (7.4 ms before the shared set-valued edge), with 1.8 set edits per write instead of 52.5; the remaining cost is delivery, ≈ 0.3 to 0.4 µs per operation per subscriber |
+| Over PostgreSQL (`LEFT JOIN`, 1 000 users, 2 000 tickets), WAL and XID methods (run taken in the machine's slower state, about 1.5× the rows above) | a registration costs its two reads and their landing and nothing else, 4.0 / 3.7 ms end to end (2.5 / 2.4 ms in storage, 1.2 ms in the runtime); 5 000 inserts committed in transactions of 100 stream at ≈ 7 000 writes/s from commit to delivery, split between the engine (43 µs per write for 1 001 subscribers) and 339 sequential narrowed reads (one per newly referenced user, ≈ 1 ms each), with polling and decoding at 16 ms in total; a registration whose snapshot is held open for 300 ms while 541 writes commit and are delivered behind it lands at once with 41 of its 148 rows brought up to the newer image, none dropped, and frames equal to the tables |
 
 ### Using the engine programmatically
 
 ```rust
 use std::rc::Rc;
-use jus_sync::ivm::{MemoryStorage, SingleTableIVM, Storage};
+use jus_sync::ivm::SingleTableIVM;
 use jus_sync::model::*;
 use jus_sync::parser::{parse_read, parse_write, Catalog};
+use jus_sync::sync::{Local, MemoryStorage};
 
 let catalog = Catalog::new(vec![DbTable::new("tickets", ["id"], vec![
     DbColumn::new("id", ValueType::Int),
     DbColumn::new("status", ValueType::String),
 ])]);
 let storage = Rc::new(MemoryStorage::new());
-let mut ivm = SingleTableIVM::new(storage.clone() as Rc<dyn Storage>);
+let mut ivm = Local::new(SingleTableIVM::new(), storage.clone());   // the synchronous driver
 
 let query = parse_read("SELECT * FROM tickets WHERE status = 'OPEN'", &catalog).unwrap();
-let (q_open, snapshot) = ivm.register_query(query);          // (SubId, Vec<DataFrameOperation>)
+let (q_open, snapshot) = ivm.register_query(query);          // (SubId, Vec<SingleTableUpdate>), read landed inline
 
 let write = parse_write("INSERT INTO tickets (id, status) VALUES (1, 'OPEN')", &catalog).unwrap();
 storage.apply(&write);                                       // commit first …
 let updates = ivm.incremental_update(&write);                // … notify second
 // updates: Vec<SingleTableUpdate { query: SubId, table, op }>; q_open names ours
 ```
+
+Against Postgres, build a `Service` over `MultiTableIVM` and a `PgStorage`,
+run it on a `tokio::task::LocalSet`, and let `PgStream::run` feed its command
+channel; `tests/pg_live.rs` does exactly that.
 
 ---
 
@@ -347,7 +411,9 @@ silently narrowed:
 Cargo.toml
 paper/
   xyne-sync.tex / .pdf     the design paper (algorithms, join tree, ingestion, evaluation)
-  bench-2026-09-11.txt     raw output of the benchmark run reported in the paper
+  bench-2026-09-11.txt     raw output of the benchmark run reported in the paper (scenarios 1 to 4)
+  bench-2026-09-12-row-currency.txt      the run with the Postgres scenario (5)
+  bench-2026-09-11-async-storage.txt     the earlier Postgres run, before reads landed at once
   bench-2026-09-07-before-frontier.txt   the run before the window frontier fix
   bench-2026-09-08-list-edges.txt        the run before join edges became shared sets
 docs/
@@ -360,16 +426,28 @@ src/
     schema.rs              Catalog / DbTable / DbColumn, TableName + ColumnName newtypes
     query.rs               SingleTableReadQuery / WriteQuery, Where / Condition, SubId, QueryId
     frame.rs               DataFrameKey / DataFrameRow / DataFrameOperation + the shared TableFrame
+    position.rs            Lsn, Snapshot, RowAt: where writes, reads and frame rows sit, as WAL locations
   ivm/
     mod.rs                 SingleTableIVM: the routing core (analyze + incremental_update)
+    engine.rs              Fetch requests and the Engine trait the runtime drives
     registry.rs            subscription lifecycle: register/unregister/replace, twin sharing
-    frames.rs              frame surgery + inspection: fetch/upsert/remove rows, rows_for
+    frames.rs              frame surgery + inspection: issue/land reads, adopt/upsert/remove rows, rows_for
     index.rs               TableIndex: shared DNF disjunct counters, boundaries, in-place edits
+    columns.rs             per-column value index: equality, inequality and range lookups
     window.rs              ORDER BY / LIMIT: doubled buffer, boundary publishing, evict/refill
     multi.rs               MultiTableIVM: the join tree (LEFT / RIGHT edges) over the single engine
-    storage.rs             Storage seam: PgStorage stub + MemoryStorage
     predicate.rs           Where-tree evaluation, NULL semantics
     stats.rs               IvmStats counters + per-write diffing
+  sync/
+    storage.rs             the async Storage trait + MemoryStorage
+    runtime.rs             Runtime: the single owner, bringing results up to the engine, SyncStats
+    local.rs               Local: the synchronous driver
+    service.rs             Service: the async command loop (tokio LocalSet)
+    pg/mod.rs              PgStorage: positioned REPEATABLE READ snapshots, WAL (exported snapshot alias) or XID method
+    pg/ledger.rs           XidLedger: delivered transactions' ids and commit locations, the XID method's converter
+    pg/replication.rs      a minimal replication-protocol connection (mints the aliases)
+    pg/sql.rs              model to SQL rendering
+    pg/stream.rs           PgStream: test_decoding poller, positioned writes, progress marks
   parser/
     mod.rs                 lexer + recursive-descent parser, schema-aware against model::Catalog
   ws.rs                    axum setup: routes, WebSocket upgrade, connection loop (echo)
@@ -378,7 +456,9 @@ src/
     bench.rs               benchmark harness
 tests/
   ivm_scenarios.rs         single-table routing, windows, twin sharing (assertable spec)
-  multi_table_scenarios.rs left-join reference/fetch/prune, self-join, sub-limit scenarios
+  multi_table_scenarios.rs join reference/fetch/prune, self-join, nested and RIGHT edges
+  sync_interleaving.rs     reads out while writes stream: merge, row currency, xid vs lsn, refill, post-order
+  pg_live.rs               live Postgres: snapshot held open behind writes (both modes), async service
 ```
 
 ---
