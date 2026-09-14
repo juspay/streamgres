@@ -17,28 +17,21 @@ use crate::model::{ClientId, DataFrameKey, DataFrameRow, SingleTableReadQuery, S
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FetchId(pub u64);
 
-/// Why a read was asked for.
+/// Why a read was asked for. Every kind runs the same way, in the
+/// background while writes keep flowing; the subscription routes natively
+/// meanwhile and the runtime brings the result up to the engine before it
+/// lands.
 ///
-/// - `Snapshot`: a registration's initial result set; run in the
-///   background while writes keep flowing.
+/// - `Snapshot`: a registration's initial result set.
 /// - `Narrowed`: the subscription's filter narrowed to one join value a
-///   driving edge started referencing; run before the next write.
+///   driving edge started referencing.
 /// - `Refill`: a window drained to its limit, read again from its
-///   frontier; run before the next write.
+///   frontier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchKind {
     Snapshot,
     Narrowed,
     Refill,
-}
-
-impl FetchKind {
-    /// Whether the driver must finish this read before routing anything
-    /// else: a read asked for in the middle of maintaining a subscription
-    /// (a join crossing, a refill) lands before the next write.
-    pub fn is_blocking(self) -> bool {
-        !matches!(self, FetchKind::Snapshot)
-    }
 }
 
 /// One storage read an engine wants run on its behalf.

@@ -11,17 +11,21 @@
 //!   [`ColumnIndex::unfile_key`] following the set one member at a time). Keys fold in the numeric
 //!   coercion of [`Value::loose_eq`] (an integral float files as the
 //!   integer), so `Int(5)` finds `= 5.0`.
-//! - **Inequality** (`<>`, `NOT IN`): the mirror map records where each
-//!   condition *fails*; the matches for a value are every inequality on
-//!   the column except those filed under it. A `NOT IN` whose list holds
-//!   `NULL` is never true and is never filed.
+//! - **Inequality** (`<>`, `NOT IN`, `IS NOT NULL`): the mirror map records
+//!   where each condition *fails*; the matches for a value are every
+//!   inequality on the column except those filed under it. A `NOT IN`
+//!   whose list holds `NULL` is never true and is never filed. `IS NOT
+//!   NULL` fails only at `NULL`, so it is filed under the `NULL` key and
+//!   matched by every other value.
+//! - **Null** (`IS NULL`): filed under the `NULL` key of the equality map,
+//!   a key no `=` or `IN` ever files under; a written `NULL` yields that
+//!   key and nothing else, since every comparison is false for it.
 //! - **Ranges** (`>`, `>=`, `<`, `<=`): ordered maps from threshold to
 //!   conditions, one per comparison class (numeric, string, bool, date,
 //!   datetime) so incomparable types never fall inside a range; the
 //!   matches for a value are one ordered-map range scan, with the strict
 //!   operators dropped at a tying threshold.
 //!
-//! A `NULL` written value matches nothing, as in [`super::predicate`], and
 //! `NaN` matches only what equality semantics say it does (`= NaN`, and
 //! every inequality). Each condition sits in one family under keys a
 //! single value hits at most once, so a probe yields every condition at
@@ -100,7 +104,8 @@ pub(super) struct ColumnIndex {
 impl ColumnIndex {
     /// File one condition under every key it can match at; a condition
     /// that can never be true (`= NULL`, `NOT IN` with a `NULL`, a
-    /// threshold nothing compares with) is filed nowhere.
+    /// threshold nothing compares with, `IS` with a non-`NULL` operand) is
+    /// filed nowhere.
     pub(super) fn file(&mut self, condition: &CondRef) {
         use ComparisonOperator::*;
         let value = &condition.0.value;
@@ -108,6 +113,23 @@ impl ColumnIndex {
             EQ => {
                 if let Some(key) = value.equality_key() {
                     self.equal.entry(key).or_default().insert(condition.clone());
+                }
+            }
+            IS => {
+                if value.is_null() {
+                    self.equal
+                        .entry(Value::Null)
+                        .or_default()
+                        .insert(condition.clone());
+                }
+            }
+            IS_NOT => {
+                if value.is_null() {
+                    self.unequal
+                        .entry(Value::Null)
+                        .or_default()
+                        .insert(condition.clone());
+                    self.unequal_all.insert(condition.clone());
                 }
             }
             IN => {
@@ -164,6 +186,11 @@ impl ColumnIndex {
         let value = &condition.0.value;
         match condition.0.comparison_operator {
             EQ => remove_under(&mut self.equal, value.equality_key(), condition),
+            IS => remove_under(&mut self.equal, Some(Value::Null), condition),
+            IS_NOT => {
+                remove_under(&mut self.unequal, Some(Value::Null), condition);
+                self.unequal_all.remove(condition);
+            }
             IN => {
                 for key in member_keys(value) {
                     remove_under(&mut self.equal, Some(key), condition);
@@ -205,9 +232,16 @@ impl ColumnIndex {
             && self.below.is_empty()
     }
 
-    /// Append the conditions a written value satisfies to `out`.
+    /// Append the conditions a written value satisfies to `out`: for a
+    /// `NULL`, the null tests alone.
     pub(super) fn candidates(&self, value: &Value, out: &mut Vec<CondRef>) {
         use ComparisonOperator::*;
+        if value.is_null() {
+            if let Some(matching) = self.equal.get(&Value::Null) {
+                out.extend(matching.iter().cloned());
+            }
+            return;
+        }
         let Some(key) = value.equality_key() else {
             return;
         };

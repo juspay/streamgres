@@ -569,29 +569,25 @@ fn get_workspace_by_id() {
     );
 }
 
-/// `workspaceOrganizations`: a workspace's current organisation links
-/// with the organisation. Gap N: `leftAt IS NULL` cannot be stated, so
-/// the left link `wo2` is delivered too.
+/// `workspaceOrganizations`: a workspace's current (`leftAt IS NULL`)
+/// organisation links with the organisation; leaving one drops it with
+/// its organisation.
 #[test]
 fn workspace_organizations() {
     let mut w = World::new();
     seed_orgs(&mut w);
     let q = zql("workspace_organizations")
         .eq("workspaceId", WS)
+        .where_is_null("leftAt")
         .related("organization", same)
         .order_by("createdAt", DESC);
     assert_eq!(
         w.subscribe("q", &q),
-        ops([
-            "q/main+wo1",
-            "q/main+wo2",
-            "q/organization+org1",
-            "q/organization+org3"
-        ])
+        ops(["q/main+wo1", "q/organization+org1"])
     );
     assert_eq!(
-        w.delete("workspace_organizations", "wo2"),
-        ops(["q/main-wo2", "q/organization-org3"])
+        w.update("workspace_organizations", row!["id" => "wo1", "workspaceId" => WS, "orgId" => "org1", "role" => "OWNER", "createdAt" => 1, "leftAt" => 7]),
+        ops(["q/main-wo1", "q/organization-org1"])
     );
 }
 
@@ -613,18 +609,21 @@ fn available_organizations() {
     );
 }
 
-/// `getOrgMembers`: an organisation's members by join date. Gap N:
-/// `leftAt IS NULL` cannot be stated, so the departed member is delivered
-/// too.
+/// `getOrgMembers`: an organisation's current members by join date; a
+/// departed member rejoins when `leftAt` is cleared.
 #[test]
 fn get_org_members() {
     let mut w = World::new();
     seed_orgs(&mut w);
     let q = zql("org_members")
         .eq("orgId", "org1")
+        .where_is_null("leftAt")
         .order_by("joinedAt", ASC);
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+om1", "q/main+om2"]));
-    assert_eq!(w.delete("org_members", "om2"), ops(["q/main-om2"]));
+    assert_eq!(w.subscribe("q", &q), ops(["q/main+om1"]));
+    assert_eq!(
+        w.update("org_members", row!["memberId" => "om2", "orgId" => "org1", "userId" => "u-2", "email" => "m@j", "role" => "MEMBER", "joinedAt" => 2]),
+        ops(["q/main+om2"])
+    );
 }
 
 /// `getOrgMemberById`: one membership.

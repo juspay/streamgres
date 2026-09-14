@@ -236,9 +236,15 @@ impl Disjunct {
     }
 }
 
-/// The comparison operator of a leaf [`Condition`]: equality, ordering, and
-/// set-membership tests. Negation lives here (`NEQ`, `NOT_IN`) — the
-/// [`Where`] tree has no `NOT` node.
+/// The comparison operator of a leaf [`Condition`]: equality, ordering,
+/// set-membership and null tests. Negation lives here (`NEQ`, `NOT_IN`,
+/// `IS_NOT`) — the [`Where`] tree has no `NOT` node.
+///
+/// `IS` and `IS_NOT` are SQL's `IS [NOT] NULL`: the operand must be
+/// `Null` (the parser accepts nothing else after `IS`); with any other
+/// operand the condition follows the convention of `= NULL` and is simply
+/// never true. `IS` holds for a `NULL` or absent column, `IS_NOT` for a
+/// present, non-`NULL` one.
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ComparisonOperator {
@@ -250,6 +256,8 @@ pub enum ComparisonOperator {
     LTE,
     IN,
     NOT_IN,
+    IS,
+    IS_NOT,
 }
 
 /// `ORDER BY column ASC|DESC`.
@@ -290,6 +298,16 @@ impl Where {
         value: impl Into<Value>,
     ) -> Self {
         Where::Condition(Condition::new(column, op, value))
+    }
+
+    /// `column IS NULL`.
+    pub fn is_null(column: impl Into<ColumnName>) -> Self {
+        Where::condition(column, ComparisonOperator::IS, Value::Null)
+    }
+
+    /// `column IS NOT NULL`.
+    pub fn is_not_null(column: impl Into<ColumnName>) -> Self {
+        Where::condition(column, ComparisonOperator::IS_NOT, Value::Null)
     }
 
     /// All leaf [`Condition`]s of the tree, in depth-first order — the raw

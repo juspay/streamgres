@@ -107,16 +107,17 @@ fn with_my_status(query: Q) -> Q {
 }
 
 /// `personalCanvasFolders`: the caller's folders outside any project or
-/// channel. Gap N: the two `IS NULL` tests cannot be stated, so the
-/// caller's project-in-channel folder is delivered too.
+/// channel (both `IS NULL`).
 #[test]
 fn personal_canvas_folders() {
     let mut w = World::new();
     seed_canvases(&mut w);
     let q = zql("canvas_folders")
+        .where_is_null("projectId")
+        .where_is_null("channelId")
         .eq("createdBy", ME)
         .order_by("name", ASC);
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+cf-p", "q/main+cf-pj2"]));
+    assert_eq!(w.subscribe("q", &q), ops(["q/main+cf-p"]));
     assert_eq!(
         w.insert(
             "canvas_folders",
@@ -127,9 +128,8 @@ fn personal_canvas_folders() {
 }
 
 /// `hierarchyCanvases` at a channel's root: live canvases of the channel
-/// the caller may see, with the caller's status. Gap N: `folderId IS
-/// NULL` cannot be stated, so the foldered `k2` is delivered; gap X for
-/// the participant branch.
+/// the caller may see (`folderId IS NULL`), with the caller's status;
+/// gap X for the participant branch.
 #[test]
 fn hierarchy_canvases() {
     let mut w = World::new();
@@ -139,14 +139,15 @@ fn hierarchy_canvases() {
             zql("canvases")
                 .eq("channelId", "c1")
                 .eq("docType", "Canvas")
-                .eq("isArchived", false),
+                .eq("isArchived", false)
+                .where_is_null("folderId"),
             true,
         )
         .order_by("updatedAt", DESC),
     );
     assert_eq!(
         w.subscribe("q", &q),
-        ops(["q/main+k1", "q/main+k2", "q/userStatuses+ks1"])
+        ops(["q/main+k1", "q/userStatuses+ks1"])
     );
     assert_eq!(
         w.update("canvases", &with(&k7(), row!["visibility" => "PUBLIC"])),
@@ -166,21 +167,21 @@ fn channel_canvas_folders() {
     assert_eq!(w.delete("canvas_folders", "cf-c"), ops(["q/main-cf-c"]));
 }
 
-/// `projectCanvasFolders`: a project's folders outside channels. Gap N:
-/// `channelId IS NULL` cannot be stated, so the project-in-channel folder
-/// is delivered too.
+/// `projectCanvasFolders`: a project's folders outside channels
+/// (`channelId IS NULL`).
 #[test]
 fn project_canvas_folders() {
     let mut w = World::new();
     seed_canvases(&mut w);
     let q = zql("canvas_folders")
         .eq("projectId", "p1")
+        .where_is_null("channelId")
         .order_by("name", ASC);
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+cf-pj", "q/main+cf-pj2"]));
+    assert_eq!(w.subscribe("q", &q), ops(["q/main+cf-pj"]));
 }
 
-/// `projectFolderCanvases`: live canvases of a project folder the caller
-/// may see. Gap N drops `channelId IS NULL`; gap X the participant branch.
+/// `projectFolderCanvases`: live canvases of a project folder outside
+/// channels the caller may see; gap X drops the participant branch.
 #[test]
 fn project_folder_canvases() {
     let mut w = World::new();
@@ -190,6 +191,7 @@ fn project_folder_canvases() {
             zql("canvases")
                 .eq("folderId", "cf-pj")
                 .eq("projectId", "p1")
+                .where_is_null("channelId")
                 .eq("docType", "Canvas")
                 .eq("isArchived", false),
             true,
@@ -483,29 +485,26 @@ fn seed_collections(w: &mut World) {
     );
 }
 
-/// `collectionSubfolders`: the live folders under a root. Gap N: `parentId
-/// IS NOT NULL` and `deletedAt IS NULL` cannot be stated, so the root
-/// itself is delivered.
+/// `collectionSubfolders`: the live folders under a root (`parentId IS
+/// NOT NULL`, `deletedAt IS NULL`), the root itself excluded.
 #[test]
 fn collection_subfolders() {
     let mut w = World::new();
     seed_collections(&mut w);
     let q = zql("collections")
         .eq("rootCollectionId", "col-root")
+        .where_is_not_null("parentId")
+        .where_is_null("deletedAt")
         .order_by("createdAt", ASC);
-    assert_eq!(
-        w.subscribe("q", &q),
-        ops(["q/main+col-root", "q/main+col-sub"])
-    );
+    assert_eq!(w.subscribe("q", &q), ops(["q/main+col-sub"]));
     assert_eq!(
         w.insert("collections", row!["id" => "col-sub2", "parentId" => "col-root", "rootCollectionId" => "col-root", "name" => "Specs", "createdAt" => 6]),
         ops(["q/main+col-sub2"])
     );
 }
 
-/// `collectionItems`: a folder's latest live files with their live
-/// collection attachment. Gap N: `deletedAt IS NULL` cannot be stated, so
-/// the deleted `ci4` is delivered.
+/// `collectionItems`: a folder's latest live files (`deletedAt IS NULL`)
+/// with their live collection attachment.
 #[test]
 fn collection_items() {
     let mut w = World::new();
@@ -513,13 +512,14 @@ fn collection_items() {
     let q = zql("collection_items")
         .eq("collectionId", "col-root")
         .eq("isLatest", true)
+        .where_is_null("deletedAt")
         .order_by("createdAt", ASC)
         .related("attachment", |a| {
             a.eq("entityType", "COLLECTION").eq("isDeleted", false)
         });
     assert_eq!(
         w.subscribe("q", &q),
-        ops(["q/main+ci1", "q/main+ci4", "q/attachment+ca1"])
+        ops(["q/main+ci1", "q/attachment+ca1"])
     );
     assert_eq!(
         w.update("collection_items", row!["id" => "ci3", "collectionId" => "col-root", "rootCollectionId" => "col-root", "isLatest" => true, "name" => "a-old.pdf", "createdAt" => 3]),
@@ -527,8 +527,8 @@ fn collection_items() {
     );
 }
 
-/// `collectionFilesByRoot`: every latest file across a whole collection
-/// with its live attachment. Gap N as above.
+/// `collectionFilesByRoot`: every latest live file across a whole
+/// collection with its live attachment.
 #[test]
 fn collection_files_by_root() {
     let mut w = World::new();
@@ -536,11 +536,12 @@ fn collection_files_by_root() {
     let q = zql("collection_items")
         .eq("rootCollectionId", "col-root")
         .eq("isLatest", true)
+        .where_is_null("deletedAt")
         .order_by("createdAt", ASC)
         .related("attachment", |a| a.eq("isDeleted", false));
     assert_eq!(
         w.subscribe("q", &q),
-        ops(["q/main+ci1", "q/main+ci2", "q/main+ci4", "q/attachment+ca1"])
+        ops(["q/main+ci1", "q/main+ci2", "q/attachment+ca1"])
     );
     assert_eq!(
         w.update("message_attachments", row!["id" => "ca2", "entityId" => "ci2", "entityType" => "COLLECTION", "isDeleted" => false]),
@@ -548,27 +549,36 @@ fn collection_files_by_root() {
     );
 }
 
-/// `collectionById`: one live collection. Gap N: `deletedAt IS NULL`
-/// cannot be stated, so a deleted collection resolves too.
+/// `collectionById`: one live collection; a deleted one resolves to
+/// nothing.
 #[test]
 fn collection_by_id() {
     let mut w = World::new();
     seed_collections(&mut w);
     assert_eq!(
-        w.subscribe("q", &zql("collections").eq("id", "col-root")),
+        w.subscribe(
+            "q",
+            &zql("collections")
+                .eq("id", "col-root")
+                .where_is_null("deletedAt")
+        ),
         ops(["q/main+col-root"])
     );
     assert_eq!(
-        w.subscribe("gone", &zql("collections").eq("id", "col-del")),
-        ops(["gone/main+col-del"])
+        w.subscribe(
+            "gone",
+            &zql("collections")
+                .eq("id", "col-del")
+                .where_is_null("deletedAt")
+        ),
+        ops([])
     );
 }
 
-/// `scopedCollections` for a channel: root collections with the caller's
-/// permission rows. Gap N: `parentId IS NULL` and `deletedAt IS NULL`
-/// cannot be stated, so the subfolder is delivered; gap X: group and
-/// channel grants are existence tests inside the permission filter's
-/// `OR`.
+/// `scopedCollections` for a channel: live root collections (`parentId
+/// IS NULL`, `deletedAt IS NULL`) with the caller's permission rows; gap
+/// X: group and channel grants are existence tests inside the permission
+/// filter's `OR`.
 #[test]
 fn scoped_collections() {
     let mut w = World::new();
@@ -576,16 +586,13 @@ fn scoped_collections() {
     let q = zql("collections")
         .eq("scopeType", "CHANNEL")
         .eq("scopeId", "c1")
+        .where_is_null("parentId")
+        .where_is_null("deletedAt")
         .related("permissions", |p| p.eq("userId", ME))
         .order_by("createdAt", ASC);
     assert_eq!(
         w.subscribe("q", &q),
-        ops([
-            "q/main+col-root",
-            "q/main+col-sub",
-            "q/main+col-del",
-            "q/permissions+cpm1"
-        ])
+        ops(["q/main+col-root", "q/permissions+cpm1"])
     );
     assert_eq!(
         w.delete("collection_permissions", "cpm1"),
@@ -602,6 +609,8 @@ fn scoped_collections_with_items() {
     let q = zql("collections")
         .eq("scopeType", "CHANNEL")
         .eq("scopeId", "c1")
+        .where_is_null("parentId")
+        .where_is_null("deletedAt")
         .related("permissions", |p| p.eq("userId", ME))
         .related("allItems", |i| i.eq("isLatest", true))
         .order_by("createdAt", ASC);
@@ -609,15 +618,13 @@ fn scoped_collections_with_items() {
         w.subscribe("q", &q),
         ops([
             "q/main+col-root",
-            "q/main+col-sub",
-            "q/main+col-del",
             "q/permissions+cpm1",
             "q/allItems+ci1",
-            "q/allItems+ci2",
-            "q/allItems+ci4"
+            "q/allItems+ci4",
+            "q/allItems+ci2"
         ])
     );
-    assert_eq!(w.delete("collection_items", "ci2"), ops(["q/allItems-ci2"]));
+    assert_eq!(w.delete("collection_items", "ci4"), ops(["q/allItems-ci4"]));
 }
 
 /// `collectionPermissions`: every grant on a collection with the user,

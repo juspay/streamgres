@@ -536,7 +536,9 @@ fn key_of(row: &DataFrameRow, table: &DbTable) -> DataFrameKey {
 }
 
 /// A decoded tuple as a row image of `table`: each value converted by the
-/// column's declared type, columns the catalog does not declare skipped.
+/// column's declared type, columns the catalog does not declare skipped,
+/// declared columns the relation lacks `NULL`, so every image carries
+/// every column.
 fn image(
     table: &DbTable,
     columns: &[ColumnName],
@@ -557,6 +559,9 @@ fn image(
             }
         };
         data.insert(declared.name.clone(), value);
+    }
+    for name in table.columns.keys() {
+        data.entry(name.clone()).or_insert(Value::Null);
     }
     Ok(DataFrameRow { data })
 }

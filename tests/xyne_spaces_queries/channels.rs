@@ -7,7 +7,7 @@ use jus_sync::model::Order::{ASC, DESC};
 use jus_sync::model::Value;
 
 use super::world::{ME, World, ops, with};
-use super::zql::{eq, or, same, zql};
+use super::zql::{eq, is_null, or, same, zql};
 
 /// A full row image from its distinguishing columns.
 type Row = Vec<(&'static str, Value)>;
@@ -702,20 +702,28 @@ fn get_sdlc_tracks() {
     );
 }
 
-/// `getSdlcRepoById`: a repo with a project. Gap N: `projectId IS NOT
-/// NULL` cannot be stated; the orphan repo is simply not asked for here.
+/// `getSdlcRepoById`: a repo with a project (`projectId IS NOT NULL`);
+/// an orphan repo resolves to nothing.
 #[test]
 fn get_sdlc_repo_by_id() {
     let mut w = World::new();
     seed_sdlc(&mut w);
-    let q = zql("repos").eq("id", "r1").related("project", same).one();
+    let q = zql("repos")
+        .eq("id", "r1")
+        .where_is_not_null("projectId")
+        .related("project", same)
+        .one();
     assert_eq!(w.subscribe("q", &q), ops(["q/main+r1", "q/project+p1"]));
     assert_eq!(
         w.subscribe(
             "orphan",
-            &zql("repos").eq("id", "r2").related("project", same).one()
+            &zql("repos")
+                .eq("id", "r2")
+                .where_is_not_null("projectId")
+                .related("project", same)
+                .one()
         ),
-        ops(["orphan/main+r2"])
+        ops([])
     );
 }
 
@@ -761,8 +769,8 @@ fn get_all_repos() {
 
 /// `sdlcDiscussionConversations`: a hub's discussion threads from an id
 /// list, with opener attachments and nudge counts and the caller's
-/// participation. Gap N: `doNotPostToChannel IS NULL OR = false` keeps
-/// only its second half, so a thread with the flag unset is left out.
+/// participation; `doNotPostToChannel IS NULL OR = false` admits a thread
+/// with the flag unset, and setting the flag removes it.
 #[test]
 fn sdlc_discussion_conversations() {
     let mut w = World::new();
@@ -781,7 +789,10 @@ fn sdlc_discussion_conversations() {
     let q = zql("conversations")
         .eq("channelId", "c-sdlc")
         .in_("conversationId", &["sv1", "sv2"])
-        .eq("doNotPostToChannel", false)
+        .filter(or(vec![
+            is_null("doNotPostToChannel"),
+            eq("doNotPostToChannel", false),
+        ]))
         .related("initialMessageAttachments", same)
         .related("initialMessageNudgeCounts", |n| {
             n.filter(or(vec![eq("userId", ME), eq("channelId", "c-sdlc")]))
@@ -795,14 +806,15 @@ fn sdlc_discussion_conversations() {
         w.subscribe("q", &q),
         ops([
             "q/main+sv1",
+            "q/main+sv2",
             "q/initialMessageAttachments+sa1",
             "q/initialMessageNudgeCounts+snc1",
             "q/participants+spp1"
         ])
     );
     assert_eq!(
-        w.update("conversations", row!["conversationId" => "sv2", "channelId" => "c-sdlc", "initialMessageId" => "sm2", "doNotPostToChannel" => false, "lastActivityAt" => 20]),
-        ops(["q/main+sv2"])
+        w.update("conversations", row!["conversationId" => "sv2", "channelId" => "c-sdlc", "initialMessageId" => "sm2", "doNotPostToChannel" => true, "lastActivityAt" => 20]),
+        ops(["q/main-sv2"])
     );
 }
 

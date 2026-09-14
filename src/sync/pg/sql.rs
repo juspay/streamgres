@@ -124,7 +124,10 @@ fn render_condition(condition: &Condition) -> String {
             let keyword = if negated { "NOT IN" } else { "IN" };
             format!("{column} {keyword} ({}) IS TRUE", literals.join(", "))
         }
+        IS if condition.value.is_null() => format!("{column} IS NULL"),
+        IS_NOT if condition.value.is_null() => format!("{column} IS NOT NULL"),
         _ if condition.value.is_null() => "FALSE".to_owned(),
+        IS | IS_NOT => "FALSE".to_owned(),
         EQ => format!("{column} = {} IS TRUE", literal(&condition.value)),
         NEQ => format!("{column} <> {} IS TRUE", literal(&condition.value)),
         GT => format!("{column} > {} IS TRUE", literal(&condition.value)),
@@ -212,6 +215,27 @@ mod tests {
     /// limits; a set-valued IN renders its current members; an empty IN
     /// is FALSE; a NULL comparison is FALSE; a NOT IN with a NULL member
     /// is FALSE.
+    /// The null tests render as SQL's own, without the `IS TRUE` wrapper
+    /// they never need; an `IS` with another operand is never true.
+    #[test]
+    fn renders_null_tests() {
+        let query = SingleTableReadQuery::new(
+            "tickets",
+            Where::AND(vec![
+                Where::is_null("status"),
+                Where::is_not_null("points"),
+                Where::condition("points", ComparisonOperator::IS, 3),
+            ]),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        );
+        let sql = select_sql(&query, &tickets());
+        assert!(
+            sql.contains("(\"status\" IS NULL AND \"points\" IS NOT NULL AND FALSE)"),
+            "{sql}"
+        );
+    }
+
     #[test]
     fn renders_windows_sets_and_null_semantics() {
         let set = SharedSet::default();

@@ -21,6 +21,7 @@
 //! primary   := '(' filter ')' | condition | TRUE | FALSE
 //! condition := column ('=' | '!=' | '<>' | '>' | '>=' | '<' | '<=') value
 //!            | column [NOT] IN '(' [value (',' value)*] ')'
+//!            | column IS [NOT] NULL
 //! column    := ident
 //! value     := NULL | TRUE | FALSE | number | string
 //!            | '[' [value (',' value)*] ']'
@@ -598,10 +599,13 @@ impl Parser {
                 });
             }
 
-            let data: HashMap<ColumnName, Value> = columns.into_iter().zip(values).collect();
+            let mut data: HashMap<ColumnName, Value> = columns.into_iter().zip(values).collect();
             let pkey_value = pkey_of(table, &data);
             ensure_full_pkey(table, &pkey_value, "INSERT must provide", row_at)?;
             ensure_pkey_not_null(&pkey_value, row_at)?;
+            for column in table.columns.keys() {
+                data.entry(column.clone()).or_insert(Value::Null);
+            }
 
             Ok(WriteQuery::INSERT(InsertQuery {
                 table: table.name.clone(),
@@ -766,6 +770,24 @@ impl Parser {
         }
 
         let column = self.column_name(table)?;
+        if self.eat_word("IS") {
+            let comparison_operator = if self.eat_word("NOT") {
+                ComparisonOperator::IS_NOT
+            } else {
+                ComparisonOperator::IS
+            };
+            if !self.eat_word("NULL") {
+                return self.err(format!(
+                    "expected NULL after IS [NOT], found {}",
+                    self.describe()
+                ));
+            }
+            return Ok(Where::Condition(Condition {
+                column,
+                comparison_operator,
+                value: Value::Null,
+            }));
+        }
         let comparison_operator = if self.eat_sym("=") {
             ComparisonOperator::EQ
         } else if self.eat_sym("!=") {
@@ -793,7 +815,7 @@ impl Parser {
             }));
         } else {
             return self.err(format!(
-                "expected a comparison operator or [NOT] IN after a column, found {}",
+                "expected a comparison operator, [NOT] IN or IS [NOT] NULL after a column, found {}",
                 self.describe()
             ));
         };
@@ -1195,6 +1217,41 @@ mod tests {
         assert_eq!(
             read("SELECT * FROM tickets WHERE points <> 1").filter,
             read("SELECT * FROM tickets WHERE points != 1").filter,
+        );
+    }
+
+    /// `IS [NOT] NULL` parses to the null tests with a `NULL` operand, in
+    /// any case; any other operand after `IS` is refused.
+    #[test]
+    fn parses_null_tests() {
+        assert_eq!(
+            read("SELECT * FROM tickets WHERE status IS NULL").filter,
+            Where::is_null("status")
+        );
+        assert_eq!(
+            read("SELECT * FROM tickets WHERE status is not null").filter,
+            Where::is_not_null("status")
+        );
+        let error = parse_read("SELECT * FROM tickets WHERE points IS 3", &catalog())
+            .expect_err("IS takes NULL only");
+        assert!(error.message.contains("expected NULL after IS"), "{error}");
+    }
+
+    /// An `INSERT` naming only some columns carries the rest as `NULL`:
+    /// every image has every column.
+    #[test]
+    fn insert_fills_omitted_columns_with_null() {
+        let write = parse_write(
+            "INSERT INTO tickets (id, status) VALUES (1, 'OPEN')",
+            &catalog(),
+        )
+        .unwrap();
+        let image = write.new_row_image().unwrap();
+        assert_eq!(image.data["status"], Value::from("OPEN"));
+        assert_eq!(image.data["points"], Value::Null);
+        assert_eq!(
+            image.data.len(),
+            catalog().table("tickets").unwrap().columns.len()
         );
     }
 

@@ -57,11 +57,11 @@ every later delta continues from.
 | Join tree: `LEFT` and `RIGHT` edges at any depth, set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns | ✅ done | `src/ivm/multi.rs` |
 | Client-addressed output: every subscription belongs to a `ClientId`; one step's operations are folded per client and row (`ClientUpdate { client, table, op, targets }`), so a row image travels to a client once | ✅ done | `src/ivm/update.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
-| Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; the runtime holds the one position, brings every read up to it before landing, runs maintenance reads inline; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
+| Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; the runtime holds the one position and brings every read up to it before landing; no read ever blocks the stream; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
 | In-memory storage answering at once, honoring `ORDER BY` + `LIMIT`; per-table routing between memory and PostgreSQL (`JUS_SYNC_MEMORY_TABLES`) | ✅ done | `src/sync/storage.rs`, `src/sync/sources.rs` |
 | **PostgreSQL**: reads from the exported snapshot of a rotating temporary replication slot, flipped forward only once the feed has passed it; a streaming `pgoutput` change feed over a replication connection with heartbeat progress marks; live tests and a bench scenario against a real server | ✅ done | `src/sync/pg/` |
 | Routing counters + benchmark harness | ✅ done | `src/ivm/stats.rs`, `src/bin/bench.rs` |
-| **xyne-spaces coverage**: the dashboard's 283 synced queries (and the ACL predicates added to them) rebuilt as tests on a catalog generated from the application's schema; seven expressiveness gaps named and pinned | ✅ tests, ⏳ gaps | `tests/xyne_spaces_queries/` |
+| **xyne-spaces coverage**: the dashboard's 283 synced queries (and the ACL predicates added to them) rebuilt as tests on a catalog generated from the application's schema; six expressiveness gaps named and pinned, `IS NULL` closed | ✅ tests, ⏳ gaps | `tests/xyne_spaces_queries/` |
 | `INNER` joins: visibility gate on the driven parent | ⏳ pending | paper §6.5 |
 | **WebSocket protocol**: subscribe / unsubscribe / op stream, connection & subscription lifecycle | ⏳ pending | `src/ws.rs` is an axum echo base |
 | Batching of one write's narrowed reads | ⏳ pending | paper §13 |
@@ -91,8 +91,9 @@ The pipeline is `SQL text → typed query model → IVM routing → operations`.
   **full** row image, every column including the key), both keyed by
   `ColumnName`; `DataFrameOperation` (`Add(key, row)` / `Delete(key, row)`).
 - `SingleTableReadQuery { table, filter: Where, order_by, limit }`;
-  `Where` is `AND`/`OR` over leaf `Condition`s; no `NOT` node, so DNF is plain
-  distribution. `MultiTableReadQuery { main_table, left_joins, right_joins }`
+  `Where` is `AND`/`OR` over leaf `Condition`s (`=`, `!=`, `<`, `<=`, `>`,
+  `>=`, `IN`, `NOT IN`, `IS NULL`, `IS NOT NULL`); no `NOT` node, so DNF is
+  plain distribution. `MultiTableReadQuery { main_table, left_joins, right_joins }`
   is the join tree.
 - Writes speak the same vocabulary: `InsertQuery`/`UpdateQuery` carry a key
   and a full image; `DeleteQuery` a key.
@@ -251,12 +252,15 @@ next moves.
 Two drivers share the runtime. `Local` answers reads at once and lands every
 read before the call returns (tests, demo, bench). `Service` is a tokio
 command loop on one `LocalSet`: `Register { client, query }`, `Unregister`,
-`UnregisterClient`, `Write { write, at }`, `Progress(at)`. A subscription's
-initial read runs as its own task while the loop keeps routing; the
-maintenance reads a write asks for (join fetches, window refills) run inline
-before the next command, so the engine's state after a write is complete
-before the next write is routed. After each write and progress mark the
-service tells every storage how far the feed is and takes the new floor.
+`UnregisterClient`, `Write { write, at }`, `Progress(at)`. Every read, a
+subscription's initial snapshot as much as a join fetch or a window refill,
+runs as its own task while the loop keeps routing; the loop never waits on
+storage. Until a read lands the subscription routes natively (its filter is
+indexed, the join leaf already holds the value, the window publishes no
+boundary), and the landing is brought up to the engine's position, so the
+order in which reads return does not matter. After each write and progress
+mark the service tells every storage how far the feed is and takes the new
+floor.
 
 ### 5. PostgreSQL (`src/sync/pg/`)
 
@@ -434,7 +438,9 @@ silently narrowed:
   null); `RIGHT` keeps every child row and shows a parent row only while a
   child matches it. A finite limit below the root is normalized away.
 - **NULL semantics**: any comparison touching `NULL` (or a missing column) is
-  false, for every operator; three-valued logic collapsed to two.
+  false, for every operator; three-valued logic collapsed to two. `IS NULL`
+  and `IS NOT NULL` are the null tests, and the only operand `IS` takes is
+  `NULL`.
 - **Inserts are upserts**; **write literals are coerced** to declared column
   types (`1.0` into an `Int` column becomes `Int(1)`; out-of-range or
   mistyped values are rejected).
@@ -465,7 +471,7 @@ pins each gap on its own.
 
 | Gap | The queries use | The engine has |
 | --- | --- | --- |
-| N | `IS NULL` / `IS NOT NULL` (83 sites: `visibleTo IS NULL`, `rootId IS NULL`, `userId IS NULL`, `deletedAt IS NULL`, …) | no `IS` operator; a `NULL` row can be excluded, never selected |
+| N | `IS NULL` / `IS NOT NULL` (83 sites: `visibleTo IS NULL`, `rootId IS NULL`, `userId IS NULL`, `deletedAt IS NULL`, …) | **closed**: `IS` / `IS NOT` operators with a `NULL` operand, filed under the `NULL` key of the column index; every message, canvas and draft query states its rule in full |
 | L | `LIKE` / `ILIKE` (11 sites: name, title, xyneId searches; one over JSON text) | no pattern operator |
 | X | an existence test inside `OR` (canvas visibility, `browsableChannels`, `channelLinks`, `summaryTemplates`, `getUsers`, the channel-access ACL `visibility = PUBLIC OR EXISTS participants`, the calls ACL) | `EXISTS` is a RIGHT edge conjoined with the node's filter; `Where` has no `EXISTS` leaf. Two subscriptions unioned by the client is the workaround the tests show |
 | O | a second `ORDER BY` column (tiebreaks on `id`); `ORDER BY` / `LIMIT` inside `related` | one window column per query; below the root every matching row ships |
@@ -567,8 +573,8 @@ they are discussed rather than discovered:
 3. **`limit: u32::MAX` means unbounded** and the default `ORDER BY` is the
    first declared pkey column ascending, parser conventions that programmatic
    queries must reproduce to share materialization with parsed ones.
-4. **No `IS NULL` / `LIKE` / `BETWEEN`** operators; with NULL comparisons
-   always false, nullable columns cannot be filtered on (gaps N and L above).
+4. **No `LIKE` / `BETWEEN`** operators (gap L above); `IS NULL` and `IS NOT
+   NULL` are the only tests a `NULL` column can pass.
 5. **Strict identity vs loose predicates**: row identity is variant-exact
    (`Float(1.0)` and `Int(1)` are different keys) while predicates coerce; the
    parser closes this for SQL writes, the model API does not.

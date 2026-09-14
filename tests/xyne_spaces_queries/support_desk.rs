@@ -7,7 +7,7 @@ use jus_sync::model::Order::{ASC, DESC};
 use jus_sync::model::Value;
 
 use super::world::{ME, World, ops, with};
-use super::zql::{Q, eq, or, same, zql};
+use super::zql::{Q, eq, is_null, or, same, zql};
 
 /// A full row image from its distinguishing columns.
 type Row = Vec<(&'static str, Value)>;
@@ -125,10 +125,13 @@ fn seed_desk(w: &mut World) {
 }
 
 /// The desk row relations shared by the row and by-xyne-id queries: the
-/// caller's drafts (gap N drops the AI draft with no user) and reads.
+/// caller's drafts and the AI draft (`userId IS NULL`), and the caller's
+/// reads.
 fn caller_drafts_and_reads(query: Q) -> Q {
     query
-        .related("emailDrafts", |d| d.eq("userId", ME))
+        .related("emailDrafts", |d| {
+            d.filter(or(vec![eq("userId", ME), is_null("userId")]))
+        })
         .related("emailReads", |r| r.eq("userId", ME))
 }
 
@@ -242,9 +245,9 @@ fn support_tickets_filtered() {
 }
 
 /// `supportTicketsFilteredV2` with assignee, priority, stage and category
-/// filters and `hasAiDraft`. Gap N: the AI-draft test is `EXISTS
-/// emailDrafts WHERE userId IS NULL`; without `IS NULL` any draft counts,
-/// so the ticket only leaves when its last draft goes.
+/// filters and `hasAiDraft`, an existence test on drafts with no user;
+/// deleting the AI draft drops the ticket, deleting the caller's own
+/// draft changes nothing.
 #[test]
 fn support_tickets_filtered_v2() {
     let mut w = World::new();
@@ -256,7 +259,7 @@ fn support_tickets_filtered_v2() {
         .eq("priority", "HIGH")
         .eq("stageName", "New")
         .eq("aiCategory", "billing")
-        .where_exists("emailDrafts", same)
+        .where_exists("emailDrafts", |d| d.where_is_null("userId"))
         .order_by("createdAt", DESC)
         .related("project", same)
         .related("tags", same)
@@ -267,22 +270,17 @@ fn support_tickets_filtered_v2() {
         ops([
             "q/main+d1",
             "q/has:emailDrafts+dr1",
-            "q/has:emailDrafts+dr2",
-            "q/has:emailDrafts+dr3",
             "q/project+p1",
             "q/tags+dtg1",
             "q/conversation+cvd1",
             "q/conversation.channel+c-desk"
         ])
     );
+    assert_eq!(w.delete("email_drafts", "dr2"), ops([]));
     assert_eq!(
         w.delete("email_drafts", "dr1"),
-        ops(["q/has:emailDrafts-dr1"])
-    );
-    assert_eq!(
-        w.delete("email_drafts", "dr2"),
         ops([
-            "q/has:emailDrafts-dr2",
+            "q/has:emailDrafts-dr1",
             "q/main-d1",
             "q/project-p1",
             "q/tags-dtg1",
@@ -355,8 +353,7 @@ fn support_tickets_filtered_v3() {
 }
 
 /// `supportTicketsFilteredV4`: the `IN` spellings of the same filters;
-/// lowering the priority drops the ticket. Gap N as in V2 for
-/// `hasAiDraft`.
+/// lowering the priority drops the ticket.
 #[test]
 fn support_tickets_filtered_v4() {
     let mut w = World::new();
@@ -366,7 +363,7 @@ fn support_tickets_filtered_v4() {
         .in_("assignedTo", &[ME])
         .in_("priority", &["HIGH"])
         .in_("aiCategory", &["billing"])
-        .where_exists("emailDrafts", same)
+        .where_exists("emailDrafts", |d| d.where_is_null("userId"))
         .where_("lastEmailAt", GTE, 50)
         .order_by("createdAt", DESC)
         .related("project", same)
@@ -382,8 +379,6 @@ fn support_tickets_filtered_v4() {
         ops([
             "q/main+d1",
             "q/has:emailDrafts+dr1",
-            "q/has:emailDrafts+dr2",
-            "q/has:emailDrafts+dr3",
             "q/project+p1",
             "q/tagMappings+dg1",
             "q/conversation+cvd1",
@@ -455,8 +450,8 @@ fn support_ticket_row() {
     );
 }
 
-/// `supportTicketRowV2`: emails with attachments, the caller's drafts and
-/// reads. Gap N: the AI draft (`userId IS NULL`) is not delivered.
+/// `supportTicketRowV2`: emails with attachments, the caller's drafts, the
+/// AI draft and the caller's reads.
 #[test]
 fn support_ticket_row_v2() {
     let mut w = World::new();
@@ -482,7 +477,8 @@ fn support_ticket_row_v2() {
             "q/emails.attachments+at1",
             "q/emailDrafts+dr2",
             "q/emailReads+rd1",
-            "q/conversation+cvd1"
+            "q/conversation+cvd1",
+            "q/emailDrafts+dr1"
         ])
     );
     assert_eq!(
@@ -517,7 +513,8 @@ fn support_ticket_row_v3() {
             "q/emails.attachments+at1",
             "q/emailDrafts+dr2",
             "q/emailReads+rd1",
-            "q/conversation+cvd1"
+            "q/conversation+cvd1",
+            "q/emailDrafts+dr1"
         ])
     );
     assert_eq!(
@@ -582,7 +579,8 @@ fn support_ticket_by_xyne_id_v2() {
             "q/emails.attachments+at1",
             "q/emailDrafts+dr2",
             "q/emailReads+rd1",
-            "q/conversation+cvd1"
+            "q/conversation+cvd1",
+            "q/emailDrafts+dr1"
         ])
     );
     assert_eq!(w.delete("email_reads", "rd1"), ops(["q/emailReads-rd1"]));
@@ -615,7 +613,8 @@ fn support_ticket_by_xyne_id_v3() {
             "q/emails.attachments+at1",
             "q/emailDrafts+dr2",
             "q/emailReads+rd1",
-            "q/conversation+cvd1"
+            "q/conversation+cvd1",
+            "q/emailDrafts+dr1"
         ])
     );
     assert_eq!(
@@ -651,7 +650,8 @@ fn support_ticket_by_xyne_id_v4() {
             "q/emails.attachments+at1",
             "q/emailDrafts+dr2",
             "q/emailReads+rd1",
-            "q/conversation+cvd1"
+            "q/conversation+cvd1",
+            "q/emailDrafts+dr1"
         ])
     );
     assert_eq!(
@@ -681,7 +681,8 @@ fn support_ticket_detail() {
             "q/referencesIn.sourceTicket+d2",
             "q/emailDrafts+dr2",
             "q/emailReads+rd1",
-            "q/conversation+cvd1"
+            "q/conversation+cvd1",
+            "q/emailDrafts+dr1"
         ])
     );
     assert_eq!(
@@ -787,7 +788,8 @@ fn support_tickets_page_v2() {
             "q/emails.attachments+at1",
             "q/emailDrafts+dr2",
             "q/emailReads+rd1",
-            "q/conversation+cvd1"
+            "q/conversation+cvd1",
+            "q/emailDrafts+dr1"
         ])
     );
     assert_eq!(
@@ -963,20 +965,19 @@ fn get_emails_for_conversations_v2() {
 }
 
 /// `getDraftForConversation`: the drafts of a thread visible to the
-/// caller. Gap N: `userId IS NULL` (the AI draft) cannot be stated, so
-/// `dr1` is missing and a new AI draft does not arrive.
+/// caller: the caller's own and the AI draft with no user.
 #[test]
 fn get_draft_for_conversation() {
     let mut w = World::new();
     seed_desk(&mut w);
     let q = zql("email_drafts")
         .eq("conversationId", "cvd1")
-        .eq("userId", ME)
+        .filter(or(vec![eq("userId", ME), is_null("userId")]))
         .order_by("updatedAt", DESC);
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+dr2"]));
+    assert_eq!(w.subscribe("q", &q), ops(["q/main+dr1", "q/main+dr2"]));
     assert_eq!(
         w.insert("email_drafts", row!["id" => "dr5", "conversationId" => "cvd1", "channelId" => "c-desk", "updatedAt" => 50]),
-        ops([])
+        ops(["q/main+dr5"])
     );
 }
 
@@ -987,18 +988,17 @@ fn get_draft_for_conversation_v2() {
     seed_desk(&mut w);
     let q = zql("email_drafts")
         .eq("conversationId", "cvd1")
-        .eq("userId", ME)
+        .filter(or(vec![eq("userId", ME), is_null("userId")]))
         .order_by("updatedAt", DESC);
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+dr2"]));
+    assert_eq!(w.subscribe("q", &q), ops(["q/main+dr1", "q/main+dr2"]));
     assert_eq!(
         w.insert("email_drafts", row!["id" => "dr6", "conversationId" => "cvd1", "userId" => ME, "channelId" => "c-desk", "updatedAt" => 60]),
         ops(["q/main+dr6"])
     );
 }
 
-/// `composeDraftsByChannel`: the caller's compose drafts. Gap N:
-/// `conversationId IS NULL` cannot be stated, so the reply draft `dr2` is
-/// delivered beside the compose draft `dr3`.
+/// `composeDraftsByChannel`: the caller's compose drafts, those with no
+/// conversation.
 #[test]
 fn compose_drafts_by_channel() {
     let mut w = World::new();
@@ -1006,15 +1006,14 @@ fn compose_drafts_by_channel() {
     let q = zql("email_drafts")
         .eq("channelId", "c-desk")
         .eq("userId", ME)
+        .where_is_null("conversationId")
         .order_by("updatedAt", DESC);
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+dr2", "q/main+dr3"]));
+    assert_eq!(w.subscribe("q", &q), ops(["q/main+dr3"]));
     assert_eq!(w.delete("email_drafts", "dr3"), ops(["q/main-dr3"]));
 }
 
 /// `userEmailDrafts`: the caller's reply drafts of a channel with their
-/// ticket, below an update cursor. Gap N: `conversationId IS NOT NULL`
-/// cannot be stated, so the compose draft `dr3` is delivered too (with no
-/// ticket, its join value being `NULL`). Gap O drops the `id` tiebreak.
+/// ticket, below an update cursor. Gap O drops the `id` tiebreak.
 #[test]
 fn user_email_drafts() {
     let mut w = World::new();
@@ -1022,15 +1021,13 @@ fn user_email_drafts() {
     let q = zql("email_drafts")
         .eq("channelId", "c-desk")
         .eq("userId", ME)
+        .where_is_not_null("conversationId")
         .order_by("updatedAt", DESC)
         .order_by("id", DESC)
         .start(&[("updatedAt", DESC, 100.into())], false)
         .limit(10)
         .related("ticket", same);
-    assert_eq!(
-        w.subscribe("q", &q),
-        ops(["q/main+dr2", "q/main+dr3", "q/ticket+d1"])
-    );
+    assert_eq!(w.subscribe("q", &q), ops(["q/main+dr2", "q/ticket+d1"]));
     assert_eq!(
         w.delete("email_drafts", "dr2"),
         ops(["q/main-dr2", "q/ticket-d1"])

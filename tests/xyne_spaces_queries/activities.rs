@@ -8,7 +8,7 @@ use jus_sync::model::Order::DESC;
 use jus_sync::model::Value;
 
 use super::world::{ME, World, ops, with};
-use super::zql::{eq, or, same, zql};
+use super::zql::{eq, is_null, or, same, zql};
 
 /// A full row image from its distinguishing columns.
 type Row = Vec<(&'static str, Value)>;
@@ -366,10 +366,9 @@ fn project_recaps() {
     );
 }
 
-/// `channelRecaps`: a day's recaps of listed channels, the base ones and
-/// the caller's. Gap N: `userId IS NULL` (the base recaps) cannot be
-/// stated, so only the caller's custom recap arrives; the empty-list
-/// guard is permanently empty.
+/// `channelRecaps`: a day's recaps of listed channels, the base ones
+/// (`userId IS NULL`) and the caller's; the empty-list guard is
+/// permanently empty.
 #[test]
 fn channel_recaps() {
     let mut w = World::new();
@@ -378,8 +377,11 @@ fn channel_recaps() {
         .eq("recapDate", 20260912)
         .eq("entityType", "CHANNEL")
         .filter(or(vec![eq("entityId", "c1"), eq("entityId", "c2")]))
-        .eq("userId", ME);
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+rc2"]));
+        .filter(or(vec![is_null("userId"), eq("userId", ME)]));
+    assert_eq!(
+        w.subscribe("q", &q),
+        ops(["q/main+rc1", "q/main+rc2", "q/main+rc3"])
+    );
     assert_eq!(w.subscribe("none", &zql("recaps").limit(0)), ops([]));
     assert_eq!(
         w.insert("recaps", row!["id" => "rc4", "recapDate" => 20260912, "entityType" => "CHANNEL", "entityId" => "c2", "userId" => ME]),
@@ -387,8 +389,7 @@ fn channel_recaps() {
     );
 }
 
-/// `channelDailyRecaps` (the legacy table): the same shape and the same
-/// gap N.
+/// `channelDailyRecaps` (the legacy table): the same shape.
 #[test]
 fn channel_daily_recaps() {
     let mut w = World::new();
@@ -396,7 +397,10 @@ fn channel_daily_recaps() {
     let q = zql("channel_daily_recaps")
         .eq("recapDate", 20260912)
         .filter(or(vec![eq("channelId", "c1"), eq("channelId", "c2")]))
-        .eq("userId", ME);
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+cd2"]));
+        .filter(or(vec![is_null("userId"), eq("userId", ME)]));
+    assert_eq!(
+        w.subscribe("q", &q),
+        ops(["q/main+cd1", "q/main+cd2", "q/main+cd3"])
+    );
     assert_eq!(w.delete("channel_daily_recaps", "cd2"), ops(["q/main-cd2"]));
 }

@@ -220,6 +220,76 @@ impl Names {
     }
 }
 
+/// `IS NULL` and `IS NOT NULL` route through the column index: a `NULL`
+/// `assigned_to` reaches the null test alone (a `!=` on the column stays
+/// false for it, as SQL says), setting the column moves the row to the
+/// other test in one step, and clearing it moves it back; a `NULL` row
+/// already in storage is served to the null test at registration.
+#[test]
+fn null_tests_route_through_the_index() {
+    let tickets = table("tickets");
+    let storage = Rc::new(MemoryStorage::new());
+    let mut ivm = Local::new(SingleTableIVM::new(), storage.clone());
+    let names = Names::default();
+    let mut unassigned = open_ticket_row();
+    unassigned[2] = ("assigned_to", Value::Null);
+    storage.apply(&insert(&tickets, 9, &unassigned));
+
+    let snapshot = names.register(
+        &mut ivm,
+        "q-unassigned",
+        query(&tickets, Where::is_null("assigned_to")),
+    );
+    assert_eq!(snapshot.len(), 1, "the stored NULL row is served");
+    names.register(
+        &mut ivm,
+        "q-assigned",
+        query(&tickets, Where::is_not_null("assigned_to")),
+    );
+    names.register(
+        &mut ivm,
+        "q-not-bob",
+        query(
+            &tickets,
+            Where::condition("assigned_to", ComparisonOperator::NEQ, "bob"),
+        ),
+    );
+
+    let ops = ivm.incremental_update(&insert(&tickets, 1, &unassigned));
+    assert_eq!(names.impacted(&ops), ["q-unassigned"]);
+
+    let ops = ivm.incremental_update(&update(&tickets, 1, &open_ticket_row()));
+    assert_eq!(
+        names.impacted(&ops),
+        ["q-assigned", "q-not-bob", "q-unassigned"]
+    );
+    assert!(
+        ops.iter()
+            .any(|update| names.targets(update, "q-unassigned")
+                && matches!(update.op, DataFrameOperation::Delete(..)))
+    );
+    assert!(ops.iter().any(|update| names.targets(update, "q-assigned")
+        && matches!(update.op, DataFrameOperation::Add(..))));
+
+    let ops = ivm.incremental_update(&update(&tickets, 1, &unassigned));
+    assert_eq!(
+        names.impacted(&ops),
+        ["q-assigned", "q-not-bob", "q-unassigned"]
+    );
+    assert!(
+        ops.iter()
+            .any(|update| names.targets(update, "q-unassigned")
+                && matches!(update.op, DataFrameOperation::Add(..)))
+    );
+    assert!(ops.iter().any(|update| names.targets(update, "q-not-bob")
+        && matches!(update.op, DataFrameOperation::Delete(..))));
+    assert_eq!(
+        ivm.engine().stats().conditions_evaluated,
+        4,
+        "a NULL probe yields the null test alone, a value probe the two negations: no scan"
+    );
+}
+
 /// An insert produces `Add`s only for the subscriptions whose filters the
 /// row satisfies; non-matching frames stay empty.
 #[test]

@@ -14,7 +14,7 @@
 //!
 //! | Gap | What the queries use | What the engine has today |
 //! |-----|----------------------|---------------------------|
-//! | N | `IS NULL` / `IS NOT NULL` (74 + 9 sites: `visibleTo IS NULL`, `rootId IS NULL`, `userId IS NULL`, `deletedAt IS NULL`, …) | no `IS` operator; every comparison touching `NULL` is false, so a `NULL` row can only be excluded, never selected |
+//! | N | `IS NULL` / `IS NOT NULL` (74 + 9 sites) | **closed 2026-09-15**: `IS` / `IS_NOT` operators, indexed under the `NULL` key |
 //! | L | `LIKE` / `ILIKE` (11 sites: searches over `name`, `title`, `xyneId`, and a JSON text) | no pattern operator; the parser refuses it |
 //! | X | an existence test inside `OR` (canvas visibility, `browsableChannels`, `channelLinks`, `summaryTemplates`, `getUsers`, the channel-access ACL `visibility = PUBLIC OR EXISTS participants`, the calls ACL) | an existence test is a RIGHT edge, conjoined with the node's filter; `Where` has no `EXISTS` leaf |
 //! | O | a second `ORDER BY` column (tiebreaks on `id`, 100+ sites) and `ORDER BY` / `LIMIT` inside `related` (`rcas` latest one, last 10 `conversations`) | one window column per query; a node below the root ships every matching row, unordered and uncapped |

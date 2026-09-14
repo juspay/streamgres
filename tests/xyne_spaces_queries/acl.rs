@@ -7,7 +7,7 @@
 //! form is gap X (see `gaps.rs`).
 
 use super::world::{ME, WS, World, ops};
-use super::zql::zql;
+use super::zql::{eq, is_null, or, zql};
 
 /// Every workspace-scoped root gets `workspaceId = ctx.workspaceId`: a row
 /// of another workspace is neither in the snapshot nor ever routed.
@@ -133,9 +133,9 @@ fn tickets_acl_public_channel() {
     );
 }
 
-/// `MessagesACL` with a `channelId`: the caller-visible half of the
-/// visibility rule (gap N drops `visibleTo IS NULL`) and the conversation
-/// to channel to participant chain, four tables deep.
+/// `MessagesACL` with a `channelId`: the visibility rule (`visibleTo IS
+/// NULL OR visibleTo = me`) and the conversation to channel to participant
+/// chain, four tables deep.
 #[test]
 fn messages_acl_visible_to_and_channel_chain() {
     let mut w = World::new();
@@ -151,6 +151,10 @@ fn messages_acl_visible_to_and_channel_chain() {
     w.seed(
         "conversations",
         &[("conversationId", "cv1".into()), ("channelId", "c1".into())],
+    );
+    w.seed(
+        "messages",
+        &[("messageId", "m0".into()), ("conversationId", "cv1".into())],
     );
     w.seed(
         "messages",
@@ -170,7 +174,7 @@ fn messages_acl_visible_to_and_channel_chain() {
     );
     let scoped = zql("messages")
         .eq("conversationId", "cv1")
-        .eq("visibleTo", ME)
+        .filter(or(vec![is_null("visibleTo"), eq("visibleTo", ME)]))
         .where_exists("conversation", |c| {
             c.eq("channelId", "c1").where_exists("channel", |ch| {
                 ch.eq("id", "c1")
@@ -181,6 +185,7 @@ fn messages_acl_visible_to_and_channel_chain() {
     assert_eq!(
         w.subscribe("q", &scoped),
         ops([
+            "q/main+m0",
             "q/main+m1",
             "q/has:conversation+cv1",
             "q/has:conversation.has:channel+c1",
@@ -190,6 +195,7 @@ fn messages_acl_visible_to_and_channel_chain() {
     assert_eq!(
         w.delete("channel_participants", "p1"),
         ops([
+            "q/main-m0",
             "q/main-m1",
             "q/has:conversation-cv1",
             "q/has:conversation.has:channel-c1",

@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 
 use jus_sync::ivm::QueryPart;
-use jus_sync::model::ComparisonOperator::{EQ, GT, GTE, IN, LT, LTE, NEQ, NOT_IN};
+use jus_sync::model::ComparisonOperator::{EQ, GT, GTE, IN, IS, IS_NOT, LT, LTE, NEQ, NOT_IN};
 use jus_sync::model::{
     ComparisonOperator, Join, MultiTableReadQuery, Order, OrderBy, SingleTableReadQuery, Value,
     Where,
@@ -29,6 +29,16 @@ pub fn cmp(column: &str, op: ComparisonOperator, value: impl Into<Value>) -> Whe
 /// A `column = value` leaf.
 pub fn eq(column: &str, value: impl Into<Value>) -> Where {
     cmp(column, EQ, value)
+}
+
+/// A `column IS NULL` leaf, the client's `.where(column, 'IS', null)`.
+pub fn is_null(column: &str) -> Where {
+    Where::is_null(column)
+}
+
+/// A `column IS NOT NULL` leaf, the client's `.where(column, 'IS NOT', null)`.
+pub fn is_not_null(column: &str) -> Where {
+    Where::is_not_null(column)
 }
 
 /// An `OR` of `parts`.
@@ -99,6 +109,16 @@ impl Q {
     /// `.where(column, value)`: equality.
     pub fn eq(self, column: &str, value: impl Into<Value>) -> Q {
         self.where_(column, EQ, value)
+    }
+
+    /// `.where(column, 'IS', null)`.
+    pub fn where_is_null(self, column: &str) -> Q {
+        self.filter(is_null(column))
+    }
+
+    /// `.where(column, 'IS NOT', null)`.
+    pub fn where_is_not_null(self, column: &str) -> Q {
+        self.filter(is_not_null(column))
     }
 
     /// `.where(column, 'IN', values)`.
@@ -319,6 +339,12 @@ fn keyset(keys: &[(&str, Order, Value)], inclusive: bool) -> Where {
 /// level is not.
 fn render(filter: &Where, top: bool) -> String {
     match filter {
+        Where::Condition(condition) if condition.comparison_operator == IS => {
+            format!("{} IS NULL", condition.column.as_str())
+        }
+        Where::Condition(condition) if condition.comparison_operator == IS_NOT => {
+            format!("{} IS NOT NULL", condition.column.as_str())
+        }
         Where::Condition(condition) => {
             let op = match condition.comparison_operator {
                 EQ => "=",
@@ -329,6 +355,7 @@ fn render(filter: &Where, top: bool) -> String {
                 LTE => "<=",
                 IN => "IN",
                 NOT_IN => "NOT IN",
+                IS | IS_NOT => unreachable!("rendered above"),
             };
             format!(
                 "{} {op} {}",

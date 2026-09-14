@@ -7,7 +7,7 @@ use jus_sync::model::Order::{ASC, DESC};
 use jus_sync::model::Value;
 
 use super::world::{ME, World, ops, with};
-use super::zql::{eq, or, same, zql};
+use super::zql::{cmp, eq, is_null, or, same, zql};
 
 /// A full ticket image from its distinguishing columns.
 type Row = Vec<(&'static str, Value)>;
@@ -79,6 +79,15 @@ fn sr1() -> Row {
     row!["id" => "sr1", "ticketId" => "t1", "stageId" => "st1", "formId" => "f1", "status" => "SUBMITTED",
          "reviewerCommentMessageId" => "m-rev", "createdAt" => 10]
     .to_vec()
+}
+
+/// The Support exclusion of the board queries: `ticketType != 'Support'
+/// OR ticketType IS NULL`, so an untyped ticket counts.
+fn not_support() -> jus_sync::model::Where {
+    or(vec![
+        cmp("ticketType", NEQ, "Support"),
+        is_null("ticketType"),
+    ])
 }
 
 /// The board: project `p1` with boards `b1` and `b2`, role `r1`, channels
@@ -245,23 +254,24 @@ fn all_tickets() {
     );
 }
 
-/// `ticketsQuery` (board view of `b1`, flow steps excluded). Gap N:
-/// `rootId IS NULL` cannot be stated and the `ticketType IS NULL` half of
-/// the Support exclusion is lost, so the untyped `t0` is left out and a
-/// flow step under `t1` is admitted.
+/// `ticketsQuery` (board view of `b1`): root tickets (`rootId IS NULL`)
+/// that are not Support tickets, the untyped `t0` included; a flow step
+/// under `t1` is not admitted.
 #[test]
 fn tickets_query() {
     let mut w = World::new();
     seed_board(&mut w);
     let q = zql("tickets")
         .eq("boardId", "b1")
-        .where_("ticketType", NEQ, "Support")
+        .where_is_null("rootId")
+        .filter(not_support())
         .order_by("createdAt", DESC)
         .related("assignments", same)
         .related("stageEtaEntries", same);
     assert_eq!(
         w.subscribe("q", &q),
         ops([
+            "q/main+t0",
             "q/main+t1",
             "q/main+t2",
             "q/assignments+a1",
@@ -272,21 +282,21 @@ fn tickets_query() {
     );
     assert_eq!(
         w.insert("tickets", row!["id" => "t6", "boardId" => "b1", "ticketType" => "Task", "rootId" => "t1", "createdAt" => 600]),
-        ops(["q/main+t6"])
+        ops([])
     );
-    assert_eq!(w.held("q", "main"), ["t1", "t2", "t6"]);
+    assert_eq!(w.held("q", "main"), ["t0", "t1", "t2"]);
 }
 
 /// `ticketsQueryV2` (project view scoped to boards `b1`, `b2`): archived
-/// tickets included, assignments carry their role. Gap N as in
-/// `ticketsQuery`.
+/// tickets included, assignments carry their role.
 #[test]
 fn tickets_query_v2() {
     let mut w = World::new();
     seed_board(&mut w);
     let q = zql("tickets")
         .in_("boardId", &["b1", "b2"])
-        .where_("ticketType", NEQ, "Support")
+        .where_is_null("rootId")
+        .filter(not_support())
         .order_by("createdAt", DESC)
         .related("assignments", |a| a.related("role", same))
         .related("tagMappings", same)
@@ -294,6 +304,7 @@ fn tickets_query_v2() {
     assert_eq!(
         w.subscribe("q", &q),
         ops([
+            "q/main+t0",
             "q/main+t1",
             "q/main+t2",
             "q/main+t3",
@@ -312,8 +323,8 @@ fn tickets_query_v2() {
 }
 
 /// `kanbanTicketsPage` (board `b1`, column Todo, priority HIGH or MEDIUM,
-/// a page of 10). Gap O: the `id` tiebreak is dropped. Gap N: the untyped
-/// `t0` is left out.
+/// a page of 10), the untyped `t0` included. Gap O: the `id` tiebreak is
+/// dropped.
 #[test]
 fn kanban_tickets_page() {
     let mut w = World::new();
@@ -322,7 +333,7 @@ fn kanban_tickets_page() {
         .eq("stageName", "Todo")
         .eq("isArchived", false)
         .eq("boardId", "b1")
-        .where_("ticketType", NEQ, "Support")
+        .filter(not_support())
         .in_("priority", &["HIGH", "MEDIUM"])
         .order_by("createdAt", DESC)
         .order_by("id", ASC)
@@ -333,6 +344,7 @@ fn kanban_tickets_page() {
     assert_eq!(
         w.subscribe("q", &q),
         ops([
+            "q/main+t0",
             "q/main+t1",
             "q/assignments+a1",
             "q/stageEtaEntries+e1",
@@ -350,9 +362,9 @@ fn kanban_tickets_page() {
 
 /// `kanbanTicketsPageV2` with a role-assignment filter and overdue-only:
 /// two existence tests on the same root, both required (their referenced
-/// sets intersect), a keyset cursor rewritten as a `WHERE`. Gap N drops
-/// `stageLeftAt IS NULL` inside the overdue test, so a left stage still
-/// counts; gap O drops the `id` tiebreak.
+/// sets intersect), a keyset cursor rewritten as a `WHERE`; a left stage
+/// (`stageLeftAt` set) does not count as overdue. Gap O drops the `id`
+/// tiebreak.
 #[test]
 fn kanban_tickets_page_v2() {
     let mut w = World::new();
@@ -367,7 +379,9 @@ fn kanban_tickets_page_v2() {
         })
         .where_("statusV2", NEQ, "COMPLETED")
         .where_("statusV2", NEQ, "CANCELLED")
-        .where_exists("stageEtaEntries", |e| e.where_("stageEta", LT, 100))
+        .where_exists("stageEtaEntries", |e| {
+            e.where_is_null("stageLeftAt").where_("stageEta", LT, 100)
+        })
         .order_by("createdAt", DESC)
         .order_by("id", ASC)
         .start(
@@ -387,8 +401,7 @@ fn kanban_tickets_page_v2() {
             "q/stageEtaEntries+e1",
             "q/tagMappings+g1",
             "q/has:assignments+a1",
-            "q/has:stageEtaEntries+e1",
-            "q/has:stageEtaEntries+e2"
+            "q/has:stageEtaEntries+e1"
         ])
     );
     let t7 = row!["id" => "t7", "boardId" => "b1", "stageName" => "Todo", "statusV2" => "OPEN", "isArchived" => false,
@@ -417,7 +430,7 @@ fn kanban_tickets_page_v2() {
 
 /// `kanbanTicketsPageV3`: the overdue flag is a column, the page is a
 /// `createdAt` window `[createdAfter, cursor]`. Gap O drops the `id`
-/// tiebreak; gap N drops `rootId IS NULL` and the untyped `t0`.
+/// tiebreak.
 #[test]
 fn kanban_tickets_page_v3() {
     let mut w = World::new();
@@ -426,7 +439,8 @@ fn kanban_tickets_page_v3() {
         .eq("stageName", "Todo")
         .eq("isArchived", false)
         .eq("boardId", "b1")
-        .where_("ticketType", NEQ, "Support")
+        .where_is_null("rootId")
+        .filter(not_support())
         .where_("statusV2", NEQ, "COMPLETED")
         .where_("statusV2", NEQ, "CANCELLED")
         .eq("isStageOverdue", true)
@@ -989,8 +1003,8 @@ fn ticket_assignments_by_ticket_id() {
 }
 
 /// `ticketsByProject`: live non-Support tickets of `p1` with tags; a
-/// Support ticket retyped joins. Gap N: the untyped `t0` is left out (here
-/// the client agrees, the filter has no `IS NULL` half).
+/// Support ticket retyped joins. The untyped `t0` is left out, as in
+/// the client: this filter has no `IS NULL` half.
 #[test]
 fn tickets_by_project() {
     let mut w = World::new();
@@ -1254,9 +1268,8 @@ fn sdlc_tickets_by_ids() {
     );
 }
 
-/// `sdlcTicketsByChannel`: live root tickets of a hub. Gap N: `rootId IS
-/// NULL` and the `ticketType IS NULL` half cannot be stated, so the
-/// untyped `t0` is left out.
+/// `sdlcTicketsByChannel`: live root tickets of a hub, the untyped `t0`
+/// included.
 #[test]
 fn sdlc_tickets_by_channel() {
     let mut w = World::new();
@@ -1264,8 +1277,12 @@ fn sdlc_tickets_by_channel() {
     let q = zql("tickets")
         .eq("channelId", "c1")
         .eq("isArchived", false)
-        .where_("ticketType", NEQ, "Support");
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+t1", "q/main+t2"]));
+        .where_is_null("rootId")
+        .filter(not_support());
+    assert_eq!(
+        w.subscribe("q", &q),
+        ops(["q/main+t0", "q/main+t1", "q/main+t2"])
+    );
     assert_eq!(
         w.update("tickets", &with(&t2(), row!["isArchived" => true])),
         ops(["q/main-t2"])

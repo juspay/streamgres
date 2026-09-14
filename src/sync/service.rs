@@ -1,15 +1,13 @@
 //! The asynchronous driver: one task owns the runtime, takes commands
 //! (subscribe, unsubscribe, a positioned write, a progress mark) from a
 //! channel, hands every delta to an output channel, and runs the storage
-//! reads the runtime asks for. A registration's snapshot read runs as its
-//! own task while writes keep flowing; a read asked for in the middle of
-//! maintaining a subscription (a join crossing, a window refill) is run
-//! **before anything else**, the loop awaiting it and taking no command
-//! meanwhile, so it lands at exactly the position the engine is at. The
-//! runtime is touched only between awaits. Single-threaded by design: run
-//! it on a [`tokio::task::LocalSet`].
+//! reads the runtime asks for. Every read, a registration's snapshot as
+//! much as a join fetch or a window refill, runs as its own task while the
+//! loop keeps routing; the loop never waits on storage, and each result is
+//! brought up to the engine's position when it lands. The runtime is
+//! touched only between awaits. Single-threaded by design: run it on a
+//! [`tokio::task::LocalSet`].
 
-use std::collections::VecDeque;
 use std::rc::Rc;
 
 use tokio::sync::{mpsc, oneshot};
@@ -98,7 +96,7 @@ where
                     None => break,
                 },
             };
-            self.dispatch(step).await;
+            self.dispatch(step);
         }
         self.runtime
     }
@@ -143,34 +141,14 @@ where
         self.runtime.set_floor(self.storage.floor());
     }
 
-    /// Deliver a step's deltas and run its reads: a snapshot read as its
-    /// own task, a blocking read right here, landed before returning
-    /// (and whatever that landing asks for, the same way).
-    async fn dispatch(&mut self, step: Step) {
-        let mut queue: VecDeque<Fetch> = VecDeque::new();
-        self.emit(step, &mut queue);
-        while let Some(fetch) = queue.pop_front() {
-            if !fetch.kind.is_blocking() {
-                self.spawn(fetch);
-                continue;
-            }
-            let step = match self.storage.select(&fetch.query).await {
-                Ok(snapshot) => self.runtime.fetched(fetch.id, snapshot),
-                Err(error) => {
-                    eprintln!("storage read {} failed, parked: {error}", fetch.id.0);
-                    self.runtime.failed(fetch.id)
-                }
-            };
-            self.emit(step, &mut queue);
-        }
-    }
-
-    /// Send a step's deltas and queue its reads.
-    fn emit(&self, step: Step, queue: &mut VecDeque<Fetch>) {
+    /// Deliver a step's deltas and start each of its reads as a task.
+    fn dispatch(&self, step: Step) {
         if !step.updates.is_empty() {
             let _ = self.updates.send(step.updates);
         }
-        queue.extend(step.selects);
+        for fetch in step.selects {
+            self.spawn(fetch);
+        }
     }
 
     /// Run one read as its own task, reporting the result into the loop.

@@ -2,16 +2,16 @@
 //! message loads, attachments, pins, latest messages, DM lists, nudges,
 //! drafts and scheduled messages, one test per registry entry over one
 //! channel fixture. The message visibility rule `visibleTo IS NULL OR
-//! visibleTo = me` runs through nearly all of them; gap N leaves only its
-//! second half, so the everyone-visible messages (`m1`, `m5`) are missing
-//! wherever the rule applies.
+//! visibleTo = me` runs through nearly all of them, so the everyone-visible
+//! messages (`m1`, `m5`) arrive beside the caller's own wherever it
+//! applies.
 
 use jus_sync::model::ComparisonOperator::{GT, LTE};
 use jus_sync::model::Order::{ASC, DESC};
 use jus_sync::model::Value;
 
 use super::world::{ME, WS, World, ops, with};
-use super::zql::{Q, eq, or, same, zql};
+use super::zql::{Q, eq, is_not_null, is_null, or, same, zql};
 
 /// A full row image from its distinguishing columns.
 type Row = Vec<(&'static str, Value)>;
@@ -146,10 +146,15 @@ fn seed_dm(w: &mut World) {
     w.seed("messages", row!["messageId" => "mdm2", "conversationId" => "cvdm2", "visibleTo" => "u-2", "createdAt" => 2]);
 }
 
-/// The message visibility rule as far as the model states it: the
-/// caller's half (gap N loses `visibleTo IS NULL`).
+/// The message visibility rule: `visibleTo IS NULL OR visibleTo = me`.
 fn visible_to_me(query: Q) -> Q {
-    query.eq("visibleTo", ME)
+    query.filter(or(vec![is_null("visibleTo"), eq("visibleTo", ME)]))
+}
+
+/// The nudge-count rule of the message queries: the caller's counts or
+/// any channel's.
+fn nudge_counts_mine_or_channel(query: Q) -> Q {
+    query.filter(or(vec![eq("userId", ME), is_not_null("channelId")]))
 }
 
 /// The nudge-count filter of the channel queries: the caller's counts or
@@ -160,8 +165,8 @@ fn nudge_counts_for(channel: &'static str) -> impl Fn(Q) -> Q {
 
 /// `channelConversations`: a channel's threads with their visible opener
 /// (reactions, counts, attachments, nudge counts), parent message,
-/// authors and ticket. Gap N: `m1`, visible to everyone, is missing as
-/// opener and as parent until it is made visible to the caller.
+/// authors and ticket; hiding the everyone-visible `m1` from the caller
+/// removes it as opener and as parent.
 #[test]
 fn channel_conversations() {
     let mut w = World::new();
@@ -187,19 +192,21 @@ fn channel_conversations() {
         ops([
             "q/main+cv1",
             "q/main+cv2",
+            "q/initialMessage+m1",
             "q/initialMessage+m2",
             "q/initialMessage.reactions+rx1",
             "q/initialMessage.reactionCounts+rcnt1",
             "q/initialMessage.attachments+ma1",
             "q/initialMessage.nudgeCounts+nc1",
             "q/initialMessage.nudgeCounts+nc2",
+            "q/parentMessage+m1",
             "q/participants+pp1",
             "q/ticket+t1"
         ])
     );
     assert_eq!(
-        w.update("messages", &with(&m1(), row!["visibleTo" => ME])),
-        ops(["q/initialMessage+m1", "q/parentMessage+m1"])
+        w.update("messages", &with(&m1(), row!["visibleTo" => "u-2"])),
+        ops(["q/initialMessage-m1", "q/parentMessage-m1"])
     );
 }
 
@@ -226,8 +233,10 @@ fn channel_conversations_v2() {
         ops([
             "q/main+cv1",
             "q/main+cv2",
+            "q/initialMessage+m1",
             "q/initialMessage+m2",
             "q/initialMessage.attachments+ma1",
+            "q/parentMessage+m1",
             "q/participants+pp1",
             "q/ticket+t1"
         ])
@@ -243,9 +252,7 @@ fn channel_conversations_v2() {
 }
 
 /// `conversationMessages`: a thread's visible messages with reactions,
-/// counts, attachments and nudge counts. Gap N: only the caller-only
-/// reply `m4` is delivered (`m1`, `m5` are everyone-visible), and the
-/// nudge-count rule loses its `channelId IS NOT NULL` half.
+/// counts, attachments and nudge counts (the caller's or any channel's).
 #[test]
 fn conversation_messages() {
     let mut w = World::new();
@@ -255,8 +262,11 @@ fn conversation_messages() {
         .related("attachments", same)
         .related("reactionCounts", same)
         .related("reactions", same)
-        .related("nudgeCounts", |n| n.eq("userId", ME));
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+m4"]));
+        .related("nudgeCounts", nudge_counts_mine_or_channel);
+    assert_eq!(
+        w.subscribe("q", &q),
+        ops(["q/main+m1", "q/main+m4", "q/main+m5"])
+    );
     assert_eq!(
         w.insert("messages", row!["messageId" => "m6", "conversationId" => "cv1", "visibleTo" => ME, "createdAt" => 130]),
         ops(["q/main+m6"])
@@ -271,28 +281,33 @@ fn conversation_messages_v2() {
     let q = visible_to_me(zql("messages").eq("conversationId", "cv1"))
         .order_by("createdAt", ASC)
         .related("attachments", same)
-        .related("nudgeCounts", |n| n.eq("userId", ME));
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+m4"]));
+        .related("nudgeCounts", nudge_counts_mine_or_channel);
+    assert_eq!(
+        w.subscribe("q", &q),
+        ops(["q/main+m1", "q/main+m4", "q/main+m5"])
+    );
     assert_eq!(w.delete("messages", "m4"), ops(["q/main-m4"]));
 }
 
-/// `messagesByIds`: a literal id list under the visibility rule. Gap N:
-/// `m1` is missing.
+/// `messagesByIds`: a literal id list under the visibility rule; hiding
+/// one from the caller removes it.
 #[test]
 fn messages_by_ids() {
     let mut w = World::new();
     seed_channel(&mut w);
     let q = visible_to_me(zql("messages").in_("messageId", &["m1", "m2", "m4"]));
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+m2", "q/main+m4"]));
     assert_eq!(
-        w.update("messages", &with(&m1(), row!["visibleTo" => ME])),
-        ops(["q/main+m1"])
+        w.subscribe("q", &q),
+        ops(["q/main+m1", "q/main+m2", "q/main+m4"])
+    );
+    assert_eq!(
+        w.update("messages", &with(&m1(), row!["visibleTo" => "u-2"])),
+        ops(["q/main-m1"])
     );
 }
 
 /// `getConversationById`: one thread with opener, parent, every
-/// participant and ticket. Gap N: the opener `m1` arrives only once made
-/// visible to the caller.
+/// participant and ticket; hiding the opener from the caller removes it.
 #[test]
 fn get_conversation_by_id() {
     let mut w = World::new();
@@ -308,14 +323,15 @@ fn get_conversation_by_id() {
         w.subscribe("q", &q),
         ops([
             "q/main+cv1",
+            "q/initialMessage+m1",
             "q/participants+pp1",
             "q/participants+pp2",
             "q/ticket+t1"
         ])
     );
     assert_eq!(
-        w.update("messages", &with(&m1(), row!["visibleTo" => ME])),
-        ops(["q/initialMessage+m1"])
+        w.update("messages", &with(&m1(), row!["visibleTo" => "u-2"])),
+        ops(["q/initialMessage-m1"])
     );
 }
 
@@ -335,6 +351,7 @@ fn get_conversation_by_id_with_channel() {
         w.subscribe("q", &q),
         ops([
             "q/main+cv1",
+            "q/initialMessage+m1",
             "q/participants+pp1",
             "q/participants+pp2",
             "q/ticket+t1"
@@ -348,7 +365,7 @@ fn get_conversation_by_id_with_channel() {
 
 /// `threadConversation`: the thread panel in one query: ticket, call, the
 /// caller's participation and the visible messages with attachments and
-/// nudge counts. Gap N: `m1` and `m5` are missing.
+/// nudge counts.
 #[test]
 fn thread_conversation() {
     let mut w = World::new();
@@ -362,7 +379,7 @@ fn thread_conversation() {
             visible_to_me(m)
                 .order_by("createdAt", ASC)
                 .related("attachments", same)
-                .related("nudgeCounts", |n| n.eq("userId", ME))
+                .related("nudgeCounts", nudge_counts_mine_or_channel)
         })
         .one();
     assert_eq!(
@@ -371,7 +388,9 @@ fn thread_conversation() {
             "q/main+cv1",
             "q/ticket+t1",
             "q/participants+pp1",
-            "q/messages+m4"
+            "q/messages+m1",
+            "q/messages+m4",
+            "q/messages+m5"
         ])
     );
     assert_eq!(
@@ -392,12 +411,18 @@ fn thread_conversation_v2() {
             visible_to_me(m)
                 .order_by("createdAt", ASC)
                 .related("attachments", same)
-                .related("nudgeCounts", |n| n.eq("userId", ME))
+                .related("nudgeCounts", nudge_counts_mine_or_channel)
         })
         .one();
     assert_eq!(
         w.subscribe("q", &q),
-        ops(["q/main+cv1", "q/participants+pp1", "q/messages+m4"])
+        ops([
+            "q/main+cv1",
+            "q/participants+pp1",
+            "q/messages+m1",
+            "q/messages+m4",
+            "q/messages+m5"
+        ])
     );
     assert_eq!(
         w.insert("messages", row!["messageId" => "m7", "conversationId" => "cv1", "visibleTo" => ME, "createdAt" => 140]),
@@ -497,9 +522,8 @@ fn user_conversations_paginated() {
 }
 
 /// `userConversationsPaginatedV2`: the caller's subscribed participations
-/// by last reply. Gap N: `lastReplyAt IS NOT NULL` cannot be stated, but
-/// the cursor bound excludes the never-replied row anyway; gap O drops the
-/// `id` tiebreak.
+/// by last reply (`lastReplyAt IS NOT NULL`); gap O drops the `id`
+/// tiebreak.
 #[test]
 fn user_conversations_paginated_v2() {
     let mut w = World::new();
@@ -507,6 +531,7 @@ fn user_conversations_paginated_v2() {
     let q = zql("conversation_participants")
         .eq("userId", ME)
         .eq("isSubscribed", true)
+        .where_is_not_null("lastReplyAt")
         .order_by("lastReplyAt", DESC)
         .order_by("id", DESC)
         .start(&[("lastReplyAt", DESC, 500.into())], false)
@@ -554,7 +579,8 @@ fn channel_and_thread_messages() {
             "q/reactions+rx1",
             "q/attachments+ma1",
             "q/nudgeCounts+nc1",
-            "q/nudgeCounts+nc2"
+            "q/nudgeCounts+nc2",
+            "q/conversation.initialMessage+m1"
         ])
     );
     assert_eq!(
@@ -590,7 +616,8 @@ fn channel_and_thread_messages_v2() {
             "q/conversation.initialMessage+m2",
             "q/attachments+ma1",
             "q/nudgeCounts+nc1",
-            "q/nudgeCounts+nc2"
+            "q/nudgeCounts+nc2",
+            "q/conversation.initialMessage+m1"
         ])
     );
     assert_eq!(w.delete("messages", "m5"), ops(["q/main-m5"]));
@@ -726,7 +753,9 @@ fn channel_conversations_paginated() {
             "q/initialMessage.nudgeCounts+nc2",
             "q/participants+pp1",
             "q/participants+pp3",
-            "q/ticket+t1"
+            "q/ticket+t1",
+            "q/initialMessage+m1",
+            "q/parentMessage+m1"
         ])
     );
     assert_eq!(
@@ -739,7 +768,8 @@ fn channel_conversations_paginated() {
             "q/initialMessage.attachments-ma1",
             "q/initialMessage.nudgeCounts-nc1",
             "q/initialMessage.nudgeCounts-nc2",
-            "q/participants-pp3"
+            "q/participants-pp3",
+            "q/parentMessage-m1"
         ])
     );
 }
@@ -769,7 +799,9 @@ fn channel_conversations_paginated_v2() {
             "q/initialMessage+m2",
             "q/initialMessage.attachments+ma1",
             "q/initialMessage.nudgeCounts+nc1",
-            "q/initialMessage.nudgeCounts+nc2"
+            "q/initialMessage.nudgeCounts+nc2",
+            "q/initialMessage+m1",
+            "q/parentMessage+m1"
         ])
     );
     assert_eq!(
@@ -840,7 +872,9 @@ fn channel_latest_multiple_conversations() {
             "q/initialMessage.attachments+ma1",
             "q/initialMessage.nudgeCounts+nc1",
             "q/initialMessage.nudgeCounts+nc2",
-            "q/ticket+t1"
+            "q/ticket+t1",
+            "q/initialMessage+m1",
+            "q/parentMessage+m1"
         ])
     );
     assert_eq!(
@@ -878,7 +912,9 @@ fn channel_latest_multiple_conversations_v2() {
             "q/initialMessage.attachments+ma1",
             "q/initialMessage.nudgeCounts+nc1",
             "q/initialMessage.nudgeCounts+nc2",
-            "q/ticket+t1"
+            "q/ticket+t1",
+            "q/initialMessage+m1",
+            "q/parentMessage+m1"
         ])
     );
     assert_eq!(
@@ -1003,7 +1039,12 @@ fn get_pinned_messeges() {
         });
     assert_eq!(
         w.subscribe("q", &q),
-        ops(["q/main+cv1", "q/ticket+t1", "q/participants+pp1"])
+        ops([
+            "q/main+cv1",
+            "q/ticket+t1",
+            "q/participants+pp1",
+            "q/initialMessage+m1"
+        ])
     );
     assert_eq!(
         w.update("conversations", &with(&cv2(), row!["pinned" => true])),
@@ -1012,7 +1053,8 @@ fn get_pinned_messeges() {
             "q/initialMessage+m2",
             "q/initialMessage.reactions+rx1",
             "q/initialMessage.reactionCounts+rcnt1",
-            "q/initialMessage.attachments+ma1"
+            "q/initialMessage.attachments+ma1",
+            "q/parentMessage+m1"
         ])
     );
 }
@@ -1037,11 +1079,21 @@ fn get_pinned_messeges_v2() {
         });
     assert_eq!(
         w.subscribe("q", &q),
-        ops(["q/main+cv1", "q/ticket+t1", "q/participants+pp1"])
+        ops([
+            "q/main+cv1",
+            "q/ticket+t1",
+            "q/participants+pp1",
+            "q/initialMessage+m1"
+        ])
     );
     assert_eq!(
         w.update("conversations", &with(&cv1(), row!["pinned" => false])),
-        ops(["q/main-cv1", "q/ticket-t1", "q/participants-pp1"])
+        ops([
+            "q/main-cv1",
+            "q/ticket-t1",
+            "q/participants-pp1",
+            "q/initialMessage-m1"
+        ])
     );
 }
 
@@ -1069,7 +1121,8 @@ fn channel_latest_message() {
             "q/initialMessage+m2",
             "q/initialMessage.reactions+rx1",
             "q/initialMessage.reactionCounts+rcnt1",
-            "q/initialMessage.attachments+ma1"
+            "q/initialMessage.attachments+ma1",
+            "q/initialMessage+m1"
         ])
     );
 }
@@ -1092,7 +1145,8 @@ fn channel_latest_message_v2() {
             "q/main+cv1",
             "q/main+cv2",
             "q/initialMessage+m2",
-            "q/initialMessage.attachments+ma1"
+            "q/initialMessage.attachments+ma1",
+            "q/initialMessage+m1"
         ])
     );
     assert_eq!(w.delete("reactions", "rx1"), ops([]));
@@ -1101,7 +1155,7 @@ fn channel_latest_message_v2() {
 /// `dmChannelsLatestMessagesPaginated`: DM channels by activity through
 /// their stats row, each with its conversations opened by a visible
 /// message: an existence test under two LEFT edges. Gap O: the per-channel
-/// `LIMIT 1` is not applied; gap N loses everyone-visible openers.
+/// `LIMIT 1` is not applied.
 #[test]
 fn dm_channels_latest_messages_paginated() {
     let mut w = World::new();
@@ -1129,8 +1183,10 @@ fn dm_channels_latest_messages_paginated() {
             "q/has:channel+c-dm",
             "q/channel+c-dm",
             "q/channel.conversations+cvdm1",
+            "q/channel.conversations.has:initialMessage+m1",
             "q/channel.conversations.has:initialMessage+m2",
             "q/channel.conversations.has:initialMessage+m4",
+            "q/channel.conversations.has:initialMessage+m5",
             "q/channel.conversations.has:initialMessage+mdm1"
         ])
     );
@@ -1345,9 +1401,8 @@ fn seed_nudges(w: &mut World) {
 
 /// `messageNudges`: a message's active nudges visible to the caller, the
 /// message itself visible and in a reachable channel: three existence
-/// tests deep. Gap N: `visibleTo IS NULL` on nudge and message; gap X: the
-/// channel's public-or-participant rule, so the channel test is bare
-/// here.
+/// tests deep. Gap X: the channel's public-or-participant rule, so the
+/// channel test is bare here.
 #[test]
 fn message_nudges() {
     let mut w = World::new();
@@ -1366,8 +1421,11 @@ fn message_nudges() {
         w.subscribe("q", &q),
         ops([
             "q/main+sn1",
+            "q/main+sn3",
+            "q/has:sourceMessage+m1",
             "q/has:sourceMessage+m2",
             "q/has:sourceMessage+m4",
+            "q/has:sourceMessage+m5",
             "q/has:sourceMessage.has:conversation+cv1",
             "q/has:sourceMessage.has:conversation+cv2",
             "q/has:sourceMessage.has:conversation+cv3",
@@ -1382,7 +1440,7 @@ fn message_nudges() {
 }
 
 /// `surfaceNudgesByCountRowIds`: active nudges of given count rows,
-/// visible to the caller. Gap N as above.
+/// visible to the caller.
 #[test]
 fn surface_nudges_by_count_row_ids() {
     let mut w = World::new();
@@ -1394,7 +1452,7 @@ fn surface_nudges_by_count_row_ids() {
             .eq("state", "ACTIVE"),
     )
     .order_by("createdAt", ASC);
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+sn1"]));
+    assert_eq!(w.subscribe("q", &q), ops(["q/main+sn1", "q/main+sn3"]));
     assert_eq!(w.delete("surface_nudges", "sn1"), ops(["q/main-sn1"]));
 }
 
@@ -1407,7 +1465,10 @@ fn entity_nudges() {
     let q = visible_to_me(zql("surface_nudges").eq("sourceId", "m2"))
         .filter(or(vec![eq("state", "ACTIVE"), eq("state", "DISMISSED")]))
         .order_by("createdAt", ASC);
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+sn1", "q/main+sn2"]));
+    assert_eq!(
+        w.subscribe("q", &q),
+        ops(["q/main+sn1", "q/main+sn2", "q/main+sn3"])
+    );
     assert_eq!(
         w.update("surface_nudges", &with(&sn2(), row!["state" => "EXPIRED"])),
         ops(["q/main-sn2"])

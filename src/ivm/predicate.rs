@@ -3,8 +3,9 @@
 //! NULL semantics follow SQL, collapsed to two-valued logic: any comparison
 //! that touches `Null` — the row's value, the condition's value, or a
 //! missing column — evaluates to `false`, for every operator including
-//! `NEQ` and `NOT_IN`. (Dedicated `IS NULL` / `IS NOT NULL` operators are
-//! an open design note in the README.)
+//! `NEQ` and `NOT_IN`. The null tests are the exception: `IS NULL` holds
+//! for a `Null` or missing column and `IS NOT NULL` for a present,
+//! non-`Null` one; with any operand but `Null` neither ever holds.
 //!
 //! Every function threads an `evaluated` counter so callers can observe how
 //! much work routing a write actually costs (see `crate::ivm::IvmStats`).
@@ -40,6 +41,17 @@ pub fn eval_condition(
 ) -> bool {
     *evaluated += 1;
 
+    use ComparisonOperator::*;
+    match cond.comparison_operator {
+        IS => return cond.value.is_null() && row.get(&cond.column).is_none_or(Value::is_null),
+        IS_NOT => {
+            return cond.value.is_null()
+                && row
+                    .get(&cond.column)
+                    .is_some_and(|actual| !actual.is_null());
+        }
+        _ => {}
+    }
     let Some(actual) = row.get(&cond.column) else {
         return false;
     };
@@ -47,7 +59,6 @@ pub fn eval_condition(
         return false;
     }
 
-    use ComparisonOperator::*;
     match cond.comparison_operator {
         EQ => actual.loose_eq(&cond.value),
         NEQ => !actual.loose_eq(&cond.value),
@@ -76,6 +87,7 @@ pub fn eval_condition(
             Value::Set(set) => !set.contains(actual),
             _ => false,
         },
+        IS | IS_NOT => false,
     }
 }
 
@@ -92,6 +104,35 @@ mod tests {
     /// Evaluate `filter` against `row`, discarding the evaluated counter.
     fn check(filter: &Where, row: &HashMap<ColumnName, Value>) -> bool {
         evaluate(filter, row, &mut 0)
+    }
+
+    /// `IS NULL` holds for a `Null` or absent column, `IS NOT NULL` for a
+    /// present non-`Null` one; with any other operand neither holds, and
+    /// `= NULL` / `!= NULL` stay false.
+    #[test]
+    fn null_tests() {
+        let null_row = row(vec![("id", Value::Int(1)), ("owner", Value::Null)]);
+        let absent_row = row(vec![("id", Value::Int(1))]);
+        let owned_row = row(vec![("id", Value::Int(1)), ("owner", Value::from("u1"))]);
+        let is_null = Where::is_null("owner");
+        let is_not_null = Where::is_not_null("owner");
+        assert!(check(&is_null, &null_row));
+        assert!(check(&is_null, &absent_row));
+        assert!(!check(&is_null, &owned_row));
+        assert!(!check(&is_not_null, &null_row));
+        assert!(!check(&is_not_null, &absent_row));
+        assert!(check(&is_not_null, &owned_row));
+        let is_text = Where::condition("owner", IS, "u1");
+        assert!(!check(&is_text, &owned_row));
+        assert!(!check(&is_text, &null_row));
+        assert!(!check(
+            &Where::condition("owner", EQ, Value::Null),
+            &null_row
+        ));
+        assert!(!check(
+            &Where::condition("owner", NEQ, Value::Null),
+            &owned_row
+        ));
     }
 
     /// All six comparison operators match and reject as expected on int and

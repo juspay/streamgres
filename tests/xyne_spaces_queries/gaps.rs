@@ -5,19 +5,19 @@
 
 use jus_sync::model::ComparisonOperator::{GT, NEQ};
 use jus_sync::model::Order::{ASC, DESC};
-use jus_sync::model::{Value, ValueType};
+use jus_sync::model::{Value, ValueType, Where};
 use jus_sync::parser::parse_read;
 
 use super::catalog::catalog;
 use super::world::{ME, World, ops};
-use super::zql::{eq, or, same, zql};
+use super::zql::{eq, is_null, or, same, zql};
 
-/// Gap N: `visibleTo IS NULL OR visibleTo = me` is the visibility rule of
-/// every message query. The parser has no `IS`, `visibleTo = NULL` parses
-/// but never matches, and `!=` drops `NULL` rows as SQL does, so the
-/// `NULL` (everyone-visible) message is unreachable by any filter.
+/// Closed gap N: `visibleTo IS NULL OR visibleTo = me` is the visibility
+/// rule of every message query. `IS NULL` selects the everyone-visible
+/// message, `!=` still drops `NULL` rows as SQL does, and the parser reads
+/// both spellings while refusing `IS` with anything but `NULL`.
 #[test]
-fn n_is_null_has_no_operator_and_null_never_compares() {
+fn n_is_null_selects_null_rows_and_comparisons_still_do_not() {
     let mut w = World::new();
     w.seed(
         "messages",
@@ -46,26 +46,37 @@ fn n_is_null_has_no_operator_and_null_never_compares() {
 
     let visible = zql("messages")
         .eq("conversationId", "c1")
-        .filter(or(vec![eq("visibleTo", Value::Null), eq("visibleTo", ME)]));
-    assert_eq!(w.subscribe("q", &visible), ops(["q/main+m-me"]));
+        .filter(or(vec![is_null("visibleTo"), eq("visibleTo", ME)]));
+    assert_eq!(
+        w.subscribe("q", &visible),
+        ops(["q/main+m-all", "q/main+m-me"])
+    );
 
     let not_hidden = zql("messages")
         .eq("conversationId", "c1")
         .where_("visibleTo", NEQ, "u-2");
     assert_eq!(w.subscribe("q2", &not_hidden), ops(["q2/main+m-me"]));
+    assert_eq!(
+        w.update(
+            "messages",
+            &[
+                ("messageId", "m-all".into()),
+                ("conversationId", "c1".into()),
+                ("visibleTo", "u-2".into()),
+            ],
+        ),
+        ops(["q/main-m-all"])
+    );
 
-    let error = parse_read("SELECT * FROM messages WHERE visibleTo IS NULL", &catalog())
-        .expect_err("no IS");
-    assert!(
-        error.message.contains("expected a comparison operator"),
-        "{error}"
-    );
-    let error = parse_read("SELECT * FROM tickets WHERE rootId IS NOT NULL", &catalog())
-        .expect_err("no IS NOT");
-    assert!(
-        error.message.contains("expected a comparison operator"),
-        "{error}"
-    );
+    let parsed = parse_read("SELECT * FROM messages WHERE visibleTo IS NULL", &catalog())
+        .expect("IS NULL parses");
+    assert_eq!(parsed.filter, Where::is_null("visibleTo"));
+    let parsed = parse_read("SELECT * FROM tickets WHERE rootId IS NOT NULL", &catalog())
+        .expect("IS NOT NULL parses");
+    assert_eq!(parsed.filter, Where::is_not_null("rootId"));
+    let error = parse_read("SELECT * FROM messages WHERE visibleTo IS 'x'", &catalog())
+        .expect_err("IS takes NULL only");
+    assert!(error.message.contains("expected NULL after IS"), "{error}");
 }
 
 /// Gap L: the search queries match `name`, `title`, `xyneId` with `ILIKE`,
