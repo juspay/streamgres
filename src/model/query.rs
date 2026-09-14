@@ -10,51 +10,6 @@ use super::frame::{DataFrameKey, DataFrameRow};
 use super::schema::{ColumnName, TableName};
 use super::value::Value;
 
-/// The client-facing handle of one registered subscription.
-///
-/// A dedicated type rather than a bare `String`, so a subscription id can
-/// never be confused with the other strings the engine passes around
-/// (table names, column names). Constructed from any string-ish value;
-/// compares, orders, and hashes exactly like the underlying id, and maps
-/// keyed by `QueryId` accept a plain `&str` for lookups.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct QueryId(String);
-
-impl QueryId {
-    /// The id as a borrowed string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for QueryId {
-    /// Wraps a borrowed id.
-    fn from(id: &str) -> Self {
-        QueryId(id.to_owned())
-    }
-}
-
-impl From<String> for QueryId {
-    /// Wraps an owned id.
-    fn from(id: String) -> Self {
-        QueryId(id)
-    }
-}
-
-impl std::borrow::Borrow<str> for QueryId {
-    /// Lets maps keyed by [`QueryId`] be queried with a plain `&str`.
-    fn borrow(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for QueryId {
-    /// Renders as the bare id, honoring width/alignment format flags.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.pad(&self.0)
-    }
-}
-
 /// A subscription query: `SELECT * FROM table WHERE … ORDER BY … LIMIT …`.
 ///
 /// `Eq` + `Hash` let structurally identical queries be compared and deduped

@@ -15,8 +15,14 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 
-# The Postgres storage backend and change-stream poller (`src/sync/pg`).
+# The Postgres storage backend and change feed (`src/sync/pg`).
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+# The change feed's transport (`src/sync/pg/stream.rs`): a replication
+# connection speaking START_REPLICATION with the `pgoutput` plugin, and the
+# row messages it carries, decoded. Apache-2.0 OR MIT and MIT respectively;
+# TLS is left off, as it is for tokio-postgres above.
+pgwire-replication = { version = "0.4", default-features = false, features = ["scram"] }
+pgoutput = "0.0.7"
 # The replication-protocol connection that mints exported snapshots
 # (`src/sync/pg/replication.rs`): tokio-postgres cannot open one, so the
 # startup, authentication and simple-query messages are spoken directly.

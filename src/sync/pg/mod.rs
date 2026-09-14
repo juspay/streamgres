@@ -17,8 +17,10 @@
 //! has finished.
 //!
 //! [`stream::PgStream`] delivers the change feed from a permanent logical
-//! slot and positions every write at its commit. Everything here runs on
-//! the engine's thread inside a `tokio::task::LocalSet`.
+//! slot over a replication connection and positions every write at the
+//! end of its commit record, the same scale the aliases' consistent
+//! points are on. Everything here runs on the engine's thread inside a
+//! `tokio::task::LocalSet`.
 
 pub mod replication;
 pub mod sql;
@@ -35,8 +37,8 @@ use tokio_postgres::{Client, Config, IsolationLevel, NoTls, Row};
 
 use super::storage::{Storage, StorageError};
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameRow, DbTable, Lsn, SingleTableReadQuery, Snapshot, Value,
-    ValueType,
+    Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, Lsn, SingleTableReadQuery, Snapshot,
+    Value, ValueType,
 };
 use replication::ReplicationConnection;
 
@@ -338,18 +340,19 @@ pub fn parse_lsn(text: &str) -> Result<Lsn, StorageError> {
 /// One result row, in [`sql::select_columns`] order, as the engine's
 /// (identity, image) pair.
 fn decode_row(row: &Row, table: &DbTable) -> Result<(DataFrameKey, DataFrameRow), StorageError> {
-    let mut data: HashMap<String, Value> = HashMap::new();
+    let mut data: HashMap<ColumnName, Value> = HashMap::new();
     for (index, column) in sql::select_columns(table).into_iter().enumerate() {
         let declared = &table.columns[column].r#type;
         let value = decode_value(row, index, declared)?;
-        data.insert(column.as_str().to_owned(), value);
+        data.insert(column.clone(), value);
     }
-    let pkey_value: HashMap<String, Value> = table
-        .pkey
-        .iter()
-        .map(|column| (column.as_str().to_owned(), data[column.as_str()].clone()))
-        .collect();
-    Ok((DataFrameKey::new(pkey_value), DataFrameRow { data }))
+    let key = DataFrameKey::new(
+        table
+            .pkey
+            .iter()
+            .map(|column| (column.clone(), data[column].clone())),
+    );
+    Ok((key, DataFrameRow { data }))
 }
 
 /// One column of a result row, decoded by the cast its declared type was

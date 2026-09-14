@@ -211,18 +211,15 @@ pub(crate) fn group(raw: Vec<Raw>) -> Vec<ClientUpdate> {
 mod tests {
     use super::*;
     use crate::model::Value;
-    use std::collections::HashMap;
 
     /// A row image with one `v` column.
     fn image(v: i64) -> DataFrameRow {
-        DataFrameRow {
-            data: HashMap::from([("v".to_owned(), Value::Int(v))]),
-        }
+        DataFrameRow::new([("v", Value::Int(v))])
     }
 
     /// The key of row `id`.
     fn key(id: i64) -> DataFrameKey {
-        DataFrameKey::new(HashMap::from([("id".to_owned(), Value::Int(id))]))
+        DataFrameKey::new([("id", Value::Int(id))])
     }
 
     /// A raw operation of subscription `sub` (root part) for client `client`.

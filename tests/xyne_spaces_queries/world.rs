@@ -18,8 +18,8 @@ use std::rc::Rc;
 
 use jus_sync::ivm::{ClientUpdate, MultiTableIVM, QueryPart, SubId};
 use jus_sync::model::{
-    Catalog, ClientId, DataFrameKey, DataFrameOperation, DataFrameRow, DeleteQuery, InsertQuery,
-    UpdateQuery, Value, WriteQuery,
+    Catalog, ClientId, ColumnName, DataFrameKey, DataFrameOperation, DataFrameRow, DeleteQuery,
+    InsertQuery, UpdateQuery, Value, WriteQuery,
 };
 use jus_sync::parser::parse_read;
 use jus_sync::sync::{Local, MemoryStorage};
@@ -216,7 +216,7 @@ fn insert(table: &str, pairs: &[(&str, Value)]) -> WriteQuery {
 
 /// The identity of the row keyed `value` on `table`.
 fn key(table: &str, value: Value) -> DataFrameKey {
-    DataFrameKey::new(HashMap::from([(pkey(table).to_owned(), value)]))
+    DataFrameKey::new([(pkey(table), value)])
 }
 
 /// A full row image of `table`: every declared column, `pairs` where given,
@@ -233,7 +233,7 @@ fn row(table: &str, pairs: &[(&str, Value)]) -> (DataFrameKey, DataFrameRow) {
             "no column `{name}` on `{table}`"
         );
     }
-    let data: HashMap<String, Value> = declared
+    let data: HashMap<ColumnName, Value> = declared
         .iter()
         .map(|(column, _)| {
             let value = pairs
@@ -247,7 +247,7 @@ fn row(table: &str, pairs: &[(&str, Value)]) -> (DataFrameKey, DataFrameRow) {
                         Value::Null
                     }
                 });
-            ((*column).to_owned(), value)
+            (ColumnName::from(*column), value)
         })
         .collect();
     let key_value = data[pkey(table)].clone();

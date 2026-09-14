@@ -453,11 +453,11 @@ impl Parser {
     }
 
     /// A column name, validated to exist on `table`.
-    fn column_name(&mut self, table: &DbTable) -> Result<String, ParseError> {
+    fn column_name(&mut self, table: &DbTable) -> Result<ColumnName, ParseError> {
         let at = self.at();
         let name = self.ident()?;
         if table.column(&name).is_some() {
-            Ok(name)
+            Ok(ColumnName::from(name))
         } else {
             Err(ParseError {
                 message: format!("unknown column `{}` on table `{}`", name, table.name),
@@ -598,7 +598,7 @@ impl Parser {
                 });
             }
 
-            let data: HashMap<String, Value> = columns.into_iter().zip(values).collect();
+            let data: HashMap<ColumnName, Value> = columns.into_iter().zip(values).collect();
             let pkey_value = pkey_of(table, &data);
             ensure_full_pkey(table, &pkey_value, "INSERT must provide", row_at)?;
             ensure_pkey_not_null(&pkey_value, row_at)?;
@@ -613,7 +613,7 @@ impl Parser {
             self.expect_word("SET")?;
 
             let set_at = self.at();
-            let mut assignments: Vec<(String, Value)> = Vec::new();
+            let mut assignments: Vec<(ColumnName, Value)> = Vec::new();
             loop {
                 let column = self.column_name(table)?;
                 self.expect_sym("=")?;
@@ -633,7 +633,7 @@ impl Parser {
                 set_at,
             )?;
             for (column, _) in &assignments {
-                if table.is_pkey(column) {
+                if table.is_pkey(column.as_str()) {
                     return Err(ParseError {
                         message: format!(
                             "updating primary-key column `{column}` is not supported — \
@@ -647,11 +647,7 @@ impl Parser {
                 .columns
                 .values()
                 .filter(|column| !table.is_pkey(column.name.as_str()))
-                .filter(|column| {
-                    !assignments
-                        .iter()
-                        .any(|(name, _)| column.name == name.as_str())
-                })
+                .filter(|column| !assignments.iter().any(|(name, _)| column.name == *name))
                 .map(|column| column.name.as_str())
                 .collect();
             if !missing.is_empty() {
@@ -668,7 +664,7 @@ impl Parser {
             }
 
             let pkey_value = self.write_pkey_filter(table)?;
-            let mut data: HashMap<String, Value> = assignments.into_iter().collect();
+            let mut data: HashMap<ColumnName, Value> = assignments.into_iter().collect();
             for (column, value) in &pkey_value {
                 data.insert(column.clone(), value.clone());
             }
@@ -691,7 +687,10 @@ impl Parser {
 
     /// The mandatory `WHERE` of an UPDATE / DELETE, restricted to a
     /// conjunction of `pkey_column = value` covering the full primary key.
-    fn write_pkey_filter(&mut self, table: &DbTable) -> Result<HashMap<String, Value>, ParseError> {
+    fn write_pkey_filter(
+        &mut self,
+        table: &DbTable,
+    ) -> Result<HashMap<ColumnName, Value>, ParseError> {
         self.expect_word("WHERE")?;
         let at = self.at();
         let filter = self.filter(table)?;
@@ -706,7 +705,7 @@ impl Parser {
 
         let mut pkey_value = HashMap::new();
         for (column, value) in pairs {
-            if !table.is_pkey(&column) {
+            if !table.is_pkey(column.as_str()) {
                 return Err(ParseError {
                     message: format!(
                         "`{column}` is not a primary-key column of `{}` — writes may only \
@@ -781,14 +780,14 @@ impl Parser {
             ComparisonOperator::LT
         } else if self.eat_word("IN") {
             return Ok(Where::Condition(Condition {
-                column: column.into(),
+                column,
                 comparison_operator: ComparisonOperator::IN,
                 value: self.value_list()?,
             }));
         } else if self.eat_word("NOT") {
             self.expect_word("IN")?;
             return Ok(Where::Condition(Condition {
-                column: column.into(),
+                column,
                 comparison_operator: ComparisonOperator::NOT_IN,
                 value: self.value_list()?,
             }));
@@ -799,7 +798,7 @@ impl Parser {
             ));
         };
         Ok(Where::Condition(Condition {
-            column: column.into(),
+            column,
             comparison_operator,
             value: self.value()?,
         }))
@@ -910,9 +909,9 @@ fn default_order(table: &DbTable, at: usize) -> Result<OrderBy, ParseError> {
 }
 
 /// The primary-key values of one full row image, by pkey column name.
-fn pkey_of(table: &DbTable, data: &HashMap<String, Value>) -> HashMap<String, Value> {
+fn pkey_of(table: &DbTable, data: &HashMap<ColumnName, Value>) -> HashMap<ColumnName, Value> {
     data.iter()
-        .filter(|(column, _)| table.is_pkey(column))
+        .filter(|(column, _)| table.is_pkey(column.as_str()))
         .map(|(column, value)| (column.clone(), value.clone()))
         .collect()
 }
@@ -921,7 +920,7 @@ fn pkey_of(table: &DbTable, data: &HashMap<String, Value>) -> HashMap<String, Va
 /// `verb` prefixes the message ("INSERT must provide" / "WHERE must pin").
 fn ensure_full_pkey(
     table: &DbTable,
-    pkey_value: &HashMap<String, Value>,
+    pkey_value: &HashMap<ColumnName, Value>,
     verb: &str,
     at: usize,
 ) -> Result<(), ParseError> {
@@ -948,7 +947,10 @@ fn ensure_full_pkey(
 
 /// Reject `NULL` primary-key values — a NULL-keyed row could never be
 /// matched or addressed again.
-fn ensure_pkey_not_null(pkey_value: &HashMap<String, Value>, at: usize) -> Result<(), ParseError> {
+fn ensure_pkey_not_null(
+    pkey_value: &HashMap<ColumnName, Value>,
+    at: usize,
+) -> Result<(), ParseError> {
     let mut null_columns: Vec<&str> = pkey_value
         .iter()
         .filter(|(_, value)| value.is_null())
@@ -977,14 +979,14 @@ fn ensure_pkey_not_null(pkey_value: &HashMap<String, Value>, at: usize) -> Resul
 fn coerce_to_column_type(
     value: Value,
     table: &DbTable,
-    column: &str,
+    column: &ColumnName,
     at: usize,
 ) -> Result<Value, ParseError> {
     let declared = table
-        .column(column)
+        .column(column.as_str())
         .map(|candidate| &candidate.r#type)
         .expect("column names are validated against the table before coercion");
-    coerce_to_type(value, declared, column, at)
+    coerce_to_type(value, declared, column.as_str(), at)
 }
 
 /// Recursive worker for [`coerce_to_column_type`], matching a value (and
@@ -1036,10 +1038,10 @@ fn coerce_to_type(
 }
 
 /// Error if any column name appears more than once.
-fn ensure_no_duplicates(columns: &[String], at: usize) -> Result<(), ParseError> {
+fn ensure_no_duplicates(columns: &[ColumnName], at: usize) -> Result<(), ParseError> {
     let mut seen = HashSet::new();
     for column in columns {
-        if !seen.insert(column.as_str()) {
+        if !seen.insert(column) {
             return Err(ParseError {
                 message: format!("column `{column}` appears twice"),
                 position: at,
@@ -1051,11 +1053,11 @@ fn ensure_no_duplicates(columns: &[String], at: usize) -> Result<(), ParseError>
 
 /// Flatten a filter into `column = value` pairs; `Err(())` if it contains
 /// anything other than a conjunction of equality conditions.
-fn collect_pkey_equalities(filter: &Where, out: &mut Vec<(String, Value)>) -> Result<(), ()> {
+fn collect_pkey_equalities(filter: &Where, out: &mut Vec<(ColumnName, Value)>) -> Result<(), ()> {
     match filter {
         Where::Condition(condition) => {
             if condition.comparison_operator == ComparisonOperator::EQ {
-                out.push((condition.column.to_string(), condition.value.clone()));
+                out.push((condition.column.clone(), condition.value.clone()));
                 Ok(())
             } else {
                 Err(())

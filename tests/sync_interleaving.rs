@@ -42,18 +42,18 @@ fn users_table() -> DbTable {
 /// The one client every subscription here belongs to.
 const CLIENT: ClientId = ClientId(1);
 
-fn pkey(id: i64) -> HashMap<String, Value> {
-    HashMap::from([("id".to_owned(), Value::Int(id))])
+fn pkey(id: i64) -> HashMap<ColumnName, Value> {
+    HashMap::from([("id".into(), Value::Int(id))])
 }
 
 /// Collects `(column, value)` pairs plus the `id` primary key into a full
 /// row image.
 fn full_row(id: i64, pairs: &[(&str, Value)]) -> DataFrameRow {
-    let mut data: HashMap<String, Value> = pairs
+    let mut data: HashMap<ColumnName, Value> = pairs
         .iter()
-        .map(|(column, value)| ((*column).to_owned(), value.clone()))
+        .map(|(column, value)| ((*column).into(), value.clone()))
         .collect();
-    data.insert("id".to_owned(), Value::Int(id));
+    data.insert("id".into(), Value::Int(id));
     DataFrameRow { data }
 }
 

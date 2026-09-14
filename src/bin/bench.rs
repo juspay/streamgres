@@ -192,7 +192,7 @@ fn user_id(n: u64) -> String {
 
 /// A single-column primary key `{"id": value}`.
 fn key(id: impl Into<Value>) -> DataFrameKey {
-    DataFrameKey::new(HashMap::from([("id".to_owned(), id.into())]))
+    DataFrameKey::new([("id", id.into())])
 }
 
 /// A DELETE of one row of `table`.
@@ -241,22 +241,14 @@ impl Ticket {
 
     /// The full row image.
     fn row(&self) -> DataFrameRow {
-        DataFrameRow {
-            data: HashMap::from([
-                ("id".to_owned(), Value::Int(self.id)),
-                ("status".to_owned(), Value::from(STATUSES[self.status])),
-                (
-                    "priority".to_owned(),
-                    Value::from(PRIORITIES[self.priority]),
-                ),
-                (
-                    "assigned_to".to_owned(),
-                    Value::from(user_id(self.assigned_to)),
-                ),
-                ("points".to_owned(), Value::Int(self.points)),
-                ("team".to_owned(), Value::Int(self.team)),
-            ]),
-        }
+        DataFrameRow::new([
+            ("id", Value::Int(self.id)),
+            ("status", Value::from(STATUSES[self.status])),
+            ("priority", Value::from(PRIORITIES[self.priority])),
+            ("assigned_to", Value::from(user_id(self.assigned_to))),
+            ("points", Value::Int(self.points)),
+            ("team", Value::Int(self.team)),
+        ])
     }
 
     /// An INSERT of this ticket.
@@ -280,16 +272,11 @@ impl Ticket {
 
 /// The full image of user `n` at name version `version`.
 fn user_row(n: u64, version: u64) -> DataFrameRow {
-    DataFrameRow {
-        data: HashMap::from([
-            ("id".to_owned(), Value::from(user_id(n))),
-            (
-                "name".to_owned(),
-                Value::from(format!("user {n} v{version}")),
-            ),
-            ("team".to_owned(), Value::Int((n % TEAMS) as i64)),
-        ]),
-    }
+    DataFrameRow::new([
+        ("id", Value::from(user_id(n))),
+        ("name", Value::from(format!("user {n} v{version}"))),
+        ("team", Value::Int((n % TEAMS) as i64)),
+    ])
 }
 
 /// An INSERT of user `n`.

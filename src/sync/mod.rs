@@ -9,7 +9,7 @@
 //! | [`Runtime`] | The single owner of an engine: hands out the engine's reads, keeps the delivered writes a read may still be behind, and lands each read after bringing it up to the engine's position (its module docs). Pure state, no I/O. |
 //! | [`Local`] | The synchronous driver: reads answered at once, landed inline (tests, demo, benchmark). |
 //! | [`Service`] | The asynchronous driver: a command loop on a `LocalSet`; snapshot reads as tasks, maintenance reads inline. |
-//! | [`pg`] | Postgres: reads from the exported snapshot of a rotating temporary replication slot, flipped to a newer one only once the stream has passed it, and the change-feed poller that positions every write. |
+//! | [`pg`] | Postgres: reads from the exported snapshot of a rotating temporary replication slot, flipped to a newer one only once the stream has passed it, and the change feed streamed from a permanent slot that positions every write. |
 //!
 //! The sources differ only in how they arrive at a read's location; the
 //! runtime, the engine's rules, and both drivers are shared.

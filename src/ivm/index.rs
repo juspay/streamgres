@@ -337,7 +337,7 @@ impl TableIndex {
     /// not residence.
     pub(super) fn matched(
         &self,
-        row: &HashMap<String, Value>,
+        row: &HashMap<ColumnName, Value>,
         epoch: u64,
         holders: &BTreeSet<SubId>,
         stats: &mut IvmStats,

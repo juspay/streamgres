@@ -42,18 +42,18 @@ fn query(table: &DbTable, filter: Where) -> SingleTableReadQuery {
 }
 
 /// Builds the single-column primary-key map `{"id": id}`.
-fn pkey(id: i64) -> HashMap<String, Value> {
-    HashMap::from([("id".to_owned(), Value::Int(id))])
+fn pkey(id: i64) -> HashMap<ColumnName, Value> {
+    HashMap::from([("id".into(), Value::Int(id))])
 }
 
 /// Collects `(column, value)` pairs plus the `id` primary key into a full
 /// row image — records must carry every column, pkey included.
 fn full_row(id: i64, pairs: &[(&str, Value)]) -> DataFrameRow {
-    let mut data: HashMap<String, Value> = pairs
+    let mut data: HashMap<ColumnName, Value> = pairs
         .iter()
-        .map(|(col, val)| ((*col).to_owned(), val.clone()))
+        .map(|(col, val)| ((*col).into(), val.clone()))
         .collect();
-    data.insert("id".to_owned(), Value::Int(id));
+    data.insert("id".into(), Value::Int(id));
     DataFrameRow { data }
 }
 

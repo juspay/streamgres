@@ -8,12 +8,12 @@
 //!   authoritative schema home; queries reference tables by name and
 //!   resolve them in the catalog
 //! - [`query`] — [`SingleTableReadQuery`] / [`WriteQuery`], the `Where`
-//!   predicate tree, and the [`QueryId`] subscription handle
+//!   predicate tree, and the [`SubId`] / [`ClientId`] handles
 //! - [`frame`] — row identities, images, the [`DataFrameOperation`] delta
 //!   unit, and the engine's shared [`frame::TableFrame`] materialization
 //! - [`position`] — where a write, a read, or a frame row sits in the
-//!   source's history: one WAL location ([`Lsn`]; [`position::RowAt`] for
-//!   frame rows, [`Snapshot`] for a read's result)
+//!   source's history: one WAL location ([`Lsn`]; [`Snapshot`] for a
+//!   read's result)
 //!
 //! Structure changes here ripple through the whole engine (these types are
 //! index keys in `crate::ivm`), so keep field changes deliberate and discuss
@@ -29,7 +29,7 @@ pub use frame::{DataFrameKey, DataFrameOperation, DataFrameRow};
 pub use position::{Lsn, Snapshot};
 pub use query::{
     ClientId, ComparisonOperator, Condition, DeleteQuery, Disjunct, InsertQuery, Join,
-    MultiTableReadQuery, Order, OrderBy, QueryId, SingleTableReadQuery, SubId, UpdateQuery, Where,
+    MultiTableReadQuery, Order, OrderBy, SingleTableReadQuery, SubId, UpdateQuery, Where,
     WriteQuery,
 };
 pub use schema::{Catalog, ColumnName, DbColumn, DbTable, TableName};

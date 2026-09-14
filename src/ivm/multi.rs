@@ -203,6 +203,11 @@ struct Tree {
     post_order: Vec<QueryPart>,
 }
 
+/// The join layer's handle for one shared tree; unique for the life of
+/// the layer, never reused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+struct TreeId(u64);
+
 /// The join layer. Owns the inner [`SingleTableIVM`] exclusively, so its
 /// part ids cannot collide with anything registered from outside.
 ///
@@ -218,11 +223,11 @@ struct Tree {
 ///   disconnect.
 pub struct MultiTableIVM {
     single: SingleTableIVM,
-    trees: HashMap<usize, Tree>,
-    next_tree: usize,
-    by_sub: HashMap<SubId, usize>,
+    trees: HashMap<TreeId, Tree>,
+    next_tree: u64,
+    by_sub: HashMap<SubId, TreeId>,
     next_sub: u64,
-    parts: HashMap<SubId, (usize, QueryPart)>,
+    parts: HashMap<SubId, (TreeId, QueryPart)>,
     clients: HashMap<SubId, ClientId>,
     by_client: HashMap<ClientId, BTreeSet<SubId>>,
 }
@@ -432,7 +437,7 @@ impl MultiTableIVM {
             self.single.note_shared_snapshots(parts);
             return (sub, out);
         }
-        let tree_id = self.next_tree;
+        let tree_id = TreeId(self.next_tree);
         self.next_tree += 1;
         let mut tree = build_tree(&query);
         tree.subscribers.push(sub);
@@ -449,7 +454,7 @@ impl MultiTableIVM {
     /// restrictions; if its rows are all at hand (a twin's) it is live at
     /// once, otherwise it goes live when its read lands. LEFT children
     /// follow from [`Self::landed`].
-    fn register_part(&mut self, tree_id: usize, part: QueryPart, out: &mut Vec<MultiTableUpdate>) {
+    fn register_part(&mut self, tree_id: TreeId, part: QueryPart, out: &mut Vec<MultiTableUpdate>) {
         let (waiting, own) = {
             let tree = &self.trees[&tree_id];
             let node = &tree.nodes[&part];
@@ -501,7 +506,7 @@ impl MultiTableIVM {
     /// children (their sets are now filled by its rows), and, if it is a
     /// RIGHT child whose parent is still waiting, let the parent try to
     /// register.
-    fn landed(&mut self, tree_id: usize, part: &QueryPart, out: &mut Vec<MultiTableUpdate>) {
+    fn landed(&mut self, tree_id: TreeId, part: &QueryPart, out: &mut Vec<MultiTableUpdate>) {
         let (left_children, waiting_parent) = {
             let Some(tree) = self.trees.get_mut(&tree_id) else {
                 return;
@@ -574,7 +579,7 @@ impl MultiTableIVM {
 
     /// A part's registered filter: its own `WHERE` plus one set-valued
     /// `IN` leaf per column it is driven on.
-    fn restricted_filter(&self, tree_id: usize, part: &QueryPart) -> Where {
+    fn restricted_filter(&self, tree_id: TreeId, part: &QueryPart) -> Where {
         let tree = &self.trees[&tree_id];
         let mut parts = vec![tree.nodes[part].query.filter.clone()];
         for column in driven_columns(tree, part) {
@@ -622,7 +627,7 @@ impl MultiTableIVM {
     /// trees, every driven part before its driver, diffing replace pairs
     /// and cascading arrivals and departures.
     fn forward(&mut self, applied: Vec<SingleTableUpdate>) -> Vec<MultiTableUpdate> {
-        let mut tagged: Vec<(usize, usize, QueryPart, SingleTableUpdate)> = Vec::new();
+        let mut tagged: Vec<(TreeId, usize, QueryPart, SingleTableUpdate)> = Vec::new();
         for update in applied {
             let Some((tree_id, part)) = self.parts.get(&update.query).cloned() else {
                 continue;
@@ -700,7 +705,7 @@ impl MultiTableIVM {
     /// Forward one part operation to every subscriber of its tree.
     fn emit(
         &self,
-        tree_id: usize,
+        tree_id: TreeId,
         part: &QueryPart,
         table: &TableName,
         op: DataFrameOperation,
@@ -722,7 +727,7 @@ impl MultiTableIVM {
     /// A row now held by `part`: reference its join value on every edge
     /// the part drives (a new reference asks for a read; nothing is
     /// emitted here), count it on every edge the part is driven by.
-    fn arrived(&mut self, tree_id: usize, part: &QueryPart, row: &DataFrameRow) {
+    fn arrived(&mut self, tree_id: TreeId, part: &QueryPart, row: &DataFrameRow) {
         for (edge, drives, column) in edge_steps(&self.trees[&tree_id], part) {
             let value = join_value(row, &column);
             if drives {
@@ -736,7 +741,7 @@ impl MultiTableIVM {
     /// A row no longer held by `part`: the mirror of [`Self::arrived`].
     fn departed(
         &mut self,
-        tree_id: usize,
+        tree_id: TreeId,
         part: &QueryPart,
         row: &DataFrameRow,
         out: &mut Vec<MultiTableUpdate>,
@@ -756,7 +761,7 @@ impl MultiTableIVM {
     /// the old released after — so a kept value never crosses zero.
     fn replaced(
         &mut self,
-        tree_id: usize,
+        tree_id: TreeId,
         part: &QueryPart,
         old: &DataFrameRow,
         new: &DataFrameRow,
@@ -785,7 +790,7 @@ impl MultiTableIVM {
     /// ([`Self::land_fetch`]) they are forwarded and arrive at the driven
     /// node. Before the driven part is registered the set is filled
     /// directly; registration files it whole.
-    fn reference(&mut self, tree_id: usize, edge: usize, value: Value) {
+    fn reference(&mut self, tree_id: TreeId, edge: usize, value: Value) {
         let crossing = self.left_count(tree_id, edge, &value) == 0;
         self.left_bump(tree_id, edge, value.clone());
         if !crossing {
@@ -818,7 +823,7 @@ impl MultiTableIVM {
     /// let them depart from the driven node.
     fn release(
         &mut self,
-        tree_id: usize,
+        tree_id: TreeId,
         edge: usize,
         value: &Value,
         out: &mut Vec<MultiTableUpdate>,
@@ -856,20 +861,20 @@ impl MultiTableIVM {
     }
 
     /// The driven part of `edge` and the column its leaf is on.
-    fn driven_end(&self, tree_id: usize, edge: usize) -> (QueryPart, ColumnName) {
+    fn driven_end(&self, tree_id: TreeId, edge: usize) -> (QueryPart, ColumnName) {
         let edge = &self.trees[&tree_id].edges[edge];
         (edge.driven().clone(), edge.driven_column().clone())
     }
 
     /// The inner id and table of `part` once it is registered; `None`
     /// while registration has not reached it yet.
-    fn registered_part(&self, tree_id: usize, part: &QueryPart) -> Option<(SubId, TableName)> {
+    fn registered_part(&self, tree_id: TreeId, part: &QueryPart) -> Option<(SubId, TableName)> {
         let node = self.trees.get(&tree_id)?.nodes.get(part)?;
         node.part.map(|inner| (inner, node.query.table.clone()))
     }
 
     /// `value`'s current `left` count on `edge` (zero when absent).
-    fn left_count(&self, tree_id: usize, edge: usize, value: &Value) -> u64 {
+    fn left_count(&self, tree_id: TreeId, edge: usize, value: &Value) -> u64 {
         self.trees
             .get(&tree_id)
             .and_then(|tree| tree.edges.get(edge))
@@ -878,7 +883,7 @@ impl MultiTableIVM {
     }
 
     /// Mutable access to one edge's counts.
-    fn counts_mut(&mut self, tree_id: usize, edge: usize) -> Option<&mut JoinKeyCounts> {
+    fn counts_mut(&mut self, tree_id: TreeId, edge: usize) -> Option<&mut JoinKeyCounts> {
         self.trees
             .get_mut(&tree_id)
             .and_then(|tree| tree.edges.get_mut(edge))
@@ -886,7 +891,7 @@ impl MultiTableIVM {
     }
 
     /// Increment `value`'s `left` count on `edge`.
-    fn left_bump(&mut self, tree_id: usize, edge: usize, value: Value) {
+    fn left_bump(&mut self, tree_id: TreeId, edge: usize, value: Value) {
         if let Some(counts) = self.counts_mut(tree_id, edge) {
             *counts.left.entry(value).or_insert(0) += 1;
         }
@@ -894,7 +899,7 @@ impl MultiTableIVM {
 
     /// Decrement `value`'s `left` count on `edge`, removing the entry at
     /// zero.
-    fn left_drop(&mut self, tree_id: usize, edge: usize, value: &Value) {
+    fn left_drop(&mut self, tree_id: TreeId, edge: usize, value: &Value) {
         Self::drop_in(
             self.counts_mut(tree_id, edge)
                 .map(|counts| &mut counts.left),
@@ -903,7 +908,7 @@ impl MultiTableIVM {
     }
 
     /// Increment `value`'s `right` count on `edge`.
-    fn right_bump(&mut self, tree_id: usize, edge: usize, value: Value) {
+    fn right_bump(&mut self, tree_id: TreeId, edge: usize, value: Value) {
         if let Some(counts) = self.counts_mut(tree_id, edge) {
             *counts.right.entry(value).or_insert(0) += 1;
         }
@@ -911,7 +916,7 @@ impl MultiTableIVM {
 
     /// Decrement `value`'s `right` count on `edge`, removing the entry at
     /// zero.
-    fn right_drop(&mut self, tree_id: usize, edge: usize, value: &Value) {
+    fn right_drop(&mut self, tree_id: TreeId, edge: usize, value: &Value) {
         Self::drop_in(
             self.counts_mut(tree_id, edge)
                 .map(|counts| &mut counts.right),

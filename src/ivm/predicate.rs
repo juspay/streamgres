@@ -11,14 +11,14 @@
 
 use std::collections::HashMap;
 
-use crate::model::{ComparisonOperator, Condition, Value, Where};
+use crate::model::{ColumnName, ComparisonOperator, Condition, Value, Where};
 
 /// Evaluate a full `Where` tree against a row image.
 ///
 /// `AND` and `OR` short-circuit, so `evaluated` counts conditions actually
 /// looked at, not the size of the tree. `AND(vec![])` is `true`,
 /// `OR(vec![])` is `false`.
-pub fn evaluate(filter: &Where, row: &HashMap<String, Value>, evaluated: &mut u64) -> bool {
+pub fn evaluate(filter: &Where, row: &HashMap<ColumnName, Value>, evaluated: &mut u64) -> bool {
     match filter {
         Where::Condition(c) => eval_condition(c, row, evaluated),
         Where::AND(children) => children.iter().all(|child| evaluate(child, row, evaluated)),
@@ -33,10 +33,14 @@ pub fn evaluate(filter: &Where, row: &HashMap<String, Value>, evaluated: &mut u6
 /// A `Null` inside the list makes `NOT_IN` unsatisfiable, per the
 /// module-level NULL rule (SQL agrees: `x NOT IN (a, NULL)` is never true);
 /// `IN` needs no such guard — a `Null` element simply never matches.
-pub fn eval_condition(cond: &Condition, row: &HashMap<String, Value>, evaluated: &mut u64) -> bool {
+pub fn eval_condition(
+    cond: &Condition,
+    row: &HashMap<ColumnName, Value>,
+    evaluated: &mut u64,
+) -> bool {
     *evaluated += 1;
 
-    let Some(actual) = row.get(cond.column.as_str()) else {
+    let Some(actual) = row.get(&cond.column) else {
         return false;
     };
     if actual.is_null() || cond.value.is_null() {
@@ -81,12 +85,12 @@ mod tests {
     use crate::model::ComparisonOperator::*;
 
     /// Build a row image from `(column, value)` pairs.
-    fn row(pairs: Vec<(&str, Value)>) -> HashMap<String, Value> {
-        pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+    fn row(pairs: Vec<(&str, Value)>) -> HashMap<ColumnName, Value> {
+        pairs.into_iter().map(|(k, v)| (k.into(), v)).collect()
     }
 
     /// Evaluate `filter` against `row`, discarding the evaluated counter.
-    fn check(filter: &Where, row: &HashMap<String, Value>) -> bool {
+    fn check(filter: &Where, row: &HashMap<ColumnName, Value>) -> bool {
         evaluate(filter, row, &mut 0)
     }
 

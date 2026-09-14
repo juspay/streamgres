@@ -22,6 +22,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 
 use super::query::SubId;
+use super::schema::ColumnName;
 use super::value::{Value, unordered_map_hash};
 
 /// The identity of a row: its primary-key values — deliberately nothing
@@ -40,7 +41,7 @@ use super::value::{Value, unordered_map_hash};
 /// see `unordered_map_hash` in `model::value`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataFrameKey {
-    pub pkey_value: HashMap<String, Value>,
+    pub pkey_value: HashMap<ColumnName, Value>,
 }
 
 impl Eq for DataFrameKey {}
@@ -57,7 +58,19 @@ impl Hash for DataFrameKey {
 /// (`SingleTableReadQuery` selects whole rows), so this is the whole row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataFrameRow {
-    pub data: HashMap<String, Value>,
+    pub data: HashMap<ColumnName, Value>,
+}
+
+impl DataFrameRow {
+    /// Builds a row image from `(column, value)` pairs.
+    pub fn new(pairs: impl IntoIterator<Item = (impl Into<ColumnName>, Value)>) -> Self {
+        DataFrameRow {
+            data: pairs
+                .into_iter()
+                .map(|(column, value)| (column.into(), value))
+                .collect(),
+        }
+    }
 }
 
 /// The unit of an incremental update — self-contained, with no pre-image
@@ -185,9 +198,14 @@ impl TableFrame {
 }
 
 impl DataFrameKey {
-    /// Builds a row identity from primary-key column name → value.
-    pub fn new(pkey_value: HashMap<String, Value>) -> Self {
-        DataFrameKey { pkey_value }
+    /// Builds a row identity from `(primary-key column, value)` pairs.
+    pub fn new(pkey_value: impl IntoIterator<Item = (impl Into<ColumnName>, Value)>) -> Self {
+        DataFrameKey {
+            pkey_value: pkey_value
+                .into_iter()
+                .map(|(column, value)| (column.into(), value))
+                .collect(),
+        }
     }
 }
 
