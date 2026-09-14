@@ -14,11 +14,11 @@
 //!   hash combines per-entry hashes with an order-independent fold.
 
 use chrono::{NaiveDate, NaiveDateTime};
-use std::cmp::Ordering;
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
 /// A dynamically-typed database value.
 ///
@@ -144,7 +144,9 @@ impl Value {
                 right.sort_by(|x, y| x.0.canonical_cmp(y.0));
                 left.iter()
                     .zip(&right)
-                    .map(|((ka, va), (kb, vb))| ka.canonical_cmp(kb).then_with(|| va.canonical_cmp(vb)))
+                    .map(|((ka, va), (kb, vb))| {
+                        ka.canonical_cmp(kb).then_with(|| va.canonical_cmp(vb))
+                    })
                     .find(|ordering| *ordering != Ordering::Equal)
                     .unwrap_or_else(|| left.len().cmp(&right.len()))
             }

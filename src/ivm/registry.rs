@@ -6,7 +6,7 @@
 
 use super::index::TableIndex;
 use super::window::Window;
-use super::{window, FetchKind, SingleTableIVM};
+use super::{FetchKind, SingleTableIVM, window};
 use crate::model::{
     Condition, DataFrameKey, DataFrameOperation, SingleTableReadQuery, SubId, Value,
 };
@@ -28,7 +28,10 @@ impl SingleTableIVM {
     /// later through [`SingleTableIVM::land_fetch`]; until then the
     /// returned operations are empty. Rows already shared with other
     /// subscriptions are tagged rather than duplicated.
-    pub fn register_query(&mut self, select_query: SingleTableReadQuery) -> (SubId, Vec<DataFrameOperation>) {
+    pub fn register_query(
+        &mut self,
+        select_query: SingleTableReadQuery,
+    ) -> (SubId, Vec<DataFrameOperation>) {
         let sub = SubId(self.next_sub);
         self.next_sub += 1;
         self.stats.queries_registered += 1;
@@ -54,7 +57,7 @@ impl SingleTableIVM {
                 self.stats.snapshots_shared += 1;
                 let table = self.select_queries[&sub].table.clone();
                 for key in self.keys_of(twin) {
-                    if let Some(update) = self.share_view(sub, twin, &table, &key) {
+                    if let Some(update) = self.share_row(sub, twin, &table, &key) {
                         ops.push(update.op);
                     }
                 }
@@ -266,11 +269,7 @@ impl SingleTableIVM {
                 .or_default()
                 .register(sub, dnf, &mut self.stats);
         }
-        if self
-            .tables
-            .get(&table)
-            .is_some_and(TableIndex::is_empty)
-        {
+        if self.tables.get(&table).is_some_and(TableIndex::is_empty) {
             self.tables.remove(&table);
         }
         self.rebuild_window(sub);
@@ -279,7 +278,12 @@ impl SingleTableIVM {
 
     /// Re-key `sub` in the query-keyed index after its stored query
     /// changed shape (a swap or a literal in-place edit).
-    fn move_query_key(&mut self, sub: SubId, before: &SingleTableReadQuery, after: SingleTableReadQuery) {
+    fn move_query_key(
+        &mut self,
+        sub: SubId,
+        before: &SingleTableReadQuery,
+        after: SingleTableReadQuery,
+    ) {
         if let Some(twins) = self.by_query.get_mut(before) {
             twins.remove(&sub);
             if twins.is_empty() {
@@ -293,7 +297,11 @@ impl SingleTableIVM {
     /// query, if any — the sharing seam of registration, one lookup in the
     /// query-keyed index. Skips subscriptions in a maintenance window or
     /// with a storage read still out, whose rows lag their filter.
-    fn identical_subscription(&self, select_query: &SingleTableReadQuery, exclude: SubId) -> Option<SubId> {
+    fn identical_subscription(
+        &self,
+        select_query: &SingleTableReadQuery,
+        exclude: SubId,
+    ) -> Option<SubId> {
         self.by_query
             .get(select_query)?
             .iter()

@@ -1,8 +1,8 @@
 //! Live Postgres scenarios: the runtime over `PgStorage` and the
 //! `test_decoding` change feed, with writes committed deliberately behind
-//! an open snapshot, in both positioning modes; and the asynchronous
-//! service end to end. They run only when `JUS_SYNC_PG_DSN` names a
-//! database with `wal_level = logical` (and a free replication slot), and
+//! an open snapshot; and the asynchronous service end to end with one
+//! table mirrored in memory. They run only when `JUS_SYNC_PG_DSN` names a
+//! database with `wal_level = logical` (and free replication slots), and
 //! report themselves skipped otherwise; each scenario uses its own tables
 //! and slot, so they can run in parallel.
 
@@ -10,13 +10,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use jus_sync::ivm::{Fetch, MultiTableIVM, MultiTableUpdate, QueryPart};
+use jus_sync::ivm::{ClientUpdate, Fetch, MultiTableIVM, QueryPart};
 use jus_sync::model::*;
-use jus_sync::sync::pg::{PgStorage, PgStream, SnapshotMode, XidLedger};
-use jus_sync::sync::{Command, Runtime, Service, Storage, SubId};
+use jus_sync::sync::pg::{PgStorage, PgStream};
+use jus_sync::sync::{Command, Lsn, Runtime, Service, Sources, Storage, SubId};
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::{spawn_local, LocalSet};
+use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, NoTls};
+
+/// The one client of these scenarios.
+const CLIENT: ClientId = ClientId(7);
 
 /// The database under test, if any.
 fn dsn() -> Option<String> {
@@ -115,7 +118,9 @@ async fn admin(dsn: &str) -> Client {
 /// no leftover slot.
 async fn prepare(dsn: &str, names: &Names) -> Client {
     let client = admin(dsn).await;
-    PgStream::drop_slot(dsn, &names.slot).await.expect("drop slot");
+    PgStream::drop_slot(dsn, &names.slot)
+        .await
+        .expect("drop slot");
     client
         .batch_execute(&format!(
             "DROP TABLE IF EXISTS {t}; DROP TABLE IF EXISTS {u};
@@ -164,6 +169,48 @@ fn ids(rows: Option<HashMap<DataFrameKey, DataFrameRow>>) -> BTreeSet<i64> {
         .collect()
 }
 
+/// The stream moved: tell every storage and learn the floor (what the
+/// drivers do after each write and progress mark).
+fn moved(runtime: &mut Runtime<MultiTableIVM>, storages: &[&PgStorage]) {
+    for storage in storages {
+        storage.advance(runtime.position());
+    }
+    if let Some(floor) = storages.iter().map(|storage| storage.floor()).min() {
+        runtime.set_floor(floor);
+    }
+}
+
+/// Poll the feed and move the runtime until every storage has a current
+/// alias (the stream has passed its first consistent point).
+async fn catch_up(
+    runtime: &mut Runtime<MultiTableIVM>,
+    stream: &mut PgStream,
+    storages: &[&PgStorage],
+) -> Vec<Fetch> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut pending = Vec::new();
+    loop {
+        let batch = stream.poll().await.expect("poll");
+        for (write, at) in batch.writes {
+            pending.extend(runtime.write(&write, at).selects);
+            moved(runtime, storages);
+        }
+        pending.extend(runtime.progress(batch.progress).selects);
+        moved(runtime, storages);
+        if storages
+            .iter()
+            .all(|storage| storage.alias_position().is_some())
+        {
+            return pending;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stream never passed the first alias"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Run every read out, poll the feed to move the stream, and repeat until
 /// nothing is out; the deltas, in order.
 async fn drain(
@@ -171,16 +218,13 @@ async fn drain(
     storage: &PgStorage,
     stream: &mut PgStream,
     mut pending: Vec<Fetch>,
-) -> Vec<MultiTableUpdate> {
+) -> Vec<ClientUpdate> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut updates = Vec::new();
     loop {
         let mut next = Vec::new();
         for fetch in pending.drain(..) {
-            let snapshot = storage
-                .select(&fetch.query, runtime.stream_position())
-                .await
-                .expect("select");
+            let snapshot = storage.select(&fetch.query).await.expect("select");
             let step = runtime.fetched(fetch.id, snapshot);
             updates.extend(step.updates);
             next.extend(step.selects);
@@ -192,124 +236,148 @@ async fn drain(
         let batch = stream.poll().await.expect("poll");
         for (write, at) in batch.writes {
             let step = runtime.write(&write, at);
+            moved(runtime, &[storage]);
             updates.extend(step.updates);
             pending.extend(step.selects);
         }
         let step = runtime.progress(batch.progress);
+        moved(runtime, &[storage]);
         updates.extend(step.updates);
         pending.extend(step.selects);
-        assert!(Instant::now() < deadline, "the runtime did not settle: {} reads out", runtime.outstanding());
+        assert!(
+            Instant::now() < deadline,
+            "the runtime did not settle: {} reads out",
+            runtime.outstanding()
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-/// The registration scenario in one positioning mode: the main part's
-/// snapshot is held open while writes commit behind it, including one
-/// from a transaction that was already open when the snapshot was taken;
-/// the frames must end equal to what Postgres holds, without adopting
-/// any stale image.
-async fn registration_behind_open_snapshot(dsn: &str, mode: SnapshotMode, tag: &str) {
-    let names = Names::new(tag);
-    let client = prepare(dsn, &names).await;
-    let catalog = Rc::new(names.catalog());
-    let ledger = match &mode {
-        SnapshotMode::Xid(ledger) => Some(ledger.clone()),
-        SnapshotMode::Wal => None,
-    };
-    let mut stream = PgStream::open(dsn, &names.slot, catalog.clone(), ledger)
-        .await
-        .expect("open stream");
-    let slow = PgStorage::connect(dsn, catalog.clone(), mode.clone())
-        .await
-        .expect("connect")
-        .with_read_delay(Duration::from_millis(1500));
-    let fast = PgStorage::connect(dsn, catalog.clone(), mode).await.expect("connect");
-    let mut runtime = Runtime::new(MultiTableIVM::new());
-
-    let open_before = admin(dsn).await;
-    open_before
-        .batch_execute(&format!(
-            "BEGIN; UPDATE {} SET status = 'DONE' WHERE id = 3;",
-            names.tickets
-        ))
-        .await
-        .expect("open transaction");
-
-    let (sub, step) = runtime.register(names.spec());
-    assert_eq!(step.selects.len(), 1);
-    let main = step.selects[0].clone();
-    let query = main.query.clone();
-    let floor = runtime.stream_position();
-    let select = spawn_local(async move { slow.select(&query, floor).await });
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    client
-        .batch_execute(&format!(
-            "UPDATE {t} SET status = 'DONE' WHERE id = 1;
-             DELETE FROM {t} WHERE id = 2;
-             INSERT INTO {t} VALUES (4, 'OPEN', 8, 4);
-             UPDATE {t} SET points = 99 WHERE id = 4;",
-            t = names.tickets
-        ))
-        .await
-        .expect("writes behind the snapshot");
-    open_before.batch_execute("COMMIT;").await.expect("commit the open transaction");
-
-    let behind = stream.poll().await.expect("poll");
-    assert_eq!(behind.writes.len(), 5, "every write committed behind the snapshot is delivered before it lands");
-    let mut pending = Vec::new();
-    for (write, at) in behind.writes {
-        pending.extend(runtime.write(&write, at).selects);
-    }
-    runtime.progress(behind.progress);
-
-    let snapshot = select.await.expect("join").expect("select");
-    assert_eq!(snapshot.rows.len(), 3, "the snapshot predates every write");
-    let step = runtime.fetched(main.id, snapshot);
-    assert!(step.updates.is_empty(), "every snapshot row was overtaken, got {:?}", step.updates);
-    pending.extend(step.selects);
-
-    drain(&mut runtime, &fast, &mut stream, pending).await;
-
-    let open = truth(&client, &format!("SELECT id FROM {} WHERE status = 'OPEN'", names.tickets)).await;
-    assert_eq!(open, BTreeSet::from([4]));
-    assert_eq!(ids(runtime.engine().rows_for(sub, QueryPart::main())), open);
-    assert_eq!(ids(runtime.engine().rows_for(sub, QueryPart::join(0))), BTreeSet::from([8]));
-    let main_rows = runtime.engine().rows_for(sub, QueryPart::main()).unwrap();
-    let points: BTreeMap<i64, Value> = main_rows
-        .iter()
-        .map(|(key, row)| match key.pkey_value["id"] {
-            Value::Int(id) => (id, row.data["points"].clone()),
-            _ => panic!(),
-        })
-        .collect();
-    assert_eq!(points[&4], Value::Int(99), "the stream's image, not an older one");
-    assert_eq!(
-        runtime.stats().rows_dropped,
-        3,
-        "every snapshot row was overtaken: 1 moved out, 2 deleted, 3 moved out by the transaction open at snapshot time"
-    );
-    cleanup(dsn, &client, &names).await;
-}
-
-/// The WAL method (exported snapshot of a temporary slot): writes
-/// committed behind an open snapshot.
+/// The registration scenario: the main part's snapshot is held open while
+/// writes commit behind it, including one from a transaction that was
+/// already open when the snapshot was taken; the snapshot is behind the
+/// stream when it lands, is brought up from the delivered writes, and the
+/// frames end equal to what Postgres holds without adopting any stale
+/// image.
 #[test]
-fn wal_registration_behind_open_snapshot() {
+fn registration_behind_open_snapshot() {
     let Some(dsn) = dsn() else { return };
-    block_on(registration_behind_open_snapshot(&dsn, SnapshotMode::Wal, "wal"));
+    block_on(async {
+        let names = Names::new("wal");
+        let client = prepare(&dsn, &names).await;
+        let catalog = Rc::new(names.catalog());
+        let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+            .await
+            .expect("open stream");
+        let slow = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect")
+            .with_read_delay(Duration::from_millis(1500));
+        let fast = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&slow, &fast]).await;
+        assert!(
+            slow.floor() <= runtime.position(),
+            "an alias flips only behind the stream"
+        );
+
+        let open_before = admin(&dsn).await;
+        open_before
+            .batch_execute(&format!(
+                "BEGIN; UPDATE {} SET status = 'DONE' WHERE id = 3;",
+                names.tickets
+            ))
+            .await
+            .expect("open transaction");
+
+        let (sub, step) = runtime.register(CLIENT, names.spec());
+        assert_eq!(step.selects.len(), 1);
+        let main = step.selects[0].clone();
+        let query = main.query.clone();
+        let select = spawn_local(async move { slow.select(&query).await });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        client
+            .batch_execute(&format!(
+                "UPDATE {t} SET status = 'DONE' WHERE id = 1;
+                 DELETE FROM {t} WHERE id = 2;
+                 INSERT INTO {t} VALUES (4, 'OPEN', 8, 4);
+                 UPDATE {t} SET points = 99 WHERE id = 4;",
+                t = names.tickets
+            ))
+            .await
+            .expect("writes behind the snapshot");
+        open_before
+            .batch_execute("COMMIT;")
+            .await
+            .expect("commit the open transaction");
+
+        let behind = stream.poll().await.expect("poll");
+        assert_eq!(
+            behind.writes.len(),
+            5,
+            "every write committed behind the snapshot is delivered before it lands"
+        );
+        let mut pending = Vec::new();
+        for (write, at) in behind.writes {
+            pending.extend(runtime.write(&write, at).selects);
+            moved(&mut runtime, &[&fast]);
+        }
+        runtime.progress(behind.progress);
+        moved(&mut runtime, &[&fast]);
+
+        let snapshot = select.await.expect("join").expect("select");
+        assert_eq!(snapshot.rows.len(), 3, "the snapshot predates every write");
+        assert!(snapshot.at < runtime.position());
+        let step = runtime.fetched(main.id, snapshot);
+        assert!(
+            step.updates.is_empty(),
+            "every snapshot row was overtaken, got {:?}",
+            step.updates
+        );
+        pending.extend(step.selects);
+
+        drain(&mut runtime, &fast, &mut stream, pending).await;
+
+        let open = truth(
+            &client,
+            &format!("SELECT id FROM {} WHERE status = 'OPEN'", names.tickets),
+        )
+        .await;
+        assert_eq!(open, BTreeSet::from([4]));
+        assert_eq!(ids(runtime.engine().rows_for(sub, QueryPart::main())), open);
+        assert_eq!(
+            ids(runtime.engine().rows_for(sub, QueryPart::join(0))),
+            BTreeSet::from([8])
+        );
+        let main_rows = runtime.engine().rows_for(sub, QueryPart::main()).unwrap();
+        let points: BTreeMap<i64, Value> = main_rows
+            .iter()
+            .map(|(key, row)| match key.pkey_value["id"] {
+                Value::Int(id) => (id, row.data["points"].clone()),
+                _ => panic!(),
+            })
+            .collect();
+        assert_eq!(
+            points[&4],
+            Value::Int(99),
+            "the stream's image, not an older one"
+        );
+        assert_eq!(
+            runtime.stats().rows_dropped,
+            3,
+            "every snapshot row was overtaken: 1 moved out, 2 deleted, 3 moved out by the transaction open at snapshot time"
+        );
+        cleanup(&dsn, &client, &names).await;
+    });
 }
 
-/// Transaction-id positioning: the same, with the in-progress transaction
-/// listed in the snapshot's `xip`.
-#[test]
-fn xid_registration_behind_open_snapshot() {
-    let Some(dsn) = dsn() else { return };
-    block_on(registration_behind_open_snapshot(&dsn, SnapshotMode::Xid(XidLedger::shared()), "xid"));
-}
-
-/// The asynchronous service end to end: the poller feeds commands, the
-/// service runs reads as tasks and pushes deltas; a client frame built
-/// from the deltas alone converges to what Postgres holds.
+/// The asynchronous service end to end, with the users table mirrored in
+/// memory: the poller feeds commands, the service warms the mirror, runs
+/// reads (the join's narrowed reads inline) and pushes per-client deltas;
+/// a client frame built from the deltas alone converges to what Postgres
+/// holds, and the mirror follows the stream.
 #[test]
 fn service_streams_end_to_end() {
     let Some(dsn) = dsn() else { return };
@@ -317,21 +385,56 @@ fn service_streams_end_to_end() {
         let names = Names::new("service");
         let client = prepare(&dsn, &names).await;
         let catalog = Rc::new(names.catalog());
-        let ledger = XidLedger::shared();
-        let stream = PgStream::open(&dsn, &names.slot, catalog.clone(), Some(ledger.clone()))
+        let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
             .await
             .expect("open stream");
-        let storage = PgStorage::connect(&dsn, catalog.clone(), SnapshotMode::Xid(ledger))
-            .await
-            .expect("connect");
+        let pg = Rc::new(
+            PgStorage::connect(&dsn, catalog.clone())
+                .await
+                .expect("connect"),
+        );
+        let sources = Rc::new(Sources::new(
+            pg,
+            catalog.clone(),
+            [TableName::from(names.users.as_str())],
+        ));
         let (updates_tx, mut updates) = mpsc::unbounded_channel();
-        let (service, commands) = Service::new(MultiTableIVM::new(), Rc::new(storage), updates_tx);
+        let (service, commands) = Service::new(MultiTableIVM::new(), sources.clone(), updates_tx);
         let service = spawn_local(service.run());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sources.floor() == Lsn(0) {
+            let batch = stream.poll().await.expect("poll");
+            for (write, at) in batch.writes {
+                commands
+                    .send(Command::Write { write, at })
+                    .await
+                    .expect("send");
+            }
+            commands
+                .send(Command::Progress(batch.progress))
+                .await
+                .expect("send");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                Instant::now() < deadline,
+                "the stream never passed the first alias"
+            );
+        }
+        assert_eq!(
+            sources.warm().await.expect("warm"),
+            2,
+            "both users mirrored"
+        );
         let poller = spawn_local(stream.run(Duration::from_millis(50), commands.clone()));
 
         let (reply, sub) = oneshot::channel();
         commands
-            .send(Command::Register { query: names.spec(), reply })
+            .send(Command::Register {
+                client: CLIENT,
+                query: names.spec(),
+                reply,
+            })
             .await
             .expect("send");
         let sub: SubId = sub.await.expect("registered");
@@ -348,7 +451,11 @@ fn service_streams_end_to_end() {
             .await
             .expect("writes");
 
-        let expected_main = truth(&client, &format!("SELECT id FROM {} WHERE status = 'OPEN'", names.tickets)).await;
+        let expected_main = truth(
+            &client,
+            &format!("SELECT id FROM {} WHERE status = 'OPEN'", names.tickets),
+        )
+        .await;
         let expected_users = truth(
             &client,
             &format!(
@@ -365,14 +472,17 @@ fn service_streams_end_to_end() {
             match tokio::time::timeout(Duration::from_millis(200), updates.recv()).await {
                 Ok(Some(batch)) => {
                     for update in batch {
-                        assert_eq!(update.query, sub);
-                        let frame = frames.entry(update.part).or_default();
-                        match update.op {
-                            DataFrameOperation::Add(key, row) => {
-                                frame.insert(key, row);
-                            }
-                            DataFrameOperation::Delete(key, _) => {
-                                frame.remove(&key);
+                        assert_eq!(update.client, CLIENT);
+                        for target in &update.targets {
+                            assert_eq!(target.sub, sub);
+                            let frame = frames.entry(target.part.clone()).or_default();
+                            match &update.op {
+                                DataFrameOperation::Add(key, row) => {
+                                    frame.insert(key.clone(), row.clone());
+                                }
+                                DataFrameOperation::Delete(key, _) => {
+                                    frame.remove(key);
+                                }
                             }
                         }
                     }
@@ -391,6 +501,13 @@ fn service_streams_end_to_end() {
                 "client frames did not converge: main {main:?} vs {expected_main:?}, users {users:?} vs {expected_users:?}"
             );
         }
+        let mirrored = sources.memory().rows(&SingleTableReadQuery::new(
+            names.users.as_str(),
+            Where::AND(vec![]),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        ));
+        assert_eq!(mirrored.len(), 3, "the mirror absorbed the late user");
         poller.abort();
         drop(commands);
         let runtime = service.await.expect("service");

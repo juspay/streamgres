@@ -1,37 +1,31 @@
 //! Postgres as a source. [`PgStorage`] answers the engine's reads from
-//! one `REPEATABLE READ` snapshot each, positioned one of two ways.
+//! one `REPEATABLE READ` snapshot each, positioned by the exported
+//! snapshot of a temporary logical replication slot.
 //!
-//! - **WAL method** ([`SnapshotMode::Wal`]). A background task keeps a
-//!   current *alias*: a temporary logical replication slot created with
-//!   `EXPORT_SNAPSHOT`, whose exported snapshot and consistent point
-//!   Postgres pairs exactly (everything visible in the snapshot committed
-//!   at or below the point, everything after it is not visible). Every
-//!   read imports the current alias's snapshot with
-//!   `SET TRANSACTION SNAPSHOT` and is positioned at its consistent point;
-//!   the alias is re-minted on a cadence, and each alias lives as long as
-//!   the replication connection that minted it, held until the last read
-//!   that adopted it has finished.
-//! - **XID method** ([`SnapshotMode::Xid`]). No temporary slot and no
-//!   location asked of Postgres: the read's first statement returns
-//!   `pg_current_snapshot()`, Postgres's own account of the transactions
-//!   the snapshot sees, and that account is converted into a WAL location
-//!   through the [`ledger::XidLedger`] the feed fills with every delivered
-//!   transaction's id and commit location (see the ledger's docs for the
-//!   rule).
+//! A background task keeps minting *aliases*: a temporary logical slot
+//! created with `EXPORT_SNAPSHOT`, whose exported snapshot and consistent
+//! point Postgres pairs exactly (everything visible in the snapshot
+//! committed at or below the point, everything after it is not visible).
+//! A freshly minted alias only becomes the **current** one once the write
+//! stream has been delivered past its consistent point
+//! ([`Storage::advance`]); until then the older alias stays current. So
+//! every read is positioned at or below what the engine has applied,
+//! never ahead of it, and the runtime brings the read's rows up from
+//! there. Each read imports the current alias's snapshot with
+//! `SET TRANSACTION SNAPSHOT`; an alias lives as long as the replication
+//! connection that minted it, held until the last read that adopted it
+//! has finished.
 //!
-//! Either way the engine receives one location per read and one per
-//! write. [`stream::PgStream`] delivers the change feed from a permanent
-//! logical slot, positions every write at its commit, and fills the
-//! ledger. Everything here runs on the engine's thread inside a
-//! `tokio::task::LocalSet`.
+//! [`stream::PgStream`] delivers the change feed from a permanent logical
+//! slot and positions every write at its commit. Everything here runs on
+//! the engine's thread inside a `tokio::task::LocalSet`.
 
-pub mod ledger;
 pub mod replication;
 pub mod sql;
 pub mod stream;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -41,33 +35,20 @@ use tokio_postgres::{Client, Config, IsolationLevel, NoTls, Row};
 
 use super::storage::{Storage, StorageError};
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameRow, DbTable, Lsn, Snapshot, SingleTableReadQuery, Value,
+    Catalog, DataFrameKey, DataFrameRow, DbTable, Lsn, SingleTableReadQuery, Snapshot, Value,
     ValueType,
 };
 use replication::ReplicationConnection;
 
-pub use ledger::{SharedLedger, XidLedger};
 pub use stream::{Batch, PgStream};
 
-/// How a read's snapshot is positioned (see the module docs): by an
-/// exported snapshot's consistent point, or by converting the snapshot's
-/// transaction ids through the feed's ledger.
-#[derive(Clone)]
-pub enum SnapshotMode {
-    Wal,
-    Xid(SharedLedger),
-}
+/// How many minted aliases wait for the stream to pass them before the
+/// minter pauses (each holds a slot and a connection).
+const WAITING_ALIASES: usize = 2;
 
-impl SnapshotMode {
-    /// Whether this is the WAL method.
-    fn is_wal(&self) -> bool {
-        matches!(self, SnapshotMode::Wal)
-    }
-}
-
-/// One minted alias of the WAL method: an exported snapshot and the
-/// consistent point it was built at, alive as long as the replication
-/// connection that created its temporary slot.
+/// One minted alias: an exported snapshot and the consistent point it
+/// was built at, alive as long as the replication connection that created
+/// its temporary slot.
 pub struct Alias {
     pub snapshot: String,
     pub lsn: Lsn,
@@ -96,7 +77,11 @@ pub async fn mint(config: &Config) -> Result<Alias, StorageError> {
         .await?;
     let unreadable = || StorageError("CREATE_REPLICATION_SLOT returned no usable row".to_owned());
     let row = rows.first().ok_or_else(unreadable)?;
-    let lsn = parse_lsn(row.get(1).and_then(|column| column.as_deref()).ok_or_else(unreadable)?)?;
+    let lsn = parse_lsn(
+        row.get(1)
+            .and_then(|column| column.as_deref())
+            .ok_or_else(unreadable)?,
+    )?;
     let snapshot = row
         .get(2)
         .and_then(|column| column.clone())
@@ -115,6 +100,24 @@ impl From<tokio_postgres::Error> for StorageError {
     }
 }
 
+/// The aliases: the current one, and the newer ones minted since, oldest
+/// first, waiting for the stream to pass their consistent points.
+#[derive(Default)]
+struct Aliases {
+    current: Option<Rc<Alias>>,
+    waiting: VecDeque<Rc<Alias>>,
+}
+
+impl Aliases {
+    /// Make the newest waiting alias at or below `feed` current, dropping
+    /// the older ones it supersedes.
+    fn advance(&mut self, feed: Lsn) {
+        while self.waiting.front().is_some_and(|alias| alias.lsn <= feed) {
+            self.current = self.waiting.pop_front();
+        }
+    }
+}
+
 /// Read access to a Postgres database.
 ///
 /// - `config`: how to connect; one connection is opened per read in
@@ -122,30 +125,24 @@ impl From<tokio_postgres::Error> for StorageError {
 ///   transaction.
 /// - `catalog`: the tables' declared columns, which the `SELECT` casts to
 ///   and the rows decode by.
-/// - `mode`: how snapshots are positioned.
-/// - `alias`: the WAL method's current alias, swapped by the rotation
-///   task or by a read that found it older than its floor; a read clones
-///   the handle and keeps it until it is done.
-/// - `rotation`: how often the WAL method mints a fresh alias.
-/// - `alive`: cleared on drop, which ends the rotation task.
-/// - `stats_minted_on_demand`: aliases minted because a read's floor was
-///   past the current one.
+/// - `aliases`: the current alias and the ones waiting to become it; a
+///   read clones the current handle and keeps it until it is done.
+/// - `rotation`: how often a fresh alias is minted.
+/// - `alive`: cleared on drop, which ends the minting task.
 /// - `delay`: a test hook: hold every snapshot open this long before
 ///   reading, so writes can be committed behind it deliberately.
 pub struct PgStorage {
     config: Config,
     catalog: Rc<Catalog>,
-    mode: SnapshotMode,
     idle: RefCell<Vec<Client>>,
-    alias: Rc<RefCell<Option<Rc<Alias>>>>,
+    aliases: Rc<RefCell<Aliases>>,
     rotation: Rc<Cell<Duration>>,
     alive: Rc<Cell<bool>>,
-    stats_minted_on_demand: Cell<u64>,
     delay: Option<Duration>,
 }
 
 impl Drop for PgStorage {
-    /// End the rotation task.
+    /// End the minting task.
     fn drop(&mut self) {
         self.alive.set(false);
     }
@@ -153,32 +150,29 @@ impl Drop for PgStorage {
 
 impl PgStorage {
     /// Connect once (validating `dsn`) and keep that connection for the
-    /// first read; in the WAL method also mint the first alias and start
-    /// re-minting it every [`PgStorage::with_rotation`] interval (250 ms
-    /// by default).
-    pub async fn connect(dsn: &str, catalog: Rc<Catalog>, mode: SnapshotMode) -> Result<Self, StorageError> {
+    /// first read; mint the first alias (it becomes current with the first
+    /// [`Storage::advance`] past its point) and keep minting one every
+    /// [`PgStorage::with_rotation`] interval (250 ms by default).
+    pub async fn connect(dsn: &str, catalog: Rc<Catalog>) -> Result<Self, StorageError> {
         let config: Config = dsn.parse()?;
         let client = open(&config).await?;
         let storage = PgStorage {
             config,
             catalog,
-            mode,
             idle: RefCell::new(vec![client]),
-            alias: Rc::new(RefCell::new(None)),
+            aliases: Rc::new(RefCell::new(Aliases::default())),
             rotation: Rc::new(Cell::new(Duration::from_millis(250))),
             alive: Rc::new(Cell::new(true)),
-            stats_minted_on_demand: Cell::new(0),
             delay: None,
         };
-        if storage.mode.is_wal() {
-            *storage.alias.borrow_mut() = Some(Rc::new(mint(&storage.config).await?));
-            rotate(
-                storage.config.clone(),
-                storage.alias.clone(),
-                storage.rotation.clone(),
-                storage.alive.clone(),
-            );
-        }
+        let first = Rc::new(mint(&storage.config).await?);
+        storage.aliases.borrow_mut().waiting.push_back(first);
+        rotate(
+            storage.config.clone(),
+            storage.aliases.clone(),
+            storage.rotation.clone(),
+            storage.alive.clone(),
+        );
         Ok(storage)
     }
 
@@ -188,42 +182,28 @@ impl PgStorage {
         self
     }
 
-    /// Mint a fresh alias every `every` (WAL method).
+    /// Mint a fresh alias every `every`.
     pub fn with_rotation(self, every: Duration) -> Self {
         self.rotation.set(every);
         self
     }
 
-    /// The positioning mode.
-    pub fn mode(&self) -> &SnapshotMode {
-        &self.mode
-    }
-
-    /// The current alias's consistent point (WAL method), for inspection.
+    /// The current alias's consistent point, for inspection; `None` until
+    /// the stream has passed the first alias.
     pub fn alias_position(&self) -> Option<Lsn> {
-        self.alias.borrow().as_ref().map(|alias| alias.lsn)
+        self.aliases
+            .borrow()
+            .current
+            .as_ref()
+            .map(|alias| alias.lsn)
     }
 
-    /// The current alias if its consistent point is at or past `at_least`,
-    /// otherwise a freshly minted one (which also becomes current): a read
-    /// must never see less than the engine has already applied.
-    async fn fresh_alias(&self, at_least: Option<Lsn>) -> Result<Rc<Alias>, StorageError> {
-        let current = self.alias.borrow().clone();
-        if let Some(alias) = current
-            && at_least.is_none_or(|floor| alias.lsn >= floor)
-        {
-            return Ok(alias);
-        }
-        self.stats_minted_on_demand.set(self.stats_minted_on_demand.get() + 1);
-        let fresh = Rc::new(mint(&self.config).await?);
-        *self.alias.borrow_mut() = Some(fresh.clone());
-        Ok(fresh)
-    }
-
-    /// How many aliases were minted on demand because the current one was
-    /// older than a read's floor (WAL method).
-    pub fn minted_on_demand(&self) -> u64 {
-        self.stats_minted_on_demand.get()
+    /// The current alias, or an error while the stream has not passed
+    /// the first one yet (the runtime parks the read and asks again).
+    fn current_alias(&self) -> Result<Rc<Alias>, StorageError> {
+        self.aliases.borrow().current.clone().ok_or_else(|| {
+            StorageError("no snapshot at or below the stream's position yet".to_owned())
+        })
     }
 
     /// An idle connection, or a new one.
@@ -243,42 +223,56 @@ impl PgStorage {
 }
 
 impl Storage for PgStorage {
-    /// One `REPEATABLE READ`, read-only transaction: the WAL method imports
-    /// the current alias's exported snapshot (minting a fresh alias first
-    /// if the current one is older than `at_least`), the XID method reads
-    /// its position in its first statement (which is also what
-    /// establishes the snapshot every later statement sees); then the
-    /// `SELECT` runs against that same snapshot.
-    async fn select(&self, query: &SingleTableReadQuery, at_least: Option<Lsn>) -> Result<Snapshot, StorageError> {
-        let table = self
-            .catalog
-            .table(query.table.as_str())
-            .ok_or_else(|| StorageError(format!("table `{}` is not in the catalog", query.table)))?;
-        let alias = match &self.mode {
-            SnapshotMode::Wal => Some(self.fresh_alias(at_least).await?),
-            SnapshotMode::Xid(_) => None,
-        };
+    /// One `REPEATABLE READ`, read-only transaction importing the current
+    /// alias's exported snapshot; the `SELECT` runs against that snapshot
+    /// and is positioned at the alias's consistent point.
+    async fn select(&self, query: &SingleTableReadQuery) -> Result<Snapshot, StorageError> {
+        let table = self.catalog.table(query.table.as_str()).ok_or_else(|| {
+            StorageError(format!("table `{}` is not in the catalog", query.table))
+        })?;
+        let alias = self.current_alias()?;
         let mut client = self.acquire().await?;
-        let result = read_snapshot(&mut client, table, query, &self.mode, alias, self.delay).await;
+        let result = read_snapshot(&mut client, table, query, &alias, self.delay).await;
         if result.is_ok() {
             self.release(client);
         }
         result
     }
+
+    /// Flip to the newest minted alias the stream has passed.
+    fn advance(&self, feed: Lsn) {
+        self.aliases.borrow_mut().advance(feed);
+    }
+
+    /// The current alias's consistent point; zero while there is none.
+    fn floor(&self) -> Lsn {
+        self.alias_position().unwrap_or_default()
+    }
 }
 
-/// Keep minting aliases every `rotation` until `alive` clears; a failed
-/// mint keeps the current alias.
-fn rotate(config: Config, alias: Rc<RefCell<Option<Rc<Alias>>>>, rotation: Rc<Cell<Duration>>, alive: Rc<Cell<bool>>) {
+/// Keep minting aliases every `rotation` until `alive` clears, pausing
+/// while enough are already waiting for the stream; a failed mint is
+/// reported and tried again at the next tick.
+fn rotate(
+    config: Config,
+    aliases: Rc<RefCell<Aliases>>,
+    rotation: Rc<Cell<Duration>>,
+    alive: Rc<Cell<bool>>,
+) {
     spawn_local(async move {
         while alive.get() {
             tokio::time::sleep(rotation.get()).await;
             if !alive.get() {
                 break;
             }
+            if aliases.borrow().waiting.len() >= WAITING_ALIASES {
+                continue;
+            }
             match mint(&config).await {
-                Ok(fresh) => *alias.borrow_mut() = Some(Rc::new(fresh)),
-                Err(error) => eprintln!("snapshot rotation failed, keeping the current alias: {error}"),
+                Ok(fresh) => aliases.borrow_mut().waiting.push_back(Rc::new(fresh)),
+                Err(error) => {
+                    eprintln!("snapshot minting failed, keeping the current alias: {error}")
+                }
             }
         }
     });
@@ -295,18 +289,14 @@ async fn open(config: &Config) -> Result<Client, StorageError> {
     Ok(client)
 }
 
-/// Run one positioned read on `client` (see the module docs): the WAL
-/// method imports the alias's exported snapshot as the transaction's
-/// first statement and is positioned at its consistent point; the XID
-/// method reads `pg_current_snapshot()` in its first statement (which is
-/// what establishes the snapshot) and converts it through the ledger once
-/// the rows are in.
+/// Run one positioned read on `client`: import the alias's exported
+/// snapshot as the transaction's first statement, run the `SELECT`
+/// against it, and position the result at the alias's consistent point.
 async fn read_snapshot(
     client: &mut Client,
     table: &DbTable,
     query: &SingleTableReadQuery,
-    mode: &SnapshotMode,
-    alias: Option<Rc<Alias>>,
+    alias: &Alias,
     delay: Option<Duration>,
 ) -> Result<Snapshot, StorageError> {
     let transaction = client
@@ -315,67 +305,34 @@ async fn read_snapshot(
         .read_only(true)
         .start()
         .await?;
-    let mut seen: Option<(u64, u64, Vec<u64>)> = None;
-    match mode {
-        SnapshotMode::Wal => {
-            let alias = alias
-                .as_ref()
-                .ok_or_else(|| StorageError("the WAL method has no snapshot alias yet".to_owned()))?;
-            transaction
-                .batch_execute(&format!(
-                    "SET TRANSACTION SNAPSHOT '{}'",
-                    alias.snapshot.replace('\'', "''")
-                ))
-                .await?;
-        }
-        SnapshotMode::Xid(_) => {
-            let row = transaction
-                .query_one("SELECT pg_current_snapshot()::text", &[])
-                .await?;
-            seen = Some(parse_xid_snapshot(row.get(0))?);
-        }
-    }
+    transaction
+        .batch_execute(&format!(
+            "SET TRANSACTION SNAPSHOT '{}'",
+            alias.snapshot.replace('\'', "''")
+        ))
+        .await?;
     if let Some(delay) = delay {
         transaction
             .execute("SELECT pg_sleep($1)", &[&delay.as_secs_f64()])
             .await?;
     }
-    let rows = transaction.query(&sql::select_sql(query, table), &[]).await?;
+    let rows = transaction
+        .query(&sql::select_sql(query, table), &[])
+        .await?;
     transaction.commit().await?;
     let rows = rows
         .iter()
         .map(|row| decode_row(row, table))
         .collect::<Result<Vec<_>, _>>()?;
-    let at = match (mode, seen) {
-        (SnapshotMode::Wal, _) => alias.map(|alias| alias.lsn).unwrap_or_default(),
-        (SnapshotMode::Xid(ledger), Some((_, xmax, xip))) => {
-            ledger.borrow().position_of(xmax, &xip).unwrap_or_default()
-        }
-        (SnapshotMode::Xid(_), None) => Lsn(0),
-    };
-    Ok(Snapshot { rows, at })
+    Ok(Snapshot {
+        rows,
+        at: alias.lsn,
+    })
 }
 
 /// Parse Postgres's `X/Y`.
 pub fn parse_lsn(text: &str) -> Result<Lsn, StorageError> {
     Lsn::parse(text).ok_or_else(|| StorageError(format!("unreadable WAL location `{text}`")))
-}
-
-/// Parse `pg_current_snapshot()`'s `xmin:xmax:xip1,xip2,…` into its three
-/// parts (epoch-extended ids).
-pub fn parse_xid_snapshot(text: &str) -> Result<(u64, u64, Vec<u64>), StorageError> {
-    let unreadable = || StorageError(format!("unreadable snapshot `{text}`"));
-    let mut parts = text.trim().split(':');
-    let xmin = parts.next().and_then(|s| s.parse().ok()).ok_or_else(unreadable)?;
-    let xmax = parts.next().and_then(|s| s.parse().ok()).ok_or_else(unreadable)?;
-    let xip = parts
-        .next()
-        .unwrap_or("")
-        .split(',')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().map_err(|_| unreadable()))
-        .collect::<Result<Vec<u64>, _>>()?;
-    Ok((xmin, xmax, xip))
 }
 
 /// One result row, in [`sql::select_columns`] order, as the engine's
@@ -419,14 +376,31 @@ fn decode_value(row: &Row, index: usize, declared: &ValueType) -> Result<Value, 
 mod tests {
     use super::*;
 
-    /// The snapshot text form parses into Postgres's visibility triple.
+    /// A minted alias becomes current only once the feed passes its
+    /// point, and a newer alias the feed has passed supersedes older ones
+    /// in one step.
     #[test]
-    fn parses_snapshot_text() {
-        assert_eq!(
-            parse_xid_snapshot("725:730:726,728").unwrap(),
-            (725, 730, vec![726, 728])
-        );
-        assert_eq!(parse_xid_snapshot("725:725:").unwrap(), (725, 725, Vec::new()));
-        assert!(parse_xid_snapshot("garbage").is_err());
+    fn aliases_flip_only_behind_the_feed() {
+        let alias = |lsn: u64| {
+            Rc::new(Alias {
+                snapshot: format!("snap-{lsn}"),
+                lsn: Lsn(lsn),
+                _minter: ReplicationConnection::detached(),
+            })
+        };
+        let mut aliases = Aliases::default();
+        aliases.waiting.push_back(alias(10));
+        aliases.waiting.push_back(alias(20));
+        aliases.waiting.push_back(alias(30));
+        aliases.advance(Lsn(5));
+        assert!(aliases.current.is_none());
+        aliases.advance(Lsn(25));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(20)));
+        assert_eq!(aliases.waiting.len(), 1);
+        aliases.advance(Lsn(25));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(20)));
+        aliases.advance(Lsn(30));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(30)));
+        assert!(aliases.waiting.is_empty());
     }
 }

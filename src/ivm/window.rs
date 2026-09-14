@@ -129,7 +129,11 @@ impl Window {
     /// frontier is untouched: a removal does not change what storage
     /// covers.
     pub(super) fn remove(&mut self, key: &DataFrameKey) -> bool {
-        match self.entries.iter().position(|(_, existing)| existing == key) {
+        match self
+            .entries
+            .iter()
+            .position(|(_, existing)| existing == key)
+        {
             Some(index) => {
                 self.entries.remove(index);
                 true
@@ -185,7 +189,11 @@ impl Window {
     /// whole filter cleared the frontier when it was asked for, so for it
     /// a full result sets the frontier to its worst value (pulled in by
     /// any eviction meanwhile) and a short one leaves storage exhausted.
-    pub(super) fn note_fetch(&mut self, requested: usize, fetched: &[(DataFrameKey, DataFrameRow)]) {
+    pub(super) fn note_fetch(
+        &mut self,
+        requested: usize,
+        fetched: &[(DataFrameKey, DataFrameRow)],
+    ) {
         if fetched.len() >= requested
             && let Some(worst) = self.worst_of(fetched)
         {
@@ -422,11 +430,7 @@ impl SingleTableIVM {
         let Some(query) = self.select_queries.get(&sub).cloned() else {
             return;
         };
-        let Some((limit, threshold)) = self
-            .windows
-            .get(&sub)
-            .and_then(Window::refill_plan)
-        else {
+        let Some((limit, threshold)) = self.windows.get(&sub).and_then(Window::refill_plan) else {
             return;
         };
         if limit == 0 {

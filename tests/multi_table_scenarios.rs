@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use jus_sync::ivm::{MultiTableIVM, MultiTableUpdate, QueryPart, SubId};
+use jus_sync::ivm::{ClientUpdate, MultiTableIVM, QueryPart, SubId};
 use jus_sync::model::*;
 use jus_sync::sync::{Local, MemoryStorage};
 
@@ -93,7 +93,11 @@ fn open_tickets() -> SingleTableReadQuery {
 fn tickets_users_query() -> MultiTableReadQuery {
     left_joined(
         open_tickets(),
-        vec![left(query(&sub_table("users"), Where::AND(vec![])), "assigned_to", "id")],
+        vec![left(
+            query(&sub_table("users"), Where::AND(vec![])),
+            "assigned_to",
+            "id",
+        )],
     )
 }
 
@@ -102,7 +106,11 @@ fn tickets_users_query() -> MultiTableReadQuery {
 fn tickets_members_query() -> MultiTableReadQuery {
     left_joined(
         open_tickets(),
-        vec![left(query(&members_table(), Where::AND(vec![])), "team_id", "team")],
+        vec![left(
+            query(&members_table(), Where::AND(vec![])),
+            "team_id",
+            "team",
+        )],
     )
 }
 
@@ -113,8 +121,16 @@ fn two_users_joins_query() -> MultiTableReadQuery {
     left_joined(
         open_tickets(),
         vec![
-            left(query(&sub_table("users"), Where::AND(vec![])), "assigned_to", "id"),
-            left(query(&sub_table("users"), Where::AND(vec![])), "reviewer", "id"),
+            left(
+                query(&sub_table("users"), Where::AND(vec![])),
+                "assigned_to",
+                "id",
+            ),
+            left(
+                query(&sub_table("users"), Where::AND(vec![])),
+                "reviewer",
+                "id",
+            ),
         ],
     )
 }
@@ -192,11 +208,7 @@ fn team_ticket(id: i64, team: i64) -> WriteQuery {
 
 /// Mirror the write into storage, then route it — commit first, notify
 /// second, like a real database.
-fn write(
-    ivm: &mut Ivm,
-    storage: &MemoryStorage,
-    w: WriteQuery,
-) -> Vec<MultiTableUpdate> {
+fn write(ivm: &mut Ivm, storage: &MemoryStorage, w: WriteQuery) -> Vec<ClientUpdate> {
     storage.apply(&w);
     ivm.incremental_update(&w)
 }
@@ -217,15 +229,17 @@ struct Names {
 }
 
 impl Names {
-    /// Register `spec` under `name`, returning its snapshot.
+    /// Register `spec` under `name`, for a client of its own, returning
+    /// its snapshot.
     fn register(
         &self,
         ivm: &mut Ivm,
         name: impl Into<String>,
         spec: MultiTableReadQuery,
-    ) -> Vec<MultiTableUpdate> {
+    ) -> Vec<ClientUpdate> {
         let name = name.into();
-        let (id, ops) = ivm.register_query(spec);
+        let client = ClientId(self.ids.borrow().len() as u64 + 1);
+        let (id, ops) = ivm.register_query(client, spec);
         self.ids.borrow_mut().insert(name.clone(), id);
         self.names.borrow_mut().insert(id, name);
         ops
@@ -241,23 +255,25 @@ impl Names {
         self.names.borrow()[&id].clone()
     }
 
-    /// Compact rendering of updates for order-insensitive assertions.
-    fn tags(&self, ops: &[MultiTableUpdate]) -> Vec<String> {
+    /// Compact rendering of updates, one tag per targeted part, for
+    /// order-insensitive assertions.
+    fn tags(&self, ops: &[ClientUpdate]) -> Vec<String> {
         let mut rendered: Vec<String> = ops
             .iter()
-            .map(|update| {
-                let part = if update.part.is_main() {
+            .flat_map(|update| update.targets.iter().map(move |target| (update, target)))
+            .map(|(update, target)| {
+                let part = if target.part.is_main() {
                     "main".to_owned()
-                } else if let Some(index) = update.part.join_index() {
+                } else if let Some(index) = target.part.join_index() {
                     format!("join{index}")
                 } else {
-                    format!("part{:?}", update.part.0)
+                    format!("part{:?}", target.part.0)
                 };
                 let op = match &update.op {
                     DataFrameOperation::Add(key, _) => format!("add:{:?}", key.pkey_value["id"]),
                     DataFrameOperation::Delete(key, _) => format!("del:{:?}", key.pkey_value["id"]),
                 };
-                format!("{}/{part}/{op}", self.name(update.query))
+                format!("{}/{part}/{op}", self.name(target.sub))
             })
             .collect();
         rendered.sort();
@@ -265,8 +281,20 @@ impl Names {
     }
 }
 
+/// The part of the one target an update has.
+fn part_of(update: &ClientUpdate) -> &QueryPart {
+    assert_eq!(
+        update.targets.len(),
+        1,
+        "one target expected, got {update:?}"
+    );
+    &update.targets[0].part
+}
+
 fn frame_len(ivm: &Ivm, names: &Names, name: &str, part: QueryPart) -> usize {
-    ivm.engine().rows_for(names.id(name), part).map_or(0, |rows| rows.len())
+    ivm.engine()
+        .rows_for(names.id(name), part)
+        .map_or(0, |rows| rows.len())
 }
 
 /// Registration loads the whole snapshot from storage: every main row
@@ -303,7 +331,10 @@ fn first_reference_fetches_sub_rows() {
     names.register(&mut ivm, "q", tickets_users_query());
 
     let ops = write(&mut ivm, &storage, ticket(1, "OPEN", 7));
-    assert_eq!(names.tags(&ops), vec!["q/join0/add:Int(7)", "q/main/add:Int(1)"]);
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/join0/add:Int(7)", "q/main/add:Int(1)"]
+    );
 
     let ops = write(&mut ivm, &storage, ticket(2, "OPEN", 7));
     assert_eq!(names.tags(&ops), vec!["q/main/add:Int(2)"]);
@@ -351,7 +382,7 @@ fn unreferenced_sub_write_is_ignored() {
 }
 
 /// A write to a referenced sub row flows straight through as a join-part
-/// replace — the `Delete(old)` + `Add(new)` pair for the row.
+/// replace: the one `Add` with the new image for the client.
 #[test]
 fn referenced_sub_update_forwards() {
     let (mut ivm, storage, names) = engine();
@@ -364,7 +395,7 @@ fn referenced_sub_update_forwards() {
         &storage,
         insert("users", 7, &[("name", "meera k".into())]),
     );
-    assert_eq!(names.tags(&ops), vec!["q/join0/add:Int(7)", "q/join0/del:Int(7)"]);
+    assert_eq!(names.tags(&ops), vec!["q/join0/add:Int(7)"]);
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 1);
 }
 
@@ -398,10 +429,13 @@ fn last_reference_prunes_sub_rows() {
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 1);
 
     let ops = write(&mut ivm, &storage, delete("tickets", 2));
-    assert_eq!(names.tags(&ops), vec!["q/join0/del:Int(7)", "q/main/del:Int(2)"]);
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/join0/del:Int(7)", "q/main/del:Int(2)"]
+    );
     let pruned = ops
         .iter()
-        .find(|update| update.part == QueryPart::join(0))
+        .find(|update| part_of(update) == &QueryPart::join(0))
         .expect("the prune delete");
     assert!(
         matches!(&pruned.op, DataFrameOperation::Delete(_, row) if row.data["name"] == Value::String("meera".into()))
@@ -410,9 +444,8 @@ fn last_reference_prunes_sub_rows() {
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 0);
 }
 
-/// A main update moving the join value replaces the main row (the
-/// `Delete(old)` + `Add(new)` pair), fetches the new side, and prunes the
-/// vacated side.
+/// A main update moving the join value replaces the main row (one `Add`
+/// for the client), fetches the new side, and prunes the vacated side.
 #[test]
 fn main_update_moves_join_reference() {
     let (mut ivm, storage, names) = engine();
@@ -428,8 +461,7 @@ fn main_update_moves_join_reference() {
         vec![
             "q/join0/add:Int(8)",
             "q/join0/del:Int(7)",
-            "q/main/add:Int(1)",
-            "q/main/del:Int(1)"
+            "q/main/add:Int(1)"
         ]
     );
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 1);
@@ -453,24 +485,19 @@ fn main_update_to_unmatched_value_keeps_main_row() {
     let ops = write(&mut ivm, &storage, update_ticket(1, "OPEN", 99));
     assert_eq!(
         names.tags(&ops),
-        vec![
-            "q/join0/del:Int(7)",
-            "q/main/add:Int(1)",
-            "q/main/del:Int(1)"
-        ]
+        vec!["q/join0/del:Int(7)", "q/main/add:Int(1)"]
     );
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::main()), 1);
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 0);
 }
 
 /// Regression (review): a main-row rewrite that KEEPS its join value must
-/// emit exactly the ordered main `Delete(old)` + `Add(new)` pair and
-/// nothing else — the pair is recognized and its join values diffed, so
+/// emit exactly the main row's new image and nothing else — inside the
+/// engine the replace pair is recognized and its join values diffed, so
 /// the value's `left` count never swings through zero and the sub side is
-/// neither pruned nor refetched. Also pins the carried images: the
-/// `Delete` holds the pre-rewrite row, the `Add` the new one.
+/// neither pruned nor refetched.
 #[test]
-fn main_update_keeping_join_value_emits_only_the_replace_pair() {
+fn main_update_keeping_join_value_emits_only_the_replace() {
     let (mut ivm, storage, names) = engine();
     storage.apply(&user(7, "meera"));
     names.register(&mut ivm, "q", tickets_users_query());
@@ -489,15 +516,16 @@ fn main_update_keeping_join_value_emits_only_the_replace_pair() {
             ],
         ),
     );
-    let [del, add] = ops.as_slice() else {
-        panic!("expected exactly the main replace pair, got {:?}", names.tags(&ops));
+    let [add] = ops.as_slice() else {
+        panic!(
+            "expected exactly the main row's new image, got {:?}",
+            names.tags(&ops)
+        );
     };
-    assert_eq!(del.part, QueryPart::main());
-    assert_eq!(add.part, QueryPart::main());
+    assert_eq!(*part_of(add), QueryPart::main());
     assert!(
-        matches!(&del.op, DataFrameOperation::Delete(_, row) if !row.data.contains_key("reviewer"))
+        matches!(&add.op, DataFrameOperation::Add(_, row) if row.data["reviewer"] == Value::Int(42))
     );
-    assert!(matches!(&add.op, DataFrameOperation::Add(_, row) if row.data["reviewer"] == Value::Int(42)));
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 1);
 }
 
@@ -512,15 +540,19 @@ fn sub_move_to_unreferenced_value_emits_delete() {
     names.register(&mut ivm, "q", tickets_members_query());
     write(&mut ivm, &storage, team_ticket(10, 5));
 
-    let ops = write(&mut ivm, &storage, insert("members", 1, &[("team", Value::Int(9))]));
+    let ops = write(
+        &mut ivm,
+        &storage,
+        insert("members", 1, &[("team", Value::Int(9))]),
+    );
     assert_eq!(names.tags(&ops), vec!["q/join0/del:Int(1)"]);
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::main()), 1);
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 1);
 }
 
 /// A sub row moving between two referenced values is replaced in place —
-/// the `Delete(old)` + `Add(new)` pair, still one row, `right` counts
-/// moved by the pair's two images.
+/// one `Add` for the client, still one row, `right` counts moved by the
+/// engine's diff of the two images.
 #[test]
 fn sub_move_between_referenced_values_refreshes() {
     let (mut ivm, storage, names) = engine();
@@ -530,8 +562,12 @@ fn sub_move_between_referenced_values_refreshes() {
     write(&mut ivm, &storage, team_ticket(10, 5));
     write(&mut ivm, &storage, team_ticket(11, 6));
 
-    let ops = write(&mut ivm, &storage, insert("members", 1, &[("team", Value::Int(6))]));
-    assert_eq!(names.tags(&ops), vec!["q/join0/add:Int(1)", "q/join0/del:Int(1)"]);
+    let ops = write(
+        &mut ivm,
+        &storage,
+        insert("members", 1, &[("team", Value::Int(6))]),
+    );
+    assert_eq!(names.tags(&ops), vec!["q/join0/add:Int(1)"]);
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 2);
 }
 
@@ -566,7 +602,10 @@ fn shared_sub_row_across_two_joins_deletes_both_parts() {
     );
 
     let ops = write(&mut ivm, &storage, delete("users", 7));
-    assert_eq!(names.tags(&ops), vec!["q/join0/del:Int(7)", "q/join1/del:Int(7)"]);
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/join0/del:Int(7)", "q/join1/del:Int(7)"]
+    );
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::main()), 1);
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 0);
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(1)), 0);
@@ -589,7 +628,10 @@ fn second_subscription_shares_rows_and_gets_its_own_snapshot() {
     );
 
     let ops = write(&mut ivm, &storage, ticket(2, "OPEN", 7));
-    assert_eq!(names.tags(&ops), vec!["q1/main/add:Int(2)", "q2/main/add:Int(2)"]);
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q1/main/add:Int(2)", "q2/main/add:Int(2)"]
+    );
     ivm.unregister_query(names.id("q1"));
     assert_eq!(frame_len(&ivm, &names, "q2", QueryPart::main()), 2);
     assert_eq!(frame_len(&ivm, &names, "q2", QueryPart::join(0)), 1);
@@ -624,17 +666,23 @@ fn self_join_write_converges_for_the_client() {
         &storage,
         insert("people", 2, &[("mgr", Value::Int(2))]),
     );
-    assert_eq!(names.tags(&ops), vec!["q/join0/add:Int(2)", "q/main/add:Int(2)"]);
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/join0/add:Int(2)", "q/main/add:Int(2)"]
+    );
 
     let ops = write(
         &mut ivm,
         &storage,
         update("people", 2, &[("mgr", Value::Int(1))]),
     );
-    let join0_key2: Vec<&MultiTableUpdate> = ops
+    let join0_key2: Vec<&ClientUpdate> = ops
         .iter()
         .filter(|update| {
-            update.part == QueryPart::join(0)
+            update
+                .targets
+                .iter()
+                .any(|target| target.part == QueryPart::join(0))
                 && update.op.key().pkey_value["id"] == Value::Int(2)
         })
         .collect();
@@ -686,12 +734,18 @@ fn updates_carry_their_destination_table() {
     storage.apply(&ticket(1, "OPEN", 7));
 
     let snapshot = names.register(&mut ivm, "q", tickets_users_query());
-    assert!(snapshot.iter().any(|update| update.part == QueryPart::main()));
-    assert!(snapshot
-        .iter()
-        .any(|update| update.part == QueryPart::join(0)));
+    assert!(
+        snapshot
+            .iter()
+            .any(|update| *part_of(update) == QueryPart::main())
+    );
+    assert!(
+        snapshot
+            .iter()
+            .any(|update| *part_of(update) == QueryPart::join(0))
+    );
     for update in &snapshot {
-        if update.part.is_main() {
+        if part_of(update).is_main() {
             assert_eq!(update.table, "tickets");
         } else {
             assert_eq!(update.table, "users");
@@ -708,8 +762,16 @@ fn unregister_removes_all_parts() {
     write(&mut ivm, &storage, ticket(1, "OPEN", 7));
 
     ivm.unregister_query(names.id("q"));
-    assert!(ivm.engine().rows_for(names.id("q"), QueryPart::main()).is_none());
-    assert!(ivm.engine().rows_for(names.id("q"), QueryPart::join(0)).is_none());
+    assert!(
+        ivm.engine()
+            .rows_for(names.id("q"), QueryPart::main())
+            .is_none()
+    );
+    assert!(
+        ivm.engine()
+            .rows_for(names.id("q"), QueryPart::join(0))
+            .is_none()
+    );
     let ops = write(&mut ivm, &storage, ticket(2, "OPEN", 7));
     assert!(ops.is_empty());
 }
@@ -728,7 +790,11 @@ fn profiles_table() -> DbTable {
 }
 
 fn profile(id: i64, user: i64) -> WriteQuery {
-    insert("profiles", id, &[("user_id", Value::Int(user)), ("bio", "x".into())])
+    insert(
+        "profiles",
+        id,
+        &[("user_id", Value::Int(user)), ("bio", "x".into())],
+    )
 }
 
 /// A single `users` node.
@@ -740,7 +806,11 @@ fn users_node() -> MultiTableReadQuery {
 fn users_with_profiles() -> MultiTableReadQuery {
     left_joined(
         query(&sub_table("users"), Where::AND(vec![])),
-        vec![left(query(&profiles_table(), Where::AND(vec![])), "id", "user_id")],
+        vec![left(
+            query(&profiles_table(), Where::AND(vec![])),
+            "id",
+            "user_id",
+        )],
     )
 }
 
@@ -773,15 +843,27 @@ fn right_join_snapshot_keeps_children_and_matched_parents() {
     let snapshot = names.register(&mut ivm, "q", tickets_right_users_query(users_node()));
     assert_eq!(
         names.tags(&snapshot),
-        vec!["q/join0/add:Int(1)", "q/join0/add:Int(2)", "q/main/add:Int(10)"],
+        vec![
+            "q/join0/add:Int(1)",
+            "q/join0/add:Int(2)",
+            "q/main/add:Int(10)"
+        ],
         "users preserved; ticket 11 has no user, ticket 12 is not open"
     );
-    assert_eq!(snapshot[0].part, QueryPart::join(0), "the driving child registers first");
+    assert_eq!(
+        *part_of(&snapshot[0]),
+        QueryPart::join(0),
+        "the driving child registers first"
+    );
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::main()), 1);
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 2);
 
     let ops = write(&mut ivm, &storage, ticket(13, "OPEN", 2));
-    assert_eq!(names.tags(&ops), vec!["q/main/add:Int(13)"], "a referenced assignee: routed natively");
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/main/add:Int(13)"],
+        "a referenced assignee: routed natively"
+    );
     assert!(
         write(&mut ivm, &storage, ticket(14, "OPEN", 9)).is_empty(),
         "no such user: the parent's IN leaf rejects the row inside the index"
@@ -794,7 +876,12 @@ fn right_join_snapshot_keeps_children_and_matched_parents() {
 #[test]
 fn right_join_child_arrival_admits_parent_rows() {
     let (mut ivm, storage, names) = engine();
-    for w in [user(1, "a"), ticket(10, "OPEN", 1), ticket(11, "OPEN", 9), ticket(14, "OPEN", 9)] {
+    for w in [
+        user(1, "a"),
+        ticket(10, "OPEN", 1),
+        ticket(11, "OPEN", 9),
+        ticket(14, "OPEN", 9),
+    ] {
         storage.apply(&w);
     }
     names.register(&mut ivm, "q", tickets_right_users_query(users_node()));
@@ -803,9 +890,17 @@ fn right_join_child_arrival_admits_parent_rows() {
     let ops = write(&mut ivm, &storage, user(9, "z"));
     assert_eq!(
         names.tags(&ops),
-        vec!["q/join0/add:Int(9)", "q/main/add:Int(11)", "q/main/add:Int(14)"]
+        vec![
+            "q/join0/add:Int(9)",
+            "q/main/add:Int(11)",
+            "q/main/add:Int(14)"
+        ]
     );
-    assert_eq!(ops[0].part, QueryPart::join(0), "the driver's operation precedes the rows it admits");
+    assert_eq!(
+        *part_of(&ops[0]),
+        QueryPart::join(0),
+        "the driver's operation precedes the rows it admits"
+    );
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::main()), 3);
 }
 
@@ -815,7 +910,13 @@ fn right_join_child_arrival_admits_parent_rows() {
 #[test]
 fn right_join_departures() {
     let (mut ivm, storage, names) = engine();
-    for w in [user(1, "a"), user(9, "z"), ticket(10, "OPEN", 1), ticket(11, "OPEN", 9), ticket(14, "OPEN", 9)] {
+    for w in [
+        user(1, "a"),
+        user(9, "z"),
+        ticket(10, "OPEN", 1),
+        ticket(11, "OPEN", 9),
+        ticket(14, "OPEN", 9),
+    ] {
         storage.apply(&w);
     }
     names.register(&mut ivm, "q", tickets_right_users_query(users_node()));
@@ -824,18 +925,26 @@ fn right_join_departures() {
     let ops = write(&mut ivm, &storage, delete("users", 9));
     assert_eq!(
         names.tags(&ops),
-        vec!["q/join0/del:Int(9)", "q/main/del:Int(11)", "q/main/del:Int(14)"]
+        vec![
+            "q/join0/del:Int(9)",
+            "q/main/del:Int(11)",
+            "q/main/del:Int(14)"
+        ]
     );
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::main()), 1);
 
     let ops = write(&mut ivm, &storage, delete("tickets", 10));
-    assert_eq!(names.tags(&ops), vec!["q/main/del:Int(10)"], "the preserved child keeps its row");
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/main/del:Int(10)"],
+        "the preserved child keeps its row"
+    );
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 1);
 }
 
-/// A parent row moving between referenced values is a plain replace pair
-/// on the parent; moving to an unreferenced value leaves the parent's
-/// result set through membership.
+/// A parent row moving between referenced values is a plain replace on
+/// the parent (one `Add`); moving to an unreferenced value leaves the
+/// parent's result set through membership.
 #[test]
 fn right_join_parent_updates_route_natively() {
     let (mut ivm, storage, names) = engine();
@@ -845,7 +954,7 @@ fn right_join_parent_updates_route_natively() {
     names.register(&mut ivm, "q", tickets_right_users_query(users_node()));
 
     let ops = write(&mut ivm, &storage, update_ticket(10, "OPEN", 2));
-    assert_eq!(names.tags(&ops), vec!["q/main/add:Int(10)", "q/main/del:Int(10)"]);
+    assert_eq!(names.tags(&ops), vec!["q/main/add:Int(10)"]);
     let ops = write(&mut ivm, &storage, update_ticket(10, "OPEN", 9));
     assert_eq!(names.tags(&ops), vec!["q/main/del:Int(10)"]);
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::main()), 0);
@@ -861,10 +970,18 @@ fn nested_left_under_right_cascades() {
     for w in [user(1, "a"), profile(100, 1), ticket(10, "OPEN", 1)] {
         storage.apply(&w);
     }
-    let snapshot = names.register(&mut ivm, "q", tickets_right_users_query(users_with_profiles()));
+    let snapshot = names.register(
+        &mut ivm,
+        "q",
+        tickets_right_users_query(users_with_profiles()),
+    );
     assert_eq!(
         names.tags(&snapshot),
-        vec!["q/join0/add:Int(1)", "q/main/add:Int(10)", "q/part[0, 0]/add:Int(100)"]
+        vec![
+            "q/join0/add:Int(1)",
+            "q/main/add:Int(10)",
+            "q/part[0, 0]/add:Int(100)"
+        ]
     );
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart(vec![0, 0])), 1);
 
@@ -879,7 +996,10 @@ fn nested_left_under_right_cascades() {
         "the user's profile is fetched through the nested LEFT edge; no ticket names user 2"
     );
     let ops = write(&mut ivm, &storage, delete("users", 2));
-    assert_eq!(names.tags(&ops), vec!["q/join0/del:Int(2)", "q/part[0, 0]/del:Int(101)"]);
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/join0/del:Int(2)", "q/part[0, 0]/del:Int(101)"]
+    );
 }
 
 /// Two LEFT levels: a ticket arriving fetches its user, and the fetched
@@ -899,13 +1019,24 @@ fn nested_left_under_left_cascades() {
     let ops = write(&mut ivm, &storage, ticket(10, "OPEN", 1));
     assert_eq!(
         names.tags(&ops),
-        vec!["q/join0/add:Int(1)", "q/main/add:Int(10)", "q/part[0, 0]/add:Int(100)"]
+        vec![
+            "q/join0/add:Int(1)",
+            "q/main/add:Int(10)",
+            "q/part[0, 0]/add:Int(100)"
+        ]
     );
-    assert!(ops[0].part.is_main(), "the driving root row is forwarded before what it fetches");
+    assert!(
+        part_of(&ops[0]).is_main(),
+        "the driving root row is forwarded before what it fetches"
+    );
     let ops = write(&mut ivm, &storage, delete("tickets", 10));
     assert_eq!(
         names.tags(&ops),
-        vec!["q/join0/del:Int(1)", "q/main/del:Int(10)", "q/part[0, 0]/del:Int(100)"]
+        vec![
+            "q/join0/del:Int(1)",
+            "q/main/del:Int(10)",
+            "q/part[0, 0]/del:Int(100)"
+        ]
     );
     for part in [QueryPart::main(), QueryPart::join(0), QueryPart(vec![0, 0])] {
         assert_eq!(frame_len(&ivm, &names, "q", part), 0);
@@ -919,7 +1050,13 @@ fn nested_left_under_left_cascades() {
 #[test]
 fn two_edges_driving_one_column_intersect() {
     let (mut ivm, storage, names) = engine();
-    for w in [user(1, "a"), user(2, "b"), profile(100, 1), ticket(10, "OPEN", 1), ticket(11, "OPEN", 2)] {
+    for w in [
+        user(1, "a"),
+        user(2, "b"),
+        profile(100, 1),
+        ticket(10, "OPEN", 1),
+        ticket(11, "OPEN", 2),
+    ] {
         storage.apply(&w);
     }
     let users = MultiTableReadQuery {
@@ -958,7 +1095,10 @@ fn two_edges_driving_one_column_intersect() {
     );
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart(vec![0, 0])), 2);
     let ops = write(&mut ivm, &storage, delete("profiles", 101));
-    assert_eq!(names.tags(&ops), vec!["q/join0/del:Int(2)", "q/part[0, 0]/del:Int(101)"]);
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/join0/del:Int(2)", "q/part[0, 0]/del:Int(101)"]
+    );
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 0);
 }
 
@@ -969,7 +1109,11 @@ fn unregister_removes_nested_parts() {
     for w in [user(1, "a"), profile(100, 1), ticket(10, "OPEN", 1)] {
         storage.apply(&w);
     }
-    names.register(&mut ivm, "q", tickets_right_users_query(users_with_profiles()));
+    names.register(
+        &mut ivm,
+        "q",
+        tickets_right_users_query(users_with_profiles()),
+    );
     ivm.unregister_query(names.id("q"));
     for part in [QueryPart::main(), QueryPart::join(0), QueryPart(vec![0, 0])] {
         assert!(ivm.engine().rows_for(names.id("q"), part).is_none());
@@ -1002,17 +1146,30 @@ fn identical_subscriptions_share_one_edge() {
             "c/main/add:Int(10)"
         ]
     );
-    assert_eq!(cost.conditions_replaced, 1, "one set edit for the shared edge, not one per subscriber");
-    assert_eq!(cost.queries_impacted, 1, "one inner root part serves all three");
+    assert_eq!(
+        cost.conditions_replaced, 1,
+        "one set edit for the shared edge, not one per subscriber"
+    );
+    assert_eq!(
+        cost.queries_impacted, 1,
+        "one inner root part serves all three"
+    );
 
     ivm.unregister_query(names.id("a"));
     let ops = write(&mut ivm, &storage, ticket(11, "OPEN", 1));
-    assert_eq!(names.tags(&ops), vec!["b/main/add:Int(11)", "c/main/add:Int(11)"]);
+    assert_eq!(
+        names.tags(&ops),
+        vec!["b/main/add:Int(11)", "c/main/add:Int(11)"]
+    );
     assert_eq!(frame_len(&ivm, &names, "b", QueryPart::join(0)), 1);
 
     ivm.unregister_query(names.id("b"));
     ivm.unregister_query(names.id("c"));
-    assert!(ivm.engine().rows_for(names.id("c"), QueryPart::main()).is_none());
+    assert!(
+        ivm.engine()
+            .rows_for(names.id("c"), QueryPart::main())
+            .is_none()
+    );
     assert!(write(&mut ivm, &storage, ticket(12, "OPEN", 1)).is_empty());
 }
 
@@ -1040,7 +1197,10 @@ fn later_identical_registration_is_served_from_the_shared_tree() {
         ]
     );
     let cost = ivm.engine().stats().diff(&before);
-    assert_eq!(cost.snapshots_shared, 2, "both parts served without storage");
+    assert_eq!(
+        cost.snapshots_shared, 2,
+        "both parts served without storage"
+    );
     assert_eq!(cost.queries_registered, 0, "no inner registration happened");
 }
 
@@ -1061,8 +1221,14 @@ fn set_valued_leaf_keeps_its_identity_across_crossings() {
         write(&mut ivm, &storage, delete("tickets", 10 + id));
     }
     let cost = ivm.engine().stats().diff(&before);
-    assert_eq!(cost.conditions_replaced, 10, "five members added, five removed");
-    assert_eq!(cost.conditions_indexed, 0, "the leaf condition itself never changed");
+    assert_eq!(
+        cost.conditions_replaced, 10,
+        "five members added, five removed"
+    );
+    assert_eq!(
+        cost.conditions_indexed, 0,
+        "the leaf condition itself never changed"
+    );
     assert_eq!(cost.disjuncts_registered, 0);
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 0);
 }

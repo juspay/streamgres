@@ -129,21 +129,57 @@ impl IvmStats {
 impl fmt::Display for IvmStats {
     /// Multi-line, dot-aligned rendering of every counter.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "queries registered ......... {}", self.queries_registered)?;
-        writeln!(f, "disjuncts registered ....... {}", self.disjuncts_registered)?;
-        writeln!(f, "condition links indexed .... {}", self.conditions_indexed)?;
+        writeln!(
+            f,
+            "queries registered ......... {}",
+            self.queries_registered
+        )?;
+        writeln!(
+            f,
+            "disjuncts registered ....... {}",
+            self.disjuncts_registered
+        )?;
+        writeln!(
+            f,
+            "condition links indexed .... {}",
+            self.conditions_indexed
+        )?;
         writeln!(f, "snapshots shared ........... {}", self.snapshots_shared)?;
-        writeln!(f, "conditions replaced ........ {}", self.conditions_replaced)?;
+        writeln!(
+            f,
+            "conditions replaced ........ {}",
+            self.conditions_replaced
+        )?;
         writeln!(f, "writes processed ........... {}", self.writes_processed)?;
         writeln!(f, "columns probed ............. {}", self.columns_probed)?;
-        writeln!(f, "conditions matched ......... {}", self.conditions_evaluated)?;
+        writeln!(
+            f,
+            "conditions matched ......... {}",
+            self.conditions_evaluated
+        )?;
         writeln!(f, "condition hits ............. {}", self.index_hits)?;
-        writeln!(f, "disjunct increments ........ {}", self.disjunct_increments)?;
+        writeln!(
+            f,
+            "disjunct increments ........ {}",
+            self.disjunct_increments
+        )?;
         writeln!(f, "disjuncts fired ............ {}", self.disjuncts_fired)?;
-        writeln!(f, "membership probes / hits ... {} / {}", self.membership_probes, self.membership_hits)?;
+        writeln!(
+            f,
+            "membership probes / hits ... {} / {}",
+            self.membership_probes, self.membership_hits
+        )?;
         writeln!(f, "queries impacted ........... {}", self.queries_impacted)?;
         writeln!(f, "storage reads asked ........ {}", self.storage_reads)?;
-        writeln!(f, "window evictions / refills . {} / {}", self.window_evictions, self.window_refills)?;
-        write!(f, "ops emitted ................ {} adds, {} deletes", self.ops_add, self.ops_delete)
+        writeln!(
+            f,
+            "window evictions / refills . {} / {}",
+            self.window_evictions, self.window_refills
+        )?;
+        write!(
+            f,
+            "ops emitted ................ {} adds, {} deletes",
+            self.ops_add, self.ops_delete
+        )
     }
 }

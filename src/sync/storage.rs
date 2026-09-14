@@ -1,13 +1,17 @@
 //! The storage boundary: where rows the engine does not yet hold are read
 //! from. Every read is asynchronous and reports, with its rows, the WAL
-//! location its snapshot reflects every commit up to; how a source arrives
-//! at that location is its own business (see `pg`). The runtime never
-//! calls it from inside the engine, so a slow read never stalls the write
-//! stream. The in-process [`MemoryStorage`] answers immediately (its
-//! futures are ready when created), which is what lets the synchronous
-//! driver run it inline.
+//! location its snapshot reflects every commit up to. A source is told how
+//! far the write stream has been delivered ([`Storage::advance`]) and may
+//! only answer reads from snapshots at or below that point, so a read is
+//! never ahead of what the engine has applied; it also says the lowest
+//! location a read may be positioned at from now on ([`Storage::floor`]),
+//! which is how far back the runtime keeps delivered writes to bring a
+//! read up. The in-process [`MemoryStorage`] is always at the stream
+//! position (it holds the current rows, no bring-up needed); a source that
+//! mints snapshots ahead of time (see `pg`) flips to a newer snapshot only
+//! once the stream has passed it.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -17,7 +21,8 @@ use crate::model::{
     DataFrameKey, DataFrameRow, Lsn, Order, SingleTableReadQuery, TableName, Value, WriteQuery,
 };
 
-/// A failed storage read; the runtime re-issues the read.
+/// A failed storage read; the runtime parks the read and hands it out
+/// again once the stream moves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageError(pub String);
 
@@ -40,21 +45,33 @@ pub trait Storage {
     /// Rows of `query.table` whose full row image satisfies `query.filter`,
     /// read from **one consistent snapshot** of the source, as (identity,
     /// image) pairs, together with the position that snapshot reflects.
-    /// The snapshot must reflect every write committed at or below
-    /// `at_least`, the stream position the engine has already applied
-    /// (a source that takes its snapshot at read time satisfies this by
-    /// construction; one that mints snapshots ahead of time must pick or
-    /// mint a fresh one). When `limit` is finite the result must honor
+    /// That position must not exceed the last [`Storage::advance`]: the
+    /// snapshot may be behind the stream (the runtime brings its rows up),
+    /// never ahead of it. When `limit` is finite the result must honor
     /// `order_by` and `limit` (window maintenance depends on getting the
     /// *best* rows); an unlimited query may return rows in any order.
-    async fn select(&self, query: &SingleTableReadQuery, at_least: Option<Lsn>) -> Result<Snapshot, StorageError>;
+    async fn select(&self, query: &SingleTableReadQuery) -> Result<Snapshot, StorageError>;
+
+    /// The stream has been delivered (and applied by the engine) up to
+    /// `feed`: a snapshot at or below it may now serve reads.
+    fn advance(&self, feed: Lsn);
+
+    /// The lowest location a read issued from now on can be positioned
+    /// at; the runtime keeps every delivered write above it.
+    fn floor(&self) -> Lsn;
+
+    /// A write the stream delivered at `at`, before it is routed: a source
+    /// mirroring tables in memory applies it. No-op by default.
+    fn absorb(&self, write: &WriteQuery, at: Lsn) {
+        let _ = (write, at);
+    }
 }
 
 /// In-process storage: plain tables of rows, kept in insertion order so
 /// selects (and therefore the operations they lead to) are deterministic.
-/// Reads answer immediately and are positioned at location zero: below
-/// every write the synchronous driver ever routes, so nothing a read
-/// returns is mistaken for reflecting a write routed after it.
+/// Reads answer immediately and are positioned at the stream position the
+/// store was last advanced to: the store holds exactly the rows the
+/// engine's position implies, so nothing needs bringing up.
 ///
 /// Interior mutability lets tests hold a shared handle and mirror every
 /// write into storage *before* routing it, the same order of events a
@@ -62,10 +79,11 @@ pub trait Storage {
 #[derive(Default)]
 pub struct MemoryStorage {
     tables: RefCell<HashMap<TableName, Vec<(DataFrameKey, DataFrameRow)>>>,
+    position: Cell<Lsn>,
 }
 
 impl MemoryStorage {
-    /// An empty store.
+    /// An empty store at location zero.
     pub fn new() -> Self {
         Self::default()
     }
@@ -91,6 +109,24 @@ impl MemoryStorage {
                 }
             }
         }
+    }
+
+    /// Put a table's rows in place (a warm-up from another source),
+    /// upserting by primary key.
+    pub fn load(&self, table: &TableName, rows: Vec<(DataFrameKey, DataFrameRow)>) {
+        let mut tables = self.tables.borrow_mut();
+        let held = tables.entry(table.clone()).or_default();
+        for (key, row) in rows {
+            match held.iter().position(|(existing, _)| *existing == key) {
+                Some(index) => held[index] = (key, row),
+                None => held.push((key, row)),
+            }
+        }
+    }
+
+    /// The location the store was last advanced to.
+    pub fn position(&self) -> Lsn {
+        self.position.get()
     }
 
     /// The rows `query` selects right now: a linear scan of the table,
@@ -127,12 +163,30 @@ impl MemoryStorage {
 }
 
 impl Storage for MemoryStorage {
-    /// [`MemoryStorage::rows`], positioned at zero; ready immediately (an
-    /// in-process read is always current, so `at_least` is moot).
-    async fn select(&self, query: &SingleTableReadQuery, _at_least: Option<Lsn>) -> Result<Snapshot, StorageError> {
+    /// [`MemoryStorage::rows`], positioned at the store's position; ready
+    /// immediately.
+    async fn select(&self, query: &SingleTableReadQuery) -> Result<Snapshot, StorageError> {
         Ok(Snapshot {
             rows: self.rows(query),
-            at: Lsn(0),
+            at: self.position.get(),
         })
+    }
+
+    /// The store is current at `feed`.
+    fn advance(&self, feed: Lsn) {
+        if feed > self.position.get() {
+            self.position.set(feed);
+        }
+    }
+
+    /// Reads are never behind the position.
+    fn floor(&self) -> Lsn {
+        self.position.get()
+    }
+
+    /// Apply the write and move the position to it.
+    fn absorb(&self, write: &WriteQuery, at: Lsn) {
+        self.apply(write);
+        self.advance(at);
     }
 }

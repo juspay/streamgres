@@ -82,58 +82,21 @@
 //! [`MultiTableIVM::land_fetch`], which cascades the landed rows' arrivals
 //! exactly as it cascades a write's.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use super::stats::IvmStats;
-use super::{Engine, Fetch, SingleTableIVM, SingleTableUpdate};
+use super::update::{Raw, Target, group};
+use super::{ClientUpdate, Engine, Fetch, QueryPart, SingleTableIVM, SingleTableUpdate};
 use crate::model::{
-    ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow, Lsn,
-    MultiTableReadQuery, SharedSet, SingleTableReadQuery, SubId, TableName, Value, Where,
-    WriteQuery,
+    ClientId, ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameOperation,
+    DataFrameRow, MultiTableReadQuery, SharedSet, SingleTableReadQuery, SubId, TableName, Value,
+    Where, WriteQuery,
 };
 
-/// Which node of a subscription's join tree a part is: the path of join
-/// indices from the root, a node's left joins numbered first and its right
-/// joins after them. The root is the empty path.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub struct QueryPart(pub Vec<usize>);
-
-impl QueryPart {
-    /// The root part.
-    pub fn main() -> Self {
-        QueryPart(Vec::new())
-    }
-
-    /// The root's `index`-th join.
-    pub fn join(index: usize) -> Self {
-        QueryPart(vec![index])
-    }
-
-    /// Whether this is the root.
-    pub fn is_main(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    /// The join index of a first-level part; `None` for the root and for
-    /// nested parts.
-    pub fn join_index(&self) -> Option<usize> {
-        match self.0.as_slice() {
-            [index] => Some(*index),
-            _ => None,
-        }
-    }
-
-    /// The `index`-th child of this part.
-    fn child(&self, index: usize) -> Self {
-        let mut path = self.0.clone();
-        path.push(index);
-        QueryPart(path)
-    }
-}
-
-/// One operation for one part of one multi-table subscription — the unit
-/// the transport pushes to the subscribed client.
+/// One operation for one part of one multi-table subscription — the
+/// join layer's own unit, grouped per client before it leaves the engine
+/// ([`ClientUpdate`]).
 ///
 /// - `query`: which subscription (the engine id `register_query` returned).
 /// - `table`: the table the operation lands on.
@@ -250,6 +213,9 @@ struct Tree {
 /// - `next_sub`: the next subscription id to hand out; never reused.
 /// - `parts`: inner part id → (tree id, part), the reverse map every
 ///   routed operation goes through.
+/// - `clients`: subscription id → the client it belongs to, and
+///   `by_client` the reverse, for addressing deltas and for a client's
+///   disconnect.
 pub struct MultiTableIVM {
     single: SingleTableIVM,
     trees: HashMap<usize, Tree>,
@@ -257,16 +223,25 @@ pub struct MultiTableIVM {
     by_sub: HashMap<SubId, usize>,
     next_sub: u64,
     parts: HashMap<SubId, (usize, QueryPart)>,
+    clients: HashMap<SubId, ClientId>,
+    by_client: HashMap<ClientId, BTreeSet<SubId>>,
 }
 
 /// The row's value in `column`; a missing column joins like `NULL` (never).
 fn join_value(row: &DataFrameRow, column: &ColumnName) -> Value {
-    row.data.get(column.as_str()).cloned().unwrap_or(Value::Null)
+    row.data
+        .get(column.as_str())
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 /// The leaf restricting a driven part to a shared set's members.
 fn leaf_condition(column: &ColumnName, set: &SharedSet) -> Condition {
-    Condition::new(column.clone(), ComparisonOperator::IN, Value::Set(set.clone()))
+    Condition::new(
+        column.clone(),
+        ComparisonOperator::IN,
+        Value::Set(set.clone()),
+    )
 }
 
 /// Build the node, edge and leaf tables of a spec.
@@ -300,12 +275,7 @@ fn build_tree(spec: &MultiTableReadQuery) -> Tree {
 }
 
 /// Add `spec`'s node at `part` and, recursively, its children.
-fn add_node(
-    tree: &mut Tree,
-    spec: &MultiTableReadQuery,
-    part: QueryPart,
-    parent: Option<usize>,
-) {
+fn add_node(tree: &mut Tree, spec: &MultiTableReadQuery, part: QueryPart, parent: Option<usize>) {
     let mut node = Node {
         part: None,
         live: false,
@@ -421,6 +391,8 @@ impl MultiTableIVM {
             by_sub: HashMap::new(),
             next_sub: 0,
             parts: HashMap::new(),
+            clients: HashMap::new(),
+            by_client: HashMap::new(),
         }
     }
 
@@ -552,7 +524,9 @@ impl MultiTableIVM {
             let waiting_parent = node
                 .parent
                 .map(|edge| &tree.edges[edge])
-                .filter(|edge| edge.kind == JoinKind::Right && tree.nodes[&edge.parent].part.is_none())
+                .filter(|edge| {
+                    edge.kind == JoinKind::Right && tree.nodes[&edge.parent].part.is_none()
+                })
                 .map(|edge| edge.parent.clone());
             (left_children, waiting_parent)
         };
@@ -564,16 +538,19 @@ impl MultiTableIVM {
         }
     }
 
-    /// Land the rows a part's storage read returned, reflecting every
-    /// commit up to `at`:
-    /// merge them through the inner engine, forward the resulting
-    /// operations like a write's, letting arrivals cascade down the tree
-    /// (each may reference further join values and ask for further
-    /// reads), and, when this was the last read out for a part not yet
-    /// live, continue the registration walk from it. A read for a part
-    /// that is gone lands as nothing.
-    pub fn land_fetch(&mut self, fetch: &Fetch, rows: &[(DataFrameKey, DataFrameRow)], at: Lsn) -> Vec<MultiTableUpdate> {
-        let applied = self.single.land_fetch(fetch, rows, at);
+    /// Land the rows a part's storage read returned (brought up to the
+    /// engine's position by the runtime): merge them through the inner
+    /// engine, forward the resulting operations like a write's, letting
+    /// arrivals cascade down the tree (each may reference further join
+    /// values and ask for further reads), and, when this was the last read
+    /// out for a part not yet live, continue the registration walk from
+    /// it. A read for a part that is gone lands as nothing.
+    pub fn land_fetch(
+        &mut self,
+        fetch: &Fetch,
+        rows: &[(DataFrameKey, DataFrameRow)],
+    ) -> Vec<MultiTableUpdate> {
+        let applied = self.single.land_fetch(fetch, rows);
         let mut out = self.forward(applied);
         let Some((tree_id, part)) = self.parts.get(&fetch.sub).cloned() else {
             return out;
@@ -632,12 +609,12 @@ impl MultiTableIVM {
         }
     }
 
-    /// Route one write committed at `at` through the inner engine and
-    /// forward the resulting per-part operations to every subscriber of
-    /// their tree, maintaining the join state on the way (see the module
-    /// docs for the order and the replace-pair diffing).
-    pub fn incremental_update(&mut self, write: &WriteQuery, at: Lsn) -> Vec<MultiTableUpdate> {
-        let applied = self.single.incremental_update(write, at);
+    /// Route one write through the inner engine and forward the resulting
+    /// per-part operations to every subscriber of their tree, maintaining
+    /// the join state on the way (see the module docs for the order and
+    /// the replace-pair diffing).
+    pub fn incremental_update(&mut self, write: &WriteQuery) -> Vec<MultiTableUpdate> {
+        let applied = self.single.incremental_update(write);
         self.forward(applied)
     }
 
@@ -677,7 +654,13 @@ impl MultiTableIVM {
             match (update.op, paired_add) {
                 (DataFrameOperation::Delete(key, old), Some(add)) => {
                     let new = add.row().clone();
-                    self.emit(tree_id, &part, &table, DataFrameOperation::Delete(key, old.clone()), &mut out);
+                    self.emit(
+                        tree_id,
+                        &part,
+                        &table,
+                        DataFrameOperation::Delete(key, old.clone()),
+                        &mut out,
+                    );
                     self.emit(tree_id, &part, &table, add, &mut out);
                     self.replaced(tree_id, &part, &old, &new, &mut out);
                 }
@@ -699,7 +682,11 @@ impl MultiTableIVM {
     /// The rows currently held for one part of a subscription — key →
     /// image, an inspection view for tests and debugging. `None` for
     /// unknown ids or parts.
-    pub fn rows_for(&self, sub: SubId, part: QueryPart) -> Option<HashMap<DataFrameKey, DataFrameRow>> {
+    pub fn rows_for(
+        &self,
+        sub: SubId,
+        part: QueryPart,
+    ) -> Option<HashMap<DataFrameKey, DataFrameRow>> {
         let tree = self.trees.get(self.by_sub.get(&sub)?)?;
         let node = tree.nodes.get(&part)?;
         self.single.rows_for(node.part?)
@@ -747,7 +734,13 @@ impl MultiTableIVM {
     }
 
     /// A row no longer held by `part`: the mirror of [`Self::arrived`].
-    fn departed(&mut self, tree_id: usize, part: &QueryPart, row: &DataFrameRow, out: &mut Vec<MultiTableUpdate>) {
+    fn departed(
+        &mut self,
+        tree_id: usize,
+        part: &QueryPart,
+        row: &DataFrameRow,
+        out: &mut Vec<MultiTableUpdate>,
+    ) {
         for (edge, drives, column) in edge_steps(&self.trees[&tree_id], part) {
             let value = join_value(row, &column);
             if drives {
@@ -807,7 +800,10 @@ impl MultiTableIVM {
             set.insert(&value);
             return;
         };
-        if !self.single.set_insert(inner, &leaf_condition(&column, &set), &value) {
+        if !self
+            .single
+            .set_insert(inner, &leaf_condition(&column, &set), &value)
+        {
             return;
         }
         self.single
@@ -820,7 +816,13 @@ impl MultiTableIVM {
     /// (one index unfiling), prune the value's held driven rows from
     /// current data (no storage round-trip), forward the `Delete`s, and
     /// let them depart from the driven node.
-    fn release(&mut self, tree_id: usize, edge: usize, value: &Value, out: &mut Vec<MultiTableUpdate>) {
+    fn release(
+        &mut self,
+        tree_id: usize,
+        edge: usize,
+        value: &Value,
+        out: &mut Vec<MultiTableUpdate>,
+    ) {
         let crossing = self.left_count(tree_id, edge, value) == 1;
         self.left_drop(tree_id, edge, value);
         if !crossing {
@@ -835,7 +837,10 @@ impl MultiTableIVM {
             set.remove(value);
             return;
         };
-        if !self.single.set_remove(inner, &leaf_condition(&column, &set), value) {
+        if !self
+            .single
+            .set_remove(inner, &leaf_condition(&column, &set), value)
+        {
             return;
         }
         let deletes = self
@@ -890,7 +895,11 @@ impl MultiTableIVM {
     /// Decrement `value`'s `left` count on `edge`, removing the entry at
     /// zero.
     fn left_drop(&mut self, tree_id: usize, edge: usize, value: &Value) {
-        Self::drop_in(self.counts_mut(tree_id, edge).map(|counts| &mut counts.left), value);
+        Self::drop_in(
+            self.counts_mut(tree_id, edge)
+                .map(|counts| &mut counts.left),
+            value,
+        );
     }
 
     /// Increment `value`'s `right` count on `edge`.
@@ -903,7 +912,11 @@ impl MultiTableIVM {
     /// Decrement `value`'s `right` count on `edge`, removing the entry at
     /// zero.
     fn right_drop(&mut self, tree_id: usize, edge: usize, value: &Value) {
-        Self::drop_in(self.counts_mut(tree_id, edge).map(|counts| &mut counts.right), value);
+        Self::drop_in(
+            self.counts_mut(tree_id, edge)
+                .map(|counts| &mut counts.right),
+            value,
+        );
     }
 
     /// Decrement `value` in one count map, removing the entry at zero;
@@ -922,28 +935,77 @@ impl MultiTableIVM {
     }
 }
 
+impl MultiTableIVM {
+    /// Address per-subscription operations to their clients and group
+    /// them per client and row.
+    fn addressed(&self, updates: Vec<MultiTableUpdate>) -> Vec<ClientUpdate> {
+        group(
+            updates
+                .into_iter()
+                .filter_map(|update| {
+                    let client = *self.clients.get(&update.query)?;
+                    Some(Raw {
+                        client,
+                        table: update.table,
+                        target: Target {
+                            sub: update.query,
+                            part: update.part,
+                        },
+                        op: update.op,
+                    })
+                })
+                .collect(),
+        )
+    }
+}
+
 impl Engine for MultiTableIVM {
     type Query = MultiTableReadQuery;
-    type Update = MultiTableUpdate;
 
-    /// [`MultiTableIVM::register_query`].
-    fn subscribe(&mut self, query: MultiTableReadQuery) -> (SubId, Vec<MultiTableUpdate>) {
-        self.register_query(query)
+    /// [`MultiTableIVM::register_query`], its snapshot addressed to
+    /// `client`.
+    fn subscribe(
+        &mut self,
+        client: ClientId,
+        query: MultiTableReadQuery,
+    ) -> (SubId, Vec<ClientUpdate>) {
+        let (sub, updates) = self.register_query(query);
+        self.clients.insert(sub, client);
+        self.by_client.entry(client).or_default().insert(sub);
+        (sub, self.addressed(updates))
     }
 
     /// [`MultiTableIVM::unregister_query`].
     fn unsubscribe(&mut self, sub: SubId) {
+        if let Some(client) = self.clients.remove(&sub)
+            && let Some(subs) = self.by_client.get_mut(&client)
+        {
+            subs.remove(&sub);
+            if subs.is_empty() {
+                self.by_client.remove(&client);
+            }
+        }
         self.unregister_query(sub);
     }
 
-    /// [`MultiTableIVM::incremental_update`].
-    fn route(&mut self, write: &WriteQuery, at: Lsn) -> Vec<MultiTableUpdate> {
-        self.incremental_update(write, at)
+    /// Every subscription of `client`, unregistered.
+    fn unsubscribe_client(&mut self, client: ClientId) {
+        for sub in self.by_client.remove(&client).unwrap_or_default() {
+            self.clients.remove(&sub);
+            self.unregister_query(sub);
+        }
     }
 
-    /// [`MultiTableIVM::land_fetch`].
-    fn land(&mut self, fetch: &Fetch, rows: &[(DataFrameKey, DataFrameRow)], at: Lsn) -> Vec<MultiTableUpdate> {
-        self.land_fetch(fetch, rows, at)
+    /// [`MultiTableIVM::incremental_update`], grouped per client.
+    fn route(&mut self, write: &WriteQuery) -> Vec<ClientUpdate> {
+        let updates = self.incremental_update(write);
+        self.addressed(updates)
+    }
+
+    /// [`MultiTableIVM::land_fetch`], grouped per client.
+    fn land(&mut self, fetch: &Fetch, rows: &[(DataFrameKey, DataFrameRow)]) -> Vec<ClientUpdate> {
+        let updates = self.land_fetch(fetch, rows);
+        self.addressed(updates)
     }
 
     /// [`MultiTableIVM::take_requests`].

@@ -1,37 +1,42 @@
 //! The asynchronous driver: one task owns the runtime, takes commands
 //! (subscribe, unsubscribe, a positioned write, a progress mark) from a
-//! channel, hands every delta to an output channel, and runs each storage
-//! read the runtime asks for as its own task, reporting the result back
-//! into the loop. The runtime is touched only between awaits, never
-//! across one, so any number of reads can be out while writes keep
-//! flowing. Single-threaded by design: run it on a
-//! [`tokio::task::LocalSet`].
+//! channel, hands every delta to an output channel, and runs the storage
+//! reads the runtime asks for. A registration's snapshot read runs as its
+//! own task while writes keep flowing; a read asked for in the middle of
+//! maintaining a subscription (a join crossing, a window refill) is run
+//! **before anything else**, the loop awaiting it and taking no command
+//! meanwhile, so it lands at exactly the position the engine is at. The
+//! runtime is touched only between awaits. Single-threaded by design: run
+//! it on a [`tokio::task::LocalSet`].
 
+use std::collections::VecDeque;
 use std::rc::Rc;
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_local;
 
-use crate::model::{Lsn, Snapshot};
 use super::runtime::{Runtime, Step};
 use super::storage::{Storage, StorageError};
-use crate::ivm::{Engine, FetchId};
-use crate::model::{SubId, WriteQuery};
+use crate::ivm::{ClientUpdate, Engine, Fetch, FetchId};
+use crate::model::{ClientId, Lsn, Snapshot, SubId, WriteQuery};
 
 /// What a client of the service can ask.
 ///
-/// - `Register`: subscribe; the id comes back on `reply`, the snapshot
-///   through the delta channel like every other update.
-/// - `Unregister`: unsubscribe.
+/// - `Register`: subscribe for `client`; the id comes back on `reply`,
+///   the snapshot through the delta channel like every other update.
+/// - `Unregister`: unsubscribe one subscription.
+/// - `UnregisterClient`: a client went away; every subscription of it goes.
 /// - `Write`: one write the change feed delivered, with its commit
 ///   location.
 /// - `Progress`: the feed has delivered everything up to `lsn`.
 pub enum Command<Q> {
     Register {
+        client: ClientId,
         query: Q,
         reply: oneshot::Sender<SubId>,
     },
     Unregister(SubId),
+    UnregisterClient(ClientId),
     Write {
         write: WriteQuery,
         at: Lsn,
@@ -44,7 +49,7 @@ pub struct Service<E: Engine, S: Storage> {
     runtime: Runtime<E>,
     storage: Rc<S>,
     commands: mpsc::Receiver<Command<E::Query>>,
-    updates: mpsc::UnboundedSender<Vec<E::Update>>,
+    updates: mpsc::UnboundedSender<Vec<ClientUpdate>>,
     results: mpsc::UnboundedReceiver<(FetchId, Result<Snapshot, StorageError>)>,
     report: mpsc::UnboundedSender<(FetchId, Result<Snapshot, StorageError>)>,
 }
@@ -53,7 +58,6 @@ impl<E, S> Service<E, S>
 where
     E: Engine + 'static,
     E::Query: 'static,
-    E::Update: 'static,
     S: Storage + 'static,
 {
     /// A service over `engine` and `storage`, delivering deltas to
@@ -61,7 +65,7 @@ where
     pub fn new(
         engine: E,
         storage: Rc<S>,
-        updates: mpsc::UnboundedSender<Vec<E::Update>>,
+        updates: mpsc::UnboundedSender<Vec<ClientUpdate>>,
     ) -> (Self, mpsc::Sender<Command<E::Query>>) {
         let (commands_tx, commands) = mpsc::channel(1024);
         let (report, results) = mpsc::unbounded_channel();
@@ -88,22 +92,26 @@ where
                 result = self.results.recv() => match result {
                     Some((id, Ok(snapshot))) => self.runtime.fetched(id, snapshot),
                     Some((id, Err(error))) => {
-                        eprintln!("storage read {} failed, retrying: {error}", id.0);
+                        eprintln!("storage read {} failed, parked: {error}", id.0);
                         self.runtime.failed(id)
                     }
                     None => break,
                 },
             };
-            self.dispatch(step);
+            self.dispatch(step).await;
         }
         self.runtime
     }
 
     /// Apply one command to the runtime.
-    fn handle(&mut self, command: Command<E::Query>) -> Step<E::Update> {
+    fn handle(&mut self, command: Command<E::Query>) -> Step {
         match command {
-            Command::Register { query, reply } => {
-                let (sub, step) = self.runtime.register(query);
+            Command::Register {
+                client,
+                query,
+                reply,
+            } => {
+                let (sub, step) = self.runtime.register(client, query);
                 let _ = reply.send(sub);
                 step
             }
@@ -111,25 +119,67 @@ where
                 self.runtime.unregister(sub);
                 Step::default()
             }
-            Command::Write { write, at } => self.runtime.write(&write, at),
-            Command::Progress(lsn) => self.runtime.progress(lsn),
+            Command::UnregisterClient(client) => {
+                self.runtime.unregister_client(client);
+                Step::default()
+            }
+            Command::Write { write, at } => {
+                self.storage.absorb(&write, at);
+                let step = self.runtime.write(&write, at);
+                self.moved();
+                step
+            }
+            Command::Progress(lsn) => {
+                let step = self.runtime.progress(lsn);
+                self.moved();
+                step
+            }
         }
     }
 
-    /// Deliver a step's deltas and start a task per read it asked for,
-    /// each told the stream position the read must at least reflect.
-    fn dispatch(&mut self, step: Step<E::Update>) {
+    /// The stream moved: tell the storage, and learn its floor.
+    fn moved(&mut self) {
+        self.storage.advance(self.runtime.position());
+        self.runtime.set_floor(self.storage.floor());
+    }
+
+    /// Deliver a step's deltas and run its reads: a snapshot read as its
+    /// own task, a blocking read right here, landed before returning
+    /// (and whatever that landing asks for, the same way).
+    async fn dispatch(&mut self, step: Step) {
+        let mut queue: VecDeque<Fetch> = VecDeque::new();
+        self.emit(step, &mut queue);
+        while let Some(fetch) = queue.pop_front() {
+            if !fetch.kind.is_blocking() {
+                self.spawn(fetch);
+                continue;
+            }
+            let step = match self.storage.select(&fetch.query).await {
+                Ok(snapshot) => self.runtime.fetched(fetch.id, snapshot),
+                Err(error) => {
+                    eprintln!("storage read {} failed, parked: {error}", fetch.id.0);
+                    self.runtime.failed(fetch.id)
+                }
+            };
+            self.emit(step, &mut queue);
+        }
+    }
+
+    /// Send a step's deltas and queue its reads.
+    fn emit(&self, step: Step, queue: &mut VecDeque<Fetch>) {
         if !step.updates.is_empty() {
             let _ = self.updates.send(step.updates);
         }
-        let at_least = self.runtime.stream_position();
-        for fetch in step.selects {
-            let storage = self.storage.clone();
-            let report = self.report.clone();
-            spawn_local(async move {
-                let result = storage.select(&fetch.query, at_least).await;
-                let _ = report.send((fetch.id, result));
-            });
-        }
+        queue.extend(step.selects);
+    }
+
+    /// Run one read as its own task, reporting the result into the loop.
+    fn spawn(&self, fetch: Fetch) {
+        let storage = self.storage.clone();
+        let report = self.report.clone();
+        spawn_local(async move {
+            let result = storage.select(&fetch.query).await;
+            let _ = report.send((fetch.id, result));
+        });
     }
 }

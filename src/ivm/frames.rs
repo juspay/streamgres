@@ -9,22 +9,11 @@
 use std::collections::HashMap;
 
 use super::predicate::evaluate;
-use super::{window, Fetch, FetchId, FetchKind, SingleTableIVM, SingleTableUpdate};
-use crate::model::frame::Hold;
-use crate::model::position::RowAt;
+use super::{Fetch, FetchId, FetchKind, SingleTableIVM, SingleTableUpdate, window};
 use crate::model::{
-    ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow, Lsn,
+    ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow,
     SingleTableReadQuery, SubId, TableName, Value, Where,
 };
-
-/// What a landing found for one row already in the frame, read in one
-/// borrow so the decision can be applied in another.
-struct Found {
-    frame_newer: bool,
-    same: bool,
-    frame_image: DataFrameRow,
-    view: Option<DataFrameRow>,
-}
 
 impl SingleTableIVM {
     /// Ask for the rows of subscription `sub` matching its own filter
@@ -71,15 +60,22 @@ impl SingleTableIVM {
         });
     }
 
-    /// Land the rows a recorded read returned, positioned at `at`, for
-    /// the read's subscription: each row is merged into the shared frame
-    /// by currency (`land_row` below), the window's frontier is sized
-    /// from the whole result, overflow is evicted, a refill is asked for
-    /// if the window drained while the read was out, and the boundary is
-    /// republished. Returns the subscription's `Add`s and evictions; no
-    /// other subscription is touched. A read for a subscription that is
-    /// gone lands as nothing.
-    pub fn land_fetch(&mut self, fetch: &Fetch, rows: &[(DataFrameKey, DataFrameRow)], at: Lsn) -> Vec<SingleTableUpdate> {
+    /// Land the rows a recorded read returned for the read's subscription.
+    /// The runtime has brought them up to the engine's position, so each
+    /// is current: a row the frame does not hold is adopted with the
+    /// read's image, a row it holds keeps the frame's (equal) image, and
+    /// the subscription is tagged onto it if it was not already (rows the
+    /// stream routed to it while the read was out already are). The
+    /// window's frontier is sized from the whole result, overflow is
+    /// evicted, a refill is asked for if the window drained while the read
+    /// was out, and the boundary is republished. Returns the
+    /// subscription's `Add`s and evictions; no other subscription is
+    /// touched. A read for a subscription that is gone lands as nothing.
+    pub fn land_fetch(
+        &mut self,
+        fetch: &Fetch,
+        rows: &[(DataFrameKey, DataFrameRow)],
+    ) -> Vec<SingleTableUpdate> {
         let sub = fetch.sub;
         let Some(query) = self.select_queries.get(&sub).cloned() else {
             return Vec::new();
@@ -87,7 +83,7 @@ impl SingleTableIVM {
         let table = query.table.clone();
         let mut updates = Vec::new();
         for (key, row) in rows {
-            updates.extend(self.land_row(sub, &table, &query.filter, key, row, at));
+            updates.extend(self.land_row(sub, &table, &query.filter, key, row));
         }
         if let Some(window) = self.windows.get_mut(&sub) {
             window.note_fetch(fetch.query.limit as usize, rows);
@@ -116,19 +112,11 @@ impl SingleTableIVM {
         updates
     }
 
-    /// Merge one landed row into the shared frame for `sub`, whose filter
-    /// is `filter`. The candidate image is the newer of the frame's and
-    /// the read's: the frame's when the frame is newer than the read (a
-    /// write the read did not see) or the two are equal, the read's when
-    /// the frame is older, in which case `sub` goes **ahead of the frame**
-    /// on this row (its [`Hold`] keeps the read's location and image until
-    /// the write that produced it arrives, while every other holder keeps
-    /// the frame's). `sub` then holds the candidate iff it satisfies the
-    /// filter: it is tagged and sent an `Add`, or, if it already held a
-    /// different image, the replace pair; a held row whose candidate no
-    /// longer matches is deleted for it. A row the frame does not hold is
-    /// inserted with the read's image and stamped with the read; a row
-    /// equal to the read's and not newer is stamped too.
+    /// Adopt one landed row for `sub`, whose filter is `filter`: the frame
+    /// row is materialized with the read's image if absent (the frame's
+    /// image is current, and so is the read's, so an existing row keeps
+    /// what it has), and `sub` is tagged onto it and sent the `Add` unless
+    /// it already held it or the image does not satisfy its filter.
     fn land_row(
         &mut self,
         sub: SubId,
@@ -136,114 +124,46 @@ impl SingleTableIVM {
         filter: &Where,
         key: &DataFrameKey,
         row: &DataFrameRow,
-        at: Lsn,
     ) -> Vec<SingleTableUpdate> {
-        let mut updates = Vec::new();
         let frame = self.frames.entry(table.clone()).or_default();
-        let Some(id) = frame.id_of(key) else {
-            frame.entry(key, || (row.clone(), RowAt::Landed(at)));
-            updates.extend(self.tag_row(sub, table, key, row));
-            self.track_landed(sub, key, row);
-            return updates;
-        };
-        let Some(shared) = frame.row_mut(id) else {
-            return updates;
-        };
-        let found = Found {
-            frame_newer: shared.at.newer_than(at),
-            same: shared.data == *row,
-            frame_image: shared.data.clone(),
-            view: shared.held_by(sub).then(|| shared.view(sub).clone()),
-        };
-        if found.same && !found.frame_newer {
-            shared.at = RowAt::Landed(at);
+        let (id, shared) = frame.entry(key, || row.clone());
+        debug_assert!(
+            shared.data == *row,
+            "a read brought up to the engine's position agrees with the frame"
+        );
+        if shared.held_by(sub) {
+            return Vec::new();
         }
-        let ahead = !found.frame_newer && !found.same;
-        let candidate = if ahead { row.clone() } else { found.frame_image };
-        let hold = Hold {
-            at: if ahead { at } else { shared.at.lsn() },
-            ahead: ahead.then(|| candidate.clone()),
-        };
-        let matches = evaluate(filter, &candidate.data, &mut 0);
-        match (found.view, matches) {
-            (None, false) => {}
-            (None, true) => {
-                shared.subscribers.insert(sub, hold);
-                self.held.entry(sub).or_default().insert(id);
-                self.stats.ops_add += 1;
-                updates.push(SingleTableUpdate {
-                    query: sub,
-                    table: table.clone(),
-                    op: DataFrameOperation::Add(key.clone(), candidate.clone()),
-                });
-                self.track_landed(sub, key, &candidate);
-            }
-            (Some(view), true) => {
-                shared.subscribers.insert(sub, hold);
-                if view != candidate {
-                    self.stats.ops_delete += 1;
-                    self.stats.ops_add += 1;
-                    updates.push(SingleTableUpdate {
-                        query: sub,
-                        table: table.clone(),
-                        op: DataFrameOperation::Delete(key.clone(), view),
-                    });
-                    updates.push(SingleTableUpdate {
-                        query: sub,
-                        table: table.clone(),
-                        op: DataFrameOperation::Add(key.clone(), candidate.clone()),
-                    });
-                    self.track_landed(sub, key, &candidate);
-                }
-            }
-            (Some(view), false) => {
-                shared.subscribers.remove(&sub);
-                if let Some(ids) = self.held.get_mut(&sub) {
-                    ids.remove(&id);
-                }
-                self.stats.ops_delete += 1;
-                updates.push(SingleTableUpdate {
-                    query: sub,
-                    table: table.clone(),
-                    op: DataFrameOperation::Delete(key.clone(), view),
-                });
-                if let Some(window) = self.windows.get_mut(&sub) {
-                    window.remove(key);
-                }
-            }
+        let image = shared.data.clone();
+        if !evaluate(filter, &image.data, &mut 0) {
+            frame.drop_if_unheld(id);
+            return Vec::new();
+        }
+        let mut updates = Vec::new();
+        if let Some(update) = self.tag_row(sub, table, key, &image) {
+            updates.push(update);
+            self.track_landed(sub, key, &image);
         }
         updates
     }
 
-    /// Tag `sub` onto the row `key` of `table` with exactly what `from`
-    /// holds for it (the twin path): the frame's image at the frame's
-    /// location, or `from`'s own image and location while it is ahead of
-    /// the frame, in which case `sub` goes ahead with it. Returns the
-    /// `Add`, or `None` when `sub` already holds the row or `from` does
-    /// not.
-    pub(super) fn share_view(
+    /// Tag `sub` onto the row `key` of `table` that `from` holds (the twin
+    /// path) and return the `Add` with the frame's image, or `None` when
+    /// `sub` already holds the row or `from` does not.
+    pub(super) fn share_row(
         &mut self,
         sub: SubId,
         from: SubId,
         table: &TableName,
         key: &DataFrameKey,
     ) -> Option<SingleTableUpdate> {
-        let frame = self.frames.get_mut(table)?;
-        let id = frame.id_of(key)?;
-        let row = frame.row_mut(id)?;
-        let hold = row.subscribers.get(&from).cloned()?;
-        if row.held_by(sub) {
+        let frame = self.frames.get(table)?;
+        let row = frame.get(key)?;
+        if !row.held_by(from) {
             return None;
         }
-        let image = row.view(from).clone();
-        row.subscribers.insert(sub, hold);
-        self.held.entry(sub).or_default().insert(id);
-        self.stats.ops_add += 1;
-        Some(SingleTableUpdate {
-            query: sub,
-            table: table.clone(),
-            op: DataFrameOperation::Add(key.clone(), image),
-        })
+        let image = row.data.clone();
+        self.tag_row(sub, table, key, &image)
     }
 
     /// Record a landed row in `sub`'s window, if it has one.
@@ -262,8 +182,10 @@ impl SingleTableIVM {
         let frame = self.frames.get_mut(&table)?;
         let id = frame.id_of(key)?;
         let row = frame.row_mut(id)?;
-        let hold = row.subscribers.remove(&sub)?;
-        let removed = hold.ahead.unwrap_or_else(|| row.data.clone());
+        if !row.subscribers.remove(&sub) {
+            return None;
+        }
+        let removed = row.data.clone();
         if let Some(ids) = self.held.get_mut(&sub) {
             ids.remove(&id);
         }
@@ -276,7 +198,12 @@ impl SingleTableIVM {
 
     /// Untag every row `sub` holds whose `column` equals one of `values`.
     /// Returns the `Delete` operations.
-    pub fn delete_rows(&mut self, sub: SubId, column: &str, values: &[Value]) -> Vec<DataFrameOperation> {
+    pub fn delete_rows(
+        &mut self,
+        sub: SubId,
+        column: &str,
+        values: &[Value],
+    ) -> Vec<DataFrameOperation> {
         let doomed: Vec<DataFrameKey> = self
             .rows_matching_any(sub, column, values)
             .into_iter()
@@ -292,14 +219,24 @@ impl SingleTableIVM {
     }
 
     /// The rows `sub` holds whose `column` equals `value`.
-    pub fn rows_matching(&self, sub: SubId, column: &str, value: &Value) -> Vec<(DataFrameKey, DataFrameRow)> {
+    pub fn rows_matching(
+        &self,
+        sub: SubId,
+        column: &str,
+        value: &Value,
+    ) -> Vec<(DataFrameKey, DataFrameRow)> {
         self.rows_matching_any(sub, column, std::slice::from_ref(value))
     }
 
     /// The rows `sub` holds whose `column` equals one of `values` — walked
     /// off the subscription's held index, so cost scales with its own view,
     /// not the table.
-    fn rows_matching_any(&self, sub: SubId, column: &str, values: &[Value]) -> Vec<(DataFrameKey, DataFrameRow)> {
+    fn rows_matching_any(
+        &self,
+        sub: SubId,
+        column: &str,
+        values: &[Value],
+    ) -> Vec<(DataFrameKey, DataFrameRow)> {
         let Some(query) = self.select_queries.get(&sub) else {
             return Vec::new();
         };
@@ -311,14 +248,18 @@ impl SingleTableIVM {
         };
         ids.iter()
             .filter_map(|id| frame.row(*id))
-            .filter(|row| row.view(sub).data.get(column).is_some_and(|v| values.contains(v)))
-            .map(|row| (row.key.clone(), row.view(sub).clone()))
+            .filter(|row| {
+                row.data
+                    .data
+                    .get(column)
+                    .is_some_and(|v| values.contains(v))
+            })
+            .map(|row| (row.key.clone(), row.data.clone()))
             .collect()
     }
 
     /// The subscription's current view — every shared row it holds, as
-    /// key → the image it holds (the frame's, or its own while ahead of
-    /// the frame), enumerated from its held index. An inspection seam for
+    /// key → image, enumerated from its held index. An inspection seam for
     /// tests and debugging, not a sync mechanism: clients build their
     /// frames from the operation stream. `None` for unknown subscriptions.
     pub fn rows_for(&self, sub: SubId) -> Option<HashMap<DataFrameKey, DataFrameRow>> {
@@ -328,7 +269,7 @@ impl SingleTableIVM {
         if let Some(ids) = self.held.get(&sub) {
             for id in ids {
                 if let Some(row) = frame.and_then(|frame| frame.row(*id)) {
-                    view.insert(row.key.clone(), row.view(sub).clone());
+                    view.insert(row.key.clone(), row.data.clone());
                 }
             }
         }
@@ -342,7 +283,7 @@ impl SingleTableIVM {
         self.frames
             .get(table)
             .and_then(|frame| frame.get(key))
-            .map(|row| row.subscribers.keys().copied().collect())
+            .map(|row| row.subscribers.iter().copied().collect())
             .unwrap_or_default()
     }
 }

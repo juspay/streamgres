@@ -28,8 +28,9 @@ pub mod value;
 pub use frame::{DataFrameKey, DataFrameOperation, DataFrameRow};
 pub use position::{Lsn, Snapshot};
 pub use query::{
-    ComparisonOperator, Condition, DeleteQuery, Disjunct, InsertQuery, Join, MultiTableReadQuery,
-    Order, OrderBy, QueryId, SingleTableReadQuery, SubId, UpdateQuery, Where, WriteQuery,
+    ClientId, ComparisonOperator, Condition, DeleteQuery, Disjunct, InsertQuery, Join,
+    MultiTableReadQuery, Order, OrderBy, QueryId, SingleTableReadQuery, SubId, UpdateQuery, Where,
+    WriteQuery,
 };
 pub use schema::{Catalog, ColumnName, DbColumn, DbTable, TableName};
-pub use value::{Value, ValueType, SharedSet};
+pub use value::{SharedSet, Value, ValueType};

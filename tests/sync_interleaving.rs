@@ -1,10 +1,11 @@
-//! Deterministic interleavings of asynchronous storage reads with the
-//! write stream, driven through the runtime state machine directly: the
-//! test decides when each read's snapshot is taken, which writes stream
-//! past before it lands, and how every write and snapshot is positioned,
-//! so the runtime's merge (bring the result up to the engine, land at
-//! once) and the engine's per-row currency (a write a landed row already
-//! reflects is not news) are checked without any clock or I/O.
+//! Deterministic interleavings of storage reads with the write stream,
+//! driven through the runtime state machine directly: the test decides
+//! where each read's snapshot is positioned (never ahead of what the
+//! runtime has applied, the storage's contract), which writes stream past
+//! before it lands, and checks the runtime's one rule: a read's result is
+//! brought up to the engine's position before the engine sees it, whether
+//! the writes it missed were delivered before or after the read was
+//! issued.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -37,6 +38,9 @@ fn users_table() -> DbTable {
         ],
     )
 }
+
+/// The one client every subscription here belongs to.
+const CLIENT: ClientId = ClientId(1);
 
 fn pkey(id: i64) -> HashMap<String, Value> {
     HashMap::from([("id".to_owned(), Value::Int(id))])
@@ -185,7 +189,10 @@ fn ids(rows: Option<HashMap<DataFrameKey, DataFrameRow>>) -> BTreeSet<i64> {
 }
 
 /// The ids of a subscription's rows with one column's value, sorted by id.
-fn column_of(rows: Option<HashMap<DataFrameKey, DataFrameRow>>, column: &str) -> BTreeMap<i64, Value> {
+fn column_of(
+    rows: Option<HashMap<DataFrameKey, DataFrameRow>>,
+    column: &str,
+) -> BTreeMap<i64, Value> {
     rows.unwrap_or_default()
         .into_iter()
         .map(|(key, row)| match key.pkey_value["id"] {
@@ -198,7 +205,11 @@ fn column_of(rows: Option<HashMap<DataFrameKey, DataFrameRow>>, column: &str) ->
 /// Run every read a step handed out against the database as it is right
 /// now and land it, repeating until nothing is out; the updates of every
 /// step, in order.
-fn settle<E: Engine>(runtime: &mut Runtime<E>, db: &Db, step: Step<E::Update>) -> Vec<E::Update> {
+fn settle<E: Engine>(
+    runtime: &mut Runtime<E>,
+    db: &Db,
+    step: Step,
+) -> Vec<jus_sync::ivm::ClientUpdate> {
     let mut updates = step.updates;
     let mut queue = step.selects;
     while !queue.is_empty() {
@@ -211,9 +222,21 @@ fn settle<E: Engine>(runtime: &mut Runtime<E>, db: &Db, step: Step<E::Update>) -
 }
 
 /// Exactly one read was handed out.
-fn only(step: &Step<impl std::fmt::Debug>) -> Fetch {
-    assert_eq!(step.selects.len(), 1, "one read expected, got {:?}", step.selects);
+fn only(step: &Step) -> Fetch {
+    assert_eq!(
+        step.selects.len(),
+        1,
+        "one read expected, got {:?}",
+        step.selects
+    );
     step.selects[0].clone()
+}
+
+/// Route `write` after committing it, and move the floor up to the
+/// runtime's position the way a driver over an in-process store does.
+fn stream<E: Engine>(runtime: &mut Runtime<E>, db: &mut Db, write: &WriteQuery) -> Step {
+    let at = db.commit(write);
+    runtime.write(write, at)
 }
 
 /// A registration's snapshot is taken at some point, and writes stream
@@ -233,29 +256,31 @@ fn registration_result_is_brought_up_to_the_engine() {
     let mut runtime = Runtime::new(SingleTableIVM::new());
     runtime.progress(db.head());
 
-    let (sub, step) = runtime.register(open_tickets());
-    assert!(step.updates.is_empty(), "nothing is at hand until the read lands");
+    let (sub, step) = runtime.register(CLIENT, open_tickets());
+    assert!(
+        step.updates.is_empty(),
+        "nothing is at hand until the read lands"
+    );
     let read = only(&step);
     let snapshot = db.snapshot(&read);
     assert_eq!(snapshot.rows.len(), 3);
 
-    let moved_out = ticket_update(1, "DONE", 7, 1);
-    let mut native = runtime.write(&moved_out, db.commit(&moved_out)).updates;
-    let deleted = delete("tickets", 2);
-    native.extend(runtime.write(&deleted, db.commit(&deleted)).updates);
-    let rewritten = ticket_update(3, "OPEN", 7, 33);
-    native.extend(runtime.write(&rewritten, db.commit(&rewritten)).updates);
-    let inserted = ticket(4, "OPEN", 7, 4);
-    native.extend(runtime.write(&inserted, db.commit(&inserted)).updates);
+    let mut native = stream(&mut runtime, &mut db, &ticket_update(1, "DONE", 7, 1)).updates;
+    native.extend(stream(&mut runtime, &mut db, &delete("tickets", 2)).updates);
+    native.extend(stream(&mut runtime, &mut db, &ticket_update(3, "OPEN", 7, 33)).updates);
+    native.extend(stream(&mut runtime, &mut db, &ticket(4, "OPEN", 7, 4)).updates);
     assert_eq!(
         native.len(),
         2,
         "the rewrite and the insert route natively as adds, got {native:?}"
     );
-    runtime.progress(db.head());
 
     let landed = runtime.fetched(read.id, snapshot);
-    assert!(landed.updates.is_empty(), "every snapshot row was overtaken, got {:?}", landed.updates);
+    assert!(
+        landed.updates.is_empty(),
+        "every snapshot row was overtaken, got {:?}",
+        landed.updates
+    );
     assert_eq!(runtime.stats().rows_dropped, 2, "1 moved out, 2 deleted");
     assert_eq!(runtime.stats().rows_refreshed, 1, "3 rewritten");
     assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([3, 4]));
@@ -268,8 +293,8 @@ fn registration_result_is_brought_up_to_the_engine() {
 }
 
 /// Writes the snapshot already reflects (committed before it, delivered
-/// after the read was asked for) are adopted, and since their rows were
-/// also routed natively the landing emits nothing for them again.
+/// after the read was asked for) are not applied again: the landing adds
+/// only the rows nothing routed yet.
 #[test]
 fn covered_writes_are_adopted_without_duplicate_operations() {
     let mut db = Db::at(0);
@@ -277,7 +302,7 @@ fn covered_writes_are_adopted_without_duplicate_operations() {
     let mut runtime = Runtime::new(SingleTableIVM::new());
     runtime.progress(db.head());
 
-    let (sub, step) = runtime.register(open_tickets());
+    let (sub, step) = runtime.register(CLIENT, open_tickets());
     let read = only(&step);
 
     let touched = ticket_update(1, "OPEN", 7, 99);
@@ -289,7 +314,6 @@ fn covered_writes_are_adopted_without_duplicate_operations() {
 
     runtime.write(&touched, touched_at);
     runtime.write(&arrived, arrived_at);
-    runtime.progress(db.head());
     let landed = runtime.fetched(read.id, snapshot);
     let landed_ids: BTreeSet<i64> = landed
         .updates
@@ -302,113 +326,77 @@ fn covered_writes_are_adopted_without_duplicate_operations() {
             other => panic!("landing only adds, got {other:?}"),
         })
         .collect();
-    assert_eq!(landed_ids, BTreeSet::from([2]), "1 and 3 were already held identically");
+    assert_eq!(
+        landed_ids,
+        BTreeSet::from([2]),
+        "1 and 3 were already held identically"
+    );
     assert_eq!(runtime.stats().rows_dropped, 0);
-    assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([1, 2, 3]));
-    assert_eq!(column_of(runtime.engine().rows_for(sub), "points")[&1], Value::Int(99));
+    assert_eq!(runtime.stats().rows_refreshed, 0);
+    assert_eq!(
+        ids(runtime.engine().rows_for(sub)),
+        BTreeSet::from([1, 2, 3])
+    );
+    assert_eq!(
+        column_of(runtime.engine().rows_for(sub), "points")[&1],
+        Value::Int(99)
+    );
 }
 
-/// A snapshot ahead of the stream (the database committed writes the
-/// feed has not delivered yet) lands at once; when those writes arrive,
-/// the landed rows already reflect them and nothing is emitted again.
+/// A read positioned behind writes that were delivered *before* it was
+/// issued (the storage's snapshot lags the stream, as a rotating alias
+/// does): the buffer of delivered writes reaches back to the floor, so
+/// the result is still brought up; once the floor passes them the buffer
+/// is trimmed.
 #[test]
-fn snapshot_ahead_of_the_stream_lands_at_once() {
+fn a_read_behind_earlier_writes_is_brought_up_from_the_floor() {
     let mut db = Db::at(0);
-    db.seed(&[ticket(1, "OPEN", 7, 1)]);
+    db.seed(&[
+        ticket(1, "OPEN", 7, 1),
+        ticket(2, "OPEN", 7, 2),
+        ticket(3, "OPEN", 7, 3),
+    ]);
     let mut runtime = Runtime::new(SingleTableIVM::new());
     runtime.progress(db.head());
+    let stale_rows = db.storage.rows(&open_tickets());
+    let stale_at = db.head();
 
-    let (sub, step) = runtime.register(open_tickets());
+    stream(&mut runtime, &mut db, &ticket_update(1, "DONE", 7, 1));
+    stream(&mut runtime, &mut db, &delete("tickets", 2));
+    assert_eq!(runtime.buffered(), 2, "kept: the floor is still at zero");
+
+    let (sub, step) = runtime.register(CLIENT, open_tickets());
     let read = only(&step);
-    let late = ticket(2, "OPEN", 7, 2);
-    let late_at = db.commit(&late);
-    let snapshot = db.snapshot(&read);
-    assert_eq!(snapshot.rows.len(), 2, "the snapshot already contains the undelivered insert");
-
-    let landed = runtime.fetched(read.id, snapshot);
-    assert_eq!(landed.updates.len(), 2, "both rows land immediately, got {:?}", landed.updates);
-    assert_eq!(runtime.stats().reads_landed, 1);
-    assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([1, 2]));
-
-    let step = runtime.write(&late, late_at);
-    assert!(step.updates.is_empty(), "the landed row already reflects the write, got {:?}", step.updates);
-    assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([1, 2]));
-
-    let rewrite = ticket_update(2, "OPEN", 7, 22);
-    let step = runtime.write(&rewrite, db.commit(&rewrite));
-    assert_eq!(step.updates.len(), 2, "a write after the snapshot is news: the replace pair, got {:?}", step.updates);
-    assert_eq!(column_of(runtime.engine().rows_for(sub), "points")[&2], Value::Int(22));
-
-    let (other, step) = runtime.register(query(
-        &tickets_table(),
-        Where::condition("points", ComparisonOperator::GTE, 0),
-    ));
-    let read = only(&step);
-    let quiet = ticket(3, "DONE", 7, 3);
-    db.commit(&quiet);
-    let landed = runtime.fetched(read.id, db.snapshot(&read));
-    assert_eq!(landed.updates.len(), 3, "landed at once, ahead of the feed, got {:?}", landed.updates);
-    let step = runtime.progress(db.head());
-    assert!(step.updates.is_empty());
-    assert_eq!(ids(runtime.engine().rows_for(other)), BTreeSet::from([1, 2, 3]));
-}
-
-/// The storage's one obligation: a read's location must not be past a
-/// write the snapshot did not see. A read positioned exactly right treats
-/// the unseen write as news and drops the row it moved out; a read
-/// positioned one write too far adopts the stale row for good (the row
-/// already held keeps its newer image, since the frame is newer than the
-/// read). This is what the WAL method's consistent point and the XID
-/// method's ledger conversion guarantee.
-#[test]
-fn a_read_positioned_past_an_unseen_write_adopts_a_stale_row() {
-    let mut db = Db::at(0);
-    db.seed(&[ticket(1, "OPEN", 7, 1), ticket(2, "OPEN", 7, 2)]);
-    let mut runtime = Runtime::new(SingleTableIVM::new());
-    runtime.progress(db.head());
-
-    let (sub, step) = runtime.register(open_tickets());
-    let read = only(&step);
-    let snapshot = db.snapshot(&read);
-    let moved_out = ticket_update(2, "DONE", 7, 2);
-    let moved_at = db.commit(&moved_out);
-    let rewritten = ticket_update(1, "OPEN", 7, 11);
-    runtime.write(&moved_out, moved_at);
-    runtime.write(&rewritten, db.commit(&rewritten));
-    let landed = runtime.fetched(read.id, snapshot);
-    assert!(landed.updates.is_empty(), "2 is dropped, 1 is already held newer, got {:?}", landed.updates);
-    assert_eq!(runtime.stats().rows_dropped, 1);
-    assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([1]));
-    assert_eq!(column_of(runtime.engine().rows_for(sub), "points")[&1], Value::Int(11));
-
-    let mut too_far = Runtime::new(SingleTableIVM::new());
-    too_far.progress(Lsn(2));
-    let (sub, step) = too_far.register(open_tickets());
-    let read = only(&step);
-    let mut stale = db.storage.rows(&read.query);
-    stale.push((
-        DataFrameKey::new(pkey(2)),
-        full_row(2, &[("status", "OPEN".into()), ("assigned_to", Value::Int(7)), ("points", Value::Int(2))]),
-    ));
-    too_far.write(&moved_out, Lsn(3));
-    too_far.write(&rewritten, Lsn(4));
-    too_far.fetched(
+    let landed = runtime.fetched(
         read.id,
         Snapshot {
-            rows: stale,
-            at: Lsn(3),
+            rows: stale_rows,
+            at: stale_at,
         },
     );
     assert_eq!(
-        ids(too_far.engine().rows_for(sub)),
-        BTreeSet::from([1, 2]),
-        "positioned as if it had seen the write at 3, the read keeps the row that write moved out"
+        landed.updates.len(),
+        1,
+        "only 3 survives, got {:?}",
+        landed.updates
     );
+    assert_eq!(runtime.stats().rows_dropped, 2);
+    assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([3]));
+
+    runtime.set_floor(db.head());
     assert_eq!(
-        column_of(too_far.engine().rows_for(sub), "points")[&1],
-        Value::Int(11),
-        "a row already held keeps the newer image the stream wrote"
+        runtime.buffered(),
+        0,
+        "nothing can be positioned below the floor anymore"
     );
+    stream(&mut runtime, &mut db, &ticket(4, "OPEN", 7, 4));
+    assert_eq!(
+        runtime.buffered(),
+        1,
+        "a write above the floor is kept until the floor passes it"
+    );
+    runtime.set_floor(db.head());
+    assert_eq!(runtime.buffered(), 0);
 }
 
 /// A join crossing's narrowed read is out while the driven table is
@@ -418,7 +406,12 @@ fn a_read_positioned_past_an_unseen_write_adopts_a_stale_row() {
 #[test]
 fn narrowed_join_fetch_defers_to_later_writes() {
     let mut db = Db::at(0);
-    db.seed(&[user(7, "meera"), user(8, "old"), user(9, "gone"), ticket(1, "OPEN", 7, 1)]);
+    db.seed(&[
+        user(7, "meera"),
+        user(8, "old"),
+        user(9, "gone"),
+        ticket(1, "OPEN", 7, 1),
+    ]);
     let mut runtime = Runtime::new(MultiTableIVM::new());
     runtime.progress(db.head());
     let spec = MultiTableReadQuery {
@@ -430,41 +423,47 @@ fn narrowed_join_fetch_defers_to_later_writes() {
         )],
         right_joins: Vec::new(),
     };
-    let (sub, step) = runtime.register(spec);
+    let (sub, step) = runtime.register(CLIENT, spec);
     settle(&mut runtime, &db, step);
-    assert_eq!(ids(runtime.engine().rows_for(sub, QueryPart::join(0))), BTreeSet::from([7]));
+    assert_eq!(
+        ids(runtime.engine().rows_for(sub, QueryPart::join(0))),
+        BTreeSet::from([7])
+    );
 
-    let refer = ticket(2, "OPEN", 8, 2);
-    let step = runtime.write(&refer, db.commit(&refer));
-    runtime.progress(db.head());
+    let step = stream(&mut runtime, &mut db, &ticket(2, "OPEN", 8, 2));
     let read = only(&step);
     assert_eq!(read.query.table, "users");
     let snapshot = db.snapshot(&read);
     assert_eq!(snapshot.rows.len(), 1);
 
-    let renamed = user(8, "new");
-    let native = runtime.write(&renamed, db.commit(&renamed)).updates;
-    assert_eq!(native.len(), 1, "the newly referenced user routes natively, got {native:?}");
-    runtime.progress(db.head());
+    let native = stream(&mut runtime, &mut db, &user(8, "new")).updates;
+    assert_eq!(
+        native.len(),
+        1,
+        "the newly referenced user routes natively, got {native:?}"
+    );
     let landed = runtime.fetched(read.id, snapshot);
-    assert!(landed.updates.is_empty(), "the frame already holds the newer image, got {:?}", landed.updates);
+    assert!(
+        landed.updates.is_empty(),
+        "the frame already holds the newer image, got {:?}",
+        landed.updates
+    );
     assert_eq!(runtime.stats().rows_refreshed, 1);
     assert_eq!(
         column_of(runtime.engine().rows_for(sub, QueryPart::join(0)), "name"),
         BTreeMap::from([(7, "meera".into()), (8, "new".into())])
     );
 
-    let refer = ticket(3, "OPEN", 9, 3);
-    let step = runtime.write(&refer, db.commit(&refer));
-    runtime.progress(db.head());
+    let step = stream(&mut runtime, &mut db, &ticket(3, "OPEN", 9, 3));
     let read = only(&step);
     let snapshot = db.snapshot(&read);
-    let removed = delete("users", 9);
-    runtime.write(&removed, db.commit(&removed));
-    runtime.progress(db.head());
+    stream(&mut runtime, &mut db, &delete("users", 9));
     let landed = runtime.fetched(read.id, snapshot);
     assert!(landed.updates.is_empty());
-    assert_eq!(ids(runtime.engine().rows_for(sub, QueryPart::join(0))), BTreeSet::from([7, 8]));
+    assert_eq!(
+        ids(runtime.engine().rows_for(sub, QueryPart::join(0))),
+        BTreeSet::from([7, 8])
+    );
 }
 
 /// A refill is out while the window's table is written: the boundary is
@@ -489,47 +488,60 @@ fn refill_in_flight_keeps_the_window_exact() {
         OrderBy::new("points", Order::ASC),
         2,
     );
-    let (sub, step) = runtime.register(windowed);
+    let (sub, step) = runtime.register(CLIENT, windowed);
     settle(&mut runtime, &db, step);
-    assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([10, 20, 30, 40]));
+    assert_eq!(
+        ids(runtime.engine().rows_for(sub)),
+        BTreeSet::from([10, 20, 30, 40])
+    );
 
-    let drop_10 = delete("tickets", 10);
-    runtime.write(&drop_10, db.commit(&drop_10));
-    let drop_20 = delete("tickets", 20);
-    let step = runtime.write(&drop_20, db.commit(&drop_20));
-    runtime.progress(db.head());
+    stream(&mut runtime, &mut db, &delete("tickets", 10));
+    let step = stream(&mut runtime, &mut db, &delete("tickets", 20));
     let refill = only(&step);
-    assert_eq!(refill.query.limit, 3, "two missing plus the held row at the frontier");
+    assert_eq!(
+        refill.query.limit, 3,
+        "two missing plus the held row at the frontier"
+    );
     let snapshot = db.snapshot(&refill);
     assert_eq!(snapshot.rows.len(), 3, "40, 50, 60");
 
-    let during = ticket(45, "OPEN", 7, 45);
-    let admitted = runtime.write(&during, db.commit(&during)).updates;
+    let admitted = stream(&mut runtime, &mut db, &ticket(45, "OPEN", 7, 45)).updates;
     assert_eq!(admitted.len(), 1, "boundary open while the refill is out");
-    let far = ticket(100, "OPEN", 7, 100);
-    let admitted = runtime.write(&far, db.commit(&far)).updates;
-    assert_eq!(admitted.len(), 1, "even a row far beyond the old frontier is admitted for now");
-    runtime.progress(db.head());
+    let admitted = stream(&mut runtime, &mut db, &ticket(100, "OPEN", 7, 100)).updates;
+    assert_eq!(
+        admitted.len(),
+        1,
+        "even a row far beyond the old frontier is admitted for now"
+    );
 
     let landed = runtime.fetched(refill.id, snapshot);
-    assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([30, 40, 45, 50]));
+    assert_eq!(
+        ids(runtime.engine().rows_for(sub)),
+        BTreeSet::from([30, 40, 45, 50])
+    );
     let deletes = landed
         .updates
         .iter()
         .filter(|update| matches!(update.op, DataFrameOperation::Delete(..)))
         .count();
-    assert_eq!(deletes, 2, "60 and 100 evicted past capacity, got {:?}", landed.updates);
+    assert_eq!(
+        deletes, 2,
+        "60 and 100 evicted past capacity, got {:?}",
+        landed.updates
+    );
 
-    let worse = ticket(70, "OPEN", 7, 70);
     assert!(
-        runtime.write(&worse, db.commit(&worse)).updates.is_empty(),
+        stream(&mut runtime, &mut db, &ticket(70, "OPEN", 7, 70))
+            .updates
+            .is_empty(),
         "the boundary is back: worse than the frontier is rejected"
     );
-    let better = ticket(35, "OPEN", 7, 35);
-    let step = runtime.write(&better, db.commit(&better));
-    runtime.progress(db.head());
+    let step = stream(&mut runtime, &mut db, &ticket(35, "OPEN", 7, 35));
     assert_eq!(step.updates.len(), 2, "admitted, worst evicted");
-    assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([30, 35, 40, 45]));
+    assert_eq!(
+        ids(runtime.engine().rows_for(sub)),
+        BTreeSet::from([30, 35, 40, 45])
+    );
     assert_eq!(runtime.outstanding(), 0);
 }
 
@@ -559,15 +571,24 @@ fn post_order_registration_follows_landings() {
             "id",
         )],
     };
-    let (sub, step) = runtime.register(right);
+    let (sub, step) = runtime.register(CLIENT, right);
     let first = only(&step);
     assert_eq!(first.query.table, "users", "the driving child reads first");
     let step = runtime.fetched(first.id, db.snapshot(&first));
     let second = only(&step);
-    assert_eq!(second.query.table, "tickets", "the parent registers once the child landed");
+    assert_eq!(
+        second.query.table, "tickets",
+        "the parent registers once the child landed"
+    );
     let step = runtime.fetched(second.id, db.snapshot(&second));
-    assert!(step.selects.is_empty(), "the parent's set was complete: no narrowed reads");
-    assert_eq!(ids(runtime.engine().rows_for(sub, QueryPart::main())), BTreeSet::from([1, 2]));
+    assert!(
+        step.selects.is_empty(),
+        "the parent's set was complete: no narrowed reads"
+    );
+    assert_eq!(
+        ids(runtime.engine().rows_for(sub, QueryPart::main())),
+        BTreeSet::from([1, 2])
+    );
     assert_eq!(runtime.engine().stats().storage_reads, 2);
 
     let left = MultiTableReadQuery {
@@ -583,41 +604,57 @@ fn post_order_registration_follows_landings() {
         right_joins: Vec::new(),
     };
     let before = runtime.engine().stats().storage_reads;
-    let (sub, step) = runtime.register(left);
+    let (sub, step) = runtime.register(CLIENT, left);
     let main = only(&step);
     assert_eq!(main.query.table, "tickets");
     let step = runtime.fetched(main.id, db.snapshot(&main));
     let child = only(&step);
-    assert_eq!(child.query.table, "users", "the LEFT child registers after the parent landed");
+    assert_eq!(
+        child.query.table, "users",
+        "the LEFT child registers after the parent landed"
+    );
     let step = runtime.fetched(child.id, db.snapshot(&child));
     assert!(step.selects.is_empty());
-    assert_eq!(ids(runtime.engine().rows_for(sub, QueryPart::join(0))), BTreeSet::from([7, 8]));
-    assert_eq!(runtime.engine().stats().storage_reads - before, 2, "one read per part");
+    assert_eq!(
+        ids(runtime.engine().rows_for(sub, QueryPart::join(0))),
+        BTreeSet::from([7, 8])
+    );
+    assert_eq!(
+        runtime.engine().stats().storage_reads - before,
+        2,
+        "one read per part"
+    );
 }
 
-/// A failed read is handed out again and reconciled from the point of the
-/// stream it is re-issued at; an unregistered subscription's read lands
-/// as a no-op; a second identical registration while the first's read is
-/// out reads for itself rather than copying an incomplete twin.
+/// A read the driver could not run is parked and handed out again when
+/// the stream moves; an unregistered subscription's read lands as a
+/// no-op; a second identical registration while the first's read is out
+/// reads for itself rather than copying an incomplete twin.
 #[test]
-fn retries_unregistration_and_pending_twins() {
+fn parked_reads_unregistration_and_pending_twins() {
     let mut db = Db::at(0);
     db.seed(&[ticket(1, "OPEN", 7, 1)]);
     let mut runtime = Runtime::new(SingleTableIVM::new());
     runtime.progress(db.head());
 
-    let (sub, step) = runtime.register(open_tickets());
+    let (sub, step) = runtime.register(CLIENT, open_tickets());
     let read = only(&step);
-    let retry = runtime.failed(read.id);
-    assert_eq!(only(&retry).id, read.id, "the same read, handed out again");
+    let parked = runtime.failed(read.id);
+    assert!(parked.selects.is_empty(), "parked, not re-issued at once");
+    assert_eq!(runtime.outstanding(), 1);
+    let woken = stream(&mut runtime, &mut db, &ticket(2, "DONE", 7, 2));
+    assert_eq!(only(&woken).id, read.id, "the same read, handed out again");
     assert_eq!(runtime.stats().reads_retried, 1);
     runtime.fetched(read.id, db.snapshot(&read));
     assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([1]));
 
-    let (doomed, step) = runtime.register(query(
-        &tickets_table(),
-        Where::condition("points", ComparisonOperator::GTE, 0),
-    ));
+    let (doomed, step) = runtime.register(
+        CLIENT,
+        query(
+            &tickets_table(),
+            Where::condition("points", ComparisonOperator::GTE, 0),
+        ),
+    );
     let read = only(&step);
     runtime.unregister(doomed);
     let landed = runtime.fetched(read.id, db.snapshot(&read));
@@ -625,36 +662,62 @@ fn retries_unregistration_and_pending_twins() {
     assert_eq!(runtime.outstanding(), 0);
     assert!(runtime.engine().rows_for(doomed).is_none());
 
-    let (first, step) = runtime.register(query(
-        &tickets_table(),
-        Where::condition("assigned_to", ComparisonOperator::EQ, 7),
-    ));
+    let (first, step) = runtime.register(
+        CLIENT,
+        query(
+            &tickets_table(),
+            Where::condition("assigned_to", ComparisonOperator::EQ, 7),
+        ),
+    );
     let first_read = only(&step);
-    let (second, step) = runtime.register(query(
-        &tickets_table(),
-        Where::condition("assigned_to", ComparisonOperator::EQ, 7),
-    ));
+    let (second, step) = runtime.register(
+        CLIENT,
+        query(
+            &tickets_table(),
+            Where::condition("assigned_to", ComparisonOperator::EQ, 7),
+        ),
+    );
     let second_read = only(&step);
     assert_ne!(first_read.id, second_read.id);
-    assert_eq!(runtime.engine().stats().snapshots_shared, 0, "an incomplete twin donates nothing");
+    assert_eq!(
+        runtime.engine().stats().snapshots_shared,
+        0,
+        "an incomplete twin donates nothing"
+    );
     runtime.fetched(first_read.id, db.snapshot(&first_read));
     runtime.fetched(second_read.id, db.snapshot(&second_read));
-    assert_eq!(ids(runtime.engine().rows_for(first)), BTreeSet::from([1]));
-    assert_eq!(ids(runtime.engine().rows_for(second)), BTreeSet::from([1]));
+    assert_eq!(
+        ids(runtime.engine().rows_for(first)),
+        BTreeSet::from([1, 2])
+    );
+    assert_eq!(
+        ids(runtime.engine().rows_for(second)),
+        BTreeSet::from([1, 2])
+    );
 
-    let (third, step) = runtime.register(query(
-        &tickets_table(),
-        Where::condition("assigned_to", ComparisonOperator::EQ, 7),
-    ));
-    assert!(step.selects.is_empty(), "with both landed, the twin path serves it");
-    assert_eq!(step.updates.len(), 1);
+    let (third, step) = runtime.register(
+        CLIENT,
+        query(
+            &tickets_table(),
+            Where::condition("assigned_to", ComparisonOperator::EQ, 7),
+        ),
+    );
+    assert!(
+        step.selects.is_empty(),
+        "with both landed, the twin path serves it"
+    );
+    assert_eq!(step.updates.len(), 2, "one delta per shared row");
     assert_eq!(runtime.engine().stats().snapshots_shared, 1);
-    assert_eq!(ids(runtime.engine().rows_for(third)), BTreeSet::from([1]));
+    assert_eq!(
+        ids(runtime.engine().rows_for(third)),
+        BTreeSet::from([1, 2])
+    );
 }
 
 /// A later identical join registration while the shared tree is still
 /// landing is served what is there and receives the rest as it lands,
-/// like every other subscriber.
+/// like every other subscriber; two subscribers of one client receive one
+/// delta naming both.
 #[test]
 fn twin_joining_a_landing_tree_receives_the_rest() {
     let mut db = Db::at(0);
@@ -670,156 +733,38 @@ fn twin_joining_a_landing_tree_receives_the_rest() {
         )],
         right_joins: Vec::new(),
     };
-    let (first, step) = runtime.register(spec());
+    let (first, step) = runtime.register(CLIENT, spec());
     let main = only(&step);
-    let (second, step) = runtime.register(spec());
-    assert!(step.selects.is_empty() && step.updates.is_empty(), "shares the tree, nothing landed yet");
+    let (second, step) = runtime.register(CLIENT, spec());
+    assert!(
+        step.selects.is_empty() && step.updates.is_empty(),
+        "shares the tree, nothing landed yet"
+    );
 
     let step = runtime.fetched(main.id, db.snapshot(&main));
-    let for_second: Vec<&SubId> = step.updates.iter().map(|update| &update.query).filter(|sub| **sub == second).collect();
-    assert_eq!(for_second.len(), 1, "the landed main row reaches the twin too");
+    assert_eq!(step.updates.len(), 1, "one delta for the one client");
+    let subs: BTreeSet<SubId> = step.updates[0]
+        .targets
+        .iter()
+        .map(|target| target.sub)
+        .collect();
+    assert_eq!(
+        subs,
+        BTreeSet::from([first, second]),
+        "naming both subscribers"
+    );
     let child = only(&step);
     let step = runtime.fetched(child.id, db.snapshot(&child));
-    assert_eq!(step.updates.len(), 2, "the user row, once per subscriber");
-    for sub in [first, second] {
-        assert_eq!(ids(runtime.engine().rows_for(sub, QueryPart::main())), BTreeSet::from([1]));
-        assert_eq!(ids(runtime.engine().rows_for(sub, QueryPart::join(0))), BTreeSet::from([7]));
-    }
-}
-
-/// A registration read returns a row the frame already holds for another
-/// subscription, with a newer image (a write committed before the
-/// snapshot, not yet delivered): the reader gets the read's image and is
-/// ahead of the frame on that row, the other holder keeps the frame's
-/// image and hears about the write when it arrives, the reader does not;
-/// a later write reaches both, the reader's `Delete` carrying its own
-/// image.
-#[test]
-fn reader_ahead_of_the_frame_gets_the_read_image() {
-    let mut db = Db::at(0);
-    db.seed(&[ticket(1, "OPEN", 7, 1)]);
-    let mut runtime = Runtime::new(SingleTableIVM::new());
-    runtime.progress(db.head());
-    let (b, step) = runtime.register(query(
-        &tickets_table(),
-        Where::condition("points", ComparisonOperator::GTE, 0),
-    ));
-    settle(&mut runtime, &db, step);
-    assert_eq!(column_of(runtime.engine().rows_for(b), "points")[&1], Value::Int(1));
-
-    let (a, step) = runtime.register(open_tickets());
-    let read = only(&step);
-    let bump = ticket_update(1, "OPEN", 7, 5);
-    let bump_at = db.commit(&bump);
-    let snapshot = db.snapshot(&read);
-
-    let landed = runtime.fetched(read.id, snapshot);
-    assert_eq!(landed.updates.len(), 1, "only the reader is served, got {:?}", landed.updates);
-    assert_eq!(landed.updates[0].query, a);
-    assert!(matches!(&landed.updates[0].op, DataFrameOperation::Add(_, row) if row.data["points"] == Value::Int(5)));
-    assert_eq!(column_of(runtime.engine().rows_for(a), "points")[&1], Value::Int(5), "the reader's view");
-    assert_eq!(column_of(runtime.engine().rows_for(b), "points")[&1], Value::Int(1), "the other holder's view");
-    assert_eq!(
-        runtime.engine().holders_of(&TableName::from("tickets"), &DataFrameKey::new(pkey(1))),
-        vec![b, a]
-    );
-
-    let step = runtime.write(&bump, bump_at);
-    assert_eq!(step.updates.len(), 2, "the replace pair for the holder behind, got {:?}", step.updates);
-    assert!(step.updates.iter().all(|update| update.query == b));
-    assert_eq!(column_of(runtime.engine().rows_for(b), "points")[&1], Value::Int(5));
-
-    let again = ticket_update(1, "OPEN", 7, 7);
-    let step = runtime.write(&again, db.commit(&again));
-    assert_eq!(step.updates.len(), 4, "both holders now, got {:?}", step.updates);
-    let reader_delete = step
-        .updates
-        .iter()
-        .find(|update| update.query == a && matches!(update.op, DataFrameOperation::Delete(..)))
-        .expect("the reader's delete");
-    assert!(matches!(&reader_delete.op, DataFrameOperation::Delete(_, row) if row.data["points"] == Value::Int(5)));
-    assert_eq!(column_of(runtime.engine().rows_for(a), "points")[&1], Value::Int(7));
-    assert_eq!(column_of(runtime.engine().rows_for(b), "points")[&1], Value::Int(7));
-}
-
-/// A twin registered while its donor is ahead of the frame is served the
-/// donor's view and goes ahead with it: neither hears about the write the
-/// view already reflects.
-#[test]
-fn twin_of_an_ahead_reader_shares_its_view() {
-    let mut db = Db::at(0);
-    db.seed(&[ticket(1, "OPEN", 7, 1)]);
-    let mut runtime = Runtime::new(SingleTableIVM::new());
-    runtime.progress(db.head());
-    let (b, step) = runtime.register(query(
-        &tickets_table(),
-        Where::condition("points", ComparisonOperator::GTE, 0),
-    ));
-    settle(&mut runtime, &db, step);
-    let (a, step) = runtime.register(open_tickets());
-    let read = only(&step);
-    let bump = ticket_update(1, "OPEN", 7, 5);
-    let bump_at = db.commit(&bump);
-    runtime.fetched(read.id, db.snapshot(&read));
-
-    let (twin, step) = runtime.register(open_tickets());
-    assert!(step.selects.is_empty(), "served from the donor");
     assert_eq!(step.updates.len(), 1);
-    assert!(matches!(&step.updates[0].op, DataFrameOperation::Add(_, row) if row.data["points"] == Value::Int(5)));
-    assert_eq!(column_of(runtime.engine().rows_for(twin), "points")[&1], Value::Int(5));
-
-    let step = runtime.write(&bump, bump_at);
-    assert!(step.updates.iter().all(|update| update.query == b), "reader and twin already have it, got {:?}", step.updates);
-    assert_eq!(step.updates.len(), 2);
-    for sub in [a, twin, b] {
-        assert_eq!(column_of(runtime.engine().rows_for(sub), "points")[&1], Value::Int(5));
+    assert_eq!(step.updates[0].targets.len(), 2);
+    for sub in [first, second] {
+        assert_eq!(
+            ids(runtime.engine().rows_for(sub, QueryPart::main())),
+            BTreeSet::from([1])
+        );
+        assert_eq!(
+            ids(runtime.engine().rows_for(sub, QueryPart::join(0))),
+            BTreeSet::from([7])
+        );
     }
-}
-
-/// The join layer's counts follow each part's own view: a main part
-/// ahead of the frame references the join value of the image it holds,
-/// is not disturbed when the write it already reflects arrives, and diffs
-/// from its own image when a later write moves the row again.
-#[test]
-fn reader_ahead_keeps_join_counts_consistent() {
-    let mut db = Db::at(0);
-    db.seed(&[user(7, "meera"), user(8, "arjun"), user(9, "kai"), ticket(1, "OPEN", 7, 1)]);
-    let mut runtime = Runtime::new(MultiTableIVM::new());
-    runtime.progress(db.head());
-    let users_join = || Join::new(
-        MultiTableReadQuery::single(query(&users_table(), Where::AND(vec![]))),
-        "assigned_to",
-        "id",
-    );
-    let (b, step) = runtime.register(MultiTableReadQuery {
-        main_table: query(&tickets_table(), Where::condition("points", ComparisonOperator::GTE, 0)),
-        left_joins: vec![users_join()],
-        right_joins: Vec::new(),
-    });
-    settle(&mut runtime, &db, step);
-    assert_eq!(ids(runtime.engine().rows_for(b, QueryPart::join(0))), BTreeSet::from([7]));
-
-    let (a, step) = runtime.register(MultiTableReadQuery {
-        main_table: open_tickets(),
-        left_joins: vec![users_join()],
-        right_joins: Vec::new(),
-    });
-    let main = only(&step);
-    let move8 = ticket_update(1, "OPEN", 8, 1);
-    let move8_at = db.commit(&move8);
-    let step = runtime.fetched(main.id, db.snapshot(&main));
-    settle(&mut runtime, &db, step);
-    assert_eq!(ids(runtime.engine().rows_for(a, QueryPart::join(0))), BTreeSet::from([8]), "the reader's own image drives its edge");
-    assert_eq!(ids(runtime.engine().rows_for(b, QueryPart::join(0))), BTreeSet::from([7]));
-
-    let step = runtime.write(&move8, move8_at);
-    settle(&mut runtime, &db, step);
-    assert_eq!(ids(runtime.engine().rows_for(a, QueryPart::join(0))), BTreeSet::from([8]), "untouched: it already reflected the write");
-    assert_eq!(ids(runtime.engine().rows_for(b, QueryPart::join(0))), BTreeSet::from([8]), "the holder behind moved with the write");
-
-    let move9 = ticket_update(1, "OPEN", 9, 1);
-    let step = runtime.write(&move9, db.commit(&move9));
-    settle(&mut runtime, &db, step);
-    assert_eq!(ids(runtime.engine().rows_for(a, QueryPart::join(0))), BTreeSet::from([9]), "released 8 from its own image, not 7 from the frame's");
-    assert_eq!(ids(runtime.engine().rows_for(b, QueryPart::join(0))), BTreeSet::from([9]));
 }

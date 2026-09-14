@@ -16,9 +16,9 @@
 //! `tests/ivm_scenarios.rs`; the parser's own tests live in
 //! `src/parser/mod.rs`.
 
-use jus_sync::ivm::{IvmStats, SingleTableIVM, SubId};
+use jus_sync::ivm::{ClientId, IvmStats, SingleTableIVM, SubId};
 use jus_sync::model::*;
-use jus_sync::parser::{parse_read, parse_write, point_at, Catalog};
+use jus_sync::parser::{Catalog, parse_read, parse_write, point_at};
 use jus_sync::sync::{Local, MemoryStorage};
 use std::rc::Rc;
 
@@ -55,9 +55,9 @@ fn main() {
     let mut names: Vec<(SubId, &str)> = Vec::new();
     for (uuid, sql) in subscriptions {
         println!("  {uuid:<14} {sql}");
-        let query = parse_read(sql, &catalog)
-            .unwrap_or_else(|error| panic!("{}", point_at(sql, &error)));
-        let (id, _) = ivm.register_query(query);
+        let query =
+            parse_read(sql, &catalog).unwrap_or_else(|error| panic!("{}", point_at(sql, &error)));
+        let (id, _) = ivm.register_query(ClientId(1), query);
         names.push((id, uuid));
     }
     println!(
@@ -99,7 +99,7 @@ fn main() {
         &["q-all", "q-mine-active", "q-open", "q-open-dup"],
         Some(
             "row moves OUT of q-open, q-open-dup and q-mine-active (Delete), and is \
-             replaced in place for q-all (Delete of the old image + Add of the new)",
+             replaced in place for q-all (one Add with the new image)",
         ),
     );
 
@@ -139,16 +139,16 @@ fn run_write(
             .map_or("?", |(_, name)| name)
     };
     println!("\n-- {sql}");
-    let write = parse_write(sql, catalog)
-        .unwrap_or_else(|error| panic!("{}", point_at(sql, &error)));
+    let write =
+        parse_write(sql, catalog).unwrap_or_else(|error| panic!("{}", point_at(sql, &error)));
 
     let before: IvmStats = ivm.engine().stats().clone();
     let ops = ivm.incremental_update(&write);
     let cost = ivm.engine().stats().diff(&before);
 
     let mut found: Vec<&str> = Vec::new();
-    for update in &ops {
-        let name = name_of(update.query);
+    for target in ops.iter().flat_map(|update| update.targets.iter()) {
+        let name = name_of(target.sub);
         if !found.contains(&name) {
             found.push(name);
         }
@@ -163,7 +163,18 @@ fn run_write(
     println!("   expected : {expected_impacted:?}");
     println!("   impacted : {found:?}   [{verdict}]");
     for update in &ops {
-        println!("   op       : {:<14} <- {}", name_of(update.query), fmt_op(&update.op));
+        let mut names: Vec<&str> = update
+            .targets
+            .iter()
+            .map(|target| name_of(target.sub))
+            .collect();
+        names.sort_unstable();
+        println!(
+            "   op       : {:<14} <- {} (client {})",
+            names.join(", "),
+            fmt_op(&update.op),
+            update.client
+        );
     }
     println!("   cost     : {}", cost.routing_summary());
     if let Some(note) = note {

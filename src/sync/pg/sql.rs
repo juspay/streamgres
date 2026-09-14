@@ -24,9 +24,19 @@ pub fn select_sql(query: &SingleTableReadQuery, table: &DbTable) -> String {
             sql.push_str(", ");
         }
         let declared = &table.columns[*column].r#type;
-        let _ = write!(sql, "{}::{}", quote_ident(column.as_str()), cast_of(declared));
+        let _ = write!(
+            sql,
+            "{}::{}",
+            quote_ident(column.as_str()),
+            cast_of(declared)
+        );
     }
-    let _ = write!(sql, " FROM {} WHERE {}", quote_ident(query.table.as_str()), render_where(&query.filter));
+    let _ = write!(
+        sql,
+        " FROM {} WHERE {}",
+        quote_ident(query.table.as_str()),
+        render_where(&query.filter)
+    );
     if query.limit != u32::MAX {
         let direction = match query.order_by.direction {
             Order::ASC => "ASC NULLS LAST",
@@ -141,13 +151,17 @@ fn literal(value: &Value) -> String {
         Value::String(text) => quote_literal(text),
         Value::Int(int) => int.to_string(),
         Value::Float(float) if float.is_nan() => "'NaN'::float8".to_owned(),
-        Value::Float(float) if float.is_infinite() && *float > 0.0 => "'Infinity'::float8".to_owned(),
+        Value::Float(float) if float.is_infinite() && *float > 0.0 => {
+            "'Infinity'::float8".to_owned()
+        }
         Value::Float(float) if float.is_infinite() => "'-Infinity'::float8".to_owned(),
         Value::Float(float) => format!("{float:?}::float8"),
         Value::Bool(true) => "TRUE".to_owned(),
         Value::Bool(false) => "FALSE".to_owned(),
         Value::Date(date) => format!("DATE '{}'", date.format("%Y-%m-%d")),
-        Value::Datetime(datetime) => format!("TIMESTAMP '{}'", datetime.format("%Y-%m-%d %H:%M:%S%.6f")),
+        Value::Datetime(datetime) => {
+            format!("TIMESTAMP '{}'", datetime.format("%Y-%m-%d %H:%M:%S%.6f"))
+        }
         Value::List(_) | Value::Map(_) | Value::Set(_) => "NULL".to_owned(),
     }
 }
@@ -206,9 +220,21 @@ mod tests {
         let query = SingleTableReadQuery::new(
             "tickets",
             Where::OR(vec![
-                Where::Condition(Condition::new("points", ComparisonOperator::IN, Value::Set(set))),
-                Where::Condition(Condition::new("points", ComparisonOperator::IN, Value::List(Vec::new()))),
-                Where::Condition(Condition::new("status", ComparisonOperator::EQ, Value::Null)),
+                Where::Condition(Condition::new(
+                    "points",
+                    ComparisonOperator::IN,
+                    Value::Set(set),
+                )),
+                Where::Condition(Condition::new(
+                    "points",
+                    ComparisonOperator::IN,
+                    Value::List(Vec::new()),
+                )),
+                Where::Condition(Condition::new(
+                    "status",
+                    ComparisonOperator::EQ,
+                    Value::Null,
+                )),
                 Where::Condition(Condition::new(
                     "status",
                     ComparisonOperator::NOT_IN,
@@ -219,8 +245,15 @@ mod tests {
             5,
         );
         let sql = select_sql(&query, &tickets());
-        assert!(sql.contains("\"points\" IN (7, 9) IS TRUE") || sql.contains("\"points\" IN (9, 7) IS TRUE"), "{sql}");
+        assert!(
+            sql.contains("\"points\" IN (7, 9) IS TRUE")
+                || sql.contains("\"points\" IN (9, 7) IS TRUE"),
+            "{sql}"
+        );
         assert!(sql.contains(" OR FALSE OR FALSE OR FALSE)"), "{sql}");
-        assert!(sql.ends_with("ORDER BY \"points\" DESC NULLS FIRST LIMIT 5"), "{sql}");
+        assert!(
+            sql.ends_with("ORDER BY \"points\" DESC NULLS FIRST LIMIT 5"),
+            "{sql}"
+        );
     }
 }

@@ -16,15 +16,17 @@ use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
-use tokio_postgres::config::Host;
 use tokio_postgres::Config;
+use tokio_postgres::config::Host;
 
 use crate::sync::storage::StorageError;
 
-/// The socket underneath, either flavor.
+/// The socket underneath, either flavor; `Detached` is a connection that
+/// was never opened (a placeholder for tests of the alias bookkeeping).
 enum Socket {
     Tcp(TcpStream),
     Unix(UnixStream),
+    Detached,
 }
 
 impl Socket {
@@ -33,6 +35,7 @@ impl Socket {
         match self {
             Socket::Tcp(stream) => stream.read_buf(buffer).await,
             Socket::Unix(stream) => stream.read_buf(buffer).await,
+            Socket::Detached => Err(io::ErrorKind::NotConnected.into()),
         }
     }
 
@@ -41,6 +44,7 @@ impl Socket {
         match self {
             Socket::Tcp(stream) => stream.write_all(bytes).await,
             Socket::Unix(stream) => stream.write_all(bytes).await,
+            Socket::Detached => Err(io::ErrorKind::NotConnected.into()),
         }
     }
 }
@@ -54,6 +58,16 @@ pub struct ReplicationConnection {
 }
 
 impl ReplicationConnection {
+    /// A connection that was never opened: every use fails with
+    /// `NotConnected`. Lets tests build an [`super::Alias`] without a
+    /// server.
+    pub fn detached() -> Self {
+        ReplicationConnection {
+            socket: Socket::Detached,
+            buffer: BytesMut::new(),
+        }
+    }
+
     /// Connect with `config`'s first host, user, password and database in
     /// replication mode and authenticate.
     pub async fn open(config: &Config) -> Result<Self, StorageError> {
@@ -63,7 +77,11 @@ impl ReplicationConnection {
             .ok_or_else(|| StorageError("the connection string names no host".to_owned()))?;
         let port = config.get_ports().first().copied().unwrap_or(5432);
         let socket = match host {
-            Host::Tcp(host) => Socket::Tcp(TcpStream::connect((host.as_str(), port)).await.map_err(io_error)?),
+            Host::Tcp(host) => Socket::Tcp(
+                TcpStream::connect((host.as_str(), port))
+                    .await
+                    .map_err(io_error)?,
+            ),
             Host::Unix(dir) => {
                 let path = dir.join(format!(".s.PGSQL.{port}"));
                 Socket::Unix(UnixStream::connect(path).await.map_err(io_error)?)
@@ -77,21 +95,30 @@ impl ReplicationConnection {
             socket,
             buffer: BytesMut::with_capacity(8192),
         };
-        let mut params = vec![("client_encoding", "UTF8"), ("user", user.as_str()), ("replication", "database")];
+        let mut params = vec![
+            ("client_encoding", "UTF8"),
+            ("user", user.as_str()),
+            ("replication", "database"),
+        ];
         if let Some(dbname) = config.get_dbname() {
             params.push(("database", dbname));
         }
         let mut out = BytesMut::new();
         frontend::startup_message(params, &mut out).map_err(io_error)?;
         connection.socket.write(&out).await.map_err(io_error)?;
-        connection.authenticate(&user, config.get_password()).await?;
+        connection
+            .authenticate(&user, config.get_password())
+            .await?;
         connection.until_ready().await?;
         Ok(connection)
     }
 
     /// Run one command and return its rows as text columns (`None` for
     /// SQL `NULL`).
-    pub async fn simple_query(&mut self, sql: &str) -> Result<Vec<Vec<Option<String>>>, StorageError> {
+    pub async fn simple_query(
+        &mut self,
+        sql: &str,
+    ) -> Result<Vec<Vec<Option<String>>>, StorageError> {
         let mut out = BytesMut::new();
         frontend::query(sql, &mut out).map_err(io_error)?;
         self.socket.write(&out).await.map_err(io_error)?;
@@ -102,7 +129,9 @@ impl ReplicationConnection {
                     let mut row = Vec::new();
                     let mut ranges = body.ranges();
                     while let Some(range) = ranges.next().map_err(io_error)? {
-                        row.push(range.map(|range| String::from_utf8_lossy(&body.buffer()[range]).into_owned()));
+                        row.push(range.map(|range| {
+                            String::from_utf8_lossy(&body.buffer()[range]).into_owned()
+                        }));
                     }
                     rows.push(row);
                 }
@@ -114,32 +143,53 @@ impl ReplicationConnection {
     }
 
     /// Answer the server's authentication request with the password.
-    async fn authenticate(&mut self, user: &str, password: Option<&[u8]>) -> Result<(), StorageError> {
-        let missing = || StorageError("the server asked for a password and the connection string has none".to_owned());
+    async fn authenticate(
+        &mut self,
+        user: &str,
+        password: Option<&[u8]>,
+    ) -> Result<(), StorageError> {
+        let missing = || {
+            StorageError(
+                "the server asked for a password and the connection string has none".to_owned(),
+            )
+        };
         match self.next_message().await? {
             Message::AuthenticationOk => return Ok(()),
             Message::AuthenticationCleartextPassword => {
                 self.send_password(password.ok_or_else(missing)?).await?;
             }
             Message::AuthenticationMd5Password(body) => {
-                let hashed = authentication::md5_hash(user.as_bytes(), password.ok_or_else(missing)?, body.salt());
+                let hashed = authentication::md5_hash(
+                    user.as_bytes(),
+                    password.ok_or_else(missing)?,
+                    body.salt(),
+                );
                 self.send_password(hashed.as_bytes()).await?;
             }
             Message::AuthenticationSasl(body) => {
                 let mut offered = body.mechanisms();
                 let mut scram = false;
                 while let Some(mechanism) = offered.next().map_err(io_error)? {
-                    scram |= mechanism == sasl::SCRAM_SHA_256 || mechanism == sasl::SCRAM_SHA_256_PLUS;
+                    scram |=
+                        mechanism == sasl::SCRAM_SHA_256 || mechanism == sasl::SCRAM_SHA_256_PLUS;
                 }
                 if !scram {
-                    return Err(StorageError("the server offers no SCRAM-SHA-256 authentication".to_owned()));
+                    return Err(StorageError(
+                        "the server offers no SCRAM-SHA-256 authentication".to_owned(),
+                    ));
                 }
-                let mut exchange = sasl::ScramSha256::new(password.ok_or_else(missing)?, sasl::ChannelBinding::unsupported());
+                let mut exchange = sasl::ScramSha256::new(
+                    password.ok_or_else(missing)?,
+                    sasl::ChannelBinding::unsupported(),
+                );
                 let mut out = BytesMut::new();
-                frontend::sasl_initial_response(sasl::SCRAM_SHA_256, exchange.message(), &mut out).map_err(io_error)?;
+                frontend::sasl_initial_response(sasl::SCRAM_SHA_256, exchange.message(), &mut out)
+                    .map_err(io_error)?;
                 self.socket.write(&out).await.map_err(io_error)?;
                 match self.next_message().await? {
-                    Message::AuthenticationSaslContinue(body) => exchange.update(body.data()).map_err(io_error)?,
+                    Message::AuthenticationSaslContinue(body) => {
+                        exchange.update(body.data()).map_err(io_error)?
+                    }
                     Message::ErrorResponse(body) => return Err(server_error(body.fields())),
                     _ => return Err(StorageError("unexpected message during SCRAM".to_owned())),
                 }
@@ -147,7 +197,9 @@ impl ReplicationConnection {
                 frontend::sasl_response(exchange.message(), &mut out).map_err(io_error)?;
                 self.socket.write(&out).await.map_err(io_error)?;
                 match self.next_message().await? {
-                    Message::AuthenticationSaslFinal(body) => exchange.finish(body.data()).map_err(io_error)?,
+                    Message::AuthenticationSaslFinal(body) => {
+                        exchange.finish(body.data()).map_err(io_error)?
+                    }
                     Message::ErrorResponse(body) => return Err(server_error(body.fields())),
                     _ => return Err(StorageError("unexpected message during SCRAM".to_owned())),
                 }
@@ -158,7 +210,9 @@ impl ReplicationConnection {
         match self.next_message().await? {
             Message::AuthenticationOk => Ok(()),
             Message::ErrorResponse(body) => Err(server_error(body.fields())),
-            _ => Err(StorageError("unexpected message after authentication".to_owned())),
+            _ => Err(StorageError(
+                "unexpected message after authentication".to_owned(),
+            )),
         }
     }
 

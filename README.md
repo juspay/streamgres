@@ -53,6 +53,7 @@ the number that **actually match**, and then patches only the affected views.
 | In-memory storage answering at once, honoring `ORDER BY` + `LIMIT`; commit-first test harness | ✅ done | `src/sync/storage.rs` |
 | **PostgreSQL**: positioned snapshot reads in two methods (WAL: the exported snapshot of a rotating temporary replication slot, exact at its consistent point; XID: `pg_current_snapshot()` transaction ids), a `test_decoding` change-feed poller that positions every write, a minimal replication-protocol connection, live tests and a bench scenario against a real server | ✅ done | `src/sync/pg/` |
 | Routing counters + benchmark harness | ✅ done | `src/ivm/stats.rs`, `src/bin/bench.rs` |
+| **xyne-spaces coverage**: the dashboard's 283 synced queries (and the ACL predicates added to them) rebuilt as tests on a catalog generated from the application's schema; seven expressiveness gaps named and pinned | ✅ tests, ⏳ gaps | `tests/xyne_spaces_queries/` |
 | `INNER` joins: visibility gate on the driven parent | ⏳ pending | paper §6.5 |
 | **WebSocket protocol**: subscribe / unsubscribe / op stream, connection & subscription lifecycle | ⏳ pending | `src/ws.rs` is an axum echo base |
 | Streaming `pgoutput` consumer (the poller consumes the slot by SQL today), batching of one write's narrowed reads | ⏳ pending | paper §7, §13 |
@@ -292,6 +293,7 @@ tables, reconnect/catch-up, and back-pressure are part of this work item.
 ```bash
 cargo run --bin jus_sync      # scripted demo: SQL in, routed operations + cost counters out
 cargo test                    # model, parser, routing, window, join and read/write interleaving scenarios
+cargo test --test xyne_spaces_queries   # the xyne-spaces dashboard's 283 queries on the engine (gap table in its main.rs)
 cargo run --release --bin bench   # routing / registration / window / join benchmarks
 cargo run --bin server        # the WebSocket base (echo) on 127.0.0.1:8080
 
@@ -405,6 +407,36 @@ silently narrowed:
 
 ---
 
+## Coverage: the xyne-spaces queries
+
+`tests/xyne_spaces_queries/` rebuilds every synced query of the xyne-spaces
+dashboard (the registry in the backend's `queries.ts`, 283 queries at
+v1.316.4) on the engine, one test per query, plus the access-control
+predicates `defineQuery` adds to each. The catalog is generated from the application's
+schema (128 tables, 395 relationships, every one a single-column hop). Each
+test registers the closest query the model can express over seeded storage,
+asserts the snapshot, routes writes and asserts the deltas; a single-table
+query also round-trips through the SQL parser. Where a query needs something
+the engine lacks, the test keeps the expressible part and names the gap, so
+the assertion shows today's behavior and flips when the gap closes; `gaps.rs`
+pins each gap on its own.
+
+| Gap | The queries use | The engine has |
+| --- | --- | --- |
+| N | `IS NULL` / `IS NOT NULL` (83 sites: `visibleTo IS NULL`, `rootId IS NULL`, `userId IS NULL`, `deletedAt IS NULL`, …) | no `IS` operator; a `NULL` row can be excluded, never selected |
+| L | `LIKE` / `ILIKE` (11 sites: name, title, xyneId searches; one over JSON text) | no pattern operator |
+| X | an existence test inside `OR` (canvas visibility, `browsableChannels`, `channelLinks`, `summaryTemplates`, `getUsers`, the channel-access ACL `visibility = PUBLIC OR EXISTS participants`, the calls ACL) | `EXISTS` is a RIGHT edge conjoined with the node's filter; `Where` has no `EXISTS` leaf. Two subscriptions unioned by the client is the workaround the tests show |
+| O | a second `ORDER BY` column (tiebreaks on `id`); `ORDER BY` / `LIMIT` inside `related` | one window column per query; below the root every matching row ships |
+| J | `json` columns | opaque strings |
+| E | `whereExists` returns no child rows | the matching child rows ship as their own part |
+| S, B | `.one()`, `LIMIT n` | `LIMIT 1`; the doubled buffer ships up to `2n` rows, the client shows `n` |
+
+Keyset cursors (`.start(row, {inclusive})`) and the empty `IN` list need no
+engine change: the builder spells the cursor as the `WHERE` it means, and
+`IN ()` is simply false.
+
+---
+
 ## Layout
 
 ```text
@@ -459,6 +491,8 @@ tests/
   multi_table_scenarios.rs join reference/fetch/prune, self-join, nested and RIGHT edges
   sync_interleaving.rs     reads out while writes stream: merge, row currency, xid vs lsn, refill, post-order
   pg_live.rs               live Postgres: snapshot held open behind writes (both modes), async service
+  xyne_spaces_queries/     the xyne-spaces registry (283 queries) and ACL shapes on a catalog generated
+                           from the application's schema; gaps.rs pins each expressiveness gap
 ```
 
 ---

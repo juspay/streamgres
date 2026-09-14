@@ -1,8 +1,7 @@
-//! Where in the source's history a write, a storage read, or a frame row
-//! sits: one WAL location ([`Lsn`]) for all of them. The engine compares
-//! locations only; how a source arrives at them is the storage layer's
-//! business (see `sync::pg` for the two Postgres methods and
-//! `sync::MemoryStorage` for the in-process store).
+//! Where in the source's history a write or a storage read sits: one WAL
+//! location ([`Lsn`]) for both. The engine itself never compares
+//! locations; the runtime does, to bring a read's result up to the point
+//! the engine has reached before the engine sees it (see `sync::Runtime`).
 
 use std::fmt;
 
@@ -39,41 +38,6 @@ pub struct Snapshot {
     pub at: Lsn,
 }
 
-/// How current a frame row's image is: written by the stream at a
-/// location (every later write is news for it), or landed from a read
-/// (a write the read already saw is not).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RowAt {
-    Written(Lsn),
-    Landed(Lsn),
-}
-
-impl RowAt {
-    /// The location itself.
-    pub fn lsn(&self) -> Lsn {
-        match self {
-            RowAt::Written(lsn) | RowAt::Landed(lsn) => *lsn,
-        }
-    }
-
-    /// Whether the row's image already reflects the write committed at
-    /// `write`. A written row never does: the stream delivers in commit
-    /// order, and two writes of one transaction share a location, so a
-    /// write reaching a written row is always news.
-    pub fn reflects(&self, write: Lsn) -> bool {
-        match self {
-            RowAt::Written(_) => false,
-            RowAt::Landed(read) => write <= *read,
-        }
-    }
-
-    /// Whether the row's image is newer than what a read positioned at
-    /// `read` returned for it.
-    pub fn newer_than(&self, read: Lsn) -> bool {
-        self.lsn() > read
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,21 +51,5 @@ mod tests {
         assert_eq!(lsn.to_string(), "1/A0");
         assert!(Lsn::parse("0/FFFFFFFF").unwrap() < Lsn::parse("1/0").unwrap());
         assert!(Lsn::parse("nonsense").is_none());
-    }
-
-    /// A row's currency against writes and against reads.
-    #[test]
-    fn row_currency() {
-        let landed = RowAt::Landed(Lsn(100));
-        assert!(landed.reflects(Lsn(90)));
-        assert!(landed.reflects(Lsn(100)));
-        assert!(!landed.reflects(Lsn(110)));
-        assert!(landed.newer_than(Lsn(50)));
-        assert!(!landed.newer_than(Lsn(100)));
-        let written = RowAt::Written(Lsn(120));
-        assert!(!written.reflects(Lsn(10)));
-        assert!(!written.reflects(Lsn(120)));
-        assert!(written.newer_than(Lsn(100)));
-        assert!(!written.newer_than(Lsn(120)));
     }
 }

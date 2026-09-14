@@ -225,7 +225,7 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
                         return Err(ParseError {
                             message: "unterminated string literal".into(),
                             position: at,
-                        })
+                        });
                     }
                 }
             }
@@ -278,10 +278,13 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
                     return Err(ParseError {
                         message: format!("unexpected character `{other}`"),
                         position: at,
-                    })
+                    });
                 }
             };
-            tokens.push(Spanned { tok: Tok::Sym(sym), at });
+            tokens.push(Spanned {
+                tok: Tok::Sym(sym),
+                at,
+            });
         }
     }
 
@@ -536,7 +539,12 @@ impl Parser {
             u32::MAX
         };
 
-        Ok(SingleTableReadQuery::new(table.name.clone(), filter, order_by, limit))
+        Ok(SingleTableReadQuery::new(
+            table.name.clone(),
+            filter,
+            order_by,
+            limit,
+        ))
     }
 
     /// `INSERT` / `UPDATE` / `DELETE`, enforcing the v1 write restrictions.
@@ -639,7 +647,11 @@ impl Parser {
                 .columns
                 .values()
                 .filter(|column| !table.is_pkey(column.name.as_str()))
-                .filter(|column| !assignments.iter().any(|(name, _)| column.name == name.as_str()))
+                .filter(|column| {
+                    !assignments
+                        .iter()
+                        .any(|(name, _)| column.name == name.as_str())
+                })
                 .map(|column| column.name.as_str())
                 .collect();
             if !missing.is_empty() {
@@ -679,10 +691,7 @@ impl Parser {
 
     /// The mandatory `WHERE` of an UPDATE / DELETE, restricted to a
     /// conjunction of `pkey_column = value` covering the full primary key.
-    fn write_pkey_filter(
-        &mut self,
-        table: &DbTable,
-    ) -> Result<HashMap<String, Value>, ParseError> {
+    fn write_pkey_filter(&mut self, table: &DbTable) -> Result<HashMap<String, Value>, ParseError> {
         self.expect_word("WHERE")?;
         let at = self.at();
         let filter = self.filter(table)?;
@@ -939,10 +948,7 @@ fn ensure_full_pkey(
 
 /// Reject `NULL` primary-key values — a NULL-keyed row could never be
 /// matched or addressed again.
-fn ensure_pkey_not_null(
-    pkey_value: &HashMap<String, Value>,
-    at: usize,
-) -> Result<(), ParseError> {
+fn ensure_pkey_not_null(pkey_value: &HashMap<String, Value>, at: usize) -> Result<(), ParseError> {
     let mut null_columns: Vec<&str> = pkey_value
         .iter()
         .filter(|(_, value)| value.is_null())
@@ -999,8 +1005,7 @@ fn coerce_to_type(
         (value @ Value::Bool(_), ValueType::Bool) => value,
         (Value::Int(int), ValueType::Float) => Value::Float(int as f64),
         (Value::Float(float), ValueType::Int)
-            if float.fract() == 0.0
-                && ((i64::MIN as f64)..(i64::MAX as f64)).contains(&float) =>
+            if float.fract() == 0.0 && ((i64::MIN as f64)..(i64::MAX as f64)).contains(&float) =>
         {
             Value::Int(float as i64)
         }
@@ -1017,7 +1022,7 @@ fn coerce_to_type(
                      are not supported yet"
                 ),
                 position: at,
-            })
+            });
         }
         (value, _) => {
             return Err(ParseError {
@@ -1025,7 +1030,7 @@ fn coerce_to_type(
                     "column `{column}` is declared {declared:?} but the value is {value:?}"
                 ),
                 position: at,
-            })
+            });
         }
     })
 }
@@ -1195,8 +1200,14 @@ mod tests {
     /// match in any case.
     #[test]
     fn true_false_filters_and_keyword_case() {
-        assert_eq!(read("SELECT * FROM tickets WHERE TRUE").filter, Where::AND(vec![]));
-        assert_eq!(read("SELECT * FROM tickets WHERE FALSE").filter, Where::OR(vec![]));
+        assert_eq!(
+            read("SELECT * FROM tickets WHERE TRUE").filter,
+            Where::AND(vec![])
+        );
+        assert_eq!(
+            read("SELECT * FROM tickets WHERE FALSE").filter,
+            Where::OR(vec![])
+        );
         assert_eq!(
             read("select * from tickets where status = 'x' limit 5"),
             read("SELECT * FROM tickets WHERE status = 'x' LIMIT 5"),
@@ -1214,7 +1225,9 @@ mod tests {
         let q = read("SELECT * FROM tickets WHERE status = NULL");
         assert!(matches!(&q.filter, Where::Condition(c) if c.value == Value::Null));
         let q = read("SELECT * FROM tickets WHERE status = 'it''s'");
-        assert!(matches!(&q.filter, Where::Condition(c) if c.value == Value::String("it's".into())));
+        assert!(
+            matches!(&q.filter, Where::Condition(c) if c.value == Value::String("it's".into()))
+        );
     }
 
     /// INSERT extracts the pkey identity into `pkey_value` and carries the
@@ -1236,9 +1249,9 @@ mod tests {
     /// onto the SET columns), addressed by the pkey.
     #[test]
     fn update_builds_full_row_image_addressed_by_pkey() {
-        let WriteQuery::UPDATE(update) = write(
-            "UPDATE tickets SET status = 'DONE', priority = 'LOW', points = 3 WHERE id = 7",
-        ) else {
+        let WriteQuery::UPDATE(update) =
+            write("UPDATE tickets SET status = 'DONE', priority = 'LOW', points = 3 WHERE id = 7")
+        else {
             panic!("expected an UPDATE");
         };
         assert_eq!(update.pkey_value.pkey_value["id"], Value::Int(7));
@@ -1259,10 +1272,16 @@ mod tests {
     #[test]
     fn v1_restrictions_are_rejected_loudly() {
         let cases = [
-            ("SELECT * FROM tickets LEFT JOIN tickets", "joins are not supported"),
+            (
+                "SELECT * FROM tickets LEFT JOIN tickets",
+                "joins are not supported",
+            ),
             ("SELECT * FROM nope", "unknown table"),
             ("SELECT * FROM tickets WHERE ghost = 1", "unknown column"),
-            ("SELECT * FROM tickets ORDER BY id, points", "one ORDER BY column"),
+            (
+                "SELECT * FROM tickets ORDER BY id, points",
+                "one ORDER BY column",
+            ),
             (
                 "INSERT INTO tickets (status) VALUES ('x')",
                 "every primary-key column",
@@ -1331,10 +1350,11 @@ mod tests {
                 DbColumn::new("score", ValueType::Float),
             ],
         )]);
-        let WriteQuery::INSERT(insert) =
-            parse_write("INSERT INTO metrics (id, score) VALUES (1, 2)", &float_catalog)
-                .expect("should parse")
-        else {
+        let WriteQuery::INSERT(insert) = parse_write(
+            "INSERT INTO metrics (id, score) VALUES (1, 2)",
+            &float_catalog,
+        )
+        .expect("should parse") else {
             panic!("expected an INSERT");
         };
         assert_eq!(insert.record.data["score"], Value::Float(2.0));
@@ -1375,9 +1395,18 @@ mod tests {
                 "DELETE FROM tickets WHERE id = 9223372036854775808.0",
                 "declared Int",
             ),
-            ("INSERT INTO tickets (id, points) VALUES (1, 'many')", "declared Int"),
-            ("INSERT INTO tickets (id, status) VALUES (1.5, 'x')", "declared Int"),
-            ("INSERT INTO tickets (id, status) VALUES (NULL, 'x')", "cannot be NULL"),
+            (
+                "INSERT INTO tickets (id, points) VALUES (1, 'many')",
+                "declared Int",
+            ),
+            (
+                "INSERT INTO tickets (id, status) VALUES (1.5, 'x')",
+                "declared Int",
+            ),
+            (
+                "INSERT INTO tickets (id, status) VALUES (NULL, 'x')",
+                "cannot be NULL",
+            ),
             (
                 "UPDATE tickets SET status = 'x', priority = 'y', points = 1 WHERE id = NULL",
                 "cannot be NULL",
@@ -1435,12 +1464,16 @@ mod tests {
     /// [`parse_read`] refuses writes and [`parse_write`] refuses reads.
     #[test]
     fn wrong_kind_is_an_error() {
-        assert!(read_err("DELETE FROM tickets WHERE id = 1")
-            .message
-            .contains("expected a SELECT"));
-        assert!(write_err("SELECT * FROM tickets")
-            .message
-            .contains("expected a write statement"));
+        assert!(
+            read_err("DELETE FROM tickets WHERE id = 1")
+                .message
+                .contains("expected a SELECT")
+        );
+        assert!(
+            write_err("SELECT * FROM tickets")
+                .message
+                .contains("expected a write statement")
+        );
     }
 
     /// Tokens after a complete statement error at their byte position.

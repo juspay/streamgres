@@ -2,13 +2,15 @@
 //! never reads storage itself. Where it needs rows it does not hold (a
 //! registration's initial result set, a join edge's newly referenced
 //! value, a drained window's refill) it records a [`Fetch`] request and
-//! carries on; the runtime runs the read, drops from its result the rows
-//! the stream has since removed, and lands the rest through
-//! [`Engine::land`] together with the position the read saw. [`Engine`]
-//! is what the two engines (single-table and join tree) expose to that
-//! runtime.
+//! carries on; the runtime runs the read, brings its result up to the
+//! point the engine has reached, and lands the rest through
+//! [`Engine::land`]. Positions never enter the engine: what lands is
+//! current by construction. [`Engine`] is what the two engines
+//! (single-table and join tree) expose to that runtime, and every delta
+//! they emit is addressed to a client ([`super::ClientUpdate`]).
 
-use crate::model::{DataFrameKey, DataFrameRow, Lsn, SingleTableReadQuery, SubId, WriteQuery};
+use super::ClientUpdate;
+use crate::model::{ClientId, DataFrameKey, DataFrameRow, SingleTableReadQuery, SubId, WriteQuery};
 
 /// The engine's handle for one storage read it asked for; unique for the
 /// life of the engine.
@@ -17,16 +19,26 @@ pub struct FetchId(pub u64);
 
 /// Why a read was asked for.
 ///
-/// - `Snapshot`: a registration's initial result set.
+/// - `Snapshot`: a registration's initial result set; run in the
+///   background while writes keep flowing.
 /// - `Narrowed`: the subscription's filter narrowed to one join value a
-///   driving edge started referencing.
+///   driving edge started referencing; run before the next write.
 /// - `Refill`: a window drained to its limit, read again from its
-///   frontier.
+///   frontier; run before the next write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchKind {
     Snapshot,
     Narrowed,
     Refill,
+}
+
+impl FetchKind {
+    /// Whether the driver must finish this read before routing anything
+    /// else: a read asked for in the middle of maintaining a subscription
+    /// (a join crossing, a refill) lands before the next write.
+    pub fn is_blocking(self) -> bool {
+        !matches!(self, FetchKind::Snapshot)
+    }
 }
 
 /// One storage read an engine wants run on its behalf.
@@ -49,27 +61,27 @@ pub struct Fetch {
 pub trait Engine {
     /// The subscription spec this engine registers.
     type Query;
-    /// The per-subscription delta this engine emits.
-    type Update;
 
-    /// Register a subscription: its id, and whatever of its initial result
-    /// set is available at once (a twin's rows; nothing when a read was
-    /// requested instead).
-    fn subscribe(&mut self, query: Self::Query) -> (SubId, Vec<Self::Update>);
+    /// Register a subscription for `client`: its id, and whatever of its
+    /// initial result set is available at once (a twin's rows; nothing
+    /// when a read was requested instead).
+    fn subscribe(&mut self, client: ClientId, query: Self::Query) -> (SubId, Vec<ClientUpdate>);
 
     /// Remove a subscription; reads still in flight for it land as no-ops.
     fn unsubscribe(&mut self, sub: SubId);
 
-    /// Route one write, committed at `at`, to every subscription it
-    /// affects.
-    fn route(&mut self, write: &WriteQuery, at: Lsn) -> Vec<Self::Update>;
+    /// Remove every subscription of `client` (it disconnected).
+    fn unsubscribe_client(&mut self, client: ClientId);
 
-    /// Land the rows a requested read returned, whose snapshot reflects
-    /// every commit up to `at`, after the runtime has dropped the rows the
-    /// stream removed since that snapshot; the engine merges each
-    /// remaining row against what its frame holds and serves the reading
-    /// subscription.
-    fn land(&mut self, fetch: &Fetch, rows: &[(DataFrameKey, DataFrameRow)], at: Lsn) -> Vec<Self::Update>;
+    /// Route one write to every subscription it affects, grouped per
+    /// client.
+    fn route(&mut self, write: &WriteQuery) -> Vec<ClientUpdate>;
+
+    /// Land the rows a requested read returned, already brought up to the
+    /// engine's position by the runtime: each row is adopted into the
+    /// shared frame if the frame does not hold it and tagged for the
+    /// reading subscription.
+    fn land(&mut self, fetch: &Fetch, rows: &[(DataFrameKey, DataFrameRow)]) -> Vec<ClientUpdate>;
 
     /// Take the reads recorded since the last call, in the order they were
     /// asked for.

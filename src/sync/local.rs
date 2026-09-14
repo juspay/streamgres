@@ -12,14 +12,14 @@ use std::task::{Context, Poll, Waker};
 
 use super::runtime::{Runtime, Step};
 use super::storage::Storage;
-use crate::ivm::Engine;
-use crate::model::{Lsn, SubId, WriteQuery};
+use crate::ivm::{ClientUpdate, Engine};
+use crate::model::{ClientId, Lsn, SubId, WriteQuery};
 
 /// A runtime over an engine and an immediately-answering storage.
 ///
 /// - `clock`: the driver's own write counter, the location every routed
-///   write is committed at; reads of an in-process store are positioned
-///   at zero, below all of them.
+///   write is committed at; the storage is advanced to it after each
+///   write, so its reads are positioned exactly there.
 pub struct Local<E: Engine, S: Storage> {
     runtime: Runtime<E>,
     storage: Rc<S>,
@@ -36,10 +36,14 @@ impl<E: Engine, S: Storage> Local<E, S> {
         }
     }
 
-    /// Register a subscription and return its id and its complete initial
-    /// snapshot, every read it needed already landed.
-    pub fn register_query(&mut self, query: E::Query) -> (SubId, Vec<E::Update>) {
-        let (sub, step) = self.runtime.register(query);
+    /// Register a subscription for `client` and return its id and its
+    /// complete initial snapshot, every read it needed already landed.
+    pub fn register_query(
+        &mut self,
+        client: ClientId,
+        query: E::Query,
+    ) -> (SubId, Vec<ClientUpdate>) {
+        let (sub, step) = self.runtime.register(client, query);
         (sub, self.settle(step))
     }
 
@@ -48,17 +52,23 @@ impl<E: Engine, S: Storage> Local<E, S> {
         self.runtime.unregister(sub);
     }
 
+    /// Remove every subscription of `client`.
+    pub fn unregister_client(&mut self, client: ClientId) {
+        self.runtime.unregister_client(client);
+    }
+
     /// Route one write at the next tick of the driver's clock and return
     /// every delta it led to, reads included.
-    pub fn incremental_update(&mut self, write: &WriteQuery) -> Vec<E::Update> {
+    pub fn incremental_update(&mut self, write: &WriteQuery) -> Vec<ClientUpdate> {
         self.clock += 1;
         let step = self.runtime.write(write, Lsn(self.clock));
+        self.moved();
         self.settle(step)
     }
 
     /// Run the reads the engine asked for through a direct maintenance
     /// call ([`Local::engine_mut`]) and return the deltas they led to.
-    pub fn pump(&mut self) -> Vec<E::Update> {
+    pub fn pump(&mut self) -> Vec<ClientUpdate> {
         let step = self.runtime.pump();
         self.settle(step)
     }
@@ -84,13 +94,19 @@ impl<E: Engine, S: Storage> Local<E, S> {
         &self.storage
     }
 
+    /// The stream moved: tell the storage, and learn its floor.
+    fn moved(&mut self) {
+        self.storage.advance(self.runtime.position());
+        self.runtime.set_floor(self.storage.floor());
+    }
+
     /// Run every read a step handed out, land it, and keep going until no
     /// read is left, collecting the deltas in order.
-    fn settle(&mut self, step: Step<E::Update>) -> Vec<E::Update> {
+    fn settle(&mut self, step: Step) -> Vec<ClientUpdate> {
         let mut updates = step.updates;
         let mut queue: VecDeque<_> = step.selects.into();
         while let Some(fetch) = queue.pop_front() {
-            let snapshot = immediate(self.storage.select(&fetch.query, None))
+            let snapshot = immediate(self.storage.select(&fetch.query))
                 .expect("Local drives storage that answers at once; use Service for asynchronous storage")
                 .expect("Local drives storage that cannot fail");
             let landed = self.runtime.fetched(fetch.id, snapshot);

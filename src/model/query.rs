@@ -94,6 +94,20 @@ impl std::fmt::Display for SubId {
     }
 }
 
+/// The engine's handle for one connected client: the transport hands it in
+/// with every registration, and every delta the engine emits is addressed
+/// to one client (see `ivm::ClientUpdate`), so a row two of a client's
+/// queries hold travels to that client once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ClientId(pub u64);
+
+impl std::fmt::Display for ClientId {
+    /// The bare number.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// One join edge of a [`MultiTableReadQuery`]: rows of `sub`'s main table
 /// attach to rows of the enclosing node where
 /// `sub.<sub_table_column> = enclosing.<main_table_column>`.
@@ -513,7 +527,10 @@ mod tests {
     #[test]
     fn or_concatenates_and_distributes_over_and() {
         let or = Where::OR(vec![c("a", 1), c("b", 2)]);
-        assert_eq!(or.to_dnf(), vec![disjunct(&[("a", 1)]), disjunct(&[("b", 2)])]);
+        assert_eq!(
+            or.to_dnf(),
+            vec![disjunct(&[("a", 1)]), disjunct(&[("b", 2)])]
+        );
 
         let cross = Where::AND(vec![
             Where::OR(vec![c("a", 1), c("b", 2)]),

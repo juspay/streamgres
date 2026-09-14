@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use jus_sync::ivm::{SingleTableIVM, SingleTableUpdate, SubId};
+use jus_sync::ivm::{ClientUpdate, SingleTableIVM, SubId};
 use jus_sync::model::*;
 use jus_sync::sync::{Local, MemoryStorage};
 use std::rc::Rc;
@@ -88,29 +88,45 @@ fn delete(table: &DbTable, id: i64) -> WriteQuery {
 fn standard_ivm(tickets: &DbTable) -> (Ivm, Names) {
     let mut ivm = Local::new(SingleTableIVM::new(), Rc::new(MemoryStorage::new()));
     let names = Names::default();
-    names.register(&mut ivm, "q-open", query(
+    names.register(
+        &mut ivm,
+        "q-open",
+        query(
             tickets,
             Where::condition("status", ComparisonOperator::EQ, "OPEN"),
-        ));
-    names.register(&mut ivm, "q-mine-active", query(
+        ),
+    );
+    names.register(
+        &mut ivm,
+        "q-mine-active",
+        query(
             tickets,
             Where::AND(vec![
                 Where::condition("assigned_to", ComparisonOperator::EQ, "aniket"),
                 Where::condition("status", ComparisonOperator::NEQ, "DONE"),
             ]),
-        ));
-    names.register(&mut ivm, "q-hot", query(
+        ),
+    );
+    names.register(
+        &mut ivm,
+        "q-hot",
+        query(
             tickets,
             Where::condition(
                 "priority",
                 ComparisonOperator::IN,
                 Value::List(vec!["HIGH".into(), "URGENT".into()]),
             ),
-        ));
-    names.register(&mut ivm, "q-big", query(
+        ),
+    );
+    names.register(
+        &mut ivm,
+        "q-big",
+        query(
             tickets,
             Where::condition("points", ComparisonOperator::GTE, 8),
-        ));
+        ),
+    );
     names.register(&mut ivm, "q-all", query(tickets, Where::AND(vec![])));
     (ivm, names)
 }
@@ -127,7 +143,8 @@ fn open_ticket_row() -> Vec<(&'static str, Value)> {
 }
 
 /// Test-side directory from readable names to the engine's subscription
-/// ids and back: the role the transport layer plays in production.
+/// ids and back: the role the transport layer plays in production. Every
+/// subscription is its own client unless a test says otherwise.
 #[derive(Default)]
 struct Names {
     ids: RefCell<HashMap<String, SubId>>,
@@ -135,16 +152,29 @@ struct Names {
 }
 
 impl Names {
-    /// Register `query` under `name`, returning its snapshot as bare
-    /// operations.
+    /// Register `query` under `name` for a client of its own, returning
+    /// its snapshot as bare operations.
     fn register(
         &self,
         ivm: &mut Ivm,
         name: impl Into<String>,
         query: SingleTableReadQuery,
     ) -> Vec<DataFrameOperation> {
+        let client = ClientId(self.ids.borrow().len() as u64 + 1);
+        self.register_for(ivm, client, name, query)
+    }
+
+    /// Register `query` under `name` for `client`, returning its snapshot
+    /// as bare operations.
+    fn register_for(
+        &self,
+        ivm: &mut Ivm,
+        client: ClientId,
+        name: impl Into<String>,
+        query: SingleTableReadQuery,
+    ) -> Vec<DataFrameOperation> {
         let name = name.into();
-        let (id, updates) = ivm.register_query(query);
+        let (id, updates) = ivm.register_query(client, query);
         self.ids.borrow_mut().insert(name.clone(), id);
         self.names.borrow_mut().insert(id, name);
         updates.into_iter().map(|update| update.op).collect()
@@ -161,18 +191,25 @@ impl Names {
     }
 
     /// The impacted subscriptions of an update batch by name, deduplicated
-    /// (an in-place replace contributes an adjacent `Delete` + `Add` pair
-    /// under one subscription) and sorted.
-    fn impacted(&self, ops: &[SingleTableUpdate]) -> Vec<String> {
+    /// and sorted.
+    fn impacted(&self, ops: &[ClientUpdate]) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for update in ops {
-            let name = self.name(update.query);
+        for target in ops.iter().flat_map(|update| update.targets.iter()) {
+            let name = self.name(target.sub);
             if !out.contains(&name) {
                 out.push(name);
             }
         }
         out.sort();
         out
+    }
+
+    /// Whether an update names subscription `name`.
+    fn targets(&self, update: &ClientUpdate, name: &str) -> bool {
+        update
+            .targets
+            .iter()
+            .any(|target| target.sub == self.id(name))
     }
 
     /// The names of `ids`, sorted.
@@ -192,10 +229,14 @@ fn insert_routes_to_matching_queries_only() {
 
     let ops = ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
 
-    assert_eq!(names.impacted(&ops), vec!["q-all", "q-mine-active", "q-open"]);
-    assert!(ops
-        .iter()
-        .all(|update| matches!(update.op, DataFrameOperation::Add(..))));
+    assert_eq!(
+        names.impacted(&ops),
+        vec!["q-all", "q-mine-active", "q-open"]
+    );
+    assert!(
+        ops.iter()
+            .all(|update| matches!(update.op, DataFrameOperation::Add(..)))
+    );
     assert!(ops.iter().all(|update| update.table == "tickets"));
     assert_eq!(ivm.engine().rows_for(names.id("q-open")).unwrap().len(), 1);
     assert_eq!(ivm.engine().rows_for(names.id("q-hot")).unwrap().len(), 0);
@@ -228,8 +269,8 @@ fn partial_disjunct_does_not_fire() {
 
 /// An update that stops a held row from matching emits `Delete` — carrying
 /// the removed image — for the subscriptions it leaves; the row still
-/// matching the unfiltered subscription (`q-all`) is replaced in place with
-/// an adjacent `Delete(old)` + `Add(new)` pair.
+/// matching the unfiltered subscription (`q-all`) is replaced in place,
+/// which reaches its client as the one `Add` with the new image.
 #[test]
 fn update_moves_row_out_with_delete() {
     let tickets = table("tickets");
@@ -240,10 +281,13 @@ fn update_moves_row_out_with_delete() {
     done_row[0] = ("status", "DONE".into());
     let ops = ivm.incremental_update(&update(&tickets, 1, &done_row));
 
-    assert_eq!(names.impacted(&ops), vec!["q-all", "q-mine-active", "q-open"]);
+    assert_eq!(
+        names.impacted(&ops),
+        vec!["q-all", "q-mine-active", "q-open"]
+    );
     let ops_for = |uuid: &str| -> Vec<&DataFrameOperation> {
         ops.iter()
-            .filter(|update| update.query == names.id(uuid))
+            .filter(|update| names.targets(update, uuid))
             .map(|update| &update.op)
             .collect()
     };
@@ -257,11 +301,9 @@ fn update_moves_row_out_with_delete() {
         [DataFrameOperation::Delete(..)]
     ));
     let q_all = ops_for("q-all");
-    let [DataFrameOperation::Delete(_, old), DataFrameOperation::Add(_, new)] = q_all.as_slice()
-    else {
-        panic!("q-all expects the replace pair, got {q_all:?}");
+    let [DataFrameOperation::Add(_, new)] = q_all.as_slice() else {
+        panic!("q-all expects the one Add of an in-place change, got {q_all:?}");
     };
-    assert_eq!(old.data["status"], Value::String("OPEN".into()));
     assert_eq!(new.data["status"], Value::String("DONE".into()));
 
     assert_eq!(ivm.engine().rows_for(names.id("q-open")).unwrap().len(), 0);
@@ -300,10 +342,14 @@ fn delete_reaches_only_queries_holding_the_row() {
 
     let ops = ivm.incremental_update(&delete(&tickets, 1));
 
-    assert_eq!(names.impacted(&ops), vec!["q-all", "q-mine-active", "q-open"]);
-    assert!(ops
-        .iter()
-        .all(|update| matches!(update.op, DataFrameOperation::Delete(..))));
+    assert_eq!(
+        names.impacted(&ops),
+        vec!["q-all", "q-mine-active", "q-open"]
+    );
+    assert!(
+        ops.iter()
+            .all(|update| matches!(update.op, DataFrameOperation::Delete(..)))
+    );
     assert!(ivm.engine().rows_for(names.id("q-all")).unwrap().is_empty());
 
     let ops = ivm.incremental_update(&delete(&tickets, 99));
@@ -336,13 +382,17 @@ fn vacuously_true_filter_is_found_even_when_its_leaf_fails() {
     let tickets = table("tickets");
     let mut ivm = Local::new(SingleTableIVM::new(), Rc::new(MemoryStorage::new()));
     let names = Names::default();
-    names.register(&mut ivm, "q-weird", query(
+    names.register(
+        &mut ivm,
+        "q-weird",
+        query(
             &tickets,
             Where::OR(vec![
                 Where::condition("status", ComparisonOperator::EQ, "NOPE"),
                 Where::AND(vec![]),
             ]),
-        ));
+        ),
+    );
 
     let ops = ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
     assert_eq!(names.impacted(&ops), vec!["q-weird"]);
@@ -356,16 +406,25 @@ fn writes_on_other_tables_are_isolated() {
     let tickets = table("tickets");
     let calls = table("calls");
     let (mut ivm, names) = standard_ivm(&tickets);
-    names.register(&mut ivm, "q-calls-active", query(
+    names.register(
+        &mut ivm,
+        "q-calls-active",
+        query(
             &calls,
             Where::condition("status", ComparisonOperator::EQ, "ACTIVE"),
-        ));
+        ),
+    );
 
     let ops = ivm.incremental_update(&insert(&calls, 1, &[("status", "ACTIVE".into())]));
     assert_eq!(names.impacted(&ops), vec!["q-calls-active"]);
 
     let ops = ivm.incremental_update(&insert(&tickets, 1, &[("status", "ACTIVE".into())]));
-    assert!(!names.impacted(&ops).iter().any(|name| name == "q-calls-active"));
+    assert!(
+        !names
+            .impacted(&ops)
+            .iter()
+            .any(|name| name == "q-calls-active")
+    );
 }
 
 /// The read-only probe and the mutating path agree: `search_impacted_queries`
@@ -390,10 +449,14 @@ fn search_impacted_queries_matches_incremental_update_routing() {
 fn duplicate_condition_routes_to_every_subscriber() {
     let tickets = table("tickets");
     let (mut ivm, names) = standard_ivm(&tickets);
-    names.register(&mut ivm, "q-open-dup", query(
+    names.register(
+        &mut ivm,
+        "q-open-dup",
+        query(
             &tickets,
             Where::condition("status", ComparisonOperator::EQ, "OPEN"),
-        ));
+        ),
+    );
 
     let ops = ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
     let found = names.impacted(&ops);
@@ -418,7 +481,10 @@ fn or_of_ands_routes_by_either_disjunct() {
     let tickets = table("tickets");
     let mut ivm = Local::new(SingleTableIVM::new(), Rc::new(MemoryStorage::new()));
     let names = Names::default();
-    names.register(&mut ivm, "q-either", query(
+    names.register(
+        &mut ivm,
+        "q-either",
+        query(
             &tickets,
             Where::OR(vec![
                 Where::AND(vec![
@@ -427,26 +493,39 @@ fn or_of_ands_routes_by_either_disjunct() {
                 ]),
                 Where::condition("points", ComparisonOperator::GTE, 8),
             ]),
-        ));
+        ),
+    );
 
     let ops = ivm.incremental_update(&insert(
         &tickets,
         1,
-        &[("status", "OPEN".into()), ("priority", "HIGH".into()), ("points", 9.into())],
+        &[
+            ("status", "OPEN".into()),
+            ("priority", "HIGH".into()),
+            ("points", 9.into()),
+        ],
     ));
     assert_eq!(names.impacted(&ops), vec!["q-either"]);
 
     let ops = ivm.incremental_update(&insert(
         &tickets,
         2,
-        &[("status", "OPEN".into()), ("priority", "LOW".into()), ("points", 1.into())],
+        &[
+            ("status", "OPEN".into()),
+            ("priority", "LOW".into()),
+            ("points", 1.into()),
+        ],
     ));
     assert_eq!(names.impacted(&ops), vec!["q-either"]);
 
     let ops = ivm.incremental_update(&insert(
         &tickets,
         3,
-        &[("status", "DONE".into()), ("priority", "LOW".into()), ("points", 1.into())],
+        &[
+            ("status", "DONE".into()),
+            ("priority", "LOW".into()),
+            ("points", 1.into()),
+        ],
     ));
     assert!(ops.is_empty());
 }
@@ -461,7 +540,12 @@ fn where_false_never_matches() {
 
     let ops = ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
     assert!(ops.is_empty());
-    assert!(ivm.engine().rows_for(names.id("q-never")).unwrap().is_empty());
+    assert!(
+        ivm.engine()
+            .rows_for(names.id("q-never"))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// A subscription whose query changes is unregistered and registered anew
@@ -476,12 +560,26 @@ fn reregistration_replaces_routing_and_unregister_removes_it() {
     let tickets = table("tickets");
     let mut ivm = Local::new(SingleTableIVM::new(), Rc::new(MemoryStorage::new()));
     let names = Names::default();
-    names.register(&mut ivm, "q", query(&tickets, Where::condition("status", ComparisonOperator::EQ, "OPEN")));
+    names.register(
+        &mut ivm,
+        "q",
+        query(
+            &tickets,
+            Where::condition("status", ComparisonOperator::EQ, "OPEN"),
+        ),
+    );
     ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
     assert_eq!(ivm.engine().rows_for(names.id("q")).unwrap().len(), 1);
 
     ivm.unregister_query(names.id("q"));
-    names.register(&mut ivm, "q", query(&tickets, Where::condition("points", ComparisonOperator::GTE, 8)));
+    names.register(
+        &mut ivm,
+        "q",
+        query(
+            &tickets,
+            Where::condition("points", ComparisonOperator::GTE, 8),
+        ),
+    );
     assert!(ivm.engine().rows_for(names.id("q")).unwrap().is_empty());
 
     let ops = ivm.incremental_update(&insert(&tickets, 2, &open_ticket_row()));
@@ -581,8 +679,8 @@ fn shared_counter_survives_partial_unregistration() {
 /// exactly the filters the row image satisfies.
 #[test]
 fn counting_agrees_with_tree_evaluation() {
-    use jus_sync::ivm::evaluate;
     use ComparisonOperator::*;
+    use jus_sync::ivm::evaluate;
 
     let tickets = table("tickets");
     let filters: Vec<Where> = vec![
@@ -621,17 +719,37 @@ fn counting_agrees_with_tree_evaluation() {
         ]),
     ];
     let rows: Vec<Vec<(&str, Value)>> = vec![
-        vec![("status", "OPEN".into()), ("priority", "LOW".into()), ("points", 3.into())],
-        vec![("status", "OPEN".into()), ("priority", "HIGH".into()), ("points", 9.into())],
-        vec![("status", "TODO".into()), ("priority", "MEDIUM".into()), ("points", 5.into())],
-        vec![("status", "DONE".into()), ("priority", "LOW".into()), ("points", 9.into())],
+        vec![
+            ("status", "OPEN".into()),
+            ("priority", "LOW".into()),
+            ("points", 3.into()),
+        ],
+        vec![
+            ("status", "OPEN".into()),
+            ("priority", "HIGH".into()),
+            ("points", 9.into()),
+        ],
+        vec![
+            ("status", "TODO".into()),
+            ("priority", "MEDIUM".into()),
+            ("points", 5.into()),
+        ],
+        vec![
+            ("status", "DONE".into()),
+            ("priority", "LOW".into()),
+            ("points", 9.into()),
+        ],
         vec![("status", "NOPE".into()), ("points", 1.into())],
     ];
 
     let mut ivm = Local::new(SingleTableIVM::new(), Rc::new(MemoryStorage::new()));
     let names = Names::default();
     for (index, filter) in filters.iter().enumerate() {
-        names.register(&mut ivm, format!("q{index:02}"), query(&tickets, filter.clone()));
+        names.register(
+            &mut ivm,
+            format!("q{index:02}"),
+            query(&tickets, filter.clone()),
+        );
     }
 
     for (row_index, pairs) in rows.iter().enumerate() {
@@ -665,7 +783,10 @@ fn identical_queries_maintain_independent_frames() {
     let ops = ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
     assert_eq!(names.impacted(&ops), vec!["q-a", "q-b"]);
 
-    assert_eq!(ivm.engine().rows_for(names.id("q-a")), ivm.engine().rows_for(names.id("q-b")));
+    assert_eq!(
+        ivm.engine().rows_for(names.id("q-a")),
+        ivm.engine().rows_for(names.id("q-b"))
+    );
     assert_eq!(ivm.engine().rows_for(names.id("q-a")).unwrap().len(), 1);
 }
 
@@ -686,10 +807,15 @@ fn late_identical_registration_inherits_the_twins_rows() {
 
     let snapshot = names.register(&mut ivm, "late", query(&tickets, Where::AND(vec![])));
     assert_eq!(snapshot.len(), 3, "the twin's three rows arrive as Adds");
-    assert!(snapshot
-        .iter()
-        .all(|op| matches!(op, DataFrameOperation::Add(..))));
-    assert_eq!(ivm.engine().rows_for(names.id("late")), ivm.engine().rows_for(names.id("early")));
+    assert!(
+        snapshot
+            .iter()
+            .all(|op| matches!(op, DataFrameOperation::Add(..)))
+    );
+    assert_eq!(
+        ivm.engine().rows_for(names.id("late")),
+        ivm.engine().rows_for(names.id("early"))
+    );
     assert_eq!(ivm.engine().stats().snapshots_shared, 1);
 
     let ops = ivm.incremental_update(&delete(&tickets, 1));
@@ -758,9 +884,9 @@ fn limit_window_admits_evicts_and_refills() {
     assert_eq!(
         names.impacted(&ops),
         vec!["w"],
-        "a held row worsening keeps its slot (replace pair), got {ops:?}"
+        "a held row worsening keeps its slot (one Add with the new image), got {ops:?}"
     );
-    assert_eq!(ops.len(), 2);
+    assert_eq!(ops.len(), 1);
     assert_eq!(ivm.engine().rows_for(names.id("w")).unwrap().len(), 4);
 
     let better = insert(&tickets, 9, &[("points", 45.into())]);
@@ -815,7 +941,8 @@ fn replaced_query_is_not_a_twin_donor_until_reconciled() {
     );
 
     ivm.unregister_query(names.id("t"));
-    ivm.engine_mut().fetch(names.id("s"), "points", &[Value::Int(20)]);
+    ivm.engine_mut()
+        .fetch(names.id("s"), "points", &[Value::Int(20)]);
     ivm.pump();
     assert_eq!(ivm.engine().rows_for(names.id("s")).unwrap().len(), 2);
     let snapshot = names.register(&mut ivm, "u", wide.clone());
@@ -858,7 +985,8 @@ fn replaced_condition_view_is_not_a_twin_donor_until_reconciled() {
     assert_eq!(snapshot.len(), 1);
 
     let before = ivm.engine().stats().clone();
-    ivm.engine_mut().replace_condition(names.id("a"), &in_points(10), in_points(20));
+    ivm.engine_mut()
+        .replace_condition(names.id("a"), &in_points(10), in_points(20));
     let after = ivm.engine().stats();
     assert_eq!(after.disjuncts_registered, before.disjuncts_registered);
     assert_eq!(after.conditions_indexed, before.conditions_indexed);
@@ -870,9 +998,11 @@ fn replaced_condition_view_is_not_a_twin_donor_until_reconciled() {
     assert_eq!(ivm.engine().stats().snapshots_shared, 0);
 
     ivm.unregister_query(names.id("b"));
-    ivm.engine_mut().fetch(names.id("a"), "points", &[Value::Int(20)]);
+    ivm.engine_mut()
+        .fetch(names.id("a"), "points", &[Value::Int(20)]);
     ivm.pump();
-    ivm.engine_mut().delete_rows(names.id("a"), "points", &[Value::Int(10)]);
+    ivm.engine_mut()
+        .delete_rows(names.id("a"), "points", &[Value::Int(10)]);
     ivm.engine_mut().mark_reconciled(names.id("a"));
     let snapshot = names.register(&mut ivm, "c", with(20));
     assert_eq!(snapshot.len(), 1, "a declared-reconciled twin donates");
@@ -946,14 +1076,23 @@ fn desc_window_admits_evicts_and_refills() {
     });
     assert_eq!(
         held,
-        vec![Value::Int(30), Value::Int(40), Value::Int(50), Value::Int(60)],
+        vec![
+            Value::Int(30),
+            Value::Int(40),
+            Value::Int(50),
+            Value::Int(60)
+        ],
         "DESC loads the four LARGEST"
     );
 
     let admit = insert(&tickets, 7, &[("points", 100.into())]);
     storage.apply(&admit);
     let ops = ivm.incremental_update(&admit);
-    assert_eq!(ops.len(), 2, "the best row is admitted and 30 evicted, got {ops:?}");
+    assert_eq!(
+        ops.len(),
+        2,
+        "the best row is admitted and 30 evicted, got {ops:?}"
+    );
     assert!(
         matches!(&ops[1].op, DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(3))
     );
@@ -995,10 +1134,17 @@ fn fetch_respects_the_window() {
     assert_eq!(names.register(&mut ivm, "w", windowed).len(), 4);
     storage.apply(&insert(&tickets, 5, &[("points", 1.into())]));
 
-    ivm.engine_mut().fetch(names.id("w"), "points", &[Value::Int(1)]);
+    ivm.engine_mut()
+        .fetch(names.id("w"), "points", &[Value::Int(1)]);
     let ops: Vec<DataFrameOperation> = ivm.pump().into_iter().map(|update| update.op).collect();
-    assert_eq!(ops.len(), 2, "fetched Add plus overflow eviction, got {ops:?}");
-    assert!(matches!(&ops[0], DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(5)));
+    assert_eq!(
+        ops.len(),
+        2,
+        "fetched Add plus overflow eviction, got {ops:?}"
+    );
+    assert!(
+        matches!(&ops[0], DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(5))
+    );
     assert!(
         matches!(&ops[1], DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(4))
     );
@@ -1058,7 +1204,11 @@ fn window_boundary_survives_a_deletion() {
     let removal = delete(&tickets, 1);
     storage.apply(&removal);
     ivm.incremental_update(&removal);
-    assert_eq!(ivm.engine().rows_for(names.id("w")).unwrap().len(), 3, "below capacity, above the limit: no refill");
+    assert_eq!(
+        ivm.engine().rows_for(names.id("w")).unwrap().len(),
+        3,
+        "below capacity, above the limit: no refill"
+    );
 
     let beyond = insert(&tickets, 9, &[("points", 1000.into())]);
     storage.apply(&beyond);
@@ -1070,7 +1220,11 @@ fn window_boundary_survives_a_deletion() {
     let within = insert(&tickets, 10, &[("points", 35.into())]);
     storage.apply(&within);
     let ops = ivm.incremental_update(&within);
-    assert_eq!(names.impacted(&ops), vec!["twin", "w"], "inside the frontier: admitted, got {ops:?}");
+    assert_eq!(
+        names.impacted(&ops),
+        vec!["twin", "w"],
+        "inside the frontier: admitted, got {ops:?}"
+    );
     assert_eq!(ops.len(), 2, "no eviction while the buffer has room");
 
     for id in [2, 3] {
@@ -1136,7 +1290,11 @@ fn window_refill_reaches_rows_tying_the_frontier() {
         held.sort_unstable();
         held
     };
-    assert_eq!(points_of(&ivm), vec![3, 3, 3, 3], "the refill fetched the unheld ties, not the 5");
+    assert_eq!(
+        points_of(&ivm),
+        vec![3, 3, 3, 3],
+        "the refill fetched the unheld ties, not the 5"
+    );
 
     let held_ids: Vec<i64> = ivm
         .engine()
@@ -1159,7 +1317,9 @@ fn window_refill_reaches_rows_tying_the_frontier() {
         "storage exhausted: the two remaining ties and the 5 are all held"
     );
     assert!(
-        ivm.incremental_update(&insert(&tickets, 8, &[("points", 4.into())])).len() == 1,
+        ivm.incremental_update(&insert(&tickets, 8, &[("points", 4.into())]))
+            .len()
+            == 1,
         "with storage exhausted there is no boundary: a matching arrival is admitted"
     );
 }
@@ -1173,23 +1333,49 @@ fn disjuncts_are_canonical_regardless_of_condition_order() {
     let mut ivm = Local::new(SingleTableIVM::new(), Rc::new(MemoryStorage::new()));
     let names = Names::default();
     let open = Where::condition("status", ComparisonOperator::EQ, "OPEN");
-    let mine = Where::condition("assigned_to", ComparisonOperator::IN, Value::List(vec!["a".into()]));
-    names.register(&mut ivm, "ab", query(&tickets, Where::AND(vec![open.clone(), mine.clone()])));
+    let mine = Where::condition(
+        "assigned_to",
+        ComparisonOperator::IN,
+        Value::List(vec!["a".into()]),
+    );
+    names.register(
+        &mut ivm,
+        "ab",
+        query(&tickets, Where::AND(vec![open.clone(), mine.clone()])),
+    );
     let links = ivm.engine().stats().conditions_indexed;
     assert_eq!(links, 2, "two conditions linked to one counter");
 
-    names.register(&mut ivm, "ba", query(&tickets, Where::AND(vec![mine.clone(), open.clone()])));
+    names.register(
+        &mut ivm,
+        "ba",
+        query(&tickets, Where::AND(vec![mine.clone(), open.clone()])),
+    );
     assert_eq!(
         ivm.engine().stats().conditions_indexed,
         links,
         "the reversed filter shares the counter: no new links"
     );
 
-    let widened = Condition::new("assigned_to", ComparisonOperator::IN, Value::List(vec!["a".into(), "b".into()]));
-    let Where::Condition(narrow) = mine.clone() else { unreachable!() };
-    ivm.engine_mut().replace_condition(names.id("ab"), &narrow, widened.clone());
+    let widened = Condition::new(
+        "assigned_to",
+        ComparisonOperator::IN,
+        Value::List(vec!["a".into(), "b".into()]),
+    );
+    let Where::Condition(narrow) = mine.clone() else {
+        unreachable!()
+    };
+    ivm.engine_mut()
+        .replace_condition(names.id("ab"), &narrow, widened.clone());
     let links_after_edit = ivm.engine().stats().conditions_indexed;
-    names.register(&mut ivm, "fresh", query(&tickets, Where::AND(vec![Where::Condition(widened), open.clone()])));
+    names.register(
+        &mut ivm,
+        "fresh",
+        query(
+            &tickets,
+            Where::AND(vec![Where::Condition(widened), open.clone()]),
+        ),
+    );
     assert_eq!(
         ivm.engine().stats().conditions_indexed,
         links_after_edit,
@@ -1211,10 +1397,19 @@ fn column_index_matches_every_operator_family() {
     let subscriptions: Vec<(&str, Where)> = vec![
         ("eq", Where::condition("points", EQ, 5)),
         ("eq-float", Where::condition("points", EQ, 5.0)),
-        ("in", Where::condition("points", IN, Value::List(vec![1.into(), 2.into()]))),
+        (
+            "in",
+            Where::condition("points", IN, Value::List(vec![1.into(), 2.into()])),
+        ),
         ("neq", Where::condition("points", NEQ, 5)),
-        ("not-in", Where::condition("points", NOT_IN, Value::List(vec![1.into(), 2.into()]))),
-        ("not-in-null", Where::condition("points", NOT_IN, Value::List(vec![1.into(), Value::Null]))),
+        (
+            "not-in",
+            Where::condition("points", NOT_IN, Value::List(vec![1.into(), 2.into()])),
+        ),
+        (
+            "not-in-null",
+            Where::condition("points", NOT_IN, Value::List(vec![1.into(), Value::Null])),
+        ),
         ("gt", Where::condition("points", GT, 5)),
         ("gte", Where::condition("points", GTE, 5)),
         ("lt", Where::condition("points", LT, 5)),
@@ -1226,7 +1421,10 @@ fn column_index_matches_every_operator_family() {
     }
     let cases: Vec<(Value, Vec<&str>)> = vec![
         (5.into(), vec!["eq", "eq-float", "gte", "lte", "not-in"]),
-        (Value::Float(5.0), vec!["eq", "eq-float", "gte", "lte", "not-in"]),
+        (
+            Value::Float(5.0),
+            vec!["eq", "eq-float", "gte", "lte", "not-in"],
+        ),
         (4.into(), vec!["lt", "lte", "neq", "not-in"]),
         (6.into(), vec!["gt", "gte", "neq", "not-in"]),
         (1.into(), vec!["in", "lt", "lte", "neq"]),
@@ -1251,13 +1449,92 @@ fn routing_probes_columns_instead_of_evaluating_every_condition() {
     let names = Names::default();
     for points in 0..50 {
         let uuid = format!("points-{points}");
-        names.register(&mut ivm, uuid.as_str(), query(&tickets, Where::condition("points", EQ, points)));
+        names.register(
+            &mut ivm,
+            uuid.as_str(),
+            query(&tickets, Where::condition("points", EQ, points)),
+        );
     }
     let before = ivm.engine().stats().clone();
     let ops = ivm.incremental_update(&insert(&tickets, 1, &[("points", 7.into())]));
     let cost = ivm.engine().stats().diff(&before);
     assert_eq!(names.impacted(&ops), vec!["points-7"]);
-    assert_eq!(cost.conditions_evaluated, 1, "one candidate, not fifty evaluations");
+    assert_eq!(
+        cost.conditions_evaluated, 1,
+        "one candidate, not fifty evaluations"
+    );
     assert_eq!(cost.index_hits, 1);
     assert!(cost.columns_probed >= 1);
+}
+
+/// Deltas are addressed per client: two subscriptions of one client
+/// holding one row receive it once, the update naming both; a
+/// subscription of another client gets its own; and a client's
+/// disconnect drops every subscription it had.
+#[test]
+fn updates_are_grouped_per_client() {
+    let tickets = table("tickets");
+    let mut ivm = Local::new(SingleTableIVM::new(), Rc::new(MemoryStorage::new()));
+    let names = Names::default();
+    let one = ClientId(1);
+    let two = ClientId(2);
+    names.register_for(
+        &mut ivm,
+        one,
+        "one-open",
+        query(
+            &tickets,
+            Where::condition("status", ComparisonOperator::EQ, "OPEN"),
+        ),
+    );
+    names.register_for(
+        &mut ivm,
+        one,
+        "one-all",
+        query(&tickets, Where::AND(vec![])),
+    );
+    names.register_for(
+        &mut ivm,
+        two,
+        "two-all",
+        query(&tickets, Where::AND(vec![])),
+    );
+
+    let ops = ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
+    assert_eq!(ops.len(), 2, "one delta per client, got {ops:?}");
+    let for_one = ops
+        .iter()
+        .find(|update| update.client == one)
+        .expect("client one");
+    assert_eq!(
+        for_one.targets.len(),
+        2,
+        "both of client one's subscriptions"
+    );
+    assert!(names.targets(for_one, "one-open") && names.targets(for_one, "one-all"));
+    let for_two = ops
+        .iter()
+        .find(|update| update.client == two)
+        .expect("client two");
+    assert_eq!(for_two.targets.len(), 1);
+
+    let mut done_row = open_ticket_row();
+    done_row[0] = ("status", "DONE".into());
+    let ops = ivm.incremental_update(&update(&tickets, 1, &done_row));
+    let for_one: Vec<&ClientUpdate> = ops.iter().filter(|update| update.client == one).collect();
+    assert_eq!(
+        for_one.len(),
+        2,
+        "client one: the row leaves one-open and is replaced for one-all, got {for_one:?}"
+    );
+    assert!(matches!(for_one[0].op, DataFrameOperation::Delete(..)));
+    assert!(names.targets(for_one[0], "one-open"));
+    assert!(matches!(for_one[1].op, DataFrameOperation::Add(..)));
+    assert!(names.targets(for_one[1], "one-all"));
+
+    ivm.unregister_client(one);
+    assert!(ivm.engine().rows_for(names.id("one-all")).is_none());
+    let ops = ivm.incremental_update(&delete(&tickets, 1));
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].client, two);
 }

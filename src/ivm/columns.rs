@@ -117,14 +117,20 @@ impl ColumnIndex {
             }
             NEQ => {
                 if let Some(key) = value.equality_key() {
-                    self.unequal.entry(key).or_default().insert(condition.clone());
+                    self.unequal
+                        .entry(key)
+                        .or_default()
+                        .insert(condition.clone());
                     self.unequal_all.insert(condition.clone());
                 }
             }
             NOT_IN => {
                 if negation_is_satisfiable(value) {
                     for key in member_keys(value) {
-                        self.unequal.entry(key).or_default().insert(condition.clone());
+                        self.unequal
+                            .entry(key)
+                            .or_default()
+                            .insert(condition.clone());
                     }
                     self.unequal_all.insert(condition.clone());
                 }
@@ -247,7 +253,11 @@ impl ColumnIndex {
 }
 
 /// Remove `condition` from the set under `key`, dropping an emptied set.
-fn remove_under(map: &mut HashMap<Value, HashSet<CondRef>>, key: Option<Value>, condition: &CondRef) {
+fn remove_under(
+    map: &mut HashMap<Value, HashSet<CondRef>>,
+    key: Option<Value>,
+    condition: &CondRef,
+) {
     let Some(key) = key else {
         return;
     };

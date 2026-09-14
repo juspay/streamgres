@@ -4,25 +4,27 @@
 //!
 //! | Piece | Role |
 //! |-------|------|
-//! | [`Lsn`] | Where a write, a read's snapshot, or a frame row sits in the source's history: one WAL location, whatever the source (see `pg` for how the two Postgres methods arrive at it). |
-//! | [`Storage`] | The asynchronous read seam every source implements: [`MemoryStorage`] in-process, [`pg::PgStorage`] over Postgres. |
-//! | [`Runtime`] | The single owner of an engine: hands out the engine's reads, buffers the writes routed meanwhile, and lands each read by one rule (its module docs). Pure state, no I/O. |
+//! | [`Lsn`] | Where a write or a read's snapshot sits in the source's history: one WAL location. |
+//! | [`Storage`] | The asynchronous read seam every source implements: [`MemoryStorage`] in-process, [`pg::PgStorage`] over Postgres, [`Sources`] routing by table between the two. |
+//! | [`Runtime`] | The single owner of an engine: hands out the engine's reads, keeps the delivered writes a read may still be behind, and lands each read after bringing it up to the engine's position (its module docs). Pure state, no I/O. |
 //! | [`Local`] | The synchronous driver: reads answered at once, landed inline (tests, demo, benchmark). |
-//! | [`Service`] | The asynchronous driver: a command loop on a `LocalSet`, one task per read. |
-//! | [`pg`] | Postgres: snapshot-positioned selects (the WAL method's exported-snapshot alias, or the XID method's `pg_current_snapshot()` converted through the feed's xid ledger) and the change-feed poller that positions every write. |
+//! | [`Service`] | The asynchronous driver: a command loop on a `LocalSet`; snapshot reads as tasks, maintenance reads inline. |
+//! | [`pg`] | Postgres: reads from the exported snapshot of a rotating temporary replication slot, flipped to a newer one only once the stream has passed it, and the change-feed poller that positions every write. |
 //!
 //! The sources differ only in how they arrive at a read's location; the
 //! runtime, the engine's rules, and both drivers are shared.
 
-pub mod pg;
 mod local;
+pub mod pg;
 mod runtime;
 mod service;
+mod sources;
 mod storage;
 
+pub use crate::model::{ClientId, SubId};
 pub use crate::model::{Lsn, Snapshot};
 pub use local::Local;
 pub use runtime::{Runtime, Step, SyncStats};
 pub use service::{Command, Service};
+pub use sources::{MEMORY_TABLES_VAR, Sources};
 pub use storage::{MemoryStorage, Storage, StorageError};
-pub use crate::model::SubId;

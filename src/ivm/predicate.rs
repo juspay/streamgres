@@ -47,7 +47,10 @@ pub fn eval_condition(cond: &Condition, row: &HashMap<String, Value>, evaluated:
     match cond.comparison_operator {
         EQ => actual.loose_eq(&cond.value),
         NEQ => !actual.loose_eq(&cond.value),
-        GT => matches!(actual.compare(&cond.value), Some(std::cmp::Ordering::Greater)),
+        GT => matches!(
+            actual.compare(&cond.value),
+            Some(std::cmp::Ordering::Greater)
+        ),
         GTE => matches!(
             actual.compare(&cond.value),
             Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
@@ -64,8 +67,7 @@ pub fn eval_condition(cond: &Condition, row: &HashMap<String, Value>, evaluated:
         },
         NOT_IN => match &cond.value {
             Value::List(items) => {
-                !items.iter().any(Value::is_null)
-                    && !items.iter().any(|item| actual.loose_eq(item))
+                !items.iter().any(Value::is_null) && !items.iter().any(|item| actual.loose_eq(item))
             }
             Value::Set(set) => !set.contains(actual),
             _ => false,
@@ -143,10 +145,19 @@ mod tests {
         let r3 = row(vec![("status", Value::String("OPEN".into()))]);
         let with_null = Value::List(vec!["OPEN".into(), Value::Null]);
         let with_null_other = Value::List(vec!["CLOSED".into(), Value::Null]);
-        assert!(check(&Where::condition("status", IN, with_null.clone()), &r3));
-        assert!(!check(&Where::condition("status", IN, with_null_other.clone()), &r3));
+        assert!(check(
+            &Where::condition("status", IN, with_null.clone()),
+            &r3
+        ));
+        assert!(!check(
+            &Where::condition("status", IN, with_null_other.clone()),
+            &r3
+        ));
         assert!(!check(&Where::condition("status", NOT_IN, with_null), &r3));
-        assert!(!check(&Where::condition("status", NOT_IN, with_null_other), &r3));
+        assert!(!check(
+            &Where::condition("status", NOT_IN, with_null_other),
+            &r3
+        ));
         let r2 = row(vec![("status", Value::String("OPEN".into()))]);
         assert!(!check(&Where::condition("status", EQ, Value::Null), &r2));
         assert!(!check(&Where::condition("status", NEQ, Value::Null), &r2));
