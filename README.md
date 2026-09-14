@@ -20,14 +20,14 @@ summary: what the system is, what is built, what is next, and how to run it.
 ```text
 clients                       Xyne-Sync engine                       PostgreSQL
   │                              │                                        │
-  ├─ subscribe(id, SQL) ────────>│                                        │
-  │                              ├─ initial SELECT @ exported snapshot ──>│ replica
-  │<─ snapshot: [Add, Add, …] ───┤                                        │
-  │                              │<──── committed changes (one logical ───┤ primary
-  │                              │      replication slot, commit-LSN order)│
+  ├─ subscribe(client, SQL) ────>│                                        │
+  │                              ├─ initial SELECT @ exported snapshot ──>│
+  │<─ snapshot: [Add, Add, …] ───┤   (never ahead of the engine)          │
+  │                              │<──── committed changes (one pgoutput ──┤ primary
+  │                              │      slot, streamed, commit order)     │
   │                              ├─ route: which views does this touch?   │
   │                              ├─ patch: emit Add / Delete per view     │
-  │<─ [Delete(old), Add(new)] ───┤                                        │
+  │<─ [Add(new) → q1, q2] ───────┤   (grouped per client, one image each) │
 ```
 
 Recomputing every subscribed query on every write scales as
@@ -35,28 +35,36 @@ Recomputing every subscribed query on every write scales as
 proportional to the number of **distinct predicates** on the written table and
 the number that **actually match**, and then patches only the affected views.
 
+**One position.** The whole engine sits at one WAL position: the point up to
+which the change feed has delivered every commit. A snapshot read is taken at
+or below that position, never ahead of it, and before its rows land the runtime
+applies to them every delivered write they do not hold. So the rows a
+subscription is served reflect exactly the engine's position, the same position
+every later delta continues from.
+
 ---
 
 ## Status at a glance
 
 | Area | Status | Where |
 | --- | --- | --- |
-| Typed query/row model, self-contained ops (`Delete` carries its image; replace = `Delete(old)` + `Add(new)`) | ✅ done | `src/model/` |
+| Typed query/row model, self-contained ops (`Delete` carries its image; a row that changes in place reaches a client as one `Add`); row images and identities keyed by `ColumnName` | ✅ done | `src/model/` |
 | DNF counting index: canonical disjuncts, shared epoch-stamped counters fire exactly | ✅ done | `src/ivm/index.rs` |
 | Per-column value index: a write reaches only the conditions it satisfies, `O(columns · log n)` lookups (equality maps, inequality by set difference, range maps per comparison class) | ✅ done | `src/ivm/columns.rs` |
 | Shared frames: one frame per table, rows tagged with holders as compact ids (`RowId`, `SubId`); held mirror; twin registration served from the frame through a query-keyed index | ✅ done | `src/ivm/frames.rs`, `src/ivm/registry.rs` |
 | `ORDER BY` / `LIMIT` windows: doubled buffer, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
 | In-place condition edits: a literal `IN` swapped inside its disjuncts, or a set-valued `IN` (`Value::Set`) gaining/losing one member in O(1) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
 | Join tree: `LEFT` and `RIGHT` edges at any depth, set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns | ✅ done | `src/ivm/multi.rs` |
+| Client-addressed output: every subscription belongs to a `ClientId`; one step's operations are folded per client and row (`ClientUpdate { client, table, op, targets }`), so a row image travels to a client once | ✅ done | `src/ivm/update.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
-| Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; a read lands the moment it returns, its result first brought up to the engine, every landed row stamped with the read so the writes it already saw are recognized when they arrive; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
-| In-memory storage answering at once, honoring `ORDER BY` + `LIMIT`; commit-first test harness | ✅ done | `src/sync/storage.rs` |
-| **PostgreSQL**: positioned snapshot reads in two methods (WAL: the exported snapshot of a rotating temporary replication slot, exact at its consistent point; XID: `pg_current_snapshot()` transaction ids), a `test_decoding` change-feed poller that positions every write, a minimal replication-protocol connection, live tests and a bench scenario against a real server | ✅ done | `src/sync/pg/` |
+| Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; the runtime holds the one position, brings every read up to it before landing, runs maintenance reads inline; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
+| In-memory storage answering at once, honoring `ORDER BY` + `LIMIT`; per-table routing between memory and PostgreSQL (`JUS_SYNC_MEMORY_TABLES`) | ✅ done | `src/sync/storage.rs`, `src/sync/sources.rs` |
+| **PostgreSQL**: reads from the exported snapshot of a rotating temporary replication slot, flipped forward only once the feed has passed it; a streaming `pgoutput` change feed over a replication connection with heartbeat progress marks; live tests and a bench scenario against a real server | ✅ done | `src/sync/pg/` |
 | Routing counters + benchmark harness | ✅ done | `src/ivm/stats.rs`, `src/bin/bench.rs` |
 | **xyne-spaces coverage**: the dashboard's 283 synced queries (and the ACL predicates added to them) rebuilt as tests on a catalog generated from the application's schema; seven expressiveness gaps named and pinned | ✅ tests, ⏳ gaps | `tests/xyne_spaces_queries/` |
 | `INNER` joins: visibility gate on the driven parent | ⏳ pending | paper §6.5 |
 | **WebSocket protocol**: subscribe / unsubscribe / op stream, connection & subscription lifecycle | ⏳ pending | `src/ws.rs` is an axum echo base |
-| Streaming `pgoutput` consumer (the poller consumes the slot by SQL today), batching of one write's narrowed reads | ⏳ pending | paper §7, §13 |
+| Batching of one write's narrowed reads | ⏳ pending | paper §13 |
 | Parser `JOIN` syntax | ⏳ pending | multi-table queries are built programmatically |
 | Table-sharded multithreading | ⏳ pending | paper §10.3; engine is single-threaded by design |
 
@@ -74,25 +82,30 @@ The pipeline is `SQL text → typed query model → IVM routing → operations`.
 
 - `Value`: the dynamic cell type (`Int` is `i64`; manual `Eq`/`Hash` for
   floats and maps; `Set` is the engine's identity-compared shared set).
-  `TableName` and `ColumnName` are newtypes; a subscription is addressed by
-  `SubId`, a `u64` the engine hands out at registration and never reuses.
-  The client's own subscription names (`QueryId`) live in the transport
-  layer, which maps them to `SubId`s and back.
+  `TableName` and `ColumnName` are newtypes. A subscription is addressed by
+  `SubId`, a `u64` the engine hands out at registration and never reuses, and
+  belongs to a `ClientId`, the transport's handle for one connection. The
+  client's own subscription names live in the transport, which maps them to
+  `SubId`s and back.
 - `DataFrameKey` (primary-key values, identity only), `DataFrameRow` (a
-  **full** row image, every column including the key), `DataFrameOperation`
-  (`Add(key, row)` / `Delete(key, row)`).
+  **full** row image, every column including the key), both keyed by
+  `ColumnName`; `DataFrameOperation` (`Add(key, row)` / `Delete(key, row)`).
 - `SingleTableReadQuery { table, filter: Where, order_by, limit }`;
   `Where` is `AND`/`OR` over leaf `Condition`s; no `NOT` node, so DNF is plain
-  distribution. `MultiTableReadQuery { main_table, left_joins }` today; the
-  tree form is in the paper.
+  distribution. `MultiTableReadQuery { main_table, left_joins, right_joins }`
+  is the join tree.
 - Writes speak the same vocabulary: `InsertQuery`/`UpdateQuery` carry a key
   and a full image; `DeleteQuery` a key.
+- `Lsn` is a WAL location; `Snapshot { rows, at }` is what a storage read
+  returns: the rows and the position they reflect every commit up to.
 
 **Operation contract.** Every op is self-contained. Ops on the same key are
-applied in stream order (the `Delete` of a replaced row precedes its `Add`; a
-row admitted then evicted in one step has its `Add` before its `Delete`). Ops
-on different rows commute; a client applies `Add` as insert-or-replace and
-`Delete` as remove and converges.
+applied in stream order (the `Delete` of a row a client loses precedes any
+`Add` of that row in the same step; a row admitted then evicted in one step
+has its `Add` before its `Delete`). Ops on different rows commute; a client
+applies `Add` as insert-or-replace and `Delete` as remove and converges. A row
+that changes in place is, inside the engine, a `Delete(old)` + `Add(new)` pair
+(the join layer diffs it); the client receives only the `Add`.
 
 ### 2. Single-table engine (`src/ivm/`)
 
@@ -101,7 +114,7 @@ A write can affect a subscription two ways, and both are checked:
 | new row matches | frame holds row | emitted |
 | --- | --- | --- |
 | yes | no | `Add` |
-| yes | yes | `Delete(old)` + `Add(new)` |
+| yes | yes | `Delete(old)` + `Add(new)` in the engine; one `Add` to the client |
 | no | yes | `Delete(old)` |
 | no | no | nothing |
 
@@ -120,19 +133,18 @@ A write can affect a subscription two ways, and both are checked:
   conditions or subscriptions exist.
 - **Way 2, membership** (`frames.rs`). One shared `TableFrame` per table:
   key → `RowId` (a `u64` handed out when the row enters the frame, retired
-  when its last holder leaves) → `SharedRow` with its `subscribers` as
-  `SubId`s. Deletes and updates-out are found in O(1) off the tags.
-  `held: SubId → RowIds` mirrors the tags so a subscription's view is
-  enumerable without scanning the table; a (subscription, row) pair costs
-  two small integers, not a copied key and a copied name.
-- **Registration** (`registry.rs`). Hand out a `SubId`, index the DNF; serve
-  the initial rows from storage or, for a structurally identical query found
-  through a query-keyed index in one lookup, from the twin's rows with no
-  storage query (`snapshots_shared`). `replace_condition` edits one leaf in
-  place (stored filter + indexed disjuncts, splitting shared counters
-  correctly). `replace_query` / `replace_condition` open a maintenance window
-  during which the subscription is not a twin donor until the caller's
-  `mark_reconciled`.
+  when its last holder leaves) → `SharedRow { key, data, subscribers }`.
+  Deletes and updates-out are found in O(1) off the tags. `held: SubId →
+  RowIds` mirrors the tags so a subscription's view is enumerable without
+  scanning the table; a (subscription, row) pair costs two small integers.
+- **Registration** (`registry.rs`). Hand out a `SubId` under its client,
+  index the DNF; serve the initial rows from storage or, for a structurally
+  identical query found through a query-keyed index in one lookup, from the
+  twin's rows with no storage query (`snapshots_shared`). `replace_condition`
+  edits one leaf in place (stored filter + indexed disjuncts, splitting shared
+  counters correctly). `replace_query` / `replace_condition` open a
+  maintenance window during which the subscription is not a twin donor until
+  the caller's `mark_reconciled`.
 - **Windows** (`window.rs`). A finite `LIMIT L` keeps a buffer of `2L` rows
   (storage queried with the doubled limit) and a **frontier**: the worst order
   value known to be covered from storage (every matching row better than it
@@ -146,6 +158,14 @@ A write can affect a subscription two ways, and both are checked:
   (held ties dedup). `NULL`/`NaN` sort largest; an unenforceable frontier
   publishes no boundary rather than rejecting everything; `LIMIT 0` is
   permanently empty.
+- **Client grouping** (`update.rs`). Inside the engine every operation is
+  produced per subscription. Before anything leaves, one step's operations
+  are folded per (client, table, row) into at most three entries in order:
+  a `Delete` for the subscriptions that lost the row, an `Add` naming every
+  subscription that holds it now (a subscription that lost and regained the
+  row appears only here), and a `Delete` for a row admitted and evicted in
+  the same step. A client with ten subscriptions holding one row receives
+  that row once, with ten targets.
 
 ### 3. Multi-table layer (`src/ivm/multi.rs`)
 
@@ -167,23 +187,24 @@ driven on one column from both sides (a `LEFT` parent above, a `RIGHT` child
 below, both on `id`) holds the **intersection** of the driving edges'
 referenced values in one set.
 
-Subscriptions that register an identical spec **share one tree**: one inner
-part per node, one set of edges and counts, one crossing per event; each
-part's operations are emitted once per subscriber, a later identical
-registration is served from the shared parts, and the tree goes with its
-last subscriber.
+Subscriptions that register an identical spec **share one tree** (a `TreeId`
+per spec): one inner part per node, one set of edges and counts, one crossing
+per event; each part's operations are emitted once per subscriber, a later
+identical registration is served from the shared parts, and the tree goes
+with its last subscriber.
 
 Per edge and per value the layer keeps `left` (driver rows carrying it) and
 `right` (driven rows held); only `left` zero-crossings that change a set act:
 `0→1` inserts the member, files the leaf under it in the column index (O(1)),
 and fetches that value's driven rows in one narrowed query; `→0` removes it
-and prunes held rows with no storage trip. The
-rows a fetch brings in are arrivals at the driven node and a prune's rows are
-departures, and the driven node may drive further edges, so the same handling
-cascades through the tree. Registration is a post-order walk (right children,
-node, left children); within a write every driven part is forwarded before its
-driver, and a replace pair is diffed per edge so a kept value never churns
-through zero. Updates arrive as `MultiTableUpdate { query, table, part, op }`.
+and prunes held rows with no storage trip. The rows a fetch brings in are
+arrivals at the driven node and a prune's rows are departures, and the driven
+node may drive further edges, so the same handling cascades through the tree.
+Registration is a post-order walk (right children, node, left children);
+within a write every driven part is forwarded before its driver, and a
+replace pair is diffed per edge so a kept value never churns through zero.
+What leaves the layer is the same client-grouped `ClientUpdate`, each target
+naming the subscription and the part.
 
 `INNER` edges (a visibility gate on the driven parent) are specified in the
 paper and pending.
@@ -192,99 +213,115 @@ paper and pending.
 
 The engine never reads storage. Where it needs rows it does not hold, it
 records a `Fetch` request (`src/ivm/engine.rs`) and carries on: a
-registration's initial result set, a join edge's newly referenced value, a
-drained window's refill. Until the request lands, the subscription routes
-natively (its filter is indexed, the join leaf already holds the value), a
-windowed subscription publishes no admission boundary, and it donates no twin
-snapshot.
+registration's initial result set (`Snapshot`), a join edge's newly referenced
+value (`Narrowed`), a drained window's refill (`Refill`). Until the request
+lands, the subscription routes natively (its filter is indexed, the join leaf
+already holds the value), a windowed subscription publishes no admission
+boundary, and it donates no twin snapshot. The engine itself is
+**position-free**.
 
-`Storage` is asynchronous: `select(query, at_least)` returns the rows of one
-consistent snapshot **and the WAL location it reflects every commit up to**.
-The engine sees nothing but locations (`Lsn`): every write carries its commit
-location, every read its snapshot's, every frame row its image's. How a source
-arrives at a read's location is its own business (below).
+`Storage` is asynchronous: `select(query)` returns a `Snapshot`, the rows of
+one consistent snapshot and the position it reflects every commit up to;
+`advance(feed)` tells the storage how far the feed has delivered, `floor()`
+says the oldest position its next read can be at, and `absorb(write, at)`
+lets a store that mirrors data apply the feed's writes. `MemoryStorage` is at
+the position of the last write it applied. `Sources` routes each table's reads
+to memory or PostgreSQL: the tables named in `JUS_SYNC_MEMORY_TABLES`
+(comma-separated, read by `Sources::cached_from_env`) or passed to
+`Sources::new` are loaded from PostgreSQL once (`warm()`), kept in process
+and fed by the same writes; everything else, by default every table, is read
+from PostgreSQL.
 
-`Runtime` is the single owner of an engine and pure state (no I/O, no clock):
-it hands the engine's requests to a driver, remembers the writes routed while
-reads are out, and lands each result **the moment it returns**. If the engine
-is ahead of the snapshot, the result is first brought up to the engine: a row
-that a delivered write the snapshot does not reflect deleted or moved out of
-the read's filter is dropped, one it rewrote takes the newer image. If the
-snapshot is ahead of the feed, the frame absorbs the difference by currency:
-every frame row remembers how current its image is (`RowAt`: the write that
-produced it, or the read it landed from) and, per holder, the location of the
-image that holder has (`Hold`). A landing inserts rows the frame
-lacks stamped with the read and serves only the query that asked; for a row
-the frame already holds, the reader gets the newer of the frame's image and
-the read's, and when that is the read's it goes *ahead of the frame* on that
-row (its `Hold` keeps the read's location and image) while the other
-holders keep the frame's image and hear about the write when it arrives. That
-write then leaves the reader alone; the first write past the reader's snapshot
-ends its lead, its `Delete` carrying the image the reader actually held. When
-a write arrives that the frame row itself already reflects, image and holders
-are left alone and only the queries the frame's image newly matches are
-tagged. No read ever waits for the feed and nothing stalls the stream. Two drivers share the runtime: `Local` (a storage that answers at
-once, every read landed before the call returns; what the tests, demo and
-bench use) and `Service` (a tokio command loop on one `LocalSet`, one task per
-read). Each read is passed the stream position the runtime has seen, which the
-WAL method uses to mint a fresh alias when the current one is older.
+`Runtime` is the single owner of an engine and pure state (no I/O, no clock).
+It holds **the one position** of the whole engine, the point up to which the
+feed has delivered every commit, moved by every write and every progress mark.
+It hands the engine's requests to a driver, keeps the writes delivered while
+reads are out, and lands each result the moment it returns, after **bringing
+it up to the engine's position**: every delivered write on the read's table
+positioned above the snapshot is applied to the result, a row it deleted or
+moved out of the read's filter dropped, a row it rewrote given the newer
+image. A snapshot is never ahead of the engine (the storage guarantees it, see
+§5), so nothing the stream removed can be resurrected and a landed row the
+frame already holds agrees with the frame's image. The buffer of delivered
+writes is bounded below by the **floor**, the oldest position a storage's next
+read or an outstanding read can be at, and is empty while nothing is out. A
+read the storage could not answer is parked and handed out again when the feed
+next moves.
+
+Two drivers share the runtime. `Local` answers reads at once and lands every
+read before the call returns (tests, demo, bench). `Service` is a tokio
+command loop on one `LocalSet`: `Register { client, query }`, `Unregister`,
+`UnregisterClient`, `Write { write, at }`, `Progress(at)`. A subscription's
+initial read runs as its own task while the loop keeps routing; the
+maintenance reads a write asks for (join fetches, window refills) run inline
+before the next command, so the engine's state after a write is complete
+before the next write is routed. After each write and progress mark the
+service tells every storage how far the feed is and takes the new floor.
 
 ### 5. PostgreSQL (`src/sync/pg/`)
 
-- `PgStorage::connect(dsn, catalog, mode)` runs each read in its own read-only
-  `REPEATABLE READ` transaction, positioned by one of two methods.
-  **WAL** (`SnapshotMode::Wal`): a background task mints an *alias* every
-  250 ms (configurable), and on demand when a read finds it older than the
-  engine's position, by opening a replication-protocol connection
-  (`replication.rs`; tokio-postgres cannot) and creating a temporary logical
-  slot with `EXPORT_SNAPSHOT`, which returns a snapshot name and the
-  consistent point it was built at, exactly paired by Postgres. Each read's
-  first statement is `SET TRANSACTION SNAPSHOT '<alias>'` and its location is
-  the alias's consistent point; an alias lives as long as its connection,
-  held until the last read that adopted it finishes. **XID**
-  (`SnapshotMode::Xid(ledger)`): no temporary slot and no location asked of
-  Postgres; the first statement returns `pg_current_snapshot()`
-  (`xmin:xmax:xip`), and that account is converted through the `XidLedger`
-  (`ledger.rs`) the poller fills with every delivered transaction's id and
-  commit location: the read's location is just below the earliest delivered
-  transaction the snapshot does not see, or the newest delivered location
-  when it sees them all. Queries are rendered from the model with the
-  catalog's types cast on the way out (`sql.rs`), every leaf wrapped in
-  `IS TRUE` so `NULL` semantics match the engine's. One connection per read
-  in flight, pooled.
-- `PgStream::open(dsn, slot, catalog, ledger)` polls a `test_decoding` logical
-  replication slot (`pg_logical_slot_get_changes`), turns each committed change
-  into a full-image insert/update or a key-only delete positioned at its
-  transaction's commit location, records every transaction in the ledger when
-  one is attached, and ends every batch with a progress mark (the flush
-  location read before consuming). A primary-key change becomes delete +
-  insert; tables with large TOASTed columns need `REPLICA IDENTITY FULL`.
-  `PgStream::run` feeds a `Service`'s command channel.
-- Both methods are exact. The WAL method needs `max_replication_slots` and
-  `max_wal_senders` headroom for the live aliases (two per storage instance at
-  a rotation boundary) and delays a mint while a long transaction is open (the
-  reads keep the current alias). The XID method needs neither, but positions
-  a read no further than the feed has delivered.
+- `PgStorage::connect(dsn, catalog)` runs each read in its own read-only
+  `REPEATABLE READ` transaction positioned by an **alias**: a temporary
+  logical replication slot created with `EXPORT_SNAPSHOT` over a
+  replication-protocol connection (`replication.rs`; tokio-postgres cannot
+  open one), which returns a snapshot name and the consistent point it was
+  built at, exactly paired by Postgres. A read's first statement is
+  `SET TRANSACTION SNAPSHOT '<alias>'` and its position is that point. A
+  background task mints a fresh alias every 250 ms (configurable), but the
+  **flip rule** is what keeps reads behind the engine: a minted alias becomes
+  the current one only once the feed has been delivered past its consistent
+  point (`advance`); until then the older alias stays current, and before the
+  feed passes the first alias reads are parked. An alias lives as long as its
+  connection, held until the last read that adopted it finishes. Queries are
+  rendered from the model with the catalog's types cast on the way out
+  (`sql.rs`), every leaf wrapped in `IS TRUE` so `NULL` semantics match the
+  engine's. One connection per read in flight, pooled.
+- `PgStream::open(dsn, slot, catalog)` streams a permanent `pgoutput` slot
+  over a replication connection (`START_REPLICATION`, spoken by the
+  `pgwire-replication` crate; the row messages decoded by the `pgoutput`
+  crate, mapped onto the catalog's tables and types here). It creates the
+  slot and a publication `<slot>_pub` for all tables if they are missing.
+  Every change becomes a full-image insert/update or a key-only delete
+  **positioned at the end of its transaction's commit record**, the scale the
+  aliases' consistent points are on: a snapshot at consistent point `X` holds
+  exactly the writes positioned at or below `X`. Progress marks come from
+  **heartbeats**: a poll commits a tiny `pg_logical_emit_message` and consumes
+  the feed until that heartbeat comes back; decoding emits whole transactions
+  in commit order, so everything committed before it has been delivered by
+  then, and the heartbeat's position is the mark. A primary-key change becomes
+  delete + insert; tables with large TOASTed columns need `REPLICA IDENTITY
+  FULL`; a `TRUNCATE` on a published table stops the feed. `PgStream::run`
+  feeds a `Service`'s command channel and heartbeats on an interval so the
+  mark keeps moving while the tables are quiet.
+- Requirements: `wal_level = logical`; `max_replication_slots` and
+  `max_wal_senders` headroom for the feed's slot plus the live aliases (up to
+  three per storage instance at a rotation boundary); a role that may create
+  the publication (`FOR ALL TABLES` needs a superuser, or create it beforehand
+  under the feed's name). A mint waits for open transactions; the reads keep
+  the current alias meanwhile.
 - Live scenarios (`tests/pg_live.rs`) hold a snapshot open while writes commit
-  behind it, in both modes, and run the async service end to end; they need
-  `JUS_SYNC_PG_DSN` pointing at a database with `wal_level = logical` and
+  behind it, one of them from a transaction already open when the snapshot
+  was taken, and run the async service end to end with one table mirrored in
+  memory; they need `JUS_SYNC_PG_DSN` pointing at such a database and
   otherwise report themselves skipped.
 
 ### 6. WebSocket API (*base only, pending*)
 
 `src/ws.rs` is an axum server with `GET /health` and `GET /ws`; the connection
-loop echoes. The protocol to wire in:
+loop echoes. The protocol to wire in, one connection being one client:
 
 ```text
 client → server : {"subscribe": {"id": "q1", "sql": "SELECT * FROM tickets WHERE status = 'OPEN'"}}
-server → client : {"snapshot": {"id": "q1", "ops": [{"table": "tickets", "part": "main", "op": {"Add": {...}}}, …]}}
-server → client : {"update":   {"id": "q1", "table": "tickets", "part": "main", "op": {"Delete": {...}}}}
+server → client : {"snapshot": {"ops": [{"table": "tickets", "op": {"Add": {...}}, "targets": [{"id": "q1", "part": []}]}, …]}}
+server → client : {"update":   {"table": "tickets", "op": {"Delete": {...}}, "targets": [{"id": "q1", "part": []}, {"id": "q7", "part": [0]}]}}
 client → server : {"unsubscribe": {"id": "q1"}}
 ```
 
 One connection carries many subscriptions; all subscriptions of all
-connections live in the one engine instance. Per-connection subscription
-tables, reconnect/catch-up, and back-pressure are part of this work item.
+connections live in the one engine instance, and a row reaches a connection
+once per step however many of its subscriptions hold it. Per-connection
+subscription tables, reconnect/catch-up, and back-pressure are part of this
+work item.
 
 ---
 
@@ -297,7 +334,7 @@ cargo test --test xyne_spaces_queries   # the xyne-spaces dashboard's 283 querie
 cargo run --release --bin bench   # routing / registration / window / join benchmarks
 cargo run --bin server        # the WebSocket base (echo) on 127.0.0.1:8080
 
-# against a real Postgres (wal_level = logical, a free replication slot):
+# against a real Postgres (wal_level = logical, replication slots to spare, a role that may create a publication):
 export JUS_SYNC_PG_DSN=postgresql://postgres@localhost:5499/jus_sync
 cargo test --test pg_live     # snapshot held open while writes commit behind it; async service end to end
 cargo run --release --bin bench   # adds scenario 5: registration, streamed writes, registration under load
@@ -330,19 +367,19 @@ yardstick for every optimization: change the strategy, rerun, compare.
 `cargo run --release --bin bench` on an Apple M4 Max (rustc 1.89, release,
 one thread; scenarios 2 to 4 use a bench-local in-memory storage double,
 scenario 1 registers against an empty store so frames fill from writes alone,
-scenario 5 runs against PostgreSQL 15 on the same machine; raw output in
-[paper/bench-2026-09-11.txt](paper/bench-2026-09-11.txt) and
-[paper/bench-2026-09-12-row-currency.txt](paper/bench-2026-09-12-row-currency.txt),
+scenario 5 runs against PostgreSQL 15 on the same machine over the streaming
+feed; raw output with peak memory in
+[paper/bench-2026-09-14-streaming-feed.txt](paper/bench-2026-09-14-streaming-feed.txt),
 analysis in paper §9):
 
 | Scenario | Result |
 | --- | --- |
-| Routing, 100 → 10 000 subscriptions | a write touches only the 3 to 4 conditions it satisfies (one probe per column) while the table carries 67 to 85; route-only cost ≈ 1.3 µs fixed + 0.15 µs per impacted subscription; delivery ≈ 0.9 µs per emitted op |
-| Registration, 100 → 10 000 subscriptions | 4.8 / 1.9 / 1.5 µs, flat: the twin lookup is one probe of the query-keyed index (17 µs at 10 000 with the earlier linear scan); peak memory of the whole run 0.53 GB (2.2 GB before shared join trees and compact ids) |
-| Twin registration (400-row snapshot) | 752 µs from the shared frame vs 1 844 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
-| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.5 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~100 ms across 10 000 writes) |
-| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | identical subscriptions share one tree, so a ticket insert costs 62 µs for all 1 000 (7.4 ms before the shared set-valued edge), with 1.8 set edits per write instead of 52.5; the remaining cost is delivery, ≈ 0.3 to 0.4 µs per operation per subscriber |
-| Over PostgreSQL (`LEFT JOIN`, 1 000 users, 2 000 tickets), WAL and XID methods (run taken in the machine's slower state, about 1.5× the rows above) | a registration costs its two reads and their landing and nothing else, 4.0 / 3.7 ms end to end (2.5 / 2.4 ms in storage, 1.2 ms in the runtime); 5 000 inserts committed in transactions of 100 stream at ≈ 7 000 writes/s from commit to delivery, split between the engine (43 µs per write for 1 001 subscribers) and 339 sequential narrowed reads (one per newly referenced user, ≈ 1 ms each), with polling and decoding at 16 ms in total; a registration whose snapshot is held open for 300 ms while 541 writes commit and are delivered behind it lands at once with 41 of its 148 rows brought up to the newer image, none dropped, and frames equal to the tables |
+| Routing, 100 → 10 000 subscriptions | a write touches only the 3 to 4 conditions it satisfies (one probe per column) while the table carries 67 to 85; routing alone costs 0.9 / 2.0 / 13.0 µs per write at 100 / 1 000 / 10 000 subscriptions, delivery included 3.0 / 13.5 / 107.5 µs for an insert, and what grows is the impacted count (1.2 → 92 subscriptions per write), not the lookup |
+| Registration, 100 → 10 000 subscriptions | 2.7 / 2.2 / 1.4 µs, flat: the twin lookup is one probe of the query-keyed index; peak memory of the whole run 0.51 GB |
+| Twin registration (400-row snapshot) | 547 µs from the shared frame vs 1 517 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
+| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.6 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~70 ms across 10 000 writes) |
+| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | identical subscriptions share one tree, so a ticket insert costs 117 µs for all 1 000 with 1.8 set edits per write instead of 52.5; the remaining cost is delivery, one operation per subscriber |
+| Over PostgreSQL (`LEFT JOIN`, 1 000 users, 2 000 tickets), streaming feed | a registration costs its two reads and their landing and nothing else: 3.0 ms end to end (1.8 ms in storage, 1.1 ms in the runtime), a twin 369 µs; 5 000 inserts committed in transactions of 100 stream from commit to delivery at 5 544 writes/s, split between the engine (107 µs per write for 1 001 subscribers, client grouping included), 339 sequential narrowed reads (one per newly referenced user, 229 ms) and 5 ms of feed and decoding; a registration whose snapshot is held open for 300 ms while 500 writes commit and are delivered behind it lands at once with 41 of its 148 rows brought up to the newer image, none dropped, and frames equal to the tables |
 
 ### Using the engine programmatically
 
@@ -350,7 +387,7 @@ analysis in paper §9):
 use std::rc::Rc;
 use jus_sync::ivm::SingleTableIVM;
 use jus_sync::model::*;
-use jus_sync::parser::{parse_read, parse_write, Catalog};
+use jus_sync::parser::{parse_read, parse_write};
 use jus_sync::sync::{Local, MemoryStorage};
 
 let catalog = Catalog::new(vec![DbTable::new("tickets", ["id"], vec![
@@ -361,17 +398,19 @@ let storage = Rc::new(MemoryStorage::new());
 let mut ivm = Local::new(SingleTableIVM::new(), storage.clone());   // the synchronous driver
 
 let query = parse_read("SELECT * FROM tickets WHERE status = 'OPEN'", &catalog).unwrap();
-let (q_open, snapshot) = ivm.register_query(query);          // (SubId, Vec<SingleTableUpdate>), read landed inline
+let client = ClientId(1);
+let (q_open, snapshot) = ivm.register_query(client, query);  // (SubId, Vec<ClientUpdate>), read landed inline
 
 let write = parse_write("INSERT INTO tickets (id, status) VALUES (1, 'OPEN')", &catalog).unwrap();
 storage.apply(&write);                                       // commit first …
 let updates = ivm.incremental_update(&write);                // … notify second
-// updates: Vec<SingleTableUpdate { query: SubId, table, op }>; q_open names ours
+// updates: Vec<ClientUpdate { client, table, op, targets: Vec<Target { sub, part }> }>
 ```
 
-Against Postgres, build a `Service` over `MultiTableIVM` and a `PgStorage`,
-run it on a `tokio::task::LocalSet`, and let `PgStream::run` feed its command
-channel; `tests/pg_live.rs` does exactly that.
+Against Postgres, build a `Service` over `MultiTableIVM` and `Sources` (a
+`PgStorage` plus the tables to mirror), run it on a `tokio::task::LocalSet`,
+send it the feed's first progress mark, `warm()` the mirrored tables, and let
+`PgStream::run` feed its command channel; `tests/pg_live.rs` does exactly that.
 
 ---
 
@@ -388,7 +427,7 @@ silently narrowed:
   columns, which then read as `NULL`); the engine debug-asserts that an image
   carries its key columns. Logical decoding delivers full images given
   `REPLICA IDENTITY FULL` (otherwise an update's new tuple omits unchanged
-  TOASTed columns; paper §7.6).
+  TOASTed columns, which the feed reports as an error; paper §7.2).
 - **`LIMIT L` is a doubled window**; **`ORDER BY` decides which rows a window
   keeps**, never the order operations arrive in.
 - **Join semantics**: `LEFT` keeps every parent row (an empty child side is
@@ -404,6 +443,9 @@ silently narrowed:
   deliberate step: shard by table.
 - **DNF has no size cap** yet (exponential for adversarial filters; a cap with
   tree-evaluation fallback is deferred until a workload needs it).
+- **Schema changes are not followed**: the feed skips tables the catalog does
+  not declare and maps columns by name; a changed table needs a restart with
+  the new catalog.
 
 ---
 
@@ -443,11 +485,10 @@ engine change: the builder spells the cursor as the `WHERE` it means, and
 Cargo.toml
 paper/
   xyne-sync.tex / .pdf     the design paper (algorithms, join tree, ingestion, evaluation)
-  bench-2026-09-11.txt     raw output of the benchmark run reported in the paper (scenarios 1 to 4)
-  bench-2026-09-12-row-currency.txt      the run with the Postgres scenario (5)
-  bench-2026-09-11-async-storage.txt     the earlier Postgres run, before reads landed at once
-  bench-2026-09-07-before-frontier.txt   the run before the window frontier fix
-  bench-2026-09-08-list-edges.txt        the run before join edges became shared sets
+  bench-2026-09-14-streaming-feed.txt   the benchmark run reported here (all five scenarios, peak memory)
+  bench-2026-09-11.txt     the earlier run of scenarios 1 to 4 the paper's tables were taken from
+  bench-2026-09-12-row-currency.txt, bench-2026-09-11-async-storage.txt,
+  bench-2026-09-08-list-edges.txt, bench-2026-09-07-before-frontier.txt   earlier runs, kept for the record
 docs/
   pg-lsn-cdc-lab.md        hands-on lab: LSNs, MVCC snapshots, the CDC handoff
 src/
@@ -456,12 +497,13 @@ src/
   model/
     value.rs               Value / ValueType, manual Eq+Hash (floats, maps)
     schema.rs              Catalog / DbTable / DbColumn, TableName + ColumnName newtypes
-    query.rs               SingleTableReadQuery / WriteQuery, Where / Condition, SubId, QueryId
+    query.rs               SingleTableReadQuery / WriteQuery, Where / Condition, SubId, ClientId
     frame.rs               DataFrameKey / DataFrameRow / DataFrameOperation + the shared TableFrame
-    position.rs            Lsn, Snapshot, RowAt: where writes, reads and frame rows sit, as WAL locations
+    position.rs            Lsn and Snapshot: where a write or a read's rows sit, as WAL locations
   ivm/
     mod.rs                 SingleTableIVM: the routing core (analyze + incremental_update)
     engine.rs              Fetch requests and the Engine trait the runtime drives
+    update.rs              QueryPart, Target, ClientUpdate: per-client grouping of one step's operations
     registry.rs            subscription lifecycle: register/unregister/replace, twin sharing
     frames.rs              frame surgery + inspection: issue/land reads, adopt/upsert/remove rows, rows_for
     index.rs               TableIndex: shared DNF disjunct counters, boundaries, in-place edits
@@ -472,14 +514,14 @@ src/
     stats.rs               IvmStats counters + per-write diffing
   sync/
     storage.rs             the async Storage trait + MemoryStorage
-    runtime.rs             Runtime: the single owner, bringing results up to the engine, SyncStats
+    sources.rs             Sources: per-table routing between memory and Postgres (JUS_SYNC_MEMORY_TABLES)
+    runtime.rs             Runtime: the single owner, the one position, bringing results up to it, SyncStats
     local.rs               Local: the synchronous driver
     service.rs             Service: the async command loop (tokio LocalSet)
-    pg/mod.rs              PgStorage: positioned REPEATABLE READ snapshots, WAL (exported snapshot alias) or XID method
-    pg/ledger.rs           XidLedger: delivered transactions' ids and commit locations, the XID method's converter
+    pg/mod.rs              PgStorage: positioned REPEATABLE READ snapshots from exported-snapshot aliases
     pg/replication.rs      a minimal replication-protocol connection (mints the aliases)
     pg/sql.rs              model to SQL rendering
-    pg/stream.rs           PgStream: test_decoding poller, positioned writes, progress marks
+    pg/stream.rs           PgStream: the streaming pgoutput feed, positioned writes, heartbeat progress marks
   parser/
     mod.rs                 lexer + recursive-descent parser, schema-aware against model::Catalog
   ws.rs                    axum setup: routes, WebSocket upgrade, connection loop (echo)
@@ -487,13 +529,30 @@ src/
     server.rs              the server binary
     bench.rs               benchmark harness
 tests/
-  ivm_scenarios.rs         single-table routing, windows, twin sharing (assertable spec)
+  ivm_scenarios.rs         single-table routing, windows, twin sharing, per-client grouping (assertable spec)
   multi_table_scenarios.rs join reference/fetch/prune, self-join, nested and RIGHT edges
-  sync_interleaving.rs     reads out while writes stream: merge, row currency, xid vs lsn, refill, post-order
-  pg_live.rs               live Postgres: snapshot held open behind writes (both modes), async service
+  sync_interleaving.rs     reads out while writes stream: bring-up from the floor, parking, refill, post-order
+  pg_live.rs               live Postgres: snapshot held open behind writes, async service with a mirrored table
   xyne_spaces_queries/     the xyne-spaces registry (283 queries) and ACL shapes on a catalog generated
                            from the application's schema; gaps.rs pins each expressiveness gap
 ```
+
+---
+
+## Dependencies
+
+Nine crates, all permissively licensed; the reason for each is beside it in
+`Cargo.toml`.
+
+| Crate | Used for | License |
+| --- | --- | --- |
+| `chrono` | `Date` / `Datetime` values (no timezone database) | MIT OR Apache-2.0 |
+| `tokio` | the async drivers and the server | MIT |
+| `axum` | the WebSocket server | MIT |
+| `tokio-postgres` | SQL reads, slot and publication management, heartbeats | MIT OR Apache-2.0 |
+| `postgres-protocol`, `fallible-iterator`, `bytes` | the replication-protocol connection that mints exported snapshots | MIT OR Apache-2.0, MIT OR Apache-2.0, MIT |
+| `pgwire-replication` | the change feed's replication connection (`START_REPLICATION`, feedback, transaction boundaries); TLS features off | Apache-2.0 OR MIT |
+| `pgoutput` | decoding the `pgoutput` row messages | MIT |
 
 ---
 
@@ -509,16 +568,17 @@ they are discussed rather than discovered:
    first declared pkey column ascending, parser conventions that programmatic
    queries must reproduce to share materialization with parsed ones.
 4. **No `IS NULL` / `LIKE` / `BETWEEN`** operators; with NULL comparisons
-   always false, nullable columns cannot be filtered on.
+   always false, nullable columns cannot be filtered on (gaps N and L above).
 5. **Strict identity vs loose predicates**: row identity is variant-exact
    (`Float(1.0)` and `Int(1)` are different keys) while predicates coerce; the
    parser closes this for SQL writes, the model API does not.
-6. **No `Update` op variant**: a change is the `Delete`+`Add` pair; no
-   operation carries an ordering position.
+6. **No `Update` op variant**: a change reaches a client as one `Add`
+   (insert-or-replace); no operation carries an ordering position.
 7. **Window ties and `NULL`s are pragmatic**, not SQL-exact (strict boundary,
    `NULL`/`NaN` largest, unenforceable boundary dropped).
-8. **Twin lookup is a linear scan** over subscriptions; a query-keyed index
-   must be maintained inside `replace_query` / `replace_condition` too.
+8. **One heartbeat per poll**: the feed's progress mark costs a tiny
+   committed transaction per poll (or per interval under the service); a
+   server that forbids `pg_logical_emit_message` needs another mark.
 
 ---
 
