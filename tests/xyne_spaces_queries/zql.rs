@@ -1,14 +1,15 @@
 //! A ZQL-shaped builder over the query model, so each test reads like the
 //! query it mirrors: `zql("tickets").eq("channelId", "c1").related("project",
 //! same).where_exists("assignments", |a| a.eq("userId", ME))`. `related`
-//! becomes a LEFT edge (the client preserves the parent), `where_exists` a RIGHT
-//! edge (the parent shows only while a child matches), both joined on the
-//! columns the schema declares for the relationship. `start` renders the client's
-//! keyset cursor as the equivalent `WHERE` over the sort columns. Only the
-//! first `order_by` column reaches the model: the engine keys a window on
-//! one column, so a tiebreak column is recorded as dropped (gap O in
-//! `main.rs`). A single-table query also renders to the SQL the parser
-//! accepts, which the harness uses to check parser and builder agree.
+//! becomes a LEFT edge (the client preserves the parent), `where_exists` an
+//! INNER edge (the parent shows only while a child matches, the child only
+//! under a shown parent), both joined on the columns the schema declares
+//! for the relationship; `exists` returns the INNER edge's test as a leaf
+//! to place anywhere in a predicate tree. `start` renders the client's keyset
+//! cursor as the equivalent `WHERE` over the sort columns, and every
+//! `order_by` column reaches the model in order. A single-table query also
+//! renders to the SQL the parser accepts, which the harness uses to check
+//! parser and builder agree.
 
 use std::collections::HashMap;
 
@@ -68,7 +69,7 @@ pub fn same(query: Q) -> Q {
 ///
 /// - `table`: the node's table.
 /// - `filters`: the `where` calls, conjoined.
-/// - `order`: the first `order_by`; `dropped_order` the later ones.
+/// - `order`: the `order_by` columns, in order.
 /// - `limit`: the row cap, `u32::MAX` for none.
 /// - `left`: the `related` edges; `right`: the `where_exists` edges, each
 ///   with the relationship name they were declared with.
@@ -76,8 +77,7 @@ pub fn same(query: Q) -> Q {
 pub struct Q {
     table: &'static str,
     filters: Vec<Where>,
-    order: Option<(String, Order)>,
-    dropped_order: Vec<String>,
+    order: Vec<(String, Order)>,
     limit: u32,
     left: Vec<(String, Q)>,
     inner: Vec<(String, Q)>,
@@ -88,8 +88,7 @@ pub fn zql(table: &'static str) -> Q {
     Q {
         table,
         filters: Vec::new(),
-        order: None,
-        dropped_order: Vec::new(),
+        order: Vec::new(),
         limit: u32::MAX,
         left: Vec::new(),
         inner: Vec::new(),
@@ -163,14 +162,9 @@ impl Q {
         Where::exists(edge.source, self.inner.len() - 1)
     }
 
-    /// `.orderBy(column, direction)`; a second column is a tiebreak the
-    /// model cannot carry and is recorded in [`Q::dropped_order`].
+    /// `.orderBy(column, direction)`; later calls add tiebreak columns.
     pub fn order_by(mut self, column: &str, direction: Order) -> Q {
-        if self.order.is_none() {
-            self.order = Some((column.to_owned(), direction));
-        } else {
-            self.dropped_order.push(column.to_owned());
-        }
+        self.order.push((column.to_owned(), direction));
         self
     }
 
@@ -189,11 +183,6 @@ impl Q {
     /// columns, as the `WHERE` it means.
     pub fn start(self, keys: &[(&str, Order, Value)], inclusive: bool) -> Q {
         self.filter(keyset(keys, inclusive))
-    }
-
-    /// The `order_by` columns after the first, which the model dropped.
-    pub fn dropped_order(&self) -> &[String] {
-        &self.dropped_order
     }
 
     /// The model query, and the name of every part by its path: `main`, then
@@ -215,9 +204,13 @@ impl Q {
         names: &mut HashMap<QueryPart, String>,
     ) -> MultiTableReadQuery {
         names.insert(QueryPart(path.clone()), name.to_owned());
-        let order_by = match &self.order {
-            Some((column, direction)) => OrderBy::new(column.as_str(), *direction),
-            None => OrderBy::new(pkey(self.table), Order::ASC),
+        let order_by: Vec<OrderBy> = if self.order.is_empty() {
+            vec![OrderBy::new(pkey(self.table), Order::ASC)]
+        } else {
+            self.order
+                .iter()
+                .map(|(column, direction)| OrderBy::new(column.as_str(), *direction))
+                .collect()
         };
         let main_table = SingleTableReadQuery::new(
             self.table,
@@ -269,15 +262,22 @@ impl Q {
             sql.push_str(" WHERE ");
             sql.push_str(&render(&filter, true));
         }
-        let (column, direction) = self
-            .order
-            .clone()
-            .unwrap_or_else(|| (pkey(self.table).to_owned(), Order::ASC));
-        let direction = match direction {
-            Order::ASC => "ASC",
-            Order::DESC => "DESC",
+        let order: Vec<(String, Order)> = if self.order.is_empty() {
+            vec![(pkey(self.table).to_owned(), Order::ASC)]
+        } else {
+            self.order.clone()
         };
-        sql.push_str(&format!(" ORDER BY {column} {direction}"));
+        let clauses: Vec<String> = order
+            .iter()
+            .map(|(column, direction)| {
+                let direction = match direction {
+                    Order::ASC => "ASC",
+                    Order::DESC => "DESC",
+                };
+                format!("{column} {direction}")
+            })
+            .collect();
+        sql.push_str(&format!(" ORDER BY {}", clauses.join(", ")));
         if self.limit != u32::MAX {
             sql.push_str(&format!(" LIMIT {}", self.limit));
         }

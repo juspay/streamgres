@@ -15,13 +15,13 @@
 //! | Gap | What the queries use | What the engine has today |
 //! |-----|----------------------|---------------------------|
 //! | N | `IS NULL` / `IS NOT NULL` (74 + 9 sites) | **closed 2026-09-15**: `IS` / `IS_NOT` operators, indexed under the `NULL` key |
-//! | L | `LIKE` / `ILIKE` (11 sites: searches over `name`, `title`, `xyneId`, and a JSON text) | no pattern operator; the parser refuses it |
+//! | L | `LIKE` / `ILIKE` (11 sites: searches over `name`, `title`, `xyneId`, and a JSON text) | not supported, by decision (2026-09-15): no pattern operator; the parser refuses it |
 //! | X | an existence test inside `OR` (canvas visibility, `browsableChannels`, `channelLinks`, `summaryTemplates`, `getUsers`, the channel-access ACL `visibility = PUBLIC OR EXISTS participants`, the calls ACL) | **closed 2026-09-15**: an `EXISTS` leaf placed in the filter, bound to an INNER join's set |
-//! | O | a second `ORDER BY` column (tiebreaks on `id`, 100+ sites) and `ORDER BY` / `LIMIT` inside `related` (`rcas` latest one, last 10 `conversations`) | one window column per query; a node below the root ships every matching row, unordered and uncapped |
-//! | J | `json` columns (`metadata`, `recordingParticipants` searched with `LIKE`) | carried as opaque strings; no containment or path operators |
+//! | O | a second `ORDER BY` column (tiebreaks on `id`, 100+ sites) and `ORDER BY` / `LIMIT` inside `related` (`rcas` latest one, last 10 `conversations`) | **half closed 2026-09-15**: `ORDER BY` is a list of columns compared in turn, the page and the boundary decided by all of them; a node below the root still ships every matching row, unordered and uncapped |
+//! | J | `json` columns (`metadata`, `recordingParticipants` searched with `LIKE`) | carried as opaque strings, serialized and deserialized as they are; no containment, path or pattern operator, by decision |
 //! | E | `whereExists` returns no child rows | **closed 2026-09-15**: `whereExists` is an INNER edge; child rows ship as a part, only under a shown parent |
-//! | S | `.one()` is a singular result | `LIMIT 1`; the singular shape is the transport's |
-//! | B | `LIMIT n` ships `n` rows | the window keeps a doubled buffer: up to `2n` rows are shipped and the client shows the best `n` |
+//! | S | `.one()` is a singular result | **closed 2026-09-15**: `LIMIT 1`, exactly one row shipped; the singular shape is the transport's |
+//! | B | `LIMIT n` ships `n` rows | **closed 2026-09-15**: the client receives exactly the page of `n`, the difference of the page after every step; the doubled buffer behind it is the engine's |
 //!
 //! Keyset cursors (`.start(row, {inclusive})`, 34 sites) need no engine
 //! change: the builder spells them as the `WHERE` they mean, and the tests

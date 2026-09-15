@@ -453,7 +453,7 @@ fn seed_apps(w: &mut World) {
 }
 
 /// `getWorkspaceInstalledApps`: installs whose user is in the caller's
-/// workspace, with the app. Gap O drops the `id` tiebreak.
+/// workspace, with the app.
 #[test]
 fn get_workspace_installed_apps() {
     let mut w = World::new();

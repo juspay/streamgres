@@ -169,8 +169,7 @@ fn user_scheduled_calls_v2() {
 }
 
 /// `userCallHistory`: non-recording calls neither scheduled nor cancelled,
-/// newest first below a cursor, with participants. Gap O drops the `id`
-/// tiebreak.
+/// newest first below a cursor, with participants.
 #[test]
 fn user_call_history() {
     let mut w = World::new();
@@ -364,8 +363,7 @@ fn oats_recording_by_external_id() {
 
 /// `summaryTemplates`: templates the caller made or that are public. Gap
 /// X: the other two branches (pending approval for admins, shared with
-/// the caller) are existence tests inside the `OR`; gap O drops the
-/// `version` tiebreak.
+/// the caller) are existence tests inside the `OR`.
 #[test]
 fn summary_templates() {
     let mut w = World::new();

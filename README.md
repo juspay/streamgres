@@ -52,7 +52,7 @@ every later delta continues from.
 | DNF counting index: canonical disjuncts, shared epoch-stamped counters fire exactly | ✅ done | `src/ivm/index.rs` |
 | Per-column value index: a write reaches only the conditions it satisfies, `O(columns · log n)` lookups (equality maps, inequality by set difference, range maps per comparison class) | ✅ done | `src/ivm/columns.rs` |
 | Shared frames: one frame per table, rows tagged with holders as compact ids (`RowId`, `SubId`); held mirror; twin registration served from the frame through a query-keyed index | ✅ done | `src/ivm/frames.rs`, `src/ivm/registry.rs` |
-| `ORDER BY` / `LIMIT` windows: doubled buffer, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
+| `ORDER BY` / `LIMIT` windows: compound order, the page of `L` to the client over a buffer of `2L`, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
 | In-place condition edits: a literal `IN` swapped inside its disjuncts, or a set-valued `IN` (`Value::Set`) gaining/losing one member in O(1) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
 | Join tree: `LEFT`, `RIGHT` and `INNER` edges at any depth, existence tests placed anywhere in a node's filter (`EXISTS` inside `OR`), set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns; a child row is shown only under a shown parent | ✅ done | `src/ivm/multi.rs` |
 | Client-addressed output: every subscription belongs to a `ClientId`; one step's operations are folded per client and row (`ClientUpdate { client, table, op, targets }`), so a row image travels to a client once | ✅ done | `src/ivm/update.rs` |
@@ -89,7 +89,8 @@ The pipeline is `SQL text → typed query model → IVM routing → operations`.
 - `DataFrameKey` (primary-key values, identity only), `DataFrameRow` (a
   **full** row image, every column including the key), both keyed by
   `ColumnName`; `DataFrameOperation` (`Add(key, row)` / `Delete(key, row)`).
-- `SingleTableReadQuery { table, filter: Where, order_by, limit }`;
+- `SingleTableReadQuery { table, filter: Where, order_by: Vec<OrderBy>, limit }`
+  (the order columns compared in turn);
   `Where` is `AND`/`OR` over leaf `Condition`s (`=`, `!=`, `<`, `<=`, `>`,
   `>=`, `IN`, `NOT IN`, `IS NULL`, `IS NOT NULL`, and `EXISTS` naming one of
   the node's inner joins); no `NOT` node, so DNF is plain distribution.
@@ -146,19 +147,25 @@ A write can affect a subscription two ways, and both are checked:
   counters correctly). `replace_query` / `replace_condition` open a
   maintenance window during which the subscription is not a twin donor until
   the caller's `mark_reconciled`.
-- **Windows** (`window.rs`). A finite `LIMIT L` keeps a buffer of `2L` rows
-  (storage queried with the doubled limit) and a **frontier**: the worst order
-  value known to be covered from storage (every matching row better than it
-  is held). A full storage read sets the frontier to its worst value, a short
-  one clears it (storage exhausted), an eviction pulls it in. The admission
-  boundary (`col < frontier` for ASC, `>` for DESC, strict) is **published
-  into the index's `boundaries` side table** and checked inside `matched()`;
-  admission only; a held row that worsens keeps its slot until evicted. Past
-  capacity the worst row is evicted (`Delete`); when a removal drains the
-  buffer to `L`, one storage query refills from the frontier inclusive
-  (held ties dedup). `NULL`/`NaN` sort largest; an unenforceable frontier
-  publishes no boundary rather than rejecting everything; `LIMIT 0` is
-  permanently empty.
+- **Windows** (`window.rs`). `ORDER BY` is a list of columns compared in
+  turn. A finite `LIMIT L` keeps a buffer of `2L` rows (storage queried with
+  the doubled limit) and a **frontier**: the worst order key known to be
+  covered from storage (every matching row better than it is held). A full
+  storage read sets the frontier to its worst key, a short one clears it
+  (storage exhausted), an eviction pulls it in. The admission boundary,
+  strictly better than the frontier (`col < frontier` for ASC, `>` for DESC;
+  over several columns the `OR` of one branch per column, each tying the
+  earlier columns and strict on its own), is **published into the index's
+  `boundaries` side table** and checked inside `matched()`; admission only; a
+  held row that worsens keeps its slot until evicted. Past capacity the worst
+  row is evicted; when a removal drains the buffer to `L`, one storage query
+  refills from the frontier inclusive (held ties dedup). **The client
+  receives the page**: exactly the best `L` rows at registration and, after
+  every step, the difference between the page before and after (a page row
+  rewritten in place arrives as one `Add`); the buffer behind the page is the
+  engine's, so a row leaving the page is replaced from it without a storage
+  trip. `NULL`/`NaN` sort largest; an unenforceable frontier publishes no
+  boundary rather than rejecting everything; `LIMIT 0` is permanently empty.
 - **Client grouping** (`update.rs`). Inside the engine every operation is
   produced per subscription. Before anything leaves, one step's operations
   are folded per (client, table, row) into at most three entries in order:
@@ -391,19 +398,21 @@ scenario 1 registers against an empty store so frames fill from writes alone,
 scenario 5 runs against PostgreSQL 15 on the same machine over the streaming
 feed, scenario 6 runs three xyne-spaces query shapes on the real catalog over
 synthetic data; raw output with peak memory in
-[paper/bench-2026-09-14-streaming-feed.txt](paper/bench-2026-09-14-streaming-feed.txt)
-(scenarios 1 to 5) and
-[paper/bench-2026-09-15-inner-exists.txt](paper/bench-2026-09-15-inner-exists.txt)
-(scenario 6, the whole run repeated), analysis in paper §9):
+[paper/bench-2026-09-15-order-limit.txt](paper/bench-2026-09-15-order-limit.txt)
+(the whole run; earlier runs beside it), analysis in paper §9. Scenarios 1
+to 5 below quote the 2026-09-14 run; on 2026-09-15 the same machine ran
+every scenario about 40% slower, the 2026-09-14 code included when rebuilt
+and rerun beside the current one, so the day's numbers are comparable among
+themselves and the relative results hold):
 
 | Scenario | Result |
 | --- | --- |
 | Routing, 100 → 10 000 subscriptions | a write touches only the 3 to 4 conditions it satisfies (one probe per column) while the table carries 67 to 85; routing alone costs 0.9 / 2.0 / 13.0 µs per write at 100 / 1 000 / 10 000 subscriptions, delivery included 3.0 / 13.5 / 107.5 µs for an insert, and what grows is the impacted count (1.2 → 92 subscriptions per write), not the lookup |
 | Registration, 100 → 10 000 subscriptions | 2.7 / 2.2 / 1.4 µs, flat: the twin lookup is one probe of the query-keyed index; peak memory of the whole run 0.51 GB, 0.76 GB with scenario 6 |
 | Twin registration (400-row snapshot) | 547 µs from the shared frame vs 1 517 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
-| Window, `ORDER BY … LIMIT 50` over 100 000 rows | non-qualifying writes rejected inside the index at 0.6 µs (12 operations for 10 000 writes); under targeted writes the cost is the storage double's refill scans (12 × ~70 ms across 10 000 writes) |
+| Window, `ORDER BY … LIMIT 50` over 100 000 rows | the client receives the page: 50 rows at registration over a buffer of 100; non-qualifying writes rejected inside the index at 0.9 µs (12 operations for 10 000 writes); under targeted writes, every delete on the page, the page moves on 9 192 of 10 000 writes (two operations each, the row leaving and the buffered one taking its place) with ten storage refills, and the cost is those refill scans of the storage double (10 × ~90 ms across 10 000 writes) |
 | `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | identical subscriptions share one tree, so a ticket insert costs 117 µs for all 1 000 with 1.8 set edits per write instead of 52.5; the remaining cost is delivery, one operation per subscriber |
-| xyne-spaces shapes (200 users, 50 channels, 1 000 conversations, 20 000 messages, 2 000 tickets; 1 400 subscriptions in 1 205 trees) | `browsableChannels` (`EXISTS` inside `OR`, participants attached) registers in 6.8 ms and ships the 1 091 rows it asks for; `conversationMessages` under the channel-access chain (three `INNER` edges, the last inside an `OR`) registers in 2.1 ms with three reads; the board view (`IS NULL` twice, two `LEFT` edges) is a 2.4 ms twin copy of 874 rows. A message insert routes in 8.4 µs (119 000 writes/s); a membership change costs 1 ms, moving 8 set members, fetching 3.8 uncovered channels and fanning its participant row out to the 112 subscriptions showing that channel; an in-place ticket update 191 µs, one `Add` per subscriber of its board |
+| xyne-spaces shapes (1 000 users, 500 channels, 50 000 conversations, 100 000 messages, 10 000 tickets on 20 boards; 7 000 subscriptions in 6 020 trees) | `browsableChannels` (`EXISTS` inside `OR`, participants attached) registers in 14.8 ms and ships the 2 250 rows it asks for (about 108 channels and their participants per user); `conversationMessages` under the channel-access chain (three `INNER` edges, the last inside an `OR`) registers in 1.2 ms with three reads; the board view (`IS NULL` twice, two `LEFT` edges, a page of 50 by `createdAt DESC, id ASC`) is a 0.5 ms twin copy of 150 rows. A message insert routes in 13.6 µs over 7 000 subscriptions (73 000 writes/s); a membership change costs 1.9 ms, moving 10.7 set members, fetching 5.3 uncovered channels and fanning its participant row out to the 230 subscriptions showing that channel (a public channel is shown by all 1 000 users); an in-place ticket update 56 µs: beyond the buffer's frontier it is rejected inside the index, behind the page it changes nothing the client sees, on the page it is one `Add` per subscriber of its board (5.2 client updates per write) |
 | Over PostgreSQL (`LEFT JOIN`, 1 000 users, 2 000 tickets), streaming feed | a registration costs its two reads and their landing and nothing else: 3.0 ms end to end (1.8 ms in storage, 1.1 ms in the runtime), a twin 369 µs; 5 000 inserts committed in transactions of 100 stream from commit to delivery at 5 544 writes/s, split between the engine (107 µs per write for 1 001 subscribers, client grouping included), 339 sequential narrowed reads (one per newly referenced user, 229 ms) and 5 ms of feed and decoding; a registration whose snapshot is held open for 300 ms while 500 writes commit and are delivered behind it lands at once with 41 of its 148 rows brought up to the newer image, none dropped, and frames equal to the tables |
 
 ### Using the engine programmatically
@@ -453,7 +462,8 @@ silently narrowed:
   carries its key columns. Logical decoding delivers full images given
   `REPLICA IDENTITY FULL` (otherwise an update's new tuple omits unchanged
   TOASTed columns, which the feed reports as an error; paper §7.2).
-- **`LIMIT L` is a doubled window**; **`ORDER BY` decides which rows a window
+- **`LIMIT L` ships the page of `L`** over a doubled buffer the engine
+  keeps; **`ORDER BY` (one or more columns) decides which rows a window
   keeps**, never the order operations arrive in.
 - **Join semantics**: `LEFT` keeps every parent row (an empty child side is
   null); `RIGHT` keeps every child row and shows a parent row only while a
@@ -496,12 +506,12 @@ pins each gap on its own.
 | Gap | The queries use | The engine has |
 | --- | --- | --- |
 | N | `IS NULL` / `IS NOT NULL` (83 sites: `visibleTo IS NULL`, `rootId IS NULL`, `userId IS NULL`, `deletedAt IS NULL`, …) | **closed**: `IS` / `IS NOT` operators with a `NULL` operand, filed under the `NULL` key of the column index; every message, canvas and draft query states its rule in full |
-| L | `LIKE` / `ILIKE` (11 sites: name, title, xyneId searches; one over JSON text) | no pattern operator |
+| L | `LIKE` / `ILIKE` (11 sites: name, title, xyneId searches; one over JSON text) | not supported, by decision: no pattern operator |
 | X | an existence test inside `OR` (canvas visibility, `browsableChannels`, `channelLinks`, `summaryTemplates`, `getUsers`, the channel-access ACL `visibility = PUBLIC OR EXISTS participants`, the calls ACL) | **closed**: an `EXISTS` leaf naming an inner join, bound in place to the edge's set; one subscription, the set-valued leaf inside the `OR` |
-| O | a second `ORDER BY` column (tiebreaks on `id`); `ORDER BY` / `LIMIT` inside `related` | one window column per query; below the root every matching row ships |
-| J | `json` columns | opaque strings |
+| O | a second `ORDER BY` column (tiebreaks on `id`); `ORDER BY` / `LIMIT` inside `related` | **half closed**: `ORDER BY` takes a list of columns, the page and the boundary decided by every column in turn; below the root every matching row still ships |
+| J | `json` columns | opaque strings, serialized and deserialized as they are; no path, containment or pattern operator |
 | E | `whereExists` returns no child rows | **closed**: `whereExists` is an `INNER` edge; the matching child rows ship as their own part, only under a shown parent (what the reference server syncs to its client too, though not in the result) |
-| S, B | `.one()`, `LIMIT n` | `LIMIT 1`; the doubled buffer ships up to `2n` rows, the client shows `n` |
+| S, B | `.one()`, `LIMIT n` | **closed**: the client receives exactly the page of `n` (`.one()` is `LIMIT 1`) and the page's difference after every step; the doubled buffer behind it is the engine's |
 
 Keyset cursors (`.start(row, {inclusive})`) and the empty `IN` list need no
 engine change: the builder spells the cursor as the `WHERE` it means, and
@@ -539,7 +549,7 @@ src/
     frames.rs              frame surgery + inspection: issue/land reads, adopt/upsert/remove rows, rows_for
     index.rs               TableIndex: shared DNF disjunct counters, boundaries, in-place edits
     columns.rs             per-column value index: equality, inequality and range lookups
-    window.rs              ORDER BY / LIMIT: doubled buffer, boundary publishing, evict/refill
+    window.rs              ORDER BY / LIMIT: compound order, the page over a doubled buffer, boundary publishing, evict/refill
     multi.rs               MultiTableIVM: the join tree (LEFT / RIGHT / INNER edges, the gate, EXISTS binding) over the single engine
     predicate.rs           Where-tree evaluation, NULL semantics
     stats.rs               IvmStats counters + per-write diffing

@@ -128,7 +128,7 @@ pub use multi::{MultiTableIVM, MultiTableUpdate};
 pub use predicate::{eval_condition, evaluate};
 pub use stats::IvmStats;
 pub use update::{ClientUpdate, QueryPart, Target};
-pub use window::order_cmp;
+pub use window::{order_cmp, order_rows};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -365,7 +365,8 @@ impl SingleTableIVM {
         }
         ops.append(&mut window_ops);
 
-        ops
+        let impacted: Vec<SubId> = impacts.iter().map(|impact| impact.sub).collect();
+        self.gate_updates(&impacted, ops)
     }
 
     /// Tag `sub` onto the frame row `key` of `table` (which must be

@@ -803,8 +803,7 @@ fn support_tickets_page_v2() {
 
 /// `supportTicketsPageV3` in the Starred folder: an existence test on the
 /// caller's mailbox overlay, also related for the client's folder logic;
-/// starring another ticket brings it with its drafts and reads. Gap O
-/// drops the `id` tiebreak.
+/// starring another ticket brings it with its drafts and reads.
 #[test]
 fn support_tickets_page_v3() {
     let mut w = World::new();
@@ -1016,7 +1015,7 @@ fn compose_drafts_by_channel() {
 }
 
 /// `userEmailDrafts`: the caller's reply drafts of a channel with their
-/// ticket, below an update cursor. Gap O drops the `id` tiebreak.
+/// ticket, below an update cursor.
 #[test]
 fn user_email_drafts() {
     let mut w = World::new();
@@ -1039,7 +1038,7 @@ fn user_email_drafts() {
 
 /// `userEmailsSent` for the caller: outbound emails in a channel with
 /// their ticket, in a channel the caller may see (public, or a
-/// participant); gap O drops the `id` tiebreak.
+/// participant).
 #[test]
 fn user_emails_sent() {
     let mut w = World::new();

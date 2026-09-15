@@ -38,10 +38,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
 use super::columns::{ColumnIndex, CondRef};
-use super::predicate::eval_condition;
+use super::predicate::evaluate;
 use super::stats::IvmStats;
 use crate::model::SubId;
-use crate::model::{ColumnName, Condition, Disjunct, Value};
+use crate::model::{ColumnName, Condition, Disjunct, Value, Where};
 
 /// Shared handle to one disjunct's counting state; cloned under every
 /// condition key the disjunct contains.
@@ -99,7 +99,7 @@ pub(super) struct TableIndex {
     columns: HashMap<ColumnName, ColumnIndex>,
     by_disjunct: HashMap<Disjunct, SharedCounter>,
     unconditional: Vec<SubId>,
-    boundaries: HashMap<SubId, Condition>,
+    boundaries: HashMap<SubId, Where>,
 }
 
 impl TableIndex {
@@ -277,10 +277,10 @@ impl TableIndex {
     }
 
     /// Publish, move, or clear `subscriber`'s admission boundary.
-    pub(super) fn set_boundary(&mut self, subscriber: SubId, boundary: Option<Condition>) {
+    pub(super) fn set_boundary(&mut self, subscriber: SubId, boundary: Option<Where>) {
         match boundary {
-            Some(condition) => {
-                self.boundaries.insert(subscriber, condition);
+            Some(boundary) => {
+                self.boundaries.insert(subscriber, boundary);
             }
             None => {
                 self.boundaries.remove(&subscriber);
@@ -378,7 +378,7 @@ impl TableIndex {
                 || self
                     .boundaries
                     .get(uuid)
-                    .is_none_or(|boundary| eval_condition(boundary, row, &mut 0))
+                    .is_none_or(|boundary| evaluate(boundary, row, &mut 0))
         });
         fired
     }

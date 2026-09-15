@@ -24,8 +24,9 @@
 //! 3. **Window** — one `ORDER BY points ASC LIMIT 50` subscription over
 //!    100_000 storage rows under uniform writes (the published boundary
 //!    rejects nearly everything) and window-targeted writes (every insert
-//!    aims below the boundary, every delete hits a held row, so
-//!    admissions, evictions, and refills all happen).
+//!    aims below the boundary, every delete hits a row on the client's
+//!    page, so admissions, evictions, and refills all happen). The client
+//!    receives the page of 50; the buffer of 100 behind it is the engine's.
 //! 4. **LEFT JOIN** — `tickets LEFT JOIN users ON assigned_to = users.id`
 //!    with 1_000 identical subscriptions plus 100 distinct ones over 1_000
 //!    users: ticket inserts, ticket reassignments, and user updates.
@@ -33,9 +34,10 @@
 //!    catalog over synthetic data: `browsableChannels` (an existence test
 //!    inside an `OR`), `conversationMessages` under the channel-access
 //!    chain (three INNER edges deep, the visibility rule with `IS NULL`),
-//!    and the board view (`IS NULL`, `OR` with `IS NULL`, two LEFT edges);
-//!    one subscription per user for each, then message inserts, membership
-//!    churn that moves the existence sets, and in-place ticket updates.
+//!    and the board view (`IS NULL`, `OR` with `IS NULL`, two LEFT edges,
+//!    a page of 50 ordered by `createdAt DESC, id ASC`); one subscription
+//!    per user for each, then message inserts, membership churn that moves
+//!    the existence sets, and in-place ticket updates.
 //! 5. **Postgres** (only when `JUS_SYNC_PG_DSN` names a database with
 //!    `wal_level = logical`) — the same join over real tables: a
 //!    registration's end-to-end latency (two positioned reads), writes
@@ -60,7 +62,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use jus_sync::ivm::{Fetch, IvmStats, MultiTableIVM, SingleTableIVM, evaluate};
+use jus_sync::ivm::{Fetch, IvmStats, MultiTableIVM, SingleTableIVM, evaluate, order_rows};
 use jus_sync::model::ComparisonOperator::{EQ, GTE};
 use jus_sync::model::*;
 use jus_sync::sync::pg::{PgStorage, PgStream};
@@ -128,15 +130,16 @@ const PG_WRITES_PER_TXN: usize = 100;
 const PG_LOAD_WRITES: usize = 500;
 const PG_SLOT: &str = "jus_sync_bench";
 
-const XY_USERS: u64 = 200;
-const XY_CHANNELS: u64 = 50;
-const XY_PUBLIC_CHANNELS: u64 = 20;
+const XY_USERS: u64 = 1_000;
+const XY_CHANNELS: u64 = 500;
+const XY_PUBLIC_CHANNELS: u64 = 100;
 const XY_MEMBERSHIPS_PER_USER: u64 = 10;
-const XY_CONVERSATIONS_PER_CHANNEL: u64 = 20;
-const XY_MESSAGES_PER_CONVERSATION: u64 = 20;
+const XY_CONVERSATIONS_PER_CHANNEL: u64 = 100;
+const XY_MESSAGES_PER_CONVERSATION: u64 = 2;
 const XY_THREADS_PER_USER: u64 = 5;
-const XY_BOARDS: u64 = 5;
-const XY_TICKETS: u64 = 2_000;
+const XY_BOARDS: u64 = 20;
+const XY_BOARD_PAGE: u32 = 50;
+const XY_TICKETS: u64 = 10_000;
 const XY_MESSAGE_INSERTS: usize = 5_000;
 const XY_MEMBERSHIP_CHURN: usize = 1_000;
 const XY_TICKET_UPDATES: usize = 2_000;
@@ -402,6 +405,62 @@ impl Vocabulary {
 struct BenchTable {
     rows: Vec<(DataFrameKey, DataFrameRow)>,
     positions: HashMap<DataFrameKey, usize>,
+    by_value: HashMap<ColumnName, HashMap<Value, HashSet<usize>>>,
+}
+
+impl BenchTable {
+    /// The value of `column` in `row`, `NULL` when the image lacks it.
+    fn value_of(row: &DataFrameRow, column: &ColumnName) -> Value {
+        row.data.get(column).cloned().unwrap_or(Value::Null)
+    }
+
+    /// Build the equality index of `column` on first use; every later
+    /// write keeps it current.
+    fn ensure_index(&mut self, column: &ColumnName) {
+        if self.by_value.contains_key(column) {
+            return;
+        }
+        let mut index: HashMap<Value, HashSet<usize>> = HashMap::new();
+        for (position, (_, row)) in self.rows.iter().enumerate() {
+            index
+                .entry(Self::value_of(row, column))
+                .or_default()
+                .insert(position);
+        }
+        self.by_value.insert(column.clone(), index);
+    }
+
+    /// File the row at `position` under its values in every index.
+    fn file(&mut self, position: usize, row: &DataFrameRow) {
+        for (column, index) in self.by_value.iter_mut() {
+            index
+                .entry(Self::value_of(row, column))
+                .or_default()
+                .insert(position);
+        }
+    }
+
+    /// Unfile the row at `position` from every index.
+    fn unfile(&mut self, position: usize, row: &DataFrameRow) {
+        for (column, index) in self.by_value.iter_mut() {
+            if let Some(bucket) = index.get_mut(&Self::value_of(row, column)) {
+                bucket.remove(&position);
+            }
+        }
+    }
+
+    /// The positions matching any of `values` in `column`, ascending.
+    fn positions_of(&self, column: &ColumnName, values: &[Value]) -> Vec<usize> {
+        let index = &self.by_value[column];
+        let mut positions: Vec<usize> = values
+            .iter()
+            .filter_map(|value| index.get(value))
+            .flat_map(|bucket| bucket.iter().copied())
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        positions
+    }
 }
 
 /// The bench storage (see the module header); `position` is where the
@@ -414,23 +473,33 @@ struct BenchStorage {
 
 impl BenchStorage {
     /// Mirror one write: insert/update upsert by primary key, delete
-    /// removes (swap-remove, index patched for the moved row).
+    /// removes (swap-remove, positions and indexes patched for the moved
+    /// row).
     fn apply(&self, write: &WriteQuery) {
         let mut tables = self.tables.borrow_mut();
         let table = tables.entry(write.table().clone()).or_default();
         let key = write.pkey_value();
         match (write.new_row_image(), table.positions.get(key).copied()) {
-            (Some(image), Some(position)) => table.rows[position].1 = image.clone(),
+            (Some(image), Some(position)) => {
+                let old = std::mem::replace(&mut table.rows[position].1, image.clone());
+                table.unfile(position, &old);
+                table.file(position, image);
+            }
             (Some(image), None) => {
-                table.positions.insert(key.clone(), table.rows.len());
+                let position = table.rows.len();
+                table.positions.insert(key.clone(), position);
                 table.rows.push((key.clone(), image.clone()));
+                table.file(position, image);
             }
             (None, Some(position)) => {
                 table.positions.remove(key);
-                table.rows.swap_remove(position);
+                let (_, gone) = table.rows.swap_remove(position);
+                table.unfile(position, &gone);
                 if position < table.rows.len() {
-                    let moved = table.rows[position].0.clone();
-                    table.positions.insert(moved, position);
+                    let (moved_key, moved_row) = table.rows[position].clone();
+                    table.positions.insert(moved_key, position);
+                    table.unfile(table.rows.len(), &moved_row);
+                    table.file(position, &moved_row);
                 }
             }
             (None, None) => {}
@@ -438,23 +507,26 @@ impl BenchStorage {
     }
 }
 
-/// Every primary-key `IN` / `=` conjunct of the filter — conditions on
-/// `id` reachable through `AND`s only, so any one of them bounds the
-/// result set.
-fn pkey_restrictions(filter: &Where, out: &mut Vec<Vec<Value>>) {
+/// Every `=` / `IN` conjunct of the filter reachable through `AND`s only,
+/// as `(column, values)`: any one of them bounds the result set.
+fn equality_restrictions(filter: &Where, out: &mut Vec<(ColumnName, Vec<Value>)>) {
     match filter {
-        Where::Condition(condition) if condition.column == "id" => {
-            match (&condition.comparison_operator, &condition.value) {
-                (ComparisonOperator::IN, Value::List(values)) => out.push(values.clone()),
-                (ComparisonOperator::IN, Value::Set(set)) => out.push(set.members()),
-                (ComparisonOperator::EQ, value) => out.push(vec![value.clone()]),
-                _ => {}
+        Where::Condition(condition) => match (&condition.comparison_operator, &condition.value) {
+            (ComparisonOperator::IN, Value::List(values)) => {
+                out.push((condition.column.clone(), values.clone()));
             }
-        }
-        Where::Condition(_) | Where::OR(_) => {}
+            (ComparisonOperator::IN, Value::Set(set)) => {
+                out.push((condition.column.clone(), set.members()));
+            }
+            (ComparisonOperator::EQ, value) => {
+                out.push((condition.column.clone(), vec![value.clone()]));
+            }
+            _ => {}
+        },
+        Where::OR(_) => {}
         Where::AND(children) => {
             for child in children {
-                pkey_restrictions(child, out);
+                equality_restrictions(child, out);
             }
         }
     }
@@ -466,39 +538,32 @@ fn order_of(
     a: &(DataFrameKey, DataFrameRow),
     b: &(DataFrameKey, DataFrameRow),
 ) -> Ordering {
-    let column = query.order_by.column.as_str();
-    let ordering = match (a.1.data.get(column), b.1.data.get(column)) {
-        (Some(x), Some(y)) => x.compare(y).unwrap_or(Ordering::Equal),
-        _ => Ordering::Equal,
-    };
-    match query.order_by.direction {
-        Order::ASC => ordering,
-        Order::DESC => ordering.reverse(),
-    }
+    order_rows(&query.order_by, &a.1, &b.1)
 }
 
 impl BenchStorage {
-    /// Scan the table (narrowed to the smallest primary-key conjunct when
-    /// the filter has one), evaluate the filter on every candidate, and
-    /// for a finite limit keep the best rows in `order_by` order.
+    /// Scan the table — narrowed to the smallest equality conjunct through
+    /// a per-column index built on first use, the way a database would
+    /// pick an index — evaluate the filter on every candidate, and for a
+    /// finite limit keep the best rows in `order_by` order.
     fn rows(&self, query: &SingleTableReadQuery) -> Vec<(DataFrameKey, DataFrameRow)> {
-        let tables = self.tables.borrow();
-        let Some(table) = tables.get(&query.table) else {
+        let mut tables = self.tables.borrow_mut();
+        let Some(table) = tables.get_mut(&query.table) else {
             return Vec::new();
         };
         let mut restrictions = Vec::new();
-        pkey_restrictions(&query.filter, &mut restrictions);
-        let candidates: Vec<&(DataFrameKey, DataFrameRow)> =
-            match restrictions.iter().min_by_key(|values| values.len()) {
-                Some(values) => values
-                    .iter()
-                    .filter_map(|value| table.positions.get(&key(value.clone())))
-                    .map(|&position| &table.rows[position])
-                    .collect(),
-                None => table.rows.iter().collect(),
-            };
+        equality_restrictions(&query.filter, &mut restrictions);
+        for (column, _) in &restrictions {
+            table.ensure_index(column);
+        }
+        let candidates: Vec<usize> = restrictions
+            .iter()
+            .map(|(column, values)| table.positions_of(column, values))
+            .min_by_key(Vec::len)
+            .unwrap_or_else(|| (0..table.rows.len()).collect());
         let mut selected: Vec<(DataFrameKey, DataFrameRow)> = candidates
             .into_iter()
+            .map(|position| &table.rows[position])
             .filter(|(_, row)| evaluate(&query.filter, &row.data, &mut 0))
             .cloned()
             .collect();
@@ -851,9 +916,9 @@ fn twin_sharing() {
     );
 }
 
-/// The bench's client-side view of the windowed subscription, rebuilt
-/// from the operation stream exactly as a real client would — used to aim
-/// the targeted workload at rows the window currently holds.
+/// The bench's client-side view of the windowed subscription — its page
+/// — rebuilt from the operation stream exactly as a real client would;
+/// used to aim the targeted workload at rows the client currently shows.
 #[derive(Default)]
 struct Mirror {
     held: Vec<(i64, i64)>,
@@ -901,7 +966,7 @@ impl Mirror {
         (adds, deletes)
     }
 
-    /// The worst (largest) held `points` — the admission boundary.
+    /// The worst (largest) `points` on the page.
     fn worst_points(&self) -> i64 {
         self.held
             .iter()
@@ -910,7 +975,7 @@ impl Mirror {
             .unwrap_or(0)
     }
 
-    /// A uniformly chosen held id, if any row is held.
+    /// A uniformly chosen id on the page, if any row is shown.
     fn random_id(&self, rng: &mut XorShift64) -> Option<i64> {
         if self.held.is_empty() {
             None
@@ -936,7 +1001,8 @@ impl WindowBench {
     /// One workload of [`WINDOW_WRITES`] writes, a coin flip between insert
     /// and delete each. Uniform: random points, random victim. Targeted:
     /// points drawn from twice the initial boundary (so about half are
-    /// admitted at first), victims drawn from the rows the window holds.
+    /// admitted at first), victims drawn from the rows the client's page
+    /// shows (every such delete moves the page and drains the buffer).
     fn run(&mut self, label: &str, targeted: bool) -> (Run, u64, u64) {
         let tickets_table = tickets_table();
         let before = self.ivm.engine().stats().clone();
@@ -1020,10 +1086,20 @@ fn window() {
     let snapshot: Vec<DataFrameOperation> = snapshot.into_iter().map(|update| update.op).collect();
     let mut mirror = Mirror::default();
     mirror.apply(&snapshot);
-    let initial_boundary = mirror.worst_points();
+    let buffer = SingleTableReadQuery::new(
+        tickets_table.name.clone(),
+        Where::AND(vec![]),
+        OrderBy::new("points", Order::ASC),
+        WINDOW_LIMIT * 2,
+    );
+    let initial_boundary = storage
+        .rows(&buffer)
+        .last()
+        .map_or(0, |(_, row)| Mirror::points_of(row));
     println!(
-        "registration: {} snapshot rows (buffer = 2 x limit) in {} us; initial boundary points < {initial_boundary}",
+        "registration: {} snapshot rows (the page; the engine buffers {} behind it) in {} us; initial boundary points < {initial_boundary}",
         snapshot.len(),
+        WINDOW_LIMIT * 2,
         one(registration.as_secs_f64() * 1e6)
     );
 
@@ -1074,7 +1150,7 @@ fn window() {
         &rows,
     );
     println!(
-        "final: window holds {} rows, boundary points < {}",
+        "final: the client's page holds {} rows, its worst points {}",
         bench.mirror.held.len(),
         bench.mirror.worst_points()
     );
@@ -1808,11 +1884,12 @@ fn xy_thread(user: &str, conversation: &str) -> MultiTableReadQuery {
     }
 }
 
-/// The board view of `board`: root, non-Support tickets with their
-/// assignments and stage ETAs.
+/// The board view of `board`: a page of [`XY_BOARD_PAGE`] root,
+/// non-Support tickets, newest first with `id` as the tiebreak, with
+/// their assignments and stage ETAs.
 fn xy_board(board: &str) -> MultiTableReadQuery {
     MultiTableReadQuery {
-        main_table: xy_query(
+        main_table: SingleTableReadQuery::new(
             "tickets",
             Where::AND(vec![
                 Where::condition("boardId", EQ, board),
@@ -1822,6 +1899,11 @@ fn xy_board(board: &str) -> MultiTableReadQuery {
                     Where::is_null("ticketType"),
                 ]),
             ]),
+            vec![
+                OrderBy::new("createdAt", Order::DESC),
+                OrderBy::new("id", Order::ASC),
+            ],
+            XY_BOARD_PAGE,
         ),
         left_joins: vec![
             xy_join(
@@ -2053,7 +2135,7 @@ fn xy_route(
 /// Scenario 6: the xyne-spaces query shapes over synthetic data.
 fn xyne_spaces() {
     println!(
-        "\n== 6. xyne-spaces: browsableChannels, conversationMessages under the channel ACL, the board view ({XY_USERS} users, {XY_CHANNELS} channels, {} conversations, {} messages, {XY_TICKETS} tickets) ==",
+        "\n== 6. xyne-spaces: browsableChannels, conversationMessages under the channel ACL, the board view as a page of {XY_BOARD_PAGE} ({XY_USERS} users, {XY_CHANNELS} channels, {} conversations, {} messages, {XY_TICKETS} tickets on {XY_BOARDS} boards) ==",
         XY_CHANNELS * XY_CONVERSATIONS_PER_CHANNEL,
         XY_CHANNELS * XY_CONVERSATIONS_PER_CHANNEL * XY_MESSAGES_PER_CONVERSATION
     );
@@ -2114,7 +2196,7 @@ fn xyne_spaces() {
                 thread_reads.to_string(),
             ],
             vec![
-                "board view".to_owned(),
+                format!("board view (page of {XY_BOARD_PAGE})"),
                 XY_USERS.to_string(),
                 XY_BOARDS.to_string(),
                 one(board_us),

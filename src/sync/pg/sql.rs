@@ -38,14 +38,21 @@ pub fn select_sql(query: &SingleTableReadQuery, table: &DbTable) -> String {
         render_where(&query.filter)
     );
     if query.limit != u32::MAX {
-        let direction = match query.order_by.direction {
-            Order::ASC => "ASC NULLS LAST",
-            Order::DESC => "DESC NULLS FIRST",
-        };
+        let clauses: Vec<String> = query
+            .order_by
+            .iter()
+            .map(|clause| {
+                let direction = match clause.direction {
+                    Order::ASC => "ASC NULLS LAST",
+                    Order::DESC => "DESC NULLS FIRST",
+                };
+                format!("{} {direction}", quote_ident(clause.column.as_str()))
+            })
+            .collect();
         let _ = write!(
             sql,
-            " ORDER BY {} {direction} LIMIT {}",
-            quote_ident(query.order_by.column.as_str()),
+            " ORDER BY {} LIMIT {}",
+            clauses.join(", "),
             query.limit
         );
     }

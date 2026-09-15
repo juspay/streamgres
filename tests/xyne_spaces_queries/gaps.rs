@@ -5,7 +5,7 @@
 
 use jus_sync::model::ComparisonOperator::{GT, NEQ};
 use jus_sync::model::Order::{ASC, DESC};
-use jus_sync::model::{Value, ValueType, Where};
+use jus_sync::model::{OrderBy, Value, ValueType, Where};
 use jus_sync::parser::parse_read;
 
 use super::catalog::catalog;
@@ -196,33 +196,56 @@ fn x_exists_inside_or_is_one_subscription() {
     );
 }
 
-/// Gap O: the parser takes one `ORDER BY` column and the builder drops the
-/// tiebreak, so `ORDER BY createdAt DESC, id ASC` orders by `createdAt`
-/// alone, and a related node's `ORDER BY … LIMIT 1` ships every related
-/// row: the "latest RCA" relation delivers both RCAs.
+/// Gap O, the tiebreak half closed: `ORDER BY createdAt DESC, id ASC` is
+/// one compound order, parsed and honored, so a page of two among tickets
+/// tying on `createdAt` is decided by `id`; and only the page ships (gap B
+/// closed: the doubled buffer is the engine's). The other half remains: a
+/// related node's `ORDER BY … LIMIT 1` ships every related row, the
+/// "latest RCA" relation delivering both RCAs.
 #[test]
-fn o_one_window_column_and_no_limit_below_the_root() {
-    let error = parse_read(
-        "SELECT * FROM tickets ORDER BY createdAt DESC, id ASC",
+fn o_compound_order_pages_by_the_tiebreak_and_related_limits_still_ship_all() {
+    let parsed = parse_read(
+        "SELECT * FROM tickets ORDER BY createdAt DESC, id ASC LIMIT 2",
         &catalog(),
     )
-    .expect_err("one column");
-    assert!(
-        error.message.contains("only one ORDER BY column"),
-        "{error}"
+    .expect("compound order");
+    assert_eq!(
+        parsed.order_by,
+        vec![OrderBy::new("createdAt", DESC), OrderBy::new("id", ASC)]
     );
-    let paged = zql("tickets")
-        .order_by("createdAt", DESC)
-        .order_by("id", ASC);
-    assert_eq!(paged.dropped_order(), ["id"]);
 
     let mut w = World::new();
-    w.seed("tickets", &[("id", "t1".into())]);
+    for (id, created) in [("t1", 100), ("t2", 100), ("t3", 100), ("t0", 200)] {
+        w.seed(
+            "tickets",
+            &[("id", id.into()), ("createdAt", created.into())],
+        );
+    }
+    let paged = zql("tickets")
+        .order_by("createdAt", DESC)
+        .order_by("id", ASC)
+        .limit(2);
+    assert_eq!(w.subscribe("q", &paged), ops(["q/main+t0", "q/main+t1"]));
+    assert_eq!(
+        w.insert(
+            "tickets",
+            &[("id", "t05".into()), ("createdAt", 100.into())]
+        ),
+        ops(["q/main+t05", "q/main-t1"]),
+        "a tie on createdAt is broken by id: t05 enters the page and t1 leaves it"
+    );
+    assert_eq!(
+        w.delete("tickets", "t0"),
+        ops(["q/main-t0", "q/main+t1"]),
+        "the buffer refills the page without a storage trip"
+    );
+
+    w.seed("tickets", &[("id", "t9".into())]);
     w.seed(
         "rcas",
         &[
             ("id", "r-old".into()),
-            ("ticketId", "t1".into()),
+            ("ticketId", "t9".into()),
             ("createdAt", 100.into()),
         ],
     );
@@ -230,16 +253,16 @@ fn o_one_window_column_and_no_limit_below_the_root() {
         "rcas",
         &[
             ("id", "r-new".into()),
-            ("ticketId", "t1".into()),
+            ("ticketId", "t9".into()),
             ("createdAt", 200.into()),
         ],
     );
     let latest_rca = zql("tickets")
-        .eq("id", "t1")
+        .eq("id", "t9")
         .related("rcas", |r| r.order_by("createdAt", DESC).limit(1));
     assert_eq!(
-        w.subscribe("q", &latest_rca),
-        ops(["q/main+t1", "q/rcas+r-old", "q/rcas+r-new"])
+        w.subscribe("latest", &latest_rca),
+        ops(["latest/main+t9", "latest/rcas+r-old", "latest/rcas+r-new"])
     );
 }
 
@@ -313,12 +336,12 @@ fn e_where_exists_ships_only_the_children_of_shown_parents() {
     );
 }
 
-/// Gaps S and B: `.one()` is a window of one row, and a window of `n`
-/// keeps a doubled buffer, so the client receives up to `2n` rows (here
-/// both conversations) and shows the best `n`; a better arrival evicts
-/// the worst buffered row.
+/// Gaps S and B, closed: `.one()` is a window of one row and the client
+/// receives exactly its page — the best row now — while the engine keeps
+/// a doubled buffer behind it: a better arrival replaces the shown row,
+/// and when the shown row goes the buffered one surfaces at once.
 #[test]
-fn s_and_b_one_is_a_window_with_a_buffer_of_two() {
+fn s_and_b_one_ships_exactly_one_row() {
     let mut w = World::new();
     w.seed(
         "conversations",
@@ -348,10 +371,7 @@ fn s_and_b_one_is_a_window_with_a_buffer_of_two() {
         .eq("channelId", "ch")
         .order_by("createdAt", DESC)
         .one();
-    assert_eq!(
-        w.subscribe("q", &latest),
-        ops(["q/main+c-new", "q/main+c-old"])
-    );
+    assert_eq!(w.subscribe("q", &latest), ops(["q/main+c-new"]));
     assert_eq!(
         w.insert(
             "conversations",
@@ -361,7 +381,11 @@ fn s_and_b_one_is_a_window_with_a_buffer_of_two() {
                 ("createdAt", 300.into())
             ]
         ),
-        ops(["q/main+c-newer", "q/main-c-old"])
+        ops(["q/main+c-newer", "q/main-c-new"])
+    );
+    assert_eq!(
+        w.delete("conversations", "c-newer"),
+        ops(["q/main-c-newer", "q/main+c-new"])
     );
 }
 

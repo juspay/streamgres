@@ -37,6 +37,28 @@
 //!   never push the refill threshold past storage rows that were never
 //!   fetched, and rows tying the frontier stay reachable.
 //!
+//! `ORDER BY` may name several columns, compared in turn. The order value
+//! of a row is then a tuple, the frontier one too, and the boundary and
+//! refill threshold become the lexicographic comparison spelled out as a
+//! predicate: for `ORDER BY a ASC, b ASC` and frontier `(fa, fb)` the
+//! admission boundary is `a < fa OR (a = fa AND b < fb)`, one branch per
+//! column with the earlier columns tied, each branch strict in its own
+//! direction; the refill threshold is the same shape with the operators
+//! reversed and the last column inclusive. A frontier with a `NULL` or
+//! `NaN` in any column is unenforceable, as for one column.
+//!
+//! **What the client sees.** The buffer is the engine's; the client is sent
+//! exactly the best `L` rows. After every step that touched a windowed
+//! subscription its raw operations are narrowed
+//! ([`SingleTableIVM::gate_window`]) to the difference between the previous
+//! and the current best-`L` prefix: a row entering the prefix is an `Add`
+//! (whether it arrived from storage or a write, or moved up from the
+//! buffer), a row leaving it a `Delete` (whether it left the buffer or was
+//! pushed down into it), a shown row rewritten in place its own operations
+//! (the `Delete` + `Add` pair the join layer diffs, one `Add` at the
+//! client); buffer rows below the prefix produce nothing. A twin registration and
+//! [`SingleTableIVM::rows_for`] see the same prefix.
+//!
 //! A storage read lands some time after it is asked for, and writes route
 //! in between. While one is out the window publishes **no boundary** (so
 //! no write the read will not return is turned away; arrivals are
@@ -66,19 +88,20 @@ use std::cmp::Ordering;
 
 use super::{SingleTableIVM, SingleTableUpdate};
 use crate::model::{
-    ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow,
-    Order, SingleTableReadQuery, SubId, Value, Where,
+    ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow, Order, OrderBy,
+    SingleTableReadQuery, SubId, TableName, Value, Where,
 };
 
 /// The ORDER BY / LIMIT state of one subscription: its held rows' order
-/// values, best → worst, and the storage frontier the boundary and the
-/// refill threshold are anchored at.
+/// values (one per `ORDER BY` column), best → worst, the storage frontier
+/// the boundary and the refill threshold are anchored at, and the keys
+/// last delivered to the client (the best-`L` prefix at the last step).
 pub(super) struct Window {
-    pub(super) column: ColumnName,
-    ascending: bool,
+    order: Vec<OrderBy>,
     user_limit: usize,
-    entries: Vec<(Value, DataFrameKey)>,
-    frontier: Option<Value>,
+    entries: Vec<(Vec<Value>, DataFrameKey)>,
+    frontier: Option<Vec<Value>>,
+    shown: Vec<DataFrameKey>,
 }
 
 impl Window {
@@ -90,11 +113,11 @@ impl Window {
             return None;
         }
         Some(Window {
-            column: query.order_by.column.clone(),
-            ascending: matches!(query.order_by.direction, Order::ASC),
+            order: query.order_by.clone(),
             user_limit: query.limit as usize,
             entries: Vec::new(),
             frontier: None,
+            shown: Vec::new(),
         })
     }
 
@@ -103,26 +126,43 @@ impl Window {
         self.user_limit * 2
     }
 
-    /// The order value of a row image (`Null` when the column is absent).
-    pub(super) fn order_value(&self, row: &DataFrameRow) -> Value {
-        row.data
-            .get(self.column.as_str())
-            .cloned()
-            .unwrap_or(Value::Null)
+    /// The order value of a row image: one value per `ORDER BY` column
+    /// (`Null` where the column is absent).
+    pub(super) fn order_value(&self, row: &DataFrameRow) -> Vec<Value> {
+        self.order
+            .iter()
+            .map(|clause| row.data.get(&clause.column).cloned().unwrap_or(Value::Null))
+            .collect()
     }
 
     /// Insert one row's order value, keeping best → worst order; ties land
     /// after their equals (stable). Idempotent: a key already present is
     /// re-inserted at its new value's position, never duplicated.
-    pub(super) fn insert(&mut self, value: Value, key: DataFrameKey) {
+    pub(super) fn insert(&mut self, value: Vec<Value>, key: DataFrameKey) {
         self.remove(&key);
-        let ascending = self.ascending;
         let position = self
             .entries
             .iter()
-            .position(|(existing, _)| is_worse(existing, &value, ascending))
+            .position(|(existing, _)| is_worse(existing, &value, &self.order))
             .unwrap_or(self.entries.len());
         self.entries.insert(position, (value, key));
+    }
+
+    /// The keys of the best `L` held rows: what the client is shown.
+    pub(super) fn shown_prefix(&self) -> Vec<DataFrameKey> {
+        self.entries
+            .iter()
+            .take(self.user_limit)
+            .map(|(_, key)| key.clone())
+            .collect()
+    }
+
+    /// Record the current prefix as delivered, returning the previous and
+    /// the current one for the gate to diff.
+    pub(super) fn take_shown(&mut self) -> (Vec<DataFrameKey>, Vec<DataFrameKey>) {
+        let current = self.shown_prefix();
+        let previous = std::mem::replace(&mut self.shown, current.clone());
+        (previous, current)
     }
 
     /// Drop one row from the window; reports whether it was present. The
@@ -158,23 +198,23 @@ impl Window {
     /// already at or better than it: the covered prefix only ever shrinks
     /// here (a held row that worsened in place past the frontier and is
     /// then evicted must not widen it).
-    fn cover(&mut self, value: Value) {
+    fn cover(&mut self, value: Vec<Value>) {
         let keep = self
             .frontier
             .as_ref()
-            .is_some_and(|frontier| !is_worse(frontier, &value, self.ascending));
+            .is_some_and(|frontier| !is_worse(frontier, &value, &self.order));
         if !keep {
             self.frontier = Some(value);
         }
     }
 
     /// The worst order value among fetched rows.
-    fn worst_of(&self, fetched: &[(DataFrameKey, DataFrameRow)]) -> Option<Value> {
+    fn worst_of(&self, fetched: &[(DataFrameKey, DataFrameRow)]) -> Option<Vec<Value>> {
         fetched
             .iter()
             .map(|(_, row)| self.order_value(row))
             .reduce(|worst, value| {
-                if is_worse(&value, &worst, self.ascending) {
+                if is_worse(&value, &worst, &self.order) {
                     value
                 } else {
                     worst
@@ -202,60 +242,61 @@ impl Window {
     }
 
     /// The current frontier — what a twin registration inherits.
-    pub(super) fn frontier(&self) -> Option<Value> {
+    pub(super) fn frontier(&self) -> Option<Vec<Value>> {
         self.frontier.clone()
     }
 
     /// Adopt a frontier wholesale (a twin's, whose held rows this window
     /// was just rebuilt from).
-    pub(super) fn set_frontier(&mut self, frontier: Option<Value>) {
+    pub(super) fn set_frontier(&mut self, frontier: Option<Vec<Value>>) {
         self.frontier = frontier;
     }
 
-    /// The admission boundary: strictly better than the frontier (`<` for
-    /// ASC, `>` for DESC). Absent while storage is exhausted, and absent
-    /// for an unenforceable (`Null`/`NaN`) frontier.
-    pub(super) fn boundary_condition(&self) -> Option<Condition> {
+    /// The admission boundary: strictly better than the frontier, column
+    /// by column (`<` for ASC, `>` for DESC, the earlier columns tied).
+    /// Absent while storage is exhausted, and absent for an unenforceable
+    /// frontier (`Null`/`NaN` in any column).
+    pub(super) fn boundary_condition(&self) -> Option<Where> {
         let frontier = self.frontier.as_ref()?;
         if !enforceable(frontier) {
             return None;
         }
-        let operator = if self.ascending {
-            ComparisonOperator::LT
-        } else {
-            ComparisonOperator::GT
-        };
-        Some(Condition::new(
-            self.column.clone(),
-            operator,
-            frontier.clone(),
+        Some(lexicographic(
+            &self.order,
+            frontier,
+            |direction, _| match direction {
+                Order::ASC => ComparisonOperator::LT,
+                Order::DESC => ComparisonOperator::GT,
+            },
         ))
     }
 
     /// The refill read as (limit, threshold): `None` when storage is
-    /// exhausted (nothing left to fetch). Otherwise the threshold is the
-    /// frontier inclusive (`>=` for ASC, `<=` for DESC) and the limit is
-    /// the missing count plus the held rows at or beyond the frontier,
-    /// which the threshold returns again and the upsert dedups; an
-    /// unenforceable frontier yields an unthresholded read sized to
-    /// capacity.
-    pub(super) fn refill_plan(&self) -> Option<(u32, Option<Condition>)> {
+    /// exhausted (nothing left to fetch). Otherwise the threshold is "at or
+    /// worse than the frontier" (`>` / `<` by direction with the earlier
+    /// columns tied, inclusive on the last column) and the limit is the
+    /// missing count plus the held rows at or beyond the frontier, which
+    /// the threshold returns again and the upsert dedups; an unenforceable
+    /// frontier yields an unthresholded read sized to capacity.
+    pub(super) fn refill_plan(&self) -> Option<(u32, Option<Where>)> {
         let frontier = self.frontier.as_ref()?;
         if !enforceable(frontier) {
             return Some((self.capacity() as u32, None));
         }
-        let operator = if self.ascending {
-            ComparisonOperator::GTE
-        } else {
-            ComparisonOperator::LTE
-        };
         let held_beyond = self
             .entries
             .iter()
-            .filter(|(value, _)| !is_worse(frontier, value, self.ascending))
+            .filter(|(value, _)| !is_worse(frontier, value, &self.order))
             .count();
         let limit = (self.missing() as usize + held_beyond) as u32;
-        let threshold = Condition::new(self.column.clone(), operator, frontier.clone());
+        let threshold = lexicographic(&self.order, frontier, |direction, last| {
+            match (direction, last) {
+                (Order::ASC, false) => ComparisonOperator::GT,
+                (Order::ASC, true) => ComparisonOperator::GTE,
+                (Order::DESC, false) => ComparisonOperator::LT,
+                (Order::DESC, true) => ComparisonOperator::LTE,
+            }
+        });
         Some((limit, Some(threshold)))
     }
 
@@ -286,22 +327,96 @@ pub(super) fn storage_limit(query: &SingleTableReadQuery) -> u32 {
     }
 }
 
-/// Whether a boundary value can be enforced as a predicate condition —
-/// comparisons touching `Null` or `NaN` are always false, so conditions
-/// built from them would reject or fetch nothing.
-fn enforceable(value: &Value) -> bool {
-    !value.is_null() && !matches!(value, Value::Float(f) if f.is_nan())
+/// Whether a frontier can be enforced as a predicate — comparisons
+/// touching `Null` or `NaN` are always false, so a condition built from
+/// one would reject or fetch nothing.
+fn enforceable(values: &[Value]) -> bool {
+    values
+        .iter()
+        .all(|value| !value.is_null() && !matches!(value, Value::Float(f) if f.is_nan()))
 }
 
-/// Whether `existing` sorts strictly worse than `candidate` for the given
-/// direction (worse = greater for ASC, less for DESC).
-fn is_worse(existing: &Value, candidate: &Value, ascending: bool) -> bool {
-    let ordering = order_cmp(existing, candidate);
-    if ascending {
-        ordering == Ordering::Greater
-    } else {
-        ordering == Ordering::Less
+/// Whether `existing` sorts strictly worse than `candidate` under `order`:
+/// the first column that differs decides, worse being greater for ASC and
+/// less for DESC; a full tie is not worse.
+fn is_worse(existing: &[Value], candidate: &[Value], order: &[OrderBy]) -> bool {
+    for (index, clause) in order.iter().enumerate() {
+        let ordering = order_cmp(
+            existing.get(index).unwrap_or(&Value::Null),
+            candidate.get(index).unwrap_or(&Value::Null),
+        );
+        if ordering == Ordering::Equal {
+            continue;
+        }
+        return match clause.direction {
+            Order::ASC => ordering == Ordering::Greater,
+            Order::DESC => ordering == Ordering::Less,
+        };
     }
+    false
+}
+
+/// The lexicographic comparison against `frontier` as a predicate: one
+/// branch per column, the earlier columns tied and the column itself
+/// compared with the operator `operator_for` picks from its direction and
+/// whether it is the last; a single column is the bare condition.
+fn lexicographic(
+    order: &[OrderBy],
+    frontier: &[Value],
+    operator_for: impl Fn(Order, bool) -> ComparisonOperator,
+) -> Where {
+    let branches: Vec<Where> = order
+        .iter()
+        .enumerate()
+        .map(|(index, clause)| {
+            let mut conjuncts: Vec<Where> = order[..index]
+                .iter()
+                .zip(frontier)
+                .map(|(tied, value)| {
+                    Where::Condition(Condition::new(
+                        tied.column.clone(),
+                        ComparisonOperator::EQ,
+                        value.clone(),
+                    ))
+                })
+                .collect();
+            conjuncts.push(Where::Condition(Condition::new(
+                clause.column.clone(),
+                operator_for(clause.direction, index + 1 == order.len()),
+                frontier.get(index).cloned().unwrap_or(Value::Null),
+            )));
+            if conjuncts.len() == 1 {
+                conjuncts.pop().expect("one conjunct")
+            } else {
+                Where::AND(conjuncts)
+            }
+        })
+        .collect();
+    if branches.len() == 1 {
+        branches.into_iter().next().expect("one branch")
+    } else {
+        Where::OR(branches)
+    }
+}
+
+/// The order of two rows under `order`: the first differing column
+/// decides, reversed for DESC; a full tie is `Equal`. The comparison the
+/// storage doubles sort by.
+pub fn order_rows(order: &[OrderBy], a: &DataFrameRow, b: &DataFrameRow) -> Ordering {
+    for clause in order {
+        let ordering = order_cmp(
+            a.data.get(&clause.column).unwrap_or(&Value::Null),
+            b.data.get(&clause.column).unwrap_or(&Value::Null),
+        );
+        if ordering == Ordering::Equal {
+            continue;
+        }
+        return match clause.direction {
+            Order::ASC => ordering,
+            Order::DESC => ordering.reverse(),
+        };
+    }
+    Ordering::Equal
 }
 
 /// Total order over [`Value`]s for window and storage sorting: delegates
@@ -347,19 +462,14 @@ impl SingleTableIVM {
     /// table's routing index — the `boundaries` side table `matched()`
     /// filters candidates through. Called after every change that can
     /// move the boundary; a `LIMIT 0` query publishes the always-false
-    /// `IN ()`, and a subscription with a storage read out publishes
-    /// none.
+    /// `OR()`, and a subscription with a storage read out publishes none.
     pub(super) fn sync_boundary(&mut self, sub: SubId) {
         let Some(query) = self.select_queries.get(&sub) else {
             return;
         };
         let table = query.table.clone();
         let boundary = if query.limit == 0 {
-            Some(Condition::new(
-                query.order_by.column.clone(),
-                ComparisonOperator::IN,
-                Value::List(Vec::new()),
-            ))
+            Some(Where::OR(Vec::new()))
         } else if self.is_pending(sub) {
             None
         } else {
@@ -437,7 +547,7 @@ impl SingleTableIVM {
             return;
         }
         let mut parts = vec![query.filter.clone()];
-        parts.extend(threshold.map(Where::Condition));
+        parts.extend(threshold);
         let refill_query = SingleTableReadQuery {
             table: query.table.clone(),
             filter: Where::AND(parts),
@@ -494,5 +604,108 @@ impl SingleTableIVM {
                 op,
             })
             .collect()
+    }
+
+    /// Narrow one windowed subscription's raw operations to the client's
+    /// view: the difference between the prefix delivered last time and the
+    /// best-`L` prefix now, plus the raw operations of a row that stays in
+    /// the prefix (a rewrite's `Delete` + `Add` pair, which the join layer
+    /// diffs; see the module header). A subscription without a window
+    /// passes its operations through.
+    pub(super) fn gate_window(
+        &mut self,
+        sub: SubId,
+        raw: Vec<DataFrameOperation>,
+    ) -> Vec<DataFrameOperation> {
+        let (previous, current) = match self.windows.get_mut(&sub) {
+            Some(window) => window.take_shown(),
+            None => return raw,
+        };
+        let frame = self
+            .select_queries
+            .get(&sub)
+            .and_then(|query| self.frames.get(&query.table));
+        let latest = |key: &DataFrameKey, adds: bool| -> Option<DataFrameRow> {
+            raw.iter()
+                .rev()
+                .find_map(|op| match (op, adds) {
+                    (DataFrameOperation::Add(candidate, row), true)
+                    | (DataFrameOperation::Delete(candidate, row), false)
+                        if candidate == key =>
+                    {
+                        Some(row.clone())
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    frame
+                        .and_then(|frame| frame.get(key))
+                        .map(|row| row.data.clone())
+                })
+        };
+        let mut out = Vec::new();
+        for key in previous.iter().filter(|key| !current.contains(key)) {
+            if let Some(image) = latest(key, false) {
+                out.push(DataFrameOperation::Delete(key.clone(), image));
+            }
+        }
+        for key in &current {
+            if !previous.contains(key) {
+                if let Some(image) = latest(key, true) {
+                    out.push(DataFrameOperation::Add(key.clone(), image));
+                }
+            } else {
+                out.extend(raw.iter().filter(|op| op.key() == key).cloned());
+            }
+        }
+        out
+    }
+
+    /// Gate the windowed subscriptions among `subs` in `updates`: their
+    /// raw operations are replaced by [`SingleTableIVM::gate_window`]'s
+    /// result, every other update passes through in order.
+    pub(super) fn gate_updates(
+        &mut self,
+        subs: &[SubId],
+        updates: Vec<SingleTableUpdate>,
+    ) -> Vec<SingleTableUpdate> {
+        let windowed: Vec<SubId> = subs
+            .iter()
+            .copied()
+            .filter(|sub| self.windows.contains_key(sub))
+            .fold(Vec::new(), |mut seen, sub| {
+                if !seen.contains(&sub) {
+                    seen.push(sub);
+                }
+                seen
+            });
+        if windowed.is_empty() {
+            return updates;
+        }
+        let mut out = Vec::new();
+        let mut raw: Vec<(SubId, TableName, Vec<DataFrameOperation>)> = windowed
+            .iter()
+            .filter_map(|sub| {
+                self.select_queries
+                    .get(sub)
+                    .map(|query| (*sub, query.table.clone(), Vec::new()))
+            })
+            .collect();
+        for update in updates {
+            match raw.iter_mut().find(|(sub, _, _)| *sub == update.query) {
+                Some((_, _, ops)) => ops.push(update.op),
+                None => out.push(update),
+            }
+        }
+        for (sub, table, ops) in raw {
+            for op in self.gate_window(sub, ops) {
+                out.push(SingleTableUpdate {
+                    query: sub,
+                    table: table.clone(),
+                    op,
+                });
+            }
+        }
+        out
     }
 }

@@ -894,11 +894,12 @@ fn late_identical_registration_inherits_the_twins_rows() {
     assert_eq!(ivm.engine().rows_for(names.id("late")).unwrap().len(), 2);
 }
 
-/// ORDER BY + LIMIT: the engine buffers twice the requested limit, admits
-/// only rows strictly better than the storage frontier (evicting the
-/// worst past capacity), keeps a held row that worsens in place until a
-/// better arrival evicts it, and refills from storage when a removal
-/// drains the buffer to the requested limit.
+/// ORDER BY + LIMIT: the client receives exactly the requested rows while
+/// the engine buffers twice as many. An arrival better than the storage
+/// frontier enters the buffer (evicting the worst past capacity) and ships
+/// only if it enters the page; a held row that worsens in place keeps its
+/// buffer slot but leaves the page; removals drain the buffer to the limit
+/// before a storage refill; and a buffered row surfaces without one.
 #[test]
 fn limit_window_admits_evicts_and_refills() {
     let tickets = table("tickets");
@@ -915,17 +916,30 @@ fn limit_window_admits_evicts_and_refills() {
         2,
     );
     let snapshot = names.register(&mut ivm, "w", windowed);
-    assert_eq!(snapshot.len(), 4, "the buffer holds twice the limit");
+    assert_eq!(
+        snapshot.len(),
+        2,
+        "the client receives the limit, not the buffer"
+    );
 
     let admit = insert(&tickets, 7, &[("points", 5.into())]);
     storage.apply(&admit);
     let ops = ivm.incremental_update(&admit);
-    assert_eq!(ops.len(), 2, "admission plus eviction, got {ops:?}");
-    assert!(
-        matches!(&ops[0].op, DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(7))
+    assert_eq!(
+        ops.len(),
+        2,
+        "5 enters the page and 20 leaves it, got {ops:?}"
     );
     assert!(
-        matches!(&ops[1].op, DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(4))
+        matches!(&ops[0].op, DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(2))
+    );
+    assert!(
+        matches!(&ops[1].op, DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(7))
+    );
+    assert_eq!(
+        ivm.engine().stats().window_evictions,
+        1,
+        "40 left the buffer without the client hearing of it"
     );
 
     let reject = insert(&tickets, 8, &[("points", 100.into())]);
@@ -940,33 +954,50 @@ fn limit_window_admits_evicts_and_refills() {
         storage.apply(&removal);
         ivm.incremental_update(&removal);
     }
-    assert_eq!(
-        ivm.engine().rows_for(names.id("w")).unwrap().len(),
-        4,
+    assert_eq!(ivm.engine().rows_for(names.id("w")).unwrap().len(), 2);
+    assert!(
+        ivm.engine().stats().window_refills >= 1,
         "draining to the limit refilled the buffer from storage"
     );
-    assert_eq!(ivm.engine().stats().window_evictions, 1);
-    assert!(ivm.engine().stats().window_refills >= 1);
 
     let worsen = update(&tickets, 2, &[("points", 999.into())]);
     storage.apply(&worsen);
     let ops = ivm.incremental_update(&worsen);
+    assert_eq!(names.impacted(&ops), vec!["w"]);
     assert_eq!(
-        names.impacted(&ops),
-        vec!["w"],
-        "a held row worsening keeps its slot (one Add with the new image), got {ops:?}"
+        ops.len(),
+        2,
+        "the worsened row leaves the page and the buffered 40 takes its place, got {ops:?}"
     );
-    assert_eq!(ops.len(), 1);
-    assert_eq!(ivm.engine().rows_for(names.id("w")).unwrap().len(), 4);
+    assert!(
+        matches!(&ops[0].op, DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(2))
+    );
+    assert!(
+        matches!(&ops[1].op, DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(4))
+    );
 
     let better = insert(&tickets, 9, &[("points", 45.into())]);
     storage.apply(&better);
     let ops = ivm.incremental_update(&better);
-    assert_eq!(ops.len(), 2);
     assert!(
-        matches!(&ops[1].op, DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(2)),
-        "the worsened row is the one a better arrival evicts, got {ops:?}"
+        ops.is_empty(),
+        "45 is buffered behind the page of 30, 40, got {ops:?}"
     );
+    assert_eq!(
+        ivm.engine().stats().window_evictions,
+        2,
+        "the worsened row is the one a better arrival evicts"
+    );
+
+    let refills = ivm.engine().stats().window_refills;
+    let removal = delete(&tickets, 3);
+    storage.apply(&removal);
+    let ops = ivm.incremental_update(&removal);
+    assert!(
+        matches!(&ops[1].op, DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(9)),
+        "the buffered 45 surfaces without a refill, got {ops:?}"
+    );
+    assert_eq!(ivm.engine().stats().window_refills, refills);
 }
 
 /// Regression (review): a subscription between `replace_query` and the
@@ -1113,8 +1144,8 @@ fn limit_zero_subscription_stays_empty() {
     assert!(ivm.engine().rows_for(names.id("z")).unwrap().is_empty());
 }
 
-/// A DESC window mirrors the ASC behaviors: the snapshot loads the top
-/// rows, admission requires strictly beating the smallest held value,
+/// A DESC window mirrors the ASC behaviors: the page shows the largest
+/// rows, admission requires strictly beating the smallest buffered value,
 /// eviction drops the smallest, and refills walk downward.
 #[test]
 fn desc_window_admits_evicts_and_refills() {
@@ -1132,27 +1163,25 @@ fn desc_window_admits_evicts_and_refills() {
         2,
     );
     let snapshot = names.register(&mut ivm, "w", windowed);
-    assert_eq!(snapshot.len(), 4);
-    let mut held: Vec<Value> = ivm
-        .engine()
-        .rows_for(names.id("w"))
-        .unwrap()
-        .values()
-        .map(|row| row.data["points"].clone())
-        .collect();
-    held.sort_by_key(|value| match value {
-        Value::Int(i) => *i,
-        _ => 0,
-    });
+    assert_eq!(snapshot.len(), 2);
+    let held = |ivm: &Ivm| -> Vec<Value> {
+        let mut held: Vec<Value> = ivm
+            .engine()
+            .rows_for(names.id("w"))
+            .unwrap()
+            .values()
+            .map(|row| row.data["points"].clone())
+            .collect();
+        held.sort_by_key(|value| match value {
+            Value::Int(i) => *i,
+            _ => 0,
+        });
+        held
+    };
     assert_eq!(
-        held,
-        vec![
-            Value::Int(30),
-            Value::Int(40),
-            Value::Int(50),
-            Value::Int(60)
-        ],
-        "DESC loads the four LARGEST"
+        held(&ivm),
+        vec![Value::Int(50), Value::Int(60)],
+        "DESC shows the two LARGEST"
     );
 
     let admit = insert(&tickets, 7, &[("points", 100.into())]);
@@ -1161,11 +1190,15 @@ fn desc_window_admits_evicts_and_refills() {
     assert_eq!(
         ops.len(),
         2,
-        "the best row is admitted and 30 evicted, got {ops:?}"
+        "100 enters the page and 50 leaves it (30 leaves the buffer), got {ops:?}"
     );
     assert!(
-        matches!(&ops[1].op, DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(3))
+        matches!(&ops[0].op, DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(5))
     );
+    assert!(
+        matches!(&ops[1].op, DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(7))
+    );
+    assert_eq!(ivm.engine().stats().window_evictions, 1);
 
     let reject = insert(&tickets, 8, &[("points", 5.into())]);
     storage.apply(&reject);
@@ -1177,15 +1210,16 @@ fn desc_window_admits_evicts_and_refills() {
         ivm.incremental_update(&removal);
     }
     assert_eq!(
-        ivm.engine().rows_for(names.id("w")).unwrap().len(),
-        4,
-        "drained to the limit — refilled downward from storage"
+        held(&ivm),
+        vec![Value::Int(40), Value::Int(50)],
+        "drained to the limit — refilled downward from storage; the page is exact"
     );
+    assert!(ivm.engine().stats().window_refills >= 1);
 }
 
 /// A fetch into a windowed subscription maintains the window: fetched
-/// rows enter it and overflow evicts the worst, so the buffer never
-/// silently overruns.
+/// rows enter the buffer and overflow evicts the worst, while the client
+/// sees only the page's change.
 #[test]
 fn fetch_respects_the_window() {
     let tickets = table("tickets");
@@ -1201,7 +1235,7 @@ fn fetch_respects_the_window() {
         OrderBy::new("points", Order::ASC),
         2,
     );
-    assert_eq!(names.register(&mut ivm, "w", windowed).len(), 4);
+    assert_eq!(names.register(&mut ivm, "w", windowed).len(), 2);
     storage.apply(&insert(&tickets, 5, &[("points", 1.into())]));
 
     ivm.engine_mut()
@@ -1210,15 +1244,20 @@ fn fetch_respects_the_window() {
     assert_eq!(
         ops.len(),
         2,
-        "fetched Add plus overflow eviction, got {ops:?}"
+        "the fetched 1 enters the page and 20 leaves it, got {ops:?}"
     );
     assert!(
-        matches!(&ops[0], DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(5))
+        matches!(&ops[0], DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(2))
     );
     assert!(
-        matches!(&ops[1], DataFrameOperation::Delete(key, _) if key.pkey_value["id"] == Value::Int(4))
+        matches!(&ops[1], DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(5))
     );
-    assert_eq!(ivm.engine().rows_for(names.id("w")).unwrap().len(), 4);
+    assert_eq!(ivm.engine().rows_for(names.id("w")).unwrap().len(), 2);
+    assert_eq!(
+        ivm.engine().stats().window_evictions,
+        1,
+        "40 overflowed the buffer"
+    );
 }
 
 /// The identical-query snapshot happens WITHOUT a storage round-trip: a
@@ -1250,9 +1289,9 @@ fn identical_registration_skips_storage() {
 /// Regression (review): the admission boundary is anchored at the storage
 /// frontier, not at the worst held row. After a delete leaves the buffer
 /// below capacity, an arrival beyond the frontier is still rejected (the
-/// rows still in storage are better), a twin inherits the same frontier,
-/// and the refill that follows a drain fetches from the frontier so the
-/// held top-L stays exact.
+/// rows still in storage are better) while one inside it is buffered for
+/// both twins, out of sight until a page drains to it, and the refill that
+/// follows a drain fetches from the frontier so the page stays exact.
 #[test]
 fn window_boundary_survives_a_deletion() {
     let tickets = table("tickets");
@@ -1268,15 +1307,16 @@ fn window_boundary_survives_a_deletion() {
         OrderBy::new("points", Order::ASC),
         2,
     );
-    assert_eq!(names.register(&mut ivm, "w", windowed.clone()).len(), 4);
-    assert_eq!(names.register(&mut ivm, "twin", windowed).len(), 4);
+    assert_eq!(names.register(&mut ivm, "w", windowed.clone()).len(), 2);
+    assert_eq!(names.register(&mut ivm, "twin", windowed).len(), 2);
 
     let removal = delete(&tickets, 1);
     storage.apply(&removal);
     ivm.incremental_update(&removal);
+    assert_eq!(ivm.engine().rows_for(names.id("w")).unwrap().len(), 2);
     assert_eq!(
-        ivm.engine().rows_for(names.id("w")).unwrap().len(),
-        3,
+        ivm.engine().stats().window_refills,
+        0,
         "below capacity, above the limit: no refill"
     );
 
@@ -1290,18 +1330,31 @@ fn window_boundary_survives_a_deletion() {
     let within = insert(&tickets, 10, &[("points", 35.into())]);
     storage.apply(&within);
     let ops = ivm.incremental_update(&within);
-    assert_eq!(
-        names.impacted(&ops),
-        vec!["twin", "w"],
-        "inside the frontier: admitted, got {ops:?}"
+    assert!(
+        ops.is_empty(),
+        "inside the frontier: buffered, behind the page of 20, 30, got {ops:?}"
     );
-    assert_eq!(ops.len(), 2, "no eviction while the buffer has room");
 
-    for id in [2, 3] {
-        let removal = delete(&tickets, id);
-        storage.apply(&removal);
-        ivm.incremental_update(&removal);
-    }
+    let removal = delete(&tickets, 2);
+    storage.apply(&removal);
+    let ops = ivm.incremental_update(&removal);
+    assert_eq!(names.impacted(&ops), vec!["twin", "w"]);
+    assert!(
+        ops.iter().any(|update| matches!(
+            &update.op,
+            DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(10)
+        )),
+        "the buffered 35 takes the vacated slot on both pages, got {ops:?}"
+    );
+    assert_eq!(
+        ivm.engine().stats().window_refills,
+        0,
+        "served from the buffer"
+    );
+
+    let removal = delete(&tickets, 3);
+    storage.apply(&removal);
+    ivm.incremental_update(&removal);
     let mut held: Vec<i64> = ivm
         .engine()
         .rows_for(names.id("w"))
@@ -1315,15 +1368,17 @@ fn window_boundary_survives_a_deletion() {
     held.sort_unstable();
     assert_eq!(
         held,
-        vec![35, 40, 50, 60],
-        "the refill walked storage from the frontier; the top-2 is exact"
+        vec![35, 40],
+        "the refill walked storage from the frontier; the page is exact"
     );
+    assert!(ivm.engine().stats().window_refills >= 1);
 }
 
 /// Regression (review): rows tying the frontier are reachable. With four
-/// rows sharing the boundary value and two of them held, refills fetch
-/// from the frontier inclusive and dedup the held ties, so the held top-L
-/// never contains a strictly worse row while a tied one sits in storage.
+/// rows sharing the boundary value and two of them buffered, refills fetch
+/// from the frontier inclusive and dedup the held ties, so the page never
+/// shows a strictly worse row while a tied one sits in storage; once
+/// storage is exhausted there is no boundary and arrivals are buffered.
 #[test]
 fn window_refill_reaches_rows_tying_the_frontier() {
     let tickets = table("tickets");
@@ -1339,7 +1394,7 @@ fn window_refill_reaches_rows_tying_the_frontier() {
         OrderBy::new("points", Order::ASC),
         2,
     );
-    assert_eq!(names.register(&mut ivm, "w", windowed).len(), 4);
+    assert_eq!(names.register(&mut ivm, "w", windowed).len(), 2);
 
     for id in [1, 2] {
         let removal = delete(&tickets, id);
@@ -1362,36 +1417,49 @@ fn window_refill_reaches_rows_tying_the_frontier() {
     };
     assert_eq!(
         points_of(&ivm),
-        vec![3, 3, 3, 3],
+        vec![3, 3],
         "the refill fetched the unheld ties, not the 5"
     );
 
-    let held_ids: Vec<i64> = ivm
-        .engine()
-        .rows_for(names.id("w"))
-        .unwrap()
-        .keys()
-        .map(|key| match key.pkey_value["id"] {
-            Value::Int(id) => id,
-            _ => unreachable!(),
-        })
-        .collect();
-    for id in held_ids.into_iter().take(2) {
+    let shown_ids = |ivm: &Ivm| -> Vec<i64> {
+        ivm.engine()
+            .rows_for(names.id("w"))
+            .unwrap()
+            .keys()
+            .map(|key| match key.pkey_value["id"] {
+                Value::Int(id) => id,
+                _ => unreachable!(),
+            })
+            .collect()
+    };
+    for id in shown_ids(&ivm) {
         let removal = delete(&tickets, id);
         storage.apply(&removal);
         ivm.incremental_update(&removal);
     }
     assert_eq!(
         points_of(&ivm),
-        vec![3, 3, 5],
-        "storage exhausted: the two remaining ties and the 5 are all held"
+        vec![3, 3],
+        "the two remaining ties come out of the buffer and the refill, ahead of the 5"
     );
+
+    let arrival = insert(&tickets, 8, &[("points", 4.into())]);
+    storage.apply(&arrival);
     assert!(
-        ivm.incremental_update(&insert(&tickets, 8, &[("points", 4.into())]))
-            .len()
-            == 1,
-        "with storage exhausted there is no boundary: a matching arrival is admitted"
+        ivm.incremental_update(&arrival).is_empty(),
+        "storage exhausted, so no boundary: the 4 is buffered behind the ties"
     );
+    let removal = delete(&tickets, shown_ids(&ivm)[0]);
+    storage.apply(&removal);
+    let ops = ivm.incremental_update(&removal);
+    assert!(
+        ops.iter().any(|update| matches!(
+            &update.op,
+            DataFrameOperation::Add(key, _) if key.pkey_value["id"] == Value::Int(8)
+        )),
+        "the buffered 4 surfaces ahead of the 5, got {ops:?}"
+    );
+    assert_eq!(points_of(&ivm), vec![3, 4]);
 }
 
 /// Disjunct identity is canonical: the same conditions in a different

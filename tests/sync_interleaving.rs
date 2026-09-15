@@ -468,10 +468,10 @@ fn narrowed_join_fetch_defers_to_later_writes() {
 }
 
 /// A refill is out while the window's table is written: the boundary is
-/// open meanwhile, so rows the refill will not return are admitted (and
-/// evicted past capacity), and landing re-derives the frontier so the
-/// window ends up holding exactly the best rows and rejects worse ones
-/// again.
+/// open meanwhile, so rows the refill will not return are buffered (and
+/// evicted past capacity once it lands), landing re-derives the frontier
+/// so the buffer holds exactly the best rows and rejects worse ones again,
+/// and the client sees nothing but its page move.
 #[test]
 fn refill_in_flight_keeps_the_window_exact() {
     let mut db = Db::at(0);
@@ -493,7 +493,7 @@ fn refill_in_flight_keeps_the_window_exact() {
     settle(&mut runtime, &db, step);
     assert_eq!(
         ids(runtime.engine().rows_for(sub)),
-        BTreeSet::from([10, 20, 30, 40])
+        BTreeSet::from([10, 20])
     );
 
     stream(&mut runtime, &mut db, &delete("tickets", 10));
@@ -507,28 +507,30 @@ fn refill_in_flight_keeps_the_window_exact() {
     assert_eq!(snapshot.rows.len(), 3, "40, 50, 60");
 
     let admitted = stream(&mut runtime, &mut db, &ticket(45, "OPEN", 7, 45)).updates;
-    assert_eq!(admitted.len(), 1, "boundary open while the refill is out");
+    assert!(
+        admitted.is_empty(),
+        "boundary open while the refill is out: buffered behind the page of 30, 40, got {admitted:?}"
+    );
     let admitted = stream(&mut runtime, &mut db, &ticket(100, "OPEN", 7, 100)).updates;
-    assert_eq!(
-        admitted.len(),
-        1,
-        "even a row far beyond the old frontier is admitted for now"
+    assert!(
+        admitted.is_empty(),
+        "even a row far beyond the old frontier is buffered for now, got {admitted:?}"
     );
 
     let landed = runtime.fetched(refill.id, snapshot);
     assert_eq!(
         ids(runtime.engine().rows_for(sub)),
-        BTreeSet::from([30, 40, 45, 50])
+        BTreeSet::from([30, 40])
     );
-    let deletes = landed
-        .updates
-        .iter()
-        .filter(|update| matches!(update.op, DataFrameOperation::Delete(..)))
-        .count();
-    assert_eq!(
-        deletes, 2,
-        "60 and 100 evicted past capacity, got {:?}",
+    assert!(
+        landed.updates.is_empty(),
+        "the page did not move, got {:?}",
         landed.updates
+    );
+    assert_eq!(
+        runtime.engine().stats().window_evictions,
+        2,
+        "60 and 100 evicted past capacity"
     );
 
     assert!(
@@ -538,12 +540,26 @@ fn refill_in_flight_keeps_the_window_exact() {
         "the boundary is back: worse than the frontier is rejected"
     );
     let step = stream(&mut runtime, &mut db, &ticket(35, "OPEN", 7, 35));
-    assert_eq!(step.updates.len(), 2, "admitted, worst evicted");
+    assert_eq!(
+        step.updates.len(),
+        2,
+        "35 enters the page and 40 leaves it, got {:?}",
+        step.updates
+    );
     assert_eq!(
         ids(runtime.engine().rows_for(sub)),
-        BTreeSet::from([30, 35, 40, 45])
+        BTreeSet::from([30, 35])
     );
     assert_eq!(runtime.outstanding(), 0);
+
+    stream(&mut runtime, &mut db, &delete("tickets", 30));
+    let step = stream(&mut runtime, &mut db, &delete("tickets", 35));
+    assert_eq!(
+        ids(runtime.engine().rows_for(sub)),
+        BTreeSet::from([40, 45]),
+        "the 45 buffered while the refill was out surfaces from the buffer"
+    );
+    only(&step);
 }
 
 /// Registration walks the tree as reads land: a RIGHT child's read comes

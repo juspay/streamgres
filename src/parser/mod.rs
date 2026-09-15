@@ -10,7 +10,7 @@
 //! ```text
 //! query     := read | write
 //! read      := SELECT '*' FROM ident [WHERE filter]
-//!              [ORDER BY column [ASC | DESC]] [LIMIT integer]
+//!              [ORDER BY column [ASC | DESC] (, column [ASC | DESC])*] [LIMIT integer]
 //! write     := INSERT INTO ident '(' ident (',' ident)* ')' VALUES row
 //!            | UPDATE ident SET assign (',' assign)* WHERE filter
 //!            | DELETE FROM ident WHERE filter
@@ -505,23 +505,23 @@ impl Parser {
 
         let order_by = if self.eat_word("ORDER") {
             self.expect_word("BY")?;
-            let at = self.at();
-            let column = self.column_name(table)?;
-            let direction = if self.eat_word("DESC") {
-                Order::DESC
-            } else {
-                self.eat_word("ASC");
-                Order::ASC
-            };
-            if self.is_sym(",") {
-                return Err(ParseError {
-                    message: "only one ORDER BY column is supported yet".into(),
-                    position: at,
-                });
+            let mut clauses = Vec::new();
+            loop {
+                let column = self.column_name(table)?;
+                let direction = if self.eat_word("DESC") {
+                    Order::DESC
+                } else {
+                    self.eat_word("ASC");
+                    Order::ASC
+                };
+                clauses.push(OrderBy::new(column, direction));
+                if !self.eat_sym(",") {
+                    break;
+                }
             }
-            OrderBy::new(column, direction)
+            clauses
         } else {
-            default_order(table, self.at())?
+            vec![default_order(table, self.at())?]
         };
 
         let limit = if self.eat_word("LIMIT") {
@@ -1149,9 +1149,23 @@ mod tests {
                 Where::condition("points", ComparisonOperator::GTE, 8),
             ])
         );
-        assert_eq!(q.order_by.column, "points");
-        assert_eq!(q.order_by.direction, Order::DESC);
+        assert_eq!(q.order_by, vec![OrderBy::new("points", Order::DESC)]);
         assert_eq!(q.limit, 10);
+    }
+
+    /// Several `ORDER BY` columns parse in order, each with its own
+    /// direction, `ASC` the default.
+    #[test]
+    fn parses_compound_order() {
+        let q = read("SELECT * FROM tickets ORDER BY points DESC, status, id ASC LIMIT 3");
+        assert_eq!(
+            q.order_by,
+            vec![
+                OrderBy::new("points", Order::DESC),
+                OrderBy::new("status", Order::ASC),
+                OrderBy::new("id", Order::ASC),
+            ]
+        );
     }
 
     /// A bare SELECT defaults to a vacuous filter, pkey-ascending order,
@@ -1160,8 +1174,7 @@ mod tests {
     fn select_defaults_no_filter_pkey_order_unbounded_limit() {
         let q = read("SELECT * FROM tickets");
         assert_eq!(q.filter, Where::AND(vec![]));
-        assert_eq!(q.order_by.column, "id");
-        assert_eq!(q.order_by.direction, Order::ASC);
+        assert_eq!(q.order_by, vec![OrderBy::new("id", Order::ASC)]);
         assert_eq!(q.limit, u32::MAX);
     }
 
@@ -1178,7 +1191,7 @@ mod tests {
             ],
         )]);
         let q = parse_read("SELECT * FROM events", &catalog).expect("should parse");
-        assert_eq!(q.order_by.column, "ts");
+        assert_eq!(q.order_by[0].column, "ts");
     }
 
     /// `AND` groups before `OR`, and parentheses override that precedence.
@@ -1337,10 +1350,6 @@ mod tests {
             ),
             ("SELECT * FROM nope", "unknown table"),
             ("SELECT * FROM tickets WHERE ghost = 1", "unknown column"),
-            (
-                "SELECT * FROM tickets ORDER BY id, points",
-                "one ORDER BY column",
-            ),
             (
                 "INSERT INTO tickets (status) VALUES ('x')",
                 "every primary-key column",

@@ -323,8 +323,7 @@ fn tickets_query_v2() {
 }
 
 /// `kanbanTicketsPage` (board `b1`, column Todo, priority HIGH or MEDIUM,
-/// a page of 10), the untyped `t0` included. Gap O: the `id` tiebreak is
-/// dropped.
+/// a page of 10), the untyped `t0` included.
 #[test]
 fn kanban_tickets_page() {
     let mut w = World::new();
@@ -363,8 +362,7 @@ fn kanban_tickets_page() {
 /// `kanbanTicketsPageV2` with a role-assignment filter and overdue-only:
 /// two existence tests on the same root, both required (their referenced
 /// sets intersect), a keyset cursor rewritten as a `WHERE`; a left stage
-/// (`stageLeftAt` set) does not count as overdue. Gap O drops the `id`
-/// tiebreak.
+/// (`stageLeftAt` set) does not count as overdue.
 #[test]
 fn kanban_tickets_page_v2() {
     let mut w = World::new();
@@ -430,8 +428,7 @@ fn kanban_tickets_page_v2() {
 }
 
 /// `kanbanTicketsPageV3`: the overdue flag is a column, the page is a
-/// `createdAt` window `[createdAfter, cursor]`. Gap O drops the `id`
-/// tiebreak.
+/// `createdAt` window `[createdAfter, cursor]`.
 #[test]
 fn kanban_tickets_page_v3() {
     let mut w = World::new();
@@ -697,8 +694,8 @@ fn ticket_details_by_id_v2() {
 }
 
 /// `ticketByXyneId`: lookup by the human id; a second ticket with the same
-/// id in another workspace is invisible, one in this workspace joins the
-/// `.one()` buffer (gap B).
+/// id in another workspace is invisible, one in this workspace waits in
+/// the `.one()` buffer and surfaces when the shown ticket goes.
 #[test]
 fn ticket_by_xyne_id() {
     let mut w = World::new();
@@ -734,7 +731,20 @@ fn ticket_by_xyne_id() {
     );
     assert_eq!(
         w.insert("tickets", row!["id" => "t9", "xyneId" => "X-1"]),
-        ops(["q/main+t9"])
+        ops([])
+    );
+    assert_eq!(
+        w.delete("tickets", "t1"),
+        ops([
+            "q/main-t1",
+            "q/project-p1",
+            "q/tags-tg1",
+            "q/referencesOut-rm1",
+            "q/referencesOut.targetTicket-t2",
+            "q/entity-em1",
+            "q/conversation-cv1",
+            "q/main+t9"
+        ])
     );
 }
 
@@ -1078,7 +1088,7 @@ fn ticket_activities() {
 }
 
 /// `ticketActivitiesForTickets`: a page across several tickets below a
-/// timestamp cursor. Gap O: the `id` tiebreak is dropped.
+/// timestamp cursor.
 #[test]
 fn ticket_activities_for_tickets() {
     let mut w = World::new();
@@ -1176,8 +1186,7 @@ fn seed_project_tags(w: &mut World) {
 }
 
 /// `projectTagsByProjectId`: a name-ordered page after the cursor
-/// `(name 'b', id 'x')`, spelled as a `WHERE`. Gap O: the `id` tiebreak is
-/// dropped.
+/// `(name 'b', id 'x')`, spelled as a `WHERE`.
 #[test]
 fn project_tags_by_project_id() {
     let mut w = World::new();
@@ -1458,8 +1467,8 @@ fn rca_by_id() {
     );
 }
 
-/// `rcaByTicketId`: the RCA of a ticket. Gap B: `.one()` keeps a buffer of
-/// two, so both RCAs of `t1` arrive.
+/// `rcaByTicketId`: the RCA of a ticket — `.one()` shows the first by id
+/// though `t1` has two.
 #[test]
 fn rca_by_ticket_id() {
     let mut w = World::new();
@@ -1473,13 +1482,7 @@ fn rca_by_ticket_id() {
         .one();
     assert_eq!(
         w.subscribe("q", &q),
-        ops([
-            "q/main+rc1",
-            "q/main+rc2",
-            "q/impacts+im1",
-            "q/coes+co1",
-            "q/ticket+t1"
-        ])
+        ops(["q/main+rc1", "q/impacts+im1", "q/coes+co1", "q/ticket+t1"])
     );
 }
 
@@ -1500,8 +1503,8 @@ fn release_attributions_by_ticket_id() {
 
 /// `applicationReleaseTicketsByReleaseId` with column data: the dev ticket
 /// with its pull requests, workflows, tags and form values, and the sub
-/// ticket with its mapped ticket. Gap O: the pull-request `LIMIT 1` and
-/// the `id` tiebreak are dropped.
+/// ticket with its mapped ticket. Gap O: the pull-request `LIMIT 1` is
+/// not applied.
 #[test]
 fn application_release_tickets_by_release_id() {
     let mut w = World::new();
@@ -1572,8 +1575,7 @@ fn release_changes_by_release_id() {
     );
 }
 
-/// `releaseEventsByReleaseId`: the audit feed minus form saves. Gap O:
-/// the `id` tiebreak is dropped.
+/// `releaseEventsByReleaseId`: the audit feed minus form saves.
 #[test]
 fn release_events_by_release_id() {
     let mut w = World::new();

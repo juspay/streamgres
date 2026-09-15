@@ -405,8 +405,7 @@ fn search_channel_participants() {
 }
 
 /// `channelParticipantsPaginated`: members by role then user, after a
-/// cursor. Gap O: the `userId` tiebreak is dropped, so the cursor's second
-/// key is spelled out in the `WHERE` alone.
+/// two-key cursor spelled as a `WHERE`.
 #[test]
 fn channel_participants_paginated() {
     let mut w = World::new();

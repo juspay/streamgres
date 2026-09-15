@@ -74,6 +74,7 @@ impl SingleTableIVM {
         }
         ops.extend(self.evict_overflow(sub));
         self.sync_boundary(sub);
+        let ops = self.gate_window(sub, ops);
         (sub, ops)
     }
 

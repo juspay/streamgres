@@ -19,8 +19,9 @@ use super::value::Value;
 ///
 /// - `table`: table name, resolved against the [`super::schema::Catalog`].
 /// - `filter`: the `WHERE` predicate tree.
-/// - `order_by`: the `ORDER BY` clause; the parser defaults it to the
-///   first declared pkey column, ascending.
+/// - `order_by`: the `ORDER BY` clause, one or more columns compared in
+///   turn; the parser defaults it to the first declared pkey column,
+///   ascending.
 /// - `limit`: the `LIMIT` row cap; `u32::MAX` is the parser's spelling of
 ///   "no limit".
 ///
@@ -31,7 +32,7 @@ use super::value::Value;
 pub struct SingleTableReadQuery {
     pub table: TableName,
     pub filter: Where,
-    pub order_by: OrderBy,
+    pub order_by: Vec<OrderBy>,
     pub limit: u32,
 }
 
@@ -279,11 +280,19 @@ pub enum ComparisonOperator {
     EXISTS,
 }
 
-/// `ORDER BY column ASC|DESC`.
+/// One `column ASC|DESC` of an `ORDER BY`; a query's clause is a list of
+/// these, later columns breaking the earlier ones' ties.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OrderBy {
     pub column: ColumnName,
     pub direction: Order,
+}
+
+impl From<OrderBy> for Vec<OrderBy> {
+    /// A one-column clause.
+    fn from(order_by: OrderBy) -> Self {
+        vec![order_by]
+    }
 }
 
 /// Sort direction of an [`OrderBy`] clause: ascending or descending.
@@ -455,12 +464,18 @@ impl OrderBy {
 }
 
 impl SingleTableReadQuery {
-    /// Builds a subscription query from its four clauses.
-    pub fn new(table: impl Into<TableName>, filter: Where, order_by: OrderBy, limit: u32) -> Self {
+    /// Builds a subscription query from its four clauses; `order_by`
+    /// takes one [`OrderBy`] or a list of them.
+    pub fn new(
+        table: impl Into<TableName>,
+        filter: Where,
+        order_by: impl Into<Vec<OrderBy>>,
+        limit: u32,
+    ) -> Self {
         SingleTableReadQuery {
             table: table.into(),
             filter,
-            order_by,
+            order_by: order_by.into(),
             limit,
         }
     }

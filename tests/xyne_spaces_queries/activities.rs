@@ -218,7 +218,7 @@ fn user_unread_activities() {
 }
 
 /// `userActivitiesPaginated` for two action types and one classification
-/// below a cursor. Gap O drops the `id` tiebreak.
+/// below a cursor, ties broken by `id`.
 #[test]
 fn user_activities_paginated() {
     let mut w = World::new();

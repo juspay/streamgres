@@ -211,8 +211,7 @@ fn project_folder_canvases() {
 
 /// `channelCanvasesPaginated`: a page of a channel's live canvases the
 /// caller may see, with participants, channel and the caller's status;
-/// archiving one removes it and its participants. Gap O drops the `id`
-/// tiebreak.
+/// archiving one removes it and its participants.
 #[test]
 fn channel_canvases_paginated() {
     let mut w = World::new();
@@ -419,8 +418,7 @@ fn get_canvas() {
 }
 
 /// `canvasVersions`: a canvas's versions, the canvas an existence test
-/// under the visibility rule (only the versions' own canvas ships). Gap O
-/// drops the `id` tiebreak.
+/// under the visibility rule (only the versions' own canvas ships).
 #[test]
 fn canvas_versions() {
     let mut w = World::new();

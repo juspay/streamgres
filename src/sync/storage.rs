@@ -15,11 +15,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
 
-use crate::ivm::{evaluate, order_cmp};
+use crate::ivm::{evaluate, order_rows};
 use crate::model::Snapshot;
-use crate::model::{
-    DataFrameKey, DataFrameRow, Lsn, Order, SingleTableReadQuery, TableName, Value, WriteQuery,
-};
+use crate::model::{DataFrameKey, DataFrameRow, Lsn, SingleTableReadQuery, TableName, WriteQuery};
 
 /// A failed storage read; the runtime parks the read and hands it out
 /// again once the stream moves.
@@ -132,8 +130,8 @@ impl MemoryStorage {
     /// The rows `query` selects right now: a linear scan of the table,
     /// filtering by the query's `Where` via the same predicate evaluation
     /// the engine routes with. A finite `limit` sorts by the `order_by`
-    /// column (via the window module's total order) and truncates; an
-    /// unlimited query keeps insertion order.
+    /// columns in turn (via the window module's total order) and
+    /// truncates; an unlimited query keeps insertion order.
     pub fn rows(&self, query: &SingleTableReadQuery) -> Vec<(DataFrameKey, DataFrameRow)> {
         let tables = self.tables.borrow();
         let Some(rows) = tables.get(&query.table) else {
@@ -145,17 +143,7 @@ impl MemoryStorage {
             .cloned()
             .collect();
         if query.limit != u32::MAX {
-            let column = query.order_by.column.as_str();
-            selected.sort_by(|(_, a), (_, b)| {
-                let ordering = order_cmp(
-                    a.data.get(column).unwrap_or(&Value::Null),
-                    b.data.get(column).unwrap_or(&Value::Null),
-                );
-                match query.order_by.direction {
-                    Order::ASC => ordering,
-                    Order::DESC => ordering.reverse(),
-                }
-            });
+            selected.sort_by(|(_, a), (_, b)| order_rows(&query.order_by, a, b));
             selected.truncate(query.limit as usize);
         }
         selected

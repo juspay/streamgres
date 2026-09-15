@@ -478,9 +478,8 @@ fn get_conversation_by_call_id() {
     );
 }
 
-/// `getConversationByTimestamp`: the newest thread at or before a time.
-/// Gap B: the `.one()` buffer holds two; gap O drops the `conversationId`
-/// tiebreak. A newer thread evicts the older buffered one.
+/// `getConversationByTimestamp`: the newest thread at or before a time,
+/// ties broken by id; a newer thread replaces it.
 #[test]
 fn get_conversation_by_timestamp() {
     let mut w = World::new();
@@ -492,13 +491,13 @@ fn get_conversation_by_timestamp() {
         .order_by("conversationId", DESC)
         .limit(1)
         .one();
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+cv1", "q/main+cv2"]));
+    assert_eq!(w.subscribe("q", &q), ops(["q/main+cv2"]));
     assert_eq!(
         w.insert(
             "conversations",
             row!["conversationId" => "cv6", "channelId" => "c1", "createdAt" => 220]
         ),
-        ops(["q/main+cv6", "q/main-cv1"])
+        ops(["q/main+cv6", "q/main-cv2"])
     );
 }
 
@@ -525,8 +524,7 @@ fn user_conversations_paginated() {
 }
 
 /// `userConversationsPaginatedV2`: the caller's subscribed participations
-/// by last reply (`lastReplyAt IS NOT NULL`); gap O drops the `id`
-/// tiebreak.
+/// by last reply (`lastReplyAt IS NOT NULL`).
 #[test]
 fn user_conversations_paginated_v2() {
     let mut w = World::new();
@@ -955,8 +953,7 @@ fn channel_latest_multiple_conversations_v3() {
     );
 }
 
-/// `channelLatestConversation`: the newest thread of a channel. Gap B:
-/// the `.one()` buffer holds two; gap O drops the tiebreak.
+/// `channelLatestConversation`: the newest thread of a channel.
 #[test]
 fn channel_latest_conversation() {
     let mut w = World::new();
@@ -967,7 +964,7 @@ fn channel_latest_conversation() {
         .order_by("conversationId", DESC)
         .limit(1)
         .one();
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+cv1", "q/main+cv2"]));
+    assert_eq!(w.subscribe("q", &q), ops(["q/main+cv2"]));
 }
 
 /// `getConversationAttachements`: a channel's attachments through their
@@ -1100,7 +1097,7 @@ fn get_pinned_messeges_v2() {
 }
 
 /// `channelLatestMessage`: the newest thread with its opener's reactions,
-/// counts and attachments. Gap B: the buffer holds two threads.
+/// counts and attachments.
 #[test]
 fn channel_latest_message() {
     let mut w = World::new();
@@ -1118,13 +1115,11 @@ fn channel_latest_message() {
     assert_eq!(
         w.subscribe("q", &q),
         ops([
-            "q/main+cv1",
             "q/main+cv2",
             "q/initialMessage+m2",
             "q/initialMessage.reactions+rx1",
             "q/initialMessage.reactionCounts+rcnt1",
-            "q/initialMessage.attachments+ma1",
-            "q/initialMessage+m1"
+            "q/initialMessage.attachments+ma1"
         ])
     );
 }
@@ -1144,11 +1139,9 @@ fn channel_latest_message_v2() {
     assert_eq!(
         w.subscribe("q", &q),
         ops([
-            "q/main+cv1",
             "q/main+cv2",
             "q/initialMessage+m2",
-            "q/initialMessage.attachments+ma1",
-            "q/initialMessage+m1"
+            "q/initialMessage.attachments+ma1"
         ])
     );
     assert_eq!(w.delete("reactions", "rx1"), ops([]));
@@ -1277,8 +1270,7 @@ fn get_message_for_activity_v2() {
 }
 
 /// `userSentMessagesPaginated`: the caller's live messages, newest first,
-/// with attachments and conversation. Gap O drops the `messageId`
-/// tiebreak.
+/// with attachments and conversation.
 #[test]
 fn user_sent_messages_paginated() {
     let mut w = World::new();
@@ -1348,7 +1340,7 @@ fn user_delayed_messages() {
 }
 
 /// `userDelayedMessagesPaginated` over two statuses after a schedule
-/// cursor. Gap O drops the `id` tiebreak.
+/// cursor.
 #[test]
 fn user_delayed_messages_paginated() {
     let mut w = World::new();

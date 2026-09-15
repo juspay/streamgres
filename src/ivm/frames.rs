@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use super::predicate::evaluate;
+use super::window::Window;
 use super::{Fetch, FetchId, FetchKind, SingleTableIVM, SingleTableUpdate, window};
 use crate::model::{
     ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow,
@@ -109,7 +110,7 @@ impl SingleTableIVM {
             self.refill(sub);
         }
         self.sync_boundary(sub);
-        updates
+        self.gate_updates(&[sub], updates)
     }
 
     /// Adopt one landed row for `sub`, whose filter is `filter`: the frame
@@ -204,7 +205,8 @@ impl SingleTableIVM {
         column: &str,
         values: &[Value],
     ) -> Vec<DataFrameOperation> {
-        self.remove_rows_where(sub, column, values, |_| true)
+        let ops = self.remove_rows_where(sub, column, values, |_| true);
+        self.gate_window(sub, ops)
     }
 
     /// Untag every row `sub` holds whose `column` equals one of `values`
@@ -224,9 +226,10 @@ impl SingleTableIVM {
         else {
             return Vec::new();
         };
-        self.remove_rows_where(sub, column, values, |row| {
+        let ops = self.remove_rows_where(sub, column, values, |row| {
             !evaluate(&filter, &row.data, &mut 0)
-        })
+        });
+        self.gate_window(sub, ops)
     }
 
     /// Untag the rows `sub` holds whose `column` equals one of `values`
@@ -300,15 +303,17 @@ impl SingleTableIVM {
     pub fn rows_for(&self, sub: SubId) -> Option<HashMap<DataFrameKey, DataFrameRow>> {
         let query = self.select_queries.get(&sub)?;
         let frame = self.frames.get(&query.table);
-        let mut view = HashMap::new();
-        if let Some(ids) = self.held.get(&sub) {
-            for id in ids {
-                if let Some(row) = frame.and_then(|frame| frame.row(*id)) {
-                    view.insert(row.key.clone(), row.data.clone());
-                }
-            }
-        }
-        Some(view)
+        let shown = self.windows.get(&sub).map(Window::shown_prefix);
+        Some(
+            self.held
+                .get(&sub)
+                .into_iter()
+                .flatten()
+                .filter_map(|id| frame.and_then(|frame| frame.row(*id)))
+                .filter(|row| shown.as_ref().is_none_or(|shown| shown.contains(&row.key)))
+                .map(|row| (row.key.clone(), row.data.clone()))
+                .collect(),
+        )
     }
 
     /// The subscriptions currently holding one shared row — its subscriber

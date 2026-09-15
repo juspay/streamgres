@@ -264,8 +264,7 @@ fn stages_by_board() {
 }
 
 /// `stagesByBoards`: the stages of a project's kanban boards, the board an
-/// existence test; retyping a board brings its stages. Gap O drops the
-/// `sequenceNumber` tiebreak.
+/// existence test; retyping a board brings its stages.
 #[test]
 fn stages_by_boards() {
     let mut w = World::new();
@@ -495,7 +494,7 @@ fn get_form_by_id() {
 }
 
 /// `getFormFieldsByFormId`: a form's fields in sequence with their global
-/// field. Gap O drops the `createdAt` tiebreak.
+/// field.
 #[test]
 fn get_form_fields_by_form_id() {
     let mut w = World::new();
