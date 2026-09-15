@@ -422,6 +422,7 @@ fn narrowed_join_fetch_defers_to_later_writes() {
             "id",
         )],
         right_joins: Vec::new(),
+        inner_joins: Vec::new(),
     };
     let (sub, step) = runtime.register(CLIENT, spec);
     settle(&mut runtime, &db, step);
@@ -570,6 +571,7 @@ fn post_order_registration_follows_landings() {
             "assigned_to",
             "id",
         )],
+        inner_joins: Vec::new(),
     };
     let (sub, step) = runtime.register(CLIENT, right);
     let first = only(&step);
@@ -602,6 +604,7 @@ fn post_order_registration_follows_landings() {
             "id",
         )],
         right_joins: Vec::new(),
+        inner_joins: Vec::new(),
     };
     let before = runtime.engine().stats().storage_reads;
     let (sub, step) = runtime.register(CLIENT, left);
@@ -732,6 +735,7 @@ fn twin_joining_a_landing_tree_receives_the_rest() {
             "id",
         )],
         right_joins: Vec::new(),
+        inner_joins: Vec::new(),
     };
     let (first, step) = runtime.register(CLIENT, spec());
     let main = only(&step);

@@ -2,9 +2,9 @@
 //! ACL classes (the per-table ACL modules of the shared package): the tenant
 //! backstop, the user scope, and the channel-access chain. Where the ACL
 //! passes `channelId` and `isMember` (every V2+ conversation, message and
-//! desk query) the chain is a plain RIGHT edge tree and is fully
-//! expressible; the generic `visibility = PUBLIC OR EXISTS participants`
-//! form is gap X (see `gaps.rs`).
+//! desk query) the chain is a tree of INNER edges; the generic
+//! `visibility = PUBLIC OR EXISTS participants` form is the same with the
+//! existence test placed inside the `OR` (see `gaps.rs`).
 
 use super::world::{ME, WS, World, ops};
 use super::zql::{eq, is_null, or, zql};

@@ -281,13 +281,12 @@ fn user_activities_paginated_v2() {
     assert_eq!(
         w.subscribe("q", &q),
         ops([
+            "q/has:actor+u-2",
             "q/main+ac1",
             "q/main+ac4",
-            "q/has:actor+u-me",
-            "q/has:actor+u-2",
             "q/message+m1",
-            "q/message.conversation+cv1",
             "q/message.attachments+mat1",
+            "q/message.conversation+cv1",
             "q/ticket+t1"
         ])
     );

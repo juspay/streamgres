@@ -50,6 +50,7 @@ pub fn eval_condition(
                     .get(&cond.column)
                     .is_some_and(|actual| !actual.is_null());
         }
+        EXISTS => return false,
         _ => {}
     }
     let Some(actual) = row.get(&cond.column) else {
@@ -87,7 +88,7 @@ pub fn eval_condition(
             Value::Set(set) => !set.contains(actual),
             _ => false,
         },
-        IS | IS_NOT => false,
+        IS | IS_NOT | EXISTS => false,
     }
 }
 

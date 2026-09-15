@@ -101,6 +101,7 @@ impl Names {
                 "id",
             )],
             right_joins: Vec::new(),
+            inner_joins: Vec::new(),
         }
     }
 }

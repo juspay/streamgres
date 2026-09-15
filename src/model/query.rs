@@ -67,12 +67,18 @@ impl std::fmt::Display for ClientId {
 /// attach to rows of the enclosing node where
 /// `sub.<sub_table_column> = enclosing.<main_table_column>`.
 ///
-/// `sub` is a full multi-table query, so a leaf is a node whose two join
-/// vectors are empty and nesting costs nothing. Whether the enclosing node
-/// lists the edge under `left_joins` or `right_joins` decides which side
-/// is preserved: a LEFT edge keeps every enclosing row and attaches the
-/// matching sub rows; a RIGHT edge keeps every sub row and shows enclosing
-/// rows only while a sub row matches them. Below the root, a node's
+/// `sub` is a full multi-table query, so a leaf is a node whose join
+/// vectors are empty and nesting costs nothing. Which of the enclosing
+/// node's vectors lists the edge decides what is preserved: a LEFT edge
+/// keeps every enclosing row and attaches the matching sub rows; a RIGHT
+/// edge keeps every sub row and shows enclosing rows only while a sub row
+/// matches them; an INNER edge shows an enclosing row only while a sub
+/// row matches it and a sub row only while a shown enclosing row matches
+/// it, evaluated from the sub side (`whereExists` in the client's terms, with
+/// the sub rows delivered). An INNER edge's test may be placed anywhere
+/// in the enclosing node's `WHERE` through an
+/// [`ComparisonOperator::EXISTS`] leaf naming it; unnamed, it is
+/// conjoined. Below the root, a node's
 /// `order_by` / `limit` are unused — a `LIMIT` on a join's sub side has no
 /// SQL meaning (it would cap the whole side across every referenced
 /// value), so the engine normalizes it away at registration. A `NULL` (or
@@ -102,14 +108,17 @@ impl Join {
 }
 
 /// A multi-table subscription: a tree whose every node is a single-table
-/// query and every edge a LEFT or RIGHT join. The root is the query the
-/// client subscribed to; its `order_by` / `limit` apply to the root's
-/// rows. Structurally identical trees compare equal, the basis of sharing.
+/// query and every edge a LEFT, RIGHT or INNER join. The root is the query
+/// the client subscribed to; its `order_by` / `limit` apply to the root's
+/// rows. A node's parts are numbered left joins first, then right, then
+/// inner. Structurally identical trees compare equal, the basis of
+/// sharing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultiTableReadQuery {
     pub main_table: SingleTableReadQuery,
     pub left_joins: Vec<Join>,
     pub right_joins: Vec<Join>,
+    pub inner_joins: Vec<Join>,
 }
 
 impl MultiTableReadQuery {
@@ -119,6 +128,7 @@ impl MultiTableReadQuery {
             main_table,
             left_joins: Vec::new(),
             right_joins: Vec::new(),
+            inner_joins: Vec::new(),
         }
     }
 }
@@ -245,6 +255,14 @@ impl Disjunct {
 /// operand the condition follows the convention of `= NULL` and is simply
 /// never true. `IS` holds for a `NULL` or absent column, `IS_NOT` for a
 /// present, non-`NULL` one.
+///
+/// `EXISTS` is the existence test of a multi-table query, placed where the
+/// author wants it in the tree: `column EXISTS Int(i)` names the node's
+/// `inner_joins[i]`, whose `main_table_column` must be `column`. At
+/// registration the join layer binds it in place into `column IN <set>`,
+/// the set of join values the inner query currently produces, so from
+/// then on it is an ordinary set-valued `IN`. Unbound, or with any other
+/// operand, it is never true.
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ComparisonOperator {
@@ -258,6 +276,7 @@ pub enum ComparisonOperator {
     NOT_IN,
     IS,
     IS_NOT,
+    EXISTS,
 }
 
 /// `ORDER BY column ASC|DESC`.
@@ -308,6 +327,19 @@ impl Where {
     /// `column IS NOT NULL`.
     pub fn is_not_null(column: impl Into<ColumnName>) -> Self {
         Where::condition(column, ComparisonOperator::IS_NOT, Value::Null)
+    }
+
+    /// The existence test of the node's `inner_joins[index]`, on the
+    /// node's join column `column`; see [`ComparisonOperator::EXISTS`].
+    pub fn exists(column: impl Into<ColumnName>, index: usize) -> Self {
+        Where::condition(column, ComparisonOperator::EXISTS, Value::Int(index as i64))
+    }
+
+    /// Whether `condition` is one of the tree's leaves.
+    pub fn contains(&self, condition: &Condition) -> bool {
+        self.leaf_conditions()
+            .into_iter()
+            .any(|leaf| leaf == condition)
     }
 
     /// All leaf [`Condition`]s of the tree, in depth-first order — the raw

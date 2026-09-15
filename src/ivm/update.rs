@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use crate::model::{ClientId, DataFrameKey, DataFrameOperation, DataFrameRow, SubId, TableName};
 
 /// Which node of a subscription's join tree a part is: the path of join
-/// indices from the root, a node's left joins numbered first and its right
-/// joins after them. The root is the empty path; a single-table
-/// subscription has only the root.
+/// indices from the root, a node's left joins numbered first, its right
+/// joins next and its inner joins last. The root is the empty path; a
+/// single-table subscription has only the root.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct QueryPart(pub Vec<usize>);
 

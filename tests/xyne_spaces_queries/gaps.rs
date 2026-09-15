@@ -104,14 +104,15 @@ fn l_like_and_ilike_are_refused() {
     );
 }
 
-/// Gap X: `visibility = PUBLIC OR EXISTS(participants WHERE userId = me)`
-/// is the channel-access rule the ACL attaches to tickets, conversations,
-/// messages, attachments and channels. The model has no `EXISTS` leaf, so
-/// the disjunction cannot be one subscription; it can be two, unioned by
-/// the client, which is what this pins: the public branch, the member
-/// branch, and a channel in both showing up in both.
+/// Closed gap X: `visibility = PUBLIC OR EXISTS(participants WHERE userId
+/// = me)` is the channel-access rule the ACL attaches to tickets,
+/// conversations, messages, attachments and channels. The existence test
+/// is an `EXISTS` leaf placed inside the `OR`, bound to the inner join's
+/// set at registration: one subscription, a channel in both branches
+/// delivered once, and a membership lost from a public channel changing
+/// nothing but the participant row (the prune re-evaluates the filter).
 #[test]
-fn x_exists_inside_or_needs_a_union_of_two_subscriptions() {
+fn x_exists_inside_or_is_one_subscription() {
     let mut w = World::new();
     w.seed(
         "channels",
@@ -154,32 +155,44 @@ fn x_exists_inside_or_needs_a_union_of_two_subscriptions() {
         ],
     );
 
-    let public = zql("channels").eq("visibility", "PUBLIC");
-    let member = zql("channels").where_exists("participants", |p| p.eq("userId", ME));
+    let mut q = zql("channels");
+    let member = q.exists("participants", |p| p.eq("userId", ME));
+    let q = q.filter(or(vec![eq("visibility", "PUBLIC"), member]));
     assert_eq!(
-        w.subscribe("public", &public),
-        ops(["public/main+c-pub", "public/main+c-both"])
-    );
-    assert_eq!(
-        w.subscribe("member", &member),
+        w.subscribe("q", &q),
         ops([
-            "member/main+c-mine",
-            "member/main+c-both",
-            "member/has:participants+p1",
-            "member/has:participants+p2"
+            "q/main+c-pub",
+            "q/main+c-mine",
+            "q/main+c-both",
+            "q/has:participants+p1",
+            "q/has:participants+p2"
         ])
     );
-
+    assert_eq!(
+        w.delete("channel_participants", "p2"),
+        ops(["q/has:participants-p2"])
+    );
     assert_eq!(
         w.delete("channel_participants", "p1"),
-        ops(["member/main-c-mine", "member/has:participants-p1"])
+        ops(["q/main-c-mine", "q/has:participants-p1"])
     );
     assert_eq!(
         w.update(
             "channels",
             &[("id", "c-pub".into()), ("visibility", "PRIVATE".into())]
         ),
-        ops(["public/main-c-pub"])
+        ops(["q/main-c-pub"])
+    );
+    assert_eq!(
+        w.insert(
+            "channel_participants",
+            &[
+                ("id", "p4".into()),
+                ("channelId", "c-other".into()),
+                ("userId", ME.into()),
+            ],
+        ),
+        ops(["q/main+c-other", "q/has:participants+p4"])
     );
 }
 
@@ -249,12 +262,12 @@ fn j_json_columns_are_opaque_strings() {
     );
 }
 
-/// Gap E: the client's `whereExists` filters the parent and returns nothing of
-/// the child; the engine's RIGHT edge ships the matching child rows as a
-/// part of their own (and every matching child, not just those under a
-/// visible parent, since the child drives the edge).
+/// Closed gap E: `whereExists` is an INNER edge. The matching child rows
+/// still ship as a part of their own, the client composing the join from
+/// them, but only under a shown parent: `a2` belongs to the archived `t2`
+/// and is held by the engine (it drives the edge) without being delivered.
 #[test]
-fn e_where_exists_ships_the_matching_child_rows() {
+fn e_where_exists_ships_only_the_children_of_shown_parents() {
     let mut w = World::new();
     w.seed(
         "tickets",
@@ -285,7 +298,18 @@ fn e_where_exists_ships_the_matching_child_rows() {
         .where_exists("assignments", |a| a.eq("userId", "u-2"));
     assert_eq!(
         w.subscribe("q", &reviewed_by),
-        ops(["q/main+t1", "q/has:assignments+a1", "q/has:assignments+a2"])
+        ops(["q/main+t1", "q/has:assignments+a1"])
+    );
+    assert_eq!(
+        w.update(
+            "tickets",
+            &[("id", "t2".into()), ("isArchived", false.into())],
+        ),
+        ops(["q/main+t2", "q/has:assignments+a2"])
+    );
+    assert_eq!(
+        w.delete("ticket_assignments", "a1"),
+        ops(["q/main-t1", "q/has:assignments-a1"])
     );
 }
 

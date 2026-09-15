@@ -104,8 +104,8 @@ pub(super) struct ColumnIndex {
 impl ColumnIndex {
     /// File one condition under every key it can match at; a condition
     /// that can never be true (`= NULL`, `NOT IN` with a `NULL`, a
-    /// threshold nothing compares with, `IS` with a non-`NULL` operand) is
-    /// filed nowhere.
+    /// threshold nothing compares with, `IS` with a non-`NULL` operand, an
+    /// unbound `EXISTS`) is filed nowhere.
     pub(super) fn file(&mut self, condition: &CondRef) {
         use ComparisonOperator::*;
         let value = &condition.0.value;
@@ -132,6 +132,7 @@ impl ColumnIndex {
                     self.unequal_all.insert(condition.clone());
                 }
             }
+            EXISTS => {}
             IN => {
                 for key in member_keys(value) {
                     self.equal.entry(key).or_default().insert(condition.clone());
@@ -191,6 +192,7 @@ impl ColumnIndex {
                 remove_under(&mut self.unequal, Some(Value::Null), condition);
                 self.unequal_all.remove(condition);
             }
+            EXISTS => {}
             IN => {
                 for key in member_keys(value) {
                     remove_under(&mut self.equal, Some(key), condition);

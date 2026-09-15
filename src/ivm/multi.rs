@@ -1,6 +1,6 @@
-//! Multi-table subscriptions: a tree of single-table parts joined by LEFT
-//! and RIGHT edges, maintained over the single-table engine, with one tree
-//! shared by every subscription that registers the same spec.
+//! Multi-table subscriptions: a tree of single-table parts joined by LEFT,
+//! RIGHT and INNER edges, maintained over the single-table engine, with
+//! one tree shared by every subscription that registers the same spec.
 //!
 //! A [`MultiTableReadQuery`] is a tree: every node is a single-table query,
 //! every edge a join, and a child is itself a full multi-table query. Each
@@ -16,65 +16,85 @@
 //! restriction `driven_column IN <set>` inside its filter. A LEFT edge
 //! preserves the parent, so the parent drives and the child is driven; a
 //! RIGHT edge preserves the child, so the child drives and the parent is
-//! driven. Because the restriction lives inside the driven part's filter,
-//! writes on the driven table route natively through the single engine: a
-//! row matching the filter (restriction included) fires an `Add`, a held
-//! row moving out fires a `Delete` via membership, and an unreferenced row
-//! never fires at all. The join layer never inspects driven-side writes;
-//! it forwards them and keeps its counts.
+//! driven; an INNER edge is evaluated from the child like a RIGHT edge,
+//! and adds the gate below. Because the restriction lives inside the
+//! driven part's filter, writes on the driven table route natively through
+//! the single engine: a row matching the filter (restriction included)
+//! fires an `Add`, a held row moving out fires a `Delete` via membership,
+//! and an unreferenced row never fires at all. The join layer never
+//! inspects driven-side writes; it forwards them and keeps its counts.
 //!
-//! # Set-valued leaves
+//! # Set-valued leaves, placed
 //!
-//! The restriction's operand is a [`SharedSet`], one per (driven part,
-//! column), owned by the tree and referenced by the part's filter. A zero
-//! crossing therefore adds or removes **one member**
-//! ([`SingleTableIVM::set_insert`] / [`SingleTableIVM::set_remove`]): the
-//! index files the leaf under that one value, the filter is untouched
-//! (it holds the same set), and nothing proportional to the set's size is
-//! rebuilt. A node driven by several edges on one column — a LEFT parent
-//! above it and a RIGHT child below it, both on `id` — has one leaf whose
-//! members are the **intersection** of the driving edges' referenced
-//! values, maintained one crossing at a time.
+//! The restriction's operand is a [`SharedSet`] owned by the tree and
+//! referenced by the part's filter. A zero crossing therefore adds or
+//! removes **one member** ([`SingleTableIVM::set_insert`] /
+//! [`SingleTableIVM::set_remove`]): the index files the leaf under that one
+//! value, the filter is untouched (it holds the same set), and nothing
+//! proportional to the set's size is rebuilt. Where the leaf sits is the
+//! author's choice: an `EXISTS` leaf in the node's own `WHERE`
+//! ([`ComparisonOperator::EXISTS`], naming one of the node's inner joins)
+//! is bound in place, so `visibility = 'PUBLIC' OR EXISTS(...)` is one
+//! filter with the restriction inside its `OR`; an edge no leaf names is
+//! conjoined at the top. Edges bound by a leaf have a set of their own;
+//! unnamed edges driving one part on one column — a LEFT parent above it
+//! and a RIGHT child below it, both on `id` — share one set holding the
+//! **intersection** of their referenced values. When a value leaves a set
+//! the value's held rows are re-evaluated against the filter, not deleted
+//! outright, so a row another branch still admits stays.
+//!
+//! # The gate
+//!
+//! A row is *shown* (delivered to clients) only under a shown parent row:
+//! under a LEFT or INNER edge a child row is shown while at least one
+//! shown parent row carries its join value, under a RIGHT edge always (the
+//! child is preserved), and the root always. Per edge and per value the
+//! layer counts the shown parent rows; a crossing of that count admits
+//! (one `Add` each) or retracts (one `Delete` each) the child rows for the
+//! value, and each of those rows in turn is counted on the edges below it,
+//! so a chain of INNER edges shows exactly the rows that reach the root.
+//! Held rows that are not shown still drive: an INNER child's rows are
+//! evaluated first and fill the parent's set whether or not the parent row
+//! that makes them visible has arrived.
 //!
 //! # Sharing
 //!
 //! Subscriptions with an identical spec share one tree: one inner part
 //! per node, one set of edges and counts, one crossing per event. A later
 //! identical registration is served its snapshot from the shared parts'
-//! rows, and every operation a part produces is emitted once per
+//! shown rows, and every operation a part produces is emitted once per
 //! subscriber of its tree. The tree is dropped with its last subscriber.
 //!
 //! # Counts, crossings, cascades
 //!
 //! Per edge and per join value the layer keeps `left` (driver rows
-//! carrying the value) and `right` (driven rows held for it;
-//! observational). Only zero crossings of `left` act, and only when they
-//! change the driven leaf: the value's driven rows are fetched (one
-//! narrowed storage query) or pruned from current data. Rows a fetch
-//! brings in are **arrivals** at the driven node and rows a prune removes
-//! are **departures**, and the driven node may itself drive further edges,
-//! so the same handling cascades down the tree — the recursion that makes
-//! nesting work with one code path.
+//! carrying the value) and `shown` (shown parent rows carrying it). Only
+//! zero crossings of `left` act on the set: the value's driven rows are
+//! fetched (one narrowed storage query) or pruned from current data. Rows
+//! a fetch brings in are **arrivals** at the driven node and rows a prune
+//! removes are **departures**, and the driven node may itself drive
+//! further edges, so the same handling cascades down the tree — the
+//! recursion that makes nesting work with one code path.
 //!
 //! # Order
 //!
-//! Registration is a post-order walk: a node's RIGHT children register
-//! first (their rows fill the sets it is restricted by), then the node,
-//! then its LEFT children (restricted by the node's rows); during that
-//! walk crossings only fill sets, since every part is registered with its
-//! full set. A part's rows arrive when its storage read **lands**, some
-//! time after it is asked for, so the walk is driven by landings: a node
-//! registers once every RIGHT child below it is *live* (its own read
-//! landed and nothing further out for it), and its LEFT children register
-//! once it is live itself. A part served from a twin is live at once.
-//! Within one write, each part's native operations are forwarded with
-//! every **driven part before its driver** — LEFT children before their
-//! parent, a RIGHT child after its parent — because handling a driver's
-//! operation may prune the driven frame, and a stale driven operation
-//! forwarded after that prune would resurrect a row on the client. An
-//! in-place replacement arrives as an adjacent `Delete(old)` + `Add(new)`
-//! pair and is diffed per edge, so a rewrite that keeps a join value
-//! never swings its count through zero.
+//! Registration is a post-order walk: a node's RIGHT and INNER children
+//! register first (their rows fill the sets it is restricted by), then the
+//! node, then its LEFT children (restricted by the node's rows); during
+//! that walk crossings only fill sets, since every part is registered with
+//! its full set. A part's rows arrive when its storage read **lands**,
+//! some time after it is asked for, so the walk is driven by landings: a
+//! node registers once every RIGHT and INNER child below it is *live*
+//! (its own read landed and nothing further out for it), and its LEFT
+//! children register once it is live itself. A part served from a twin is
+//! live at once. Within one write, each part's native operations are
+//! forwarded with every **driven part before its driver** — LEFT children
+//! before their parent, a RIGHT or INNER child after its parent — because
+//! handling a driver's operation may prune the driven frame, and a stale
+//! driven operation forwarded after that prune would resurrect a row on
+//! the client. An in-place replacement arrives as an adjacent
+//! `Delete(old)` + `Add(new)` pair and is diffed per edge, so a rewrite
+//! that keeps a join value never swings its count through zero.
 //!
 //! Inner parts are ordinary subscriptions of the inner engine, addressed by
 //! the ids it hands out and looked up in a map; the reads they ask for
@@ -112,35 +132,57 @@ pub struct MultiTableUpdate {
 }
 
 /// Which side of an edge is preserved: LEFT keeps the parent (the parent
-/// drives), RIGHT keeps the child (the child drives).
+/// drives), RIGHT keeps the child (the child drives), INNER keeps neither
+/// (the child drives, and its rows are shown only under a shown parent
+/// row).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinKind {
     Left,
     Right,
+    Inner,
 }
 
-/// Per-edge reference counts.
+/// Which shared set an edge restricts its driven part through: an edge
+/// bound by an `EXISTS` leaf has a set of its own; unnamed edges driving
+/// one part on one column share a set holding the intersection of their
+/// referenced values.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LeafKey {
+    Shared(QueryPart, ColumnName),
+    Own(usize),
+}
+
+/// Per-edge counts by join value.
 ///
-/// - `left`: how many driver rows carry each join value.
-/// - `right`: how many driven rows the driven part holds per value;
-///   observational, kept for the `left == 0 ⇒ right == 0` invariant.
+/// - `left`: how many driver rows carry the value; its zero crossings
+///   move the value in and out of the driven part's set.
+/// - `shown`: how many shown parent rows carry the value; its zero
+///   crossings admit and retract the child rows under a LEFT or INNER
+///   edge.
 ///
 /// Entries leave the maps when they reach zero, so they only hold live
 /// values.
 #[derive(Default)]
 struct JoinKeyCounts {
     left: HashMap<Value, u64>,
-    right: HashMap<Value, u64>,
+    shown: HashMap<Value, u64>,
 }
 
 /// One join edge of a registered tree, with its direction made explicit
 /// through [`Edge::driven`].
+///
+/// - `leaf`: the set the edge's restriction reads.
+/// - `named`: the `EXISTS` leaf in the driven node's own filter the edge
+///   binds, if the filter names it; otherwise the restriction is
+///   conjoined at the top.
 struct Edge {
     kind: JoinKind,
     parent: QueryPart,
     child: QueryPart,
     parent_column: ColumnName,
     child_column: ColumnName,
+    leaf: LeafKey,
+    named: Option<Condition>,
     counts: JoinKeyCounts,
 }
 
@@ -149,7 +191,7 @@ impl Edge {
     fn driven(&self) -> &QueryPart {
         match self.kind {
             JoinKind::Left => &self.child,
-            JoinKind::Right => &self.parent,
+            JoinKind::Right | JoinKind::Inner => &self.parent,
         }
     }
 
@@ -157,7 +199,7 @@ impl Edge {
     fn driven_column(&self) -> &ColumnName {
         match self.kind {
             JoinKind::Left => &self.child_column,
-            JoinKind::Right => &self.parent_column,
+            JoinKind::Right | JoinKind::Inner => &self.parent_column,
         }
     }
 
@@ -168,6 +210,11 @@ impl Edge {
         } else {
             &self.child_column
         }
+    }
+
+    /// Whether the child's rows are shown only under a shown parent row.
+    fn gates_child(&self) -> bool {
+        self.kind != JoinKind::Right
     }
 }
 
@@ -188,7 +235,7 @@ struct Node {
 /// - `subscribers`: the subscription ids sharing it, in registration order.
 /// - `nodes`: every part by path.
 /// - `edges`: every join edge; nodes refer to them by index.
-/// - `leaves`: the shared set behind each (driven part, column) leaf.
+/// - `leaves`: the shared set behind each leaf, by [`LeafKey`].
 /// - `rank`: forwarding order of the parts, every driven part before its
 ///   driver (see the module docs).
 /// - `post_order`: registration order of the parts, used to serve a later
@@ -198,7 +245,7 @@ struct Tree {
     subscribers: Vec<SubId>,
     nodes: HashMap<QueryPart, Node>,
     edges: Vec<Edge>,
-    leaves: HashMap<(QueryPart, ColumnName), SharedSet>,
+    leaves: HashMap<LeafKey, SharedSet>,
     rank: HashMap<QueryPart, usize>,
     post_order: Vec<QueryPart>,
 }
@@ -232,6 +279,23 @@ pub struct MultiTableIVM {
     by_client: HashMap<ClientId, BTreeSet<SubId>>,
 }
 
+/// Whether a held row of `part` is shown to clients: the root always, a
+/// child under a RIGHT edge always, a child under a LEFT or INNER edge
+/// only while a shown parent row carries its join value.
+fn shown_in(tree: &Tree, part: &QueryPart, row: &DataFrameRow) -> bool {
+    let Some(edge) = tree.nodes[part].parent.map(|edge| &tree.edges[edge]) else {
+        return true;
+    };
+    if !edge.gates_child() {
+        return true;
+    }
+    let value = join_value(row, &edge.child_column);
+    edge.counts
+        .shown
+        .get(&value)
+        .is_some_and(|count| *count > 0)
+}
+
 /// The row's value in `column`; a missing column joins like `NULL` (never).
 fn join_value(row: &DataFrameRow, column: &ColumnName) -> Value {
     row.data
@@ -262,9 +326,7 @@ fn build_tree(spec: &MultiTableReadQuery) -> Tree {
     };
     add_node(&mut tree, spec, QueryPart::main(), None);
     for edge in &tree.edges {
-        tree.leaves
-            .entry((edge.driven().clone(), edge.driven_column().clone()))
-            .or_default();
+        tree.leaves.entry(edge.leaf.clone()).or_default();
     }
     let mut forward = Vec::new();
     forwarding_order(&tree, &QueryPart::main(), &mut forward);
@@ -279,7 +341,10 @@ fn build_tree(spec: &MultiTableReadQuery) -> Tree {
     tree
 }
 
-/// Add `spec`'s node at `part` and, recursively, its children.
+/// Add `spec`'s node at `part` and, recursively, its children: left joins
+/// numbered first, then right, then inner. An inner join the node's own
+/// filter names through an `EXISTS` leaf gets a set of its own, bound in
+/// place at registration.
 fn add_node(tree: &mut Tree, spec: &MultiTableReadQuery, part: QueryPart, parent: Option<usize>) {
     let mut node = Node {
         part: None,
@@ -291,17 +356,45 @@ fn add_node(tree: &mut Tree, spec: &MultiTableReadQuery, part: QueryPart, parent
     let joins = spec
         .left_joins
         .iter()
-        .map(|join| (JoinKind::Left, join))
-        .chain(spec.right_joins.iter().map(|join| (JoinKind::Right, join)));
-    for (index, (kind, join)) in joins.enumerate() {
+        .map(|join| (JoinKind::Left, join, None))
+        .chain(
+            spec.right_joins
+                .iter()
+                .map(|join| (JoinKind::Right, join, None)),
+        )
+        .chain(
+            spec.inner_joins
+                .iter()
+                .enumerate()
+                .map(|(index, join)| (JoinKind::Inner, join, Some(index))),
+        );
+    for (index, (kind, join, inner_index)) in joins.enumerate() {
         let child = part.child(index);
         let edge = tree.edges.len();
+        let named = inner_index
+            .map(|inner_index| {
+                Condition::new(
+                    join.main_table_column.clone(),
+                    ComparisonOperator::EXISTS,
+                    Value::Int(inner_index as i64),
+                )
+            })
+            .filter(|leaf| spec.main_table.filter.contains(leaf));
+        let leaf = match (&named, kind) {
+            (Some(_), _) => LeafKey::Own(edge),
+            (None, JoinKind::Left) => LeafKey::Shared(child.clone(), join.sub_table_column.clone()),
+            (None, JoinKind::Right | JoinKind::Inner) => {
+                LeafKey::Shared(part.clone(), join.main_table_column.clone())
+            }
+        };
         tree.edges.push(Edge {
             kind,
             parent: part.clone(),
             child: child.clone(),
             parent_column: join.main_table_column.clone(),
             child_column: join.sub_table_column.clone(),
+            leaf,
+            named,
             counts: JoinKeyCounts::default(),
         });
         node.children.push(edge);
@@ -311,7 +404,8 @@ fn add_node(tree: &mut Tree, spec: &MultiTableReadQuery, part: QueryPart, parent
 }
 
 /// Append the subtree at `part` in forwarding order: LEFT subtrees (driven
-/// by this node) first, the node, then RIGHT subtrees (which drive it).
+/// by this node) first, the node, then RIGHT and INNER subtrees (which
+/// drive it).
 fn forwarding_order(tree: &Tree, part: &QueryPart, out: &mut Vec<QueryPart>) {
     let node = &tree.nodes[part];
     for &edge in &node.children {
@@ -321,18 +415,19 @@ fn forwarding_order(tree: &Tree, part: &QueryPart, out: &mut Vec<QueryPart>) {
     }
     out.push(part.clone());
     for &edge in &node.children {
-        if tree.edges[edge].kind == JoinKind::Right {
+        if tree.edges[edge].kind != JoinKind::Left {
             forwarding_order(tree, &tree.edges[edge].child, out);
         }
     }
 }
 
-/// Append the subtree at `part` in registration order: RIGHT subtrees
-/// (which fill this node's sets) first, the node, then LEFT subtrees.
+/// Append the subtree at `part` in registration order: RIGHT and INNER
+/// subtrees (which fill this node's sets) first, the node, then LEFT
+/// subtrees.
 fn registration_order(tree: &Tree, part: &QueryPart, out: &mut Vec<QueryPart>) {
     let node = &tree.nodes[part];
     for &edge in &node.children {
-        if tree.edges[edge].kind == JoinKind::Right {
+        if tree.edges[edge].kind != JoinKind::Left {
             registration_order(tree, &tree.edges[edge].child, out);
         }
     }
@@ -344,24 +439,18 @@ fn registration_order(tree: &Tree, part: &QueryPart, out: &mut Vec<QueryPart>) {
     }
 }
 
-/// Whether every edge driving `part` on `column` currently references
-/// `value` — the membership test of the leaf's intersection.
-fn referenced_by_all(tree: &Tree, part: &QueryPart, column: &ColumnName, value: &Value) -> bool {
-    tree.edges
-        .iter()
-        .filter(|edge| edge.driven() == part && edge.driven_column() == column)
-        .all(|edge| edge.counts.left.contains_key(value))
-}
-
-/// The distinct columns on which `part` is driven, in edge order.
-fn driven_columns(tree: &Tree, part: &QueryPart) -> Vec<ColumnName> {
-    let mut columns: Vec<ColumnName> = Vec::new();
-    for edge in &tree.edges {
-        if edge.driven() == part && !columns.contains(edge.driven_column()) {
-            columns.push(edge.driven_column().clone());
-        }
+/// Whether every edge reading `edge`'s set currently references `value`:
+/// the membership test of a shared leaf's intersection, trivially true for
+/// a set of the edge's own.
+fn referenced_by_all(tree: &Tree, edge: usize, value: &Value) -> bool {
+    match &tree.edges[edge].leaf {
+        LeafKey::Own(_) => true,
+        key => tree
+            .edges
+            .iter()
+            .filter(|other| other.leaf == *key)
+            .all(|other| other.counts.left.contains_key(value)),
     }
-    columns
 }
 
 /// What `part` does on each edge it touches: `(edge, drives, column)`
@@ -425,6 +514,9 @@ impl MultiTableIVM {
                     continue;
                 };
                 for (key, row) in rows {
+                    if !shown_in(tree, part, &row) {
+                        continue;
+                    }
                     out.push(MultiTableUpdate {
                         query: sub,
                         table: node.query.table.clone(),
@@ -447,11 +539,11 @@ impl MultiTableIVM {
         (sub, out)
     }
 
-    /// Register the subtree at `part` in post-order. RIGHT children not yet
-    /// live are registered first and the node waits for them: the last of
-    /// them to go live comes back here through [`Self::landed`]. With every
-    /// RIGHT child live the node registers itself with its full set
-    /// restrictions; if its rows are all at hand (a twin's) it is live at
+    /// Register the subtree at `part` in post-order. RIGHT and INNER
+    /// children not yet live are registered first and the node waits for
+    /// them: the last of them to go live comes back here through
+    /// [`Self::landed`]. With every such child live the node registers
+    /// itself with its full set restrictions; if its rows are all at hand (a twin's) it is live at
     /// once, otherwise it goes live when its read lands. LEFT children
     /// follow from [`Self::landed`].
     fn register_part(&mut self, tree_id: TreeId, part: QueryPart, out: &mut Vec<MultiTableUpdate>) {
@@ -465,7 +557,7 @@ impl MultiTableIVM {
                 .children
                 .iter()
                 .map(|&edge| &tree.edges[edge])
-                .filter(|edge| edge.kind == JoinKind::Right && !tree.nodes[&edge.child].live)
+                .filter(|edge| edge.kind != JoinKind::Left && !tree.nodes[&edge.child].live)
                 .map(|edge| edge.child.clone())
                 .collect();
             (waiting, node.query.clone())
@@ -494,7 +586,7 @@ impl MultiTableIVM {
         for op in ops {
             self.emit(tree_id, &part, &own.table, op.clone(), out);
             if let DataFrameOperation::Add(_, row) = &op {
-                self.arrived(tree_id, &part, row);
+                self.arrived(tree_id, &part, row, out);
             }
         }
         if !self.single.is_pending(inner) {
@@ -504,8 +596,8 @@ impl MultiTableIVM {
 
     /// `part`'s rows have all arrived: mark it live, register its LEFT
     /// children (their sets are now filled by its rows), and, if it is a
-    /// RIGHT child whose parent is still waiting, let the parent try to
-    /// register.
+    /// RIGHT or INNER child whose parent is still waiting, let the parent
+    /// try to register.
     fn landed(&mut self, tree_id: TreeId, part: &QueryPart, out: &mut Vec<MultiTableUpdate>) {
         let (left_children, waiting_parent) = {
             let Some(tree) = self.trees.get_mut(&tree_id) else {
@@ -530,7 +622,7 @@ impl MultiTableIVM {
                 .parent
                 .map(|edge| &tree.edges[edge])
                 .filter(|edge| {
-                    edge.kind == JoinKind::Right && tree.nodes[&edge.parent].part.is_none()
+                    edge.kind != JoinKind::Left && tree.nodes[&edge.parent].part.is_none()
                 })
                 .map(|edge| edge.parent.clone());
             (left_children, waiting_parent)
@@ -577,15 +669,33 @@ impl MultiTableIVM {
         self.single.take_requests()
     }
 
-    /// A part's registered filter: its own `WHERE` plus one set-valued
-    /// `IN` leaf per column it is driven on.
+    /// A part's registered filter: its own `WHERE` with every `EXISTS`
+    /// leaf bound in place to its edge's set, and one set-valued `IN` leaf
+    /// conjoined per set the unnamed edges driving it read.
     fn restricted_filter(&self, tree_id: TreeId, part: &QueryPart) -> Where {
         let tree = &self.trees[&tree_id];
-        let mut parts = vec![tree.nodes[part].query.filter.clone()];
-        for column in driven_columns(tree, part) {
-            let set = &tree.leaves[&(part.clone(), column.clone())];
-            parts.push(Where::Condition(leaf_condition(&column, set)));
+        let mut filter = tree.nodes[part].query.filter.clone();
+        let mut conjoined: Vec<LeafKey> = Vec::new();
+        let mut parts = Vec::new();
+        for edge in tree.edges.iter().filter(|edge| edge.driven() == part) {
+            let bound = leaf_condition(edge.driven_column(), &tree.leaves[&edge.leaf]);
+            match &edge.named {
+                Some(unbound) => filter.replace_condition(unbound, &bound),
+                None if conjoined.contains(&edge.leaf) => {}
+                None => {
+                    conjoined.push(edge.leaf.clone());
+                    parts.push(Where::Condition(bound));
+                }
+            }
         }
+        debug_assert!(
+            !filter
+                .leaf_conditions()
+                .iter()
+                .any(|leaf| leaf.comparison_operator == ComparisonOperator::EXISTS),
+            "an EXISTS leaf names no inner join of its node"
+        );
+        parts.insert(0, filter);
         Where::AND(parts)
     }
 
@@ -672,7 +782,7 @@ impl MultiTableIVM {
                 (op @ DataFrameOperation::Add(_, _), _) => {
                     let row = op.row().clone();
                     self.emit(tree_id, &part, &table, op, &mut out);
-                    self.arrived(tree_id, &part, &row);
+                    self.arrived(tree_id, &part, &row, &mut out);
                 }
                 (op @ DataFrameOperation::Delete(_, _), None) => {
                     let row = op.row().clone();
@@ -684,9 +794,9 @@ impl MultiTableIVM {
         out
     }
 
-    /// The rows currently held for one part of a subscription — key →
-    /// image, an inspection view for tests and debugging. `None` for
-    /// unknown ids or parts.
+    /// The rows currently shown for one part of a subscription — key →
+    /// image, the client's view of the part; an inspection seam for tests
+    /// and debugging. `None` for unknown ids or parts.
     pub fn rows_for(
         &self,
         sub: SubId,
@@ -694,7 +804,12 @@ impl MultiTableIVM {
     ) -> Option<HashMap<DataFrameKey, DataFrameRow>> {
         let tree = self.trees.get(self.by_sub.get(&sub)?)?;
         let node = tree.nodes.get(&part)?;
-        self.single.rows_for(node.part?)
+        let rows = self.single.rows_for(node.part?)?;
+        Some(
+            rows.into_iter()
+                .filter(|(_, row)| shown_in(tree, &part, row))
+                .collect(),
+        )
     }
 
     /// The inner engine's routing counters.
@@ -702,7 +817,8 @@ impl MultiTableIVM {
         self.single.stats()
     }
 
-    /// Forward one part operation to every subscriber of its tree.
+    /// Forward one part operation to every subscriber of its tree, unless
+    /// the row is not shown (a child with no shown parent row).
     fn emit(
         &self,
         tree_id: TreeId,
@@ -714,6 +830,9 @@ impl MultiTableIVM {
         let Some(tree) = self.trees.get(&tree_id) else {
             return;
         };
+        if !shown_in(tree, part, op.row()) {
+            return;
+        }
         for subscriber in &tree.subscribers {
             out.push(MultiTableUpdate {
                 query: *subscriber,
@@ -726,15 +845,23 @@ impl MultiTableIVM {
 
     /// A row now held by `part`: reference its join value on every edge
     /// the part drives (a new reference asks for a read; nothing is
-    /// emitted here), count it on every edge the part is driven by.
-    fn arrived(&mut self, tree_id: TreeId, part: &QueryPart, row: &DataFrameRow) {
+    /// emitted for it here) and, if the row is shown, count it on the
+    /// edges below it, admitting the children it uncovers.
+    fn arrived(
+        &mut self,
+        tree_id: TreeId,
+        part: &QueryPart,
+        row: &DataFrameRow,
+        out: &mut Vec<MultiTableUpdate>,
+    ) {
+        let shown = shown_in(&self.trees[&tree_id], part, row);
         for (edge, drives, column) in edge_steps(&self.trees[&tree_id], part) {
-            let value = join_value(row, &column);
             if drives {
-                self.reference(tree_id, edge, value);
-            } else {
-                self.right_bump(tree_id, edge, value);
+                self.reference(tree_id, edge, join_value(row, &column));
             }
+        }
+        if shown {
+            self.appear(tree_id, part, row, out);
         }
     }
 
@@ -746,19 +873,20 @@ impl MultiTableIVM {
         row: &DataFrameRow,
         out: &mut Vec<MultiTableUpdate>,
     ) {
+        if shown_in(&self.trees[&tree_id], part, row) {
+            self.vanish(tree_id, part, row, out);
+        }
         for (edge, drives, column) in edge_steps(&self.trees[&tree_id], part) {
-            let value = join_value(row, &column);
             if drives {
-                self.release(tree_id, edge, &value, out);
-            } else {
-                self.right_drop(tree_id, edge, &value);
+                self.release(tree_id, edge, &join_value(row, &column), out);
             }
         }
     }
 
     /// A row of `part` replaced in place: move references only on edges
     /// whose join value actually changed — the new value referenced first,
-    /// the old released after — so a kept value never crosses zero.
+    /// the old released after — so a kept value never crosses zero; the
+    /// shown counts below it move the same way.
     fn replaced(
         &mut self,
         tree_id: TreeId,
@@ -767,26 +895,144 @@ impl MultiTableIVM {
         new: &DataFrameRow,
         out: &mut Vec<MultiTableUpdate>,
     ) {
+        let (was, is) = {
+            let tree = &self.trees[&tree_id];
+            (shown_in(tree, part, old), shown_in(tree, part, new))
+        };
         for (edge, drives, column) in edge_steps(&self.trees[&tree_id], part) {
             let old_value = join_value(old, &column);
             let new_value = join_value(new, &column);
-            if old_value == new_value {
-                continue;
-            }
-            if drives {
+            if drives && old_value != new_value {
                 self.reference(tree_id, edge, new_value);
                 self.release(tree_id, edge, &old_value, out);
-            } else {
-                self.right_drop(tree_id, edge, &old_value);
-                self.right_bump(tree_id, edge, new_value);
+            }
+        }
+        for edge in self.trees[&tree_id].nodes[part].children.clone() {
+            let column = self.trees[&tree_id].edges[edge].parent_column.clone();
+            let old_value = join_value(old, &column);
+            let new_value = join_value(new, &column);
+            if was && is && old_value == new_value {
+                continue;
+            }
+            if is {
+                self.show(tree_id, edge, new_value, out);
+            }
+            if was {
+                self.hide(tree_id, edge, &old_value, out);
             }
         }
     }
 
+    /// A shown row of `part` is in place: count it on every edge below,
+    /// admitting the children its value uncovers.
+    fn appear(
+        &mut self,
+        tree_id: TreeId,
+        part: &QueryPart,
+        row: &DataFrameRow,
+        out: &mut Vec<MultiTableUpdate>,
+    ) {
+        for edge in self.trees[&tree_id].nodes[part].children.clone() {
+            let column = self.trees[&tree_id].edges[edge].parent_column.clone();
+            self.show(tree_id, edge, join_value(row, &column), out);
+        }
+    }
+
+    /// A shown row of `part` is going: the mirror of [`Self::appear`].
+    fn vanish(
+        &mut self,
+        tree_id: TreeId,
+        part: &QueryPart,
+        row: &DataFrameRow,
+        out: &mut Vec<MultiTableUpdate>,
+    ) {
+        for edge in self.trees[&tree_id].nodes[part].children.clone() {
+            let column = self.trees[&tree_id].edges[edge].parent_column.clone();
+            self.hide(tree_id, edge, &join_value(row, &column), out);
+        }
+    }
+
+    /// One more shown parent row carries `value` on `edge`; on the 0 → 1
+    /// crossing of a gating edge, admit the child rows held for the value.
+    fn show(
+        &mut self,
+        tree_id: TreeId,
+        edge: usize,
+        value: Value,
+        out: &mut Vec<MultiTableUpdate>,
+    ) {
+        let Some(counts) = self.counts_mut(tree_id, edge) else {
+            return;
+        };
+        let count = counts.shown.entry(value.clone()).or_insert(0);
+        *count += 1;
+        if *count != 1 || !self.trees[&tree_id].edges[edge].gates_child() {
+            return;
+        }
+        let (child, column) = {
+            let edge = &self.trees[&tree_id].edges[edge];
+            (edge.child.clone(), edge.child_column.clone())
+        };
+        let Some((inner, table)) = self.registered_part(tree_id, &child) else {
+            return;
+        };
+        for (key, row) in self.single.rows_matching(inner, column.as_str(), &value) {
+            self.emit(
+                tree_id,
+                &child,
+                &table,
+                DataFrameOperation::Add(key, row.clone()),
+                out,
+            );
+            self.appear(tree_id, &child, &row, out);
+        }
+    }
+
+    /// One shown parent row fewer carries `value` on `edge`; on the 1 → 0
+    /// crossing of a gating edge, retract the child rows held for the
+    /// value before the count drops, so their `Delete`s still pass the
+    /// gate.
+    fn hide(
+        &mut self,
+        tree_id: TreeId,
+        edge: usize,
+        value: &Value,
+        out: &mut Vec<MultiTableUpdate>,
+    ) {
+        let crossing = self
+            .trees
+            .get(&tree_id)
+            .and_then(|tree| tree.edges.get(edge))
+            .is_some_and(|e| e.gates_child() && e.counts.shown.get(value).copied() == Some(1));
+        if crossing {
+            let (child, column) = {
+                let edge = &self.trees[&tree_id].edges[edge];
+                (edge.child.clone(), edge.child_column.clone())
+            };
+            if let Some((inner, table)) = self.registered_part(tree_id, &child) {
+                for (key, row) in self.single.rows_matching(inner, column.as_str(), value) {
+                    self.emit(
+                        tree_id,
+                        &child,
+                        &table,
+                        DataFrameOperation::Delete(key, row.clone()),
+                        out,
+                    );
+                    self.vanish(tree_id, &child, &row, out);
+                }
+            }
+        }
+        Self::drop_in(
+            self.counts_mut(tree_id, edge)
+                .map(|counts| &mut counts.shown),
+            value,
+        );
+    }
+
     /// A driver row now carries `value` on `edge`: bump `left`, and on the
-    /// 0 → 1 crossing, if every edge driving the same leaf now references
-    /// the value, add it to the leaf's set (one index filing) and ask for
-    /// the value's driven rows (one narrowed storage read); when it lands
+    /// 0 → 1 crossing, if every edge reading the same set now references
+    /// the value, add it to the set (one index filing) and ask for the
+    /// value's driven rows (one narrowed storage read); when it lands
     /// ([`Self::land_fetch`]) they are forwarded and arrive at the driven
     /// node. Before the driven part is registered the set is filled
     /// directly; registration files it whole.
@@ -796,11 +1042,11 @@ impl MultiTableIVM {
         if !crossing {
             return;
         }
-        let (driven, column) = self.driven_end(tree_id, edge);
-        if !referenced_by_all(&self.trees[&tree_id], &driven, &column, &value) {
+        if !referenced_by_all(&self.trees[&tree_id], edge, &value) {
             return;
         }
-        let set = self.trees[&tree_id].leaves[&(driven.clone(), column.clone())].clone();
+        let (driven, column, key) = self.leaf_of(tree_id, edge);
+        let set = self.trees[&tree_id].leaves[&key].clone();
         let Some((inner, _)) = self.registered_part(tree_id, &driven) else {
             set.insert(&value);
             return;
@@ -817,9 +1063,9 @@ impl MultiTableIVM {
     }
 
     /// A driver row no longer carries `value` on `edge`: drop `left`, and
-    /// on the crossing to 0, if the value was in the leaf's set, remove it
-    /// (one index unfiling), prune the value's held driven rows from
-    /// current data (no storage round-trip), forward the `Delete`s, and
+    /// on the crossing to 0, if the value was in the set, remove it (one
+    /// index unfiling), prune the value's held driven rows the filter no
+    /// longer admits (no storage round-trip), forward the `Delete`s, and
     /// let them depart from the driven node.
     fn release(
         &mut self,
@@ -833,8 +1079,8 @@ impl MultiTableIVM {
         if !crossing {
             return;
         }
-        let (driven, column) = self.driven_end(tree_id, edge);
-        let set = self.trees[&tree_id].leaves[&(driven.clone(), column.clone())].clone();
+        let (driven, column, key) = self.leaf_of(tree_id, edge);
+        let set = self.trees[&tree_id].leaves[&key].clone();
         if !set.contains(value) {
             return;
         }
@@ -850,7 +1096,7 @@ impl MultiTableIVM {
         }
         let deletes = self
             .single
-            .delete_rows(inner, column.as_str(), std::slice::from_ref(value));
+            .prune_rows(inner, column.as_str(), std::slice::from_ref(value));
         self.single.mark_reconciled(inner);
         for op in deletes {
             self.emit(tree_id, &driven, &table, op.clone(), out);
@@ -860,10 +1106,15 @@ impl MultiTableIVM {
         }
     }
 
-    /// The driven part of `edge` and the column its leaf is on.
-    fn driven_end(&self, tree_id: TreeId, edge: usize) -> (QueryPart, ColumnName) {
+    /// The driven part of `edge`, the column its leaf is on, and the set
+    /// the leaf reads.
+    fn leaf_of(&self, tree_id: TreeId, edge: usize) -> (QueryPart, ColumnName, LeafKey) {
         let edge = &self.trees[&tree_id].edges[edge];
-        (edge.driven().clone(), edge.driven_column().clone())
+        (
+            edge.driven().clone(),
+            edge.driven_column().clone(),
+            edge.leaf.clone(),
+        )
     }
 
     /// The inner id and table of `part` once it is registered; `None`
@@ -903,23 +1154,6 @@ impl MultiTableIVM {
         Self::drop_in(
             self.counts_mut(tree_id, edge)
                 .map(|counts| &mut counts.left),
-            value,
-        );
-    }
-
-    /// Increment `value`'s `right` count on `edge`.
-    fn right_bump(&mut self, tree_id: TreeId, edge: usize, value: Value) {
-        if let Some(counts) = self.counts_mut(tree_id, edge) {
-            *counts.right.entry(value).or_insert(0) += 1;
-        }
-    }
-
-    /// Decrement `value`'s `right` count on `edge`, removing the entry at
-    /// zero.
-    fn right_drop(&mut self, tree_id: TreeId, edge: usize, value: &Value) {
-        Self::drop_in(
-            self.counts_mut(tree_id, edge)
-                .map(|counts| &mut counts.right),
             value,
         );
     }

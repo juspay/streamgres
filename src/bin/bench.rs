@@ -6,7 +6,7 @@
 //! cargo run --release --bin bench
 //! ```
 //!
-//! Four scenarios, each printed as a compact table:
+//! Six scenarios, each printed as a compact table:
 //!
 //! 1. **Routing scale** — `tickets` subscriptions drawn from a small
 //!    filter vocabulary (so conditions are shared across subscriptions) at
@@ -29,6 +29,13 @@
 //! 4. **LEFT JOIN** — `tickets LEFT JOIN users ON assigned_to = users.id`
 //!    with 1_000 identical subscriptions plus 100 distinct ones over 1_000
 //!    users: ticket inserts, ticket reassignments, and user updates.
+//! 6. **xyne-spaces** — three of the dashboard's query shapes on the real
+//!    catalog over synthetic data: `browsableChannels` (an existence test
+//!    inside an `OR`), `conversationMessages` under the channel-access
+//!    chain (three INNER edges deep, the visibility rule with `IS NULL`),
+//!    and the board view (`IS NULL`, `OR` with `IS NULL`, two LEFT edges);
+//!    one subscription per user for each, then message inserts, membership
+//!    churn that moves the existence sets, and in-place ticket updates.
 //! 5. **Postgres** (only when `JUS_SYNC_PG_DSN` names a database with
 //!    `wal_level = logical`) — the same join over real tables: a
 //!    registration's end-to-end latency (two positioned reads), writes
@@ -59,6 +66,12 @@ use jus_sync::model::*;
 use jus_sync::sync::pg::{PgStorage, PgStream};
 use jus_sync::sync::{Local, Lsn, Runtime, Snapshot, Storage, StorageError};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// The xyne-spaces catalog, generated from the application's schema, shared with
+/// the test suite of the same name.
+#[path = "../../tests/xyne_spaces_queries/catalog.rs"]
+#[allow(dead_code)]
+mod xyne;
 
 /// Clients handed out so far: every registration in the bench is its own
 /// client, so per-client grouping never merges two subscriptions' deltas.
@@ -114,6 +127,19 @@ const PG_WRITES: usize = 5_000;
 const PG_WRITES_PER_TXN: usize = 100;
 const PG_LOAD_WRITES: usize = 500;
 const PG_SLOT: &str = "jus_sync_bench";
+
+const XY_USERS: u64 = 200;
+const XY_CHANNELS: u64 = 50;
+const XY_PUBLIC_CHANNELS: u64 = 20;
+const XY_MEMBERSHIPS_PER_USER: u64 = 10;
+const XY_CONVERSATIONS_PER_CHANNEL: u64 = 20;
+const XY_MESSAGES_PER_CONVERSATION: u64 = 20;
+const XY_THREADS_PER_USER: u64 = 5;
+const XY_BOARDS: u64 = 5;
+const XY_TICKETS: u64 = 2_000;
+const XY_MESSAGE_INSERTS: usize = 5_000;
+const XY_MEMBERSHIP_CHURN: usize = 1_000;
+const XY_TICKET_UPDATES: usize = 2_000;
 
 const JOIN_TWINS: usize = 1_000;
 const JOIN_DISTINCT: usize = 100;
@@ -1144,6 +1170,7 @@ fn join_spec(main: Where) -> MultiTableReadQuery {
             "id",
         )],
         right_joins: Vec::new(),
+        inner_joins: Vec::new(),
     }
 }
 
@@ -1281,6 +1308,7 @@ fn main() {
     twin_sharing();
     window();
     left_join();
+    xyne_spaces();
     match std::env::var("JUS_SYNC_PG_DSN") {
         Ok(dsn) => postgres(&dsn),
         Err(_) => println!(
@@ -1646,5 +1674,538 @@ fn postgres(dsn: &str) {
                 ]
             })
             .collect::<Vec<_>>(),
+    );
+}
+
+/// A full row image of the xyne table `table`: every declared column,
+/// `pairs` where given, `NULL` elsewhere, with its key.
+fn xy_row(table: &str, pairs: &[(&str, Value)]) -> (DataFrameKey, DataFrameRow) {
+    let mut data: HashMap<ColumnName, Value> = xyne::columns(table)
+        .iter()
+        .map(|(column, _)| (ColumnName::from(*column), Value::Null))
+        .collect();
+    for (column, value) in pairs {
+        data.insert(ColumnName::from(*column), value.clone());
+    }
+    let key = DataFrameKey::new([(xyne::pkey(table), data[xyne::pkey(table)].clone())]);
+    (key, DataFrameRow { data })
+}
+
+/// An INSERT of one xyne row.
+fn xy_insert(table: &str, pairs: &[(&str, Value)]) -> WriteQuery {
+    let (pkey_value, record) = xy_row(table, pairs);
+    WriteQuery::INSERT(InsertQuery {
+        table: table.into(),
+        pkey_value,
+        record,
+    })
+}
+
+/// An UPDATE carrying one xyne row's full image.
+fn xy_update(table: &str, pairs: &[(&str, Value)]) -> WriteQuery {
+    let (pkey_value, record) = xy_row(table, pairs);
+    WriteQuery::UPDATE(UpdateQuery {
+        table: table.into(),
+        pkey_value,
+        record,
+    })
+}
+
+/// A DELETE of one xyne row by its string id.
+fn xy_delete(table: &str, id: &str) -> WriteQuery {
+    WriteQuery::DELETE(DeleteQuery {
+        table: table.into(),
+        pkey_value: DataFrameKey::new([(xyne::pkey(table), Value::from(id))]),
+    })
+}
+
+/// A single-table query on a xyne table, ordered by its key, unbounded.
+fn xy_query(table: &str, filter: Where) -> SingleTableReadQuery {
+    SingleTableReadQuery::new(
+        table,
+        filter,
+        OrderBy::new(xyne::pkey(table), Order::ASC),
+        u32::MAX,
+    )
+}
+
+/// A join edge along the schema relationship `name` of `table`.
+fn xy_join(table: &str, name: &str, sub: MultiTableReadQuery) -> Join {
+    let rel = xyne::rel(table, name);
+    Join::new(sub, rel.source, rel.dest)
+}
+
+/// The channel-access rule for `user`: public, or a channel the user
+/// participates in, the existence test inside the `OR`.
+fn xy_channel_access(user: &str) -> MultiTableReadQuery {
+    MultiTableReadQuery {
+        main_table: xy_query(
+            "channels",
+            Where::OR(vec![
+                Where::condition("visibility", EQ, "PUBLIC"),
+                Where::exists(xyne::rel("channels", "participants").source, 0),
+            ]),
+        ),
+        left_joins: Vec::new(),
+        right_joins: Vec::new(),
+        inner_joins: vec![xy_join(
+            "channels",
+            "participants",
+            MultiTableReadQuery::single(xy_query(
+                "channel_participants",
+                Where::condition("userId", EQ, user),
+            )),
+        )],
+    }
+}
+
+/// `browsableChannels` for `user`: regular channels the user may see, with
+/// their participants.
+fn xy_browsable(user: &str) -> MultiTableReadQuery {
+    let mut spec = xy_channel_access(user);
+    spec.main_table.filter = Where::AND(vec![
+        Where::condition("scopeType", EQ, "DEFAULT"),
+        spec.main_table.filter,
+    ]);
+    spec.left_joins.push(xy_join(
+        "channels",
+        "participants",
+        MultiTableReadQuery::single(xy_query("channel_participants", Where::AND(vec![]))),
+    ));
+    spec
+}
+
+/// `conversationMessages` for `user` on `conversation`, under the ACL:
+/// the visibility rule on the messages, the conversation an INNER edge,
+/// its channel another, the channel's access rule a third.
+fn xy_thread(user: &str, conversation: &str) -> MultiTableReadQuery {
+    MultiTableReadQuery {
+        main_table: xy_query(
+            "messages",
+            Where::AND(vec![
+                Where::condition("conversationId", EQ, conversation),
+                Where::OR(vec![
+                    Where::is_null("visibleTo"),
+                    Where::condition("visibleTo", EQ, user),
+                ]),
+            ]),
+        ),
+        left_joins: Vec::new(),
+        right_joins: Vec::new(),
+        inner_joins: vec![xy_join(
+            "messages",
+            "conversation",
+            MultiTableReadQuery {
+                main_table: xy_query(
+                    "conversations",
+                    Where::condition("conversationId", EQ, conversation),
+                ),
+                left_joins: Vec::new(),
+                right_joins: Vec::new(),
+                inner_joins: vec![xy_join("conversations", "channel", xy_channel_access(user))],
+            },
+        )],
+    }
+}
+
+/// The board view of `board`: root, non-Support tickets with their
+/// assignments and stage ETAs.
+fn xy_board(board: &str) -> MultiTableReadQuery {
+    MultiTableReadQuery {
+        main_table: xy_query(
+            "tickets",
+            Where::AND(vec![
+                Where::condition("boardId", EQ, board),
+                Where::is_null("rootId"),
+                Where::OR(vec![
+                    Where::condition("ticketType", ComparisonOperator::NEQ, "Support"),
+                    Where::is_null("ticketType"),
+                ]),
+            ]),
+        ),
+        left_joins: vec![
+            xy_join(
+                "tickets",
+                "assignments",
+                MultiTableReadQuery::single(xy_query("ticket_assignments", Where::AND(vec![]))),
+            ),
+            xy_join(
+                "tickets",
+                "stageEtaEntries",
+                MultiTableReadQuery::single(xy_query("ticket_stage_eta", Where::AND(vec![]))),
+            ),
+        ],
+        right_joins: Vec::new(),
+        inner_joins: Vec::new(),
+    }
+}
+
+/// The memberships of the synthetic workspace as `(participant id,
+/// channel, user)`, and its tickets' columns.
+type XyWorkspace = (Vec<(String, u64, u64)>, Vec<Vec<(&'static str, Value)>>);
+
+/// The synthetic workspace: users, channels (public and private), each
+/// user's memberships, conversations with their messages (most visible to
+/// everyone, some to one user), and boards with tickets, assignments and
+/// stage ETAs. Returns the memberships for the churn phase and the tickets
+/// for the update phase.
+fn xy_load(storage: &BenchStorage, rng: &mut XorShift64) -> XyWorkspace {
+    for user in 0..XY_USERS {
+        storage.apply(&xy_insert(
+            "users",
+            &[
+                ("id", Value::from(format!("u{user}"))),
+                ("name", Value::from(format!("user {user}"))),
+            ],
+        ));
+    }
+    for channel in 0..XY_CHANNELS {
+        let visibility = if channel < XY_PUBLIC_CHANNELS {
+            "PUBLIC"
+        } else {
+            "PRIVATE"
+        };
+        storage.apply(&xy_insert(
+            "channels",
+            &[
+                ("id", Value::from(format!("c{channel}"))),
+                ("name", Value::from(format!("channel {channel}"))),
+                ("type", Value::from("DEFAULT")),
+                ("scopeType", Value::from("DEFAULT")),
+                ("visibility", Value::from(visibility)),
+            ],
+        ));
+    }
+    let mut memberships = Vec::new();
+    for user in 0..XY_USERS {
+        let mut joined: Vec<u64> = Vec::new();
+        while joined.len() < XY_MEMBERSHIPS_PER_USER as usize {
+            let channel = rng.below(XY_CHANNELS);
+            if !joined.contains(&channel) {
+                joined.push(channel);
+            }
+        }
+        for channel in joined {
+            let id = format!("cp{}", memberships.len());
+            storage.apply(&xy_insert(
+                "channel_participants",
+                &[
+                    ("id", Value::from(id.as_str())),
+                    ("channelId", Value::from(format!("c{channel}"))),
+                    ("userId", Value::from(format!("u{user}"))),
+                    ("role", Value::from("MEMBER")),
+                ],
+            ));
+            memberships.push((id, channel, user));
+        }
+    }
+    let mut message = 0u64;
+    for channel in 0..XY_CHANNELS {
+        for slot in 0..XY_CONVERSATIONS_PER_CHANNEL {
+            let conversation = channel * XY_CONVERSATIONS_PER_CHANNEL + slot;
+            storage.apply(&xy_insert(
+                "conversations",
+                &[
+                    ("conversationId", Value::from(format!("cv{conversation}"))),
+                    ("channelId", Value::from(format!("c{channel}"))),
+                    ("initialMessageId", Value::from(format!("m{message}"))),
+                    ("createdAt", Value::Int(conversation as i64)),
+                    ("lastActivityAt", Value::Int(conversation as i64)),
+                ],
+            ));
+            for _ in 0..XY_MESSAGES_PER_CONVERSATION {
+                storage.apply(&xy_message(rng, message, conversation));
+                message += 1;
+            }
+        }
+    }
+    let mut tickets = Vec::with_capacity(XY_TICKETS as usize);
+    for ticket in 0..XY_TICKETS {
+        let columns = xy_ticket(rng, ticket, "Todo");
+        storage.apply(&xy_insert("tickets", &columns));
+        tickets.push(columns);
+        storage.apply(&xy_insert(
+            "ticket_assignments",
+            &[
+                ("id", Value::from(format!("a{ticket}"))),
+                ("ticketId", Value::from(format!("t{ticket}"))),
+                ("userId", Value::from(format!("u{}", rng.below(XY_USERS)))),
+                ("userResponsibility", Value::from("ASSIGNEE")),
+            ],
+        ));
+        storage.apply(&xy_insert(
+            "ticket_stage_eta",
+            &[
+                ("id", Value::from(format!("e{ticket}"))),
+                ("ticketId", Value::from(format!("t{ticket}"))),
+                ("stageEta", Value::Int(rng.below(1_000) as i64)),
+            ],
+        ));
+    }
+    (memberships, tickets)
+}
+
+/// One message in `conversation`, visible to everyone nine times in ten
+/// and to one random user otherwise.
+fn xy_message(rng: &mut XorShift64, message: u64, conversation: u64) -> WriteQuery {
+    let visible_to = if rng.below(10) == 0 {
+        Value::from(format!("u{}", rng.below(XY_USERS)))
+    } else {
+        Value::Null
+    };
+    xy_insert(
+        "messages",
+        &[
+            ("messageId", Value::from(format!("m{message}"))),
+            ("conversationId", Value::from(format!("cv{conversation}"))),
+            ("senderId", Value::from(format!("u{}", rng.below(XY_USERS)))),
+            ("visibleTo", visible_to),
+            ("createdAt", Value::Int(message as i64)),
+            ("showInChannel", Value::Bool(true)),
+            ("isDeleted", Value::Bool(false)),
+        ],
+    )
+}
+
+/// The columns of one ticket on a random board: untyped one time in ten,
+/// Support one time in ten, a flow step under another ticket one time in
+/// five.
+fn xy_ticket(rng: &mut XorShift64, ticket: u64, stage: &str) -> Vec<(&'static str, Value)> {
+    let ticket_type = match rng.below(10) {
+        0 => Value::Null,
+        1 => Value::from("Support"),
+        2..=5 => Value::from("Task"),
+        _ => Value::from("Bug"),
+    };
+    let root = if rng.below(5) == 0 {
+        Value::from(format!("t{}", rng.below(XY_TICKETS)))
+    } else {
+        Value::Null
+    };
+    vec![
+        ("id", Value::from(format!("t{ticket}"))),
+        ("boardId", Value::from(format!("b{}", rng.below(XY_BOARDS)))),
+        ("projectId", Value::from("p1")),
+        ("stageName", Value::from(stage)),
+        ("statusV2", Value::from("OPEN")),
+        (
+            "assignedTo",
+            Value::from(format!("u{}", rng.below(XY_USERS))),
+        ),
+        ("createdAt", Value::Int(ticket as i64)),
+        ("isArchived", Value::Bool(false)),
+        ("ticketType", ticket_type),
+        ("rootId", root),
+    ]
+}
+
+/// Register `count` subscriptions built by `spec`, timing the whole batch;
+/// returns the mean microseconds per registration, the snapshot
+/// operations delivered, and the storage reads it took.
+fn xy_register(
+    ivm: &mut Multi,
+    count: u64,
+    mut spec: impl FnMut(u64) -> MultiTableReadQuery,
+) -> (f64, u64, u64) {
+    let before = ivm.engine().stats().clone();
+    let started = Instant::now();
+    let mut ops = 0u64;
+    for index in 0..count {
+        ops += ivm.register_query(client(), spec(index)).1.len() as u64;
+    }
+    let elapsed = started.elapsed();
+    let after = ivm.engine().stats().diff(&before);
+    (
+        elapsed.as_secs_f64() * 1e6 / count as f64,
+        ops,
+        after.storage_reads,
+    )
+}
+
+/// Route `writes`, mirroring each into storage first and timing the
+/// engine call alone: the run, and the client updates it produced.
+fn xy_route(
+    ivm: &mut Multi,
+    storage: &BenchStorage,
+    label: &str,
+    writes: &[WriteQuery],
+) -> (Run, u64) {
+    let before = ivm.engine().stats().clone();
+    let mut elapsed = Duration::ZERO;
+    let mut delivered = 0u64;
+    for write in writes {
+        storage.apply(write);
+        let started = Instant::now();
+        let updates = ivm.incremental_update(write);
+        elapsed += started.elapsed();
+        delivered += updates.len() as u64;
+    }
+    let run = Run {
+        label: label.to_owned(),
+        writes: writes.len() as u64,
+        elapsed,
+        stats: ivm.engine().stats().diff(&before),
+        returned: delivered,
+    };
+    (run, delivered)
+}
+
+/// Scenario 6: the xyne-spaces query shapes over synthetic data.
+fn xyne_spaces() {
+    println!(
+        "\n== 6. xyne-spaces: browsableChannels, conversationMessages under the channel ACL, the board view ({XY_USERS} users, {XY_CHANNELS} channels, {} conversations, {} messages, {XY_TICKETS} tickets) ==",
+        XY_CHANNELS * XY_CONVERSATIONS_PER_CHANNEL,
+        XY_CHANNELS * XY_CONVERSATIONS_PER_CHANNEL * XY_MESSAGES_PER_CONVERSATION
+    );
+    let mut rng = XorShift64::new(SEED ^ 7);
+    let storage = Rc::new(BenchStorage::default());
+    let (mut memberships, mut tickets) = xy_load(&storage, &mut rng);
+    let mut ivm: Multi = Local::new(MultiTableIVM::new(), storage.clone());
+
+    let (browsable_us, browsable_ops, browsable_reads) =
+        xy_register(&mut ivm, XY_USERS, |user| xy_browsable(&format!("u{user}")));
+    let threads: Vec<(u64, u64)> = (0..XY_USERS)
+        .flat_map(|user| {
+            (0..XY_THREADS_PER_USER).map(move |slot| {
+                (
+                    user,
+                    (user * 7 + slot * 131) % (XY_CHANNELS * XY_CONVERSATIONS_PER_CHANNEL),
+                )
+            })
+        })
+        .collect();
+    let (thread_us, thread_ops, thread_reads) =
+        xy_register(&mut ivm, threads.len() as u64, |index| {
+            let (user, conversation) = threads[index as usize];
+            xy_thread(&format!("u{user}"), &format!("cv{conversation}"))
+        });
+    let (board_us, board_ops, board_reads) = xy_register(&mut ivm, XY_USERS, |user| {
+        xy_board(&format!("b{}", user % XY_BOARDS))
+    });
+    let stats = ivm.engine().stats().clone();
+    println!(
+        "\nregistration (one subscription per user; the board view shared by {} users per board):",
+        XY_USERS / XY_BOARDS
+    );
+    print_table(
+        &[
+            "query",
+            "subs",
+            "trees",
+            "us/register",
+            "snapshot ops/sub",
+            "storage reads",
+        ],
+        &[
+            vec![
+                "browsableChannels".to_owned(),
+                XY_USERS.to_string(),
+                XY_USERS.to_string(),
+                one(browsable_us),
+                one(browsable_ops as f64 / XY_USERS as f64),
+                browsable_reads.to_string(),
+            ],
+            vec![
+                "conversationMessages + ACL".to_owned(),
+                threads.len().to_string(),
+                threads.len().to_string(),
+                one(thread_us),
+                one(thread_ops as f64 / threads.len() as f64),
+                thread_reads.to_string(),
+            ],
+            vec![
+                "board view".to_owned(),
+                XY_USERS.to_string(),
+                XY_BOARDS.to_string(),
+                one(board_us),
+                one(board_ops as f64 / XY_USERS as f64),
+                board_reads.to_string(),
+            ],
+        ],
+    );
+    println!(
+        "index after registration: {} disjuncts, {} conditions, {} snapshots shared",
+        stats.disjuncts_registered, stats.conditions_indexed, stats.snapshots_shared
+    );
+
+    let mut message = XY_CHANNELS * XY_CONVERSATIONS_PER_CHANNEL * XY_MESSAGES_PER_CONVERSATION;
+    let mut inserts = Vec::with_capacity(XY_MESSAGE_INSERTS);
+    for _ in 0..XY_MESSAGE_INSERTS {
+        let conversation = rng.below(XY_CHANNELS * XY_CONVERSATIONS_PER_CHANNEL);
+        inserts.push(xy_message(&mut rng, message, conversation));
+        message += 1;
+    }
+    let mut churn = Vec::with_capacity(XY_MEMBERSHIP_CHURN);
+    for step in 0..XY_MEMBERSHIP_CHURN {
+        let index = rng.index(memberships.len());
+        let (id, channel, user) = memberships[index].clone();
+        if step % 2 == 0 {
+            churn.push(xy_delete("channel_participants", &id));
+            memberships.swap_remove(index);
+        } else {
+            let fresh = format!("cp{}", 100_000 + step);
+            let channel = rng.below(XY_CHANNELS);
+            churn.push(xy_insert(
+                "channel_participants",
+                &[
+                    ("id", Value::from(fresh.as_str())),
+                    ("channelId", Value::from(format!("c{channel}"))),
+                    ("userId", Value::from(format!("u{user}"))),
+                    ("role", Value::from("MEMBER")),
+                ],
+            ));
+            memberships.push((fresh, channel, user));
+        }
+        let _ = channel;
+    }
+    let mut ticket_updates = Vec::with_capacity(XY_TICKET_UPDATES);
+    for _ in 0..XY_TICKET_UPDATES {
+        let ticket = rng.index(tickets.len());
+        let stage = ["Todo", "Doing", "Review", "Done"][rng.index(4)];
+        for (column, value) in tickets[ticket].iter_mut() {
+            if *column == "stageName" {
+                *value = Value::from(stage);
+            }
+        }
+        ticket_updates.push(xy_update("tickets", &tickets[ticket]));
+    }
+    let phases = [
+        xy_route(&mut ivm, &storage, "message insert", &inserts),
+        xy_route(&mut ivm, &storage, "membership churn", &churn),
+        xy_route(&mut ivm, &storage, "ticket update", &ticket_updates),
+    ];
+    println!(
+        "\nrouting (to {} subscriptions):",
+        XY_USERS + threads.len() as u64 + XY_USERS
+    );
+    let rows: Vec<Vec<String>> = phases
+        .iter()
+        .map(|(run, delivered)| {
+            vec![
+                run.label.clone(),
+                run.writes.to_string(),
+                one(run.micros_per_write()),
+                whole(run.writes_per_second()),
+                one(run.per_write(run.stats.conditions_evaluated)),
+                one(run.per_write(run.stats.queries_impacted)),
+                one(*delivered as f64 / run.writes as f64),
+                run.stats.storage_reads.to_string(),
+                run.stats.conditions_replaced.to_string(),
+            ]
+        })
+        .collect();
+    print_table(
+        &[
+            "phase",
+            "writes",
+            "us/write",
+            "writes/s",
+            "cond_match",
+            "impacted",
+            "client updates/write",
+            "narrowed reads",
+            "set edits",
+        ],
+        &rows,
     );
 }

@@ -204,9 +204,44 @@ impl SingleTableIVM {
         column: &str,
         values: &[Value],
     ) -> Vec<DataFrameOperation> {
+        self.remove_rows_where(sub, column, values, |_| true)
+    }
+
+    /// Untag every row `sub` holds whose `column` equals one of `values`
+    /// and that its filter no longer matches: the prune after a set-valued
+    /// leaf lost those values. A row another branch of the filter still
+    /// admits stays. Returns the `Delete` operations.
+    pub fn prune_rows(
+        &mut self,
+        sub: SubId,
+        column: &str,
+        values: &[Value],
+    ) -> Vec<DataFrameOperation> {
+        let Some(filter) = self
+            .select_queries
+            .get(&sub)
+            .map(|query| query.filter.clone())
+        else {
+            return Vec::new();
+        };
+        self.remove_rows_where(sub, column, values, |row| {
+            !evaluate(&filter, &row.data, &mut 0)
+        })
+    }
+
+    /// Untag the rows `sub` holds whose `column` equals one of `values`
+    /// and that `doomed` selects; the `Delete` operations.
+    fn remove_rows_where(
+        &mut self,
+        sub: SubId,
+        column: &str,
+        values: &[Value],
+        doomed: impl Fn(&DataFrameRow) -> bool,
+    ) -> Vec<DataFrameOperation> {
         let doomed: Vec<DataFrameKey> = self
             .rows_matching_any(sub, column, values)
             .into_iter()
+            .filter(|(_, row)| doomed(row))
             .map(|(key, _)| key)
             .collect();
         let mut ops = Vec::new();

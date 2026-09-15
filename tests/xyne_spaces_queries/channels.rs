@@ -7,7 +7,7 @@ use jus_sync::model::Order::{ASC, DESC};
 use jus_sync::model::Value;
 
 use super::world::{ME, World, ops, with};
-use super::zql::{eq, is_null, or, same, zql};
+use super::zql::{and, eq, is_null, or, same, zql};
 
 /// A full row image from its distinguishing columns.
 type Row = Vec<(&'static str, Value)>;
@@ -224,41 +224,34 @@ fn user_visible_email_channels() {
 }
 
 /// `browsableChannels`: regular channels that are public or that the
-/// caller is in. Gap X: the `OR` over an existence test cannot be one
-/// subscription; the public half is tested here, the member half is the
-/// union partner shown in `gaps.rs`.
+/// caller is in, one subscription with the existence test inside the
+/// `OR`; leaving the private channel drops it with its participants.
 #[test]
 fn browsable_channels() {
     let mut w = World::new();
     seed_workspace(&mut w);
-    let q = zql("channels")
-        .eq("scopeType", "DEFAULT")
-        .eq("visibility", "PUBLIC")
+    let mut q = zql("channels").eq("scopeType", "DEFAULT");
+    let member = q.exists("participants", |p| p.eq("userId", ME));
+    let q = q
+        .filter(or(vec![eq("visibility", "PUBLIC"), member]))
         .related("participants", same)
         .order_by("name", ASC);
     assert_eq!(
         w.subscribe("q", &q),
         ops([
             "q/main+c1",
+            "q/main+c2",
             "q/main+c-mail",
             "q/participants+cp1",
-            "q/participants+cp4"
+            "q/participants+cp2",
+            "q/participants+cp4",
+            "q/has:participants+cp1",
+            "q/has:participants+cp2"
         ])
     );
-    let member = zql("channels")
-        .eq("scopeType", "DEFAULT")
-        .eq("visibility", "PRIVATE")
-        .where_exists("participants", |p| p.eq("userId", ME))
-        .related("participants", same)
-        .order_by("name", ASC);
     assert_eq!(
-        w.subscribe("member", &member),
-        ops([
-            "member/main+c2",
-            "member/has:participants+cp1",
-            "member/has:participants+cp2",
-            "member/participants+cp2"
-        ])
+        w.delete("channel_participants", "cp2"),
+        ops(["q/main-c2", "q/participants-cp2", "q/has:participants-cp2"])
     );
 }
 
@@ -470,42 +463,51 @@ fn user_bookmarks() {
     );
 }
 
-/// `channelLinks`: a channel's links the caller may see. Gap X: the rule
-/// is an `OR` of three branches, two with existence tests; the branch
-/// with none (personal links by the caller) is one subscription, the
-/// shared-with-me branch another, the default-visibility branch a third
-/// whose channel test is itself gap X.
+/// `channelLinks`: a channel's links the caller may see: an `OR` of three
+/// branches, personal links by the caller, personal links shared with the
+/// caller, and default-visibility links in a channel the caller may see
+/// (public, or a participant), the last an existence test nested inside
+/// another.
 #[test]
 fn channel_links() {
     let mut w = World::new();
     seed_workspace(&mut w);
-    let mine = zql("links")
-        .eq("channelId", "c1")
-        .eq("visibility", "PERSONAL")
-        .eq("createdBy", ME)
-        .related("sharedWith", same)
-        .order_by("createdAt", DESC);
-    assert_eq!(w.subscribe("mine", &mine), ops(["mine/main+lk2"]));
-    let shared = zql("links")
-        .eq("channelId", "c1")
-        .eq("visibility", "PERSONAL")
-        .where_exists("sharedWith", |s| s.eq("userId", ME))
+    let mut q = zql("links").eq("channelId", "c1");
+    let shared = q.exists("sharedWith", |s| s.eq("userId", ME));
+    let visible_channel = q.exists("channel", |ch| {
+        let mut ch = ch;
+        let member = ch.exists("participants", |p| p.eq("userId", ME));
+        ch.filter(or(vec![eq("visibility", "PUBLIC"), member]))
+    });
+    let q = q
+        .filter(or(vec![
+            and(vec![eq("visibility", "PERSONAL"), eq("createdBy", ME)]),
+            and(vec![eq("visibility", "PERSONAL"), shared]),
+            and(vec![eq("visibility", "DEFAULT"), visible_channel]),
+        ]))
         .related("sharedWith", same)
         .order_by("createdAt", DESC);
     assert_eq!(
-        w.subscribe("shared", &shared),
+        w.subscribe("q", &q),
         ops([
-            "shared/main+lk3",
-            "shared/has:sharedWith+la1",
-            "shared/sharedWith+la1"
+            "q/main+lk1",
+            "q/main+lk2",
+            "q/main+lk3",
+            "q/sharedWith+la1",
+            "q/has:sharedWith+la1",
+            "q/has:channel+c1",
+            "q/has:channel.has:participants+cp1"
         ])
     );
     assert_eq!(
         w.update(
             "links",
-            &with(&lk1(), row!["visibility" => "PERSONAL", "createdBy" => ME])
+            &with(
+                &lk1(),
+                row!["visibility" => "PERSONAL", "createdBy" => "u-2"]
+            )
         ),
-        ops(["mine/main+lk1"])
+        ops(["q/main-lk1"])
     );
 }
 

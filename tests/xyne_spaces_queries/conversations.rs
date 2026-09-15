@@ -157,6 +157,14 @@ fn nudge_counts_mine_or_channel(query: Q) -> Q {
     query.filter(or(vec![eq("userId", ME), is_not_null("channelId")]))
 }
 
+/// The channel-access rule: public, or a channel the caller participates
+/// in, the existence test inside the `OR`.
+fn channel_public_or_mine(channel: Q) -> Q {
+    let mut channel = channel;
+    let member = channel.exists("participants", |p| p.eq("userId", ME));
+    channel.filter(or(vec![eq("visibility", "PUBLIC"), member]))
+}
+
 /// The nudge-count filter of the channel queries: the caller's counts or
 /// the channel's.
 fn nudge_counts_for(channel: &'static str) -> impl Fn(Q) -> Q {
@@ -495,8 +503,7 @@ fn get_conversation_by_timestamp() {
 }
 
 /// `userConversationsPaginated`: threads with replies the caller takes
-/// part in, by activity. The participation test ships every row of the
-/// caller's (gap E).
+/// part in, by activity; the participation rows ship under their threads.
 #[test]
 fn user_conversations_paginated() {
     let mut w = World::new();
@@ -509,15 +516,11 @@ fn user_conversations_paginated() {
         .limit(10);
     assert_eq!(
         w.subscribe("q", &q),
-        ops([
-            "q/main+cv1",
-            "q/has:participants+pp1",
-            "q/has:participants+pp3"
-        ])
+        ops(["q/has:participants+pp1", "q/main+cv1"])
     );
     assert_eq!(
         w.update("conversations", &with(&cv2(), row!["replyCount" => 1])),
-        ops(["q/main+cv2"])
+        ops(["q/has:participants+pp3", "q/main+cv2"])
     );
 }
 
@@ -968,24 +971,27 @@ fn channel_latest_conversation() {
 }
 
 /// `getConversationAttachements`: a channel's attachments through their
-/// conversation. Gap X: the inline channel access test (public, or a
-/// participant) is an `OR` of existence tests and cannot be stated; the
-/// conversation test alone is.
+/// conversation, the channel itself public or one the caller is in (an
+/// existence test inside the `OR`, nested two levels down).
 #[test]
 fn get_conversation_attachements() {
     let mut w = World::new();
     seed_channel(&mut w);
     let q = zql("message_attachments")
-        .where_exists("conversation", |c| c.eq("channelId", "c1"))
+        .where_exists("conversation", |c| {
+            c.eq("channelId", "c1")
+                .where_exists("channel", channel_public_or_mine)
+        })
         .start(&[("createdAt", DESC, 500.into())], true)
         .order_by("createdAt", DESC)
         .limit(20);
     assert_eq!(
         w.subscribe("q", &q),
         ops([
-            "q/main+ma1",
-            "q/has:conversation+cv1",
-            "q/has:conversation+cv2"
+            "q/has:conversation+cv2",
+            "q/has:conversation.has:channel+c1",
+            "q/has:conversation.has:channel.has:participants+cp1",
+            "q/main+ma1"
         ])
     );
 }
@@ -1003,15 +1009,11 @@ fn get_conversation_attachements_v2() {
         .limit(20);
     assert_eq!(
         w.subscribe("q", &q),
-        ops([
-            "q/main+ma1",
-            "q/has:conversation+cv1",
-            "q/has:conversation+cv2"
-        ])
+        ops(["q/has:conversation+cv2", "q/main+ma1"])
     );
     assert_eq!(
         w.insert("message_attachments", row!["id" => "ma5", "entityId" => "m5", "entityType" => "CHAT", "conversationId" => "cv1", "createdAt" => 5]),
-        ops(["q/main+ma5"])
+        ops(["q/has:conversation+cv1", "q/main+ma5"])
     );
 }
 
@@ -1179,15 +1181,11 @@ fn dm_channels_latest_messages_paginated() {
     assert_eq!(
         w.subscribe("q", &q),
         ops([
-            "q/main+c-dm",
-            "q/has:channel+c-dm",
             "q/channel+c-dm",
             "q/channel.conversations+cvdm1",
-            "q/channel.conversations.has:initialMessage+m1",
-            "q/channel.conversations.has:initialMessage+m2",
-            "q/channel.conversations.has:initialMessage+m4",
-            "q/channel.conversations.has:initialMessage+m5",
-            "q/channel.conversations.has:initialMessage+mdm1"
+            "q/channel.conversations.has:initialMessage+mdm1",
+            "q/has:channel+c-dm",
+            "q/main+c-dm"
         ])
     );
     assert_eq!(
@@ -1401,8 +1399,7 @@ fn seed_nudges(w: &mut World) {
 
 /// `messageNudges`: a message's active nudges visible to the caller, the
 /// message itself visible and in a reachable channel: three existence
-/// tests deep. Gap X: the channel's public-or-participant rule, so the
-/// channel test is bare here.
+/// tests deep, the channel public or one the caller is in.
 #[test]
 fn message_nudges() {
     let mut w = World::new();
@@ -1414,23 +1411,20 @@ fn message_nudges() {
             .eq("state", "ACTIVE"),
     )
     .where_exists("sourceMessage", |m| {
-        visible_to_me(m).where_exists("conversation", |c| c.where_exists("channel", same))
+        visible_to_me(m).where_exists("conversation", |c| {
+            c.where_exists("channel", channel_public_or_mine)
+        })
     })
     .order_by("createdAt", ASC);
     assert_eq!(
         w.subscribe("q", &q),
         ops([
-            "q/main+sn1",
-            "q/main+sn3",
-            "q/has:sourceMessage+m1",
             "q/has:sourceMessage+m2",
-            "q/has:sourceMessage+m4",
-            "q/has:sourceMessage+m5",
-            "q/has:sourceMessage.has:conversation+cv1",
             "q/has:sourceMessage.has:conversation+cv2",
-            "q/has:sourceMessage.has:conversation+cv3",
             "q/has:sourceMessage.has:conversation.has:channel+c1",
-            "q/has:sourceMessage.has:conversation.has:channel+c2"
+            "q/has:sourceMessage.has:conversation.has:channel.has:participants+cp1",
+            "q/main+sn1",
+            "q/main+sn3"
         ])
     );
     assert_eq!(

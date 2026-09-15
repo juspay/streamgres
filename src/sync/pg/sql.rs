@@ -124,6 +124,7 @@ fn render_condition(condition: &Condition) -> String {
             let keyword = if negated { "NOT IN" } else { "IN" };
             format!("{column} {keyword} ({}) IS TRUE", literals.join(", "))
         }
+        EXISTS => "FALSE".to_owned(),
         IS if condition.value.is_null() => format!("{column} IS NULL"),
         IS_NOT if condition.value.is_null() => format!("{column} IS NOT NULL"),
         _ if condition.value.is_null() => "FALSE".to_owned(),

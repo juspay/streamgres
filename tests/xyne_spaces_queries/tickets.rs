@@ -412,7 +412,7 @@ fn kanban_tickets_page_v2() {
             "ticket_assignments",
             row!["id" => "a8", "ticketId" => "t7", "roleId" => "r1", "userId" => "u-2"]
         ),
-        ops(["q/has:assignments+a8"])
+        ops([])
     );
     assert_eq!(
         w.insert(
@@ -420,9 +420,10 @@ fn kanban_tickets_page_v2() {
             row!["id" => "e8", "ticketId" => "t7", "stageEta" => 10]
         ),
         ops([
+            "q/assignments+a8",
+            "q/has:assignments+a8",
             "q/has:stageEtaEntries+e8",
             "q/main+t7",
-            "q/assignments+a8",
             "q/stageEtaEntries+e8"
         ])
     );
@@ -495,7 +496,7 @@ fn workflows_paginated() {
     );
     assert_eq!(
         w.update("workflows", &with(&w1(), row!["status" => "DONE"])),
-        ops(["q/main-w1", "q/ticket-t1"])
+        ops(["q/has:ticket-t1", "q/main-w1", "q/ticket-t1"])
     );
 }
 
@@ -1618,58 +1619,59 @@ fn seed_release_values(w: &mut World) {
 }
 
 /// `releaseChangeFormValuesByReleaseId`: env and migration form values of
-/// a release with their field. Gap X: the `changeLog` exclusion is an `OR`
-/// of two existence tests (form field or global field named otherwise)
-/// and cannot be stated, so the change-log value is included here.
+/// a release with their field, the `changeLog` field excluded through an
+/// `OR` of two existence tests (a form field or a global field named
+/// otherwise).
 #[test]
 fn release_change_form_values_by_release_id() {
     let mut w = World::new();
     seed_release_values(&mut w);
-    let q = zql("form_entity_values")
+    let mut q = zql("form_entity_values")
         .eq("contextId", "t-rel")
         .filter(or(vec![
             eq("entityType", "RELEASE_ENV_FORM"),
             eq("entityType", "RELEASE_MIGRATION_FORM"),
-        ]))
+        ]));
+    let form_field = q.exists("formField", |f| f.where_("fieldName", NEQ, "changeLog"));
+    let global_field = q.exists("globalField", |g| g.where_("fieldName", NEQ, "changeLog"));
+    let q = q
+        .filter(or(vec![form_field, global_field]))
         .related("formField", same)
         .related("globalField", same);
     assert_eq!(
         w.subscribe("q", &q),
-        ops([
-            "q/main+fev-r1",
-            "q/main+fev-r2",
-            "q/formField+ff1",
-            "q/formField+ff-log"
-        ])
+        ops(["q/main+fev-r1", "q/formField+ff1", "q/has:formField+ff1"])
     );
     assert_eq!(
         w.delete("form_entity_values", "fev-r1"),
-        ops(["q/main-fev-r1", "q/formField-ff1"])
+        ops(["q/main-fev-r1", "q/formField-ff1", "q/has:formField-ff1"])
     );
 }
 
-/// `releaseChangeLogValuesByReleaseId`: the change-log half. Gap X: the
-/// selection by field name is the same `OR` of existence tests; without
-/// it this is the same set as the form-values query.
+/// `releaseChangeLogValuesByReleaseId`: the change-log half, selected by
+/// the same `OR` of existence tests on the field name.
 #[test]
 fn release_change_log_values_by_release_id() {
     let mut w = World::new();
     seed_release_values(&mut w);
-    let q = zql("form_entity_values")
+    let mut q = zql("form_entity_values")
         .eq("contextId", "t-rel")
         .filter(or(vec![
             eq("entityType", "RELEASE_ENV_FORM"),
             eq("entityType", "RELEASE_MIGRATION_FORM"),
-        ]))
+        ]));
+    let form_field = q.exists("formField", |f| f.eq("fieldName", "changeLog"));
+    let global_field = q.exists("globalField", |g| g.eq("fieldName", "changeLog"));
+    let q = q
+        .filter(or(vec![form_field, global_field]))
         .related("formField", same)
         .related("globalField", same);
     assert_eq!(
         w.subscribe("q", &q),
         ops([
-            "q/main+fev-r1",
             "q/main+fev-r2",
-            "q/formField+ff1",
-            "q/formField+ff-log"
+            "q/formField+ff-log",
+            "q/has:formField+ff-log"
         ])
     );
     assert_eq!(w.rows("q", "globalField"), 0);

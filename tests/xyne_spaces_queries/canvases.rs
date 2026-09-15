@@ -1,8 +1,8 @@
 //! The canvas, folder and knowledge-collection queries, one test per
 //! registry entry. The canvas visibility rule is `createdBy = me OR EXISTS
-//! participants(me, my groups, my channels) [OR visibility = PUBLIC]`; its
-//! two scalar branches are one subscription here, the participant branch
-//! is gap X (a union partner, shown once).
+//! participants(me) [OR visibility = PUBLIC]`, the existence test placed
+//! inside the `OR` of one subscription (the group and channel grants of the
+//! participant branch are not modelled by the fixture).
 
 use jus_sync::model::Order::{ASC, DESC};
 use jus_sync::model::Value;
@@ -92,13 +92,17 @@ fn seed_canvases(w: &mut World) {
     w.seed("canvas_comments", row!["id" => "cc2", "threadId" => "th1", "canvasId" => "k1", "body" => "second", "isInitial" => false, "createdAt" => 2]);
 }
 
-/// The visibility rule's scalar branches: mine, or public when asked.
+/// The visibility rule: mine, or public when asked, or a canvas the
+/// caller participates in (an existence test inside the `OR`).
 fn visible(query: Q, include_public: bool) -> Q {
+    let mut query = query;
+    let participant = query.exists("participants", |p| p.eq("userId", ME));
+    let mut branches = vec![eq("createdBy", ME)];
     if include_public {
-        query.filter(or(vec![eq("createdBy", ME), eq("visibility", "PUBLIC")]))
-    } else {
-        query.eq("createdBy", ME)
+        branches.push(eq("visibility", "PUBLIC"));
     }
+    branches.push(participant);
+    query.filter(or(branches))
 }
 
 /// The caller's own status row on each canvas.
@@ -128,8 +132,8 @@ fn personal_canvas_folders() {
 }
 
 /// `hierarchyCanvases` at a channel's root: live canvases of the channel
-/// the caller may see (`folderId IS NULL`), with the caller's status;
-/// gap X for the participant branch.
+/// the caller may see (`folderId IS NULL`, own, public or participating),
+/// with the caller's status.
 #[test]
 fn hierarchy_canvases() {
     let mut w = World::new();
@@ -181,7 +185,7 @@ fn project_canvas_folders() {
 }
 
 /// `projectFolderCanvases`: live canvases of a project folder outside
-/// channels the caller may see; gap X drops the participant branch.
+/// channels the caller may see.
 #[test]
 fn project_folder_canvases() {
     let mut w = World::new();
@@ -276,9 +280,8 @@ fn channel_quarto_docs_paginated() {
     );
 }
 
-/// `userCanvasesPaginated`: the caller's own live canvases (no public
-/// branch here), newest first. Gap X: canvases reached through
-/// participation need the union partner.
+/// `userCanvasesPaginated`: the caller's own live canvases and those
+/// reached through participation (no public branch here), newest first.
 #[test]
 fn user_canvases_paginated() {
     let mut w = World::new();
@@ -303,38 +306,31 @@ fn user_canvases_paginated() {
     );
 }
 
-/// `userQuartoDocsPaginated`: the caller's Quarto documents. Gap X: `k3`,
-/// reached through participation, needs the union partner, shown as a
-/// second subscription.
+/// `userQuartoDocsPaginated`: the caller's Quarto documents, own or
+/// reached through participation (`k3`), one subscription.
 #[test]
 fn user_quarto_docs_paginated() {
     let mut w = World::new();
     seed_canvases(&mut w);
-    let mine = with_my_status(
-        zql("canvases")
-            .eq("docType", "Quarto")
-            .eq("createdBy", ME)
+    let q = with_my_status(
+        visible(zql("canvases").eq("docType", "Quarto"), false)
             .order_by("updatedAt", DESC)
             .order_by("id", DESC)
             .limit(10)
             .related("participants", same),
     );
-    assert_eq!(w.subscribe("mine", &mine), ops(["mine/main+k8"]));
-    let shared = with_my_status(
-        zql("canvases")
-            .eq("docType", "Quarto")
-            .where_exists("participants", |p| p.eq("userId", ME))
-            .order_by("updatedAt", DESC)
-            .limit(10)
-            .related("participants", same),
+    assert_eq!(
+        w.subscribe("q", &q),
+        ops([
+            "q/main+k3",
+            "q/main+k8",
+            "q/has:participants+kp3",
+            "q/participants+kp3"
+        ])
     );
     assert_eq!(
-        w.subscribe("shared", &shared),
-        ops([
-            "shared/main+k3",
-            "shared/has:participants+kp3",
-            "shared/participants+kp3"
-        ])
+        w.delete("canvas_participants", "kp3"),
+        ops(["q/main-k3", "q/has:participants-kp3", "q/participants-kp3"])
     );
 }
 
@@ -423,8 +419,8 @@ fn get_canvas() {
 }
 
 /// `canvasVersions`: a canvas's versions, the canvas an existence test
-/// under the visibility rule (whose matching canvases all ship, gap E).
-/// Gap O drops the `id` tiebreak.
+/// under the visibility rule (only the versions' own canvas ships). Gap O
+/// drops the `id` tiebreak.
 #[test]
 fn canvas_versions() {
     let mut w = World::new();
@@ -436,15 +432,7 @@ fn canvas_versions() {
         .order_by("id", DESC);
     assert_eq!(
         w.subscribe("q", &q),
-        ops([
-            "q/main+kv1",
-            "q/main+kv2",
-            "q/has:canvas+k1",
-            "q/has:canvas+k2",
-            "q/has:canvas+k5",
-            "q/has:canvas+k6",
-            "q/has:canvas+k8"
-        ])
+        ops(["q/has:canvas+k1", "q/main+kv1", "q/main+kv2"])
     );
     assert_eq!(w.delete("canvas_versions", "kv2"), ops(["q/main-kv2"]));
 }

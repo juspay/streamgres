@@ -7,7 +7,7 @@ use jus_sync::model::Order::{ASC, DESC};
 use jus_sync::model::Value;
 
 use super::world::{ME, WS, World, ops, with};
-use super::zql::{eq, or, same, zql};
+use super::zql::{Q, eq, or, same, zql};
 
 /// A full row image from its distinguishing columns.
 type Row = Vec<(&'static str, Value)>;
@@ -271,22 +271,31 @@ fn created_oats_recordings() {
 }
 
 /// `sharedOatsRecordings`: others' recordings with a live share reaching
-/// the caller; revoking the share drops the recording. Gap X: the share
-/// may also reach the caller through a group or a channel, an `OR` over
-/// existence tests; the direct branch is tested.
+/// the caller directly, through a group the caller is in, or through a
+/// channel the caller is in: three existence tests on one column inside
+/// one `OR`, each with a set of its own. Revoking the direct share drops
+/// the recording.
 #[test]
 fn shared_oats_recordings() {
     let mut w = World::new();
     seed_calls(&mut w);
-    let q = zql("calls")
+    let live = |s: Q| {
+        s.eq("shareableEntityType", "NOTE_TAKER")
+            .where_("entityUserAccess", NEQ, "REVOKED")
+    };
+    let mut q = zql("calls")
         .eq("workspaceId", WS)
         .eq("callType", "HEADLESS")
-        .where_("createdByUserId", NEQ, ME)
-        .where_exists("shares", |s| {
-            s.eq("shareableEntityType", "NOTE_TAKER")
-                .where_("entityUserAccess", NEQ, "REVOKED")
-                .eq("userId", ME)
-        })
+        .where_("createdByUserId", NEQ, ME);
+    let direct = q.exists("shares", |s| live(s).eq("userId", ME));
+    let via_group = q.exists("shares", |s| {
+        live(s).where_exists("userGroupMemberships", |m| m.eq("userId", ME))
+    });
+    let via_channel = q.exists("shares", |s| {
+        live(s).where_exists("channelMembers", |m| m.eq("userId", ME))
+    });
+    let q = q
+        .filter(or(vec![direct, via_group, via_channel]))
         .order_by("startedAt", DESC)
         .order_by("id", DESC)
         .limit(10);

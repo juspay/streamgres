@@ -8,7 +8,7 @@ use jus_sync::model::Order::{ASC, DESC};
 use jus_sync::model::Value;
 
 use super::world::{ME, WS, World, ops, with};
-use super::zql::{and, eq, same, zql};
+use super::zql::{and, cmp, eq, or, same, zql};
 
 /// A full row image from its distinguishing columns.
 type Row = Vec<(&'static str, Value)>;
@@ -85,29 +85,23 @@ fn seed_directory(w: &mut World) {
 }
 
 /// `getUsers` with a watermark: users changed since it, or whose presence
-/// changed, with presence. Gap X: the presence half is an existence test
-/// inside an `OR`; the user half is tested, the presence half would be a
-/// second subscription.
+/// changed (an existence test inside the `OR`), with presence.
 #[test]
 fn get_users() {
     let mut w = World::new();
     seed_directory(&mut w);
-    let q = zql("users")
-        .where_("updatedAt", GT, 150)
+    let mut q = zql("users");
+    let presence_changed = q.exists("presenceStatus", |p| p.where_("updatedAt", GT, 150));
+    let q = q
+        .filter(or(vec![cmp("updatedAt", GT, 150), presence_changed]))
         .related("presenceStatus", same);
     assert_eq!(
         w.subscribe("q", &q),
-        ops(["q/main+u-2", "q/main+u-bot", "q/presenceStatus+pr2"])
-    );
-    let presence = zql("users")
-        .where_exists("presenceStatus", |p| p.where_("updatedAt", GT, 150))
-        .related("presenceStatus", same);
-    assert_eq!(
-        w.subscribe("presence", &presence),
         ops([
-            "presence/main+u-2",
-            "presence/has:presenceStatus+pr2",
-            "presence/presenceStatus+pr2"
+            "q/main+u-2",
+            "q/main+u-bot",
+            "q/presenceStatus+pr2",
+            "q/has:presenceStatus+pr2"
         ])
     );
     assert_eq!(
@@ -115,11 +109,7 @@ fn get_users() {
             "user_presence",
             row!["id" => "pr2", "userId" => "u-2", "status" => "AWAY", "updatedAt" => 260]
         ),
-        ops([
-            "q/presenceStatus+pr2",
-            "presence/has:presenceStatus+pr2",
-            "presence/presenceStatus+pr2"
-        ])
+        ops(["q/presenceStatus+pr2", "q/has:presenceStatus+pr2"])
     );
 }
 

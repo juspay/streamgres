@@ -340,14 +340,16 @@ fn support_tickets_filtered_v3() {
     assert_eq!(
         w.delete("conversation_label_mappings", "lm1"),
         ops([
-            "q/has:conversationLabelMappings-lm1",
-            "q/main-d1",
-            "q/project-p1",
-            "q/tagMappings-dg1",
             "q/conversation-cvd1",
             "q/conversation.channel-c-desk",
             "q/emailReads-rd1",
-            "q/formEntityValues-fev-d1"
+            "q/formEntityValues-fev-d1",
+            "q/has:conversationLabelMappings-lm1",
+            "q/has:formEntityValues-fev-d1",
+            "q/has:subTicketMappings-dm1",
+            "q/main-d1",
+            "q/project-p1",
+            "q/tagMappings-dg1"
         ])
     );
 }
@@ -389,12 +391,13 @@ fn support_tickets_filtered_v4() {
     assert_eq!(
         w.update("tickets", &with(&d1(), row!["priority" => "LOW"])),
         ops([
-            "q/main-d1",
-            "q/project-p1",
-            "q/tagMappings-dg1",
             "q/conversation-cvd1",
             "q/conversation.channel-c-desk",
-            "q/emailReads-rd1"
+            "q/emailReads-rd1",
+            "q/has:emailDrafts-dr1",
+            "q/main-d1",
+            "q/project-p1",
+            "q/tagMappings-dg1"
         ])
     );
 }
@@ -1035,8 +1038,8 @@ fn user_email_drafts() {
 }
 
 /// `userEmailsSent` for the caller: outbound emails in a channel with
-/// their ticket. Gap X: the `channel` scope's public-or-participant test
-/// cannot be stated; gap O drops the `id` tiebreak.
+/// their ticket, in a channel the caller may see (public, or a
+/// participant); gap O drops the `id` tiebreak.
 #[test]
 fn user_emails_sent() {
     let mut w = World::new();
@@ -1045,11 +1048,19 @@ fn user_emails_sent() {
         .eq("channelId", "c-desk")
         .in_("type", &["REPLY", "REPLY_ALL", "COMPOSE"])
         .eq("sentByUserId", ME)
+        .where_exists("channel", |ch| {
+            let mut ch = ch;
+            let member = ch.exists("participants", |p| p.eq("userId", ME));
+            ch.filter(or(vec![eq("visibility", "PUBLIC"), member]))
+        })
         .order_by("createdAt", DESC)
         .order_by("id", DESC)
         .limit(10)
         .related("ticket", same);
-    assert_eq!(w.subscribe("q", &q), ops(["q/main+em1", "q/ticket+d1"]));
+    assert_eq!(
+        w.subscribe("q", &q),
+        ops(["q/main+em1", "q/ticket+d1", "q/has:channel+c-desk"])
+    );
     assert_eq!(
         w.insert("emails", row!["id" => "em5", "conversationId" => "cvd2", "channelId" => "c-desk", "type" => "COMPOSE", "sentByUserId" => ME, "createdAt" => 40]),
         ops(["q/main+em5", "q/ticket+d2"])

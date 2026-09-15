@@ -13,7 +13,9 @@
 use std::collections::HashMap;
 
 use jus_sync::ivm::QueryPart;
-use jus_sync::model::ComparisonOperator::{EQ, GT, GTE, IN, IS, IS_NOT, LT, LTE, NEQ, NOT_IN};
+use jus_sync::model::ComparisonOperator::{
+    EQ, EXISTS, GT, GTE, IN, IS, IS_NOT, LT, LTE, NEQ, NOT_IN,
+};
 use jus_sync::model::{
     ComparisonOperator, Join, MultiTableReadQuery, Order, OrderBy, SingleTableReadQuery, Value,
     Where,
@@ -78,7 +80,7 @@ pub struct Q {
     dropped_order: Vec<String>,
     limit: u32,
     left: Vec<(String, Q)>,
-    right: Vec<(String, Q)>,
+    inner: Vec<(String, Q)>,
 }
 
 /// Start a query on `table`, like `zql.table`.
@@ -90,7 +92,7 @@ pub fn zql(table: &'static str) -> Q {
         dropped_order: Vec::new(),
         limit: u32::MAX,
         left: Vec::new(),
-        right: Vec::new(),
+        inner: Vec::new(),
     }
 }
 
@@ -144,12 +146,21 @@ impl Q {
         self
     }
 
-    /// `.whereExists(name, sub)`: a RIGHT edge to the relationship's table.
+    /// `.whereExists(name, sub)`: an INNER edge to the relationship's
+    /// table, conjoined with the node's filter.
     pub fn where_exists(mut self, name: &str, sub: impl FnOnce(Q) -> Q) -> Q {
-        let edge = rel(self.table, name);
-        self.right
-            .push((name.to_owned(), sub(zql(edge.dest_table))));
+        self.exists(name, sub);
         self
+    }
+
+    /// `exists(name, sub)` inside a `where` helper: an INNER edge to the
+    /// relationship's table plus the `EXISTS` leaf that places it, for the
+    /// caller to put anywhere in a predicate tree.
+    pub fn exists(&mut self, name: &str, sub: impl FnOnce(Q) -> Q) -> Where {
+        let edge = rel(self.table, name);
+        self.inner
+            .push((name.to_owned(), sub(zql(edge.dest_table))));
+        Where::exists(edge.source, self.inner.len() - 1)
     }
 
     /// `.orderBy(column, direction)`; a second column is a tiebreak the
@@ -186,7 +197,7 @@ impl Q {
     }
 
     /// The model query, and the name of every part by its path: `main`, then
-    /// relationship names, a RIGHT edge's prefixed `has:`, nested ones
+    /// relationship names, an INNER edge's prefixed `has:`, nested ones
     /// dotted (`conversation.has:channel`).
     pub fn build(&self) -> (MultiTableReadQuery, HashMap<QueryPart, String>) {
         let mut names = HashMap::new();
@@ -195,7 +206,8 @@ impl Q {
     }
 
     /// Build this node at `path` under the name `name`, recursing into its
-    /// edges: left joins are numbered first, right joins after them.
+    /// edges: left joins are numbered first, inner joins after them (the
+    /// builder issues no right joins).
     fn node(
         &self,
         path: Vec<usize>,
@@ -225,29 +237,30 @@ impl Q {
             .left
             .iter()
             .map(|(rel_name, child)| (rel_name.clone(), child));
-        let right = self
-            .right
+        let inner = self
+            .inner
             .iter()
             .map(|(rel_name, child)| (format!("has:{rel_name}"), child));
-        for (index, (label, child)) in left.chain(right).enumerate() {
+        for (index, (label, child)) in left.chain(inner).enumerate() {
             let edge = rel(self.table, label.trim_start_matches("has:"));
             let mut child_path = path.clone();
             child_path.push(index);
             let sub = child.node(child_path, &child_name(&label), names);
             edges.push(Join::new(sub, edge.source, edge.dest));
         }
-        let right_joins = edges.split_off(self.left.len());
+        let inner_joins = edges.split_off(self.left.len());
         MultiTableReadQuery {
             main_table,
             left_joins: edges,
-            right_joins,
+            right_joins: Vec::new(),
+            inner_joins,
         }
     }
 
     /// The SQL text of a single-table query, `None` when it has edges (the
     /// parser has no join syntax yet).
     pub fn sql(&self) -> Option<String> {
-        if !self.left.is_empty() || !self.right.is_empty() {
+        if !self.left.is_empty() || !self.inner.is_empty() {
             return None;
         }
         let filter = normalize(collapse(self.filters.clone()));
@@ -356,6 +369,7 @@ fn render(filter: &Where, top: bool) -> String {
                 IN => "IN",
                 NOT_IN => "NOT IN",
                 IS | IS_NOT => unreachable!("rendered above"),
+                EXISTS => unreachable!("a query with edges has no SQL"),
             };
             format!(
                 "{} {op} {}",
