@@ -562,6 +562,57 @@ fn refill_in_flight_keeps_the_window_exact() {
     only(&step);
 }
 
+/// Identical registrations arriving while the first one's read is out
+/// share that read: the later ones are served the donor's rows so far
+/// (none yet) and issue nothing, a write streamed meanwhile reaches all
+/// of them, and the one landing completes all of them.
+#[test]
+fn registrations_while_the_read_is_out_share_it() {
+    let mut db = Db::at(0);
+    db.seed(&[
+        ticket(1, "OPEN", 7, 1),
+        ticket(2, "OPEN", 7, 2),
+        ticket(3, "CLOSED", 7, 3),
+    ]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let (a, step) = runtime.register(CLIENT, open_tickets());
+    let read = only(&step);
+    let (b, step) = runtime.register(ClientId(2), open_tickets());
+    assert!(
+        step.selects.is_empty(),
+        "no second read, got {:?}",
+        step.selects
+    );
+    assert!(step.updates.is_empty());
+    let (c, step) = runtime.register(ClientId(3), open_tickets());
+    assert!(step.selects.is_empty());
+
+    let snapshot = db.snapshot(&read);
+    let streamed = stream(&mut runtime, &mut db, &ticket(4, "OPEN", 7, 4)).updates;
+    assert_eq!(
+        streamed.len(),
+        3,
+        "routed natively to all three while the read is out"
+    );
+
+    let landed = runtime.fetched(read.id, snapshot);
+    for sub in [a, b, c] {
+        assert_eq!(
+            ids(runtime.engine().rows_for(sub)),
+            BTreeSet::from([1, 2, 4])
+        );
+    }
+    assert_eq!(
+        landed.updates.len(),
+        6,
+        "rows 1 and 2 for each of the three"
+    );
+    assert_eq!(runtime.stats().reads_issued, 1);
+    assert_eq!(runtime.engine().stats().snapshots_shared, 2);
+    assert_eq!(runtime.outstanding(), 0);
+}
+
 /// Registration walks the tree as reads land: a RIGHT child's read comes
 /// first, and only once it has landed does the parent register, with the
 /// child's join values already in its set, so the parent costs one read;
@@ -648,7 +699,7 @@ fn post_order_registration_follows_landings() {
 /// A read the driver could not run is parked and handed out again when
 /// the stream moves; an unregistered subscription's read lands as a
 /// no-op; a second identical registration while the first's read is out
-/// reads for itself rather than copying an incomplete twin.
+/// joins that read instead of reading for itself.
 #[test]
 fn parked_reads_unregistration_and_pending_twins() {
     let mut db = Db::at(0);
@@ -696,15 +747,18 @@ fn parked_reads_unregistration_and_pending_twins() {
             Where::condition("assigned_to", ComparisonOperator::EQ, 7),
         ),
     );
-    let second_read = only(&step);
-    assert_ne!(first_read.id, second_read.id);
+    assert!(
+        step.selects.is_empty(),
+        "the twin joins the read that is out, got {:?}",
+        step.selects
+    );
     assert_eq!(
         runtime.engine().stats().snapshots_shared,
-        0,
-        "an incomplete twin donates nothing"
+        1,
+        "an incomplete twin donates what it has and shares its read"
     );
     runtime.fetched(first_read.id, db.snapshot(&first_read));
-    runtime.fetched(second_read.id, db.snapshot(&second_read));
+    assert_eq!(runtime.outstanding(), 0);
     assert_eq!(
         ids(runtime.engine().rows_for(first)),
         BTreeSet::from([1, 2])
@@ -726,7 +780,7 @@ fn parked_reads_unregistration_and_pending_twins() {
         "with both landed, the twin path serves it"
     );
     assert_eq!(step.updates.len(), 2, "one delta per shared row");
-    assert_eq!(runtime.engine().stats().snapshots_shared, 1);
+    assert_eq!(runtime.engine().stats().snapshots_shared, 2);
     assert_eq!(
         ids(runtime.engine().rows_for(third)),
         BTreeSet::from([1, 2])

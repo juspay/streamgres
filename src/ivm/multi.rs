@@ -639,26 +639,30 @@ impl MultiTableIVM {
     /// engine's position by the runtime): merge them through the inner
     /// engine, forward the resulting operations like a write's, letting
     /// arrivals cascade down the tree (each may reference further join
-    /// values and ask for further reads), and, when this was the last read
-    /// out for a part not yet live, continue the registration walk from
-    /// it. A read for a part that is gone lands as nothing.
+    /// values and ask for further reads), and, for each part the read
+    /// served that is not yet live and has no read left out, continue the
+    /// registration walk from it. A read for parts that are gone lands as
+    /// nothing.
     pub fn land_fetch(
         &mut self,
         fetch: &Fetch,
         rows: &[(DataFrameKey, DataFrameRow)],
     ) -> Vec<MultiTableUpdate> {
+        let readers = self.single.readers_of(fetch);
         let applied = self.single.land_fetch(fetch, rows);
         let mut out = self.forward(applied);
-        let Some((tree_id, part)) = self.parts.get(&fetch.sub).cloned() else {
-            return out;
-        };
-        let live = self
-            .trees
-            .get(&tree_id)
-            .and_then(|tree| tree.nodes.get(&part))
-            .is_some_and(|node| node.live);
-        if !live && !self.single.is_pending(fetch.sub) {
-            self.landed(tree_id, &part, &mut out);
+        for sub in readers {
+            let Some((tree_id, part)) = self.parts.get(&sub).cloned() else {
+                continue;
+            };
+            let live = self
+                .trees
+                .get(&tree_id)
+                .and_then(|tree| tree.nodes.get(&part))
+                .is_some_and(|node| node.live);
+            if !live && !self.single.is_pending(sub) {
+                self.landed(tree_id, &part, &mut out);
+            }
         }
         out
     }
@@ -1059,7 +1063,6 @@ impl MultiTableIVM {
         }
         self.single
             .fetch(inner, column.as_str(), std::slice::from_ref(&value));
-        self.single.mark_reconciled(inner);
     }
 
     /// A driver row no longer carries `value` on `edge`: drop `left`, and
@@ -1097,7 +1100,6 @@ impl MultiTableIVM {
         let deletes = self
             .single
             .prune_rows(inner, column.as_str(), std::slice::from_ref(value));
-        self.single.mark_reconciled(inner);
         for op in deletes {
             self.emit(tree_id, &driven, &table, op.clone(), out);
             if let DataFrameOperation::Delete(_, row) = &op {

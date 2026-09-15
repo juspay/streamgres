@@ -142,11 +142,15 @@ A write can affect a subscription two ways, and both are checked:
 - **Registration** (`registry.rs`). Hand out a `SubId` under its client,
   index the DNF; serve the initial rows from storage or, for a structurally
   identical query found through a query-keyed index in one lookup, from the
-  twin's rows with no storage query (`snapshots_shared`). `replace_condition`
+  twin's rows with no storage query (`snapshots_shared`) — even while the
+  twin's own read is out: a read lands into every subscription of its
+  query, so a burst of identical registrations costs one storage query.
+  `replace_condition`
   edits one leaf in place (stored filter + indexed disjuncts, splitting shared
-  counters correctly). `replace_query` / `replace_condition` open a
-  maintenance window during which the subscription is not a twin donor until
-  the caller's `mark_reconciled`.
+  counters correctly). `replace_query` / `replace_condition` leave
+  reconciling the held rows to the caller, in the same call: a widening
+  fetch (whose pending read keeps the subscription from donating a twin
+  snapshot until it lands) or a narrowing prune.
 - **Windows** (`window.rs`). `ORDER BY` is a list of columns compared in
   turn. A finite `LIMIT L` keeps a buffer of `2L` rows (storage queried with
   the doubled limit) and a **frontier**: the worst order key known to be

@@ -23,7 +23,9 @@ impl SingleTableIVM {
     /// query **structurally identical** to one already registered is
     /// served from the shared frame — the twin's current rows, no storage
     /// read, counted in `snapshots_shared` — found through the query-keyed
-    /// index in one lookup. A query with no twin records one storage read
+    /// index in one lookup; a twin whose own read is still out donates
+    /// what it holds so far, and that read serves the new subscription
+    /// too when it lands. A query with no twin records one storage read
     /// ([`super::FetchKind::Snapshot`]) that the runtime runs and lands
     /// later through [`SingleTableIVM::land_fetch`]; until then the
     /// returned operations are empty. Rows already shared with other
@@ -66,6 +68,7 @@ impl SingleTableIVM {
                 if let Some(window) = self.windows.get_mut(&sub) {
                     window.set_frontier(inherited);
                 }
+                self.join_reads(sub, twin);
             }
             None => {
                 self.rebuild_window(sub);
@@ -85,10 +88,11 @@ impl SingleTableIVM {
     /// unregister/re-register churn.
     ///
     /// As with [`SingleTableIVM::replace_query`], the caller owns
-    /// reconciling held rows with the new condition (fetch what widened
-    /// in, prune what narrowed out), and the subscription is skipped as a
-    /// twin donor until [`SingleTableIVM::mark_reconciled`]. Unknown
-    /// subscriptions and identical conditions are no-ops.
+    /// reconciling held rows with the new condition before it returns to
+    /// the runtime: a fetch for what widened in (its pending read keeps
+    /// the subscription from donating a twin snapshot until it lands), a
+    /// prune of what narrowed out in the same call. Unknown subscriptions
+    /// and identical conditions are no-ops.
     pub fn replace_condition(&mut self, sub: SubId, old: &Condition, new: Condition) {
         let Some(query) = self.select_queries.get_mut(&sub) else {
             return;
@@ -103,7 +107,6 @@ impl SingleTableIVM {
         if let Some(table_index) = self.tables.get_mut(&before.table) {
             table_index.update_condition(sub, old, &new, &mut self.stats);
         }
-        self.stale_views.insert(sub);
     }
 
     /// Add `value` to the set behind `condition`, a set-valued `IN` leaf of
@@ -111,10 +114,10 @@ impl SingleTableIVM {
     /// form of a join edge gaining a value. The stored filter needs no
     /// rewrite, since it holds the same set, and the query's identity does
     /// not change. As with [`SingleTableIVM::replace_condition`], the
-    /// caller fetches the value's rows and then calls
-    /// [`SingleTableIVM::mark_reconciled`]. Reports whether the set
-    /// changed; a member already present, an unknown subscription, or a
-    /// condition that is not set-valued changes nothing.
+    /// caller fetches the value's rows in the same call. Reports whether
+    /// the set changed; a member already present, an unknown
+    /// subscription, or a condition that is not set-valued changes
+    /// nothing.
     pub fn set_insert(&mut self, sub: SubId, condition: &Condition, value: &Value) -> bool {
         let Value::Set(set) = &condition.value else {
             return false;
@@ -130,14 +133,13 @@ impl SingleTableIVM {
             table_index.set_insert(condition, value);
         }
         self.stats.conditions_replaced += 1;
-        self.stale_views.insert(sub);
         true
     }
 
     /// Remove `value` from the set behind `condition` and unfile the leaf
     /// from it: the O(1) form of a join edge losing a value. The caller
-    /// prunes the value's held rows and then calls
-    /// [`SingleTableIVM::mark_reconciled`]. Reports whether the set changed.
+    /// prunes the value's held rows in the same call. Reports whether the
+    /// set changed.
     pub fn set_remove(&mut self, sub: SubId, condition: &Condition, value: &Value) -> bool {
         let Value::Set(set) = &condition.value else {
             return false;
@@ -153,7 +155,6 @@ impl SingleTableIVM {
             table_index.set_remove(condition, value);
         }
         self.stats.conditions_replaced += 1;
-        self.stale_views.insert(sub);
         true
     }
 
@@ -163,18 +164,6 @@ impl SingleTableIVM {
     /// "registrations that touched no storage".
     pub(super) fn note_shared_snapshots(&mut self, count: u64) {
         self.stats.snapshots_shared += count;
-    }
-
-    /// Declare a `replace_query` / `replace_condition` / set edit
-    /// reconciliation complete: the caller has finished every fetch and
-    /// prune the change required, so the subscription's held rows again
-    /// match its filter and it may donate twin snapshots. Only the caller
-    /// can know when that point is reached — a widened filter needs a
-    /// fetch, a narrowed one a prune, a swapped one both — so nothing
-    /// clears the flag implicitly. A no-op for unknown or already
-    /// reconciled subscriptions.
-    pub fn mark_reconciled(&mut self, sub: SubId) {
-        self.stale_views.remove(&sub);
     }
 
     /// The storage-facing form of a subscription's query: identical except
@@ -190,15 +179,32 @@ impl SingleTableIVM {
     /// Remove a subscription: its routing-index entries and its tag on
     /// every shared row it holds — walked off its held index, not by
     /// scanning the table — dropping rows nobody holds anymore. A table
-    /// index that routes nothing afterwards is dropped too; reads not yet
-    /// taken by the runtime are withdrawn and reads already out land as
-    /// no-ops. Unknown subscriptions are a no-op.
+    /// index that routes nothing afterwards is dropped too; a read not yet
+    /// taken by the runtime passes to a twin waiting on it or is
+    /// withdrawn, and a read already out lands for the twins waiting on
+    /// it or as a no-op. Unknown subscriptions are a no-op.
     pub fn unregister_query(&mut self, sub: SubId) {
         let Some(query) = self.select_queries.remove(&sub) else {
             return;
         };
         self.pending.remove(&sub);
-        self.requests.retain(|fetch| fetch.sub != sub);
+        self.readers.retain(|_, readers| {
+            readers.retain(|reader| *reader != sub);
+            !readers.is_empty()
+        });
+        let readers = &self.readers;
+        self.requests.retain_mut(|fetch| {
+            if fetch.sub != sub {
+                return true;
+            }
+            match readers.get(&fetch.id).and_then(|readers| readers.first()) {
+                Some(&next) => {
+                    fetch.sub = next;
+                    true
+                }
+                None => false,
+            }
+        });
         if let Some(twins) = self.by_query.get_mut(&query) {
             twins.remove(&sub);
             if twins.is_empty() {
@@ -215,7 +221,6 @@ impl SingleTableIVM {
         {
             self.tables.remove(&query.table);
         }
-        self.stale_views.remove(&sub);
         self.windows.remove(&sub);
         let ids = self.held.remove(&sub).unwrap_or_default();
         if let Some(frame) = self.frames.get_mut(&query.table) {
@@ -241,13 +246,14 @@ impl SingleTableIVM {
     /// The caller owns keeping held rows consistent with the new filter —
     /// this is the general reseat seam (for a single value change of a
     /// set-valued leaf, [`SingleTableIVM::set_insert`] is the cheap edit).
-    /// Until the caller declares that reconciliation complete
-    /// ([`SingleTableIVM::mark_reconciled`], after however many fetches
-    /// and prunes the change needs — a swap needs both), the subscription
-    /// is skipped as a twin donor: its filter is ahead of its held rows,
-    /// and a registration served from it would inherit the gap
-    /// permanently. The table must stay the same (a cross-table swap is
-    /// refused); unknown subscriptions and identical queries are no-ops.
+    /// That must happen before control returns to the runtime: a widened
+    /// filter needs a fetch, whose pending read keeps the subscription
+    /// from donating a twin snapshot until it lands; a narrowed one a
+    /// prune in the same call; a swap both. A registration served from a
+    /// subscription whose filter is ahead of its rows would inherit the
+    /// gap permanently. The table must stay the same (a cross-table swap
+    /// is refused); unknown subscriptions and identical queries are
+    /// no-ops.
     pub fn replace_query(&mut self, sub: SubId, select_query: SingleTableReadQuery) {
         let Some(existing) = self.select_queries.get_mut(&sub) else {
             return;
@@ -259,7 +265,6 @@ impl SingleTableIVM {
         let before = existing.clone();
         *existing = select_query.clone();
         self.move_query_key(sub, &before, select_query.clone());
-        self.stale_views.insert(sub);
         if let Some(table_index) = self.tables.get_mut(&table) {
             table_index.unregister(sub);
         }
@@ -275,6 +280,21 @@ impl SingleTableIVM {
         }
         self.rebuild_window(sub);
         self.sync_boundary(sub);
+    }
+
+    /// Make `sub` a reader of every read `twin` is waiting on: the rows
+    /// they bring are the rows `sub` lacks too.
+    fn join_reads(&mut self, sub: SubId, twin: SubId) {
+        let mut joined = 0u32;
+        for readers in self.readers.values_mut() {
+            if readers.contains(&twin) && !readers.contains(&sub) {
+                readers.push(sub);
+                joined += 1;
+            }
+        }
+        if joined > 0 {
+            *self.pending.entry(sub).or_default() += joined;
+        }
     }
 
     /// Re-key `sub` in the query-keyed index after its stored query
@@ -296,8 +316,8 @@ impl SingleTableIVM {
 
     /// Another registered subscription with a structurally identical
     /// query, if any — the sharing seam of registration, one lookup in the
-    /// query-keyed index. Skips subscriptions in a maintenance window or
-    /// with a storage read still out, whose rows lag their filter.
+    /// query-keyed index. A twin with a read still out qualifies: the read
+    /// serves the new subscription too.
     fn identical_subscription(
         &self,
         select_query: &SingleTableReadQuery,
@@ -306,9 +326,7 @@ impl SingleTableIVM {
         self.by_query
             .get(select_query)?
             .iter()
-            .find(|twin| {
-                **twin != exclude && !self.stale_views.contains(twin) && !self.is_pending(**twin)
-            })
+            .find(|twin| **twin != exclude)
             .copied()
     }
 

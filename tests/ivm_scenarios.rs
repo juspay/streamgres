@@ -1000,14 +1000,11 @@ fn limit_window_admits_evicts_and_refills() {
     assert_eq!(ivm.engine().stats().window_refills, refills);
 }
 
-/// Regression (review): a subscription between `replace_query` and the
-/// caller's declared reconciliation has a filter ahead of its held rows.
-/// Registering an identical query in that window must NOT be served from
-/// the stale view — it falls back to storage — and only the caller's
-/// explicit `mark_reconciled` (a fetch alone might be half of a swap)
-/// re-enables twin donation.
+/// `replace_query` leaves the filter ahead of the held rows until the
+/// caller's fetch lands. A twin registering meanwhile is served what the
+/// subscription holds so far and joins the read, which lands into both.
 #[test]
-fn replaced_query_is_not_a_twin_donor_until_reconciled() {
+fn replaced_query_shares_its_fetch_with_a_twin() {
     let tickets = table("tickets");
     let storage = Rc::new(MemoryStorage::new());
     let mut ivm = Local::new(SingleTableIVM::new(), storage.clone());
@@ -1034,40 +1031,35 @@ fn replaced_query_is_not_a_twin_donor_until_reconciled() {
     assert_eq!(snapshot.len(), 1);
 
     ivm.engine_mut().replace_query(names.id("s"), wide.clone());
-    let snapshot = names.register(&mut ivm, "t", wide.clone());
-    assert_eq!(
-        snapshot.len(),
-        2,
-        "mid-maintenance `s` must not donate; storage serves the full set"
-    );
-
-    ivm.unregister_query(names.id("t"));
     ivm.engine_mut()
         .fetch(names.id("s"), "points", &[Value::Int(20)]);
-    ivm.pump();
-    assert_eq!(ivm.engine().rows_for(names.id("s")).unwrap().len(), 2);
-    let snapshot = names.register(&mut ivm, "u", wide.clone());
+    let reads = ivm.engine().stats().storage_reads;
+    names.register(&mut ivm, "t", wide);
     assert_eq!(
-        snapshot.len(),
-        2,
-        "a fetch alone might be half of a swap — still no donation (served by storage)"
+        ivm.engine().stats().snapshots_shared,
+        1,
+        "served from `s` though its read is out"
     );
-    assert_eq!(ivm.engine().stats().snapshots_shared, 0);
-
-    ivm.unregister_query(names.id("u"));
-    ivm.engine_mut().mark_reconciled(names.id("s"));
-    let snapshot = names.register(&mut ivm, "v", wide);
-    assert_eq!(snapshot.len(), 2, "a declared-reconciled twin donates");
-    assert_eq!(ivm.engine().stats().snapshots_shared, 1);
+    assert_eq!(
+        ivm.engine().stats().storage_reads,
+        reads,
+        "no read of its own: it joined `s`'s"
+    );
+    assert_eq!(ivm.engine().rows_for(names.id("s")).unwrap().len(), 2);
+    assert_eq!(
+        ivm.engine().rows_for(names.id("t")).unwrap().len(),
+        2,
+        "the fetch landed into both"
+    );
 }
 
-/// Regression (review): `replace_condition` opens the same maintenance
-/// window as `replace_query` — until the caller declares reconciliation,
-/// a registration with the identical (post-edit) query must be served by
-/// storage, not by the half-reconciled subscription. And the edit itself
-/// must not re-register anything: only `conditions_replaced` moves.
+/// `replace_condition` behaves the same: the edit itself re-registers
+/// nothing (only `conditions_replaced` moves); the caller prunes what
+/// narrowed out and fetches what widened in, in the same call; a twin
+/// registering while that fetch is out shares it, and both route on the
+/// edited leaf.
 #[test]
-fn replaced_condition_view_is_not_a_twin_donor_until_reconciled() {
+fn replaced_condition_shares_its_fetch_with_a_twin() {
     let tickets = table("tickets");
     let storage = Rc::new(MemoryStorage::new());
     let mut ivm = Local::new(SingleTableIVM::new(), storage.clone());
@@ -1092,33 +1084,76 @@ fn replaced_condition_view_is_not_a_twin_donor_until_reconciled() {
     assert_eq!(after.disjuncts_registered, before.disjuncts_registered);
     assert_eq!(after.conditions_indexed, before.conditions_indexed);
     assert!(after.conditions_replaced > before.conditions_replaced);
-
-    let snapshot = names.register(&mut ivm, "b", with(20));
-    assert_eq!(snapshot.len(), 1, "served by storage, not the stale view");
-    assert_eq!(snapshot[0].key(), &DataFrameKey::new(pkey(2)));
-    assert_eq!(ivm.engine().stats().snapshots_shared, 0);
-
-    ivm.unregister_query(names.id("b"));
-    ivm.engine_mut()
-        .fetch(names.id("a"), "points", &[Value::Int(20)]);
-    ivm.pump();
     ivm.engine_mut()
         .delete_rows(names.id("a"), "points", &[Value::Int(10)]);
-    ivm.engine_mut().mark_reconciled(names.id("a"));
-    let snapshot = names.register(&mut ivm, "c", with(20));
-    assert_eq!(snapshot.len(), 1, "a declared-reconciled twin donates");
+    ivm.engine_mut()
+        .fetch(names.id("a"), "points", &[Value::Int(20)]);
+
+    let reads = ivm.engine().stats().storage_reads;
+    names.register(&mut ivm, "b", with(20));
     assert_eq!(ivm.engine().stats().snapshots_shared, 1);
+    assert_eq!(ivm.engine().stats().storage_reads, reads);
+    let held = ivm.engine().rows_for(names.id("b")).unwrap();
+    assert_eq!(held.len(), 1, "the landed row and nothing pruned");
+    assert!(held.contains_key(&DataFrameKey::new(pkey(2))));
+    assert_eq!(ivm.engine().rows_for(names.id("a")).unwrap().len(), 1);
 
     let admitted = insert(&tickets, 3, &[("points", 20.into())]);
     storage.apply(&admitted);
     assert_eq!(
         names.impacted(&ivm.incremental_update(&admitted)),
-        vec!["a", "c"],
+        vec!["a", "b"],
         "the edited IN condition routes new writes"
     );
     let ignored = insert(&tickets, 4, &[("points", 10.into())]);
     storage.apply(&ignored);
     assert!(ivm.incremental_update(&ignored).is_empty());
+}
+
+/// A read serves the query, not the subscription: identical registrations
+/// arriving while the first one's snapshot read is out issue nothing and
+/// wait on that read, which lands into all of them — each with its own
+/// window and page — so a burst of identical registrations costs one
+/// storage read.
+#[test]
+fn identical_registrations_share_the_read_that_is_out() {
+    let tickets = table("tickets");
+    let mut engine = SingleTableIVM::new();
+    let windowed = SingleTableReadQuery::new(
+        tickets.name.clone(),
+        Where::AND(vec![]),
+        OrderBy::new("points", Order::ASC),
+        2,
+    );
+    let (a, first) = engine.register_query(windowed.clone());
+    assert!(first.is_empty(), "nothing has landed yet");
+    let (b, second) = engine.register_query(windowed);
+    assert!(
+        second.is_empty(),
+        "served from `a`, which holds nothing yet"
+    );
+    assert_eq!(engine.stats().snapshots_shared, 1);
+    assert!(engine.is_pending(a) && engine.is_pending(b));
+    let requests = engine.take_requests();
+    assert_eq!(requests.len(), 1, "one read for the two registrations");
+
+    let rows: Vec<(DataFrameKey, DataFrameRow)> = [(1, 10), (2, 20), (3, 30), (4, 40)]
+        .iter()
+        .map(|&(id, points)| {
+            let write = insert(&tickets, id, &[("points", points.into())]);
+            (
+                write.pkey_value().clone(),
+                write.new_row_image().unwrap().clone(),
+            )
+        })
+        .collect();
+    let landed = engine.land_fetch(&requests[0], &rows);
+    let page = |sub: SubId| landed.iter().filter(|update| update.query == sub).count();
+    assert_eq!(page(a), 2, "the page of two for `a`, got {landed:?}");
+    assert_eq!(page(b), 2, "and for `b`");
+    assert!(!engine.is_pending(a) && !engine.is_pending(b));
+    assert_eq!(engine.rows_for(a), engine.rows_for(b));
+    assert!(engine.take_requests().is_empty(), "no read left to run");
 }
 
 /// A `LIMIT 0` subscription is permanently empty: an empty registration

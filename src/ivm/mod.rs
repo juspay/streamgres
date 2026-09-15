@@ -22,9 +22,10 @@
 //! Registration exploits the sharing: a query **structurally identical**
 //! to one already registered is served straight from the shared frame —
 //! the twin's current rows are tagged for the new subscription and
-//! returned as its snapshot, with no storage query. A subscription midway
-//! through a [`SingleTableIVM::replace_query`] maintenance window (filter
-//! swapped, rows not yet reconciled) is skipped as a donor.
+//! returned as its snapshot, with no storage query. A twin whose own read
+//! is still out donates what it holds so far, and the read, when it
+//! lands, serves every subscription of its query, so a burst of identical
+//! registrations costs one storage read.
 //!
 //! # How a write is routed
 //!
@@ -176,16 +177,15 @@ pub struct SingleTableUpdate {
 ///   queries only): the order-value → row-key map whose worst entry is
 ///   the admission boundary, published into the table's routing index
 ///   whenever it moves (see the `window` module).
-/// - `stale_views`: subscriptions midway through a `replace_query` /
-///   `replace_condition` maintenance window — filter already swapped,
-///   held rows not yet reconciled — excluded as twin donors until the
-///   caller declares the reconciliation complete
-///   ([`SingleTableIVM::mark_reconciled`]).
 /// - `tables`: one routing index per table — the condition →
 ///   shared-disjunct-counter machinery (see the `index` module).
-/// - `pending`: subscription → how many of its storage reads are still
-///   out; while nonzero the subscription publishes no admission boundary,
-///   asks for no refill, and donates no twin snapshot.
+/// - `pending`: subscription → how many storage reads it is waiting on,
+///   its own and its twins' (a read serves every subscription of its
+///   query); while nonzero the subscription publishes no admission
+///   boundary and asks for no refill.
+/// - `readers`: read out → the subscriptions it will land into: the one
+///   that asked and every subscription of its query, joined by twins
+///   registered while it is out.
 /// - `requests`: the reads asked for since the runtime last took them.
 /// - `clients`: subscription id → its client, and `by_client` the
 ///   reverse, kept only for subscriptions registered through the
@@ -202,9 +202,9 @@ pub struct SingleTableIVM {
     frames: HashMap<TableName, TableFrame>,
     held: HashMap<SubId, HashSet<RowId>>,
     windows: HashMap<SubId, Window>,
-    stale_views: HashSet<SubId>,
     tables: HashMap<TableName, TableIndex>,
     pending: HashMap<SubId, u32>,
+    readers: HashMap<FetchId, Vec<SubId>>,
     requests: Vec<Fetch>,
     clients: HashMap<SubId, ClientId>,
     by_client: HashMap<ClientId, BTreeSet<SubId>>,
@@ -243,9 +243,9 @@ impl SingleTableIVM {
             frames: HashMap::new(),
             held: HashMap::new(),
             windows: HashMap::new(),
-            stale_views: HashSet::new(),
             tables: HashMap::new(),
             pending: HashMap::new(),
+            readers: HashMap::new(),
             requests: Vec::new(),
             clients: HashMap::new(),
             by_client: HashMap::new(),
@@ -261,9 +261,19 @@ impl SingleTableIVM {
         std::mem::take(&mut self.requests)
     }
 
-    /// Whether a storage read for `sub` is still out.
+    /// Whether a storage read `sub` is waiting on is still out.
     pub fn is_pending(&self, sub: SubId) -> bool {
         self.pending.get(&sub).is_some_and(|count| *count > 0)
+    }
+
+    /// The subscriptions a read out will land into (the one that asked
+    /// and its twins); a read the engine does not know lands into the one
+    /// that asked.
+    pub fn readers_of(&self, fetch: &Fetch) -> Vec<SubId> {
+        self.readers
+            .get(&fetch.id)
+            .cloned()
+            .unwrap_or_else(|| vec![fetch.sub])
     }
 
     /// Which registered subscriptions does this write affect?

@@ -20,8 +20,9 @@ impl SingleTableIVM {
     /// Ask for the rows of subscription `sub` matching its own filter
     /// narrowed to `column IN values`: one recorded storage read, landed
     /// later through [`SingleTableIVM::land_fetch`]. Until it lands the
-    /// subscription publishes no admission boundary and donates no twin
-    /// snapshot. Unknown subscriptions are a no-op.
+    /// subscription publishes no admission boundary; the read serves every
+    /// subscription of its query, twins registered meanwhile included.
+    /// Unknown subscriptions are a no-op.
     pub fn fetch(&mut self, sub: SubId, column: &str, values: &[Value]) {
         let Some(query) = self.select_queries.get(&sub) else {
             return;
@@ -42,16 +43,21 @@ impl SingleTableIVM {
         self.sync_boundary(sub);
     }
 
-    /// Record one storage read for `sub`, counting it as pending; a read
-    /// for no rows at all (`LIMIT 0`) is not worth a round trip and is
-    /// dropped.
+    /// Record one storage read for `sub`, counted as pending by `sub` and
+    /// every subscription of its query, all of which it will land into; a
+    /// read for no rows at all (`LIMIT 0`) is not worth a round trip and
+    /// is dropped.
     pub(super) fn issue(&mut self, sub: SubId, query: SingleTableReadQuery, kind: FetchKind) {
         if query.limit == 0 {
             return;
         }
         let id = FetchId(self.next_fetch);
         self.next_fetch += 1;
-        *self.pending.entry(sub).or_default() += 1;
+        let readers = self.query_group(sub);
+        for reader in &readers {
+            *self.pending.entry(*reader).or_default() += 1;
+        }
+        self.readers.insert(id, readers);
         self.stats.storage_reads += 1;
         self.requests.push(Fetch {
             id,
@@ -61,23 +67,52 @@ impl SingleTableIVM {
         });
     }
 
-    /// Land the rows a recorded read returned for the read's subscription.
-    /// The runtime has brought them up to the engine's position, so each
-    /// is current: a row the frame does not hold is adopted with the
-    /// read's image, a row it holds keeps the frame's (equal) image, and
-    /// the subscription is tagged onto it if it was not already (rows the
-    /// stream routed to it while the read was out already are). The
-    /// window's frontier is sized from the whole result, overflow is
-    /// evicted, a refill is asked for if the window drained while the read
-    /// was out, and the boundary is republished. Returns the
-    /// subscription's `Add`s and evictions; no other subscription is
-    /// touched. A read for a subscription that is gone lands as nothing.
+    /// `sub` and every other subscription with its query, in id order;
+    /// `sub` alone if it is not registered.
+    fn query_group(&self, sub: SubId) -> Vec<SubId> {
+        self.select_queries
+            .get(&sub)
+            .and_then(|query| self.by_query.get(query))
+            .map(|group| group.iter().copied().collect())
+            .unwrap_or_else(|| vec![sub])
+    }
+
+    /// Land the rows a recorded read returned, for every subscription the
+    /// read serves ([`SingleTableIVM::readers_of`]: the one that asked and
+    /// its twins). The runtime has brought the rows up to the engine's
+    /// position, so each is current: a row the frame does not hold is
+    /// adopted with the read's image, a row it holds keeps the frame's
+    /// (equal) image, and each subscription is tagged onto it if it was
+    /// not already (rows the stream routed to it while the read was out
+    /// already are). Per subscription, the window's frontier is sized
+    /// from the whole result, overflow is evicted, a refill is asked for
+    /// if the window drained while the read was out, and the boundary is
+    /// republished. Returns those subscriptions' `Add`s and evictions; no
+    /// other is touched. A read whose subscriptions are all gone lands as
+    /// nothing.
     pub fn land_fetch(
         &mut self,
         fetch: &Fetch,
         rows: &[(DataFrameKey, DataFrameRow)],
     ) -> Vec<SingleTableUpdate> {
-        let sub = fetch.sub;
+        let readers = self
+            .readers
+            .remove(&fetch.id)
+            .unwrap_or_else(|| vec![fetch.sub]);
+        let mut updates = Vec::new();
+        for sub in readers {
+            updates.extend(self.land_for(sub, fetch, rows));
+        }
+        updates
+    }
+
+    /// [`SingleTableIVM::land_fetch`] for one of the read's subscriptions.
+    fn land_for(
+        &mut self,
+        sub: SubId,
+        fetch: &Fetch,
+        rows: &[(DataFrameKey, DataFrameRow)],
+    ) -> Vec<SingleTableUpdate> {
         let Some(query) = self.select_queries.get(&sub).cloned() else {
             return Vec::new();
         };

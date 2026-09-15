@@ -148,6 +148,13 @@ impl Window {
         self.entries.insert(position, (value, key));
     }
 
+    /// Carry the page `previous` last delivered over to this window, so
+    /// the next gate ships the difference from what the client holds
+    /// rather than the whole page again.
+    pub(super) fn adopt_page(&mut self, previous: Window) {
+        self.shown = previous.shown;
+    }
+
     /// The keys of the best `L` held rows: what the client is shown.
     pub(super) fn shown_prefix(&self) -> Vec<DataFrameKey> {
         self.entries
@@ -485,17 +492,20 @@ impl SingleTableIVM {
 
     /// (Re)derive a subscription's window entries from the rows it
     /// currently holds, with no frontier yet — the caller records the
-    /// storage read or twin the rows came from; queries without a finite
-    /// positive limit carry no window.
+    /// storage read or twin the rows came from — keeping the page the
+    /// client was last sent, if there was a window before; queries without
+    /// a finite positive limit carry no window.
     pub(super) fn rebuild_window(&mut self, sub: SubId) {
+        let previous = self.windows.remove(&sub);
         let Some(query) = self.select_queries.get(&sub) else {
-            self.windows.remove(&sub);
             return;
         };
         let Some(mut window) = Window::for_query(query) else {
-            self.windows.remove(&sub);
             return;
         };
+        if let Some(previous) = previous {
+            window.adopt_page(previous);
+        }
         if let Some(ids) = self.held.get(&sub)
             && let Some(frame) = self.frames.get(&query.table)
         {
