@@ -182,6 +182,11 @@ impl Catalog {
     pub fn table(&self, name: &str) -> Option<&DbTable> {
         self.tables.get(name)
     }
+
+    /// Every table, in no particular order.
+    pub fn tables(&self) -> impl Iterator<Item = &DbTable> {
+        self.tables.values()
+    }
 }
 
 impl DbColumn {

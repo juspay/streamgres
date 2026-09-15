@@ -13,11 +13,11 @@
 
 use std::collections::HashMap;
 
-use jus_sync::ivm::QueryPart;
-use jus_sync::model::ComparisonOperator::{
+use xyne_sync::ivm::QueryPart;
+use xyne_sync::model::ComparisonOperator::{
     EQ, EXISTS, GT, GTE, IN, IS, IS_NOT, LT, LTE, NEQ, NOT_IN,
 };
-use jus_sync::model::{
+use xyne_sync::model::{
     ComparisonOperator, Join, MultiTableReadQuery, Order, OrderBy, SingleTableReadQuery, Value,
     Where,
 };

@@ -24,18 +24,13 @@ pub fn select_sql(query: &SingleTableReadQuery, table: &DbTable) -> String {
             sql.push_str(", ");
         }
         let declared = &table.columns[*column].r#type;
-        let _ = write!(
-            sql,
-            "{}::{}",
-            quote_ident(column.as_str()),
-            cast_of(declared)
-        );
+        sql.push_str(&select_expr(column.as_str(), declared));
     }
     let _ = write!(
         sql,
         " FROM {} WHERE {}",
         quote_ident(query.table.as_str()),
-        render_where(&query.filter)
+        render_where(&query.filter, table)
     );
     if query.limit != u32::MAX {
         let clauses: Vec<String> = query
@@ -77,13 +72,43 @@ pub fn select_columns(table: &DbTable) -> Vec<&crate::model::ColumnName> {
 /// way out, so decoding is uniform whatever the column's own type.
 pub fn cast_of(declared: &ValueType) -> &'static str {
     match declared {
-        ValueType::Int => "int8",
+        ValueType::Int | ValueType::Timestamp => "int8",
         ValueType::Float => "float8",
-        ValueType::String => "text",
+        ValueType::String | ValueType::Json => "text",
         ValueType::Bool => "bool",
         ValueType::Date => "date",
         ValueType::Datetime => "timestamp",
         ValueType::List(_) | ValueType::Map(_, _) => "text",
+    }
+}
+
+/// The SQL reading one column in the form the engine keeps it: a time
+/// column as epoch milliseconds, a JSON, array or map column as JSON text,
+/// every other cast to its declared type's Postgres form.
+pub fn select_expr(column: &str, declared: &ValueType) -> String {
+    let quoted = quote_ident(column);
+    match declared {
+        ValueType::Timestamp => epoch_millis(&quoted),
+        ValueType::Json | ValueType::List(_) | ValueType::Map(_, _) => {
+            format!("to_json({quoted})::text")
+        }
+        other => format!("{quoted}::{}", cast_of(other)),
+    }
+}
+
+/// `expr` as milliseconds since the epoch; `extract` is numeric, so the
+/// rounding to `int8` keeps the millisecond a `timestamp(3)` column has.
+fn epoch_millis(expr: &str) -> String {
+    format!("(extract(epoch from {expr}) * 1000)::int8")
+}
+
+/// A column as the SQL its conditions compare it by: a time column
+/// through the same epoch expression the read returns it by, so a literal
+/// in milliseconds compares against milliseconds.
+fn column_expr(column: &str, table: &DbTable) -> String {
+    match table.column(column).map(|declared| &declared.r#type) {
+        Some(ValueType::Timestamp) => epoch_millis(&quote_ident(column)),
+        _ => quote_ident(column),
     }
 }
 
@@ -93,26 +118,32 @@ pub fn quote_ident(name: &str) -> String {
 }
 
 /// The filter tree as a boolean expression.
-fn render_where(filter: &Where) -> String {
+fn render_where(filter: &Where, table: &DbTable) -> String {
     match filter {
-        Where::Condition(condition) => render_condition(condition),
+        Where::Condition(condition) => render_condition(condition, table),
         Where::AND(children) if children.is_empty() => "TRUE".to_owned(),
         Where::OR(children) if children.is_empty() => "FALSE".to_owned(),
         Where::AND(children) => {
-            let parts: Vec<String> = children.iter().map(render_where).collect();
+            let parts: Vec<String> = children
+                .iter()
+                .map(|child| render_where(child, table))
+                .collect();
             format!("({})", parts.join(" AND "))
         }
         Where::OR(children) => {
-            let parts: Vec<String> = children.iter().map(render_where).collect();
+            let parts: Vec<String> = children
+                .iter()
+                .map(|child| render_where(child, table))
+                .collect();
             format!("({})", parts.join(" OR "))
         }
     }
 }
 
 /// One leaf, with the engine's `NULL` and list semantics made explicit.
-fn render_condition(condition: &Condition) -> String {
+fn render_condition(condition: &Condition, table: &DbTable) -> String {
     use ComparisonOperator::*;
-    let column = quote_ident(condition.column.as_str());
+    let column = column_expr(condition.column.as_str(), table);
     match condition.comparison_operator {
         IN | NOT_IN => {
             let members = members_of(&condition.value);

@@ -1,15 +1,42 @@
-//! The server binary.
+//! The sync gateway binary.
 //!
 //! ```bash
-//! cargo run --bin server
+//! cargo run --release --bin server
 //! ```
+//!
+//! Configured by `XYNE_SYNC_*` environment variables (see `.env.example`);
+//! a `.env` file in the working directory is read first, without
+//! overriding variables already set.
 
-#[tokio::main]
-async fn main() {
-    let address = std::env::var("JUS_SYNC_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_owned());
-
-    if let Err(error) = jus_sync::ws::serve(&address).await {
-        eprintln!("server error: {error}");
+fn main() {
+    load_dotenv(".env");
+    let outcome = xyne_sync::gateway::Config::from_env().and_then(xyne_sync::gateway::serve);
+    if let Err(error) = outcome {
+        eprintln!("{error}");
         std::process::exit(1);
+    }
+}
+
+/// Set every `KEY=VALUE` line of `path` that is not already set; a
+/// missing file is fine.
+fn load_dotenv(path: &str) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if std::env::var_os(key).is_none() {
+            // SAFETY: called from `main` before any other thread exists.
+            unsafe { std::env::set_var(key, value) };
+        }
     }
 }

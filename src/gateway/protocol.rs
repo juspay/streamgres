@@ -1,0 +1,427 @@
+//! Zero's sync protocol (version 51, the one `@rocicorp/zero` 1.9 speaks)
+//! as the gateway reads and writes it: the upstream messages a client
+//! sends, each a two-element JSON array of a tag and a body, the
+//! downstream messages the gateway answers with, the base64 handshake
+//! header carrying the first message, and the lexicographic version
+//! strings that serve as cookies.
+
+use std::collections::HashMap;
+
+use base64::Engine as _;
+use serde::Deserialize;
+use serde_json::{Value as Json, json};
+
+/// The protocol version this gateway speaks.
+pub const PROTOCOL_VERSION: u32 = 51;
+
+/// One message a client sends.
+#[derive(Debug)]
+pub enum Upstream {
+    InitConnection(Box<InitConnection>),
+    Ping,
+    ChangeDesiredQueries(Vec<QueryPatchOp>),
+    DeleteClients(DeleteClients),
+    Push(Push),
+    Pull(Pull),
+    CloseConnection,
+    /// `updateAuth`, `inspect`, `ackMutationResponses`: acknowledged and
+    /// otherwise ignored.
+    Other(String),
+}
+
+/// The first message of a connection: what the client wants synced, and
+/// its schema on a first connection.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InitConnection {
+    #[serde(default)]
+    pub desired_queries_patch: Vec<QueryPatchOp>,
+    #[serde(default)]
+    pub client_schema: Option<ClientSchema>,
+    #[serde(default)]
+    pub deleted: Option<DeleteClients>,
+    #[serde(default)]
+    pub user_push_url: Option<String>,
+    #[serde(default)]
+    pub user_push_headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub user_query_url: Option<String>,
+    #[serde(default)]
+    pub user_query_headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub active_clients: Option<Vec<String>>,
+}
+
+/// One change to a client's desired queries.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "op", rename_all = "camelCase")]
+pub enum QueryPatchOp {
+    Put {
+        hash: String,
+        #[serde(default)]
+        ttl: Option<f64>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        args: Option<Vec<Json>>,
+        #[serde(default)]
+        ast: Option<Json>,
+    },
+    Del {
+        hash: String,
+    },
+    Clear,
+}
+
+/// The client's schema: tables with their columns' types and primary
+/// keys, keyed by the names the server knows.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ClientSchema {
+    #[serde(default)]
+    pub tables: HashMap<String, ClientTable>,
+}
+
+/// One table of the client's schema.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTable {
+    #[serde(default)]
+    pub columns: HashMap<String, Json>,
+    #[serde(default)]
+    pub primary_key: Vec<String>,
+}
+
+/// Clients (or whole client groups) the client knows are gone.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteClients {
+    #[serde(default, rename = "clientIDs")]
+    pub client_ids: Vec<String>,
+    #[serde(default, rename = "clientGroupIDs")]
+    pub client_group_ids: Vec<String>,
+}
+
+/// A batch of mutations to forward: the body as sent (it goes to the
+/// application server verbatim) and the ids in it, for the error the
+/// gateway reports when forwarding fails.
+#[derive(Debug, Clone)]
+pub struct Push {
+    pub body: Json,
+    pub client_group_id: String,
+    pub mutation_ids: Vec<MutationId>,
+}
+
+/// The identity of one mutation.
+#[derive(Debug, Clone)]
+pub struct MutationId {
+    pub client_id: String,
+    pub id: i64,
+}
+
+/// A mutation-recovery pull: the client asks for the last mutation ids of
+/// its group.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Pull {
+    #[serde(rename = "clientGroupID")]
+    pub client_group_id: String,
+    #[serde(default)]
+    pub cookie: Option<String>,
+    #[serde(rename = "requestID")]
+    pub request_id: String,
+}
+
+/// Parse one upstream message.
+pub fn parse_upstream(text: &str) -> Result<Upstream, String> {
+    let message: Json = serde_json::from_str(text).map_err(|error| format!("not JSON: {error}"))?;
+    let Json::Array(items) = &message else {
+        return Err("a message is a [tag, body] array".to_owned());
+    };
+    let Some(Json::String(tag)) = items.first() else {
+        return Err("a message starts with its tag".to_owned());
+    };
+    let body = items.get(1).cloned().unwrap_or(Json::Null);
+    let parsed = |body: Json| -> Result<Upstream, String> {
+        Ok(match tag.as_str() {
+            "initConnection" => Upstream::InitConnection(Box::new(deserialize(body)?)),
+            "ping" => Upstream::Ping,
+            "changeDesiredQueries" => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Body {
+                    #[serde(default)]
+                    desired_queries_patch: Vec<QueryPatchOp>,
+                }
+                let body: Body = deserialize(body)?;
+                Upstream::ChangeDesiredQueries(body.desired_queries_patch)
+            }
+            "deleteClients" => Upstream::DeleteClients(deserialize(body)?),
+            "push" => Upstream::Push(parse_push(body)?),
+            "pull" => Upstream::Pull(deserialize(body)?),
+            "closeConnection" => Upstream::CloseConnection,
+            other => Upstream::Other(other.to_owned()),
+        })
+    };
+    parsed(body)
+}
+
+/// Deserialize a body, naming the failure.
+fn deserialize<T: for<'de> Deserialize<'de>>(body: Json) -> Result<T, String> {
+    serde_json::from_value(body).map_err(|error| format!("malformed body: {error}"))
+}
+
+/// The parts of a push body the gateway itself needs.
+fn parse_push(body: Json) -> Result<Push, String> {
+    let client_group_id = body
+        .get("clientGroupID")
+        .and_then(Json::as_str)
+        .ok_or("a push names its clientGroupID")?
+        .to_owned();
+    let mutation_ids = body
+        .get("mutations")
+        .and_then(Json::as_array)
+        .map(|mutations| {
+            mutations
+                .iter()
+                .filter_map(|mutation| {
+                    Some(MutationId {
+                        client_id: mutation.get("clientID")?.as_str()?.to_owned(),
+                        id: mutation.get("id")?.as_i64()?,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Push {
+        body,
+        client_group_id,
+        mutation_ids,
+    })
+}
+
+/// What the `Sec-WebSocket-Protocol` header carries: the first message,
+/// when it fit, and the auth token.
+#[derive(Debug, Default)]
+pub struct Handshake {
+    pub init: Option<InitConnection>,
+    pub auth_token: Option<String>,
+}
+
+/// Decode the handshake header: URI-encoded base64 of the JSON
+/// `{initConnectionMessage, authToken}`.
+pub fn decode_handshake(header: &str) -> Result<Handshake, String> {
+    let decoded = percent_encoding::percent_decode_str(header)
+        .decode_utf8()
+        .map_err(|error| format!("handshake header is not UTF-8: {error}"))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(decoded.as_bytes())
+        .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(decoded.as_bytes()))
+        .map_err(|error| format!("handshake header is not base64: {error}"))?;
+    let json: Json = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("handshake header is not JSON: {error}"))?;
+    let init = match json.get("initConnectionMessage") {
+        Some(Json::Array(items)) if items.len() == 2 => Some(deserialize(items[1].clone())?),
+        _ => None,
+    };
+    let auth_token = json
+        .get("authToken")
+        .and_then(Json::as_str)
+        .map(str::to_owned);
+    Ok(Handshake { init, auth_token })
+}
+
+/// A version as Zero's lexicographic cookie: the length of its base-36
+/// form minus one, then the base-36 form, so string order is numeric
+/// order.
+pub fn cookie(version: u64) -> String {
+    let digits = to_base36(version);
+    format!("{}{digits}", to_base36(digits.len() as u64 - 1))
+}
+
+/// A number in base 36, lowercase.
+fn to_base36(mut value: u64) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if value == 0 {
+        return "0".to_owned();
+    }
+    let mut out = Vec::new();
+    while value > 0 {
+        out.push(DIGITS[(value % 36) as usize]);
+        value /= 36;
+    }
+    out.reverse();
+    String::from_utf8(out).expect("ascii digits")
+}
+
+/// Serialize a downstream message.
+fn frame(tag: &str, body: Json) -> String {
+    Json::Array(vec![Json::String(tag.to_owned()), body]).to_string()
+}
+
+/// `connected`: the server's acknowledgement.
+pub fn connected(wsid: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or_default();
+    frame("connected", json!({"wsid": wsid, "timestamp": now}))
+}
+
+/// `pong`.
+pub fn pong() -> String {
+    frame("pong", json!({}))
+}
+
+/// `error` with a plain kind and message, from the gateway.
+pub fn error(kind: &str, message: &str) -> String {
+    frame(
+        "error",
+        json!({"kind": kind, "message": message, "origin": "zeroCache"}),
+    )
+}
+
+/// `error` for a whole push the application server could not take.
+pub fn push_failed(
+    mutation_ids: &[MutationId],
+    status: Option<u16>,
+    preview: Option<&str>,
+    message: &str,
+) -> String {
+    let ids: Vec<Json> = mutation_ids
+        .iter()
+        .map(|id| json!({"clientID": id.client_id, "id": id.id}))
+        .collect();
+    let body = match status {
+        Some(status) => json!({
+            "kind": "PushFailed", "origin": "zeroCache", "reason": "http",
+            "status": status, "bodyPreview": preview.unwrap_or(""),
+            "mutationIDs": ids, "message": message,
+        }),
+        None => json!({
+            "kind": "PushFailed", "origin": "zeroCache", "reason": "internal",
+            "mutationIDs": ids, "message": message,
+        }),
+    };
+    frame("error", body)
+}
+
+/// `error` for a query transform the application server could not do.
+pub fn transform_failed(query_ids: &[String], status: Option<u16>, message: &str) -> String {
+    let body = match status {
+        Some(status) => json!({
+            "kind": "TransformFailed", "origin": "zeroCache", "reason": "http",
+            "status": status, "queryIDs": query_ids, "message": message,
+        }),
+        None => json!({
+            "kind": "TransformFailed", "origin": "zeroCache", "reason": "internal",
+            "queryIDs": query_ids, "message": message,
+        }),
+    };
+    frame("error", body)
+}
+
+/// `transformError`: queries the application server, or this gateway,
+/// could not turn into something to run.
+pub fn transform_error(errors: Vec<Json>) -> String {
+    frame("transformError", Json::Array(errors))
+}
+
+/// One entry of a `transformError`, as an application error.
+pub fn errored_query(id: &str, name: &str, message: &str) -> Json {
+    json!({"error": "app", "id": id, "name": name, "message": message})
+}
+
+/// `deleteClients`: the clients the gateway dropped.
+pub fn delete_clients(deleted: &DeleteClients) -> String {
+    frame(
+        "deleteClients",
+        json!({"clientIDs": deleted.client_ids, "clientGroupIDs": deleted.client_group_ids}),
+    )
+}
+
+/// `pushResponse`: the application server's per-mutation results.
+pub fn push_response(body: Json) -> String {
+    frame("pushResponse", body)
+}
+
+/// `pull`: the last mutation ids of a client group.
+pub fn pull_response(cookie: &str, request_id: &str, lmids: &HashMap<String, i64>) -> String {
+    frame(
+        "pull",
+        json!({"cookie": cookie, "requestID": request_id, "lastMutationIDChanges": lmids}),
+    )
+}
+
+/// `pokeStart`.
+pub fn poke_start(poke_id: &str, base_cookie: Option<&str>) -> String {
+    frame(
+        "pokeStart",
+        json!({"pokeID": poke_id, "baseCookie": base_cookie}),
+    )
+}
+
+/// `pokePart` with the given (already assembled) body fields.
+pub fn poke_part(poke_id: &str, mut body: serde_json::Map<String, Json>) -> String {
+    body.insert("pokeID".to_owned(), Json::String(poke_id.to_owned()));
+    frame("pokePart", Json::Object(body))
+}
+
+/// `pokeEnd`.
+pub fn poke_end(poke_id: &str, cookie: &str) -> String {
+    frame("pokeEnd", json!({"pokeID": poke_id, "cookie": cookie}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cookies order like numbers: length prefix, then base 36.
+    #[test]
+    fn cookies_are_lexicographic_versions() {
+        assert_eq!(cookie(0), "00");
+        assert_eq!(cookie(35), "0z");
+        assert_eq!(cookie(36), "110");
+        assert!(cookie(35) < cookie(36));
+        assert!(cookie(1295) < cookie(1296));
+    }
+
+    /// The handshake header round-trips the first message and the token.
+    #[test]
+    fn handshake_header_decodes() {
+        let payload = r#"{"initConnectionMessage":["initConnection",{"desiredQueriesPatch":[{"op":"put","hash":"h1","name":"q","args":[1],"ttl":300000}]}],"authToken":"t"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+        let header =
+            percent_encoding::utf8_percent_encode(&encoded, percent_encoding::NON_ALPHANUMERIC)
+                .to_string();
+        let handshake = decode_handshake(&header).unwrap();
+        assert_eq!(handshake.auth_token.as_deref(), Some("t"));
+        let init = handshake.init.unwrap();
+        assert_eq!(init.desired_queries_patch.len(), 1);
+        assert!(
+            matches!(&init.desired_queries_patch[0], QueryPatchOp::Put { hash, name: Some(name), .. } if hash == "h1" && name == "q")
+        );
+    }
+
+    /// Upstream messages parse by tag.
+    #[test]
+    fn upstream_messages_parse() {
+        assert!(matches!(
+            parse_upstream(r#"["ping",{}]"#),
+            Ok(Upstream::Ping)
+        ));
+        let push = parse_upstream(r#"["push",{"clientGroupID":"g","mutations":[{"type":"custom","id":3,"clientID":"c","name":"m","args":[],"timestamp":1}],"pushVersion":1,"requestID":"r","timestamp":1}]"#).unwrap();
+        let Upstream::Push(push) = push else {
+            panic!("push")
+        };
+        assert_eq!(push.client_group_id, "g");
+        assert_eq!(push.mutation_ids[0].id, 3);
+        assert!(
+            matches!(parse_upstream(r#"["changeDesiredQueries",{"desiredQueriesPatch":[{"op":"del","hash":"h"}]}]"#), Ok(Upstream::ChangeDesiredQueries(ops)) if ops.len() == 1)
+        );
+        assert!(matches!(
+            parse_upstream(r#"["inspect",{}]"#),
+            Ok(Upstream::Other(_))
+        ));
+        assert!(parse_upstream("nope").is_err());
+    }
+}

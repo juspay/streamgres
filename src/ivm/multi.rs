@@ -1253,4 +1253,18 @@ impl Engine for MultiTableIVM {
     fn requests(&mut self) -> Vec<Fetch> {
         self.take_requests()
     }
+
+    /// Every part of the subscription's tree is live, with no read out.
+    fn hydrated(&self, sub: SubId) -> bool {
+        let Some(tree) = self
+            .by_sub
+            .get(&sub)
+            .and_then(|tree_id| self.trees.get(tree_id))
+        else {
+            return false;
+        };
+        tree.nodes
+            .values()
+            .all(|node| node.live && node.part.is_some_and(|part| !self.single.is_pending(part)))
+    }
 }

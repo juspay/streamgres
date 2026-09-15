@@ -22,9 +22,11 @@
 //! points are on. Everything here runs on the engine's thread inside a
 //! `tokio::task::LocalSet`.
 
+pub mod catalog;
 pub mod replication;
 pub mod sql;
 pub mod stream;
+pub mod text;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -42,7 +44,8 @@ use crate::model::{
 };
 use replication::ReplicationConnection;
 
-pub use stream::{Batch, PgStream};
+pub use catalog::load_catalog;
+pub use stream::{Batch, Feed, PgStream, Transport};
 
 /// How many minted aliases wait for the stream to pass them before the
 /// minter pauses (each holds a slot and a connection).
@@ -68,7 +71,7 @@ static MINTED: AtomicU64 = AtomicU64::new(0);
 pub async fn mint(config: &Config) -> Result<Alias, StorageError> {
     let mut minter = ReplicationConnection::open(config).await?;
     let slot = format!(
-        "jus_sync_snap_{}_{}",
+        "xyne_sync_snap_{}_{}",
         std::process::id(),
         MINTED.fetch_add(1, Ordering::Relaxed)
     );
@@ -361,9 +364,13 @@ fn decode_value(row: &Row, index: usize, declared: &ValueType) -> Result<Value, 
     let value = match declared {
         ValueType::Int => row.try_get::<_, Option<i64>>(index)?.map(Value::Int),
         ValueType::Float => row.try_get::<_, Option<f64>>(index)?.map(Value::Float),
-        ValueType::String | ValueType::List(_) | ValueType::Map(_, _) => {
+        ValueType::String | ValueType::Json | ValueType::Map(_, _) => {
             row.try_get::<_, Option<String>>(index)?.map(Value::String)
         }
+        ValueType::List(inner) => row
+            .try_get::<_, Option<String>>(index)?
+            .map(|text| text::json_list(&text, inner)),
+        ValueType::Timestamp => row.try_get::<_, Option<i64>>(index)?.map(Value::Int),
         ValueType::Bool => row.try_get::<_, Option<bool>>(index)?.map(Value::Bool),
         ValueType::Date => row
             .try_get::<_, Option<chrono::NaiveDate>>(index)?

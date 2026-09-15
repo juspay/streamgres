@@ -1,6 +1,6 @@
 //! The data model the whole engine operates on.
 //!
-//! Split by concern, re-exported flat — `use jus_sync::model::*` gives the
+//! Split by concern, re-exported flat — `use xyne_sync::model::*` gives the
 //! full vocabulary:
 //!
 //! - [`value`] — [`Value`] / [`ValueType`], the dynamic value representation

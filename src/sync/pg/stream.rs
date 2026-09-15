@@ -47,7 +47,7 @@ type Decoded = Event<BinaryValueTraitOff, StreamingValueTraitOff>;
 type Columns = TupleData<BinaryValueTraitOff>;
 
 /// The prefix of the feed's heartbeat messages.
-const HEARTBEAT_PREFIX: &str = "jus_sync";
+const HEARTBEAT_PREFIX: &str = "xyne_sync";
 
 /// How long a poll waits for its heartbeat to come back before failing.
 const HEARTBEAT_WAIT: Duration = Duration::from_secs(10);
@@ -143,13 +143,16 @@ impl Decoder {
             return Ok(());
         };
         if let BaseEvent::Relation(relation) = &event {
+            let qualified = format!("{}.{}", relation.relation_namespace, relation.name);
+            let declared = self.catalog.table(&qualified).or_else(|| {
+                (relation.relation_namespace == "public")
+                    .then(|| self.catalog.table(&relation.name))
+                    .flatten()
+            });
             self.relations.insert(
                 relation.oid,
                 Relation {
-                    table: self
-                        .catalog
-                        .table(&relation.name)
-                        .map(|table| table.name.clone()),
+                    table: declared.map(|table| table.name.clone()),
                     columns: relation
                         .columns
                         .iter()
@@ -253,26 +256,39 @@ impl Decoder {
     }
 }
 
-/// A feed over one permanent slot: the replication connection, the SQL
-/// connection that manages the slot and commits heartbeats, and the
-/// decoder. Heartbeats reach every slot of the database, so each carries
-/// a token naming this stream (its slot and start time) and its number.
+/// The change feed over one replication slot: the transport half (the
+/// replication connection, and the ordinary connection the heartbeats go
+/// through) and the decoding half (the catalog-driven decoder and the
+/// delivered position), together for a single-threaded driver, or split
+/// ([`PgStream::split`]) so the transport runs on a thread of its own and
+/// hands raw events to the decoder over a channel.
 pub struct PgStream {
+    transport: Transport,
+    feed: Feed,
+}
+
+/// The connections of a change feed. Nothing in it is tied to a thread:
+/// it forwards raw replication events and beats the heart.
+pub struct Transport {
     client: Client,
     feed: ReplicationClient,
-    decoder: Decoder,
-    progress: Lsn,
     heart: Heart,
 }
 
-/// The heartbeat sequence of one stream.
+/// The decoding half of a change feed: raw events in, catalog writes and
+/// the delivered position out. It holds the catalog by `Rc`, so it lives
+/// on the engine's thread.
+pub struct Feed {
+    decoder: Decoder,
+    progress: Lsn,
+}
+
 struct Heart {
     prefix: String,
     count: u64,
 }
 
 impl Heart {
-    /// A sequence unique to `slot` and this moment.
     fn new(slot: &str) -> Self {
         let started = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -284,7 +300,6 @@ impl Heart {
         }
     }
 
-    /// Commit the next heartbeat on `client` and return its token.
     async fn beat(&mut self, client: &Client) -> Result<String, StorageError> {
         let token = format!("{}{}", self.prefix, self.count);
         self.count += 1;
@@ -298,12 +313,11 @@ impl Heart {
     }
 }
 
-impl PgStream {
-    /// Connect and make sure the publication and `slot` exist (created
-    /// for all tables, and with `pgoutput`, if not), then start streaming
-    /// from the slot's confirmed position: a fresh slot delivers only what
-    /// is committed after this call.
-    pub async fn open(dsn: &str, slot: &str, catalog: Rc<Catalog>) -> Result<Self, StorageError> {
+impl Transport {
+    /// Open the connections to `dsn` for `slot`, creating the publication
+    /// (`<slot>_pub`, every table) and the slot when they do not exist
+    /// yet.
+    pub async fn open(dsn: &str, slot: &str) -> Result<Self, StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config).await?;
         let publication = publication_of(slot);
@@ -339,17 +353,96 @@ impl PgStream {
         let feed = ReplicationClient::connect(replication_config(&config, slot, &publication))
             .await
             .map_err(|error| StorageError(format!("replication connection: {error}")))?;
-        Ok(PgStream {
+        Ok(Transport {
             client,
             feed,
-            decoder: Decoder::new(catalog),
-            progress: Lsn(0),
             heart: Heart::new(slot),
         })
     }
 
-    /// Drop the slot and its publication (tests and the bench tear down
-    /// with this), ending the connection streaming from it first.
+    /// Tell the slot that every commit up to `at` is applied.
+    fn acknowledge(&mut self, at: Lsn) {
+        self.feed.update_applied_lsn(pgwire_replication::Lsn(at.0));
+    }
+
+    /// Run until `events` has no receiver or the connection ends: forward
+    /// every event as it arrives, acknowledging each commit to the slot,
+    /// and beat the heart every `interval` so the decoder's position keeps
+    /// moving while nothing is written.
+    pub async fn run(mut self, interval: Duration, events: mpsc::Sender<ReplicationEvent>) {
+        let mut ticker = tokio::time::interval(interval);
+        loop {
+            let event = tokio::select! {
+                _ = ticker.tick() => {
+                    if let Err(error) = self.heart.beat(&self.client).await {
+                        eprintln!("change feed heartbeat failed: {error}");
+                    }
+                    continue;
+                }
+                event = self.feed.recv() => event,
+            };
+            let event = match event {
+                Ok(Some(event)) => event,
+                Ok(None) => return,
+                Err(error) => {
+                    eprintln!("change feed ended: {error}");
+                    return;
+                }
+            };
+            if let ReplicationEvent::Commit { end_lsn, .. } = &event {
+                self.acknowledge(position(*end_lsn));
+            }
+            if events.send(event).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl Feed {
+    /// A decoder for `catalog`, at position zero until the first event.
+    pub fn new(catalog: Rc<Catalog>) -> Self {
+        Feed {
+            decoder: Decoder::new(catalog),
+            progress: Lsn(0),
+        }
+    }
+
+    /// Absorb one raw event: a keepalive or a commit moves the position,
+    /// and a commit also yields the transaction it closes.
+    pub fn absorb(&mut self, event: ReplicationEvent) -> Result<Option<Transaction>, StorageError> {
+        if let ReplicationEvent::KeepAlive { wal_end, .. } = &event {
+            self.progress = self.progress.max(position(*wal_end));
+        }
+        let transaction = self.decoder.absorb(event)?;
+        if let Some(transaction) = &transaction {
+            self.progress = self.progress.max(transaction.at);
+        }
+        Ok(transaction)
+    }
+
+    /// The position every commit has been delivered up to.
+    pub fn progress(&self) -> Lsn {
+        self.progress
+    }
+}
+
+impl PgStream {
+    /// Open the feed of `slot` at `dsn`, decoding with `catalog`.
+    pub async fn open(dsn: &str, slot: &str, catalog: Rc<Catalog>) -> Result<Self, StorageError> {
+        Ok(PgStream {
+            transport: Transport::open(dsn, slot).await?,
+            feed: Feed::new(catalog),
+        })
+    }
+
+    /// The two halves, to run on separate threads.
+    pub fn split(self) -> (Transport, Feed) {
+        (self.transport, self.feed)
+    }
+
+    /// Drop `slot` and its publication, ending the walsender holding the
+    /// slot first (the drop is retried while it lets go).
     pub async fn drop_slot(dsn: &str, slot: &str) -> Result<(), StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config).await?;
@@ -385,16 +478,16 @@ impl PgStream {
         Ok(())
     }
 
-    /// Consume everything committed up to now: commit a heartbeat and take
-    /// events until the feed returns it. The progress mark is the
-    /// heartbeat's position, or a later keepalive's.
+    /// Emit a heartbeat and collect every write the feed delivers up to
+    /// it, with the position the feed reached; fails if the heartbeat does
+    /// not come back within [`HEARTBEAT_WAIT`].
     pub async fn poll(&mut self) -> Result<Batch, StorageError> {
-        let token = self.heart.beat(&self.client).await?;
+        let token = self.transport.heart.beat(&self.transport.client).await?;
         let deadline = Instant::now() + HEARTBEAT_WAIT;
         let mut writes = Vec::new();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let event = tokio::time::timeout(remaining, self.feed.recv())
+            let event = tokio::time::timeout(remaining, self.transport.feed.recv())
                 .await
                 .map_err(|_| {
                     StorageError(format!(
@@ -413,40 +506,33 @@ impl PgStream {
             if done {
                 return Ok(Batch {
                     writes,
-                    progress: self.progress,
+                    progress: self.feed.progress(),
                 });
             }
         }
     }
 
-    /// Absorb one event, moving the progress mark on keepalives and
-    /// commits and acknowledging each finished transaction to the server.
     fn absorb(&mut self, event: ReplicationEvent) -> Result<Option<Transaction>, StorageError> {
-        if let ReplicationEvent::KeepAlive { wal_end, .. } = &event {
-            self.progress = self.progress.max(position(*wal_end));
-        }
-        let transaction = self.decoder.absorb(event)?;
+        let transaction = self.feed.absorb(event)?;
         if let Some(transaction) = &transaction {
-            self.progress = self.progress.max(transaction.at);
-            self.feed
-                .update_applied_lsn(pgwire_replication::Lsn(transaction.at.0));
+            self.transport.acknowledge(transaction.at);
         }
         Ok(transaction)
     }
 
-    /// Stream into the service's command channel until it closes: every
-    /// finished transaction's writes, then the progress mark; a heartbeat
-    /// is committed every `interval` so the mark keeps moving while the
-    /// tables are quiet. A failure ends the stream and is reported.
+    /// Run on one thread until `commands` has no receiver or the
+    /// connection ends: each transaction's writes go out as
+    /// [`Command::Write`]s followed by a [`Command::Progress`], and a
+    /// heartbeat every `interval` keeps the position moving while nothing
+    /// is written.
     pub async fn run<Q>(mut self, interval: Duration, commands: mpsc::Sender<Command<Q>>) {
         let mut ticker = tokio::time::interval(interval);
         loop {
-            let PgStream {
+            let Transport {
                 client,
                 feed,
                 heart,
-                ..
-            } = &mut self;
+            } = &mut self.transport;
             let event = tokio::select! {
                 _ = ticker.tick() => {
                     if let Err(error) = heart.beat(client).await {
@@ -479,7 +565,7 @@ impl PgStream {
                 }
             }
             if commands
-                .send(Command::Progress(self.progress))
+                .send(Command::Progress(self.feed.progress()))
                 .await
                 .is_err()
             {
@@ -489,7 +575,6 @@ impl PgStream {
     }
 }
 
-/// The publication the feed on `slot` reads.
 fn publication_of(slot: &str) -> String {
     format!("{slot}_pub")
 }
@@ -572,9 +657,9 @@ fn convert(raw: &str, declared: &ValueType) -> Result<Value, StorageError> {
     Ok(match declared {
         ValueType::Int => Value::Int(raw.parse().map_err(|_| unreadable())?),
         ValueType::Float => Value::Float(raw.parse().map_err(|_| unreadable())?),
-        ValueType::String | ValueType::List(_) | ValueType::Map(_, _) => {
-            Value::String(raw.to_owned())
-        }
+        ValueType::String | ValueType::Json | ValueType::Map(_, _) => Value::String(raw.to_owned()),
+        ValueType::List(inner) => super::text::array_literal(raw, inner),
+        ValueType::Timestamp => Value::Int(super::text::epoch_millis(raw).ok_or_else(unreadable)?),
         ValueType::Bool => Value::Bool(match raw {
             "true" | "t" => true,
             "false" | "f" => false,

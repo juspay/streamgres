@@ -1,7 +1,7 @@
 //! Live Postgres scenarios: the runtime over `PgStorage` and the
 //! `test_decoding` change feed, with writes committed deliberately behind
 //! an open snapshot; and the asynchronous service end to end with one
-//! table mirrored in memory. They run only when `JUS_SYNC_PG_DSN` names a
+//! table mirrored in memory. They run only when `XYNE_SYNC_PG_DSN` names a
 //! database with `wal_level = logical` (and free replication slots), and
 //! report themselves skipped otherwise; each scenario uses its own tables
 //! and slot, so they can run in parallel.
@@ -10,22 +10,22 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use jus_sync::ivm::{ClientUpdate, Fetch, MultiTableIVM, QueryPart};
-use jus_sync::model::*;
-use jus_sync::sync::pg::{PgStorage, PgStream};
-use jus_sync::sync::{Command, Lsn, Runtime, Service, Sources, Storage, SubId};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, NoTls};
+use xyne_sync::ivm::{ClientUpdate, Fetch, MultiTableIVM, QueryPart};
+use xyne_sync::model::*;
+use xyne_sync::sync::pg::{PgStorage, PgStream};
+use xyne_sync::sync::{Command, Lsn, Runtime, Service, Sources, Storage, SubId};
 
 /// The one client of these scenarios.
 const CLIENT: ClientId = ClientId(7);
 
 /// The database under test, if any.
 fn dsn() -> Option<String> {
-    let dsn = std::env::var("JUS_SYNC_PG_DSN").ok();
+    let dsn = std::env::var("XYNE_SYNC_PG_DSN").ok();
     if dsn.is_none() {
-        eprintln!("JUS_SYNC_PG_DSN not set: live Postgres scenario skipped");
+        eprintln!("XYNE_SYNC_PG_DSN not set: live Postgres scenario skipped");
     }
     dsn
 }
@@ -53,7 +53,7 @@ impl Names {
         Names {
             tickets: format!("live_{tag}_tickets"),
             users: format!("live_{tag}_users"),
-            slot: format!("jus_sync_live_{tag}"),
+            slot: format!("xyne_sync_live_{tag}"),
         }
     }
 

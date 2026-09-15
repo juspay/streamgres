@@ -9,9 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use jus_sync::ivm::{Engine, Fetch, MultiTableIVM, QueryPart, SingleTableIVM, SubId};
-use jus_sync::model::*;
-use jus_sync::sync::{Lsn, MemoryStorage, Runtime, Snapshot, Step};
+use xyne_sync::ivm::{Engine, Fetch, MultiTableIVM, QueryPart, SingleTableIVM, SubId};
+use xyne_sync::model::*;
+use xyne_sync::sync::{Lsn, MemoryStorage, Runtime, Snapshot, Step};
 
 /// `tickets(id, status, assigned_to, points)`.
 fn tickets_table() -> DbTable {
@@ -209,7 +209,7 @@ fn settle<E: Engine>(
     runtime: &mut Runtime<E>,
     db: &Db,
     step: Step,
-) -> Vec<jus_sync::ivm::ClientUpdate> {
+) -> Vec<xyne_sync::ivm::ClientUpdate> {
     let mut updates = step.updates;
     let mut queue = step.selects;
     while !queue.is_empty() {
@@ -611,6 +611,97 @@ fn registrations_while_the_read_is_out_share_it() {
     assert_eq!(runtime.stats().reads_issued, 1);
     assert_eq!(runtime.engine().stats().snapshots_shared, 2);
     assert_eq!(runtime.outstanding(), 0);
+}
+
+/// A read may run against a snapshot older than the engine: a row written
+/// into the filter after that snapshot but before the subscription existed
+/// is in neither the snapshot nor the routing, so landing adds it from the
+/// delivered writes; a row written out of the filter stays out.
+#[test]
+fn writes_between_the_snapshot_and_the_registration_land_too() {
+    let mut db = Db::at(0);
+    db.seed(&[ticket(1, "OPEN", 7, 1)]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let stale_rows = db.storage.rows(&open_tickets());
+    let stale_at = db.head();
+
+    stream(&mut runtime, &mut db, &ticket(2, "OPEN", 7, 2));
+    stream(&mut runtime, &mut db, &ticket(3, "DONE", 7, 3));
+    let (sub, step) = runtime.register(CLIENT, open_tickets());
+    let read = only(&step);
+    let landed = runtime.fetched(
+        read.id,
+        Snapshot {
+            rows: stale_rows,
+            at: stale_at,
+        },
+    );
+    assert_eq!(
+        ids(runtime.engine().rows_for(sub)),
+        BTreeSet::from([1, 2]),
+        "ticket 2 was written after the snapshot and before the registration"
+    );
+    assert_eq!(landed.updates.len(), 2);
+    assert_eq!(runtime.stats().rows_added, 1);
+}
+
+/// The same under a window whose read came back full: a late row better
+/// than the worst row read joins the result, one worse than it is left to
+/// a refill, so the frontier the landing sets covers only what storage
+/// returned.
+#[test]
+fn late_writes_respect_a_full_window() {
+    let mut db = Db::at(0);
+    db.seed(
+        &[10, 20, 30, 40, 50]
+            .iter()
+            .map(|points| ticket(*points, "OPEN", 7, *points))
+            .collect::<Vec<_>>(),
+    );
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let windowed = SingleTableReadQuery::new(
+        tickets_table().name.clone(),
+        Where::AND(vec![]),
+        OrderBy::new("points", Order::ASC),
+        2,
+    );
+    let storage_query = SingleTableReadQuery {
+        limit: 4,
+        ..windowed.clone()
+    };
+    let stale_rows = db.storage.rows(&storage_query);
+    let stale_at = db.head();
+    assert_eq!(stale_rows.len(), 4, "the buffer read comes back full");
+
+    stream(&mut runtime, &mut db, &ticket(5, "OPEN", 7, 5));
+    stream(&mut runtime, &mut db, &ticket(45, "OPEN", 7, 45));
+    let (sub, step) = runtime.register(CLIENT, windowed);
+    let read = only(&step);
+    runtime.fetched(
+        read.id,
+        Snapshot {
+            rows: stale_rows,
+            at: stale_at,
+        },
+    );
+    assert_eq!(
+        ids(runtime.engine().rows_for(sub)),
+        BTreeSet::from([5, 10]),
+        "the better late row joins the page"
+    );
+    assert_eq!(
+        runtime.stats().rows_added,
+        1,
+        "the worse one is left to a refill"
+    );
+    assert!(
+        stream(&mut runtime, &mut db, &ticket(60, "OPEN", 7, 60))
+            .updates
+            .is_empty(),
+        "the frontier stands at the worst row read: 60 is rejected"
+    );
 }
 
 /// Registration walks the tree as reads land: a RIGHT child's read comes

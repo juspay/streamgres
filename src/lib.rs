@@ -1,4 +1,4 @@
-//! # jus_sync
+//! # xyne_sync
 //!
 //! A sync engine: clients subscribe to read queries over a WebSocket and
 //! keep receiving incremental updates to those queries as the underlying
@@ -44,8 +44,8 @@
 //! 8. Streaming `pgoutput` consumer, batching of one write's narrowed reads,
 //!    table sharding
 
+pub mod gateway;
 pub mod ivm;
 pub mod model;
 pub mod parser;
 pub mod sync;
-pub mod ws;

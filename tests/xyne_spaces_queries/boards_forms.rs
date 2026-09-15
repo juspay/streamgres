@@ -1,8 +1,8 @@
 //! The project, board, stage, form and SLA queries, one test per registry
 //! entry over one project fixture.
 
-use jus_sync::model::ComparisonOperator::NEQ;
-use jus_sync::model::Order::{ASC, DESC};
+use xyne_sync::model::ComparisonOperator::NEQ;
+use xyne_sync::model::Order::{ASC, DESC};
 
 use super::world::{World, ops};
 use super::zql::{same, zql};

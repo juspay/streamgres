@@ -49,6 +49,14 @@ pub enum ValueType {
     Datetime,
     List(Box<ValueType>),
     Map(Box<ValueType>, Box<ValueType>),
+    /// A point in time carried as milliseconds since the Unix epoch, the
+    /// form Zero clients see for `timestamp`, `timestamptz` and `date`
+    /// columns; the cell is a [`Value::Int`].
+    Timestamp,
+    /// A JSON document carried as its text, the form the engine keeps for
+    /// `json` and `jsonb` columns; the cell is a [`Value::String`] and the
+    /// transport writes it out as the JSON it holds.
+    Json,
 }
 
 impl Value {

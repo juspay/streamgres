@@ -4,8 +4,8 @@
 //! inside the `OR` of one subscription (the group and channel grants of the
 //! participant branch are not modelled by the fixture).
 
-use jus_sync::model::Order::{ASC, DESC};
-use jus_sync::model::Value;
+use xyne_sync::model::Order::{ASC, DESC};
+use xyne_sync::model::Value;
 
 use super::world::{ME, World, ops, with};
 use super::zql::{Q, eq, or, same, zql};

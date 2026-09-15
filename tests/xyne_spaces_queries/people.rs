@@ -3,9 +3,9 @@
 //! workspaces and organisations, roles, saved views, lookups, emojis and
 //! dashboards, one test per registry entry.
 
-use jus_sync::model::ComparisonOperator::GT;
-use jus_sync::model::Order::{ASC, DESC};
-use jus_sync::model::Value;
+use xyne_sync::model::ComparisonOperator::GT;
+use xyne_sync::model::Order::{ASC, DESC};
+use xyne_sync::model::Value;
 
 use super::world::{ME, WS, World, ops, with};
 use super::zql::{and, cmp, eq, or, same, zql};

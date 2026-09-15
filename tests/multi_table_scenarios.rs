@@ -6,9 +6,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use jus_sync::ivm::{ClientUpdate, MultiTableIVM, QueryPart, SubId};
-use jus_sync::model::*;
-use jus_sync::sync::{Local, MemoryStorage};
+use xyne_sync::ivm::{ClientUpdate, MultiTableIVM, QueryPart, SubId};
+use xyne_sync::model::*;
+use xyne_sync::sync::{Local, MemoryStorage};
 
 /// The join layer under the synchronous driver, over in-process storage:
 /// every read a registration or a crossing asks for is landed inline.

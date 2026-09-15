@@ -1,7 +1,7 @@
 //! Reads routed by table: some tables are mirrored in memory (fed by the
 //! same write stream and read without a round trip), the rest are read
 //! from Postgres. Which tables live in memory is configuration
-//! (`JUS_SYNC_MEMORY_TABLES`, a comma-separated list); by default every
+//! (`XYNE_SYNC_MEMORY_TABLES`, a comma-separated list); by default every
 //! read goes to Postgres.
 
 use std::collections::HashSet;
@@ -14,7 +14,7 @@ use crate::model::{
 };
 
 /// The environment variable naming the tables to mirror in memory.
-pub const MEMORY_TABLES_VAR: &str = "JUS_SYNC_MEMORY_TABLES";
+pub const MEMORY_TABLES_VAR: &str = "XYNE_SYNC_MEMORY_TABLES";
 
 /// One [`Storage`] over two: the in-memory mirror for the cached tables,
 /// Postgres for everything else.
@@ -47,7 +47,7 @@ impl Sources {
         }
     }
 
-    /// The tables named in `JUS_SYNC_MEMORY_TABLES` (empty when unset).
+    /// The tables named in `XYNE_SYNC_MEMORY_TABLES` (empty when unset).
     pub fn cached_from_env() -> Vec<TableName> {
         std::env::var(MEMORY_TABLES_VAR)
             .ok()

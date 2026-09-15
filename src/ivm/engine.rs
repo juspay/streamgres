@@ -79,4 +79,9 @@ pub trait Engine {
     /// Take the reads recorded since the last call, in the order they were
     /// asked for.
     fn requests(&mut self) -> Vec<Fetch>;
+
+    /// Whether every row of `sub`'s initial result has arrived: no read it
+    /// waits on is still out and, for a tree, every part is live. False
+    /// for a subscription the engine does not know.
+    fn hydrated(&self, sub: SubId) -> bool;
 }

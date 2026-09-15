@@ -58,11 +58,11 @@ every later delta continues from.
 | Client-addressed output: every subscription belongs to a `ClientId`; one step's operations are folded per client and row (`ClientUpdate { client, table, op, targets }`), so a row image travels to a client once | ✅ done | `src/ivm/update.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
 | Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; the runtime holds the one position and brings every read up to it before landing; no read ever blocks the stream; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
-| In-memory storage answering at once, honoring `ORDER BY` + `LIMIT`; per-table routing between memory and PostgreSQL (`JUS_SYNC_MEMORY_TABLES`) | ✅ done | `src/sync/storage.rs`, `src/sync/sources.rs` |
+| In-memory storage answering at once, honoring `ORDER BY` + `LIMIT`; per-table routing between memory and PostgreSQL (`XYNE_SYNC_MEMORY_TABLES`) | ✅ done | `src/sync/storage.rs`, `src/sync/sources.rs` |
 | **PostgreSQL**: reads from the exported snapshot of a rotating temporary replication slot, flipped forward only once the feed has passed it; a streaming `pgoutput` change feed over a replication connection with heartbeat progress marks; live tests and a bench scenario against a real server | ✅ done | `src/sync/pg/` |
 | Routing counters + benchmark harness | ✅ done | `src/ivm/stats.rs`, `src/bin/bench.rs` |
 | **xyne-spaces coverage**: the dashboard's 283 synced queries (and the ACL predicates added to them) rebuilt as tests on a catalog generated from the application's schema; `IS NULL`, `EXISTS` inside `OR` and `whereExists` closed, four expressiveness gaps left and pinned | ✅ tests, ⏳ gaps | `tests/xyne_spaces_queries/` |
-| **WebSocket protocol**: subscribe / unsubscribe / op stream, connection & subscription lifecycle | ⏳ pending | `src/ws.rs` is an axum echo base |
+| **Sync gateway** speaking Zero's sync protocol (v51, the `@rocicorp/zero` 1.9 client): connect handshake, ping/pong and liveness, desired queries through the app server's query endpoint, pokes per client group, mutations through its mutate endpoint, `lastMutationID` off the app's clients table | ✅ done (no history across restarts, query TTLs not honored) | `src/gateway/` |
 | Batching of one write's narrowed reads | ⏳ pending | paper §13 |
 | Parser `JOIN` syntax | ⏳ pending | multi-table queries are built programmatically |
 | Table-sharded multithreading | ⏳ pending | paper §10.3; engine is single-threaded by design |
@@ -255,7 +255,7 @@ one consistent snapshot and the position it reflects every commit up to;
 says the oldest position its next read can be at, and `absorb(write, at)`
 lets a store that mirrors data apply the feed's writes. `MemoryStorage` is at
 the position of the last write it applied. `Sources` routes each table's reads
-to memory or PostgreSQL: the tables named in `JUS_SYNC_MEMORY_TABLES`
+to memory or PostgreSQL: the tables named in `XYNE_SYNC_MEMORY_TABLES`
 (comma-separated, read by `Sources::cached_from_env`) or passed to
 `Sources::new` are loaded from PostgreSQL once (`warm()`), kept in process
 and fed by the same writes; everything else, by default every table, is read
@@ -334,42 +334,97 @@ floor.
 - Live scenarios (`tests/pg_live.rs`) hold a snapshot open while writes commit
   behind it, one of them from a transaction already open when the snapshot
   was taken, and run the async service end to end with one table mirrored in
-  memory; they need `JUS_SYNC_PG_DSN` pointing at such a database and
+  memory; they need `XYNE_SYNC_PG_DSN` pointing at such a database and
   otherwise report themselves skipped.
 
-### 6. WebSocket API (*base only, pending*)
+### 6. The sync gateway (`src/gateway/`)
 
-`src/ws.rs` is an axum server with `GET /health` and `GET /ws`; the connection
-loop echoes. The protocol to wire in, one connection being one client:
+The server a Zero client connects to in place of the reference server. The xyne-spaces
+dashboard (`@rocicorp/zero` 1.9, sync protocol 51) connects to it unchanged.
 
-```text
-client → server : {"subscribe": {"id": "q1", "sql": "SELECT * FROM tickets WHERE status = 'OPEN'"}}
-server → client : {"snapshot": {"ops": [{"table": "tickets", "op": {"Add": {...}}, "targets": [{"id": "q1", "part": []}]}, …]}}
-server → client : {"update":   {"table": "tickets", "op": {"Delete": {...}}, "targets": [{"id": "q1", "part": []}, {"id": "q7", "part": [0]}]}}
-client → server : {"unsubscribe": {"id": "q1"}}
-```
+- **Threads.** A *feed thread* holds the replication connection, forwards raw
+  `pgoutput` events and emits a heartbeat at an interval so the engine's
+  position moves while nothing is written. The *engine thread* owns the
+  runtime, decodes the events, runs every storage read as a task on its own
+  local set (nothing blocks; a read lands when it returns), keeps every client
+  group's view and builds the pokes. Every value the engine holds is
+  thread-bound, so this is the only thread that touches writes, queries or
+  deltas; it hands connections finished frames. The *server threads* (a
+  multi-threaded tokio runtime) run the WebSocket connections: the handshake,
+  the message loop, the liveness rules, and the HTTP calls to the application
+  server for query ASTs and mutations.
+- **A connection.** `GET <base>/sync/v51/connect?clientID&clientGroupID&…`
+  with the first message base64-encoded in `Sec-WebSocket-Protocol` (echoed
+  back, as the browser requires) or sent as the first frame. The gateway
+  answers `connected`, then pokes. A `pong` answers every `ping`; when
+  nothing has gone downstream for `XYNE_SYNC_PONG_INTERVAL_MS` a `pong` goes
+  out anyway (so a client waiting behind a slow request still sees the server
+  alive); a WebSocket ping frame goes out every `XYNE_SYNC_PING_INTERVAL_MS`
+  and a connection that has sent nothing back for `XYNE_SYNC_CLIENT_TIMEOUT_MS`
+  is closed and leaves its client group. A group's subscriptions outlive its
+  last connection by `XYNE_SYNC_GROUP_TTL_MS`, then are released.
+- **Queries.** A desired query arrives as a name and arguments; the gateway
+  posts them to the application server's query endpoint (with the
+  connection's cookies and origin, the way the reference server does) and gets query
+  ASTs back, which `gateway/ast.rs` translates into the engine's trees:
+  `related` edges become LEFT joins, `EXISTS` subqueries INNER joins with an
+  `EXISTS` leaf in their place, a keyset `start` the `WHERE` it means, the
+  root's `limit` the window; the primary key is appended to the order when
+  absent. What the engine cannot run (`LIKE`, `NOT EXISTS`, compound join
+  keys) comes back to the client as a `transformError` for that query alone.
+  Subqueries the client marks as permission checks register but their rows are not
+  shipped, as the reference server withholds them.
+- **Pokes.** Per client group the gateway keeps, for every row shipped, the
+  subscription parts holding it, so a row is `del`ed only when its last
+  holder lets go and a row several queries share ships once. A poke goes out
+  per committed transaction (a mutation's rows and its `lastMutationID`,
+  read off the application's `xyne_0.clients` table, travel together), per
+  landed read, and per query change; `gotQueriesPatch` follows a query once
+  every part of its tree is live. Versions are the client's lexicographic cookies.
+  The gateway keeps no history: a client reconnecting with the group's
+  current cookie continues; with any other (a restart, changes it missed) it
+  is told to start a fresh sync (`InvalidConnectionRequestBaseCookie`), which
+  the client does on its own.
+- **Mutations.** A `push` is forwarded verbatim to the mutate endpoint with
+  `schema` and `appID` parameters and the connection's cookies; the answer
+  comes back as `pushResponse`, a refusal as the `PushFailed` error the client
+  understands. The application server records each mutation in
+  `<app>_<shard>.clients` inside the mutation's transaction; the feed delivers
+  that row with the rest, and the poke carries the id.
+- **Types.** The catalog is read from `information_schema` at startup
+  (`sync/pg/catalog.rs`), mapped the way the sync protocol maps Postgres for its clients:
+  `timestamp`, `timestamptz` and `date` are milliseconds since the epoch
+  (`ValueType::Timestamp`, read through `extract(epoch …)` and parsed off the
+  feed's text), `json` and `jsonb` travel as their text and are embedded as
+  JSON on the wire (`ValueType::Json`), arrays as JSON arrays, enums and
+  uuids as strings; `bytea` is left out.
 
-One connection carries many subscriptions; all subscriptions of all
-connections live in the one engine instance, and a row reaches a connection
-once per step however many of its subscriptions hold it. Per-connection
-subscription tables, reconnect/catch-up, and back-pressure are part of this
-work item.
+Configuration is by `XYNE_SYNC_*` variables (see [.env.example](.env.example);
+the names a reference-server deployment sets are accepted for the database
+and endpoint URLs). Not yet: history across reconnects (every reconnect after
+a missed change is a fresh sync), query TTLs, the inspector protocol.
 
 ---
 
 ## Try it
 
 ```bash
-cargo run --bin jus_sync      # scripted demo: SQL in, routed operations + cost counters out
+cargo run --bin xyne_sync      # scripted demo: SQL in, routed operations + cost counters out
 cargo test                    # model, parser, routing, window, join and read/write interleaving scenarios
 cargo test --test xyne_spaces_queries   # the xyne-spaces dashboard's 283 queries on the engine (gap table in its main.rs)
 cargo run --release --bin bench   # routing / registration / window / join benchmarks, and the xyne-spaces query shapes
-cargo run --bin server        # the WebSocket base (echo) on 127.0.0.1:8080
+cargo run --release --bin server  # the sync gateway on :4848 (reads .env; see .env.example)
 
 # against a real Postgres (wal_level = logical, replication slots to spare, a role that may create a publication):
-export JUS_SYNC_PG_DSN=postgresql://postgres@localhost:5499/jus_sync
+export XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5499/xyne_sync
 cargo test --test pg_live     # snapshot held open while writes commit behind it; async service end to end
 cargo run --release --bin bench   # adds scenario 5: registration, streamed writes, registration under load
+
+# the gateway in front of a local xyne-spaces (backend on :3001 with ENABLE_DEV_AUTH=true, dashboard on :5173,
+# Postgres with wal_level = logical and the app's xyne_0.clients / xyne_0.mutations tables):
+cp .env.example .env              # set XYNE_SYNC_PG_DSN and the two endpoint URLs
+cargo run --release --bin server
+node scripts/e2e-protocol.mjs   # two dev users, real mutations, fan-out, reconnects; PASS when the chain holds
 ```
 
 The demo registers six subscriptions on a `tickets` table and plays an
@@ -423,10 +478,10 @@ themselves and the relative results hold):
 
 ```rust
 use std::rc::Rc;
-use jus_sync::ivm::SingleTableIVM;
-use jus_sync::model::*;
-use jus_sync::parser::{parse_read, parse_write};
-use jus_sync::sync::{Local, MemoryStorage};
+use xyne_sync::ivm::SingleTableIVM;
+use xyne_sync::model::*;
+use xyne_sync::parser::{parse_read, parse_write};
+use xyne_sync::sync::{Local, MemoryStorage};
 
 let catalog = Catalog::new(vec![DbTable::new("tickets", ["id"], vec![
     DbColumn::new("id", ValueType::Int),
@@ -559,19 +614,30 @@ src/
     stats.rs               IvmStats counters + per-write diffing
   sync/
     storage.rs             the async Storage trait + MemoryStorage
-    sources.rs             Sources: per-table routing between memory and Postgres (JUS_SYNC_MEMORY_TABLES)
+    sources.rs             Sources: per-table routing between memory and Postgres (XYNE_SYNC_MEMORY_TABLES)
     runtime.rs             Runtime: the single owner, the one position, bringing results up to it, SyncStats
     local.rs               Local: the synchronous driver
     service.rs             Service: the async command loop (tokio LocalSet)
     pg/mod.rs              PgStorage: positioned REPEATABLE READ snapshots from exported-snapshot aliases
     pg/replication.rs      a minimal replication-protocol connection (mints the aliases)
     pg/sql.rs              model to SQL rendering
-    pg/stream.rs           PgStream: the streaming pgoutput feed, positioned writes, heartbeat progress marks
+    pg/stream.rs           PgStream: the streaming pgoutput feed (Transport + Feed halves), positioned writes, heartbeat progress marks
+    pg/catalog.rs          the catalog read from information_schema, typed the way the protocol types Postgres
+    pg/text.rs             the text forms of times, JSON arrays and array literals
+  gateway/
+    mod.rs                 the threads and their wiring
+    config.rs              XYNE_SYNC_* configuration
+    protocol.rs            Zero's sync protocol v51: messages, handshake header, cookies
+    ast.rs                 the client's query AST to the engine's query tree
+    wire.rs                rows and keys as the wire carries them
+    backend.rs             the query and mutate endpoints of the application server
+    core.rs                the engine thread: client groups, held rows, pokes
+    connection.rs          one WebSocket connection: handshake, message loop, liveness
+    log.rs                 a leveled stderr log
   parser/
     mod.rs                 lexer + recursive-descent parser, schema-aware against model::Catalog
-  ws.rs                    axum setup: routes, WebSocket upgrade, connection loop (echo)
   bin/
-    server.rs              the server binary
+    server.rs              the sync gateway binary
     bench.rs               benchmark harness
 tests/
   ivm_scenarios.rs         single-table routing, windows, twin sharing, per-client grouping (assertable spec)
@@ -593,7 +659,10 @@ Nine crates, all permissively licensed; the reason for each is beside it in
 | --- | --- | --- |
 | `chrono` | `Date` / `Datetime` values (no timezone database) | MIT OR Apache-2.0 |
 | `tokio` | the async drivers and the server | MIT |
-| `axum` | the WebSocket server | MIT |
+| `axum`, `futures-util` | the WebSocket server | MIT, MIT OR Apache-2.0 |
+| `serde`, `serde_json` | the protocol's messages and the ASTs | MIT OR Apache-2.0 |
+| `reqwest` (rustls) | the calls to the application server | MIT OR Apache-2.0 |
+| `base64`, `percent-encoding` | the handshake header | MIT OR Apache-2.0 |
 | `tokio-postgres` | SQL reads, slot and publication management, heartbeats | MIT OR Apache-2.0 |
 | `postgres-protocol`, `fallible-iterator`, `bytes` | the replication-protocol connection that mints exported snapshots | MIT OR Apache-2.0, MIT OR Apache-2.0, MIT |
 | `pgwire-replication` | the change feed's replication connection (`START_REPLICATION`, feedback, transaction boundaries); TLS features off | Apache-2.0 OR MIT |
@@ -636,7 +705,7 @@ they are discussed rather than discovered:
   design note you are addressing first.
 - **Comment convention**: one `//!` block per file, `///` above every `fn` and
   type, no comments inside function bodies.
-- Run `cargo test && cargo clippy --all-targets && cargo run --bin jus_sync`
+- Run `cargo test && cargo clippy --all-targets && cargo run --bin xyne_sync`
   before pushing; the demo must end all-`PASS`.
 
 ## Building

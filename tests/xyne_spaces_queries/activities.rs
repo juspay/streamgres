@@ -3,9 +3,9 @@
 //! `userId = ctx.userID`, which these tests include because without it
 //! the set is plainly wrong.
 
-use jus_sync::model::ComparisonOperator::GT;
-use jus_sync::model::Order::DESC;
-use jus_sync::model::Value;
+use xyne_sync::model::ComparisonOperator::GT;
+use xyne_sync::model::Order::DESC;
+use xyne_sync::model::Value;
 
 use super::world::{ME, World, ops, with};
 use super::zql::{eq, is_null, or, same, zql};

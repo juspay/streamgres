@@ -38,7 +38,7 @@
 //!    a page of 50 ordered by `createdAt DESC, id ASC`); one subscription
 //!    per user for each, then message inserts, membership churn that moves
 //!    the existence sets, and in-place ticket updates.
-//! 5. **Postgres** (only when `JUS_SYNC_PG_DSN` names a database with
+//! 5. **Postgres** (only when `XYNE_SYNC_PG_DSN` names a database with
 //!    `wal_level = logical`) — the same join over real tables: a
 //!    registration's end-to-end latency (two positioned reads), writes
 //!    committed in Postgres and streamed through the `test_decoding`
@@ -62,12 +62,12 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use jus_sync::ivm::{Fetch, IvmStats, MultiTableIVM, SingleTableIVM, evaluate, order_rows};
-use jus_sync::model::ComparisonOperator::{EQ, GTE};
-use jus_sync::model::*;
-use jus_sync::sync::pg::{PgStorage, PgStream};
-use jus_sync::sync::{Local, Lsn, Runtime, Snapshot, Storage, StorageError};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use xyne_sync::ivm::{Fetch, IvmStats, MultiTableIVM, SingleTableIVM, evaluate, order_rows};
+use xyne_sync::model::ComparisonOperator::{EQ, GTE};
+use xyne_sync::model::*;
+use xyne_sync::sync::pg::{PgStorage, PgStream};
+use xyne_sync::sync::{Local, Lsn, Runtime, Snapshot, Storage, StorageError};
 
 /// The xyne-spaces catalog, generated from the application's schema, shared with
 /// the test suite of the same name.
@@ -128,7 +128,7 @@ const PG_TICKETS: usize = 2_000;
 const PG_WRITES: usize = 5_000;
 const PG_WRITES_PER_TXN: usize = 100;
 const PG_LOAD_WRITES: usize = 500;
-const PG_SLOT: &str = "jus_sync_bench";
+const PG_SLOT: &str = "xyne_sync_bench";
 
 const XY_USERS: u64 = 1_000;
 const XY_CHANNELS: u64 = 500;
@@ -1375,7 +1375,7 @@ fn left_join() {
 /// Run the four scenarios in order.
 fn main() {
     println!(
-        "jus_sync bench: release build, single thread, xorshift seed {SEED:#x}, tables {} / {}",
+        "xyne_sync bench: release build, single thread, xorshift seed {SEED:#x}, tables {} / {}",
         tickets_table().name,
         users_table().name
     );
@@ -1385,10 +1385,10 @@ fn main() {
     window();
     left_join();
     xyne_spaces();
-    match std::env::var("JUS_SYNC_PG_DSN") {
+    match std::env::var("XYNE_SYNC_PG_DSN") {
         Ok(dsn) => postgres(&dsn),
         Err(_) => println!(
-            "\n== 5. postgres: skipped (set JUS_SYNC_PG_DSN to a database with wal_level = logical) =="
+            "\n== 5. postgres: skipped (set XYNE_SYNC_PG_DSN to a database with wal_level = logical) =="
         ),
     }
     println!(

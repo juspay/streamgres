@@ -2,9 +2,9 @@
 //! tickets, workflows, RCAs and releases, one test per registry entry over
 //! one board fixture.
 
-use jus_sync::model::ComparisonOperator::{GTE, LT, LTE, NEQ};
-use jus_sync::model::Order::{ASC, DESC};
-use jus_sync::model::Value;
+use xyne_sync::model::ComparisonOperator::{GTE, LT, LTE, NEQ};
+use xyne_sync::model::Order::{ASC, DESC};
+use xyne_sync::model::Value;
 
 use super::world::{ME, World, ops, with};
 use super::zql::{cmp, eq, is_null, or, same, zql};
@@ -83,7 +83,7 @@ fn sr1() -> Row {
 
 /// The Support exclusion of the board queries: `ticketType != 'Support'
 /// OR ticketType IS NULL`, so an untyped ticket counts.
-fn not_support() -> jus_sync::model::Where {
+fn not_support() -> xyne_sync::model::Where {
     or(vec![
         cmp("ticketType", NEQ, "Support"),
         is_null("ticketType"),

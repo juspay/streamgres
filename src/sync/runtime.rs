@@ -28,7 +28,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-use crate::ivm::{ClientUpdate, Engine, Fetch, FetchId, evaluate};
+use crate::ivm::{ClientUpdate, Engine, Fetch, FetchId, evaluate, order_rows};
 use crate::model::{
     ClientId, DataFrameKey, DataFrameRow, Lsn, Snapshot, SubId, TableName, WriteQuery,
 };
@@ -76,6 +76,7 @@ pub struct SyncStats {
     pub reads_retried: u64,
     pub rows_dropped: u64,
     pub rows_refreshed: u64,
+    pub rows_added: u64,
     pub writes_buffered: u64,
 }
 
@@ -93,6 +94,7 @@ impl fmt::Display for SyncStats {
             "rows dropped / refreshed ... {} / {}",
             self.rows_dropped, self.rows_refreshed
         )?;
+        writeln!(f, "rows added late ............ {}", self.rows_added)?;
         write!(f, "writes buffered ............ {}", self.writes_buffered)
     }
 }
@@ -298,8 +300,12 @@ impl<E: Engine> Runtime<E> {
 
     /// Apply to a read's result every delivered write past its snapshot's
     /// location: a delete, or a new image that fails the read's filter,
-    /// drops the row; a new image that passes replaces it. Rows the writes
-    /// never touched stand.
+    /// drops the row; a new image that passes replaces it; a row the
+    /// snapshot did not have that a write since brought into the filter
+    /// is added (it was routed to nobody if the subscription did not exist
+    /// yet). Rows the writes never touched stand. Under a window whose
+    /// read came back full, a late row worse than the worst row read is
+    /// left to a refill, so the frontier the landing sets stays honest.
     fn bring_up(
         &mut self,
         fetch: &Fetch,
@@ -307,6 +313,14 @@ impl<E: Engine> Runtime<E> {
         at: Lsn,
     ) -> Vec<(DataFrameKey, DataFrameRow)> {
         let table: &TableName = &fetch.query.table;
+        let query = &fetch.query;
+        let worst_read = (query.limit != u32::MAX && rows.len() >= query.limit as usize)
+            .then(|| {
+                rows.iter()
+                    .map(|(_, row)| row.clone())
+                    .max_by(|a, b| order_rows(&query.order_by, a, b))
+            })
+            .flatten();
         let mut index: HashMap<DataFrameKey, usize> = rows
             .iter()
             .enumerate()
@@ -319,6 +333,21 @@ impl<E: Engine> Runtime<E> {
                 continue;
             }
             let Some(&position) = index.get(delivered.write.pkey_value()) else {
+                let Some(image) = delivered.write.new_row_image() else {
+                    continue;
+                };
+                if !evaluate(&query.filter, &image.data, &mut 0) {
+                    continue;
+                }
+                let beyond = worst_read.as_ref().is_some_and(|worst| {
+                    order_rows(&query.order_by, image, worst) == std::cmp::Ordering::Greater
+                });
+                if beyond {
+                    continue;
+                }
+                index.insert(delivered.write.pkey_value().clone(), rows.len());
+                rows.push(Some((delivered.write.pkey_value().clone(), image.clone())));
+                self.stats.rows_added += 1;
                 continue;
             };
             match delivered.write.new_row_image() {

@@ -4,10 +4,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use jus_sync::ivm::{ClientUpdate, SingleTableIVM, SubId};
-use jus_sync::model::*;
-use jus_sync::sync::{Local, MemoryStorage};
 use std::rc::Rc;
+use xyne_sync::ivm::{ClientUpdate, SingleTableIVM, SubId};
+use xyne_sync::model::*;
+use xyne_sync::sync::{Local, MemoryStorage};
 
 /// The single-table engine under the synchronous driver, over in-process
 /// storage: registration and routing keep the engine's own call shape,
@@ -750,7 +750,7 @@ fn shared_counter_survives_partial_unregistration() {
 #[test]
 fn counting_agrees_with_tree_evaluation() {
     use ComparisonOperator::*;
-    use jus_sync::ivm::evaluate;
+    use xyne_sync::ivm::evaluate;
 
     let tickets = table("tickets");
     let filters: Vec<Where> = vec![

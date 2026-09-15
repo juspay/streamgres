@@ -16,11 +16,11 @@
 //! `tests/ivm_scenarios.rs`; the parser's own tests live in
 //! `src/parser/mod.rs`.
 
-use jus_sync::ivm::{ClientId, IvmStats, SingleTableIVM, SubId};
-use jus_sync::model::*;
-use jus_sync::parser::{Catalog, parse_read, parse_write, point_at};
-use jus_sync::sync::{Local, MemoryStorage};
 use std::rc::Rc;
+use xyne_sync::ivm::{ClientId, IvmStats, SingleTableIVM, SubId};
+use xyne_sync::model::*;
+use xyne_sync::parser::{Catalog, parse_read, parse_write, point_at};
+use xyne_sync::sync::{Local, MemoryStorage};
 
 /// The engine under the synchronous driver over an (empty) in-process
 /// store: every write is routed from the stream alone.
@@ -31,7 +31,7 @@ type Demo = Local<SingleTableIVM, MemoryStorage>;
 /// through [`run_write`], then prints each subscription's final frame size
 /// and the engine's cumulative counters.
 fn main() {
-    println!("== jus_sync SingleTableIVM demo ==================================================");
+    println!("== xyne_sync SingleTableIVM demo ==================================================");
 
     let catalog = Catalog::new(vec![tickets_table()]);
     let mut ivm: Demo = Local::new(SingleTableIVM::new(), Rc::new(MemoryStorage::new()));

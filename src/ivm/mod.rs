@@ -578,4 +578,9 @@ impl Engine for SingleTableIVM {
     fn requests(&mut self) -> Vec<Fetch> {
         self.take_requests()
     }
+
+    /// Registered, with no read out.
+    fn hydrated(&self, sub: SubId) -> bool {
+        self.select_queries.contains_key(&sub) && !self.is_pending(sub)
+    }
 }

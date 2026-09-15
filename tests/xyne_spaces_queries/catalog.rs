@@ -1,4 +1,4 @@
-//! The application schema of xyne-spaces as a jus_sync catalog: every table with
+//! The application schema of xyne-spaces as a xyne_sync catalog: every table with
 //! its columns and primary key, and every relationship edge, generated from
 //! the shared package's `schema.ts` of juspay/xyne-spaces at commit
 //! f80fd19 (v1.316.4, 2026-09-11) by the extraction script kept beside the
@@ -8,7 +8,7 @@
 //! schema is one hop on one column pair, and every primary key is one
 //! column, so nothing here needed approximating.
 
-use jus_sync::model::{Catalog, DbColumn, DbTable, ValueType};
+use xyne_sync::model::{Catalog, DbColumn, DbTable, ValueType};
 
 /// One relationship of the application's schema: rows of `table` reach rows of
 /// `dest_table` where `table.source = dest_table.dest` (the client's `one` /
