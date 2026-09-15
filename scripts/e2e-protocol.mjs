@@ -6,7 +6,7 @@
 // deliver the rows), A subscribes to channelConversations, starts a conversation
 // through the real conversations.send mutation, subscribes to its thread, B
 // subscribes to the same thread from another client group, A replies (B must see
-// it), A reconnects with its current cookie (no reset) and once with a stale one
+// it), A drops the thread query (with ttl 0 so the release is immediate), A reconnects with its current cookie (no reset) and once with a stale one
 // (reset). Exits 0 on PASS.
 //
 //   node scripts/e2e-protocol.mjs
@@ -141,7 +141,7 @@ function advance() {
       if (!(a.lmid >= 1 && [...(a.rows.conversations?.values() ?? [])].some(c => c.conversationId === conversationId))) return;
       log('A: the new conversation arrived by poke with lastMutationID', a.lmid);
       stage = 'thread';
-      a.send(['changeDesiredQueries', { desiredQueriesPatch: [{ op: 'put', hash: 'h3', name: 'conversationMessages', args: [{ conversationId }], ttl: 300000 }] }]);
+      a.send(['changeDesiredQueries', { desiredQueriesPatch: [{ op: 'put', hash: 'h3', name: 'conversationMessages', args: [{ conversationId }], ttl: 0 }] }]);
       return;
     }
     case 'thread': {

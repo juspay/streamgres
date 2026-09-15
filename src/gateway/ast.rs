@@ -161,7 +161,14 @@ fn node(
         }
     }
     let filter = match &ast.start {
-        Some(bound) => collapse(vec![filter, keyset(bound, &order, table)?]),
+        Some(bound) => {
+            let cursor = keyset(bound, &order, table)?;
+            if matches!(&filter, Where::AND(children) if children.is_empty()) {
+                cursor
+            } else {
+                collapse(vec![filter, cursor])
+            }
+        }
         None => filter,
     };
     let limit = match ast.limit {
@@ -369,21 +376,25 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
 }
 
 /// The `WHERE` a keyset cursor means over `order`: one branch per sort
-/// column, earlier columns tied and the column itself strictly past the
-/// cursor, plus the cursor row itself when inclusive.
+/// column the cursor names (a cursor may stop short of the trailing
+/// columns, the appended primary key in particular, and is then compared
+/// on the prefix it has), earlier columns tied and the column itself
+/// strictly past the cursor, plus the cursor row itself when inclusive.
 fn keyset(bound: &Bound, order: &[OrderBy], table: &DbTable) -> Result<Where, String> {
     let mut keys = Vec::with_capacity(order.len());
     for clause in order {
         let name = clause.column.as_str();
-        let literal = bound
-            .row
-            .get(name)
-            .ok_or_else(|| format!("the cursor lacks the sort column `{name}`"))?;
+        let Some(literal) = bound.row.get(name) else {
+            break;
+        };
         let declared = &table
             .column(name)
             .ok_or_else(|| format!("unknown column `{name}`"))?
             .r#type;
         keys.push((name, clause.direction, literal_value(literal, declared)?));
+    }
+    if keys.is_empty() {
+        return Err("the cursor names none of the sort columns".to_owned());
     }
     let mut branches = Vec::with_capacity(keys.len() + 1);
     for (index, (column, direction, value)) in keys.iter().enumerate() {
@@ -543,6 +554,24 @@ mod tests {
         assert!(
             rendered.contains("LT") && rendered.contains("GT"),
             "the cursor is a WHERE: {rendered}"
+        );
+    }
+
+    /// A cursor that stops short of the appended primary key is compared
+    /// on the columns it has; one that names no sort column is refused.
+    #[test]
+    fn cursors_compare_on_their_prefix() {
+        let ast: Ast = serde_json::from_str(r#"{"table": "messages", "orderBy": [["createdAt", "desc"]], "start": {"row": {"createdAt": 1000}, "exclusive": true}, "limit": 5}"#).unwrap();
+        let translated = translate(&ast, &catalog()).unwrap();
+        assert_eq!(
+            translated.query.main_table.filter,
+            Where::condition("createdAt", LT, Value::Int(1000))
+        );
+        let empty: Ast = serde_json::from_str(r#"{"table": "messages", "orderBy": [["createdAt", "desc"]], "start": {"row": {"other": 1}, "exclusive": true}}"#).unwrap();
+        assert!(
+            translate(&empty, &catalog())
+                .unwrap_err()
+                .contains("none of the sort columns")
         );
     }
 

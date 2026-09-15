@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use pgwire_replication::ReplicationEvent;
 use serde_json::{Map, Value as Json, json};
@@ -109,6 +110,27 @@ pub enum Request {
         group: String,
         generation: u64,
     },
+    ExpireQuery {
+        group: String,
+        hash: String,
+        generation: u64,
+    },
+}
+
+/// How long a query outlives the last client desiring it when the client
+/// gave no `ttl`.
+const DEFAULT_QUERY_TTL: Duration = Duration::from_secs(300);
+/// The longest a query outlives the last client desiring it.
+const MAX_QUERY_TTL: Duration = Duration::from_secs(600);
+
+/// A client's `ttl` (milliseconds) as the lifetime honored for it.
+fn lifetime_of(ttl: Option<f64>) -> Duration {
+    match ttl {
+        Some(ms) if ms.is_finite() && ms >= 0.0 => {
+            Duration::from_millis(ms.min(MAX_QUERY_TTL.as_millis() as f64) as u64)
+        }
+        _ => DEFAULT_QUERY_TTL,
+    }
 }
 
 /// The engine thread's answer to a connection.
@@ -133,6 +155,8 @@ struct QueryState {
     sub: Option<SubId>,
     hidden: HashSet<QueryPart>,
     got: bool,
+    ttl: Duration,
+    inactive: u64,
 }
 
 /// One client group's view.
@@ -222,6 +246,7 @@ pub struct Core {
     requests: mpsc::Sender<Request>,
     report: mpsc::UnboundedSender<(FetchId, Result<Snapshot, StorageError>)>,
     next_poke: u64,
+    next_generation: u64,
 }
 
 /// Run the engine thread until every request sender and the feed are
@@ -265,6 +290,7 @@ pub async fn run(
         requests,
         report,
         next_poke: 1,
+        next_generation: 0,
     };
     gw_info!("engine thread up; waiting for the first heartbeat before serving queries");
     loop {
@@ -329,6 +355,14 @@ impl Core {
                 let _ = reply.send(answer);
             }
             Request::Expire { group, generation } => self.expire(&group, generation),
+            Request::ExpireQuery {
+                group,
+                hash,
+                generation,
+            } => {
+                self.expire_query(&group, &hash, generation);
+                self.flush();
+            }
         }
     }
 
@@ -343,22 +377,29 @@ impl Core {
         schema: Option<ClientSchema>,
         lmids: Vec<(String, i64)>,
     ) -> ConnectReply {
-        let known = self
+        let known: Option<Option<String>> = self
             .groups
             .get(group_id)
-            .map(|group| protocol::cookie(group.version));
+            .map(|group| (group.version > 0).then(|| protocol::cookie(group.version)));
         match (&known, &base_cookie) {
             (None, Some(_)) => {
                 return ConnectReply::Reset {
                     reason: "the server holds no state for this client group".to_owned(),
                 };
             }
-            (Some(current), Some(offered)) if current != offered => {
-                return ConnectReply::Reset {
-                    reason: format!("the server is at {current}, the client at {offered}"),
-                };
+            (Some(current), offered) if current != offered => {
+                if offered.is_none() {
+                    self.drop_group(group_id);
+                } else {
+                    return ConnectReply::Reset {
+                        reason: format!(
+                            "the server is at {}, the client at {}",
+                            current.as_deref().unwrap_or("the start"),
+                            offered.as_deref().unwrap_or("the start")
+                        ),
+                    };
+                }
             }
-            (Some(_), None) => self.drop_group(group_id),
             _ => {}
         }
         if !self.groups.contains_key(group_id) {
@@ -484,6 +525,7 @@ impl Core {
         ttl: Option<f64>,
         ast: Option<Json>,
     ) {
+        let lifetime = lifetime_of(ttl);
         let group = self.groups.get_mut(group_id).expect("checked");
         group
             .desired
@@ -492,14 +534,20 @@ impl Core {
             .insert(hash.clone());
         let mut echo = json!({"op": "put", "hash": hash});
         if let Some(ttl) = ttl {
-            echo["ttl"] = json!(ttl);
+            echo["ttl"] = if ttl.fract() == 0.0 && ttl.abs() < 9.0e15 {
+                json!(ttl as i64)
+            } else {
+                json!(ttl)
+            };
         }
         group
             .queued_desired
             .entry(client.to_owned())
             .or_default()
             .push(echo);
-        if group.queries.contains_key(&hash) {
+        if let Some(state) = group.queries.get_mut(&hash) {
+            state.inactive = 0;
+            state.ttl = lifetime;
             return;
         }
         let Some(ast) = ast else {
@@ -509,6 +557,8 @@ impl Core {
                     sub: None,
                     hidden: HashSet::new(),
                     got: false,
+                    ttl: lifetime,
+                    inactive: 0,
                 },
             );
             return;
@@ -528,6 +578,8 @@ impl Core {
                         sub: Some(sub),
                         hidden: translated.hidden,
                         got: false,
+                        ttl: lifetime,
+                        inactive: 0,
                     },
                 );
                 gw_debug!(
@@ -544,6 +596,8 @@ impl Core {
                         sub: None,
                         hidden: HashSet::new(),
                         got: false,
+                        ttl: lifetime,
+                        inactive: 0,
                     },
                 );
                 let frame: Arc<str> =
@@ -568,6 +622,49 @@ impl Core {
             .push(json!({"op": "del", "hash": hash}));
         let wanted = group.desired.values().any(|desired| desired.contains(hash));
         if !wanted {
+            self.deactivate(group_id, hash);
+        }
+    }
+
+    /// Nobody desires `hash` any more: keep it registered for its
+    /// lifetime, so a client coming back to it within that time finds its
+    /// rows in place, then release it.
+    fn deactivate(&mut self, group_id: &str, hash: &str) {
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        let Some(state) = self
+            .groups
+            .get_mut(group_id)
+            .and_then(|group| group.queries.get_mut(hash))
+        else {
+            return;
+        };
+        state.inactive = generation;
+        let ttl = state.ttl;
+        let requests = self.requests.clone();
+        let group = group_id.to_owned();
+        let hash = hash.to_owned();
+        spawn_local(async move {
+            tokio::time::sleep(ttl).await;
+            let _ = requests
+                .send(Request::ExpireQuery {
+                    group,
+                    hash,
+                    generation,
+                })
+                .await;
+        });
+    }
+
+    /// A query's lifetime after its last client ran out; released unless a
+    /// client came back to it meanwhile.
+    fn expire_query(&mut self, group_id: &str, hash: &str, generation: u64) {
+        let expired = self
+            .groups
+            .get(group_id)
+            .and_then(|group| group.queries.get(hash))
+            .is_some_and(|state| state.inactive == generation);
+        if expired {
             self.unsubscribe(group_id, hash);
         }
     }
@@ -595,7 +692,7 @@ impl Core {
                 .values()
                 .any(|desired| desired.contains(&hash));
             if !wanted {
-                self.unsubscribe(group_id, &hash);
+                self.deactivate(group_id, &hash);
             }
         }
     }
@@ -858,11 +955,11 @@ impl Core {
         let rows = coalesce(rows);
         let poke_id = self.next_poke.to_string();
         self.next_poke += 1;
-        let base = protocol::cookie(group.version);
+        let base = (group.version > 0).then(|| protocol::cookie(group.version));
         group.version += 1;
         let cookie = protocol::cookie(group.version);
         let mut frames: Vec<Arc<str>> = Vec::new();
-        frames.push(protocol::poke_start(&poke_id, Some(&base)).into());
+        frames.push(protocol::poke_start(&poke_id, base.as_deref()).into());
         let got_count = got.len();
         let mut first = Map::new();
         if !desired.is_empty() {
@@ -910,7 +1007,8 @@ impl Core {
         }
         frames.push(protocol::poke_end(&poke_id, &cookie).into());
         gw_debug!(
-            "group {group_id}: poke {poke_id} {base} -> {cookie}: {puts} puts, {dels} dels, {got_count} got, {} lmids",
+            "group {group_id}: poke {poke_id} {} -> {cookie}: {puts} puts, {dels} dels, {got_count} got, {} lmids",
+            base.as_deref().unwrap_or("null"),
             lmids.len()
         );
         for frame in &frames {

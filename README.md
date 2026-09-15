@@ -62,7 +62,7 @@ every later delta continues from.
 | **PostgreSQL**: reads from the exported snapshot of a rotating temporary replication slot, flipped forward only once the feed has passed it; a streaming `pgoutput` change feed over a replication connection with heartbeat progress marks; live tests and a bench scenario against a real server | ✅ done | `src/sync/pg/` |
 | Routing counters + benchmark harness | ✅ done | `src/ivm/stats.rs`, `src/bin/bench.rs` |
 | **xyne-spaces coverage**: the dashboard's 283 synced queries (and the ACL predicates added to them) rebuilt as tests on a catalog generated from the application's schema; `IS NULL`, `EXISTS` inside `OR` and `whereExists` closed, four expressiveness gaps left and pinned | ✅ tests, ⏳ gaps | `tests/xyne_spaces_queries/` |
-| **Sync gateway** speaking Zero's sync protocol (v51, the `@rocicorp/zero` 1.9 client): connect handshake, ping/pong and liveness, desired queries through the app server's query endpoint, pokes per client group, mutations through its mutate endpoint, `lastMutationID` off the app's clients table | ✅ done (no history across restarts, query TTLs not honored) | `src/gateway/` |
+| **Sync gateway** speaking Zero's sync protocol (v51, the `@rocicorp/zero` 1.9 client): connect handshake, ping/pong and liveness, desired queries through the app server's query endpoint, pokes per client group, mutations through its mutate endpoint, `lastMutationID` off the app's clients table | ✅ done (no history across restarts) | `src/gateway/` |
 | Batching of one write's narrowed reads | ⏳ pending | paper §13 |
 | Parser `JOIN` syntax | ⏳ pending | multi-table queries are built programmatically |
 | Table-sharded multithreading | ⏳ pending | paper §10.3; engine is single-threaded by design |
@@ -399,10 +399,17 @@ dashboard (`@rocicorp/zero` 1.9, sync protocol 51) connects to it unchanged.
   JSON on the wire (`ValueType::Json`), arrays as JSON arrays, enums and
   uuids as strings; `bytea` is left out.
 
+- **Query lifetimes.** A query nobody desires any more stays registered
+  for the `ttl` the client gave it (capped at ten minutes, five when
+  absent), so a client coming back to it, or swapping a paginated query for
+  its next page, finds the rows in place; only when the lifetime runs out
+  are its rows withdrawn and its `got` revoked. Without this the dashboard
+  re-requests some queries several times a second and rows flicker.
+
 Configuration is by `XYNE_SYNC_*` variables (see [.env.example](.env.example);
 the names a reference-server deployment sets are accepted for the database
 and endpoint URLs). Not yet: history across reconnects (every reconnect after
-a missed change is a fresh sync), query TTLs, the inspector protocol.
+a missed change is a fresh sync), the inspector protocol.
 
 ---
 

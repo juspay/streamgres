@@ -31,8 +31,7 @@
 //!
 //! A client group's history is not kept: a client reconnecting with a
 //! cookie the gateway does not hold (after a restart, or after changes it
-//! missed) is told to start over. Query TTLs are not honored (a query
-//! nobody desires is released at once). Inspector messages are ignored.
+//! missed) is told to start over. Inspector messages are ignored.
 
 pub mod ast;
 pub mod backend;
