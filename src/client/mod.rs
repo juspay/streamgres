@@ -5,8 +5,9 @@
 //! Everything here is about clients. It speaks their protocol
 //! ([`protocol`]), translates the ASTs their queries arrive as into the
 //! engine's trees ([`ast`]), calls the application server for those ASTs
-//! and for their mutations ([`backend`]), keeps each client group's view
-//! and builds its pokes ([`groups`]). The engine, its storage and the
+//! and for their mutations ([`backend`]), decides which side of a join
+//! is read whole before registering it ([`plan`]), keeps each client
+//! group's view and builds its pokes ([`groups`]). The engine, its storage and the
 //! change feed are none of its business: it reaches them only through
 //! [`crate::sync::Service`]'s channels, which [`crate::sync::pg`] wires
 //! up ([`crate::sync::pg::threads`]).
@@ -46,6 +47,7 @@ pub mod backend;
 pub mod config;
 pub mod connection;
 pub mod groups;
+pub mod plan;
 pub mod protocol;
 pub mod wire;
 

@@ -38,6 +38,7 @@ use tokio::task::spawn_local;
 
 use super::ast::{self, Ast, Translated};
 use super::config::Config;
+use super::plan::{Planner, Policy, Step};
 use super::protocol::{self, ClientSchema};
 use super::wire;
 use crate::ivm::{ClientUpdate, QueryPart};
@@ -148,6 +149,17 @@ pub enum ConnectReply {
     Reset {
         reason: String,
     },
+}
+
+/// One query between its translation and its registration: the planner
+/// deciding which side of its joins is read whole, and where its answer
+/// goes.
+struct Planning {
+    group: String,
+    client: String,
+    hash: String,
+    name: String,
+    planner: Planner,
 }
 
 /// One row operation bound for a group.
@@ -265,6 +277,8 @@ pub struct Groups {
     by_sub: HashMap<SubId, (String, String)>,
     /// Registrations in flight, by the token they were sent with.
     awaiting: HashMap<u64, (String, String)>,
+    /// Plans waiting on a count, by the token the count was asked with.
+    plans: HashMap<u64, Planning>,
     next_client: u64,
     pending: HashMap<ClientId, Vec<ClientUpdate>>,
     lmid_changes: HashMap<String, HashMap<String, i64>>,
@@ -303,6 +317,7 @@ pub async fn run(
         by_client: HashMap::new(),
         by_sub: HashMap::new(),
         awaiting: HashMap::new(),
+        plans: HashMap::new(),
         next_client: 1,
         pending: HashMap::new(),
         lmid_changes: HashMap::new(),
@@ -427,6 +442,7 @@ impl Groups {
                 self.flush();
             }
             Event::Landed => self.flush(),
+            Event::Counted { token, count } => self.counted(token, count),
             Event::Moved { position, floor } => {
                 if let Ok(batch) = watched.try_recv() {
                     for write in batch {
@@ -439,6 +455,107 @@ impl Groups {
                 self.serve_when_covered(position, floor);
             }
         }
+    }
+
+    /// The join policy the configuration sets.
+    fn policy(&self) -> Policy {
+        Policy {
+            limit: self.config.join_limit,
+            preferred: self.config.join_preferred_side,
+        }
+    }
+
+    /// Drive one query's plan: ask the engine side for the count it needs
+    /// next, or act on its decision.
+    fn plan(&mut self, token: u64, mut planning: Planning) {
+        match planning.planner.step() {
+            Step::Count(query, cap) => {
+                log_debug!(
+                    "group {}: query {} ({}) counts {} up to {cap}",
+                    planning.group,
+                    planning.name,
+                    planning.hash,
+                    query.table
+                );
+                self.plans.insert(token, planning);
+                self.command(Command::Count { query, cap, token });
+            }
+            Step::Done(Ok(translated)) => self.register_planned(token, planning, translated),
+            Step::Done(Err(reason)) => self.refuse(token, planning, &reason),
+        }
+    }
+
+    /// A count the engine side answered, for a plan in flight.
+    fn counted(&mut self, token: u64, count: Result<u64, String>) {
+        let Some(mut planning) = self.plans.remove(&token) else {
+            return;
+        };
+        match count {
+            Ok(count) => {
+                planning.planner.answer(count);
+                self.plan(token, planning);
+            }
+            Err(error) => self.refuse(
+                token,
+                planning,
+                &format!("counting its rows failed: {error}"),
+            ),
+        }
+    }
+
+    /// The plan is in: register the query in the shape the planner chose,
+    /// unless the query was released while the plan was being made.
+    fn register_planned(&mut self, token: u64, planning: Planning, translated: Translated) {
+        let Some(group) = self.groups.get_mut(&planning.group) else {
+            return;
+        };
+        let Some(state) = group.queries.get_mut(&planning.hash) else {
+            return;
+        };
+        if state.awaiting != token {
+            return;
+        }
+        state.hidden = translated.hidden;
+        let engine_client = group.client;
+        self.awaiting
+            .insert(token, (planning.group.clone(), planning.hash.clone()));
+        self.command(Command::Register {
+            client: engine_client,
+            query: translated.query,
+            token,
+        });
+        log_debug!(
+            "group {}: query {} ({}) registering",
+            planning.group,
+            planning.name,
+            planning.hash
+        );
+    }
+
+    /// The plan refused the query: the client is told why, and the query
+    /// stays known to the group with no subscription behind it.
+    fn refuse(&mut self, token: u64, planning: Planning, reason: &str) {
+        log_warn!(
+            "group {}: query {} ({}) refused: {reason}",
+            planning.group,
+            planning.name,
+            planning.hash
+        );
+        let Some(group) = self.groups.get_mut(&planning.group) else {
+            return;
+        };
+        if let Some(state) = group.queries.get_mut(&planning.hash)
+            && state.awaiting == token
+        {
+            state.awaiting = 0;
+        }
+        let frame: Arc<str> = protocol::transform_error(vec![protocol::errored_query(
+            &planning.hash,
+            &planning.name,
+            reason,
+        )])
+        .into();
+        group.send_to_client(&planning.client, &frame);
     }
 
     /// Start serving once the engine's position covers the storage's
@@ -582,6 +699,7 @@ impl Groups {
             self.command(Command::UnregisterClient(group.client));
             self.by_client.remove(&group.client);
             self.by_sub.retain(|_, (owner, _)| owner != group_id);
+            self.plans.retain(|_, planning| planning.group != group_id);
             self.pending.remove(&group.client);
             self.lmid_changes.remove(group_id);
             self.dirty.remove(group_id);
@@ -678,26 +796,25 @@ impl Groups {
             Ok(translated) => {
                 self.next_generation += 1;
                 let generation = self.next_generation;
-                let engine_client = group.client;
                 group.queries.insert(
                     hash.clone(),
                     QueryState {
                         sub: None,
                         awaiting: generation,
-                        hidden: translated.hidden,
+                        hidden: translated.hidden.clone(),
                         got: false,
                         ttl: lifetime,
                         inactive: 0,
                     },
                 );
-                self.awaiting
-                    .insert(generation, (group_id.to_owned(), hash.clone()));
-                self.command(Command::Register {
-                    client: engine_client,
-                    query: translated.query,
-                    token: generation,
-                });
-                log_debug!("group {group_id}: query {name} ({hash}) registering");
+                let planning = Planning {
+                    group: group_id.to_owned(),
+                    client: client.to_owned(),
+                    hash: hash.clone(),
+                    name: name.to_owned(),
+                    planner: Planner::new(translated, self.policy()),
+                };
+                self.plan(generation, planning);
             }
             Err(message) => {
                 log_warn!("group {group_id}: query {name} ({hash}) cannot run here: {message}");

@@ -79,12 +79,13 @@ impl std::fmt::Display for ClientId {
 /// the sub rows delivered). An INNER edge's test may be placed anywhere
 /// in the enclosing node's `WHERE` through an
 /// [`ComparisonOperator::EXISTS`] leaf naming it; unnamed, it is
-/// conjoined. Below the root, a node's
-/// `order_by` / `limit` are unused — a `LIMIT` on a join's sub side has no
-/// SQL meaning (it would cap the whole side across every referenced
-/// value), so the engine normalizes it away at registration. A `NULL` (or
-/// missing) join value never matches, consistent with the engine's NULL
-/// semantics.
+/// conjoined. Below the root, a LEFT join's sub node may carry an
+/// `order_by` / `limit` of its own: it is a window **per enclosing row**,
+/// the best *n* sub rows for each value the enclosing rows reference
+/// (`related` with a limit in the client's terms). A RIGHT or INNER sub node is
+/// read whole, so its limit is an ordinary window on that node. A `NULL`
+/// (or missing) join value never matches, consistent with the engine's
+/// NULL semantics.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Join {
     pub sub: MultiTableReadQuery,

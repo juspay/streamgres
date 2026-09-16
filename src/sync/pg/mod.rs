@@ -276,6 +276,26 @@ impl Storage for PgStorage {
         result
     }
 
+    /// `SELECT count(*)` over at most `cap` matching rows, on the same
+    /// snapshot a read would use.
+    async fn count(&self, query: &SingleTableReadQuery, cap: u64) -> Result<u64, StorageError> {
+        let table = self.catalog.table(query.table.as_str()).ok_or_else(|| {
+            StorageError(format!("table `{}` is not in the catalog", query.table))
+        })?;
+        let alias = self.current_alias()?;
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| StorageError("the read pool is closed".to_owned()))?;
+        let mut client = self.acquire().await?;
+        let result = count_snapshot(&mut client, table, query, &alias, cap).await;
+        if result.is_ok() {
+            self.release(client);
+        }
+        result
+    }
+
     /// Flip to the newest minted alias the stream has passed.
     fn advance(&self, feed: Lsn) {
         self.aliases.borrow_mut().advance(feed);
@@ -365,6 +385,34 @@ async fn read_snapshot(
         rows,
         at: alias.lsn,
     })
+}
+
+/// The capped count of `query`'s rows on `alias`'s snapshot.
+async fn count_snapshot(
+    client: &mut Client,
+    table: &DbTable,
+    query: &SingleTableReadQuery,
+    alias: &Alias,
+    cap: u64,
+) -> Result<u64, StorageError> {
+    let transaction = client
+        .build_transaction()
+        .isolation_level(IsolationLevel::RepeatableRead)
+        .read_only(true)
+        .start()
+        .await?;
+    transaction
+        .batch_execute(&format!(
+            "SET TRANSACTION SNAPSHOT '{}'",
+            alias.snapshot.replace('\'', "''")
+        ))
+        .await?;
+    let row = transaction
+        .query_one(&sql::count_sql(query, table, cap), &[])
+        .await?;
+    transaction.commit().await?;
+    let count: i64 = row.get(0);
+    Ok(count.max(0) as u64)
 }
 
 /// Parse Postgres's `X/Y`.

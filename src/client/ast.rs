@@ -2,8 +2,8 @@
 //! into the engine's query tree: `related` edges become LEFT joins,
 //! `EXISTS` subqueries in the filter become INNER joins with an `EXISTS`
 //! leaf in their place, a keyset `start` becomes the `WHERE` it means, the
-//! root's `limit` becomes the window and any deeper limit is dropped (a
-//! limit on one side of a join has no meaning here), the primary key is
+//! root's `limit` becomes its window and a `related` node's `limit` its
+//! window per parent row (the engine's driven windows), the primary key is
 //! appended to the ordering when absent so pages are deterministic, and
 //! every literal is coerced to its column's catalog type. Subqueries Zero
 //! marks as permission checks are registered but their parts are not
@@ -116,7 +116,7 @@ pub struct Translated {
 /// cannot run.
 pub fn translate(ast: &Ast, catalog: &Catalog) -> Result<Translated, String> {
     let mut hidden = HashSet::new();
-    let query = node(ast, Vec::new(), true, false, catalog, &mut hidden)?;
+    let query = node(ast, Vec::new(), false, catalog, &mut hidden)?;
     Ok(Translated { query, hidden })
 }
 
@@ -124,7 +124,6 @@ pub fn translate(ast: &Ast, catalog: &Catalog) -> Result<Translated, String> {
 fn node(
     ast: &Ast,
     path: Vec<usize>,
-    root: bool,
     concealed: bool,
     catalog: &Catalog,
     hidden: &mut HashSet<QueryPart>,
@@ -172,8 +171,8 @@ fn node(
         None => filter,
     };
     let limit = match ast.limit {
-        Some(limit) if root => limit.max(0.0).min(u32::MAX as f64) as u32,
-        _ => u32::MAX,
+        Some(limit) => limit.max(0.0).min(u32::MAX as f64) as u32,
+        None => u32::MAX,
     };
     let main_table = SingleTableReadQuery::new(table.name.clone(), normalize(filter), order, limit);
     let left_count = ast.related.len();
@@ -215,7 +214,7 @@ fn edge(
         return Err("compound join keys are not supported".to_owned());
     }
     let concealed = concealed_parent || sub.system.as_deref() == Some("permissions");
-    let child = node(&sub.subquery, child_path, false, concealed, catalog, hidden)?;
+    let child = node(&sub.subquery, child_path, concealed, catalog, hidden)?;
     Ok(Join::new(
         child,
         parent_column.as_str(),
@@ -528,9 +527,8 @@ mod tests {
         assert_eq!(root.left_joins.len(), 1);
         assert_eq!(root.inner_joins.len(), 1);
         assert_eq!(
-            root.left_joins[0].sub.main_table.limit,
-            u32::MAX,
-            "a related limit is dropped"
+            root.left_joins[0].sub.main_table.limit, 1,
+            "a related limit is kept, as a window per parent row"
         );
         assert_eq!(
             root.inner_joins[0].sub.inner_joins.len(),

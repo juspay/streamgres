@@ -54,7 +54,8 @@ every later delta continues from.
 | Shared frames: one frame per table, rows tagged with holders as compact ids (`RowId`, `SubId`); held mirror; twin registration served from the frame through a query-keyed index | ✅ done | `src/ivm/frames.rs`, `src/ivm/registry.rs` |
 | `ORDER BY` / `LIMIT` windows: compound order, the page of `L` to the client over a buffer of `2L`, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
 | In-place condition edits: a literal `IN` swapped inside its disjuncts, or a set-valued `IN` (`Value::Set`) gaining/losing one member in O(1) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
-| Join tree: `LEFT`, `RIGHT` and `INNER` edges at any depth, existence tests placed anywhere in a node's filter (`EXISTS` inside `OR`), set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns; a child row is shown only under a shown parent | ✅ done | `src/ivm/multi.rs` |
+| Join tree: `LEFT`, `RIGHT` and `INNER` edges at any depth, existence tests placed anywhere in a node's filter (`EXISTS` inside `OR`), set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns; a child row is shown only under a shown parent; a LEFT child's `ORDER BY` / `LIMIT` is a window **per parent row** (`related` with a limit) | ✅ done | `src/ivm/multi.rs` |
+| Join planning: before a query registers, every node that would be read whole is counted (capped at the limit); an INNER edge is turned around when its child is too big and its parent fits, and a query neither side of which fits is refused with the reason; `XYNE_SYNC_JOIN_LIMIT`, `XYNE_SYNC_JOIN_PREFERRED_SIDE` | ✅ done | `src/client/plan.rs` |
 | Client-addressed output: every subscription belongs to a `ClientId`; one step's operations are folded per client and row (`ClientUpdate { client, table, op, targets }`), so a row image travels to a client once | ✅ done | `src/ivm/update.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
 | Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; the runtime holds the one position and brings every read up to it before landing; no read ever blocks the stream; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
@@ -193,7 +194,9 @@ inner); inner ids are looked up in a map, never parsed.
 Every edge has a **driver** side, whose rows decide which join values are
 referenced, and a **driven** side, whose part carries `driven_col IN <set>`
 inside its filter: `LEFT` keeps the parent, so the parent drives; `RIGHT`
-and `INNER` keep the child's evaluation, so the child drives. The operand is
+and `INNER` keep the child's evaluation, so the child drives — unless the
+planner (below) turns an `INNER` edge around because the parent is the small
+side. The operand is
 a **shared set** (`Value::Set`, compared by identity) owned by the tree, so
 the restriction lives inside the driven filter and driven-table writes route
 natively, while a change to the set never rewrites the filter or the index's
@@ -383,6 +386,26 @@ thread-bound) and on two tomorrow without either side changing.
   keys) comes back to the client as a `transformError` for that query alone.
   Subqueries the client marks as permission checks register but their rows are not
   shipped, as the reference server withholds them.
+- **Planning.** Before a translated query registers, `client/plan.rs` decides
+  which side of each join is read whole. A node nothing drives (the root
+  with no `RIGHT` or `INNER` child, a `RIGHT` or `INNER` child with none of
+  its own) holds all its rows; the planner asks the engine side to count
+  each such node, no further than `XYNE_SYNC_JOIN_LIMIT` + 1 (100 000 by
+  default, so a big table is never scanned whole). A node with a page holds
+  its window and is never counted. When an `INNER` child is over the limit
+  and the root has no page, the edge is **turned around**: the child becomes
+  the root, the parent its `INNER` child, so the parent is read whole and
+  the child narrowed to the parent's keys — the same rows shown either way,
+  the hidden parts following their nodes. `XYNE_SYNC_JOIN_PREFERRED_SIDE`
+  says which side to count first (`child`, the side that drives unless told
+  otherwise, or `parent`). A query neither side of which fits is refused
+  with a `transformError` naming the sides, and a `LEFT` or `RIGHT` query
+  whose driving side is over the limit is refused the same way.
+- **Related windows.** A `related` subquery with `orderBy`/`limit` is the
+  best *n* rows per parent row, as the client means it: the engine registers one
+  windowed part per referenced parent value, so every window is maintained
+  by the single engine like any other, refills included, and the client sees
+  one part.
 - **Pokes.** Per client group `client/groups.rs` keeps, for every row shipped, the
   subscription parts holding it, so a row is `del`ed only when its last
   holder lets go and a row several queries share ships once. A poke goes out
@@ -596,7 +619,7 @@ pins each gap on its own.
 | N | `IS NULL` / `IS NOT NULL` (83 sites: `visibleTo IS NULL`, `rootId IS NULL`, `userId IS NULL`, `deletedAt IS NULL`, …) | **closed**: `IS` / `IS NOT` operators with a `NULL` operand, filed under the `NULL` key of the column index; every message, canvas and draft query states its rule in full |
 | L | `LIKE` / `ILIKE` (11 sites: name, title, xyneId searches; one over JSON text) | not supported, by decision: no pattern operator |
 | X | an existence test inside `OR` (canvas visibility, `browsableChannels`, `channelLinks`, `summaryTemplates`, `getUsers`, the channel-access ACL `visibility = PUBLIC OR EXISTS participants`, the calls ACL) | **closed**: an `EXISTS` leaf naming an inner join, bound in place to the edge's set; one subscription, the set-valued leaf inside the `OR` |
-| O | a second `ORDER BY` column (tiebreaks on `id`); `ORDER BY` / `LIMIT` inside `related` | **half closed**: `ORDER BY` takes a list of columns, the page and the boundary decided by every column in turn; below the root every matching row still ships |
+| O | a second `ORDER BY` column (tiebreaks on `id`); `ORDER BY` / `LIMIT` inside `related` | **closed**: `ORDER BY` takes a list of columns, the page and the boundary decided by every column in turn; a `related` node's `ORDER BY` / `LIMIT` is a window per parent row, one inner part per referenced value |
 | J | `json` columns | opaque strings, serialized and deserialized as they are; no path, containment or pattern operator |
 | E | `whereExists` returns no child rows | **closed**: `whereExists` is an `INNER` edge; the matching child rows ship as their own part, only under a shown parent (what the reference server syncs to its client too, though not in the result) |
 | S, B | `.one()`, `LIMIT n` | **closed**: the client receives exactly the page of `n` (`.one()` is `LIMIT 1`) and the page's difference after every step; the doubled buffer behind it is the engine's |
@@ -659,6 +682,7 @@ src/
     config.rs              XYNE_SYNC_* configuration
     protocol.rs            Zero's sync protocol v51: messages, handshake header, cookies
     ast.rs                 the client's query AST to the engine's query tree
+    plan.rs                which side of a join is read whole: counts, turning an INNER edge, refusing
     wire.rs                rows and keys as the wire carries them
     backend.rs             the query and mutate endpoints of the application server
     groups.rs              client groups, held rows, pokes: a consumer of the service's events

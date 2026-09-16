@@ -54,6 +54,17 @@ pub fn select_sql(query: &SingleTableReadQuery, table: &DbTable) -> String {
     sql
 }
 
+/// `SELECT count(*)` of the rows matching `query.filter`, stopping at
+/// `cap`: the count runs over `LIMIT cap` rows, so the scan ends as soon
+/// as the cap is reached.
+pub fn count_sql(query: &SingleTableReadQuery, table: &DbTable, cap: u64) -> String {
+    format!(
+        "SELECT count(*) FROM (SELECT 1 FROM {} WHERE {} LIMIT {cap}) AS capped",
+        quote_ident(query.table.as_str()),
+        render_where(&query.filter, table)
+    )
+}
+
 /// The table's columns in a fixed order: primary-key columns first (in
 /// declaration order), then the rest sorted by name.
 pub fn select_columns(table: &DbTable) -> Vec<&crate::model::ColumnName> {

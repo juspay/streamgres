@@ -578,3 +578,34 @@ fn reads_queue_at_the_connection_bound() {
         cleanup(&dsn, &client, &names).await;
     });
 }
+
+/// A count runs on the same snapshot a read would, and stops at the cap:
+/// three OPEN tickets count as 2 under a cap of 2 and as 3 under a cap of
+/// 10, so a planner learns whether a side fits without scanning it whole.
+#[test]
+fn a_count_stops_at_the_cap_on_the_snapshot() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let names = Names::new("count");
+        let client = prepare(&dsn, &names).await;
+        let catalog = Rc::new(names.catalog());
+        let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+
+        let open = names.spec().main_table;
+        assert_eq!(storage.count(&open, 2).await.expect("count"), 2);
+        assert_eq!(storage.count(&open, 10).await.expect("count"), 3);
+        let none = SingleTableReadQuery {
+            filter: Where::condition("status", ComparisonOperator::EQ, "GONE"),
+            ..open.clone()
+        };
+        assert_eq!(storage.count(&none, 10).await.expect("count"), 0);
+        cleanup(&dsn, &client, &names).await;
+    });
+}

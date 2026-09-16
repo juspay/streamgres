@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use super::plan::Side;
 use crate::log::Level;
 use crate::model::TableName;
 use crate::sync::pg::Settings;
@@ -71,6 +72,15 @@ pub struct Config {
     /// `XYNE_SYNC_ROWS_PER_PART`: how many row operations one poke part
     /// carries at most (500).
     pub rows_per_part: usize,
+    /// `XYNE_SYNC_JOIN_LIMIT`: the most rows a join may read whole into
+    /// memory on either side (100000). A side over it is driven from the
+    /// other side when that one fits, and the query is refused when
+    /// neither does; `0` turns the check off.
+    pub join_limit: u64,
+    /// `XYNE_SYNC_JOIN_PREFERRED_SIDE`: which side of an INNER join to
+    /// count first, `child` (the subquery, the side that drives unless
+    /// told otherwise) or `parent`.
+    pub join_preferred_side: Side,
     /// `XYNE_SYNC_LOG`: `error`, `warn`, `info` or `debug` (`info`).
     pub log: Level,
 }
@@ -117,6 +127,21 @@ impl Config {
         };
         let forward_cookies = first(&["XYNE_SYNC_FORWARD_COOKIES", "ZERO_QUERY_FORWARD_COOKIES"])
             .is_none_or(|value| value != "false" && value != "0");
+        let join_limit = match first(&["XYNE_SYNC_JOIN_LIMIT"]) {
+            Some(text) => text.parse::<u64>().map_err(|_| {
+                format!("XYNE_SYNC_JOIN_LIMIT must be a number of rows, got `{text}`")
+            })?,
+            None => 100_000,
+        };
+        let join_preferred_side = match first(&["XYNE_SYNC_JOIN_PREFERRED_SIDE"]).as_deref() {
+            None | Some("child") => Side::Child,
+            Some("parent") => Side::Parent,
+            Some(other) => {
+                return Err(format!(
+                    "XYNE_SYNC_JOIN_PREFERRED_SIDE must be child or parent, got `{other}`"
+                ));
+            }
+        };
         let log = match first(&["XYNE_SYNC_LOG"]).as_deref() {
             None | Some("info") => Level::Info,
             Some("debug") => Level::Debug,
@@ -173,6 +198,8 @@ impl Config {
                 })?,
                 None => 500,
             },
+            join_limit,
+            join_preferred_side,
             log,
         })
     }

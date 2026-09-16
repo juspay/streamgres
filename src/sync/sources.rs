@@ -114,6 +114,15 @@ impl Storage for Sources {
         }
     }
 
+    /// The count from whichever source holds the table.
+    async fn count(&self, query: &SingleTableReadQuery, cap: u64) -> Result<u64, StorageError> {
+        if self.is_cached(&query.table) {
+            self.memory.count(query, cap).await
+        } else {
+            self.pg.count(query, cap).await
+        }
+    }
+
     /// Both sources move.
     fn advance(&self, feed: Lsn) {
         self.memory.advance(feed);

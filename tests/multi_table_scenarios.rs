@@ -701,30 +701,152 @@ fn self_join_write_converges_for_the_client() {
     assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 0);
 }
 
-/// A finite `limit` on a join's sub side is normalized away — it has no
-/// SQL meaning for a join, so every referenced value's sub rows arrive
-/// regardless of it.
+/// `tickets LEFT JOIN members` with the members side windowed: the two
+/// newest members (by id, descending) of each team.
+fn tickets_two_newest_members_query() -> MultiTableReadQuery {
+    let mut spec = tickets_members_query();
+    let sub = &mut spec.left_joins[0].sub.main_table;
+    sub.order_by = vec![OrderBy::new("id", Order::DESC)];
+    sub.limit = 2;
+    spec
+}
+
+/// A `LIMIT` on a LEFT join's sub side is a window **per parent row**, as
+/// `related` means it: each referenced team shows its two newest members,
+/// not two members in all. A member arriving inside a team's window evicts
+/// that team's oldest shown member, a shown member leaving is refilled from
+/// storage, and a team no longer referenced takes its members away.
 #[test]
-fn sub_table_limit_is_normalized_away() {
+fn sub_table_limit_is_a_window_per_parent() {
     let (mut ivm, storage, names) = engine();
     for id in 1..=3 {
         storage.apply(&member(id, 5));
     }
-    let mut spec = tickets_members_query();
-    spec.left_joins[0].sub.main_table.limit = 1;
-    names.register(&mut ivm, "q", spec);
+    storage.apply(&member(4, 6));
+    names.register(&mut ivm, "q", tickets_two_newest_members_query());
 
     let ops = write(&mut ivm, &storage, team_ticket(10, 5));
     assert_eq!(
         names.tags(&ops),
         vec![
-            "q/join0/add:Int(1)",
+            "q/join0/add:Int(2)",
+            "q/join0/add:Int(3)",
+            "q/main/add:Int(10)"
+        ],
+        "team 5 shows its two newest members, not member 1"
+    );
+    assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 2);
+
+    let ops = write(&mut ivm, &storage, member(7, 5));
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/join0/add:Int(7)", "q/join0/del:Int(2)"],
+        "a newer member enters team 5's window and evicts its oldest shown one"
+    );
+
+    let ops = write(&mut ivm, &storage, delete("members", 7));
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/join0/add:Int(2)", "q/join0/del:Int(7)"],
+        "the window refills from storage when a shown member leaves"
+    );
+
+    let ops = write(&mut ivm, &storage, team_ticket(11, 6));
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/join0/add:Int(4)", "q/main/add:Int(11)"],
+        "another team gets a window of its own"
+    );
+    assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 3);
+
+    let ops = write(&mut ivm, &storage, delete("tickets", 10));
+    assert_eq!(
+        names.tags(&ops),
+        vec![
+            "q/join0/del:Int(2)",
+            "q/join0/del:Int(3)",
+            "q/main/del:Int(10)"
+        ],
+        "team 5's members go with its last ticket"
+    );
+    assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 1);
+}
+
+/// Two tickets of one team share the team's window: the second ticket
+/// adds no member rows, and the members stay while either ticket does.
+#[test]
+fn a_per_parent_window_is_shared_by_the_parent_rows_of_one_value() {
+    let (mut ivm, storage, names) = engine();
+    for id in 1..=3 {
+        storage.apply(&member(id, 5));
+    }
+    storage.apply(&team_ticket(10, 5));
+    let snapshot = names.register(&mut ivm, "q", tickets_two_newest_members_query());
+    assert_eq!(
+        names.tags(&snapshot),
+        vec![
             "q/join0/add:Int(2)",
             "q/join0/add:Int(3)",
             "q/main/add:Int(10)"
         ]
     );
-    assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 3);
+
+    let ops = write(&mut ivm, &storage, team_ticket(11, 5));
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/main/add:Int(11)"],
+        "the window is already there"
+    );
+
+    let ops = write(&mut ivm, &storage, delete("tickets", 10));
+    assert_eq!(
+        names.tags(&ops),
+        vec!["q/main/del:Int(10)"],
+        "ticket 11 still references team 5"
+    );
+    assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 2);
+
+    let ops = write(&mut ivm, &storage, delete("tickets", 11));
+    assert_eq!(
+        names.tags(&ops),
+        vec![
+            "q/join0/del:Int(2)",
+            "q/join0/del:Int(3)",
+            "q/main/del:Int(11)"
+        ]
+    );
+}
+
+/// A second subscription to a spec with a per-parent window is served the
+/// windows' shown rows from the shared tree, and both see later changes.
+#[test]
+fn a_twin_shares_the_per_parent_windows() {
+    let (mut ivm, storage, names) = engine();
+    for id in 1..=3 {
+        storage.apply(&member(id, 5));
+    }
+    storage.apply(&team_ticket(10, 5));
+    names.register(&mut ivm, "a", tickets_two_newest_members_query());
+    let snapshot = names.register(&mut ivm, "b", tickets_two_newest_members_query());
+    assert_eq!(
+        names.tags(&snapshot),
+        vec![
+            "b/join0/add:Int(2)",
+            "b/join0/add:Int(3)",
+            "b/main/add:Int(10)"
+        ]
+    );
+
+    let ops = write(&mut ivm, &storage, member(9, 5));
+    assert_eq!(
+        names.tags(&ops),
+        vec![
+            "a/join0/add:Int(9)",
+            "a/join0/del:Int(2)",
+            "b/join0/add:Int(9)",
+            "b/join0/del:Int(2)"
+        ]
+    );
 }
 
 /// Every update names the table its operation lands on: the main table for

@@ -26,7 +26,7 @@ use super::runtime::{Runtime, Step};
 use super::storage::{Storage, StorageError};
 use crate::ivm::{ClientUpdate, Engine, Fetch, FetchId};
 use crate::log::log_warn;
-use crate::model::{ClientId, Lsn, Snapshot, SubId, WriteQuery};
+use crate::model::{ClientId, Lsn, SingleTableReadQuery, Snapshot, SubId, WriteQuery};
 
 /// What a client of the service can ask.
 ///
@@ -42,6 +42,9 @@ use crate::model::{ClientId, Lsn, Snapshot, SubId, WriteQuery};
 ///   is being routed is seen only once the whole commit has been, and a
 ///   consumer never meets half a transaction.
 /// - `Progress`: the feed has delivered everything up to `lsn`.
+/// - `Count`: how many rows match `query`, no further than `cap`,
+///   answered as [`Event::Counted`] with the same `token`. What a planner
+///   asks before registering a join, to learn which side to read whole.
 pub enum Command<Q> {
     Register {
         client: ClientId,
@@ -55,6 +58,11 @@ pub enum Command<Q> {
         at: Lsn,
     },
     Progress(Lsn),
+    Count {
+        query: SingleTableReadQuery,
+        cap: u64,
+        token: u64,
+    },
 }
 
 /// What the service tells its consumer.
@@ -73,11 +81,21 @@ pub enum Command<Q> {
 ///   floor.
 #[derive(Debug)]
 pub enum Event {
-    Registered { token: u64, sub: SubId },
+    Registered {
+        token: u64,
+        sub: SubId,
+    },
     Updates(Vec<ClientUpdate>),
     Hydrated(Vec<SubId>),
     Landed,
-    Moved { position: Lsn, floor: Lsn },
+    Moved {
+        position: Lsn,
+        floor: Lsn,
+    },
+    Counted {
+        token: u64,
+        count: Result<u64, String>,
+    },
 }
 
 /// The loop's handles: the command inlet and the event outlet.
@@ -186,6 +204,17 @@ where
                 let _ = self.events.send(Event::Moved {
                     position: self.runtime.position(),
                     floor: self.runtime.floor(),
+                });
+            }
+            Command::Count { query, cap, token } => {
+                let storage = self.storage.clone();
+                let events = self.events.clone();
+                spawn_local(async move {
+                    let count = storage
+                        .count(&query, cap)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let _ = events.send(Event::Counted { token, count });
                 });
             }
         }

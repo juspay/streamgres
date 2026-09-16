@@ -50,6 +50,21 @@ pub trait Storage {
     /// *best* rows); an unlimited query may return rows in any order.
     async fn select(&self, query: &SingleTableReadQuery) -> Result<Snapshot, StorageError>;
 
+    /// How many rows of `query.table` satisfy `query.filter`, counted no
+    /// further than `cap`: the answer is exact below `cap`, and `cap`
+    /// itself means "at least that many". A planner asks this before it
+    /// registers a join, to learn which side is small enough to read
+    /// whole; a source that can stop counting early does, and the default
+    /// reads the rows and counts them.
+    async fn count(&self, query: &SingleTableReadQuery, cap: u64) -> Result<u64, StorageError> {
+        let unlimited = SingleTableReadQuery {
+            limit: u32::MAX,
+            ..query.clone()
+        };
+        let snapshot = self.select(&unlimited).await?;
+        Ok((snapshot.rows.len() as u64).min(cap))
+    }
+
     /// The stream has been delivered (and applied by the engine) up to
     /// `feed`: a snapshot at or below it may now serve reads.
     fn advance(&self, feed: Lsn);

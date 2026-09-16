@@ -98,6 +98,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
             Event::Hydrated(_) => "hydrated",
             Event::Landed => "landed",
             Event::Moved { .. } => "moved",
+            Event::Counted { .. } => "counted",
         })
         .collect()
 }
@@ -303,5 +304,58 @@ fn progress_reports_the_position() {
             "the progress mark is reported, got {:?}",
             shapes(&seen)
         );
+    });
+}
+
+/// A count is answered on the event stream with the token it was asked
+/// with, exact below the cap and the cap itself beyond it, so a planner
+/// never makes the store count a big table to the end.
+#[test]
+fn a_count_stops_at_the_cap() {
+    block_on(async {
+        let storage = Rc::new(MemoryStorage::new());
+        for id in 1..=5 {
+            storage.apply(&insert(id, "OPEN"));
+        }
+        storage.apply(&insert(6, "DONE"));
+        let (commands, mut events) = start(storage);
+        let open = open_tickets().main_table;
+
+        commands
+            .send(Command::Count {
+                query: open.clone(),
+                cap: 3,
+                token: 11,
+            })
+            .await
+            .expect("send");
+        commands
+            .send(Command::Count {
+                query: open,
+                cap: 100,
+                token: 12,
+            })
+            .await
+            .expect("send");
+        let seen = drain(&mut events).await;
+
+        let counts: Vec<(u64, u64)> = seen
+            .iter()
+            .filter_map(|event| match event {
+                Event::Counted {
+                    token,
+                    count: Ok(count),
+                } => Some((*token, *count)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            counts.len(),
+            2,
+            "both counts answered, got {:?}",
+            shapes(&seen)
+        );
+        assert!(counts.contains(&(11, 3)), "capped at 3: {counts:?}");
+        assert!(counts.contains(&(12, 5)), "exact below the cap: {counts:?}");
     });
 }

@@ -596,9 +596,9 @@ fn ticket_by_id_v2() {
     );
 }
 
-/// `ticketDetailsById`: `ticketById` plus the latest RCA. Gap O: the
-/// `rcas` relation's `LIMIT 1` is not applied below the root, both RCAs
-/// arrive.
+/// `ticketDetailsById`: `ticketById` plus the latest RCA — the `rcas`
+/// relation's `ORDER BY createdAt DESC LIMIT 1` is a window per ticket, so
+/// only the newest RCA ships, and a newer one arriving replaces it.
 #[test]
 fn ticket_details_by_id() {
     let mut w = World::new();
@@ -629,7 +629,6 @@ fn ticket_details_by_id() {
             "q/entity+em1",
             "q/conversation+cv1",
             "q/stageEtaEntries+e1",
-            "q/rcas+rc1",
             "q/rcas+rc2",
             "q/ticketStageRequests+sr1",
             "q/ticketStageRequests.form+f1"
@@ -640,7 +639,7 @@ fn ticket_details_by_id() {
             "rcas",
             row!["id" => "rc3", "ticketId" => "t1", "title" => "Third", "createdAt" => 300]
         ),
-        ops(["q/rcas+rc3"])
+        ops(["q/rcas+rc3", "q/rcas-rc2"])
     );
 }
 
@@ -681,7 +680,6 @@ fn ticket_details_by_id_v2() {
             "q/entity+em1",
             "q/conversation+cv1",
             "q/stageEtaEntries+e1",
-            "q/rcas+rc1",
             "q/rcas+rc2",
             "q/ticketStageRequests+sr1",
             "q/ticketStageRequests.form+f1"

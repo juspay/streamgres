@@ -179,7 +179,12 @@ class Conn {
         break;
       }
       case 'error': this.errors.push(body); if (body.kind === 'PushFailed') this.settle(); else this.resolveReady(); break;
-      case 'transformError': this.errors.push({ kind: 'transform', message: JSON.stringify(body).slice(0, 200) }); break;
+      case 'transformError': {
+        this.errors.push({ kind: 'transform', message: JSON.stringify(body).slice(0, 300) });
+        for (const refused of Array.isArray(body) ? body : []) { if (refused && refused.id) this.wanted.delete(refused.id); }
+        if (!this.hydratedAt && [...this.wanted].every(h => this.got.has(h))) { this.hydratedAt = Date.now(); this.resolveReady(); }
+        break;
+      }
       default: break;
     }
   }

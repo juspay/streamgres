@@ -196,14 +196,14 @@ fn x_exists_inside_or_is_one_subscription() {
     );
 }
 
-/// Gap O, the tiebreak half closed: `ORDER BY createdAt DESC, id ASC` is
-/// one compound order, parsed and honored, so a page of two among tickets
-/// tying on `createdAt` is decided by `id`; and only the page ships (gap B
-/// closed: the doubled buffer is the engine's). The other half remains: a
-/// related node's `ORDER BY … LIMIT 1` ships every related row, the
-/// "latest RCA" relation delivering both RCAs.
+/// Gap O, closed on both halves: `ORDER BY createdAt DESC, id ASC` is one
+/// compound order, parsed and honored, so a page of two among tickets
+/// tying on `createdAt` is decided by `id`, and only the page ships (gap B
+/// closed: the doubled buffer is the engine's); and a related node's
+/// `ORDER BY … LIMIT 1` is a window per parent, the "latest RCA" relation
+/// delivering the newest RCA alone.
 #[test]
-fn o_compound_order_pages_by_the_tiebreak_and_related_limits_still_ship_all() {
+fn o_compound_order_pages_by_the_tiebreak_and_a_related_limit_is_per_parent() {
     let parsed = parse_read(
         "SELECT * FROM tickets ORDER BY createdAt DESC, id ASC LIMIT 2",
         &catalog(),
@@ -262,7 +262,7 @@ fn o_compound_order_pages_by_the_tiebreak_and_related_limits_still_ship_all() {
         .related("rcas", |r| r.order_by("createdAt", DESC).limit(1));
     assert_eq!(
         w.subscribe("latest", &latest_rca),
-        ops(["latest/main+t9", "latest/rcas+r-old", "latest/rcas+r-new"])
+        ops(["latest/main+t9", "latest/rcas+r-new"])
     );
 }
 

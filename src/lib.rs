@@ -43,9 +43,13 @@
 //! 6. ✅ `INNER` edges, the streaming `pgoutput` consumer, and Zero's sync
 //!    protocol over WebSockets ([`client`]) against an unmodified Zero
 //!    client, with the engine reached only through [`sync::Service`]
-//! 7. History across reconnects, so a client that missed changes resumes
+//! 7. ✅ Windows below the root (a `related` node's `ORDER BY` / `LIMIT`
+//!    as a window per parent row) and the join planner (which side is read
+//!    whole, by counting; an `INNER` edge turned around when the parent is
+//!    the small side; refusal past the limit) ([`client::plan`])
+//! 8. History across reconnects, so a client that missed changes resumes
 //!    instead of starting a fresh sync
-//! 8. Batching of one write's narrowed reads, parser `JOIN` syntax,
+//! 9. Batching of one write's narrowed reads, parser `JOIN` syntax,
 //!    table sharding across threads
 
 pub mod client;

@@ -1148,9 +1148,10 @@ fn channel_latest_message_v2() {
 }
 
 /// `dmChannelsLatestMessagesPaginated`: DM channels by activity through
-/// their stats row, each with its conversations opened by a visible
-/// message: an existence test under two LEFT edges. Gap O: the per-channel
-/// `LIMIT 1` is not applied.
+/// their stats row, each with its newest conversation opened by a visible
+/// message: an existence test under two LEFT edges, the inner one a window
+/// per channel. A newer conversation becoming visible takes the window
+/// from the older one, and its opener comes and goes with it.
 #[test]
 fn dm_channels_latest_messages_paginated() {
     let mut w = World::new();
@@ -1183,7 +1184,12 @@ fn dm_channels_latest_messages_paginated() {
     );
     assert_eq!(
         w.update("messages", row!["messageId" => "mdm2", "conversationId" => "cvdm2", "visibleTo" => ME, "createdAt" => 2]),
-        ops(["q/channel.conversations.has:initialMessage+mdm2", "q/channel.conversations+cvdm2"])
+        ops([
+            "q/channel.conversations+cvdm2",
+            "q/channel.conversations-cvdm1",
+            "q/channel.conversations.has:initialMessage+mdm2",
+            "q/channel.conversations.has:initialMessage-mdm1"
+        ])
     );
 }
 
