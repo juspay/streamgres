@@ -1,10 +1,10 @@
-//! The engine thread of the gateway: the one owner of the runtime, the
-//! decoder of the change feed, the storage reads, and every client
-//! group's view. Connections hand it requests over a channel (connect,
-//! disconnect, desired queries, pulls); the feed thread hands it raw
-//! replication events; it hands each group's connections finished poke
-//! frames. Nothing here blocks: reads run as tasks on this thread's local
-//! set and land when they return.
+//! Every client group's view, and the one thread that keeps it. It owns
+//! no engine, no storage and no database connection: it sends the engine
+//! side subscribe and unsubscribe commands and reads back that side's
+//! events (deltas, hydrated subscriptions, landings, stream progress),
+//! turning both into the pokes a Zero client expects. Connections hand it
+//! requests over a channel (connect, disconnect, desired queries, pulls)
+//! and receive finished frames.
 //!
 //! # A client group's view
 //!
@@ -18,36 +18,42 @@
 //! committed transaction (so a mutation's rows and its `lastMutationID`
 //! travel together), per landed read, and per query change, advancing the
 //! group's version; the version is the cookie the client hands back when
-//! it reconnects, and a cookie the gateway does not hold (it keeps no
+//! it reconnects, and a cookie this server does not hold (it keeps no
 //! history) resets the client to a fresh sync.
+//!
+//! The application's mutation ids arrive as writes to its clients table,
+//! which the engine side copies here as one batch per transaction; the
+//! batch is taken when that transaction reports its progress, so a
+//! mutation's rows and its id go out in the same poke and no later
+//! transaction's id rides out early.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pgwire_replication::ReplicationEvent;
 use serde_json::{Map, Value as Json, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::spawn_local;
 
 use super::ast::{self, Ast, Translated};
 use super::config::Config;
-use super::log::{gw_debug, gw_error, gw_info, gw_warn};
 use super::protocol::{self, ClientSchema};
 use super::wire;
-use crate::ivm::{ClientUpdate, Engine, Fetch, FetchId, MultiTableIVM, QueryPart};
+use crate::ivm::{ClientUpdate, QueryPart};
+use crate::log::{log_debug, log_info, log_warn};
 use crate::model::{
-    Catalog, ClientId, DataFrameKey, DataFrameOperation, DataFrameRow, Snapshot, SubId, TableName,
-    Value, WriteQuery,
+    Catalog, ClientId, DataFrameKey, DataFrameOperation, DataFrameRow, Lsn, MultiTableReadQuery,
+    SubId, TableName, Value, WriteQuery,
 };
-use crate::sync::pg::{Feed, PgStorage};
-use crate::sync::{Runtime, Sources, Storage, StorageError};
+use crate::sync::{Command, Event};
 
-/// One frame for one connection.
+/// One frame for one connection: a text frame, a WebSocket ping (the
+/// liveness probe a browser answers on its own), or the close.
 #[derive(Debug, Clone)]
 pub enum Outbound {
     Text(Arc<str>),
+    Ping,
     Close,
 }
 
@@ -59,7 +65,7 @@ pub struct Socket {
     pub sink: mpsc::UnboundedSender<Outbound>,
 }
 
-/// One change to a client's desired queries, ready for the engine: a
+/// One change to a client's desired queries, ready for this thread: a
 /// custom query already transformed into its AST, or the reason it could
 /// not be.
 #[derive(Debug)]
@@ -76,7 +82,7 @@ pub enum DesiredOp {
     Clear,
 }
 
-/// What a connection asks of the engine thread.
+/// What a connection asks of this thread.
 #[derive(Debug)]
 pub enum Request {
     Connect {
@@ -133,11 +139,11 @@ fn lifetime_of(ttl: Option<f64>) -> Duration {
     }
 }
 
-/// The engine thread's answer to a connection.
+/// This thread's answer to a connection.
 #[derive(Debug)]
 pub enum ConnectReply {
     Accepted,
-    /// The client's cookie is not one the gateway holds; the client must
+    /// The client's cookie is not one this server holds; the client must
     /// start over.
     Reset {
         reason: String,
@@ -151,8 +157,18 @@ enum RowOp {
 }
 
 /// One desired query of a group.
+///
+/// - `sub`: the subscription, once the engine side has answered.
+/// - `awaiting`: the generation of the registration in flight, zero when
+///   none is.
+/// - `hidden`: the parts of its tree whose rows are not shipped.
+/// - `got`: whether the client has been told the query is complete.
+/// - `ttl`: how long it outlives the last client desiring it.
+/// - `inactive`: the generation of the release in flight, zero while a
+///   client still desires it.
 struct QueryState {
     sub: Option<SubId>,
+    awaiting: u64,
     hidden: HashSet<QueryPart>,
     got: bool,
     ttl: Duration,
@@ -160,6 +176,10 @@ struct QueryState {
 }
 
 /// One client group's view.
+///
+/// `generation` stamps the group's last connect or disconnect from the
+/// one monotonic counter, so an expiry timer scheduled for an earlier
+/// incarnation of the same group id can never match this one.
 struct Group {
     client: ClientId,
     version: u64,
@@ -168,6 +188,8 @@ struct Group {
     desired: HashMap<String, HashSet<String>>,
     queries: HashMap<String, QueryState>,
     subs: HashSet<SubId>,
+    /// The hidden parts of each subscription, for the per-row check.
+    hidden: HashMap<SubId, HashSet<QueryPart>>,
     rows: HashMap<(TableName, DataFrameKey), HashSet<(SubId, QueryPart)>>,
     lmids: HashMap<String, i64>,
     columns: Option<HashMap<String, HashSet<String>>>,
@@ -188,6 +210,7 @@ impl Group {
             desired: HashMap::new(),
             queries: HashMap::new(),
             subs: HashSet::new(),
+            hidden: HashMap::new(),
             rows: HashMap::new(),
             lmids: HashMap::new(),
             columns: None,
@@ -228,71 +251,66 @@ impl Group {
     }
 }
 
-/// The engine thread's state.
-pub struct Core {
+/// The client-group thread's state.
+pub struct Groups {
     config: Arc<Config>,
     catalog: Rc<Catalog>,
-    runtime: Runtime<MultiTableIVM>,
-    storage: Rc<Sources>,
-    feed: Feed,
+    /// Commands to the engine side, in the order they were made.
+    commands: mpsc::UnboundedSender<Command<MultiTableReadQuery>>,
+    requests: mpsc::Sender<Request>,
     ready: bool,
     backlog: Vec<Request>,
     groups: HashMap<String, Group>,
     by_client: HashMap<ClientId, String>,
+    by_sub: HashMap<SubId, (String, String)>,
+    /// Registrations in flight, by the token they were sent with.
+    awaiting: HashMap<u64, (String, String)>,
     next_client: u64,
     pending: HashMap<ClientId, Vec<ClientUpdate>>,
     lmid_changes: HashMap<String, HashMap<String, i64>>,
+    /// Groups with something to hear at the next flush.
+    dirty: HashSet<String>,
     clients_table: TableName,
-    requests: mpsc::Sender<Request>,
-    report: mpsc::UnboundedSender<(FetchId, Result<Snapshot, StorageError>)>,
     next_poke: u64,
     next_generation: u64,
 }
 
-/// Run the engine thread until every request sender and the feed are
-/// gone. Must run inside a `LocalSet`.
+/// Run the client-group thread until every request sender is gone. Must
+/// run inside a `LocalSet`.
 pub async fn run(
     config: Arc<Config>,
-    catalog: Catalog,
+    catalog: Rc<Catalog>,
+    engine: crate::sync::pg::Started,
     mut requests_rx: mpsc::Receiver<Request>,
     requests: mpsc::Sender<Request>,
-    mut events: mpsc::Receiver<ReplicationEvent>,
-) -> Result<(), String> {
-    let catalog = Rc::new(catalog);
-    let pg = PgStorage::connect(&config.dsn, catalog.clone())
-        .await
-        .map_err(|error| format!("connecting the storage: {error}"))?
-        .with_rotation(config.snapshot_rotation);
-    let cached = Sources::cached_from_env();
-    let storage = Rc::new(Sources::new(Rc::new(pg), catalog.clone(), cached.clone()));
-    if !cached.is_empty() {
-        let rows = storage
-            .warm()
-            .await
-            .map_err(|error| format!("warming the memory tables: {error}"))?;
-        gw_info!("memory tables warmed with {rows} rows");
-    }
-    let (report, mut results) = mpsc::unbounded_channel();
-    let mut core = Core {
+) {
+    let crate::sync::pg::Started {
+        commands,
+        mut events,
+        mut watched,
+    } = engine;
+    let (outbox, outbox_rx) = mpsc::unbounded_channel();
+    spawn_local(forward(outbox_rx, commands));
+    let mut core = Groups {
         clients_table: TableName::from(config.clients_table().as_str()),
         config,
-        feed: Feed::new(catalog.clone()),
         catalog,
-        runtime: Runtime::new(MultiTableIVM::new()),
-        storage,
+        commands: outbox,
+        requests,
         ready: false,
         backlog: Vec::new(),
         groups: HashMap::new(),
         by_client: HashMap::new(),
+        by_sub: HashMap::new(),
+        awaiting: HashMap::new(),
         next_client: 1,
         pending: HashMap::new(),
         lmid_changes: HashMap::new(),
-        requests,
-        report,
+        dirty: HashSet::new(),
         next_poke: 1,
         next_generation: 0,
     };
-    gw_info!("engine thread up; waiting for the first heartbeat before serving queries");
+    log_info!("client groups up; waiting for the first heartbeat before serving queries");
     loop {
         tokio::select! {
             request = requests_rx.recv() => match request {
@@ -300,19 +318,27 @@ pub async fn run(
                 None => break,
             },
             event = events.recv() => match event {
-                Some(event) => core.event(event),
-                None => return Err("the change feed ended".to_owned()),
-            },
-            result = results.recv() => match result {
-                Some((id, result)) => core.landed(id, result),
+                Some(event) => core.event(event, &mut watched),
                 None => break,
             },
         }
     }
-    Ok(())
 }
 
-impl Core {
+/// Hand the engine side one command at a time, in order, so a full
+/// command channel never blocks the group thread's loop.
+async fn forward(
+    mut outbox: mpsc::UnboundedReceiver<Command<MultiTableReadQuery>>,
+    commands: mpsc::Sender<Command<MultiTableReadQuery>>,
+) {
+    while let Some(command) = outbox.recv().await {
+        if commands.send(command).await.is_err() {
+            return;
+        }
+    }
+}
+
+impl Groups {
     /// Apply one request.
     fn handle(&mut self, request: Request) {
         match request {
@@ -366,6 +392,79 @@ impl Core {
         }
     }
 
+    /// One event from the engine side.
+    fn event(&mut self, event: Event, watched: &mut mpsc::UnboundedReceiver<Vec<WriteQuery>>) {
+        match event {
+            Event::Registered { token, sub } => self.registered(token, sub),
+            Event::Updates(updates) => {
+                for update in updates {
+                    if let Some(group) = self.by_client.get(&update.client) {
+                        self.dirty.insert(group.clone());
+                    }
+                    self.pending.entry(update.client).or_default().push(update);
+                }
+            }
+            // A query completes either because a read landed (an
+            // `Event::Landed` follows) or because an existing tree already
+            // held its rows, in which case nothing else would poke the
+            // group until the next write or heartbeat: flush here.
+            Event::Hydrated(subs) => {
+                for sub in subs {
+                    let Some((group_id, hash)) = self.by_sub.get(&sub).cloned() else {
+                        continue;
+                    };
+                    let Some(group) = self.groups.get_mut(&group_id) else {
+                        continue;
+                    };
+                    if let Some(state) = group.queries.get_mut(&hash)
+                        && !state.got
+                    {
+                        state.got = true;
+                        group.queued_got.push(json!({"op": "put", "hash": hash}));
+                        self.dirty.insert(group_id);
+                    }
+                }
+                self.flush();
+            }
+            Event::Landed => self.flush(),
+            Event::Moved { position, floor } => {
+                if let Ok(batch) = watched.try_recv() {
+                    for write in batch {
+                        if write.table() == &self.clients_table {
+                            self.note_lmid(&write);
+                        }
+                    }
+                }
+                self.flush();
+                self.serve_when_covered(position, floor);
+            }
+        }
+    }
+
+    /// Start serving once the engine's position covers the storage's
+    /// snapshots; the requests that arrived meanwhile run then.
+    fn serve_when_covered(&mut self, position: Lsn, floor: Lsn) {
+        if self.ready || floor.0 == 0 || position < floor {
+            return;
+        }
+        self.ready = true;
+        log_info!("serving: engine at {position}, storage snapshot at {floor}");
+        let backlog = std::mem::take(&mut self.backlog);
+        for request in backlog {
+            self.handle(request);
+        }
+    }
+
+    /// Send one command to the engine side.
+    fn command(&self, command: Command<MultiTableReadQuery>) {
+        let _ = self.commands.send(command);
+    }
+
+    /// Mark a group as having something to hear at the next flush.
+    fn mark(&mut self, group_id: &str) {
+        self.dirty.insert(group_id.to_owned());
+    }
+
     /// Attach a connection to its group, creating or resetting the group
     /// as its cookie requires.
     fn connect(
@@ -407,11 +506,13 @@ impl Core {
             self.next_client += 1;
             self.groups.insert(group_id.to_owned(), Group::new(client));
             self.by_client.insert(client, group_id.to_owned());
-            gw_info!(
+            log_info!(
                 "client group {group_id} opened as engine client {}",
                 client.0
             );
         }
+        self.next_generation += 1;
+        let generation = self.next_generation;
         let group = self.groups.get_mut(group_id).expect("just ensured");
         if let Some(schema) = &schema {
             group.adopt_schema(schema);
@@ -425,12 +526,13 @@ impl Core {
         for (client, lmid) in &group.lmids {
             group.queued_lmids.insert(client.clone(), *lmid);
         }
-        group.generation += 1;
-        gw_info!(
+        group.generation = generation;
+        log_info!(
             "connection {wsid} joined client group {group_id} as client {}",
             socket.client
         );
         group.sockets.insert(wsid, socket);
+        self.mark(group_id);
         ConnectReply::Accepted
     }
 
@@ -441,10 +543,12 @@ impl Core {
             return;
         };
         group.sockets.remove(wsid);
-        gw_info!("connection {wsid} left client group {group_id}");
+        log_info!("connection {wsid} left client group {group_id}");
         if group.sockets.is_empty() {
-            group.generation += 1;
-            let generation = group.generation;
+            self.next_generation += 1;
+            let generation = self.next_generation;
+            let group = self.groups.get_mut(group_id).expect("just had it");
+            group.generation = generation;
             let requests = self.requests.clone();
             let ttl = self.config.group_ttl;
             let group_id = group_id.to_owned();
@@ -467,7 +571,7 @@ impl Core {
             .get(group_id)
             .is_some_and(|group| group.sockets.is_empty() && group.generation == generation);
         if expired {
-            gw_info!("client group {group_id} expired; its subscriptions are released");
+            log_info!("client group {group_id} expired; its subscriptions are released");
             self.drop_group(group_id);
         }
     }
@@ -475,10 +579,12 @@ impl Core {
     /// Forget a group and every subscription it had.
     fn drop_group(&mut self, group_id: &str) {
         if let Some(group) = self.groups.remove(group_id) {
-            self.runtime.unregister_client(group.client);
+            self.command(Command::UnregisterClient(group.client));
             self.by_client.remove(&group.client);
+            self.by_sub.retain(|_, (owner, _)| owner != group_id);
             self.pending.remove(&group.client);
             self.lmid_changes.remove(group_id);
+            self.dirty.remove(group_id);
         }
     }
 
@@ -491,7 +597,7 @@ impl Core {
         ops: Vec<DesiredOp>,
     ) {
         if !self.groups.contains_key(group_id) {
-            gw_warn!("desired queries for an unknown client group {group_id}");
+            log_warn!("desired queries for an unknown client group {group_id}");
             return;
         }
         if let Some(schema) = &schema {
@@ -526,6 +632,7 @@ impl Core {
         ast: Option<Json>,
     ) {
         let lifetime = lifetime_of(ttl);
+        self.mark(group_id);
         let group = self.groups.get_mut(group_id).expect("checked");
         group
             .desired
@@ -555,6 +662,7 @@ impl Core {
                 hash,
                 QueryState {
                     sub: None,
+                    awaiting: 0,
                     hidden: HashSet::new(),
                     got: false,
                     ttl: lifetime,
@@ -568,32 +676,36 @@ impl Core {
             .and_then(|ast| ast::translate(&ast, &self.catalog));
         match translated {
             Ok(translated) => {
+                self.next_generation += 1;
+                let generation = self.next_generation;
                 let engine_client = group.client;
-                let (sub, step) = self.runtime.register(engine_client, translated.query);
-                let group = self.groups.get_mut(group_id).expect("checked");
-                group.subs.insert(sub);
                 group.queries.insert(
                     hash.clone(),
                     QueryState {
-                        sub: Some(sub),
+                        sub: None,
+                        awaiting: generation,
                         hidden: translated.hidden,
                         got: false,
                         ttl: lifetime,
                         inactive: 0,
                     },
                 );
-                gw_debug!(
-                    "group {group_id}: query {name} ({hash}) registered as {}",
-                    sub.0
-                );
-                self.absorb_step(step, false);
+                self.awaiting
+                    .insert(generation, (group_id.to_owned(), hash.clone()));
+                self.command(Command::Register {
+                    client: engine_client,
+                    query: translated.query,
+                    token: generation,
+                });
+                log_debug!("group {group_id}: query {name} ({hash}) registering");
             }
             Err(message) => {
-                gw_warn!("group {group_id}: query {name} ({hash}) cannot run here: {message}");
+                log_warn!("group {group_id}: query {name} ({hash}) cannot run here: {message}");
                 group.queries.insert(
                     hash.clone(),
                     QueryState {
                         sub: None,
+                        awaiting: 0,
                         hidden: HashSet::new(),
                         got: false,
                         ttl: lifetime,
@@ -608,9 +720,39 @@ impl Core {
         }
     }
 
+    /// The engine side registered a query: adopt the subscription, unless
+    /// the query was released while the registration was in flight, in
+    /// which case it is let go at once.
+    fn registered(&mut self, token: u64, sub: SubId) {
+        let Some((group_id, hash)) = self.awaiting.remove(&token) else {
+            self.command(Command::Unregister(sub));
+            return;
+        };
+        let adopted = self
+            .groups
+            .get_mut(&group_id)
+            .and_then(|group| {
+                let state = group.queries.get_mut(&hash)?;
+                (state.awaiting == token).then(|| {
+                    state.awaiting = 0;
+                    state.sub = Some(sub);
+                    group.subs.insert(sub);
+                    group.hidden.insert(sub, state.hidden.clone());
+                })
+            })
+            .is_some();
+        if adopted {
+            log_debug!("group {group_id}: query {hash} registered as {}", sub.0);
+            self.by_sub.insert(sub, (group_id, hash));
+        } else {
+            self.command(Command::Unregister(sub));
+        }
+    }
+
     /// One client no longer desires `hash`; unregister it when nobody in
     /// the group does.
     fn del(&mut self, group_id: &str, client: &str, hash: &str) {
+        self.mark(group_id);
         let group = self.groups.get_mut(group_id).expect("checked");
         if let Some(desired) = group.desired.get_mut(client) {
             desired.remove(hash);
@@ -680,6 +822,7 @@ impl Core {
             .remove(client)
             .map(|desired| desired.into_iter().collect())
             .unwrap_or_default();
+        self.mark(group_id);
         for hash in hashes {
             let group = self.groups.get_mut(group_id).expect("checked");
             group
@@ -700,6 +843,7 @@ impl Core {
     /// Remove a query from its group: its subscription goes, the rows only
     /// it held are `del`ed, and its `got` is withdrawn.
     fn unsubscribe(&mut self, group_id: &str, hash: &str) {
+        self.mark(group_id);
         let group = self.groups.get_mut(group_id).expect("checked");
         let Some(state) = group.queries.remove(hash) else {
             return;
@@ -711,6 +855,7 @@ impl Core {
             return;
         };
         group.subs.remove(&sub);
+        group.hidden.remove(&sub);
         let mut emptied = Vec::new();
         for (key, holders) in group.rows.iter_mut() {
             holders.retain(|(holder, _)| *holder != sub);
@@ -722,66 +867,9 @@ impl Core {
             group.rows.remove(&(table.clone(), key.clone()));
             group.queued_rows.push(RowOp::Del(table, key));
         }
-        self.runtime.unregister(sub);
-        gw_debug!("group {group_id}: query {hash} unregistered ({})", sub.0);
-    }
-
-    /// One raw replication event: a commit's writes route through the
-    /// engine and the commit's position closes the step with a flush.
-    fn event(&mut self, event: ReplicationEvent) {
-        match self.feed.absorb(event) {
-            Ok(Some(transaction)) => {
-                let at = transaction.at;
-                for write in transaction.writes {
-                    self.write(write, at);
-                }
-                self.progress();
-            }
-            Ok(None) => {}
-            Err(error) => {
-                gw_error!("change feed decoding failed: {error}");
-                std::process::exit(1);
-            }
-        }
-    }
-
-    /// One write of a transaction: recorded for the mutation-id table,
-    /// mirrored into storage, routed.
-    fn write(&mut self, write: WriteQuery, at: crate::model::Lsn) {
-        if write.table() == &self.clients_table {
-            self.note_lmid(&write);
-        }
-        self.storage.absorb(&write, at);
-        let step = self.runtime.write(&write, at);
-        self.moved();
-        self.absorb_step(step, false);
-    }
-
-    /// The feed's position moved: tell the runtime, flush the transaction,
-    /// and start serving once the storage's snapshots are covered.
-    fn progress(&mut self) {
-        let step = self.runtime.progress(self.feed.progress());
-        self.moved();
-        self.absorb_step(step, true);
-        let floor = self.storage.floor();
-        if !self.ready && floor.0 > 0 && self.runtime.position() >= floor {
-            self.ready = true;
-            gw_info!(
-                "serving: engine at {}, storage snapshot at {}",
-                self.runtime.position(),
-                self.storage.floor()
-            );
-            let backlog = std::mem::take(&mut self.backlog);
-            for request in backlog {
-                self.handle(request);
-            }
-        }
-    }
-
-    /// The stream moved: tell the storage, and learn its floor.
-    fn moved(&mut self) {
-        self.storage.advance(self.runtime.position());
-        self.runtime.set_floor(self.storage.floor());
+        self.by_sub.remove(&sub);
+        self.command(Command::Unregister(sub));
+        log_debug!("group {group_id}: query {hash} unregistered ({})", sub.0);
     }
 
     /// A write to the mutation-id table: remember the change for the
@@ -802,70 +890,16 @@ impl Core {
             Some(Value::Float(lmid)) => *lmid as i64,
             _ => return,
         };
+        self.dirty.insert(group.clone());
         self.lmid_changes
             .entry(group)
             .or_default()
             .insert(client, lmid);
     }
 
-    /// A storage read returned.
-    fn landed(&mut self, id: FetchId, result: Result<Snapshot, StorageError>) {
-        let step = match result {
-            Ok(snapshot) => self.runtime.fetched(id, snapshot),
-            Err(error) => {
-                gw_warn!("storage read {} failed, parked: {error}", id.0);
-                self.runtime.failed(id)
-            }
-        };
-        self.absorb_step(step, true);
-    }
-
-    /// Take a step's reads and updates; flush the pokes when asked.
-    fn absorb_step(&mut self, step: crate::sync::Step, flush: bool) {
-        for fetch in step.selects {
-            self.spawn_read(fetch);
-        }
-        for update in step.updates {
-            self.pending.entry(update.client).or_default().push(update);
-        }
-        if flush {
-            self.flush();
-        }
-    }
-
-    /// Run one read as its own task, reporting the result into the loop.
-    fn spawn_read(&self, fetch: Fetch) {
-        let storage = self.storage.clone();
-        let report = self.report.clone();
-        spawn_local(async move {
-            let result = storage.select(&fetch.query).await;
-            let _ = report.send((fetch.id, result));
-        });
-    }
-
     /// Turn everything accumulated into one poke per group that has
     /// anything to hear.
     fn flush(&mut self) {
-        let mut touched: HashSet<String> = HashSet::new();
-        for client in self.pending.keys() {
-            if let Some(group) = self.by_client.get(client) {
-                touched.insert(group.clone());
-            }
-        }
-        touched.extend(self.lmid_changes.keys().cloned());
-        for (id, group) in &self.groups {
-            let waiting = !group.queued_desired.is_empty()
-                || !group.queued_got.is_empty()
-                || !group.queued_lmids.is_empty()
-                || !group.queued_rows.is_empty()
-                || group
-                    .queries
-                    .values()
-                    .any(|query| !query.got && query.sub.is_some());
-            if waiting {
-                touched.insert(id.clone());
-            }
-        }
         let stray: Vec<ClientId> = self
             .pending
             .keys()
@@ -875,7 +909,7 @@ impl Core {
         for client in stray {
             self.pending.remove(&client);
         }
-        let mut touched: Vec<String> = touched.into_iter().collect();
+        let mut touched: Vec<String> = self.dirty.drain().collect();
         touched.sort();
         for group_id in touched {
             self.poke(&group_id);
@@ -901,9 +935,10 @@ impl Core {
                 .into_iter()
                 .filter(|target| group.subs.contains(&target.sub))
                 .filter(|target| {
-                    !group.queries.values().any(|query| {
-                        query.sub == Some(target.sub) && query.hidden.contains(&target.part)
-                    })
+                    !group
+                        .hidden
+                        .get(&target.sub)
+                        .is_some_and(|hidden| hidden.contains(&target.part))
                 })
                 .map(|target| (target.sub, target.part))
                 .collect();
@@ -929,17 +964,7 @@ impl Core {
                 }
             }
         }
-        let mut got = std::mem::take(&mut group.queued_got);
-        for (hash, query) in group.queries.iter_mut() {
-            if !query.got
-                && query
-                    .sub
-                    .is_some_and(|sub| self.runtime.engine().hydrated(sub))
-            {
-                query.got = true;
-                got.push(json!({"op": "put", "hash": hash}));
-            }
-        }
+        let got = std::mem::take(&mut group.queued_got);
         let desired = std::mem::take(&mut group.queued_desired);
         let mut lmids = std::mem::take(&mut group.queued_lmids);
         for (client, lmid) in lmid_changes {
@@ -1006,7 +1031,7 @@ impl Core {
             frames.push(protocol::poke_part(&poke_id, body).into());
         }
         frames.push(protocol::poke_end(&poke_id, &cookie).into());
-        gw_debug!(
+        log_debug!(
             "group {group_id}: poke {poke_id} {} -> {cookie}: {puts} puts, {dels} dels, {got_count} got, {} lmids",
             base.as_deref().unwrap_or("null"),
             lmids.len()

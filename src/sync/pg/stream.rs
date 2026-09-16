@@ -521,8 +521,8 @@ impl PgStream {
     }
 
     /// Run on one thread until `commands` has no receiver or the
-    /// connection ends: each transaction's writes go out as
-    /// [`Command::Write`]s followed by a [`Command::Progress`], and a
+    /// connection ends: each transaction goes out as
+    /// [`Command::Commit`] followed by a [`Command::Progress`], and a
     /// heartbeat every `interval` keeps the position moving while nothing
     /// is written.
     pub async fn run<Q>(mut self, interval: Duration, commands: mpsc::Sender<Command<Q>>) {
@@ -558,11 +558,15 @@ impl PgStream {
                     return;
                 }
             };
-            let at = transaction.at;
-            for write in transaction.writes {
-                if commands.send(Command::Write { write, at }).await.is_err() {
-                    return;
-                }
+            if commands
+                .send(Command::Commit {
+                    writes: transaction.writes,
+                    at: transaction.at,
+                })
+                .await
+                .is_err()
+            {
+                return;
             }
             if commands
                 .send(Command::Progress(self.feed.progress()))

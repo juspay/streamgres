@@ -16,9 +16,10 @@
 //! |--------|------------------|
 //! | [`model`] | The data model: values, schema, queries, and the row/operation wire vocabulary. What everything else speaks. |
 //! | [`ivm`] | The engine: query registration, write routing (`search_impacted_queries`), delta computation (`incremental_update`), operation counters — plus the multi-table join layer ([`ivm::MultiTableIVM`]) and the read requests ([`ivm::Fetch`]) it records instead of reading storage itself. |
-//! | [`sync`] | Running an engine against a source: positions, the asynchronous [`sync::Storage`] seam, the single-owner [`sync::Runtime`] that lands reads against the write stream, the two drivers, and PostgreSQL ([`sync::pg`]). |
+//! | [`sync`] | Running an engine against a source: positions, the asynchronous [`sync::Storage`] seam, the single-owner [`sync::Runtime`] that lands reads against the write stream, the two drivers ([`sync::Service`] answers on an [`sync::Event`] stream), and PostgreSQL ([`sync::pg`], whose [`sync::pg::threads`] wires feed, storage and driver into one engine side). |
 //! | [`parser`] | SQL text → query model: schema-aware parsing against a [`parser::Catalog`]. |
-//! | [`ws`] | The axum server: routes, WebSocket upgrade, one connection loop (engine wiring pending). |
+//! | [`client`] | The client side: the WebSocket server a Zero client connects to, the sync protocol, the AST translation, and each client group's view. It drives the engine only through [`sync::Service`]'s two channels. |
+//! | [`log`] | The leveled log the binary and the client side write to. |
 //!
 //! The demo binary (`src/main.rs`) runs a scripted scenario — SQL text in,
 //! routed operations out — and prints, per write, which subscriptions were
@@ -39,13 +40,17 @@
 //!    ([`sync::Runtime`]); PostgreSQL storage positioned by WAL location
 //!    or transaction id and a `test_decoding` change-feed poller
 //!    ([`sync::pg`]), with live tests and a bench scenario
-//! 6. WebSocket subscription protocol (subscribe / unsubscribe / push ops)
-//! 7. `INNER` edges, parser `JOIN` syntax
-//! 8. Streaming `pgoutput` consumer, batching of one write's narrowed reads,
-//!    table sharding
+//! 6. ✅ `INNER` edges, the streaming `pgoutput` consumer, and Zero's sync
+//!    protocol over WebSockets ([`client`]) against an unmodified Zero
+//!    client, with the engine reached only through [`sync::Service`]
+//! 7. History across reconnects, so a client that missed changes resumes
+//!    instead of starting a fresh sync
+//! 8. Batching of one write's narrowed reads, parser `JOIN` syntax,
+//!    table sharding across threads
 
-pub mod gateway;
+pub mod client;
 pub mod ivm;
+pub mod log;
 pub mod model;
 pub mod parser;
 pub mod sync;

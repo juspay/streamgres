@@ -62,7 +62,7 @@ every later delta continues from.
 | **PostgreSQL**: reads from the exported snapshot of a rotating temporary replication slot, flipped forward only once the feed has passed it; a streaming `pgoutput` change feed over a replication connection with heartbeat progress marks; live tests and a bench scenario against a real server | ✅ done | `src/sync/pg/` |
 | Routing counters + benchmark harness | ✅ done | `src/ivm/stats.rs`, `src/bin/bench.rs` |
 | **xyne-spaces coverage**: the dashboard's 283 synced queries (and the ACL predicates added to them) rebuilt as tests on a catalog generated from the application's schema; `IS NULL`, `EXISTS` inside `OR` and `whereExists` closed, four expressiveness gaps left and pinned | ✅ tests, ⏳ gaps | `tests/xyne_spaces_queries/` |
-| **Sync gateway** speaking Zero's sync protocol (v51, the `@rocicorp/zero` 1.9 client): connect handshake, ping/pong and liveness, desired queries through the app server's query endpoint, pokes per client group, mutations through its mutate endpoint, `lastMutationID` off the app's clients table | ✅ done (no history across restarts) | `src/gateway/` |
+| **Client side** speaking Zero's sync protocol (v51, the `@rocicorp/zero` 1.9 client): connect handshake, ping/pong and liveness, desired queries through the app server's query endpoint, pokes per client group, mutations through its mutate endpoint, `lastMutationID` off the app's clients table; it owns no engine and no database connection, reaching both only through [`sync::Service`]'s channels; verified from the xyne-spaces UI with three users (roles, resource access, channels, threads, reactions, tickets) and load-tested at 200 subscribers up to 75 mutations/s | ✅ done (no history across restarts) | `src/client/`, `src/sync/pg/threads.rs`, [docs/live-verification-2026-09-15.md](docs/live-verification-2026-09-15.md) |
 | Batching of one write's narrowed reads | ⏳ pending | paper §13 |
 | Parser `JOIN` syntax | ⏳ pending | multi-table queries are built programmatically |
 | Table-sharded multithreading | ⏳ pending | paper §10.3; engine is single-threaded by design |
@@ -337,10 +337,19 @@ floor.
   memory; they need `XYNE_SYNC_PG_DSN` pointing at such a database and
   otherwise report themselves skipped.
 
-### 6. The sync gateway (`src/gateway/`)
+### 6. The client side (`src/client/`)
 
 The server a Zero client connects to in place of the reference server. The xyne-spaces
 dashboard (`@rocicorp/zero` 1.9, sync protocol 51) connects to it unchanged.
+
+Everything in `src/client/` is about clients: their protocol, their ASTs,
+their application server, their groups' views. It owns no engine, no storage
+and no database connection. It drives the engine through the two channels of
+[`sync::Service`] — commands in (register, unregister), events out (deltas,
+the subscription a registration became, hydration, landings, stream
+progress) — which `sync/pg/threads.rs` wires to PostgreSQL. That seam is why
+the two halves can sit on one thread today (every value the engine holds is
+thread-bound) and on two tomorrow without either side changing.
 
 - **Threads.** A *feed thread* holds the replication connection, forwards raw
   `pgoutput` events and emits a heartbeat at an interval so the engine's
@@ -355,7 +364,7 @@ dashboard (`@rocicorp/zero` 1.9, sync protocol 51) connects to it unchanged.
   server for query ASTs and mutations.
 - **A connection.** `GET <base>/sync/v51/connect?clientID&clientGroupID&…`
   with the first message base64-encoded in `Sec-WebSocket-Protocol` (echoed
-  back, as the browser requires) or sent as the first frame. The gateway
+  back, as the browser requires) or sent as the first frame. The server
   answers `connected`, then pokes. A `pong` answers every `ping`; when
   nothing has gone downstream for `XYNE_SYNC_PONG_INTERVAL_MS` a `pong` goes
   out anyway (so a client waiting behind a slow request still sees the server
@@ -363,10 +372,10 @@ dashboard (`@rocicorp/zero` 1.9, sync protocol 51) connects to it unchanged.
   and a connection that has sent nothing back for `XYNE_SYNC_CLIENT_TIMEOUT_MS`
   is closed and leaves its client group. A group's subscriptions outlive its
   last connection by `XYNE_SYNC_GROUP_TTL_MS`, then are released.
-- **Queries.** A desired query arrives as a name and arguments; the gateway
+- **Queries.** A desired query arrives as a name and arguments; the client side
   posts them to the application server's query endpoint (with the
   connection's cookies and origin, the way the reference server does) and gets query
-  ASTs back, which `gateway/ast.rs` translates into the engine's trees:
+  ASTs back, which `client/ast.rs` translates into the engine's trees:
   `related` edges become LEFT joins, `EXISTS` subqueries INNER joins with an
   `EXISTS` leaf in their place, a keyset `start` the `WHERE` it means, the
   root's `limit` the window; the primary key is appended to the order when
@@ -374,14 +383,14 @@ dashboard (`@rocicorp/zero` 1.9, sync protocol 51) connects to it unchanged.
   keys) comes back to the client as a `transformError` for that query alone.
   Subqueries the client marks as permission checks register but their rows are not
   shipped, as the reference server withholds them.
-- **Pokes.** Per client group the gateway keeps, for every row shipped, the
+- **Pokes.** Per client group `client/groups.rs` keeps, for every row shipped, the
   subscription parts holding it, so a row is `del`ed only when its last
   holder lets go and a row several queries share ships once. A poke goes out
   per committed transaction (a mutation's rows and its `lastMutationID`,
   read off the application's `xyne_0.clients` table, travel together), per
   landed read, and per query change; `gotQueriesPatch` follows a query once
   every part of its tree is live. Versions are the client's lexicographic cookies.
-  The gateway keeps no history: a client reconnecting with the group's
+  The server keeps no history: a client reconnecting with the group's
   current cookie continues; with any other (a restart, changes it missed) it
   is told to start a fresh sync (`InvalidConnectionRequestBaseCookie`), which
   the client does on its own.
@@ -405,11 +414,19 @@ dashboard (`@rocicorp/zero` 1.9, sync protocol 51) connects to it unchanged.
   its next page, finds the rows in place; only when the lifetime runs out
   are its rows withdrawn and its `got` revoked. Without this the dashboard
   re-requests some queries several times a second and rows flicker.
+- **Reads.** At most `XYNE_SYNC_READ_CONNECTIONS` (16) storage reads hold a
+  Postgres connection at once; the rest queue in the server instead of at
+  the server's `max_connections`. A burst of two hundred connections opening
+  at once used to exhaust a default Postgres and park the reads it refused.
 
 Configuration is by `XYNE_SYNC_*` variables (see [.env.example](.env.example);
 the names a reference-server deployment sets are accepted for the database
-and endpoint URLs). Not yet: history across reconnects (every reconnect after
-a missed change is a fresh sync), the inspector protocol.
+and endpoint URLs). `XYNE_SYNC_LOG=debug` writes a line per poke per client
+group from the engine thread and costs throughput; keep it for bring-up. Not
+yet: history across reconnects (every reconnect after a missed change is a
+fresh sync, and a Zero client that is told so drops its local database, unsent
+mutations included, so a restart while people are typing loses their
+unsent messages), the inspector protocol.
 
 ---
 
@@ -420,18 +437,22 @@ cargo run --bin xyne_sync      # scripted demo: SQL in, routed operations + cost
 cargo test                    # model, parser, routing, window, join and read/write interleaving scenarios
 cargo test --test xyne_spaces_queries   # the xyne-spaces dashboard's 283 queries on the engine (gap table in its main.rs)
 cargo run --release --bin bench   # routing / registration / window / join benchmarks, and the xyne-spaces query shapes
-cargo run --release --bin server  # the sync gateway on :4848 (reads .env; see .env.example)
+cargo run --release --bin server  # the sync server on :4848 (reads .env; see .env.example)
 
 # against a real Postgres (wal_level = logical, replication slots to spare, a role that may create a publication):
 export XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5499/xyne_sync
 cargo test --test pg_live     # snapshot held open while writes commit behind it; async service end to end
 cargo run --release --bin bench   # adds scenario 5: registration, streamed writes, registration under load
 
-# the gateway in front of a local xyne-spaces (backend on :3001 with ENABLE_DEV_AUTH=true, dashboard on :5173,
+# the server in front of a local xyne-spaces (backend on :3001 with ENABLE_DEV_AUTH=true, dashboard on :5173,
 # Postgres with wal_level = logical and the app's xyne_0.clients / xyne_0.mutations tables):
 cp .env.example .env              # set XYNE_SYNC_PG_DSN and the two endpoint URLs
 cargo run --release --bin server
 node scripts/e2e-protocol.mjs   # two dev users, real mutations, fan-out, reconnects; PASS when the chain holds
+node scripts/ui/ui-u2-channel.mjs    # one of the Playwright scripts that drive the dashboard with three users (scripts/ui/)
+node scripts/load-protocol.mjs --connections 200 --seed 3000 --seed-replies 2000 --rate 50 --duration 60 \
+  --pid $(pgrep -f target/release/server)   # socket-level load: seed, hydrate, steady fan-out, CPU/RSS samples
+LINUX_BIN=/path/to/linux/server CPUS="2 4 8" scripts/load-matrix.sh   # the same against the server pinned to N CPUs (docker --cpus)
 ```
 
 The demo registers six subscriptions on a `tickets` table and plays an
@@ -480,6 +501,7 @@ themselves and the relative results hold):
 | `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | identical subscriptions share one tree, so a ticket insert costs 117 µs for all 1 000 with 1.8 set edits per write instead of 52.5; the remaining cost is delivery, one operation per subscriber |
 | xyne-spaces shapes (1 000 users, 500 channels, 50 000 conversations, 100 000 messages, 10 000 tickets on 20 boards; 7 000 subscriptions in 6 020 trees) | `browsableChannels` (`EXISTS` inside `OR`, participants attached) registers in 14.8 ms and ships the 2 250 rows it asks for (about 108 channels and their participants per user); `conversationMessages` under the channel-access chain (three `INNER` edges, the last inside an `OR`) registers in 1.2 ms with three reads; the board view (`IS NULL` twice, two `LEFT` edges, a page of 50 by `createdAt DESC, id ASC`) is a 0.5 ms twin copy of 150 rows. A message insert routes in 13.6 µs over 7 000 subscriptions (73 000 writes/s); a membership change costs 1.9 ms, moving 10.7 set members, fetching 5.3 uncovered channels and fanning its participant row out to the 230 subscriptions showing that channel (a public channel is shown by all 1 000 users); an in-place ticket update 56 µs: beyond the buffer's frontier it is rejected inside the index, behind the page it changes nothing the client sees, on the page it is one `Add` per subscriber of its board (5.2 client updates per write) |
 | Over PostgreSQL (`LEFT JOIN`, 1 000 users, 2 000 tickets), streaming feed | a registration costs its two reads and their landing and nothing else: 3.0 ms end to end (1.8 ms in storage, 1.1 ms in the runtime), a twin 369 µs; 5 000 inserts committed in transactions of 100 stream from commit to delivery at 5 544 writes/s, split between the engine (107 µs per write for 1 001 subscribers, client grouping included), 339 sequential narrowed reads (one per newly referenced user, 229 ms) and 5 ms of feed and decoding; a registration whose snapshot is held open for 300 ms while 500 writes commit and are delivered behind it lands at once with 41 of its 148 rows brought up to the newer image, none dropped, and frames equal to the tables |
+| The server over the wire (`scripts/load-protocol.mjs`: clients holding the chat screen's eight queries each, updates fanning out to every one of them) | 4 000 clients hold **32 000 subscriptions**, registering at **2 000 to 3 300 queries a second**; 200 clients take **200 updates a second — 40 000 client rows a second — with every row delivered and a 99th percentile under 81 ms**, and the engine thread saturates at about 400 updates a second (80 000 rows a second native, 61 000 pinned), losing nothing. Pinned to 2, 4 or 8 CPUs the figures are identical, which is what a one-thread engine predicts. Through the application server the ceiling is its own, about 95 mutations a second. Details in [docs/load-2026-09-16.md](docs/load-2026-09-16.md), raw results in [paper/load-2026-09-16/](paper/load-2026-09-16/) |
 
 ### Using the engine programmatically
 
@@ -624,27 +646,28 @@ src/
     sources.rs             Sources: per-table routing between memory and Postgres (XYNE_SYNC_MEMORY_TABLES)
     runtime.rs             Runtime: the single owner, the one position, bringing results up to it, SyncStats
     local.rs               Local: the synchronous driver
-    service.rs             Service: the async command loop (tokio LocalSet)
+    service.rs             Service: the async command loop (tokio LocalSet) and the event stream it answers on
     pg/mod.rs              PgStorage: positioned REPEATABLE READ snapshots from exported-snapshot aliases
     pg/replication.rs      a minimal replication-protocol connection (mints the aliases)
     pg/sql.rs              model to SQL rendering
     pg/stream.rs           PgStream: the streaming pgoutput feed (Transport + Feed halves), positioned writes, heartbeat progress marks
     pg/catalog.rs          the catalog read from information_schema, typed the way the protocol types Postgres
     pg/text.rs             the text forms of times, JSON arrays and array literals
-  gateway/
+    pg/threads.rs          the engine side over Postgres: the feed thread, the storage, the Service, the decoder
+  client/
     mod.rs                 the threads and their wiring
     config.rs              XYNE_SYNC_* configuration
     protocol.rs            Zero's sync protocol v51: messages, handshake header, cookies
     ast.rs                 the client's query AST to the engine's query tree
     wire.rs                rows and keys as the wire carries them
     backend.rs             the query and mutate endpoints of the application server
-    core.rs                the engine thread: client groups, held rows, pokes
+    groups.rs              client groups, held rows, pokes: a consumer of the service's events
     connection.rs          one WebSocket connection: handshake, message loop, liveness
-    log.rs                 a leveled stderr log
+  log.rs                   a leveled stderr log
   parser/
     mod.rs                 lexer + recursive-descent parser, schema-aware against model::Catalog
   bin/
-    server.rs              the sync gateway binary
+    server.rs              the sync server binary
     bench.rs               benchmark harness
 tests/
   ivm_scenarios.rs         single-table routing, windows, twin sharing, per-client grouping (assertable spec)

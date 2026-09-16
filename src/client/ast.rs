@@ -279,7 +279,7 @@ fn simple(op: &str, left: &Operand, right: &Operand, table: &DbTable) -> Result<
         Operand::Literal { value } => value,
         Operand::Static { .. } => {
             return Err(format!(
-                "an unresolved parameter reached the gateway in a condition on `{name}`"
+                "an unresolved parameter reached the engine in a condition on `{name}`"
             ));
         }
         Operand::Column { .. } => {

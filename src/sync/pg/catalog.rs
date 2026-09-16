@@ -2,7 +2,7 @@
 //! schemas that has a primary key, its columns mapped onto the engine's
 //! value types the way the sync protocol maps them for its clients (times as epoch
 //! milliseconds, JSON and arrays as JSON, enums and uuids as strings,
-//! `bytea` left out), so a gateway needs no hand-written schema. Tables of
+//! `bytea` left out), so a server needs no hand-written schema. Tables of
 //! the `public` schema keep their bare names; any other table is named
 //! `schema.table`, which is also how the change feed matches it.
 

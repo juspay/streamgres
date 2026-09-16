@@ -27,6 +27,7 @@ pub mod replication;
 pub mod sql;
 pub mod stream;
 pub mod text;
+pub mod threads;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -34,10 +35,12 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
 use tokio::task::spawn_local;
 use tokio_postgres::{Client, Config, IsolationLevel, NoTls, Row};
 
 use super::storage::{Storage, StorageError};
+use crate::log::log_warn;
 use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, Lsn, SingleTableReadQuery, Snapshot,
     Value, ValueType,
@@ -46,10 +49,16 @@ use replication::ReplicationConnection;
 
 pub use catalog::load_catalog;
 pub use stream::{Batch, Feed, PgStream, Transport};
+pub use threads::{Settings, Started};
 
 /// How many minted aliases wait for the stream to pass them before the
 /// minter pauses (each holds a slot and a connection).
 const WAITING_ALIASES: usize = 2;
+
+/// How many reads may hold a connection at once unless
+/// [`PgStorage::with_read_connections`] says otherwise; further reads wait
+/// their turn instead of opening connections the server would refuse.
+const DEFAULT_READ_CONNECTIONS: usize = 16;
 
 /// One minted alias: an exported snapshot and the consistent point it
 /// was built at, alive as long as the replication connection that created
@@ -99,9 +108,17 @@ pub async fn mint(config: &Config) -> Result<Alias, StorageError> {
 }
 
 impl From<tokio_postgres::Error> for StorageError {
-    /// The driver's message.
+    /// The driver's message followed by its causes, so a server refusal
+    /// (`FATAL: sorry, too many clients already`) reads as such.
     fn from(error: tokio_postgres::Error) -> Self {
-        StorageError(error.to_string())
+        let mut text = error.to_string();
+        let mut source = std::error::Error::source(&error);
+        while let Some(inner) = source {
+            text.push_str(": ");
+            text.push_str(&inner.to_string());
+            source = inner.source();
+        }
+        StorageError(text)
     }
 }
 
@@ -128,6 +145,8 @@ impl Aliases {
 /// - `config`: how to connect; one connection is opened per read in
 ///   flight and kept for reuse in `idle`, since each read is its own
 ///   transaction.
+/// - `permits`: how many reads may be in flight at once; the rest queue
+///   here rather than at the server's connection limit.
 /// - `catalog`: the tables' declared columns, which the `SELECT` casts to
 ///   and the rows decode by.
 /// - `aliases`: the current alias and the ones waiting to become it; a
@@ -140,6 +159,7 @@ pub struct PgStorage {
     config: Config,
     catalog: Rc<Catalog>,
     idle: RefCell<Vec<Client>>,
+    permits: Rc<Semaphore>,
     aliases: Rc<RefCell<Aliases>>,
     rotation: Rc<Cell<Duration>>,
     alive: Rc<Cell<bool>>,
@@ -165,6 +185,7 @@ impl PgStorage {
             config,
             catalog,
             idle: RefCell::new(vec![client]),
+            permits: Rc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
             aliases: Rc::new(RefCell::new(Aliases::default())),
             rotation: Rc::new(Cell::new(Duration::from_millis(250))),
             alive: Rc::new(Cell::new(true)),
@@ -184,6 +205,12 @@ impl PgStorage {
     /// Hold every snapshot open for `delay` before reading (tests).
     pub fn with_read_delay(mut self, delay: Duration) -> Self {
         self.delay = Some(delay);
+        self
+    }
+
+    /// Let at most `limit` reads hold a connection at once (at least one).
+    pub fn with_read_connections(mut self, limit: usize) -> Self {
+        self.permits = Rc::new(Semaphore::new(limit.max(1)));
         self
     }
 
@@ -236,6 +263,11 @@ impl Storage for PgStorage {
             StorageError(format!("table `{}` is not in the catalog", query.table))
         })?;
         let alias = self.current_alias()?;
+        let _permit = self
+            .permits
+            .acquire()
+            .await
+            .map_err(|_| StorageError("the read pool is closed".to_owned()))?;
         let mut client = self.acquire().await?;
         let result = read_snapshot(&mut client, table, query, &alias, self.delay).await;
         if result.is_ok() {
@@ -276,7 +308,7 @@ fn rotate(
             match mint(&config).await {
                 Ok(fresh) => aliases.borrow_mut().waiting.push_back(Rc::new(fresh)),
                 Err(error) => {
-                    eprintln!("snapshot minting failed, keeping the current alias: {error}")
+                    log_warn!("snapshot minting failed, keeping the current alias: {error}")
                 }
             }
         }
@@ -288,7 +320,7 @@ async fn open(config: &Config) -> Result<Client, StorageError> {
     let (client, connection) = config.connect(NoTls).await?;
     spawn_local(async move {
         if let Err(error) = connection.await {
-            eprintln!("postgres connection ended: {error}");
+            log_warn!("postgres connection ended: {error}");
         }
     });
     Ok(client)

@@ -10,13 +10,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, NoTls};
 use xyne_sync::ivm::{ClientUpdate, Fetch, MultiTableIVM, QueryPart};
 use xyne_sync::model::*;
 use xyne_sync::sync::pg::{PgStorage, PgStream};
-use xyne_sync::sync::{Command, Lsn, Runtime, Service, Sources, Storage, SubId};
+use xyne_sync::sync::{Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId};
 
 /// The one client of these scenarios.
 const CLIENT: ClientId = ClientId(7);
@@ -399,8 +399,8 @@ fn service_streams_end_to_end() {
             catalog.clone(),
             [TableName::from(names.users.as_str())],
         ));
-        let (updates_tx, mut updates) = mpsc::unbounded_channel();
-        let (service, commands) = Service::new(MultiTableIVM::new(), sources.clone(), updates_tx);
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let (service, commands) = Service::new(MultiTableIVM::new(), sources.clone(), events_tx);
         let service = spawn_local(service.run());
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -408,7 +408,10 @@ fn service_streams_end_to_end() {
             let batch = stream.poll().await.expect("poll");
             for (write, at) in batch.writes {
                 commands
-                    .send(Command::Write { write, at })
+                    .send(Command::Commit {
+                        writes: vec![write],
+                        at,
+                    })
                     .await
                     .expect("send");
             }
@@ -429,16 +432,23 @@ fn service_streams_end_to_end() {
         );
         let poller = spawn_local(stream.run(Duration::from_millis(50), commands.clone()));
 
-        let (reply, sub) = oneshot::channel();
         commands
             .send(Command::Register {
                 client: CLIENT,
                 query: names.spec(),
-                reply,
+                token: 1,
             })
             .await
             .expect("send");
-        let sub: SubId = sub.await.expect("registered");
+        let sub: SubId = loop {
+            match events.recv().await.expect("service ended") {
+                Event::Registered { token, sub } => {
+                    assert_eq!(token, 1, "the token comes back unchanged");
+                    break sub;
+                }
+                _ => continue,
+            }
+        };
 
         client
             .batch_execute(&format!(
@@ -470,8 +480,8 @@ fn service_streams_end_to_end() {
         let mut frames: HashMap<QueryPart, HashMap<DataFrameKey, DataFrameRow>> = HashMap::new();
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            match tokio::time::timeout(Duration::from_millis(200), updates.recv()).await {
-                Ok(Some(batch)) => {
+            match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
+                Ok(Some(Event::Updates(batch))) => {
                     for update in batch {
                         assert_eq!(update.client, CLIENT);
                         for target in &update.targets {
@@ -488,6 +498,7 @@ fn service_streams_end_to_end() {
                         }
                     }
                 }
+                Ok(Some(_)) => {}
                 Ok(None) => panic!("service ended"),
                 Err(_) => {}
             }
@@ -514,6 +525,56 @@ fn service_streams_end_to_end() {
         let runtime = service.await.expect("service");
         assert_eq!(runtime.outstanding(), 0);
         assert!(runtime.stats().reads_landed >= 2);
+        cleanup(&dsn, &client, &names).await;
+    });
+}
+
+/// The read bound: with two permits and each read holding its snapshot
+/// for 400 ms, six concurrent reads take three rounds rather than six
+/// connections, and every one of them succeeds.
+#[test]
+fn reads_queue_at_the_connection_bound() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let names = Names::new("pool");
+        let client = prepare(&dsn, &names).await;
+        let catalog = Rc::new(names.catalog());
+        let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = Rc::new(
+            PgStorage::connect(&dsn, catalog.clone())
+                .await
+                .expect("connect")
+                .with_read_delay(Duration::from_millis(400))
+                .with_read_connections(2),
+        );
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[storage.as_ref()]).await;
+        let (_, step) = runtime.register(CLIENT, names.spec());
+        let query = step.selects[0].query.clone();
+        let started = Instant::now();
+        let reads: Vec<_> = (0..6)
+            .map(|_| {
+                let storage = storage.clone();
+                let query = query.clone();
+                spawn_local(async move { storage.select(&query).await })
+            })
+            .collect();
+        for read in reads {
+            read.await.expect("join").expect("read");
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(1100),
+            "six reads over two permits take three rounds, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(2000),
+            "two permits run two reads at a time, took {elapsed:?}"
+        );
+        drop(stream);
+        drop(storage);
         cleanup(&dsn, &client, &names).await;
     });
 }

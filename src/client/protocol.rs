@@ -1,7 +1,7 @@
 //! Zero's sync protocol (version 51, the one `@rocicorp/zero` 1.9 speaks)
-//! as the gateway reads and writes it: the upstream messages a client
+//! as this server reads and writes it: the upstream messages a client
 //! sends, each a two-element JSON array of a tag and a body, the
-//! downstream messages the gateway answers with, the base64 handshake
+//! downstream messages it answers with, the base64 handshake
 //! header carrying the first message, and the lexicographic version
 //! strings that serve as cookies.
 
@@ -11,7 +11,7 @@ use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
 
-/// The protocol version this gateway speaks.
+/// The protocol version this server speaks.
 pub const PROTOCOL_VERSION: u32 = 51;
 
 /// One message a client sends.
@@ -103,7 +103,7 @@ pub struct DeleteClients {
 
 /// A batch of mutations to forward: the body as sent (it goes to the
 /// application server verbatim) and the ids in it, for the error the
-/// gateway reports when forwarding fails.
+/// the server reports when forwarding fails.
 #[derive(Debug, Clone)]
 pub struct Push {
     pub body: Json,
@@ -170,7 +170,7 @@ fn deserialize<T: for<'de> Deserialize<'de>>(body: Json) -> Result<T, String> {
     serde_json::from_value(body).map_err(|error| format!("malformed body: {error}"))
 }
 
-/// The parts of a push body the gateway itself needs.
+/// The parts of a push body the server itself needs.
 fn parse_push(body: Json) -> Result<Push, String> {
     let client_group_id = body
         .get("clientGroupID")
@@ -272,7 +272,7 @@ pub fn pong() -> String {
     frame("pong", json!({}))
 }
 
-/// `error` with a plain kind and message, from the gateway.
+/// `error` with a plain kind and message, from the server.
 pub fn error(kind: &str, message: &str) -> String {
     frame(
         "error",
@@ -320,7 +320,7 @@ pub fn transform_failed(query_ids: &[String], status: Option<u16>, message: &str
     frame("error", body)
 }
 
-/// `transformError`: queries the application server, or this gateway,
+/// `transformError`: queries the application server, or this server,
 /// could not turn into something to run.
 pub fn transform_error(errors: Vec<Json>) -> String {
     frame("transformError", Json::Array(errors))
@@ -331,7 +331,7 @@ pub fn errored_query(id: &str, name: &str, message: &str) -> Json {
     json!({"error": "app", "id": id, "name": name, "message": message})
 }
 
-/// `deleteClients`: the clients the gateway dropped.
+/// `deleteClients`: the clients the server dropped.
 pub fn delete_clients(deleted: &DeleteClients) -> String {
     frame(
         "deleteClients",

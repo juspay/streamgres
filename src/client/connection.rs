@@ -4,9 +4,9 @@
 //! (a `pong` for every `ping` and one of the server's own whenever the
 //! downstream goes quiet, a WebSocket ping frame at an interval and a
 //! close when nothing at all came back), and the cleanup that hands the
-//! connection's client group back to the engine thread. Query names go to
+//! connection's client group back to the group thread. Query names go to
 //! the application server for their ASTs and mutations are forwarded to it
-//! from here, on the server's threads; the engine thread only ever sees
+//! from here, on the server's threads; the group thread only ever sees
 //! finished ASTs.
 
 use std::collections::HashMap;
@@ -26,11 +26,11 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 use super::backend::{Backend, Identity, PushOutcome, TransformOutcome};
 use super::config::Config;
-use super::core::{ConnectReply, DesiredOp, Outbound, Request, Socket};
-use super::log::{gw_debug, gw_info, gw_warn};
+use super::groups::{ConnectReply, DesiredOp, Outbound, Request, Socket};
 use super::protocol::{
     self, DeleteClients, InitConnection, PROTOCOL_VERSION, QueryPatchOp, Upstream,
 };
+use crate::log::{log_debug, log_info, log_warn};
 
 /// What every connection shares.
 pub struct AppState {
@@ -66,14 +66,14 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind(&address)
         .await
         .map_err(|error| format!("binding {address}: {error}"))?;
-    gw_info!(
+    log_info!(
         "listening on http://{address}{}/sync/v{PROTOCOL_VERSION}/connect",
         state.config.base_path
     );
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
-            gw_info!("shutting down");
+            log_info!("shutting down");
         })
         .await
         .map_err(|error| format!("serving: {error}"))
@@ -149,7 +149,7 @@ async fn handle(
     let wsid = params.wsid.clone();
     let group_id = params.group_id.clone();
     if version != PROTOCOL_VERSION {
-        gw_warn!("connection {wsid}: protocol v{version} is not v{PROTOCOL_VERSION}");
+        log_warn!("connection {wsid}: protocol v{version} is not v{PROTOCOL_VERSION}");
         send(
             &out,
             protocol::error(
@@ -179,7 +179,7 @@ async fn handle(
     let handshake = match header.as_deref().map(protocol::decode_handshake) {
         Some(Ok(handshake)) => handshake,
         Some(Err(error)) => {
-            gw_warn!("connection {wsid}: {error}");
+            log_warn!("connection {wsid}: {error}");
             protocol::Handshake::default()
         }
         None => protocol::Handshake::default(),
@@ -219,7 +219,7 @@ async fn handle(
         Err(_) => false,
     };
     if !accepted {
-        gw_info!("connection {wsid}: client group {group_id} must start over");
+        log_info!("connection {wsid}: client group {group_id} must start over");
         send(
             &out,
             protocol::error(
@@ -274,6 +274,11 @@ async fn write_loop(
                     }
                     last_sent = Instant::now();
                 }
+                Some(Outbound::Ping) => {
+                    if sink.send(Message::Ping(Default::default())).await.is_err() {
+                        break;
+                    }
+                }
                 Some(Outbound::Close) | None => {
                     let _ = sink.send(Message::Close(None)).await;
                     break;
@@ -315,24 +320,24 @@ impl Conn {
                         last_inbound = Instant::now();
                     }
                     Some(Ok(Message::Close(_))) | None => {
-                        gw_debug!("connection {}: closed by the client", self.params.wsid);
+                        log_debug!("connection {}: closed by the client", self.params.wsid);
                         break;
                     }
                     Some(Err(error)) => {
-                        gw_debug!("connection {}: {error}", self.params.wsid);
+                        log_debug!("connection {}: {error}", self.params.wsid);
                         break;
                     }
                 },
                 _ = ticker.tick() => {
                     if last_inbound.elapsed() > timeout {
-                        gw_warn!(
+                        log_warn!(
                             "connection {}: nothing heard for {:?}; closing",
                             self.params.wsid,
                             last_inbound.elapsed()
                         );
                         break;
                     }
-                    let _ = self.out.send(Outbound::Text(protocol::pong().into()));
+                    let _ = self.out.send(Outbound::Ping);
                 }
             }
         }
@@ -343,7 +348,7 @@ impl Conn {
         let message = match protocol::parse_upstream(text) {
             Ok(message) => message,
             Err(error) => {
-                gw_warn!("connection {}: {error}", self.params.wsid);
+                log_warn!("connection {}: {error}", self.params.wsid);
                 send(&self.out, protocol::error("InvalidMessage", &error));
                 return false;
             }
@@ -380,11 +385,11 @@ impl Conn {
                 true
             }
             Upstream::CloseConnection => {
-                gw_debug!("connection {}: closeConnection", self.params.wsid);
+                log_debug!("connection {}: closeConnection", self.params.wsid);
                 false
             }
             Upstream::Other(tag) => {
-                gw_debug!("connection {}: ignoring `{tag}`", self.params.wsid);
+                log_debug!("connection {}: ignoring `{tag}`", self.params.wsid);
                 true
             }
         }
@@ -487,7 +492,7 @@ impl Conn {
                                 *slot = Some(ast.clone());
                             }
                         } else {
-                            gw_warn!(
+                            log_warn!(
                                 "connection {}: query {id} errored at the application server: {}",
                                 self.params.wsid,
                                 result.get("message").and_then(Json::as_str).unwrap_or("")
@@ -500,7 +505,7 @@ impl Conn {
                     }
                 }
                 TransformOutcome::Failed { status, message } => {
-                    gw_warn!(
+                    log_warn!(
                         "connection {}: transform failed: {message}",
                         self.params.wsid
                     );
@@ -525,7 +530,7 @@ impl Conn {
     /// back as a `pushResponse`, or as the error that stood in its way.
     async fn push(&mut self, push: protocol::Push) {
         if push.client_group_id != self.params.group_id {
-            gw_warn!(
+            log_warn!(
                 "connection {}: a push for client group {} on the connection of {}",
                 self.params.wsid,
                 push.client_group_id,
@@ -547,7 +552,7 @@ impl Conn {
                         serde_json::to_string(&json!(["error", json])).unwrap_or_default(),
                     );
                 } else {
-                    gw_warn!(
+                    log_warn!(
                         "connection {}: unexpected mutate response: {json}",
                         self.params.wsid
                     );
@@ -607,7 +612,7 @@ impl LmidReader {
                     *guard = Some(client);
                 }
                 Err(error) => {
-                    gw_warn!("cannot read last mutation ids: {error}");
+                    log_warn!("cannot read last mutation ids: {error}");
                     return Vec::new();
                 }
             }
@@ -627,7 +632,7 @@ impl LmidReader {
                 .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
                 .collect(),
             Err(error) => {
-                gw_warn!("reading last mutation ids of {group}: {error}");
+                log_warn!("reading last mutation ids of {group}: {error}");
                 *guard = None;
                 Vec::new()
             }

@@ -1,10 +1,20 @@
 //! A log with four levels on stderr, the level set once from the
-//! configuration; `gw_error!`, `gw_warn!`, `gw_info!` and `gw_debug!`
-//! format like `println!`.
+//! configuration; `log_error!`, `log_warn!`, `log_info!` and `log_debug!`
+//! format like `println!`. A line is formatted in full and written with one
+//! call, so a chatty level costs one syscall per line rather than one per
+//! fragment (at `debug`, the engine thread logs every poke).
 
+use std::io::Write;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use super::config::Level;
+/// A log level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Level {
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
 
 static LEVEL: AtomicU8 = AtomicU8::new(2);
 
@@ -30,7 +40,8 @@ pub fn log(level: Level, message: std::fmt::Arguments<'_>) {
         Level::Info => "INFO ",
         Level::Debug => "DEBUG",
     };
-    eprintln!("{now} {tag} {message}");
+    let line = format!("{now} {tag} {message}\n");
+    let _ = std::io::stderr().lock().write_all(line.as_bytes());
 }
 
 /// The numeric rank of a level, higher is chattier.
@@ -43,24 +54,24 @@ fn rank(level: Level) -> u8 {
     }
 }
 
-macro_rules! gw_error {
+macro_rules! log_error {
     ($($arg:tt)*) => {
-        $crate::gateway::log::log($crate::gateway::config::Level::Error, format_args!($($arg)*))
+        $crate::log::log($crate::log::Level::Error, format_args!($($arg)*))
     };
 }
-macro_rules! gw_warn {
+macro_rules! log_warn {
     ($($arg:tt)*) => {
-        $crate::gateway::log::log($crate::gateway::config::Level::Warn, format_args!($($arg)*))
+        $crate::log::log($crate::log::Level::Warn, format_args!($($arg)*))
     };
 }
-macro_rules! gw_info {
+macro_rules! log_info {
     ($($arg:tt)*) => {
-        $crate::gateway::log::log($crate::gateway::config::Level::Info, format_args!($($arg)*))
+        $crate::log::log($crate::log::Level::Info, format_args!($($arg)*))
     };
 }
-macro_rules! gw_debug {
+macro_rules! log_debug {
     ($($arg:tt)*) => {
-        $crate::gateway::log::log($crate::gateway::config::Level::Debug, format_args!($($arg)*))
+        $crate::log::log($crate::log::Level::Debug, format_args!($($arg)*))
     };
 }
-pub(crate) use {gw_debug, gw_error, gw_info, gw_warn};
+pub(crate) use {log_debug, log_error, log_info, log_warn};

@@ -1,4 +1,4 @@
-//! The sync gateway binary.
+//! The sync server binary.
 //!
 //! ```bash
 //! cargo run --release --bin server
@@ -10,7 +10,7 @@
 
 fn main() {
     load_dotenv(".env");
-    let outcome = xyne_sync::gateway::Config::from_env().and_then(xyne_sync::gateway::serve);
+    let outcome = xyne_sync::client::Config::from_env().and_then(xyne_sync::client::serve);
     if let Err(error) = outcome {
         eprintln!("{error}");
         std::process::exit(1);

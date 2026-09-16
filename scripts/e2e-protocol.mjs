@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// An end-to-end check of the sync gateway as a protocol client (v51) sees it, against a
+// An end-to-end check of the sync server as a protocol client (v51) sees it, against a
 // running xyne-spaces backend (port 3001, ENABLE_DEV_AUTH=true), its Postgres, and
-// the gateway (port 4848). Two dev users log in; A subscribes to browsableChannels,
+// the server (port 4848). Two dev users log in; A subscribes to browsableChannels,
 // both are made members of the first channel straight in Postgres (the poke must
 // deliver the rows), A subscribes to channelConversations, starts a conversation
 // through the real conversations.send mutation, subscribes to its thread, B
@@ -134,7 +134,7 @@ function advance() {
       if (!a.got.has('h2')) return;
       conversationId = 'cv-' + randomUUID().slice(0, 8);
       stage = 'started';
-      a.push('conversations.send', { channelId, content: 'hello from the sync gateway e2e', type: 'USER', conversationId, messageId: 'm-' + randomUUID().slice(0, 8), timestamp: Date.now() });
+      a.push('conversations.send', { channelId, content: 'hello from the sync server e2e', type: 'USER', conversationId, messageId: 'm-' + randomUUID().slice(0, 8), timestamp: Date.now() });
       return;
     }
     case 'started': {

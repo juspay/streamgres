@@ -26,3 +26,4 @@ zigcc
 
 # Paper build logs
 paper/*.log
+results/

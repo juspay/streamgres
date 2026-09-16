@@ -1,13 +1,17 @@
-//! The gateway's configuration, read from the environment: where to
-//! listen, which database to follow, where the application server answers
-//! query and mutation requests, and the timings of the connection
-//! protocol. Every setting has a `XYNE_SYNC_` name; the database and
-//! application-server URLs also accept the `ZERO_` names a zero-cache
-//! deployment already sets, so one `.env` serves both.
+//! The server's configuration, read from the environment: where to
+//! listen, which database the engine side follows, where the application
+//! server answers query and mutation requests, and the timings of the
+//! connection protocol. Every setting has a `XYNE_SYNC_` name; the
+//! database and application-server URLs also accept the `ZERO_` names a
+//! zero-cache deployment already sets, so one `.env` serves both.
 
 use std::time::Duration;
 
-/// Everything the gateway reads from the environment.
+use crate::log::Level;
+use crate::model::TableName;
+use crate::sync::pg::Settings;
+
+/// Everything the server reads from the environment.
 #[derive(Debug, Clone)]
 pub struct Config {
     /// `XYNE_SYNC_ADDR`: the address to listen on (`0.0.0.0:4848`).
@@ -29,6 +33,9 @@ pub struct Config {
     /// `XYNE_SYNC_SNAPSHOT_ROTATION_MS`: how often a fresh exported
     /// snapshot (a temporary replication slot) is minted for reads (1000).
     pub snapshot_rotation: Duration,
+    /// `XYNE_SYNC_READ_CONNECTIONS`: how many storage reads may hold a
+    /// Postgres connection at once; the rest queue (16).
+    pub read_connections: usize,
     /// `XYNE_SYNC_QUERY_URL` (or `ZERO_QUERY_URL`): the application
     /// server's query endpoint, which turns query names into ASTs.
     pub query_url: String,
@@ -66,15 +73,6 @@ pub struct Config {
     pub rows_per_part: usize,
     /// `XYNE_SYNC_LOG`: `error`, `warn`, `info` or `debug` (`info`).
     pub log: Level,
-}
-
-/// A log level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Level {
-    Error,
-    Warn,
-    Info,
-    Debug,
 }
 
 impl Config {
@@ -148,6 +146,12 @@ impl Config {
             slot: first(&["XYNE_SYNC_SLOT"]).unwrap_or_else(|| "xyne_sync".to_owned()),
             heartbeat: millis("XYNE_SYNC_HEARTBEAT_MS", 1_000)?,
             snapshot_rotation: millis("XYNE_SYNC_SNAPSHOT_ROTATION_MS", 1_000)?,
+            read_connections: match first(&["XYNE_SYNC_READ_CONNECTIONS"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("XYNE_SYNC_READ_CONNECTIONS must be a number, got `{text}`")
+                })?,
+                None => 16,
+            },
             query_url,
             mutate_url,
             forward_cookies,
@@ -183,5 +187,21 @@ impl Config {
     /// id, `<upstream schema>.clients`.
     pub fn clients_table(&self) -> String {
         format!("{}.clients", self.upstream_schema())
+    }
+
+    /// What the engine side needs: the database to follow and read, and
+    /// the one table whose rows the client side reads itself (the
+    /// application's mutation ids, which travel with the rows of the
+    /// mutation that produced them).
+    pub fn engine_settings(&self) -> Settings {
+        Settings {
+            dsn: self.dsn.clone(),
+            slot: self.slot.clone(),
+            schemas: self.schemas.clone(),
+            heartbeat: self.heartbeat,
+            snapshot_rotation: self.snapshot_rotation,
+            read_connections: self.read_connections,
+            watched: vec![TableName::from(self.clients_table().as_str())],
+        }
     }
 }

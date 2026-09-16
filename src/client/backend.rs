@@ -1,4 +1,4 @@
-//! The gateway's calls to the application server, the way zero-cache
+//! The client side's calls to the application server, the way zero-cache
 //! makes them: a `POST` of `["transform", [{id, name, args}]]` to the
 //! query endpoint turns query names into ASTs, a `POST` of a client's push
 //! body to the mutate endpoint runs its mutations; both carry the
@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::{Value as Json, json};
 
 use super::config::Config;
-use super::log::{gw_debug, gw_warn};
+use crate::log::{log_debug, log_warn};
 
 /// The HTTP client and where it posts.
 pub struct Backend {
@@ -221,7 +221,7 @@ impl Backend {
         if let Some(origin) = &identity.origin {
             request = request.header("Origin", origin);
         }
-        gw_debug!("POST {url}");
+        log_debug!("POST {url}");
         let response = request
             .body(body.to_string())
             .send()
@@ -233,7 +233,7 @@ impl Backend {
             .await
             .map_err(|error| format!("{url}: reading the response: {error}"))?;
         if !(200..300).contains(&status) {
-            gw_warn!("{url} answered {status}: {}", preview(&text));
+            log_warn!("{url} answered {status}: {}", preview(&text));
         }
         Ok((
             status,
