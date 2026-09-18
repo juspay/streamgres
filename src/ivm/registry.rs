@@ -127,7 +127,10 @@ impl SingleTableIVM {
         if !set.insert(value) {
             return false;
         }
-        let _ = query;
+        let table = query.table.clone();
+        if let Some(table_index) = self.tables.get_mut(&table) {
+            table_index.set_insert(condition, value);
+        }
         self.stats.conditions_replaced += 1;
         true
     }
@@ -146,7 +149,10 @@ impl SingleTableIVM {
         if !set.remove(value) {
             return false;
         }
-        let _ = query;
+        let table = query.table.clone();
+        if let Some(table_index) = self.tables.get_mut(&table) {
+            table_index.set_remove(condition, value);
+        }
         self.stats.conditions_replaced += 1;
         true
     }

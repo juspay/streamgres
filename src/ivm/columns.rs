@@ -8,7 +8,9 @@
 //! - **Equality** (`=`, `IN`): a hash map from value to conditions; an
 //!   `IN` is filed under each of its list values (or, for a set-valued
 //!   `IN`, its current members, with [`ColumnIndex::file_key`] and
-//!   [`ColumnIndex::unfile_key`] following the set one member at a time). Keys fold in the numeric
+//!   [`ColumnIndex::unfile_key`] following the set one member at a time;
+//!   a set past [`SET_FILING_LIMIT`] members is filed once and probed by
+//!   membership instead). Keys fold in the numeric
 //!   coercion of [`Value::loose_eq`] (an integral float files as the
 //!   integer), so `Int(5)` finds `= 5.0`.
 //! - **Inequality** (`<>`, `NOT IN`, `IS NOT NULL`): the mirror map records
@@ -99,14 +101,20 @@ pub(super) struct ColumnIndex {
     unequal_all: HashSet<CondRef>,
     above: HashMap<u8, BTreeMap<OrdValue, HashSet<CondRef>>>,
     below: HashMap<u8, BTreeMap<OrdValue, HashSet<CondRef>>>,
-    /// Set-valued `IN` conditions (a join edge's driven values), filed
-    /// once each and probed by membership, so registering one costs no
-    /// more than its condition and a member coming or going touches the
-    /// set alone.
+    /// Set-valued `IN` conditions (a join edge's driven values) with more
+    /// than [`SET_FILING_LIMIT`] members, filed once each and probed by
+    /// membership at routing time: registering one costs its condition
+    /// alone rather than a filing per member. A smaller set is filed under
+    /// each member like a list, since a probe per set on every write
+    /// would cost the number of subscriptions carrying one.
     sets: HashSet<CondRef>,
-    /// Set-valued `NOT IN` conditions, probed by non-membership.
+    /// Set-valued `NOT IN` conditions past the limit, probed by non-membership.
     not_sets: HashSet<CondRef>,
 }
+
+/// The most members a set-valued condition is filed under one by one; a
+/// larger set is probed by membership instead.
+pub(super) const SET_FILING_LIMIT: usize = 1024;
 
 impl ColumnIndex {
     /// File one condition under every key it can match at; a condition
@@ -141,7 +149,7 @@ impl ColumnIndex {
             }
             EXISTS => {}
             IN => {
-                if let Value::Set(_) = value {
+                if probed(value) {
                     self.sets.insert(condition.clone());
                 } else {
                     for key in member_keys(value) {
@@ -159,7 +167,7 @@ impl ColumnIndex {
                 }
             }
             NOT_IN => {
-                if let Value::Set(_) = value {
+                if probed(value) {
                     self.not_sets.insert(condition.clone());
                 } else if negation_is_satisfiable(value) {
                     for key in member_keys(value) {
@@ -207,9 +215,7 @@ impl ColumnIndex {
             }
             EXISTS => {}
             IN => {
-                if let Value::Set(_) = value {
-                    self.sets.remove(condition);
-                } else {
+                if !self.sets.remove(condition) {
                     for key in member_keys(value) {
                         remove_under(&mut self.equal, Some(key), condition);
                     }
@@ -220,9 +226,7 @@ impl ColumnIndex {
                 self.unequal_all.remove(condition);
             }
             NOT_IN => {
-                if let Value::Set(_) = value {
-                    self.not_sets.remove(condition);
-                } else {
+                if !self.not_sets.remove(condition) {
                     for key in member_keys(value) {
                         remove_under(&mut self.unequal, Some(key), condition);
                     }
@@ -231,6 +235,46 @@ impl ColumnIndex {
             }
             GT | GTE => remove_threshold(&mut self.above, value, condition),
             LT | LTE => remove_threshold(&mut self.below, value, condition),
+        }
+    }
+
+    /// A set-valued condition already indexed here gained `value`: file it
+    /// under that one key, unless the set is probed by membership, in
+    /// which case the set itself (the caller's to mutate) is the whole
+    /// change. The O(1) edit of a join edge gaining a value.
+    pub(super) fn file_key(&mut self, condition: &CondRef, value: &Value) {
+        use ComparisonOperator::*;
+        if self.sets.contains(condition) || self.not_sets.contains(condition) {
+            return;
+        }
+        let Some(key) = value.equality_key() else {
+            return;
+        };
+        match condition.0.comparison_operator {
+            IN => {
+                self.equal.entry(key).or_default().insert(condition.clone());
+            }
+            NOT_IN => {
+                self.unequal
+                    .entry(key)
+                    .or_default()
+                    .insert(condition.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// A set-valued condition lost `value`: unfile it from that key, unless
+    /// the set is probed by membership.
+    pub(super) fn unfile_key(&mut self, condition: &CondRef, value: &Value) {
+        use ComparisonOperator::*;
+        if self.sets.contains(condition) || self.not_sets.contains(condition) {
+            return;
+        }
+        match condition.0.comparison_operator {
+            IN => remove_under(&mut self.equal, value.equality_key(), condition),
+            NOT_IN => remove_under(&mut self.unequal, value.equality_key(), condition),
+            _ => {}
         }
     }
 
@@ -366,8 +410,16 @@ fn remove_threshold(
 fn member_keys(value: &Value) -> Vec<Value> {
     match value {
         Value::List(items) => items.iter().filter_map(Value::equality_key).collect(),
+        Value::Set(set) => set.members(),
         _ => Vec::new(),
     }
+}
+
+/// Whether a set-valued operand is probed by membership rather than filed
+/// under each member: a shared set with more than [`SET_FILING_LIMIT`]
+/// members.
+fn probed(value: &Value) -> bool {
+    matches!(value, Value::Set(set) if set.len() > SET_FILING_LIMIT)
 }
 
 /// Whether a `NOT IN` operand can ever be true: a list holding `NULL`
@@ -392,5 +444,68 @@ fn class_of(value: &Value) -> Option<u8> {
         Value::Date(_) => Some(4),
         Value::Datetime(_) => Some(5),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::SharedSet;
+
+    /// A handle to a set-valued condition on `team` under `operator`.
+    fn handle(operator: ComparisonOperator, set: &SharedSet) -> CondRef {
+        CondRef(Rc::new(Condition {
+            column: "team".into(),
+            comparison_operator: operator,
+            value: Value::Set(set.clone()),
+        }))
+    }
+
+    /// The conditions `value` reaches, as pointers.
+    fn found(index: &ColumnIndex, value: i64) -> Vec<CondRef> {
+        let mut out = Vec::new();
+        index.candidates(&Value::from(value), &mut out);
+        out
+    }
+
+    #[test]
+    fn a_small_set_is_filed_per_member_and_a_large_one_probed() {
+        let small = SharedSet::new();
+        for member in 1..=3_i64 {
+            small.insert(&Value::from(member));
+        }
+        let large = SharedSet::new();
+        for member in 0..=(SET_FILING_LIMIT as i64) {
+            large.insert(&Value::from(member));
+        }
+        let mut index = ColumnIndex::default();
+        let small_in = handle(ComparisonOperator::IN, &small);
+        let large_in = handle(ComparisonOperator::IN, &large);
+        let small_not_in = handle(ComparisonOperator::NOT_IN, &small);
+        index.file(&small_in);
+        index.file(&large_in);
+        index.file(&small_not_in);
+        assert_eq!(index.equal.len(), 3, "the small set is filed under its members");
+        assert!(index.sets.contains(&large_in), "the large set is probed");
+        assert!(index.unequal_all.contains(&small_not_in));
+        let at_two = found(&index, 2);
+        assert!(at_two.contains(&small_in) && at_two.contains(&large_in));
+        assert!(!at_two.contains(&small_not_in), "2 is in the small set, so NOT IN fails");
+        let at_nine = found(&index, 9);
+        assert!(!at_nine.contains(&small_in) && at_nine.contains(&large_in));
+        assert!(at_nine.contains(&small_not_in));
+        small.insert(&Value::from(9));
+        index.file_key(&small_in, &Value::from(9));
+        index.file_key(&small_not_in, &Value::from(9));
+        let at_nine = found(&index, 9);
+        assert!(at_nine.contains(&small_in), "a member gained is filed");
+        assert!(!at_nine.contains(&small_not_in), "and the NOT IN fails there now");
+        large.remove(&Value::from(9));
+        index.unfile_key(&large_in, &Value::from(9));
+        assert!(!found(&index, 9).contains(&large_in), "a probed set is asked, not filed");
+        index.unfile(&small_in);
+        index.unfile(&large_in);
+        index.unfile(&small_not_in);
+        assert!(index.is_empty());
     }
 }
