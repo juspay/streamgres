@@ -74,6 +74,7 @@ pub struct SyncStats {
     pub reads_issued: u64,
     pub reads_landed: u64,
     pub reads_retried: u64,
+    pub reads_refused: u64,
     pub rows_dropped: u64,
     pub rows_refreshed: u64,
     pub rows_added: u64,
@@ -89,6 +90,7 @@ impl fmt::Display for SyncStats {
             self.reads_issued, self.reads_landed
         )?;
         writeln!(f, "reads retried .............. {}", self.reads_retried)?;
+        writeln!(f, "reads refused .............. {}", self.reads_refused)?;
         writeln!(
             f,
             "rows dropped / refreshed ... {} / {}",
@@ -253,6 +255,19 @@ impl<E: Engine> Runtime<E> {
         self.collect(&mut step);
         self.trim();
         step
+    }
+
+    /// The driver refused read `id` (it will never succeed): forget it and
+    /// unsubscribe everything that was waiting on it, named with the
+    /// client of each so it can be told.
+    pub fn refused(&mut self, id: FetchId) -> Vec<(SubId, ClientId)> {
+        let Some(flight) = self.in_flight.remove(&id) else {
+            return Vec::new();
+        };
+        self.stats.reads_refused += 1;
+        let gone = self.engine.refuse(&flight.fetch);
+        self.trim();
+        gone
     }
 
     /// The driver could not run read `id` (no snapshot available yet, a

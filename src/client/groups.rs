@@ -209,6 +209,8 @@ struct QueryState {
     since: Instant,
     /// Whether the registration had to read storage.
     cold: bool,
+    /// The query's name, for the error a refusal carries.
+    name: String,
 }
 
 /// One client group's view.
@@ -462,6 +464,7 @@ impl Groups {
                 self.absorb(updates);
             }
             Event::Landed { updates } => self.absorb(updates),
+            Event::Refused { sub, reason } => self.refused(sub, &reason),
             Event::Hydrated(subs) => {
                 for sub in subs {
                     let Some((group_id, hash)) = self.by_sub.get(&sub).cloned() else {
@@ -749,6 +752,7 @@ impl Groups {
                     inactive: 0,
                     since: Instant::now(),
                     cold: false,
+                    name: name.to_owned(),
                 },
             );
             return;
@@ -766,6 +770,7 @@ impl Groups {
                 inactive: 0,
                 since: Instant::now(),
                 cold: false,
+                name: name.to_owned(),
             },
         );
         let engine_client = group.client;
@@ -807,6 +812,51 @@ impl Groups {
         } else {
             self.command(Command::Unregister(sub));
         }
+    }
+
+    /// The engine side refused a read a query depended on: the query's
+    /// subscription is gone and its rows with it, the query stays desired
+    /// but errored, and every socket of the group hears the reason.
+    fn refused(&mut self, sub: SubId, reason: &str) {
+        let Some((group_id, hash)) = self.by_sub.remove(&sub) else {
+            return;
+        };
+        self.mark(&group_id);
+        let Some(group) = self.groups.get_mut(&group_id) else {
+            return;
+        };
+        group.subs.remove(&sub);
+        group.hidden.remove(&sub);
+        let mut emptied = Vec::new();
+        for (key, holders) in group.rows.iter_mut() {
+            holders.retain(|(holder, _)| *holder != sub);
+            if holders.is_empty() {
+                emptied.push(key.clone());
+            }
+        }
+        for (table, key) in emptied {
+            group.rows.remove(&(table.clone(), key.clone()));
+            group.queued_rows.push(RowOp::Del(table, key));
+        }
+        let Some(state) = group.queries.get_mut(&hash) else {
+            return;
+        };
+        if state.got {
+            group.queued_got.push(json!({"op": "del", "hash": hash}));
+        }
+        state.sub = None;
+        state.got = false;
+        state.awaiting = 0;
+        let error =
+            protocol::transform_error(vec![protocol::errored_query(&hash, &state.name, reason)]);
+        let text: Arc<str> = Arc::from(error);
+        for socket in group.sockets.values() {
+            let _ = socket.sink.send(Outbound::Text(text.clone()));
+        }
+        log_warn!(
+            "group {group_id}: query {} ({hash}) refused: {reason}",
+            state.name
+        );
     }
 
     /// One client no longer desires `hash`; unregister it when nobody in

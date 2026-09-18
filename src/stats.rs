@@ -327,6 +327,7 @@ impl Stats {
                 "snapshots_shared": engine.ivm.snapshots_shared,
                 "reads_issued": engine.sync.reads_issued,
                 "reads_landed": engine.sync.reads_landed,
+                "reads_refused": engine.sync.reads_refused,
                 "rows_dropped": engine.sync.rows_dropped,
                 "rows_refreshed": engine.sync.rows_refreshed,
                 "rows_added": engine.sync.rows_added,

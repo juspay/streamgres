@@ -14,7 +14,9 @@ use tokio::sync::mpsc;
 use tokio::task::{LocalSet, spawn_local};
 use xyne_sync::ivm::MultiTableIVM;
 use xyne_sync::model::*;
-use xyne_sync::sync::{Command, Event, Lsn, MemoryStorage, Service, SubId, Transaction};
+use xyne_sync::sync::{
+    Command, Event, Lsn, MemoryStorage, Service, Storage, StorageError, SubId, Transaction,
+};
 
 /// The one client every subscription here belongs to.
 const CLIENT: ClientId = ClientId(1);
@@ -94,6 +96,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
             Event::Registered { .. } => "registered",
             Event::Hydrated(_) => "hydrated",
             Event::Landed { .. } => "landed",
+            Event::Refused { .. } => "refused",
             Event::Committed { .. } => "committed",
         })
         .collect()
@@ -105,7 +108,7 @@ fn updates_of(event: &Event) -> &[xyne_sync::ivm::ClientUpdate] {
         Event::Registered { updates, .. }
         | Event::Landed { updates }
         | Event::Committed { updates, .. } => updates,
-        Event::Hydrated(_) => &[],
+        Event::Hydrated(_) | Event::Refused { .. } => &[],
     }
 }
 
@@ -323,6 +326,69 @@ fn a_commit_reports_the_position_and_the_watched_writes() {
             matches!(seen.as_slice(), [Event::Committed { updates, .. }] if updates.is_empty()),
             "the commit is the one event; nobody subscribed, so it carries no delta, got {:?}",
             shapes(&seen)
+        );
+    });
+}
+
+/// Storage that refuses every read, the way a read past the row budget is.
+struct Refusing(MemoryStorage);
+
+impl Storage for Refusing {
+    /// Refused, whatever is asked.
+    async fn select(&self, query: &SingleTableReadQuery) -> Result<Snapshot, StorageError> {
+        Err(StorageError::refused(format!(
+            "a read on `{}` returned more than 1 rows",
+            query.table
+        )))
+    }
+
+    /// [`MemoryStorage::advance`].
+    fn advance(&self, feed: Lsn) {
+        self.0.advance(feed)
+    }
+
+    /// [`MemoryStorage::floor`].
+    fn floor(&self) -> Lsn {
+        self.0.floor()
+    }
+
+    /// [`MemoryStorage::absorb`].
+    fn absorb(&self, write: &WriteQuery, at: Lsn) {
+        self.0.absorb(write, at)
+    }
+}
+
+/// A refused read is not parked and retried: the subscription that was
+/// waiting on it is unregistered, its client is told why, and it is never
+/// reported complete.
+#[test]
+fn a_refused_read_unregisters_the_subscription_and_says_why() {
+    block_on(async {
+        let storage = Rc::new(Refusing(MemoryStorage::new()));
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let (service, commands) = Service::new(MultiTableIVM::new(), storage, events_tx);
+        spawn_local(service.run());
+        commands
+            .send(Command::Register {
+                client: CLIENT,
+                query: open_tickets(),
+                token: 3,
+            })
+            .await
+            .expect("send");
+        let seen = drain(&mut events).await;
+        let (_, sub) = registered(&seen).expect("the registration is named first");
+        assert_eq!(
+            shapes(&seen),
+            vec!["registered", "refused"],
+            "named, then refused, and never hydrated"
+        );
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                Event::Refused { sub: refused, reason } if *refused == sub && reason.contains("tickets")
+            )),
+            "the refusal names the subscription and the table, got {seen:?}"
         );
     });
 }

@@ -459,7 +459,11 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   A read is one simple-query batch (`BEGIN … READ ONLY; SET TRANSACTION
   SNAPSHOT; SELECT; COMMIT`), so its rows are back after one round trip, and
   a read narrowed to one join value renders that value instead of the whole
-  set it belongs to.
+  set it belongs to. A read may return at most `XYNE_SYNC_READ_ROW_LIMIT`
+  (100 000) rows; past that it is refused, the subscriptions depending on it
+  are unregistered and their clients get a `transformError` naming the
+  table, because a query without a `LIMIT` over a large table would
+  otherwise be buffered whole.
 - **Readiness.** `GET /health` answers `503` until the engine's position
   has covered the storage's first snapshot and `200` from then on; a
   connection that arrives earlier waits for that moment before any of its

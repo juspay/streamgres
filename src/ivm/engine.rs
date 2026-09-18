@@ -70,6 +70,11 @@ pub trait Engine {
     /// Remove every subscription of `client` (it disconnected).
     fn unsubscribe_client(&mut self, client: ClientId);
 
+    /// The read `fetch` will never be served: remove every subscription
+    /// that was waiting on it (all of a shared tree's) and name them with
+    /// their clients, so each can be told.
+    fn refuse(&mut self, fetch: &Fetch) -> Vec<(SubId, ClientId)>;
+
     /// Route one write to every subscription it affects, grouped per
     /// client.
     fn route(&mut self, write: &WriteQuery) -> Vec<ClientUpdate>;

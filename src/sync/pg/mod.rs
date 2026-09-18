@@ -51,7 +51,7 @@ use tokio::sync::Semaphore;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow};
 
 use super::storage::{Storage, StorageError};
-use crate::log::log_warn;
+use crate::log::{log_info, log_warn};
 use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, Lsn, SingleTableReadQuery, Snapshot,
     Value, ValueType,
@@ -70,6 +70,21 @@ const WAITING_ALIASES: usize = 2;
 /// [`PgStorage::with_read_connections`] says otherwise; further reads wait
 /// their turn instead of opening connections the server would refuse.
 const DEFAULT_READ_CONNECTIONS: usize = 16;
+
+/// The most rows one read may bring back before it is refused, unless
+/// `XYNE_SYNC_READ_ROW_LIMIT` says otherwise: a query without a `LIMIT`
+/// over a large table would otherwise be buffered whole, and one such
+/// query is enough to take the process down.
+const DEFAULT_READ_ROW_LIMIT: usize = 100_000;
+
+/// [`DEFAULT_READ_ROW_LIMIT`], or the environment's override.
+fn read_row_limit() -> usize {
+    std::env::var("XYNE_SYNC_READ_ROW_LIMIT")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_READ_ROW_LIMIT)
+}
 
 /// One minted alias: an exported snapshot and the consistent point it
 /// was built at, alive as long as the replication connection that created
@@ -171,6 +186,8 @@ struct Pool {
     catalog: Arc<Catalog>,
     idle: Mutex<Vec<Client>>,
     permits: Arc<Semaphore>,
+    /// The most rows one read may return before it is refused.
+    row_limit: usize,
     aliases: Mutex<Aliases>,
     rotation: AtomicU64,
     alive: AtomicBool,
@@ -217,6 +234,7 @@ impl PgStorage {
             catalog,
             idle: Mutex::new(vec![client]),
             permits: Arc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
+            row_limit: read_row_limit(),
             aliases: Mutex::new(Aliases::default()),
             rotation: AtomicU64::new(250),
             alive: AtomicBool::new(true),
@@ -241,6 +259,7 @@ impl PgStorage {
             catalog: self.pool.catalog.clone(),
             idle: Mutex::new(std::mem::take(&mut *self.pool.lock_idle())),
             permits: Arc::new(Semaphore::new(limit.max(1))),
+            row_limit: self.pool.row_limit,
             aliases: Mutex::new(std::mem::take(&mut *self.pool.lock_aliases())),
             rotation: AtomicU64::new(self.pool.rotation.load(Ordering::Relaxed)),
             alive: AtomicBool::new(true),
@@ -310,8 +329,25 @@ impl Storage for PgStorage {
         run_on(&self.pool.runtime, async move {
             let table = pool.table(&query)?;
             let alias = pool.current_alias()?;
-            let sql = sql::select_sql(&query, table);
+            let mut sql = sql::select_sql(&query, table);
+            if query.limit == 0 {
+                sql.push_str(&format!(" LIMIT {}", pool.row_limit + 1));
+            }
             let rows = pool.read(&alias, &sql, delay).await?;
+            if rows.len() > pool.row_limit {
+                log_warn!(
+                    "read on `{}` returned more than {} rows; refused",
+                    query.table,
+                    pool.row_limit
+                );
+                return Err(StorageError::refused(format!(
+                    "a read on `{}` returned more than {} rows",
+                    query.table, pool.row_limit
+                )));
+            }
+            if rows.len() >= pool.row_limit / 5 {
+                log_info!("read on `{}` returned {} rows", query.table, rows.len());
+            }
             let rows = rows
                 .iter()
                 .map(|row| decode_row(row, table))

@@ -21,9 +21,26 @@ use crate::model::Snapshot;
 use crate::model::{DataFrameKey, DataFrameRow, Lsn, SingleTableReadQuery, TableName, WriteQuery};
 
 /// A failed storage read; the runtime parks the read and hands it out
-/// again once the stream moves.
+/// again once the stream moves, unless the read was refused (the message
+/// begins with [`REFUSED`]): that read will never succeed, and the
+/// subscriptions depending on it are told why instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageError(pub String);
+
+/// The prefix of a refusal's message.
+pub const REFUSED: &str = "refused: ";
+
+impl StorageError {
+    /// A read that will never succeed, with the reason a client can be told.
+    pub fn refused(reason: impl Into<String>) -> Self {
+        StorageError(format!("{REFUSED}{}", reason.into()))
+    }
+
+    /// The reason, when the read was refused rather than merely failed.
+    pub fn refusal(&self) -> Option<&str> {
+        self.0.strip_prefix(REFUSED)
+    }
+}
 
 impl fmt::Display for StorageError {
     /// The message.

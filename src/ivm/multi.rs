@@ -1793,6 +1793,34 @@ impl Engine for MultiTableIVM {
         }
     }
 
+    /// Every subscription of every tree with a part reading the refused
+    /// fetch, unsubscribed.
+    fn refuse(&mut self, fetch: &Fetch) -> Vec<(SubId, ClientId)> {
+        let mut trees: Vec<TreeId> = Vec::new();
+        for inner in self.single.readers_of(fetch) {
+            if let Some((tree_id, _)) = self.parts.get(&inner)
+                && !trees.contains(tree_id)
+            {
+                trees.push(*tree_id);
+            }
+        }
+        let mut gone = Vec::new();
+        for tree_id in trees {
+            let subs = self
+                .trees
+                .get(&tree_id)
+                .map(|tree| tree.subscribers.clone())
+                .unwrap_or_default();
+            for sub in subs {
+                if let Some(client) = self.clients.get(&sub).copied() {
+                    gone.push((sub, client));
+                }
+                self.unsubscribe(sub);
+            }
+        }
+        gone
+    }
+
     /// [`MultiTableIVM::incremental_update`], grouped per client.
     fn route(&mut self, write: &WriteQuery) -> Vec<ClientUpdate> {
         let updates = self.incremental_update(write);

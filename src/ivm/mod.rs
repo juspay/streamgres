@@ -590,6 +590,18 @@ impl Engine for SingleTableIVM {
         }
     }
 
+    /// Every reader of the refused fetch, unsubscribed.
+    fn refuse(&mut self, fetch: &Fetch) -> Vec<(SubId, ClientId)> {
+        let mut gone = Vec::new();
+        for sub in self.readers_of(fetch) {
+            if let Some(client) = self.clients.get(&sub).copied() {
+                gone.push((sub, client));
+            }
+            self.unsubscribe(sub);
+        }
+        gone
+    }
+
     /// [`SingleTableIVM::incremental_update`], grouped per client.
     fn route(&mut self, write: &WriteQuery) -> Vec<ClientUpdate> {
         let updates = self.incremental_update(write);

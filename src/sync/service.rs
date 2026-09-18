@@ -99,6 +99,9 @@ impl Transaction {
 ///   the frames already held answered it). It precedes every other event
 ///   about the subscription.
 /// - `Landed`: a storage read landed, with the deltas it produced.
+/// - `Refused`: a storage read the subscription depended on was refused
+///   (it returned more rows than a read may), so the subscription is gone;
+///   `reason` is what the client can be told.
 /// - `Committed`: a transaction was applied: its deltas for this
 ///   consumer, the engine's position, the storage floor, the transaction's
 ///   writes on the watched tables, and two instants for the consumer's
@@ -117,6 +120,10 @@ pub enum Event {
     },
     Landed {
         updates: Vec<ClientUpdate>,
+    },
+    Refused {
+        sub: SubId,
+        reason: String,
     },
     Committed {
         updates: Vec<ClientUpdate>,
@@ -258,9 +265,23 @@ where
                     }
                     Some((id, Err(error))) => {
                         self.issued.remove(&id);
-                        log_warn!("storage read {} failed, parked: {error}", id.0);
-                        let step = self.runtime.failed(id);
-                        self.dispatch(step, Outcome::Nothing);
+                        if let Some(reason) = error.refusal() {
+                            log_warn!("storage read {} refused: {reason}", id.0);
+                            for (sub, client) in self.runtime.refused(id) {
+                                self.awaiting.remove(&sub);
+                                self.send_to(
+                                    client,
+                                    Event::Refused {
+                                        sub,
+                                        reason: reason.to_owned(),
+                                    },
+                                );
+                            }
+                        } else {
+                            log_warn!("storage read {} failed, parked: {error}", id.0);
+                            let step = self.runtime.failed(id);
+                            self.dispatch(step, Outcome::Nothing);
+                        }
                     }
                     None => break,
                 },
