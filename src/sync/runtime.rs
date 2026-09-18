@@ -29,6 +29,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
 use crate::ivm::{ClientUpdate, Engine, Fetch, FetchId, evaluate, order_rows};
+use crate::model::frame::SharedRow;
 use crate::model::{
     ClientId, DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
 };
@@ -113,6 +114,10 @@ impl fmt::Display for SyncStats {
 pub struct Runtime<E: Engine> {
     engine: E,
     in_flight: IdMap<FetchId, InFlight>,
+    /// The rows of landed reads, kept until [`Runtime::take_landed`] so
+    /// their freeing (an allocation per row) happens off the engine's
+    /// thread; the frames hold the ones that matter by reference.
+    landed: Vec<Vec<(DataFrameKey, DataFrameRow)>>,
     recent: VecDeque<Delivered>,
     position: Lsn,
     floor: Lsn,
@@ -125,6 +130,7 @@ impl<E: Engine> Runtime<E> {
         Runtime {
             engine,
             in_flight: IdMap::default(),
+            landed: Vec::new(),
             recent: VecDeque::new(),
             position: Lsn(0),
             floor: Lsn(0),
@@ -252,9 +258,21 @@ impl<E: Engine> Runtime<E> {
         let rows = self.bring_up(&flight.fetch, snapshot.rows, snapshot.at);
         self.stats.reads_landed += 1;
         step.updates = self.engine.land(&flight.fetch, &rows);
+        self.landed.push(rows);
         self.collect(&mut step);
         self.trim();
         step
+    }
+
+    /// [`Engine::take_dead`]: the rows dropped since the last call.
+    pub fn take_dead(&mut self) -> Vec<SharedRow> {
+        self.engine.take_dead()
+    }
+
+    /// The rows of the reads landed since the last call, to be freed
+    /// elsewhere.
+    pub fn take_landed(&mut self) -> Vec<Vec<(DataFrameKey, DataFrameRow)>> {
+        std::mem::take(&mut self.landed)
     }
 
     /// The subscriptions whose hydration may complete when read `id`

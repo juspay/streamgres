@@ -133,7 +133,7 @@ pub use window::{order_cmp, order_rows};
 
 use std::collections::{BTreeSet, HashMap};
 
-use crate::model::frame::{RowId, TableFrame};
+use crate::model::frame::{RowId, SharedRow, TableFrame};
 use crate::model::{
     DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, SingleTableReadQuery, TableName,
     WriteQuery,
@@ -196,6 +196,10 @@ pub struct SingleTableUpdate {
 ///   needed.
 /// - `next_sub`: the next subscription id to hand out; never reused.
 /// - `next_fetch`: the next read id to hand out; never reused.
+/// - `graveyard`: rows dropped since the last [`Engine::take_dead`], so
+///   that freeing them (a hash map and its strings per row) happens off
+///   the engine's thread; a release of a large subscription is otherwise
+///   spent in the allocator.
 /// - `stats`: operation counters; not part of the sync state.
 pub struct SingleTableIVM {
     select_queries: IdMap<SubId, SingleTableReadQuery>,
@@ -212,6 +216,7 @@ pub struct SingleTableIVM {
     write_epoch: u64,
     next_sub: u64,
     next_fetch: u64,
+    graveyard: Vec<SharedRow>,
     stats: IvmStats,
 }
 
@@ -253,6 +258,7 @@ impl SingleTableIVM {
             write_epoch: 0,
             next_sub: 0,
             next_fetch: 0,
+            graveyard: Vec::new(),
             stats: IvmStats::default(),
         }
     }
@@ -365,8 +371,10 @@ impl SingleTableIVM {
                     }
                 }
             }
-            if let Some(id) = frame.id_of(&key) {
-                frame.drop_if_unheld(id);
+            if let Some(id) = frame.id_of(&key)
+                && let Some(dead) = frame.take_if_unheld(id)
+            {
+                self.graveyard.push(dead);
             }
         }
 
@@ -611,6 +619,11 @@ impl Engine for SingleTableIVM {
     /// [`SingleTableIVM::readers_of`].
     fn waiting_on(&self, fetch: &Fetch) -> Vec<SubId> {
         self.readers_of(fetch)
+    }
+
+    /// The rows dropped since the last call, to be freed elsewhere.
+    fn take_dead(&mut self) -> Vec<SharedRow> {
+        std::mem::take(&mut self.graveyard)
     }
 
     /// Every reader of the refused fetch, unsubscribed.

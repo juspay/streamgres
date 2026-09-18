@@ -111,9 +111,13 @@ pub fn serve(config: Config) -> Result<(), String> {
                 )
                 .await
                 {
-                    Ok(engine) => {
+                    Ok((engine, service)) => {
                         let _ = started_tx.send(Ok(engine));
-                        std::future::pending::<()>().await;
+                        match service.await {
+                            Ok(_) => log_error!("the engine's service stopped"),
+                            Err(error) => log_error!("the engine's service panicked: {error}"),
+                        }
+                        std::process::exit(1);
                     }
                     Err(error) => {
                         let _ = started_tx.send(Err(error));
@@ -148,22 +152,27 @@ pub fn serve(config: Config) -> Result<(), String> {
                     .build()
                     .expect("groups runtime");
                 let local = tokio::task::LocalSet::new();
-                local.block_on(
-                    &runtime,
-                    groups::run(
-                        config,
-                        catalog,
-                        shard,
-                        shards,
-                        commands,
-                        events,
-                        requests_rx,
-                        requests_tx,
-                        stats,
-                        readiness,
-                    ),
-                );
-                log_error!("group thread {shard} stopped");
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    local.block_on(
+                        &runtime,
+                        groups::run(
+                            config,
+                            catalog,
+                            shard,
+                            shards,
+                            commands,
+                            events,
+                            requests_rx,
+                            requests_tx,
+                            stats,
+                            readiness,
+                        ),
+                    )
+                }));
+                match outcome {
+                    Ok(()) => log_error!("group thread {shard} stopped"),
+                    Err(_) => log_error!("group thread {shard} panicked"),
+                }
                 std::process::exit(1);
             })
             .map_err(|error| format!("group thread {shard}: {error}"))?;

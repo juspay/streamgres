@@ -392,3 +392,97 @@ fn a_refused_read_unregisters_the_subscription_and_says_why() {
         );
     });
 }
+
+/// Storage whose reads wait until the gate opens, so a read can be in
+/// flight while another registration arrives.
+struct Gated {
+    inner: MemoryStorage,
+    open: Rc<std::cell::Cell<bool>>,
+}
+
+impl Storage for Gated {
+    /// The inner read, once the gate is open.
+    async fn select(&self, query: &SingleTableReadQuery) -> Result<Snapshot, StorageError> {
+        while !self.open.get() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        self.inner.select(query).await
+    }
+
+    /// [`MemoryStorage::advance`].
+    fn advance(&self, feed: Lsn) {
+        self.inner.advance(feed)
+    }
+
+    /// [`MemoryStorage::floor`].
+    fn floor(&self) -> Lsn {
+        self.inner.floor()
+    }
+
+    /// [`MemoryStorage::absorb`].
+    fn absorb(&self, write: &WriteQuery, at: Lsn) {
+        self.inner.absorb(write, at)
+    }
+}
+
+/// A twin that registers while the first subscription's read is still
+/// out joins that read, and both are reported complete when it lands:
+/// the landing names every subscription waiting on it, not only the one
+/// that asked.
+#[test]
+fn a_twin_joining_a_read_in_flight_completes_when_it_lands() {
+    block_on(async {
+        let inner = MemoryStorage::new();
+        inner.apply(&insert(1, "OPEN"));
+        let open = Rc::new(std::cell::Cell::new(false));
+        let storage = Rc::new(Gated {
+            inner,
+            open: open.clone(),
+        });
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let (service, commands) = Service::new(MultiTableIVM::new(), storage, events_tx);
+        spawn_local(service.run());
+        for token in [1u64, 2] {
+            commands
+                .send(Command::Register {
+                    client: CLIENT,
+                    query: open_tickets(),
+                    token,
+                })
+                .await
+                .expect("send");
+        }
+        let before = drain(&mut events).await;
+        assert_eq!(
+            shapes(&before),
+            vec!["registered", "registered"],
+            "both are named and neither is complete while the read is out"
+        );
+        let subs: Vec<SubId> = before
+            .iter()
+            .filter_map(|event| match event {
+                Event::Registered { sub, .. } => Some(*sub),
+                _ => None,
+            })
+            .collect();
+        open.set(true);
+        let after = drain(&mut events).await;
+        let hydrated: Vec<SubId> = after
+            .iter()
+            .flat_map(|event| match event {
+                Event::Hydrated(subs) => subs.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert!(
+            subs.iter().all(|sub| hydrated.contains(sub)),
+            "both subscriptions complete on the one landing, got {:?} for {subs:?}",
+            shapes(&after)
+        );
+        assert!(
+            ids(&after).contains(&1),
+            "the row lands, got {:?}",
+            ids(&after)
+        );
+    });
+}

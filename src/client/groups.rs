@@ -60,8 +60,8 @@ use super::wire;
 use crate::ivm::{ClientUpdate, QueryPart};
 use crate::log::{log_debug, log_info, log_warn};
 use crate::model::{
-    Catalog, ClientId, DataFrameKey, DataFrameOperation, DataFrameRow, Lsn, MultiTableReadQuery,
-    SubId, TableName, Value, WriteQuery,
+    Catalog, ClientId, ColumnName, DataFrameKey, DataFrameOperation, DataFrameRow, Lsn,
+    MultiTableReadQuery, SubId, TableName, Value, WriteQuery,
 };
 use crate::stats::Stats;
 use crate::sync::{Command, Event};
@@ -211,6 +211,94 @@ struct QueryState {
     cold: bool,
     /// The query's name, for the error a refusal carries.
     name: String,
+    /// The reason and moment of a refusal, while a re-ask is answered
+    /// with the same error instead of a registration.
+    refused: Option<(String, Instant)>,
+}
+
+/// How long a refused query stays refused: a client asking again within
+/// this hears the reason again; after it the query is registered anew
+/// (the data or the budget may have changed).
+const REFUSAL_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// What a client group holds of one row: who shows it (subscription and
+/// part) and the image last sent, so a second holder of the same image
+/// sends nothing and a released holder deletes nothing another still
+/// shows.
+struct Held {
+    holders: HashSet<(SubId, QueryPart)>,
+    image: Arc<HashMap<ColumnName, Value>>,
+}
+
+/// Account one delta against the group's row ledger and say what the
+/// client hears: a put when the row is new to it or its image changed, a
+/// del when its last holder let go, nothing when another holder already
+/// showed the same image or still shows the row.
+fn account(
+    rows: &mut HashMap<(TableName, DataFrameKey), Held>,
+    table: TableName,
+    key: DataFrameKey,
+    image: Option<DataFrameRow>,
+    holders: HashSet<(SubId, QueryPart)>,
+) -> Option<RowOp> {
+    let slot = (table.clone(), key.clone());
+    match image {
+        Some(image) => {
+            if holders.is_empty() {
+                return None;
+            }
+            match rows.get_mut(&slot) {
+                Some(held) => {
+                    held.holders.extend(holders);
+                    if Arc::ptr_eq(&held.image, &image.data) || *held.image == *image.data {
+                        return None;
+                    }
+                    held.image = image.data.clone();
+                }
+                None => {
+                    rows.insert(
+                        slot,
+                        Held {
+                            holders,
+                            image: image.data.clone(),
+                        },
+                    );
+                }
+            }
+            Some(RowOp::Put(table, key, image))
+        }
+        None => {
+            let held = rows.get_mut(&slot)?;
+            for holder in &holders {
+                held.holders.remove(holder);
+            }
+            if held.holders.is_empty() {
+                rows.remove(&slot);
+                Some(RowOp::Del(table, key))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Every row the group shows only through `sub`, taken out of the ledger:
+/// the deletes a released subscription owes the client.
+fn release_rows(
+    rows: &mut HashMap<(TableName, DataFrameKey), Held>,
+    sub: SubId,
+) -> Vec<(TableName, DataFrameKey)> {
+    let mut emptied = Vec::new();
+    for (slot, held) in rows.iter_mut() {
+        held.holders.retain(|(holder, _)| *holder != sub);
+        if held.holders.is_empty() {
+            emptied.push(slot.clone());
+        }
+    }
+    for slot in &emptied {
+        rows.remove(slot);
+    }
+    emptied
 }
 
 /// One client group's view.
@@ -228,7 +316,7 @@ struct Group {
     subs: HashSet<SubId>,
     /// The hidden parts of each subscription, for the per-row check.
     hidden: HashMap<SubId, HashSet<QueryPart>>,
-    rows: HashMap<(TableName, DataFrameKey), HashSet<(SubId, QueryPart)>>,
+    rows: HashMap<(TableName, DataFrameKey), Held>,
     lmids: HashMap<String, i64>,
     columns: Option<Arc<Columns>>,
     queued_desired: HashMap<String, Vec<Json>>,
@@ -738,7 +826,23 @@ impl Groups {
         if let Some(state) = group.queries.get_mut(&hash) {
             state.inactive = 0;
             state.ttl = lifetime;
-            return;
+            match &state.refused {
+                Some((reason, when)) if when.elapsed() < REFUSAL_COOLDOWN => {
+                    let error = protocol::transform_error(vec![protocol::errored_query(
+                        &hash,
+                        &state.name,
+                        reason,
+                    )]);
+                    if let Some(socket) = group.sockets.get(client) {
+                        let _ = socket.sink.send(Outbound::Text(Arc::from(error)));
+                    }
+                    return;
+                }
+                Some(_) => {
+                    group.queries.remove(&hash);
+                }
+                None => return,
+            }
         }
         let Some(Ok(translated)) = planned else {
             group.queries.insert(
@@ -753,6 +857,7 @@ impl Groups {
                     since: Instant::now(),
                     cold: false,
                     name: name.to_owned(),
+                    refused: None,
                 },
             );
             return;
@@ -771,6 +876,7 @@ impl Groups {
                 since: Instant::now(),
                 cold: false,
                 name: name.to_owned(),
+                refused: None,
             },
         );
         let engine_client = group.client;
@@ -827,15 +933,7 @@ impl Groups {
         };
         group.subs.remove(&sub);
         group.hidden.remove(&sub);
-        let mut emptied = Vec::new();
-        for (key, holders) in group.rows.iter_mut() {
-            holders.retain(|(holder, _)| *holder != sub);
-            if holders.is_empty() {
-                emptied.push(key.clone());
-            }
-        }
-        for (table, key) in emptied {
-            group.rows.remove(&(table.clone(), key.clone()));
+        for (table, key) in release_rows(&mut group.rows, sub) {
             group.queued_rows.push(RowOp::Del(table, key));
         }
         let Some(state) = group.queries.get_mut(&hash) else {
@@ -847,6 +945,7 @@ impl Groups {
         state.sub = None;
         state.got = false;
         state.awaiting = 0;
+        state.refused = Some((reason.to_owned(), Instant::now()));
         let error =
             protocol::transform_error(vec![protocol::errored_query(&hash, &state.name, reason)]);
         let text: Arc<str> = Arc::from(error);
@@ -966,15 +1065,7 @@ impl Groups {
         };
         group.subs.remove(&sub);
         group.hidden.remove(&sub);
-        let mut emptied = Vec::new();
-        for (key, holders) in group.rows.iter_mut() {
-            holders.retain(|(holder, _)| *holder != sub);
-            if holders.is_empty() {
-                emptied.push(key.clone());
-            }
-        }
-        for (table, key) in emptied {
-            group.rows.remove(&(table.clone(), key.clone()));
+        for (table, key) in release_rows(&mut group.rows, sub) {
             group.queued_rows.push(RowOp::Del(table, key));
         }
         self.by_sub.remove(&sub);
@@ -1097,26 +1188,9 @@ impl Groups {
                 })
                 .map(|target| (target.sub, target.part))
                 .collect();
-            let slot = (table.clone(), key.clone());
-            if adds {
-                if holders.is_empty() {
-                    continue;
-                }
-                group.rows.insert(slot, holders);
-                if let Some(image) = image {
-                    rows.push(RowOp::Put(table, key, image));
-                }
-            } else {
-                let Some(current) = group.rows.get_mut(&slot) else {
-                    continue;
-                };
-                for holder in &holders {
-                    current.remove(holder);
-                }
-                if current.is_empty() {
-                    group.rows.remove(&slot);
-                    rows.push(RowOp::Del(table, key));
-                }
+            debug_assert!(adds == image.is_some());
+            if let Some(op) = account(&mut group.rows, table, key, image, holders) {
+                rows.push(op);
             }
         }
         let got = std::mem::take(&mut group.queued_got);
@@ -1256,4 +1330,114 @@ fn coalesce(rows: Vec<RowOp>) -> Vec<RowOp> {
         }
     }
     out.into_iter().flatten().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A holder of a row: subscription `sub`, main part.
+    fn holder(sub: u64) -> HashSet<(SubId, QueryPart)> {
+        HashSet::from([(SubId(sub), QueryPart::main())])
+    }
+
+    /// A row keyed by `id` with one `name` column.
+    fn row(id: i64, name: &str) -> (DataFrameKey, DataFrameRow) {
+        (
+            DataFrameKey::from(HashMap::from([(ColumnName::from("id"), Value::Int(id))])),
+            DataFrameRow::from(HashMap::from([
+                (ColumnName::from("id"), Value::Int(id)),
+                (ColumnName::from("name"), Value::from(name)),
+            ])),
+        )
+    }
+
+    /// A row two queries show stays on the client while either still
+    /// holds it, and the second holder's arrival sends nothing when the
+    /// image is the one already sent.
+    #[test]
+    fn a_row_stays_on_the_client_while_any_query_still_holds_it() {
+        let table = TableName::from("t");
+        let mut rows = HashMap::new();
+        let (key, image) = row(1, "a");
+        let first = account(
+            &mut rows,
+            table.clone(),
+            key.clone(),
+            Some(image.clone()),
+            holder(1),
+        );
+        assert!(
+            matches!(first, Some(RowOp::Put(..))),
+            "the first holder puts the row"
+        );
+        let second = account(
+            &mut rows,
+            table.clone(),
+            key.clone(),
+            Some(image.clone()),
+            holder(2),
+        );
+        assert!(
+            second.is_none(),
+            "the same image from a second holder sends nothing"
+        );
+        let released = account(&mut rows, table.clone(), key.clone(), None, holder(1));
+        assert!(
+            released.is_none(),
+            "the first holder letting go deletes nothing the second shows"
+        );
+        let gone = account(&mut rows, table.clone(), key.clone(), None, holder(2));
+        assert!(
+            matches!(gone, Some(RowOp::Del(..))),
+            "the last holder letting go deletes"
+        );
+        assert!(rows.is_empty());
+    }
+
+    /// A changed image is sent whoever holds the row, and a released
+    /// subscription owes exactly the rows only it showed.
+    #[test]
+    fn a_changed_image_is_sent_whoever_holds_the_row() {
+        let table = TableName::from("t");
+        let mut rows = HashMap::new();
+        let (key, image) = row(1, "a");
+        account(
+            &mut rows,
+            table.clone(),
+            key.clone(),
+            Some(image),
+            holder(1),
+        );
+        let (_, changed) = row(1, "b");
+        let again = account(
+            &mut rows,
+            table.clone(),
+            key.clone(),
+            Some(changed),
+            holder(2),
+        );
+        assert!(
+            matches!(again, Some(RowOp::Put(..))),
+            "a changed image is sent"
+        );
+        let (key2, image2) = row(2, "only two");
+        account(
+            &mut rows,
+            table.clone(),
+            key2.clone(),
+            Some(image2),
+            holder(2),
+        );
+        let owed = release_rows(&mut rows, SubId(2));
+        assert_eq!(
+            owed,
+            vec![(table.clone(), key2)],
+            "only the row nobody else shows is deleted"
+        );
+        assert!(
+            rows.contains_key(&(table, key)),
+            "the shared row stays for the first holder"
+        );
+    }
 }

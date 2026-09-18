@@ -122,14 +122,24 @@ fn epoch_millis(expr: &str) -> String {
     format!("(extract(epoch from {expr}) * 1000)::int8")
 }
 
-/// A column as the SQL its conditions compare it by: a time column
-/// through the same epoch expression the read returns it by, so a literal
-/// in milliseconds compares against milliseconds.
-fn column_expr(column: &str, table: &DbTable) -> String {
-    match table.column(column).map(|declared| &declared.r#type) {
-        Some(ValueType::Timestamp) => epoch_millis(&quote_ident(column)),
-        _ => quote_ident(column),
-    }
+/// A column as the SQL its conditions compare it by: the bare column, so
+/// an index on it answers the comparison; a time column's literal is
+/// converted instead ([`literal_as`]).
+fn column_expr(column: &str, _table: &DbTable) -> String {
+    quote_ident(column)
+}
+
+/// A literal compared against a column of `declared` type: the engine
+/// keeps a time as milliseconds since the epoch, so against a time
+/// column the number becomes the timestamp it names, and the column
+/// itself stays bare for the index.
+fn literal_as(value: &Value, declared: Option<&ValueType>) -> String {
+    let millis = match (value, declared) {
+        (Value::Int(millis), Some(ValueType::Timestamp)) => *millis,
+        (Value::Float(millis), Some(ValueType::Timestamp)) if millis.is_finite() => *millis as i64,
+        _ => return literal(value),
+    };
+    format!("(TIMESTAMP 'epoch' + {millis} * INTERVAL '1 millisecond')")
 }
 
 /// A double-quoted identifier.
@@ -164,6 +174,9 @@ fn render_where(filter: &Where, table: &DbTable) -> String {
 fn render_condition(condition: &Condition, table: &DbTable) -> String {
     use ComparisonOperator::*;
     let column = column_expr(condition.column.as_str(), table);
+    let declared = table
+        .column(condition.column.as_str())
+        .map(|declared| &declared.r#type);
     match condition.comparison_operator {
         IN | NOT_IN => {
             let members = members_of(&condition.value);
@@ -174,7 +187,7 @@ fn render_condition(condition: &Condition, table: &DbTable) -> String {
             let literals: Vec<String> = members
                 .iter()
                 .filter(|value| !value.is_null())
-                .map(literal)
+                .map(|value| literal_as(value, declared))
                 .collect();
             if literals.is_empty() {
                 return if negated { "TRUE" } else { "FALSE" }.to_owned();
@@ -187,12 +200,12 @@ fn render_condition(condition: &Condition, table: &DbTable) -> String {
         IS_NOT if condition.value.is_null() => format!("{column} IS NOT NULL"),
         _ if condition.value.is_null() => "FALSE".to_owned(),
         IS | IS_NOT => "FALSE".to_owned(),
-        EQ => format!("{column} = {}", literal(&condition.value)),
-        NEQ => format!("{column} <> {}", literal(&condition.value)),
-        GT => format!("{column} > {}", literal(&condition.value)),
-        GTE => format!("{column} >= {}", literal(&condition.value)),
-        LT => format!("{column} < {}", literal(&condition.value)),
-        LTE => format!("{column} <= {}", literal(&condition.value)),
+        EQ => format!("{column} = {}", literal_as(&condition.value, declared)),
+        NEQ => format!("{column} <> {}", literal_as(&condition.value, declared)),
+        GT => format!("{column} > {}", literal_as(&condition.value, declared)),
+        GTE => format!("{column} >= {}", literal_as(&condition.value, declared)),
+        LT => format!("{column} < {}", literal_as(&condition.value, declared)),
+        LTE => format!("{column} <= {}", literal_as(&condition.value, declared)),
     }
 }
 
@@ -276,6 +289,79 @@ mod tests {
     /// is FALSE.
     /// The null tests render as SQL's own; an `IS` with another operand
     /// is never true.
+    /// A leaf is the bare comparison PostgreSQL can serve from an index:
+    /// nothing wraps it, and a count takes an `EXISTS` leaf (an inner
+    /// edge yet to be placed) as true, so it is an upper bound.
+    #[test]
+    fn leaves_are_bare_and_a_count_assumes_exists() {
+        let query = SingleTableReadQuery::new(
+            crate::model::TableName::from("tickets"),
+            Where::AND(vec![
+                Where::condition("status", ComparisonOperator::EQ, "OPEN"),
+                Where::Condition(Condition::new(
+                    "team",
+                    ComparisonOperator::EXISTS,
+                    Value::Int(1),
+                )),
+            ]),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        );
+        let sql = select_sql(&query, &tickets());
+        assert!(!sql.contains("IS TRUE"), "{sql}");
+        assert!(sql.contains("(\"status\" = 'OPEN' AND FALSE)"), "{sql}");
+        let count = count_sql(&query, &tickets(), 100);
+        assert!(!count.contains("IS TRUE"), "{count}");
+        assert!(
+            count.contains("WHERE (\"status\" = 'OPEN') LIMIT 100")
+                || count.contains("WHERE \"status\" = 'OPEN' LIMIT 100"),
+            "the EXISTS leaf is taken as true in the count: {count}"
+        );
+    }
+
+    /// A time condition compares the bare column against the timestamp
+    /// the millisecond literal names, so an index on the column answers
+    /// it; the projection still returns milliseconds.
+    #[test]
+    fn a_time_condition_compares_the_column_itself() {
+        let table = DbTable::new(
+            "events",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("createdAt", ValueType::Timestamp),
+            ],
+        );
+        let query = SingleTableReadQuery::new(
+            crate::model::TableName::from("events"),
+            Where::AND(vec![
+                Where::condition("createdAt", ComparisonOperator::GT, 1_750_000_000_000i64),
+                Where::Condition(Condition::new(
+                    "createdAt",
+                    ComparisonOperator::IN,
+                    Value::List(vec![Value::Int(1_000), Value::Float(2_000.0)]),
+                )),
+            ]),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        );
+        let sql = select_sql(&query, &table);
+        assert!(
+            sql.contains(
+                "\"createdAt\" > (TIMESTAMP 'epoch' + 1750000000000 * INTERVAL '1 millisecond')"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("\"createdAt\" IN ((TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond'), (TIMESTAMP 'epoch' + 2000 * INTERVAL '1 millisecond'))"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("(extract(epoch from \"createdAt\") * 1000)::int8"),
+            "the projection still reads milliseconds: {sql}"
+        );
+    }
+
     #[test]
     fn renders_null_tests() {
         let query = SingleTableReadQuery::new(

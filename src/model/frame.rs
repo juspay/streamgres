@@ -260,15 +260,40 @@ impl TableFrame {
     /// Drop the row under `id` if no subscription holds it; reports
     /// whether it was dropped. The id is retired.
     pub fn drop_if_unheld(&mut self, id: RowId) -> bool {
+        self.take_if_unheld(id).is_some()
+    }
+
+    /// `sub` lets go of the row under `id`: untag it, and if no
+    /// subscription holds it any more take it out (the id retired) and
+    /// hand it back, so a caller releasing many rows can free them off
+    /// the engine's thread. One lookup per row.
+    pub fn release(&mut self, id: RowId, sub: SubId) -> Option<SharedRow> {
+        let row = self.rows.get_mut(&id)?;
+        row.subscribers.remove(&sub);
+        if !row.subscribers.is_empty() {
+            return None;
+        }
+        let row = self.rows.remove(&id)?;
+        self.ids.remove(&row.key);
+        self.unindex_row(id, &row.data);
+        Some(row)
+    }
+
+    /// [`TableFrame::drop_if_unheld`], handing the row out instead of
+    /// freeing it, so a caller releasing many rows can free them off the
+    /// engine's thread. The id is retired either way.
+    pub fn take_if_unheld(&mut self, id: RowId) -> Option<SharedRow> {
         let unheld = self
             .rows
             .get(&id)
             .is_some_and(|row| row.subscribers.is_empty());
-        if unheld && let Some(row) = self.rows.remove(&id) {
-            self.ids.remove(&row.key);
-            self.unindex_row(id, &row.data);
+        if !unheld {
+            return None;
         }
-        unheld
+        let row = self.rows.remove(&id)?;
+        self.ids.remove(&row.key);
+        self.unindex_row(id, &row.data);
+        Some(row)
     }
 
     /// Index `column` by value from now on (and over the rows already

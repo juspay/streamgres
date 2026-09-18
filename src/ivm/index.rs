@@ -92,6 +92,9 @@ struct Linked {
 ///   window maintenance as the boundary value moves. Kept beside the
 ///   disjuncts, never inside them: it changes with every admission and
 ///   would otherwise churn the counting structures.
+/// - `by_subscriber`: each subscription's non-empty disjuncts, so that
+///   releasing or editing one subscription touches its own counters and
+///   not every counter of the table.
 #[derive(Default)]
 pub(super) struct TableIndex {
     by_condition: HashMap<Condition, Linked>,
@@ -99,6 +102,7 @@ pub(super) struct TableIndex {
     by_disjunct: HashMap<Disjunct, SharedCounter>,
     unconditional: Vec<SubId>,
     boundaries: IdMap<SubId, Where>,
+    by_subscriber: IdMap<SubId, Vec<Disjunct>>,
 }
 
 impl TableIndex {
@@ -136,9 +140,17 @@ impl TableIndex {
             let mut counter = existing.borrow_mut();
             if !counter.subscribers.contains(&subscriber) {
                 counter.subscribers.push(subscriber);
+                self.by_subscriber
+                    .entry(subscriber)
+                    .or_default()
+                    .push(disjunct);
             }
             return 0;
         }
+        self.by_subscriber
+            .entry(subscriber)
+            .or_default()
+            .push(disjunct.clone());
         let counter = Rc::new(RefCell::new(DisjunctCounter {
             size: disjunct.conditions.len(),
             epoch: 0,
@@ -196,6 +208,12 @@ impl TableIndex {
     /// Detach `subscriber` from one disjunct, dropping the counter and its
     /// condition links once no subscriber remains.
     fn detach(&mut self, disjunct: &Disjunct, subscriber: SubId) {
+        if let Some(own) = self.by_subscriber.get_mut(&subscriber) {
+            own.retain(|candidate| candidate != disjunct);
+            if own.is_empty() {
+                self.by_subscriber.remove(&subscriber);
+            }
+        }
         let Some(shared) = self.by_disjunct.get(disjunct) else {
             return;
         };
@@ -233,14 +251,15 @@ impl TableIndex {
         stats: &mut IvmStats,
     ) {
         let affected: Vec<Disjunct> = self
-            .by_disjunct
-            .iter()
-            .filter(|(disjunct, shared)| {
-                disjunct.conditions.contains(old)
-                    && shared.borrow().subscribers.contains(&subscriber)
+            .by_subscriber
+            .get(&subscriber)
+            .map(|own| {
+                own.iter()
+                    .filter(|disjunct| disjunct.conditions.contains(old))
+                    .cloned()
+                    .collect()
             })
-            .map(|(disjunct, _)| disjunct.clone())
-            .collect();
+            .unwrap_or_default();
         for old_disjunct in affected {
             stats.conditions_replaced += 1;
             self.detach(&old_disjunct, subscriber);
@@ -296,13 +315,16 @@ impl TableIndex {
             .retain(|candidate| *candidate != subscriber);
         self.boundaries.remove(&subscriber);
         let mut dead_disjuncts: Vec<Disjunct> = Vec::new();
-        for (disjunct, counter) in &self.by_disjunct {
+        for disjunct in self.by_subscriber.remove(&subscriber).unwrap_or_default() {
+            let Some(counter) = self.by_disjunct.get(&disjunct) else {
+                continue;
+            };
             let mut counter = counter.borrow_mut();
             counter
                 .subscribers
                 .retain(|candidate| *candidate != subscriber);
             if counter.subscribers.is_empty() {
-                dead_disjuncts.push(disjunct.clone());
+                dead_disjuncts.push(disjunct);
             }
         }
         for disjunct in &dead_disjuncts {

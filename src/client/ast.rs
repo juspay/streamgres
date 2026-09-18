@@ -352,6 +352,9 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
             Some(int) => Value::Int(int),
             None => Value::Float(number.as_f64().unwrap_or(f64::NAN)),
         },
+        (Json::String(text), _) if text.contains('\0') => {
+            return Err("a text value contains a NUL byte".to_owned());
+        }
         (Json::String(text), ValueType::Int | ValueType::Timestamp) => text
             .parse::<i64>()
             .map(Value::Int)
@@ -580,6 +583,19 @@ mod tests {
     }
 
     /// What the engine cannot run is refused by name.
+    /// A text argument with a NUL byte is refused at translation: the
+    /// database's text cannot hold it, and a read carrying it would fail
+    /// on every attempt.
+    #[test]
+    fn refuses_a_nul_byte_in_a_text_argument() {
+        let nul: Ast = serde_json::from_str(r#"{"table": "messages", "where": {"type": "simple", "op": "=", "left": {"type": "column", "name": "visibleTo"}, "right": {"type": "literal", "value": "a\u0000b"}}}"#).unwrap();
+        assert!(
+            translate(&nul, &catalog())
+                .unwrap_err()
+                .contains("NUL byte")
+        );
+    }
+
     #[test]
     fn refuses_what_it_cannot_run() {
         let like: Ast = serde_json::from_str(r#"{"table": "messages", "where": {"type": "simple", "op": "ILIKE", "left": {"type": "column", "name": "visibleTo"}, "right": {"type": "literal", "value": "%x%"}}}"#).unwrap();

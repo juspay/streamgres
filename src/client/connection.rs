@@ -21,11 +21,12 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, Utf8Bytes, WebSocket, WebSocketUpgrade, close_code};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use axum::serve::ListenerExt;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value as Json, json};
@@ -99,12 +100,61 @@ struct ConnectParams {
 /// histograms after reading them, so a load run measures itself alone).
 pub fn router(state: Arc<AppState>) -> Router {
     let base = state.config.base_path.clone();
-    Router::new()
-        .route(&format!("{base}/sync/v{{version}}/connect"), get(connect))
-        .route(&format!("{base}/health"), get(health))
-        .route("/health", get(health))
-        .route("/stats", get(stats))
-        .with_state(state)
+    let mut router =
+        Router::new().route(&format!("{base}/sync/v{{version}}/connect"), get(connect));
+    for probe in ["health", "healthz", "readyz"] {
+        router = router
+            .route(&format!("{base}/{probe}"), get(health))
+            .route(&format!("/{probe}"), get(health));
+    }
+    router.route("/stats", get(stats)).with_state(state)
+}
+
+/// How long the listener waits for the sockets to close after a
+/// shutdown signal before returning anyway.
+const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// The window over which the goodbyes are spread, so a thousand clients
+/// do not reconnect in the same instant.
+const DRAIN_STAGGER_MS: u64 = 3_000;
+
+/// The one flag every writer watches: flipped by the first shutdown
+/// signal, never unflipped.
+fn shutdown() -> &'static watch::Sender<bool> {
+    static FLAG: std::sync::OnceLock<watch::Sender<bool>> = std::sync::OnceLock::new();
+    FLAG.get_or_init(|| watch::channel(false).0)
+}
+
+/// Resolves on ctrl-c or, on unix, `SIGTERM` (what `docker stop` sends).
+async fn signalled() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(terminate) => terminate,
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Where in the stagger window this connection says goodbye: a hash of
+/// its id, so the spread is even and needs no coordination.
+fn goodbye_after(wsid: &str) -> Duration {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    wsid.hash(&mut hasher);
+    Duration::from_millis(hasher.finish() % DRAIN_STAGGER_MS)
 }
 
 /// Bind and serve until ctrl-c.
@@ -112,18 +162,37 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
     let address = state.config.bind.clone();
     let listener = tokio::net::TcpListener::bind(&address)
         .await
-        .map_err(|error| format!("binding {address}: {error}"))?;
+        .map_err(|error| format!("binding {address}: {error}"))?
+        .tap_io(|socket| {
+            if let Err(error) = socket.set_nodelay(true) {
+                log_warn!("TCP_NODELAY could not be set on a client socket: {error}");
+            }
+        });
     log_info!(
         "listening on http://{address}{}/sync/v{PROTOCOL_VERSION}/connect",
         state.config.base_path
     );
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            log_info!("shutting down");
-        })
-        .await
-        .map_err(|error| format!("serving: {error}"))
+    let serving = axum::serve(listener, router(state)).with_graceful_shutdown(async {
+        signalled().await;
+        log_info!("shutting down: closing the clients, {DRAIN_GRACE:?} at most");
+        shutdown().send_replace(true);
+    });
+    let grace = async {
+        let mut flag = shutdown().subscribe();
+        while !*flag.borrow() {
+            if flag.changed().await.is_err() {
+                return;
+            }
+        }
+        tokio::time::sleep(DRAIN_GRACE).await;
+    };
+    tokio::select! {
+        result = serving => result.map_err(|error| format!("serving: {error}")),
+        _ = grace => {
+            log_warn!("drain grace elapsed with sockets still open; exiting");
+            Ok(())
+        }
+    }
 }
 
 /// Ready, or not yet: the status the health check answers with.
@@ -233,7 +302,13 @@ async fn handle(
     let (sink, stream) = socket.split();
     let (out, out_rx) = mpsc::unbounded_channel::<Outbound>();
     let pong_interval = state.config.pong_interval;
-    let writer = tokio::spawn(write_loop(sink, out_rx, pong_interval, state.stats.clone()));
+    let writer = tokio::spawn(write_loop(
+        sink,
+        out_rx,
+        pong_interval,
+        state.stats.clone(),
+        params.wsid.clone(),
+    ));
     let wsid = params.wsid.clone();
     let group_id = params.group_id.clone();
     if version != PROTOCOL_VERSION {
@@ -352,12 +427,26 @@ async fn write_loop(
     mut frames: mpsc::UnboundedReceiver<Outbound>,
     pong_interval: Duration,
     stats: Arc<Stats>,
+    wsid: String,
 ) {
     let mut last_sent = Instant::now();
     let mut idle = tokio::time::interval(pong_interval.max(Duration::from_millis(100)));
     idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut shutting_down = shutdown().subscribe();
     loop {
         tokio::select! {
+            changed = shutting_down.changed(), if !*shutting_down.borrow() => {
+                if changed.is_ok() && *shutting_down.borrow() {
+                    tokio::time::sleep(goodbye_after(&wsid)).await;
+                    let _ = sink
+                        .send(Message::Close(Some(CloseFrame {
+                            code: close_code::AWAY,
+                            reason: Utf8Bytes::from_static("server shutting down"),
+                        })))
+                        .await;
+                    break;
+                }
+            }
             frame = frames.recv() => match frame {
                 Some(Outbound::Text(text)) => {
                     if sink.send(Message::Text(Utf8Bytes::from(&*text))).await.is_err() {

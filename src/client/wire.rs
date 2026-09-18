@@ -78,6 +78,9 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
         Value::Int(int) => {
             let _ = write!(out, "{int}");
         }
+        Value::Float(float) if whole(*float) => {
+            let _ = write!(out, "{}", *float as i64);
+        }
         Value::Float(float) => {
             if serde_json::to_writer(&mut *out, float).is_err() {
                 out.extend_from_slice(b"null");
@@ -156,6 +159,7 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
             _ => Json::String(text.clone()),
         },
         Value::Int(int) => Json::from(*int),
+        Value::Float(float) if whole(*float) => Json::from(*float as i64),
         Value::Float(float) => {
             serde_json::Number::from_f64(*float).map_or(Json::Null, Json::Number)
         }
@@ -191,11 +195,40 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
     }
 }
 
+/// Whether a float is a whole number a JSON integer holds exactly, so
+/// it is written as `1`, not `1.0`: zero-cache writes such values as
+/// integers, and a client comparing rows byte for byte sees no
+/// difference.
+fn whole(float: f64) -> bool {
+    float.fract() == 0.0 && float.abs() < 9_007_199_254_740_992.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{DbColumn, DbTable};
     use std::collections::HashMap;
+
+    /// A whole-valued float is written as an integer on both paths, a
+    /// fractional one as it is, and a NaN as null.
+    #[test]
+    fn whole_floats_are_written_as_integers() {
+        let mut out = Vec::new();
+        write_value(&mut out, &Value::Float(1.0), None);
+        assert_eq!(out, b"1");
+        out.clear();
+        write_value(&mut out, &Value::Float(-4.0), None);
+        assert_eq!(out, b"-4");
+        out.clear();
+        write_value(&mut out, &Value::Float(1.5), None);
+        assert_eq!(out, b"1.5");
+        out.clear();
+        write_value(&mut out, &Value::Float(f64::NAN), None);
+        assert_eq!(out, b"null");
+        assert_eq!(value_json(&Value::Float(1.0), None), serde_json::json!(1));
+        assert_eq!(value_json(&Value::Float(1.5), None), serde_json::json!(1.5));
+        assert!(!whole(1e17), "beyond 2^53 a float is left as it is");
+    }
 
     /// JSON columns are embedded, times are numbers, and the client's
     /// schema filters the columns.

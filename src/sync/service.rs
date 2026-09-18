@@ -32,7 +32,8 @@ use super::runtime::{Runtime, Step};
 use super::storage::{Storage, StorageError};
 use crate::ivm::{ClientUpdate, Engine, Fetch, FetchId};
 use crate::log::log_warn;
-use crate::model::{ClientId, IdMap, Lsn, Snapshot, SubId, WriteQuery};
+use crate::model::frame::SharedRow;
+use crate::model::{ClientId, DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, WriteQuery};
 use crate::stats::Stats;
 
 /// What a client of the service can ask.
@@ -173,6 +174,10 @@ pub struct Service<E: Engine, S: Storage> {
     /// When every awaited subscription was last checked for completion;
     /// the checks otherwise touch only what a step could have completed.
     swept: Instant,
+    /// The thread that frees dropped rows and landed batches, so a
+    /// release of a large subscription or the landing of a large read
+    /// costs the engine its bookkeeping and not the allocator's work.
+    reaper: std::sync::mpsc::Sender<Dead>,
     results: mpsc::UnboundedReceiver<(FetchId, Result<Snapshot, StorageError>)>,
     report: mpsc::UnboundedSender<(FetchId, Result<Snapshot, StorageError>)>,
 }
@@ -202,6 +207,7 @@ where
             awaiting: IdMap::default(),
             issued: IdMap::default(),
             swept: Instant::now(),
+            reaper: spawn_reaper(),
             results,
             report,
         };
@@ -268,6 +274,7 @@ where
                         }
                         self.dispatch(step, Outcome::Landed);
                         self.settle(&waiting);
+                        self.reap();
                     }
                     Some((id, Err(error))) => {
                         self.issued.remove(&id);
@@ -326,6 +333,7 @@ where
                 let started = Instant::now();
                 self.runtime.unregister(sub);
                 self.awaiting.remove(&sub);
+                self.reap();
                 if let Some(stats) = &self.stats {
                     stats.unregister_step.record(started.elapsed());
                 }
@@ -334,6 +342,7 @@ where
                 let started = Instant::now();
                 self.runtime.unregister_client(client);
                 self.awaiting.retain(|_, owner| *owner != client);
+                self.reap();
                 if let Some(stats) = &self.stats {
                     stats.unregister_step.record(started.elapsed());
                 }
@@ -389,6 +398,21 @@ where
                 routed,
             },
         );
+        self.reap();
+    }
+
+    /// Hand the rows the engine dropped, and the batches it landed, to
+    /// the reaper thread.
+    fn reap(&mut self) {
+        let dead = self.runtime.take_dead();
+        if !dead.is_empty() {
+            let _ = self.reaper.send(Dead::Rows(dead));
+        }
+        for batch in self.runtime.take_landed() {
+            if !batch.is_empty() {
+                let _ = self.reaper.send(Dead::Landed(batch));
+            }
+        }
     }
 
     /// The sink that owns `client`.
@@ -538,4 +562,33 @@ async fn recv_transactions(
         Some(feed) => feed.recv_many(buffer, 64).await,
         None => std::future::pending().await,
     }
+}
+
+/// What the reaper frees: rows whose last holder let go, and the row
+/// batches of landed reads.
+enum Dead {
+    Rows(Vec<SharedRow>),
+    Landed(Vec<(DataFrameKey, DataFrameRow)>),
+}
+
+/// Start the thread that frees dropped rows and return its inlet; the
+/// thread ends when the last sender is gone.
+fn spawn_reaper() -> std::sync::mpsc::Sender<Dead> {
+    let (sender, receiver) = std::sync::mpsc::channel::<Dead>();
+    let spawned = std::thread::Builder::new()
+        .name("xyne-sync-reaper".to_owned())
+        .spawn(move || {
+            while let Ok(batch) = receiver.recv() {
+                match batch {
+                    Dead::Rows(rows) => drop(rows),
+                    Dead::Landed(rows) => drop(rows),
+                }
+            }
+        });
+    if let Err(error) = spawned {
+        log_warn!(
+            "the reaper thread could not start ({error}); rows are freed on the engine thread"
+        );
+    }
+    sender
 }

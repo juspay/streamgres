@@ -467,11 +467,19 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   are unregistered and their clients get a `transformError` naming the
   table, because a query without a `LIMIT` over a large table would
   otherwise be buffered whole.
-- **Readiness.** `GET /health` answers `503` until the engine's position
-  has covered the storage's first snapshot and `200` from then on; a
-  connection that arrives earlier waits for that moment before any of its
-  queries is planned, so a client never sees a refusal for having been
-  first.
+- **Readiness and shutdown.** `GET /health` (also `/healthz` and
+  `/readyz`) answers `503` until the engine's position has covered the
+  storage's first snapshot and `200` from then on; a connection that
+  arrives earlier waits for that moment before any of its queries is
+  planned, so a client never sees a refusal for having been first. On
+  `SIGTERM` or ctrl-c the listener stops, every client is closed with
+  `1001` (going away) spread over three seconds, and the process exits
+  once the sockets are gone or after five seconds; a panic in the engine
+  or a group thread ends the process instead of leaving a listener with
+  no engine behind it. Client sockets run with `TCP_NODELAY`, since a
+  poke is several frames and Nagle's algorithm with delayed
+  acknowledgements would hold the later ones back by tens of
+  milliseconds.
 - **Measurements.** `GET /stats` serves the server's own clock on every
   stage (feed to engine, the engine's step, engine to groups, the flush,
   groups to socket, and end to end inside the server, as p50/p90/p99 in

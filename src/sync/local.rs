@@ -13,6 +13,7 @@ use std::task::{Context, Poll, Waker};
 use super::runtime::{Runtime, Step};
 use super::storage::Storage;
 use crate::ivm::{ClientUpdate, Engine};
+use crate::model::frame::SharedRow;
 use crate::model::{ClientId, Lsn, SubId, WriteQuery};
 
 /// A runtime over an engine and an immediately-answering storage.
@@ -47,14 +48,18 @@ impl<E: Engine, S: Storage> Local<E, S> {
         (sub, self.settle(step))
     }
 
-    /// Remove a subscription.
-    pub fn unregister_query(&mut self, sub: SubId) {
+    /// Remove a subscription; the rows only it held come back to be freed
+    /// by the caller (the server frees them off the engine's thread).
+    pub fn unregister_query(&mut self, sub: SubId) -> Vec<SharedRow> {
         self.runtime.unregister(sub);
+        self.runtime.take_dead()
     }
 
-    /// Remove every subscription of `client`.
-    pub fn unregister_client(&mut self, client: ClientId) {
+    /// Remove every subscription of `client`; the rows only they held
+    /// come back to be freed by the caller.
+    pub fn unregister_client(&mut self, client: ClientId) -> Vec<SharedRow> {
         self.runtime.unregister_client(client);
+        self.runtime.take_dead()
     }
 
     /// Route one write at the next tick of the driver's clock and return

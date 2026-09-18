@@ -24,7 +24,7 @@ use crate::ivm::MultiTableIVM;
 use crate::log::{log_error, log_info, log_warn};
 use crate::model::{Catalog, MultiTableReadQuery, TableName};
 use crate::stats::Stats;
-use crate::sync::{Command, Event, Service, Sources, Transaction};
+use crate::sync::{Command, Event, Runtime, Service, Sources, Transaction};
 
 /// How the engine side reaches its database.
 ///
@@ -61,6 +61,11 @@ pub struct Started {
     pub events: Vec<mpsc::UnboundedReceiver<Event>>,
     pub storage: Arc<PgStorage>,
 }
+
+/// The service's task, kept on the engine thread: it resolves only when
+/// the service stops or panics, and a server with no engine must not
+/// keep listening.
+pub type ServiceTask = tokio::task::JoinHandle<Runtime<MultiTableIVM>>;
 
 /// Load the catalog of `schemas` over a connection of its own.
 pub async fn load_catalog_at(dsn: &str, schemas: &[String]) -> Result<Catalog, String> {
@@ -156,7 +161,7 @@ pub async fn start(
     reads: tokio::runtime::Handle,
     consumers: usize,
     stats: Arc<Stats>,
-) -> Result<Started, String> {
+) -> Result<(Started, ServiceTask), String> {
     let pg = PgStorage::connect_on(&settings.dsn, catalog.clone(), reads)
         .await
         .map_err(|error| format!("connecting the storage: {error}"))?
@@ -177,16 +182,19 @@ pub async fn start(
         .unzip();
     let first = sinks[0].clone();
     let (service, commands) = Service::new(MultiTableIVM::new(), storage, first);
-    spawn_local(
+    let service = spawn_local(
         service
             .with_feed(feed)
             .with_sinks(sinks)
             .with_stats(stats)
             .run(),
     );
-    Ok(Started {
-        commands,
-        events,
-        storage: pg,
-    })
+    Ok((
+        Started {
+            commands,
+            events,
+            storage: pg,
+        },
+        service,
+    ))
 }

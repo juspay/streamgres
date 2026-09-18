@@ -188,11 +188,12 @@ impl SingleTableIVM {
         let Some(query) = self.select_queries.remove(&sub) else {
             return;
         };
-        self.pending.remove(&sub);
-        self.readers.retain(|_, readers| {
-            readers.retain(|reader| *reader != sub);
-            !readers.is_empty()
-        });
+        if self.pending.remove(&sub).is_some() {
+            self.readers.retain(|_, readers| {
+                readers.retain(|reader| *reader != sub);
+                !readers.is_empty()
+            });
+        }
         let readers = &self.readers;
         self.requests.retain_mut(|fetch| {
             if fetch.sub != sub {
@@ -226,10 +227,9 @@ impl SingleTableIVM {
         let ids = self.held.remove(&sub).unwrap_or_default();
         if let Some(frame) = self.frames.get_mut(&query.table) {
             for id in ids {
-                if let Some(row) = frame.row_mut(id) {
-                    row.subscribers.remove(&sub);
+                if let Some(dead) = frame.release(id, sub) {
+                    self.graveyard.push(dead);
                 }
-                frame.drop_if_unheld(id);
             }
         }
     }

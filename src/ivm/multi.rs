@@ -144,6 +144,7 @@ use super::predicate::evaluate_with;
 use super::stats::IvmStats;
 use super::update::{Raw, Target, group};
 use super::{ClientUpdate, Engine, Fetch, QueryPart, SingleTableIVM, SingleTableUpdate};
+use crate::model::frame::SharedRow;
 use crate::model::{
     ClientId, ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameOperation,
     DataFrameRow, Driver, IdMap, Join, MultiTableReadQuery, SharedSet, SingleTableReadQuery, SubId,
@@ -1804,6 +1805,11 @@ impl Engine for MultiTableIVM {
             self.clients.remove(&sub);
             self.unregister_query(sub);
         }
+    }
+
+    /// [`SingleTableIVM::take_dead`] of the inner engine.
+    fn take_dead(&mut self) -> Vec<SharedRow> {
+        self.single.take_dead()
     }
 
     /// Every subscription of every tree with a part reading the fetch.

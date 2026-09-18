@@ -119,6 +119,8 @@ const ROUTING_UPDATES: usize = 20_000;
 const TWIN_ROWS: usize = 20_000;
 const TWIN_COPIES: usize = 1_000;
 const TWIN_STORAGE_SAMPLES: usize = 10;
+const RELEASE_ROWS: usize = 200_000;
+const RELEASE_SUBS: usize = 5_000;
 
 const WINDOW_ROWS: usize = 100_000;
 const WINDOW_LIMIT: u32 = 50;
@@ -1379,20 +1381,126 @@ fn main() {
         users_table().name
     );
     let started = Instant::now();
-    routing_and_registration();
-    twin_sharing();
-    window();
-    left_join();
-    xyne_spaces();
-    match std::env::var("XYNE_SYNC_PG_DSN") {
-        Ok(dsn) => postgres(&dsn),
-        Err(_) => println!(
-            "\n== 5. postgres: skipped (set XYNE_SYNC_PG_DSN to a database with wal_level = logical) =="
-        ),
+    if wanted("routing") {
+        routing_and_registration();
+    }
+    if wanted("twins") {
+        twin_sharing();
+    }
+    if wanted("release") {
+        release_cost();
+    }
+    if wanted("window") {
+        window();
+    }
+    if wanted("join") {
+        left_join();
+    }
+    if wanted("xyne") {
+        xyne_spaces();
+    }
+    if wanted("postgres") {
+        match std::env::var("XYNE_SYNC_PG_DSN") {
+            Ok(dsn) => postgres(&dsn),
+            Err(_) => println!(
+                "\n== 5. postgres: skipped (set XYNE_SYNC_PG_DSN to a database with wal_level = logical) =="
+            ),
+        }
     }
     println!(
         "\ntotal wall time: {}s",
         one(started.elapsed().as_secs_f64())
+    );
+}
+
+/// Whether scenario `name` runs: every scenario unless
+/// `XYNE_SYNC_BENCH_ONLY` names some (comma-separated: `routing`,
+/// `twins`, `release`, `window`, `join`, `xyne`, `postgres`).
+fn wanted(name: &str) -> bool {
+    std::env::var("XYNE_SYNC_BENCH_ONLY")
+        .map(|only| only.split(',').any(|scenario| scenario.trim() == name))
+        .unwrap_or(true)
+}
+
+/// Scenario 2c: what releasing a subscription costs the engine. 1 000
+/// subscriptions with distinct filters (`team = t AND points >= p`) over
+/// 20 000 tickets, each holding a few hundred rows shared with the
+/// others on its team; every fifth is released first, while the others
+/// still hold most of its rows, then the rest, whose release drops the
+/// rows nobody holds any more.
+fn release_cost() {
+    println!(
+        "\n== 2c. release cost ({RELEASE_SUBS} distinct subscriptions over {RELEASE_ROWS} tickets; every fifth released first, then the rest) =="
+    );
+    let mut rng = XorShift64::new(SEED ^ 5);
+    let tickets_table = tickets_table();
+    let storage = Rc::new(BenchStorage::default());
+    for id in 0..RELEASE_ROWS {
+        storage.apply(&Ticket::random(&mut rng, id as i64).insert());
+    }
+    let mut ivm: Single = Local::new(SingleTableIVM::new(), storage.clone());
+    let mut subs = Vec::with_capacity(RELEASE_SUBS);
+    let mut held = 0usize;
+    let started = Instant::now();
+    for i in 0..RELEASE_SUBS {
+        let team = (i % TEAMS as usize) as i64;
+        let points = ((i / TEAMS as usize) % POINTS_RANGE as usize) as i64;
+        let query = unbounded(
+            &tickets_table,
+            Where::AND(vec![
+                Where::condition("team", EQ, team),
+                Where::condition("points", GTE, points),
+            ]),
+        );
+        let (sub, ops) = ivm.register_query(client(), query);
+        held += ops.len();
+        subs.push(sub);
+    }
+    let registered = started.elapsed();
+    let time_releases = |ivm: &mut Single, pick: &dyn Fn(usize) -> bool| {
+        let mut engine = Duration::ZERO;
+        let mut freeing = Duration::ZERO;
+        let mut worst = Duration::ZERO;
+        let mut count = 0usize;
+        for (index, sub) in subs.iter().enumerate() {
+            if pick(index) {
+                let started = Instant::now();
+                let dead = ivm.unregister_query(*sub);
+                let took = started.elapsed();
+                let freed = Instant::now();
+                drop(dead);
+                freeing += freed.elapsed();
+                engine += took;
+                worst = worst.max(took);
+                count += 1;
+            }
+        }
+        let per = |total: Duration| total.as_secs_f64() * 1e6 / count.max(1) as f64;
+        (per(engine), per(freeing), worst)
+    };
+    let (shared_us, shared_free, shared_worst) = time_releases(&mut ivm, &|index| index % 5 == 0);
+    let (last_us, last_free, last_worst) = time_releases(&mut ivm, &|index| index % 5 != 0);
+    print_table(
+        &[
+            "subs",
+            "rows held/sub",
+            "us/register",
+            "us/release (others hold)",
+            "worst",
+            "us/release (last holder)",
+            "worst",
+            "us freeing (off-thread in the server)",
+        ],
+        &[vec![
+            RELEASE_SUBS.to_string(),
+            (held / RELEASE_SUBS).to_string(),
+            one(registered.as_secs_f64() * 1e6 / RELEASE_SUBS as f64),
+            one(shared_us),
+            format!("{}us", shared_worst.as_micros()),
+            one(last_us),
+            format!("{}us", last_worst.as_micros()),
+            format!("{} / {}", one(shared_free), one(last_free)),
+        ]],
     );
 }
 

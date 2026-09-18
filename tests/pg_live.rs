@@ -617,3 +617,55 @@ fn a_count_stops_at_the_cap_on_the_snapshot() {
         cleanup(&dsn, &client, &names).await;
     });
 }
+
+/// A read past the row budget is refused, not buffered: the query without
+/// a limit over a table of thirty rows is refused at a budget of ten, and
+/// the same table read through a window of five is served, because the
+/// window bounds it before the budget does.
+#[test]
+fn a_read_past_the_row_budget_is_refused() {
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    block_on(async {
+        let names = Names::new("budget");
+        let client = prepare(&dsn, &names).await;
+        client
+            .batch_execute(&format!(
+                "INSERT INTO {t} SELECT g, 'OPEN', 7, g FROM generate_series(4, 30) AS g;",
+                t = names.tickets
+            ))
+            .await
+            .expect("fill");
+        let catalog = Arc::new(names.catalog());
+        let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect")
+            .with_read_row_limit(10);
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+        let whole = SingleTableReadQuery::new(
+            names.tickets.as_str(),
+            Where::AND(vec![]),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        );
+        let refused = storage.select(&whole).await;
+        assert!(
+            matches!(&refused, Err(error) if error.refusal().is_some()),
+            "thirty rows over a budget of ten are refused, got {refused:?}"
+        );
+        let page = SingleTableReadQuery::new(
+            names.tickets.as_str(),
+            Where::AND(vec![]),
+            OrderBy::new("id", Order::ASC),
+            5,
+        );
+        let served = storage.select(&page).await.expect("a page is served");
+        assert_eq!(served.rows.len(), 5, "the window bounds the read first");
+        cleanup(&dsn, &client, &names).await;
+    });
+}

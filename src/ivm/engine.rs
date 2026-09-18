@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use super::ClientUpdate;
+use crate::model::frame::SharedRow;
 use crate::model::{ClientId, DataFrameKey, DataFrameRow, SingleTableReadQuery, SubId, WriteQuery};
 
 /// The engine's handle for one storage read it asked for; unique for the
@@ -79,6 +80,10 @@ pub trait Engine {
     /// (all of a shared tree's), so a consumer checks those and not every
     /// subscription still hydrating.
     fn waiting_on(&self, fetch: &Fetch) -> Vec<SubId>;
+
+    /// The rows dropped since the last call (their last holder released
+    /// them), handed out so the caller can free them off this thread.
+    fn take_dead(&mut self) -> Vec<SharedRow>;
 
     /// Route one write to every subscription it affects, grouped per
     /// client.

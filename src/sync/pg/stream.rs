@@ -769,6 +769,39 @@ mod tests {
         }
     }
 
+    /// An `UPDATE` whose `name` PostgreSQL sent as unchanged (a large
+    /// value the update did not touch, kind `u`) decodes to an image
+    /// without that column rather than failing: the engine completes it
+    /// from the row it holds.
+    #[test]
+    fn an_unchanged_toast_column_is_left_out_of_the_image() {
+        let mut decoder = Decoder::new(catalog());
+        let events = vec![
+            begin(),
+            xlog(
+                "52000043477075626c69630070726f62655f74006400080169640000000014ffffffff006e616d650000000019ffffffff00706f696e74730000000014ffffffff00666c61670000000010ffffffff0064000000043affffffff007473000000045affffffff00616d6f756e7400000002bdffffffff007461670000000413ffffffff",
+            ),
+            xlog(
+                "55000043474e000874000000013175740000000134740000000174740000000a323032362d30392d31317400000015323032362d30392d31312031303a30303a30302e357400000003312e357400000003612062",
+            ),
+            commit("0/3EFF508"),
+        ];
+        let transactions: Vec<Transaction> = events
+            .into_iter()
+            .filter_map(|event| decoder.absorb(event).unwrap())
+            .collect();
+        assert_eq!(transactions.len(), 1, "{transactions:?}");
+        let write = &transactions[0].writes[0];
+        assert!(matches!(write, WriteQuery::UPDATE(_)));
+        let image = write.new_row_image().unwrap();
+        assert!(
+            image.data.get("name").is_none(),
+            "the unchanged column is absent, not NULL: {image:?}"
+        );
+        assert_eq!(image.data["points"], Value::Int(4));
+        assert_eq!(image.data["tag"], Value::String("a b".into()));
+    }
+
     /// A recorded `pgoutput` session (PostgreSQL 15, `proto_version 1`,
     /// text values): two inserts with quoting, nulls and every scalar
     /// type; an update; a primary-key change, a delete and an insert on

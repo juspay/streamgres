@@ -42,7 +42,7 @@ pub mod text;
 pub mod threads;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -135,7 +135,12 @@ pub async fn mint(config: &Config) -> Result<Alias, StorageError> {
 
 impl From<tokio_postgres::Error> for StorageError {
     /// The driver's message followed by its causes, so a server refusal
-    /// (`FATAL: sorry, too many clients already`) reads as such.
+    /// (`FATAL: sorry, too many clients already`) reads as such. A read
+    /// the database will never run as written (a data error, SQLSTATE
+    /// class 22, or a syntax or type error, class 42, other than the ones
+    /// a schema change can cure; a text value with a NUL byte the driver
+    /// cannot encode) is refused rather than parked and retried forever,
+    /// with a reason that quotes no data; the message itself is logged.
     fn from(error: tokio_postgres::Error) -> Self {
         let mut text = error.to_string();
         let mut source = std::error::Error::source(&error);
@@ -144,8 +149,29 @@ impl From<tokio_postgres::Error> for StorageError {
             text.push_str(&inner.to_string());
             source = inner.source();
         }
-        StorageError(text)
+        match error.as_db_error() {
+            Some(db) if permanent(db.code().code()) => {
+                log_warn!("a read the database will not run as written: {text}");
+                StorageError::refused(format!(
+                    "the database will not run this query as written (SQLSTATE {})",
+                    db.code().code()
+                ))
+            }
+            None if text.contains("embedded null") => StorageError::refused(
+                "a text value contains a NUL byte, which the database's text cannot hold",
+            ),
+            _ => StorageError(text),
+        }
     }
+}
+
+/// Whether a SQLSTATE names an error no retry of the same statement can
+/// cure: data errors (class 22) and syntax or type errors (class 42),
+/// except the class-42 codes a schema change or a grant can cure, which
+/// stay transient.
+fn permanent(code: &str) -> bool {
+    const CURABLE: [&str; 6] = ["42501", "42P01", "42703", "42883", "42704", "42P02"];
+    code.len() >= 2 && matches!(&code[..2], "22" | "42") && !CURABLE.contains(&code)
 }
 
 /// The aliases: the current one, and the newer ones minted since, oldest
@@ -187,7 +213,7 @@ struct Pool {
     idle: Mutex<Vec<Client>>,
     permits: Arc<Semaphore>,
     /// The most rows one read may return before it is refused.
-    row_limit: usize,
+    row_limit: AtomicUsize,
     aliases: Mutex<Aliases>,
     rotation: AtomicU64,
     alive: AtomicBool,
@@ -234,7 +260,7 @@ impl PgStorage {
             catalog,
             idle: Mutex::new(vec![client]),
             permits: Arc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
-            row_limit: read_row_limit(),
+            row_limit: AtomicUsize::new(read_row_limit()),
             aliases: Mutex::new(Aliases::default()),
             rotation: AtomicU64::new(250),
             alive: AtomicBool::new(true),
@@ -244,6 +270,13 @@ impl PgStorage {
         pool.lock_aliases().waiting.push_back(first);
         rotate(pool.clone());
         Ok(PgStorage { pool, delay: None })
+    }
+
+    /// Refuse a read past `limit` rows instead of the environment's budget
+    /// (tests; at least one).
+    pub fn with_read_row_limit(self, limit: usize) -> Self {
+        self.pool.row_limit.store(limit.max(1), Ordering::Relaxed);
+        self
     }
 
     /// Hold every snapshot open for `delay` before reading (tests).
@@ -259,7 +292,7 @@ impl PgStorage {
             catalog: self.pool.catalog.clone(),
             idle: Mutex::new(std::mem::take(&mut *self.pool.lock_idle())),
             permits: Arc::new(Semaphore::new(limit.max(1))),
-            row_limit: self.pool.row_limit,
+            row_limit: AtomicUsize::new(self.pool.row_limit.load(Ordering::Relaxed)),
             aliases: Mutex::new(std::mem::take(&mut *self.pool.lock_aliases())),
             rotation: AtomicU64::new(self.pool.rotation.load(Ordering::Relaxed)),
             alive: AtomicBool::new(true),
@@ -329,23 +362,24 @@ impl Storage for PgStorage {
         run_on(&self.pool.runtime, async move {
             let table = pool.table(&query)?;
             let alias = pool.current_alias()?;
+            let row_limit = pool.row_limit.load(Ordering::Relaxed);
             let mut sql = sql::select_sql(&query, table);
             if query.limit == u32::MAX {
-                sql.push_str(&format!(" LIMIT {}", pool.row_limit + 1));
+                sql.push_str(&format!(" LIMIT {}", row_limit + 1));
             }
             let rows = pool.read(&alias, &sql, delay).await?;
-            if rows.len() > pool.row_limit {
+            if rows.len() > row_limit {
                 log_warn!(
                     "read on `{}` returned more than {} rows; refused",
                     query.table,
-                    pool.row_limit
+                    row_limit
                 );
                 return Err(StorageError::refused(format!(
                     "a read on `{}` returned more than {} rows",
-                    query.table, pool.row_limit
+                    query.table, row_limit
                 )));
             }
-            if rows.len() >= pool.row_limit / 5 {
+            if rows.len() >= row_limit / 5 {
                 log_info!("read on `{}` returned {} rows", query.table, rows.len());
             }
             let rows = rows
@@ -608,6 +642,20 @@ fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Data and syntax errors are permanent; the class-42 codes a schema
+    /// change or a grant can cure, and everything else, are not.
+    #[test]
+    fn permanent_errors_are_the_ones_no_retry_cures() {
+        assert!(permanent("22P02"));
+        assert!(permanent("22001"));
+        assert!(permanent("42601"));
+        assert!(!permanent("42P01"), "an undefined table may be created");
+        assert!(!permanent("42501"), "a missing grant may be given");
+        assert!(!permanent("53300"), "too many connections is transient");
+        assert!(!permanent("08006"));
+        assert!(!permanent(""));
+    }
 
     /// A minted alias becomes current only once the feed passes its
     /// point, and a newer alias the feed has passed supersedes older ones
