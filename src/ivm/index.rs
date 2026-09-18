@@ -274,26 +274,6 @@ impl TableIndex {
         }
     }
 
-    /// A set-valued `IN` condition already indexed here gained `value`:
-    /// file it under that one key. The set itself is the caller's to
-    /// mutate; nothing else in the index moves.
-    pub(super) fn set_insert(&mut self, condition: &Condition, value: &Value) {
-        if let Some(linked) = self.by_condition.get(condition)
-            && let Some(column) = self.columns.get_mut(&condition.column)
-        {
-            column.file_key(&linked.handle, value);
-        }
-    }
-
-    /// A set-valued `IN` condition lost `value`: unfile it from that key.
-    pub(super) fn set_remove(&mut self, condition: &Condition, value: &Value) {
-        if let Some(linked) = self.by_condition.get(condition)
-            && let Some(column) = self.columns.get_mut(&condition.column)
-        {
-            column.unfile_key(&linked.handle, value);
-        }
-    }
-
     /// Publish, move, or clear `subscriber`'s admission boundary.
     pub(super) fn set_boundary(&mut self, subscriber: SubId, boundary: Option<Where>) {
         match boundary {

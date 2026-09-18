@@ -188,25 +188,6 @@ impl SingleTableIVM {
         updates
     }
 
-    /// Tag `sub` onto the row `key` of `table` that `from` holds (the twin
-    /// path) and return the `Add` with the frame's image, or `None` when
-    /// `sub` already holds the row or `from` does not.
-    pub(super) fn share_row(
-        &mut self,
-        sub: SubId,
-        from: SubId,
-        table: &TableName,
-        key: &DataFrameKey,
-    ) -> Option<SingleTableUpdate> {
-        let frame = self.frames.get(table)?;
-        let row = frame.get(key)?;
-        if !row.held_by(from) {
-            return None;
-        }
-        let image = row.data.clone();
-        self.tag_row(sub, table, key, &image)
-    }
-
     /// Record a landed row in `sub`'s window, if it has one.
     fn track_landed(&mut self, sub: SubId, key: &DataFrameKey, image: &DataFrameRow) {
         if let Some(window) = self.windows.get_mut(&sub) {

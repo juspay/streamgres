@@ -99,6 +99,13 @@ pub(super) struct ColumnIndex {
     unequal_all: HashSet<CondRef>,
     above: HashMap<u8, BTreeMap<OrdValue, HashSet<CondRef>>>,
     below: HashMap<u8, BTreeMap<OrdValue, HashSet<CondRef>>>,
+    /// Set-valued `IN` conditions (a join edge's driven values), filed
+    /// once each and probed by membership, so registering one costs no
+    /// more than its condition and a member coming or going touches the
+    /// set alone.
+    sets: HashSet<CondRef>,
+    /// Set-valued `NOT IN` conditions, probed by non-membership.
+    not_sets: HashSet<CondRef>,
 }
 
 impl ColumnIndex {
@@ -134,8 +141,12 @@ impl ColumnIndex {
             }
             EXISTS => {}
             IN => {
-                for key in member_keys(value) {
-                    self.equal.entry(key).or_default().insert(condition.clone());
+                if let Value::Set(_) = value {
+                    self.sets.insert(condition.clone());
+                } else {
+                    for key in member_keys(value) {
+                        self.equal.entry(key).or_default().insert(condition.clone());
+                    }
                 }
             }
             NEQ => {
@@ -148,7 +159,9 @@ impl ColumnIndex {
                 }
             }
             NOT_IN => {
-                if negation_is_satisfiable(value) {
+                if let Value::Set(_) = value {
+                    self.not_sets.insert(condition.clone());
+                } else if negation_is_satisfiable(value) {
                     for key in member_keys(value) {
                         self.unequal
                             .entry(key)
@@ -194,8 +207,12 @@ impl ColumnIndex {
             }
             EXISTS => {}
             IN => {
-                for key in member_keys(value) {
-                    remove_under(&mut self.equal, Some(key), condition);
+                if let Value::Set(_) = value {
+                    self.sets.remove(condition);
+                } else {
+                    for key in member_keys(value) {
+                        remove_under(&mut self.equal, Some(key), condition);
+                    }
                 }
             }
             NEQ => {
@@ -203,27 +220,18 @@ impl ColumnIndex {
                 self.unequal_all.remove(condition);
             }
             NOT_IN => {
-                for key in member_keys(value) {
-                    remove_under(&mut self.unequal, Some(key), condition);
+                if let Value::Set(_) = value {
+                    self.not_sets.remove(condition);
+                } else {
+                    for key in member_keys(value) {
+                        remove_under(&mut self.unequal, Some(key), condition);
+                    }
+                    self.unequal_all.remove(condition);
                 }
-                self.unequal_all.remove(condition);
             }
             GT | GTE => remove_threshold(&mut self.above, value, condition),
             LT | LTE => remove_threshold(&mut self.below, value, condition),
         }
-    }
-
-    /// File an already-indexed set-valued `IN` condition under one more
-    /// member: the O(1) edit of a join edge gaining a value.
-    pub(super) fn file_key(&mut self, condition: &CondRef, value: &Value) {
-        if let Some(key) = value.equality_key() {
-            self.equal.entry(key).or_default().insert(condition.clone());
-        }
-    }
-
-    /// Unfile a set-valued `IN` condition from one member it lost.
-    pub(super) fn unfile_key(&mut self, condition: &CondRef, value: &Value) {
-        remove_under(&mut self.equal, value.equality_key(), condition);
     }
 
     /// Whether nothing is filed on the column anymore.
@@ -232,6 +240,8 @@ impl ColumnIndex {
             && self.unequal_all.is_empty()
             && self.above.is_empty()
             && self.below.is_empty()
+            && self.sets.is_empty()
+            && self.not_sets.is_empty()
     }
 
     /// Append the conditions a written value satisfies to `out`: for a
@@ -251,6 +261,20 @@ impl ColumnIndex {
         };
         if let Some(matching) = self.equal.get(&*key) {
             out.extend(matching.iter().cloned());
+        }
+        for condition in &self.sets {
+            if let Value::Set(set) = &condition.0.value
+                && set.contains(&key)
+            {
+                out.push(condition.clone());
+            }
+        }
+        for condition in &self.not_sets {
+            if let Value::Set(set) = &condition.0.value
+                && !set.contains(&key)
+            {
+                out.push(condition.clone());
+            }
         }
         if !self.unequal_all.is_empty() {
             let failing = self.unequal.get(&*key);
@@ -342,7 +366,6 @@ fn remove_threshold(
 fn member_keys(value: &Value) -> Vec<Value> {
     match value {
         Value::List(items) => items.iter().filter_map(Value::equality_key).collect(),
-        Value::Set(set) => set.members(),
         _ => Vec::new(),
     }
 }

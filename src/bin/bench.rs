@@ -121,6 +121,7 @@ const TWIN_COPIES: usize = 1_000;
 const TWIN_STORAGE_SAMPLES: usize = 10;
 const RELEASE_ROWS: usize = 200_000;
 const RELEASE_SUBS: usize = 5_000;
+const MEMORY_ROWS: usize = 200_000;
 
 const WINDOW_ROWS: usize = 100_000;
 const WINDOW_LIMIT: u32 = 50;
@@ -1390,6 +1391,9 @@ fn main() {
     if wanted("release") {
         release_cost();
     }
+    if wanted("memory") {
+        memory_per_row();
+    }
     if wanted("window") {
         window();
     }
@@ -1420,6 +1424,107 @@ fn wanted(name: &str) -> bool {
     std::env::var("XYNE_SYNC_BENCH_ONLY")
         .map(|only| only.split(',').any(|scenario| scenario.trim() == name))
         .unwrap_or(true)
+}
+
+/// This process's resident set, in kilobytes, as `ps` reports it.
+fn rss_kb() -> u64 {
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// A message-like row image (fourteen columns, a 160-byte body) under
+/// its key, the shape the application's largest table has.
+fn message_image(id: usize) -> (DataFrameKey, DataFrameRow) {
+    let text = |prefix: &str| Value::from(format!("{prefix}{id:020}"));
+    let body: String = std::iter::repeat_n("the quick brown fox ", 8).collect();
+    let mut data: HashMap<ColumnName, Value> = HashMap::new();
+    data.insert("messageId".into(), text("m"));
+    data.insert("conversationId".into(), text("c"));
+    data.insert("senderId".into(), text("u"));
+    data.insert("workspaceId".into(), text("w"));
+    data.insert("content".into(), Value::from(body));
+    data.insert(
+        "createdAt".into(),
+        Value::Int(1_750_000_000_000 + id as i64),
+    );
+    data.insert(
+        "updatedAt".into(),
+        Value::Int(1_750_000_000_000 + id as i64),
+    );
+    data.insert("isDeleted".into(), Value::Bool(false));
+    data.insert("edited".into(), Value::Bool(false));
+    data.insert("showInChannel".into(), Value::Bool(true));
+    data.insert("hasAttachment".into(), Value::Bool(false));
+    data.insert("msgType".into(), Value::from("TEXT"));
+    data.insert("visibleTo".into(), Value::Null);
+    data.insert("parentMessageId".into(), Value::Null);
+    let key = DataFrameKey::new(HashMap::from([(ColumnName::from("messageId"), text("m"))]));
+    (key, DataFrameRow::from(data))
+}
+
+/// Scenario 2d: what a held row costs in memory. The images of 200 000
+/// message-like rows are built (what decoding a read allocates), then a
+/// subscription holds them all in a frame (the ids, the tags, the
+/// per-row bookkeeping on top of the shared images); the resident set is
+/// read from `ps` at each step.
+fn memory_per_row() {
+    println!(
+        "\n== 2d. memory per held row ({MEMORY_ROWS} message-like rows of fourteen columns, one subscription holding them) =="
+    );
+    let baseline = rss_kb();
+    let images: Vec<(DataFrameKey, DataFrameRow)> = (0..MEMORY_ROWS).map(message_image).collect();
+    let with_images = rss_kb();
+    let storage = Rc::new(BenchStorage::default());
+    for (key, row) in &images {
+        storage.apply(&WriteQuery::INSERT(InsertQuery {
+            table: TableName::from("messages"),
+            pkey_value: key.clone(),
+            record: row.clone(),
+        }));
+    }
+    let with_storage = rss_kb();
+    let mut ivm: Single = Local::new(SingleTableIVM::new(), storage.clone());
+    let query = SingleTableReadQuery::new(
+        TableName::from("messages"),
+        Where::AND(vec![]),
+        OrderBy::new("messageId", Order::ASC),
+        u32::MAX,
+    );
+    let (sub, ops) = ivm.register_query(client(), query);
+    let held = ops.len();
+    drop(ops);
+    let with_frame = rss_kb();
+    let per = |from: u64, to: u64| (to.saturating_sub(from) * 1024) as f64 / MEMORY_ROWS as f64;
+    print_table(
+        &[
+            "rows",
+            "held",
+            "bytes/row: image (as decoded)",
+            "bytes/row: storage double's map",
+            "bytes/row: frame + one subscription's tags",
+            "RSS MB baseline -> images -> frame",
+        ],
+        &[vec![
+            MEMORY_ROWS.to_string(),
+            held.to_string(),
+            one(per(baseline, with_images)),
+            one(per(with_images, with_storage)),
+            one(per(with_storage, with_frame)),
+            format!(
+                "{} -> {} -> {}",
+                baseline / 1024,
+                with_images / 1024,
+                with_frame / 1024
+            ),
+        ]],
+    );
+    let _ = ivm.unregister_query(sub);
+    drop(images);
 }
 
 /// Scenario 2c: what releasing a subscription costs the engine. 1 000

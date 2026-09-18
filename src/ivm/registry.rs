@@ -6,10 +6,9 @@
 
 use super::index::TableIndex;
 use super::window::Window;
-use super::{FetchKind, SingleTableIVM, window};
-use crate::model::{
-    Condition, DataFrameKey, DataFrameOperation, SingleTableReadQuery, SubId, Value,
-};
+use super::{FetchKind, SingleTableIVM, SingleTableUpdate, window};
+use crate::model::frame::RowId;
+use crate::model::{Condition, DataFrameOperation, SingleTableReadQuery, SubId, TableName, Value};
 
 impl SingleTableIVM {
     /// Register a subscription, returning its engine id and whatever of
@@ -58,11 +57,11 @@ impl SingleTableIVM {
             Some(twin) => {
                 self.stats.snapshots_shared += 1;
                 let table = self.select_queries[&sub].table.clone();
-                for key in self.keys_of(twin) {
-                    if let Some(update) = self.share_row(sub, twin, &table, &key) {
-                        ops.push(update.op);
-                    }
-                }
+                ops.extend(
+                    self.share_rows(sub, twin, &table)
+                        .into_iter()
+                        .map(|update| update.op),
+                );
                 self.rebuild_window(sub);
                 let inherited = self.windows.get(&twin).and_then(Window::frontier);
                 if let Some(window) = self.windows.get_mut(&sub) {
@@ -128,10 +127,7 @@ impl SingleTableIVM {
         if !set.insert(value) {
             return false;
         }
-        let table = query.table.clone();
-        if let Some(table_index) = self.tables.get_mut(&table) {
-            table_index.set_insert(condition, value);
-        }
+        let _ = query;
         self.stats.conditions_replaced += 1;
         true
     }
@@ -150,10 +146,7 @@ impl SingleTableIVM {
         if !set.remove(value) {
             return false;
         }
-        let table = query.table.clone();
-        if let Some(table_index) = self.tables.get_mut(&table) {
-            table_index.set_remove(condition, value);
-        }
+        let _ = query;
         self.stats.conditions_replaced += 1;
         true
     }
@@ -324,22 +317,35 @@ impl SingleTableIVM {
             .copied()
     }
 
-    /// The keys a subscription currently holds, from its held index — what
-    /// a twin registration is served, view by view, instead of a storage
-    /// result.
-    fn keys_of(&self, sub: SubId) -> Vec<DataFrameKey> {
-        let Some(query) = self.select_queries.get(&sub) else {
+    /// Tag `sub` onto every row `from` holds, in one walk of `from`'s held
+    /// index, and return the `Add`s with the frame's images: what a twin
+    /// registration is served instead of a storage result.
+    fn share_rows(&mut self, sub: SubId, from: SubId, table: &TableName) -> Vec<SingleTableUpdate> {
+        let ids: Vec<RowId> = self
+            .held
+            .get(&from)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default();
+        let Some(frame) = self.frames.get_mut(table) else {
             return Vec::new();
         };
-        let Some(frame) = self.frames.get(&query.table) else {
-            return Vec::new();
-        };
-        let Some(ids) = self.held.get(&sub) else {
-            return Vec::new();
-        };
-        ids.iter()
-            .filter_map(|id| frame.row(*id))
-            .map(|row| row.key.clone())
-            .collect()
+        let held = self.held.entry(sub).or_default();
+        let mut updates = Vec::with_capacity(ids.len());
+        for id in ids {
+            let Some(row) = frame.row_mut(id) else {
+                continue;
+            };
+            if !row.subscribers.insert(sub) {
+                continue;
+            }
+            held.insert(id);
+            self.stats.ops_add += 1;
+            updates.push(SingleTableUpdate {
+                query: sub,
+                table: table.clone(),
+                op: DataFrameOperation::Add(row.key.clone(), row.data.clone()),
+            });
+        }
+        updates
     }
 }
