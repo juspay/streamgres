@@ -330,7 +330,7 @@ impl Storage for PgStorage {
             let table = pool.table(&query)?;
             let alias = pool.current_alias()?;
             let mut sql = sql::select_sql(&query, table);
-            if query.limit == 0 {
+            if query.limit == u32::MAX {
                 sql.push_str(&format!(" LIMIT {}", pool.row_limit + 1));
             }
             let rows = pool.read(&alias, &sql, delay).await?;

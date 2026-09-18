@@ -1,12 +1,14 @@
 //! Rendering the query model as Postgres SQL: a [`SingleTableReadQuery`]
 //! becomes one `SELECT` whose columns are cast to the types the catalog
 //! declares (so every result decodes the same way), whose `WHERE` is the
-//! filter tree rendered with the engine's two-valued semantics (every
-//! leaf is wrapped in `IS TRUE`, so a comparison touching `NULL` is
-//! false rather than unknown and `NOT` of it is not true either; an
-//! empty `IN` list is false, a `NOT IN` with a `NULL` member is never
-//! true), and whose `ORDER BY` / `LIMIT` are emitted only for a finite
-//! limit.
+//! filter tree rendered so that it selects exactly the rows the engine's
+//! two-valued evaluation would (the tree has no `NOT`, so a comparison
+//! touching `NULL`, unknown to SQL, excludes the row under `AND` and `OR`
+//! just as the engine's `false` does; an empty `IN` list is false, a
+//! `NOT IN` with a `NULL` member is never true), and every leaf is left
+//! as the bare comparison PostgreSQL can serve from an index: wrapping a
+//! leaf in `IS TRUE` turns an index condition into a filter over a whole
+//! scan. `ORDER BY` / `LIMIT` are emitted only for a finite limit.
 
 use std::fmt::Write;
 
@@ -171,19 +173,19 @@ fn render_condition(condition: &Condition, table: &DbTable) -> String {
                 return if negated { "TRUE" } else { "FALSE" }.to_owned();
             }
             let keyword = if negated { "NOT IN" } else { "IN" };
-            format!("{column} {keyword} ({}) IS TRUE", literals.join(", "))
+            format!("{column} {keyword} ({})", literals.join(", "))
         }
         EXISTS => "FALSE".to_owned(),
         IS if condition.value.is_null() => format!("{column} IS NULL"),
         IS_NOT if condition.value.is_null() => format!("{column} IS NOT NULL"),
         _ if condition.value.is_null() => "FALSE".to_owned(),
         IS | IS_NOT => "FALSE".to_owned(),
-        EQ => format!("{column} = {} IS TRUE", literal(&condition.value)),
-        NEQ => format!("{column} <> {} IS TRUE", literal(&condition.value)),
-        GT => format!("{column} > {} IS TRUE", literal(&condition.value)),
-        GTE => format!("{column} >= {} IS TRUE", literal(&condition.value)),
-        LT => format!("{column} < {} IS TRUE", literal(&condition.value)),
-        LTE => format!("{column} <= {} IS TRUE", literal(&condition.value)),
+        EQ => format!("{column} = {}", literal(&condition.value)),
+        NEQ => format!("{column} <> {}", literal(&condition.value)),
+        GT => format!("{column} > {}", literal(&condition.value)),
+        GTE => format!("{column} >= {}", literal(&condition.value)),
+        LT => format!("{column} < {}", literal(&condition.value)),
+        LTE => format!("{column} <= {}", literal(&condition.value)),
     }
 }
 
@@ -257,7 +259,7 @@ mod tests {
         );
         assert_eq!(
             select_sql(&query, &tickets()),
-            "SELECT \"id\"::int8, \"points\"::int8, \"status\"::text FROM \"tickets\" WHERE (\"status\" = 'it''s open' IS TRUE AND \"points\" >= 8 IS TRUE)"
+            "SELECT \"id\"::int8, \"points\"::int8, \"status\"::text FROM \"tickets\" WHERE (\"status\" = 'it''s open' AND \"points\" >= 8)"
         );
     }
 
@@ -265,8 +267,8 @@ mod tests {
     /// limits; a set-valued IN renders its current members; an empty IN
     /// is FALSE; a NULL comparison is FALSE; a NOT IN with a NULL member
     /// is FALSE.
-    /// The null tests render as SQL's own, without the `IS TRUE` wrapper
-    /// they never need; an `IS` with another operand is never true.
+    /// The null tests render as SQL's own; an `IS` with another operand
+    /// is never true.
     #[test]
     fn renders_null_tests() {
         let query = SingleTableReadQuery::new(
@@ -320,8 +322,7 @@ mod tests {
         );
         let sql = select_sql(&query, &tickets());
         assert!(
-            sql.contains("\"points\" IN (7, 9) IS TRUE")
-                || sql.contains("\"points\" IN (9, 7) IS TRUE"),
+            sql.contains("\"points\" IN (7, 9)") || sql.contains("\"points\" IN (9, 7)"),
             "{sql}"
         );
         assert!(sql.contains(" OR FALSE OR FALSE OR FALSE)"), "{sql}");
