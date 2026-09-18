@@ -94,8 +94,10 @@ impl Transaction {
 /// watched writes are one event.
 ///
 /// - `Registered`: the subscription a [`Command::Register`] became, with
-///   that command's `token` and the rows it was served at once (a twin's).
-///   It precedes every other event about the subscription.
+///   that command's `token`, the rows it was served at once (a twin's) and
+///   `reads`, how many storage reads the registration issued (zero when
+///   the frames already held answered it). It precedes every other event
+///   about the subscription.
 /// - `Landed`: a storage read landed, with the deltas it produced.
 /// - `Committed`: a transaction was applied: its deltas for this
 ///   consumer, the engine's position, the storage floor, the transaction's
@@ -111,6 +113,7 @@ pub enum Event {
         token: u64,
         sub: SubId,
         updates: Vec<ClientUpdate>,
+        reads: usize,
     },
     Landed {
         updates: Vec<ClientUpdate>,
@@ -132,6 +135,7 @@ enum Outcome {
         client: ClientId,
         token: u64,
         sub: SubId,
+        reads: usize,
     },
     Landed,
     Committed {
@@ -157,6 +161,8 @@ pub struct Service<E: Engine, S: Storage> {
     /// client each belongs to, so a client going away takes its own with
     /// it instead of leaving them to be probed forever.
     awaiting: IdMap<SubId, ClientId>,
+    /// When each read in flight was handed to the driver, for `read_io`.
+    issued: IdMap<FetchId, Instant>,
     results: mpsc::UnboundedReceiver<(FetchId, Result<Snapshot, StorageError>)>,
     report: mpsc::UnboundedSender<(FetchId, Result<Snapshot, StorageError>)>,
 }
@@ -184,6 +190,7 @@ where
             sinks: vec![events],
             stats: None,
             awaiting: IdMap::default(),
+            issued: IdMap::default(),
             results,
             report,
         };
@@ -237,10 +244,20 @@ where
                 }
                 result = self.results.recv() => match result {
                     Some((id, Ok(snapshot))) => {
+                        let started = Instant::now();
+                        if let Some(stats) = &self.stats
+                            && let Some(issued) = self.issued.remove(&id)
+                        {
+                            stats.read_io.record(started.duration_since(issued));
+                        }
                         let step = self.runtime.fetched(id, snapshot);
+                        if let Some(stats) = &self.stats {
+                            stats.land_step.record(started.elapsed());
+                        }
                         self.dispatch(step, Outcome::Landed);
                     }
                     Some((id, Err(error))) => {
+                        self.issued.remove(&id);
                         log_warn!("storage read {} failed, parked: {error}", id.0);
                         let step = self.runtime.failed(id);
                         self.dispatch(step, Outcome::Nothing);
@@ -260,9 +277,22 @@ where
                 query,
                 token,
             } => {
+                let started = Instant::now();
                 let (sub, step) = self.runtime.register(client, query);
+                let reads = step.selects.len();
+                if let Some(stats) = &self.stats {
+                    stats.register_step.record(started.elapsed());
+                }
                 self.awaiting.insert(sub, client);
-                self.dispatch(step, Outcome::Registered { client, token, sub });
+                self.dispatch(
+                    step,
+                    Outcome::Registered {
+                        client,
+                        token,
+                        sub,
+                        reads,
+                    },
+                );
             }
             Command::Unregister(sub) => {
                 self.runtime.unregister(sub);
@@ -362,13 +392,19 @@ where
     fn dispatch(&mut self, step: Step, outcome: Outcome) {
         let Step { updates, selects } = step;
         match outcome {
-            Outcome::Registered { client, token, sub } => {
+            Outcome::Registered {
+                client,
+                token,
+                sub,
+                reads,
+            } => {
                 self.send_to(
                     client,
                     Event::Registered {
                         token,
                         sub,
                         updates,
+                        reads,
                     },
                 );
             }
@@ -432,7 +468,8 @@ where
     }
 
     /// Run one read as its own task, reporting the result into the loop.
-    fn spawn(&self, fetch: Fetch) {
+    fn spawn(&mut self, fetch: Fetch) {
+        self.issued.insert(fetch.id, Instant::now());
         let storage = self.storage.clone();
         let report = self.report.clone();
         spawn_local(async move {

@@ -205,6 +205,10 @@ struct QueryState {
     got: bool,
     ttl: Duration,
     inactive: u64,
+    /// When the query was last sent to register, for the hydration clock.
+    since: Instant,
+    /// Whether the registration had to read storage.
+    cold: bool,
 }
 
 /// One client group's view.
@@ -452,8 +456,9 @@ impl Groups {
                 token,
                 sub,
                 updates,
+                reads,
             } => {
-                self.registered(token, sub);
+                self.registered(token, sub, reads);
                 self.absorb(updates);
             }
             Event::Landed { updates } => self.absorb(updates),
@@ -469,6 +474,12 @@ impl Groups {
                         && !state.got
                     {
                         state.got = true;
+                        let hydrate = if state.cold {
+                            &self.stats.hydrate_cold
+                        } else {
+                            &self.stats.hydrate_warm
+                        };
+                        hydrate.record(state.since.elapsed());
                         group.queued_got.push(json!({"op": "put", "hash": hash}));
                         self.dirty.insert(group_id);
                     }
@@ -736,6 +747,8 @@ impl Groups {
                     got: false,
                     ttl: lifetime,
                     inactive: 0,
+                    since: Instant::now(),
+                    cold: false,
                 },
             );
             return;
@@ -751,6 +764,8 @@ impl Groups {
                 got: false,
                 ttl: lifetime,
                 inactive: 0,
+                since: Instant::now(),
+                cold: false,
             },
         );
         let engine_client = group.client;
@@ -764,10 +779,10 @@ impl Groups {
         log_debug!("group {group_id}: query {name} ({hash}) registering");
     }
 
-    /// The engine side registered a query: adopt the subscription, unless
-    /// the query was released while the registration was in flight, in
-    /// which case it is let go at once.
-    fn registered(&mut self, token: u64, sub: SubId) {
+    /// The engine side registered a query (`reads` storage reads issued):
+    /// adopt the subscription, unless the query was released while the
+    /// registration was in flight, in which case it is let go at once.
+    fn registered(&mut self, token: u64, sub: SubId, reads: usize) {
         let Some((group_id, hash)) = self.awaiting.remove(&token) else {
             self.command(Command::Unregister(sub));
             return;
@@ -779,6 +794,7 @@ impl Groups {
                 let state = group.queries.get_mut(&hash)?;
                 (state.awaiting == token).then(|| {
                     state.awaiting = 0;
+                    state.cold = reads > 0;
                     state.sub = Some(sub);
                     group.subs.insert(sub);
                     group.hidden.insert(sub, state.hidden.clone());

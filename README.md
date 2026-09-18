@@ -468,7 +468,11 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
 - **Measurements.** `GET /stats` serves the server's own clock on every
   stage (feed to engine, the engine's step, engine to groups, the flush,
   groups to socket, and end to end inside the server, as p50/p90/p99 in
-  microseconds), the counters (transactions, pokes, frames, rows serialized
+  microseconds), the query path's own stages (the application server's
+  transform, planning, hydration per query split into cold, when the
+  registration read storage, and warm, when the held frames answered it,
+  the engine's register and land steps, and a storage read's round trip),
+  the counters (transactions, pokes, frames, rows serialized
   and rows shared within a flush) and the engine's routing counters;
   `?reset=1` zeroes the histograms after reading, which the load harness
   does at the start of its steady phase.

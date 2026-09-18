@@ -605,7 +605,10 @@ impl Conn {
         let mut errored = Vec::new();
         if !requests.is_empty() {
             let ids: Vec<String> = positions.keys().cloned().collect();
-            match self.state.backend.transform(&self.identity, requests).await {
+            let started = Instant::now();
+            let outcome = self.state.backend.transform(&self.identity, requests).await;
+            self.state.stats.transform.record(started.elapsed());
+            match outcome {
                 TransformOutcome::Queries(results) => {
                     for result in results {
                         let Some(id) = result.get("id").and_then(Json::as_str) else {
@@ -754,14 +757,17 @@ impl Conn {
 async fn plan_ast(state: &AppState, ast: Json) -> Result<Translated, String> {
     let ast: Ast =
         serde_json::from_value(ast).map_err(|error| format!("malformed AST: {error}"))?;
+    let started = Instant::now();
     let translated = ast::translate(&ast, &state.catalog)?;
-    plan::plan(
+    let planned = plan::plan(
         translated,
         state.config.policy(),
         &state.plans,
         &*state.storage,
     )
-    .await
+    .await;
+    state.stats.plan.record(started.elapsed());
+    planned
 }
 
 /// The reason a planned put failed, or the absence of a plan spelled out.

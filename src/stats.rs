@@ -164,6 +164,21 @@ struct Engine {
 /// - `end_to_end`: from the feed decoding the oldest transaction a poke
 ///   carries to that poke's last frame written (per poke and connection).
 ///
+/// Durations of the query path, so a hydration's time splits into the
+/// application server's, PostgreSQL's and the engine's own:
+/// - `transform`: one round trip to the application server for the ASTs
+///   of a desired-queries change (per change that named custom queries).
+/// - `plan`: translating and planning one query on the connection task
+///   (a cache hit is microseconds; a miss counts on the reads pool).
+/// - `hydrate_cold` / `hydrate_warm`: from a query's registration being
+///   sent to the engine to its first rows all present, per query; cold
+///   when the registration issued storage reads, warm when the frames
+///   already held answered it.
+/// - `register_step`: the engine registering one query (compute).
+/// - `read_io`: one storage read from being issued to its rows being back
+///   on the engine thread (the pool's queue, PostgreSQL, decoding).
+/// - `land_step`: the engine landing one read's rows (compute).
+///
 /// Counts: transactions and writes routed, pokes and frames written, rows
 /// serialized and rows found already serialized in the same flush.
 pub struct Stats {
@@ -174,6 +189,13 @@ pub struct Stats {
     pub groups_flush: Histogram,
     pub groups_to_socket: Histogram,
     pub end_to_end: Histogram,
+    pub transform: Histogram,
+    pub plan: Histogram,
+    pub hydrate_cold: Histogram,
+    pub hydrate_warm: Histogram,
+    pub register_step: Histogram,
+    pub read_io: Histogram,
+    pub land_step: Histogram,
     pub transactions: AtomicU64,
     pub writes: AtomicU64,
     pub pokes: AtomicU64,
@@ -201,6 +223,13 @@ impl Stats {
             groups_flush: Histogram::new(),
             groups_to_socket: Histogram::new(),
             end_to_end: Histogram::new(),
+            transform: Histogram::new(),
+            plan: Histogram::new(),
+            hydrate_cold: Histogram::new(),
+            hydrate_warm: Histogram::new(),
+            register_step: Histogram::new(),
+            read_io: Histogram::new(),
+            land_step: Histogram::new(),
             transactions: AtomicU64::new(0),
             writes: AtomicU64::new(0),
             pokes: AtomicU64::new(0),
@@ -233,6 +262,13 @@ impl Stats {
             &self.groups_flush,
             &self.groups_to_socket,
             &self.end_to_end,
+            &self.transform,
+            &self.plan,
+            &self.hydrate_cold,
+            &self.hydrate_warm,
+            &self.register_step,
+            &self.read_io,
+            &self.land_step,
         ] {
             histogram.reset();
         }
@@ -261,6 +297,13 @@ impl Stats {
                 "groups_flush": summary(&self.groups_flush),
                 "groups_to_socket": summary(&self.groups_to_socket),
                 "end_to_end": summary(&self.end_to_end),
+                "transform": summary(&self.transform),
+                "plan": summary(&self.plan),
+                "hydrate_cold": summary(&self.hydrate_cold),
+                "hydrate_warm": summary(&self.hydrate_warm),
+                "register_step": summary(&self.register_step),
+                "read_io": summary(&self.read_io),
+                "land_step": summary(&self.land_step),
             },
             "counts": {
                 "transactions": self.transactions.load(Ordering::Relaxed),
