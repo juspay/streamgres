@@ -43,13 +43,17 @@
 // at its end; default: the gateway's host and port) --pid PID (sample this process's CPU/RSS)
 // --container NAME (sample `docker stats` instead) --out FILE (statistics; add --raw for every
 // delivery delay) --label TEXT --quiet
+// --auth-pool FILE (a JSON list of identities with a `token`, `userID` and
+// `workspaceID`, the way the regression rig's harness keeps them: the users are
+// taken from it in order and the token goes in the connection's handshake, so no
+// test login is needed) --thread-query NAME (the per-conversation query, conversationMessages)
 // The `ws` package is found through E2E_WS, `ws`, or ../node_modules/ws.
 
 import { randomUUID } from 'node:crypto';
 import { execFileSync, execFile } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -91,6 +95,8 @@ const QUIET = flag('quiet');
 const DUMP = flag('dump-tables');
 const RAW = flag('raw');
 const WRITES = opt('writes', 'mutations');
+const AUTH_POOL = opt('auth-pool', process.env.E2E_AUTH_POOL ?? '');
+const THREAD_QUERY = opt('thread-query', 'conversationMessages');
 const STATS = opt('stats', GATEWAY.replace(/^ws(s?):\/\//, 'http$1://').replace(/\/[^/]*$/, '') + '/stats');
 const t0 = Date.now();
 const log = (...a) => console.log(`${String(Date.now() - t0).padStart(7)}ms`, ...a);
@@ -150,9 +156,9 @@ class Conn {
     this.opened = Date.now(); this.connectedAt = 0; this.firstPokeAt = 0; this.hydratedAt = 0; this.closed = false;
     this.wanted = new Set(patch.map(p => p.hash)); this.mutationId = 0; this.pending = new Map(); this.pushLatencies = []; this.inflight = null; this.timedOut = 0;
     const init = ['initConnection', { desiredQueriesPatch: patch, activeClients: [this.client] }];
-    const sec = encodeURIComponent(Buffer.from(JSON.stringify({ initConnectionMessage: init, authToken: undefined })).toString('base64'));
+    const sec = encodeURIComponent(Buffer.from(JSON.stringify({ initConnectionMessage: init, authToken: user.token })).toString('base64'));
     const url = `${GATEWAY}/sync/v51/connect?clientID=${this.client}&clientGroupID=${this.group}&userID=${user.userId}&baseCookie=&ts=1&lmid=0&wsid=${name}&profileID=load`;
-    this.ws = new WebSocket(url, [sec], { headers: { Cookie: user.cookie, Origin: 'http://localhost:5173' }, perMessageDeflate: false });
+    this.ws = new WebSocket(url, [sec], { headers: { ...(user.cookie ? { Cookie: user.cookie } : {}), Origin: 'http://localhost:5173' }, perMessageDeflate: false });
     this.ready = new Promise((resolve) => { this.resolveReady = resolve; });
     this.ws.on('message', (data) => this.onMessage(data));
     this.ws.on('close', (code) => { this.closed = true; this.closeCode = code; this.resolveReady(); });
@@ -253,7 +259,13 @@ const phase = (name) => {
 };
 let done = phase('setup');
 const users = [];
-for (let i = 0; i < USERS; i++) users.push(await login(`test-user-email-9${String(i).padStart(3, '0')}@xyne-test.local`));
+/// The identities: the pool's first `--users` entries, or that many test logins.
+if (AUTH_POOL) {
+  const pool = JSON.parse(readFileSync(AUTH_POOL, 'utf8'));
+  for (let i = 0; i < USERS; i++) { const entry = pool[i % pool.length]; users.push({ cookie: '', token: entry.token, userId: entry.userID, workspaceId: entry.workspaceID, email: entry.email ?? entry.userID }); }
+} else {
+  for (let i = 0; i < USERS; i++) users.push(await login(`test-user-email-9${String(i).padStart(3, '0')}@xyne-test.local`));
+}
 const workspaceId = users[0].workspaceId;
 const channelId = CHANNEL || psql(`select id from channels where "workspaceId"='${workspaceId}' and "scopeType"='DEFAULT' order by "createdAt" limit 1`);
 if (!channelId) fail('no DEFAULT channel in the workspace');
@@ -342,7 +354,7 @@ const subscriberPatch = (i) => [
   { op: 'put', hash: 'q-unread', name: 'userUnreadActivities', args: [], ttl: 300000 },
   ...Array.from({ length: Math.min(THREADS, threadPool.length) }, (_, k) => {
     const conversationId = threadPool[(i * THREADS + k) % threadPool.length];
-    return { op: 'put', hash: `q-thread-${conversationId}`, name: 'conversationMessages', args: [{ conversationId }], ttl: 300000 };
+    return { op: 'put', hash: `q-thread-${conversationId}`, name: THREAD_QUERY, args: [{ conversationId }], ttl: 300000 };
   }),
 ];
 for (let i = 0; i < CONNECTIONS; i++) {

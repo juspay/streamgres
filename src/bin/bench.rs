@@ -39,7 +39,8 @@
 //!    per user for each, then message inserts, membership churn that moves
 //!    the existence sets, and in-place ticket updates.
 //! 5. **Postgres** (only when `XYNE_SYNC_PG_DSN` names a database with
-//!    `wal_level = logical`) — the same join over real tables: a
+//!    `wal_level = logical` and `bench` in its name, since the scenario
+//!    replaces its `users` and `tickets` tables) — the same join over real tables: a
 //!    registration's end-to-end latency (two positioned reads), writes
 //!    committed in Postgres and streamed through the `test_decoding`
 //!    poller into the runtime, and a registration whose snapshot is held
@@ -1405,9 +1406,12 @@ fn main() {
     }
     if wanted("postgres") {
         match std::env::var("XYNE_SYNC_PG_DSN") {
-            Ok(dsn) => postgres(&dsn),
+            Ok(dsn) if bench_database(&dsn) => postgres(&dsn),
+            Ok(dsn) => println!(
+                "\n== 5. postgres: skipped ({dsn} does not name a database with `bench` in its name; the scenario drops and recreates `users` and `tickets` there) =="
+            ),
             Err(_) => println!(
-                "\n== 5. postgres: skipped (set XYNE_SYNC_PG_DSN to a database with wal_level = logical) =="
+                "\n== 5. postgres: skipped (set XYNE_SYNC_PG_DSN to a database with wal_level = logical and `bench` in its name) =="
             ),
         }
     }
@@ -1415,6 +1419,16 @@ fn main() {
         "\ntotal wall time: {}s",
         one(started.elapsed().as_secs_f64())
     );
+}
+
+/// Whether `dsn` names a database the postgres scenario may take over: one
+/// with `bench` in its name, since the scenario drops and recreates the
+/// `users` and `tickets` tables there.
+fn bench_database(dsn: &str) -> bool {
+    dsn.rsplit('/')
+        .next()
+        .map(|last| last.split('?').next().unwrap_or(last))
+        .is_some_and(|name| name.contains("bench"))
 }
 
 /// Whether scenario `name` runs: every scenario unless
