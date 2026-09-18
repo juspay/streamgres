@@ -58,12 +58,19 @@ pub fn select_sql(query: &SingleTableReadQuery, table: &DbTable) -> String {
 
 /// `SELECT count(*)` of the rows matching `query.filter`, stopping at
 /// `cap`: the count runs over `LIMIT cap` rows, so the scan ends as soon
-/// as the cap is reached.
+/// as the cap is reached. An `EXISTS` leaf (an inner edge to a node of
+/// its own) is taken as true, so the count is an upper bound on what the
+/// side may hold: the planner asks whether a side is small enough to read
+/// whole, and an edge that has yet to be placed cannot be assumed to cut
+/// it down.
 pub fn count_sql(query: &SingleTableReadQuery, table: &DbTable, cap: u64) -> String {
+    let filter = query
+        .filter
+        .assuming_true(&|condition| condition.comparison_operator == ComparisonOperator::EXISTS);
     format!(
         "SELECT count(*) FROM (SELECT 1 FROM {} WHERE {} LIMIT {cap}) AS capped",
         quote_ident(query.table.as_str()),
-        render_where(&query.filter, table)
+        render_where(&filter, table)
     )
 }
 

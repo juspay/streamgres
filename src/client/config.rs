@@ -84,8 +84,11 @@ pub struct Config {
     /// neither does; `0` turns the check off.
     pub join_limit: u64,
     /// `XYNE_SYNC_JOIN_PREFERRED_SIDE`: which side of an INNER join drives
-    /// it when both fit, `child` (the subquery, Zero's `whereExists` as
-    /// translated) or `parent`.
+    /// it when both fit, `parent` (the default: the parent is the query's
+    /// own key-filtered rows and the child is usually an access rule over
+    /// a whole table, so driving from the parent reads the child narrowed
+    /// to the parent's join values instead of whole) or `child` (the
+    /// subquery drives, Zero's `whereExists` as translated).
     pub join_preferred_side: Side,
     /// `XYNE_SYNC_PLAN_TTL_MS`: how long a join plan is remembered before
     /// the query is counted again (60000).
@@ -146,8 +149,8 @@ impl Config {
             None => 100_000,
         };
         let join_preferred_side = match first(&["XYNE_SYNC_JOIN_PREFERRED_SIDE"]).as_deref() {
-            None | Some("child") => Side::Child,
-            Some("parent") => Side::Parent,
+            None | Some("parent") => Side::Parent,
+            Some("child") => Side::Child,
             Some(other) => {
                 return Err(format!(
                     "XYNE_SYNC_JOIN_PREFERRED_SIDE must be child or parent, got `{other}`"

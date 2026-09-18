@@ -404,8 +404,11 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   scanned whole), a node with a page being bounded by its window and a
   driven node by its driver. A fixed point then settles the inner edges: an
   edge with one bounded side is driven from it, one with two takes
-  `XYNE_SYNC_JOIN_PREFERRED_SIDE` (`child`, the client's `whereExists` as
-  translated, or `parent`), a paged main never drives (its window would be
+  `XYNE_SYNC_JOIN_PREFERRED_SIDE` (`parent` by default: the parent is the
+  query's own key-filtered rows and the child is usually an access rule
+  over a whole table, so the child is read narrowed to the parent's join
+  values instead of whole; or `child`, the client's `whereExists` as
+  translated), a paged main never drives (its window would be
   gated after the fact), and an edge left with no bounded side refuses the
   query with a `transformError` naming the sides. The root never moves:
   the decision is the `driver` field of the edge, so part paths, hidden
