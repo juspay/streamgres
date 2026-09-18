@@ -23,7 +23,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::spawn_local;
@@ -170,6 +170,9 @@ pub struct Service<E: Engine, S: Storage> {
     awaiting: IdMap<SubId, ClientId>,
     /// When each read in flight was handed to the driver, for `read_io`.
     issued: IdMap<FetchId, Instant>,
+    /// When every awaited subscription was last checked for completion;
+    /// the checks otherwise touch only what a step could have completed.
+    swept: Instant,
     results: mpsc::UnboundedReceiver<(FetchId, Result<Snapshot, StorageError>)>,
     report: mpsc::UnboundedSender<(FetchId, Result<Snapshot, StorageError>)>,
 }
@@ -198,6 +201,7 @@ where
             stats: None,
             awaiting: IdMap::default(),
             issued: IdMap::default(),
+            swept: Instant::now(),
             results,
             report,
         };
@@ -257,11 +261,13 @@ where
                         {
                             stats.read_io.record(started.duration_since(issued));
                         }
+                        let waiting = self.runtime.waiting_on(id);
                         let step = self.runtime.fetched(id, snapshot);
                         if let Some(stats) = &self.stats {
                             stats.land_step.record(started.elapsed());
                         }
                         self.dispatch(step, Outcome::Landed);
+                        self.settle(&waiting);
                     }
                     Some((id, Err(error))) => {
                         self.issued.remove(&id);
@@ -314,6 +320,7 @@ where
                         reads,
                     },
                 );
+                self.settle(&[sub]);
             }
             Command::Unregister(sub) => {
                 self.runtime.unregister(sub);
@@ -461,17 +468,29 @@ where
         for fetch in selects {
             self.spawn(fetch);
         }
-        self.settle_awaiting();
+        if self.swept.elapsed() >= Duration::from_secs(1) {
+            self.swept = Instant::now();
+            let all: Vec<SubId> = self.awaiting.keys().copied().collect();
+            self.settle(&all);
+        }
     }
 
-    /// Name the awaited subscriptions whose first rows have all arrived,
-    /// each to the sink of its client, and forget them.
-    fn settle_awaiting(&mut self) {
-        let hydrated: Vec<(SubId, ClientId)> = self
-            .awaiting
+    /// Name those of `candidates` that are awaited and whose first rows
+    /// have all arrived, each to the sink of its client, and forget them.
+    /// A step names the subscriptions it could have completed (the one it
+    /// registered, the ones waiting on the read it landed); every awaited
+    /// subscription is checked at most once a second besides, so the check
+    /// never grows with the number still hydrating.
+    fn settle(&mut self, candidates: &[SubId]) {
+        let hydrated: Vec<(SubId, ClientId)> = candidates
             .iter()
-            .filter(|(sub, _)| self.runtime.engine().hydrated(**sub))
-            .map(|(sub, client)| (*sub, *client))
+            .filter_map(|sub| {
+                let client = *self.awaiting.get(sub)?;
+                self.runtime
+                    .engine()
+                    .hydrated(*sub)
+                    .then_some((*sub, client))
+            })
             .collect();
         if hydrated.is_empty() {
             return;

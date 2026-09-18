@@ -257,6 +257,15 @@ impl<E: Engine> Runtime<E> {
         step
     }
 
+    /// The subscriptions whose hydration may complete when read `id`
+    /// lands; nothing when the runtime is not waiting for it.
+    pub fn waiting_on(&self, id: FetchId) -> Vec<SubId> {
+        self.in_flight
+            .get(&id)
+            .map(|flight| self.engine.waiting_on(&flight.fetch))
+            .unwrap_or_default()
+    }
+
     /// The driver refused read `id` (it will never succeed): forget it and
     /// unsubscribe everything that was waiting on it, named with the
     /// client of each so it can be told.

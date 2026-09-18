@@ -608,6 +608,11 @@ impl Engine for SingleTableIVM {
         }
     }
 
+    /// [`SingleTableIVM::readers_of`].
+    fn waiting_on(&self, fetch: &Fetch) -> Vec<SubId> {
+        self.readers_of(fetch)
+    }
+
     /// Every reader of the refused fetch, unsubscribed.
     fn refuse(&mut self, fetch: &Fetch) -> Vec<(SubId, ClientId)> {
         let mut gone = Vec::new();

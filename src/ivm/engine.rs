@@ -75,6 +75,11 @@ pub trait Engine {
     /// their clients, so each can be told.
     fn refuse(&mut self, fetch: &Fetch) -> Vec<(SubId, ClientId)>;
 
+    /// The subscriptions whose first rows may complete when `fetch` lands
+    /// (all of a shared tree's), so a consumer checks those and not every
+    /// subscription still hydrating.
+    fn waiting_on(&self, fetch: &Fetch) -> Vec<SubId>;
+
     /// Route one write to every subscription it affects, grouped per
     /// client.
     fn route(&mut self, write: &WriteQuery) -> Vec<ClientUpdate>;

@@ -941,6 +941,19 @@ impl MultiTableIVM {
         out
     }
 
+    /// The trees with a part reading `fetch`, each once.
+    fn trees_reading(&self, fetch: &Fetch) -> Vec<TreeId> {
+        let mut trees: Vec<TreeId> = Vec::new();
+        for inner in self.single.readers_of(fetch) {
+            if let Some((tree_id, _)) = self.parts.get(&inner)
+                && !trees.contains(tree_id)
+            {
+                trees.push(*tree_id);
+            }
+        }
+        trees
+    }
+
     /// Take the storage reads the inner parts asked for since the last
     /// call.
     pub fn take_requests(&mut self) -> Vec<Fetch> {
@@ -1793,17 +1806,21 @@ impl Engine for MultiTableIVM {
         }
     }
 
+    /// Every subscription of every tree with a part reading the fetch.
+    fn waiting_on(&self, fetch: &Fetch) -> Vec<SubId> {
+        let mut subs = Vec::new();
+        for tree_id in self.trees_reading(fetch) {
+            if let Some(tree) = self.trees.get(&tree_id) {
+                subs.extend(tree.subscribers.iter().copied());
+            }
+        }
+        subs
+    }
+
     /// Every subscription of every tree with a part reading the refused
     /// fetch, unsubscribed.
     fn refuse(&mut self, fetch: &Fetch) -> Vec<(SubId, ClientId)> {
-        let mut trees: Vec<TreeId> = Vec::new();
-        for inner in self.single.readers_of(fetch) {
-            if let Some((tree_id, _)) = self.parts.get(&inner)
-                && !trees.contains(tree_id)
-            {
-                trees.push(*tree_id);
-            }
-        }
+        let trees = self.trees_reading(fetch);
         let mut gone = Vec::new();
         for tree_id in trees {
             let subs = self
