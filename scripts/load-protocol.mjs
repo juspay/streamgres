@@ -47,6 +47,10 @@
 // `workspaceID`, the way the regression rig's harness keeps them: the users are
 // taken from it in order and the token goes in the connection's handshake, so no
 // test login is needed) --thread-query NAME (the per-conversation query, conversationMessages)
+// --client-schema FILE (a JSON client schema to send in initConnection; the TypeScript
+// the reference server requires one for a new client group, this server does not) --post-handshake
+// (send initConnection as the first message instead of in the handshake header, the way
+// a client with a large schema does; on by default when --client-schema is given)
 // The `ws` package is found through E2E_WS, `ws`, or ../node_modules/ws.
 
 import { randomUUID } from 'node:crypto';
@@ -97,6 +101,8 @@ const RAW = flag('raw');
 const WRITES = opt('writes', 'mutations');
 const AUTH_POOL = opt('auth-pool', process.env.E2E_AUTH_POOL ?? '');
 const THREAD_QUERY = opt('thread-query', 'conversationMessages');
+const CLIENT_SCHEMA = opt('client-schema', '') ? JSON.parse(readFileSync(opt('client-schema', ''), 'utf8')) : undefined;
+const POST_HANDSHAKE = flag('post-handshake') || CLIENT_SCHEMA !== undefined;
 const STATS = opt('stats', GATEWAY.replace(/^ws(s?):\/\//, 'http$1://').replace(/\/[^/]*$/, '') + '/stats');
 const t0 = Date.now();
 const log = (...a) => console.log(`${String(Date.now() - t0).padStart(7)}ms`, ...a);
@@ -155,11 +161,12 @@ class Conn {
     this.got = new Map(); this.rows = 0; this.bytes = 0; this.pokes = 0; this.errors = []; this.seenKeys = new Set();
     this.opened = Date.now(); this.connectedAt = 0; this.firstPokeAt = 0; this.hydratedAt = 0; this.closed = false;
     this.wanted = new Set(patch.map(p => p.hash)); this.mutationId = 0; this.pending = new Map(); this.pushLatencies = []; this.inflight = null; this.timedOut = 0;
-    const init = ['initConnection', { desiredQueriesPatch: patch, activeClients: [this.client] }];
-    const sec = encodeURIComponent(Buffer.from(JSON.stringify({ initConnectionMessage: init, authToken: user.token })).toString('base64'));
+    const init = ['initConnection', { desiredQueriesPatch: patch, activeClients: [this.client], ...(CLIENT_SCHEMA ? { clientSchema: CLIENT_SCHEMA } : {}) }];
+    const sec = encodeURIComponent(Buffer.from(JSON.stringify({ initConnectionMessage: POST_HANDSHAKE ? null : init, authToken: user.token })).toString('base64'));
     const url = `${GATEWAY}/sync/v51/connect?clientID=${this.client}&clientGroupID=${this.group}&userID=${user.userId}&baseCookie=&ts=1&lmid=0&wsid=${name}&profileID=load`;
     this.ws = new WebSocket(url, [sec], { headers: { ...(user.cookie ? { Cookie: user.cookie } : {}), Origin: 'http://localhost:5173' }, perMessageDeflate: false });
     this.ready = new Promise((resolve) => { this.resolveReady = resolve; });
+    if (POST_HANDSHAKE) this.ws.on('open', () => this.send(init));
     this.ws.on('message', (data) => this.onMessage(data));
     this.ws.on('close', (code) => { this.closed = true; this.closeCode = code; this.resolveReady(); });
     this.ws.on('error', (e) => { this.errors.push({ kind: 'socket', message: e.message }); });

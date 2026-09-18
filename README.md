@@ -515,7 +515,9 @@ cargo run --release --bin server  # the sync server on :4848 (reads .env; see .e
 # against a real Postgres (wal_level = logical, replication slots to spare, a role that may create a publication):
 export XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5499/xyne_sync
 cargo test --test pg_live     # snapshot held open while writes commit behind it; async service end to end
-cargo run --release --bin bench   # adds scenario 5: registration, streamed writes, registration under load
+XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5499/xyne_bench cargo run --release --bin bench
+                              # adds scenario 5 (registration, streamed writes, registration under load); it drops and
+                              # recreates `users` and `tickets` there, so the database's name must contain `bench`
 
 # the server in front of a local xyne-spaces (backend on :3001 with ENABLE_DEV_AUTH=true, dashboard on :5173,
 # Postgres with wal_level = logical and the app's xyne_0.clients / xyne_0.mutations tables):
@@ -525,6 +527,7 @@ node scripts/e2e-protocol.mjs   # two dev users, real mutations, fan-out, reconn
 node scripts/ui/ui-u2-channel.mjs    # one of the Playwright scripts that drive the dashboard with three users (scripts/ui/)
 node scripts/load-protocol.mjs --connections 200 --seed 3000 --seed-replies 2000 --rate 50 --duration 60 \
   --pid $(pgrep -f target/release/server)   # socket-level load: seed, hydrate, steady fan-out, CPU/RSS samples
+                                            # (--auth-pool FILE runs it on a list of identities with tokens instead of the test login)
 LINUX_BIN=/path/to/linux/server CPUS="2 4 8" scripts/load-matrix.sh   # the same against the server pinned to N CPUs (docker --cpus)
 ```
 
