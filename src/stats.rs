@@ -175,6 +175,8 @@ struct Engine {
 ///   when the registration issued storage reads, warm when the frames
 ///   already held answered it.
 /// - `register_step`: the engine registering one query (compute).
+/// - `unregister_step`: the engine releasing one query or one client's
+///   queries, the rows only they held dropped (compute).
 /// - `read_io`: one storage read from being issued to its rows being back
 ///   on the engine thread (the pool's queue, PostgreSQL, decoding).
 /// - `land_step`: the engine landing one read's rows (compute).
@@ -194,6 +196,7 @@ pub struct Stats {
     pub hydrate_cold: Histogram,
     pub hydrate_warm: Histogram,
     pub register_step: Histogram,
+    pub unregister_step: Histogram,
     pub read_io: Histogram,
     pub land_step: Histogram,
     pub transactions: AtomicU64,
@@ -228,6 +231,7 @@ impl Stats {
             hydrate_cold: Histogram::new(),
             hydrate_warm: Histogram::new(),
             register_step: Histogram::new(),
+            unregister_step: Histogram::new(),
             read_io: Histogram::new(),
             land_step: Histogram::new(),
             transactions: AtomicU64::new(0),
@@ -267,6 +271,7 @@ impl Stats {
             &self.hydrate_cold,
             &self.hydrate_warm,
             &self.register_step,
+            &self.unregister_step,
             &self.read_io,
             &self.land_step,
         ] {
@@ -302,6 +307,7 @@ impl Stats {
                 "hydrate_cold": summary(&self.hydrate_cold),
                 "hydrate_warm": summary(&self.hydrate_warm),
                 "register_step": summary(&self.register_step),
+                "unregister_step": summary(&self.unregister_step),
                 "read_io": summary(&self.read_io),
                 "land_step": summary(&self.land_step),
             },

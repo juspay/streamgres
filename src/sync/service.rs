@@ -323,12 +323,20 @@ where
                 self.settle(&[sub]);
             }
             Command::Unregister(sub) => {
+                let started = Instant::now();
                 self.runtime.unregister(sub);
                 self.awaiting.remove(&sub);
+                if let Some(stats) = &self.stats {
+                    stats.unregister_step.record(started.elapsed());
+                }
             }
             Command::UnregisterClient(client) => {
+                let started = Instant::now();
                 self.runtime.unregister_client(client);
                 self.awaiting.retain(|_, owner| *owner != client);
+                if let Some(stats) = &self.stats {
+                    stats.unregister_step.record(started.elapsed());
+                }
             }
             Command::Transaction(transaction) => self.commit(transaction),
         }
