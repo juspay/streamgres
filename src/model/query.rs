@@ -252,7 +252,10 @@ pub enum WriteQuery {
 /// v1 constraint: `record` must carry the **complete new row image** —
 /// every column, primary-key columns included, never just the changed
 /// ones. Predicates are evaluated against it, so a partial image would
-/// silently mis-evaluate conditions on omitted columns. Supporting partial
+/// silently mis-evaluate conditions on omitted columns. The one exception:
+/// a column the change feed reports unchanged (a large value the update
+/// did not touch) may be absent, and the engine completes it from the
+/// image it holds when it holds the row. Supporting partial
 /// updates needs a read-before-write against storage (see the roadmap in
 /// the README).
 #[derive(Debug, Clone, PartialEq)]

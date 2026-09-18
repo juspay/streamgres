@@ -654,6 +654,7 @@ fn image(
     tuple: &Columns,
 ) -> Result<DataFrameRow, StorageError> {
     let mut data = HashMap::new();
+    let mut unchanged: Vec<ColumnName> = Vec::new();
     for (name, column) in columns.iter().zip(tuple) {
         let Some(declared) = table.column(name.as_str()) else {
             continue;
@@ -662,14 +663,16 @@ fn image(
             TupleDataColumn::PGNull => Value::Null,
             TupleDataColumn::Value(text) => convert(text, &declared.r#type)?,
             TupleDataColumn::PGUnchangedToastedValue => {
-                return Err(StorageError(format!(
-                    "column `{name}` arrived without its value; the table needs REPLICA IDENTITY FULL or smaller values"
-                )));
+                unchanged.push(declared.name.clone());
+                continue;
             }
         };
         data.insert(declared.name.clone(), value);
     }
     for name in table.columns.keys() {
+        if unchanged.contains(name) {
+            continue;
+        }
         data.entry(name.clone()).or_insert(Value::Null);
     }
     Ok(DataFrameRow::from(data))

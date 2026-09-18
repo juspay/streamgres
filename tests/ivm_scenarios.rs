@@ -1711,3 +1711,53 @@ fn updates_are_grouped_per_client() {
     assert_eq!(ops.len(), 1);
     assert_eq!(ops[0].client, two);
 }
+
+/// A column the change feed left out of an update (a large value
+/// PostgreSQL reported unchanged) keeps its held value: the subscriber
+/// sees the whole row, not one with the column gone.
+#[test]
+fn an_update_missing_a_column_keeps_the_held_value() {
+    let tickets = table("tickets");
+    let storage = Rc::new(MemoryStorage::new());
+    let mut ivm = Local::new(SingleTableIVM::new(), storage.clone());
+    let names = Names::default();
+    names.register(
+        &mut ivm,
+        "q-open",
+        query(
+            &tickets,
+            Where::condition("status", ComparisonOperator::EQ, "OPEN"),
+        ),
+    );
+    ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
+
+    let partial: HashMap<ColumnName, Value> = HashMap::from([
+        ("id".into(), Value::Int(1)),
+        ("status".into(), "OPEN".into()),
+        ("priority".into(), "HIGH".into()),
+        ("points".into(), 3.into()),
+    ]);
+    let write = WriteQuery::UPDATE(UpdateQuery {
+        table: tickets.name.clone(),
+        pkey_value: DataFrameKey::new(pkey(1)),
+        record: DataFrameRow::from(partial),
+    });
+    let ops = ivm.incremental_update(&write);
+    let added = ops
+        .iter()
+        .find_map(|update| match &update.op {
+            DataFrameOperation::Add(_, row) => Some(row.clone()),
+            _ => None,
+        })
+        .expect("the open row is re-added with its new image");
+    assert_eq!(
+        added.data.get(&ColumnName::from("assigned_to")),
+        Some(&Value::from("aniket")),
+        "the column the feed left out keeps its held value"
+    );
+    assert_eq!(
+        added.data.get(&ColumnName::from("priority")),
+        Some(&Value::from("HIGH")),
+        "the columns the feed carried are the new ones"
+    );
+}

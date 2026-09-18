@@ -307,13 +307,14 @@ impl SingleTableIVM {
         self.stats.writes_processed += 1;
         let table = write_query.table().clone();
         let key = write_query.pkey_value().clone();
-        let row_image = write_query.new_row_image();
-        let impacts = self.analyze(&table, &key, row_image);
         let old_data = self
             .frames
             .get(&table)
             .and_then(|frame| frame.get(&key))
             .map(|row| row.data.clone());
+        let completed = complete_image(write_query.new_row_image(), old_data.as_ref());
+        let row_image = completed.as_ref().or(write_query.new_row_image());
+        let impacts = self.analyze(&table, &key, row_image);
 
         let mut ops: Vec<SingleTableUpdate> = Vec::new();
         for impact in &impacts {
@@ -550,6 +551,23 @@ impl SingleTableIVM {
         }
         impacts
     }
+}
+
+/// The new image of a write completed from the image the frame holds:
+/// a column the feed left out (one PostgreSQL reported unchanged, a large
+/// value the update did not touch) takes its held value, so the row the
+/// subscribers see stays whole. `None` when nothing was missing or the
+/// row is not held, and the write's own image serves.
+fn complete_image(new: Option<&DataFrameRow>, old: Option<&DataFrameRow>) -> Option<DataFrameRow> {
+    let (new, old) = (new?, old?);
+    if old.data.keys().all(|column| new.data.contains_key(column)) {
+        return None;
+    }
+    let mut data = (*old.data).clone();
+    for (column, value) in new.data.iter() {
+        data.insert(column.clone(), value.clone());
+    }
+    Some(DataFrameRow::from(data))
 }
 
 impl Engine for SingleTableIVM {
