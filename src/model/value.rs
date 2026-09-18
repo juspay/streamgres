@@ -346,7 +346,14 @@ fn canonical_f64_bits(f: f64) -> u64 {
 /// equality: each entry is hashed on its own and the results are combined
 /// with a commutative fold.
 pub(crate) fn unordered_map_hash<K: Hash, V: Hash>(map: &HashMap<K, V>) -> u64 {
-    map.iter()
+    unordered_pairs_hash(map.iter())
+}
+
+/// The order-independent hash of `(key, value)` pairs: each pair hashed
+/// on its own, the results summed, so the same pairs in any order hash
+/// alike (a row key laid out on a schema and one built from a map agree).
+pub(crate) fn unordered_pairs_hash<K: Hash, V: Hash>(pairs: impl Iterator<Item = (K, V)>) -> u64 {
+    pairs
         .map(|(k, v)| {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             k.hash(&mut h);

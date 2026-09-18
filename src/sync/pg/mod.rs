@@ -41,7 +41,7 @@ pub mod stream;
 pub mod text;
 pub mod threads;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -53,7 +53,7 @@ use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow};
 use super::storage::{Storage, StorageError};
 use crate::log::{log_info, log_warn};
 use crate::model::{
-    Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, Lsn, SingleTableReadQuery, Snapshot,
+    Catalog, DataFrameKey, DataFrameRow, DbTable, Lsn, RowData, SingleTableReadQuery, Snapshot,
     Value, ValueType,
 };
 use replication::ReplicationConnection;
@@ -589,21 +589,24 @@ fn decode_row(
     row: &SimpleQueryRow,
     table: &DbTable,
 ) -> Result<(DataFrameKey, DataFrameRow), StorageError> {
-    let columns = sql::select_columns(table);
-    let mut data: HashMap<ColumnName, Value> = HashMap::with_capacity(columns.len());
-    for (index, column) in columns.into_iter().enumerate() {
+    let schema = table.row_schema().clone();
+    let mut values = Vec::with_capacity(schema.len());
+    for (index, column) in schema.names().iter().enumerate() {
         let declared = &table.columns[column].r#type;
         let value = match row.get(index) {
             Some(text) => decode_text(text, declared)?,
             None => Value::Null,
         };
-        data.insert(column.clone(), value);
+        values.push(value);
     }
-    let key = DataFrameKey::new(
+    let data = RowData::with_schema(schema, values);
+    let key = DataFrameKey::with_schema(
+        table.key_schema().clone(),
         table
             .pkey
             .iter()
-            .map(|column| (column.clone(), data[column].clone())),
+            .map(|column| data[column].clone())
+            .collect(),
     );
     Ok((key, DataFrameRow::from(data)))
 }

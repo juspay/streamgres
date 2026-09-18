@@ -10,9 +10,7 @@
 //! Every function threads an `evaluated` counter so callers can observe how
 //! much work routing a write actually costs (see `crate::ivm::IvmStats`).
 
-use std::collections::HashMap;
-
-use crate::model::{ColumnName, ComparisonOperator, Condition, Value, Where};
+use crate::model::{ComparisonOperator, Condition, RowData, Value, Where};
 
 /// Evaluate a full `Where` tree against a row image; an `EXISTS` leaf is
 /// never true here (see [`evaluate_with`] for a caller that can answer
@@ -21,7 +19,7 @@ use crate::model::{ColumnName, ComparisonOperator, Condition, Value, Where};
 /// `AND` and `OR` short-circuit, so `evaluated` counts conditions actually
 /// looked at, not the size of the tree. `AND(vec![])` is `true`,
 /// `OR(vec![])` is `false`.
-pub fn evaluate(filter: &Where, row: &HashMap<ColumnName, Value>, evaluated: &mut u64) -> bool {
+pub fn evaluate(filter: &Where, row: &RowData, evaluated: &mut u64) -> bool {
     evaluate_with(filter, row, evaluated, &|_| false)
 }
 
@@ -30,7 +28,7 @@ pub fn evaluate(filter: &Where, row: &HashMap<ColumnName, Value>, evaluated: &mu
 /// row is shown); every other leaf evaluates as usual.
 pub fn evaluate_with(
     filter: &Where,
-    row: &HashMap<ColumnName, Value>,
+    row: &RowData,
     evaluated: &mut u64,
     exists: &dyn Fn(&Condition) -> bool,
 ) -> bool {
@@ -56,11 +54,7 @@ pub fn evaluate_with(
 /// A `Null` inside the list makes `NOT_IN` unsatisfiable, per the
 /// module-level NULL rule (SQL agrees: `x NOT IN (a, NULL)` is never true);
 /// `IN` needs no such guard — a `Null` element simply never matches.
-pub fn eval_condition(
-    cond: &Condition,
-    row: &HashMap<ColumnName, Value>,
-    evaluated: &mut u64,
-) -> bool {
+pub fn eval_condition(cond: &Condition, row: &RowData, evaluated: &mut u64) -> bool {
     *evaluated += 1;
 
     use ComparisonOperator::*;
@@ -117,15 +111,22 @@ pub fn eval_condition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ColumnName;
     use crate::model::ComparisonOperator::*;
+    use std::collections::HashMap;
 
     /// Build a row image from `(column, value)` pairs.
-    fn row(pairs: Vec<(&str, Value)>) -> HashMap<ColumnName, Value> {
-        pairs.into_iter().map(|(k, v)| (k.into(), v)).collect()
+    fn row(pairs: Vec<(&str, Value)>) -> RowData {
+        RowData::from(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (ColumnName::from(k), v))
+                .collect::<HashMap<_, _>>(),
+        )
     }
 
     /// Evaluate `filter` against `row`, discarding the evaluated counter.
-    fn check(filter: &Where, row: &HashMap<ColumnName, Value>) -> bool {
+    fn check(filter: &Where, row: &RowData) -> bool {
         evaluate(filter, row, &mut 0)
     }
 

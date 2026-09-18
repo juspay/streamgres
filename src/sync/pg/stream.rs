@@ -33,7 +33,7 @@ use tokio_postgres::config::Host;
 
 use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, DeleteQuery, InsertQuery, Lsn,
-    TableName, UpdateQuery, Value, ValueType, WriteQuery,
+    RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
 };
 use crate::sync::service::{Command, Transaction as Committed};
 use crate::sync::storage::StorageError;
@@ -634,14 +634,17 @@ fn replication_config(
         .with_status_interval(Duration::from_secs(1))
 }
 
-/// The primary key of a decoded row image.
+/// The primary key of a decoded row image, laid out on the table's
+/// shared key schema.
 fn key_of(row: &DataFrameRow, table: &DbTable) -> DataFrameKey {
-    DataFrameKey::new(table.pkey.iter().map(|column| {
-        (
-            column.clone(),
-            row.data.get(column).cloned().unwrap_or(Value::Null),
-        )
-    }))
+    DataFrameKey::with_schema(
+        table.key_schema().clone(),
+        table
+            .pkey
+            .iter()
+            .map(|column| row.data.get(column).cloned().unwrap_or(Value::Null))
+            .collect(),
+    )
 }
 
 /// A decoded tuple as a row image of `table`: each value converted by the
@@ -668,6 +671,15 @@ fn image(
             }
         };
         data.insert(declared.name.clone(), value);
+    }
+    if unchanged.is_empty() {
+        let schema = table.row_schema().clone();
+        let values = schema
+            .names()
+            .iter()
+            .map(|name| data.remove(name.as_str()).unwrap_or(Value::Null))
+            .collect();
+        return Ok(DataFrameRow::from(RowData::with_schema(schema, values)));
     }
     for name in table.columns.keys() {
         if unchanged.contains(name) {

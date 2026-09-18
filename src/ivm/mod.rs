@@ -571,7 +571,7 @@ fn complete_image(new: Option<&DataFrameRow>, old: Option<&DataFrameRow>) -> Opt
     if old.data.keys().all(|column| new.data.contains_key(column)) {
         return None;
     }
-    let mut data = (*old.data).clone();
+    let mut data = old.data.to_map();
     for (column, value) in new.data.iter() {
         data.insert(column.clone(), value.clone());
     }

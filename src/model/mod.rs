@@ -25,6 +25,7 @@ pub mod frame;
 pub mod ids;
 pub mod position;
 pub mod query;
+pub mod row;
 pub mod schema;
 pub mod value;
 
@@ -36,5 +37,6 @@ pub use query::{
     MultiTableReadQuery, Order, OrderBy, SingleTableReadQuery, SubId, UpdateQuery, Where,
     WriteQuery,
 };
+pub use row::{RowData, RowSchema};
 pub use schema::{Catalog, ColumnName, DbColumn, DbTable, TableName};
 pub use value::{SharedSet, Value, ValueType};

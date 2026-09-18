@@ -60,8 +60,8 @@ use super::wire;
 use crate::ivm::{ClientUpdate, QueryPart};
 use crate::log::{log_debug, log_info, log_warn};
 use crate::model::{
-    Catalog, ClientId, ColumnName, DataFrameKey, DataFrameOperation, DataFrameRow, Lsn,
-    MultiTableReadQuery, SubId, TableName, Value, WriteQuery,
+    Catalog, ClientId, DataFrameKey, DataFrameOperation, DataFrameRow, Lsn, MultiTableReadQuery,
+    RowData, SubId, TableName, Value, WriteQuery,
 };
 use crate::stats::Stats;
 use crate::sync::{Command, Event};
@@ -227,7 +227,7 @@ const REFUSAL_COOLDOWN: Duration = Duration::from_secs(60);
 /// shows.
 struct Held {
     holders: HashSet<(SubId, QueryPart)>,
-    image: Arc<HashMap<ColumnName, Value>>,
+    image: Arc<RowData>,
 }
 
 /// Account one delta against the group's row ledger and say what the
@@ -1335,6 +1335,7 @@ fn coalesce(rows: Vec<RowOp>) -> Vec<RowOp> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ColumnName;
 
     /// A holder of a row: subscription `sub`, main part.
     fn holder(sub: u64) -> HashSet<(SubId, QueryPart)> {

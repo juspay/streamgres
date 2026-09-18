@@ -40,7 +40,7 @@ use std::rc::Rc;
 use super::columns::{ColumnIndex, CondRef};
 use super::predicate::evaluate;
 use super::stats::IvmStats;
-use crate::model::{ColumnName, Condition, Disjunct, IdMap, SubId, Value, Where};
+use crate::model::{ColumnName, Condition, Disjunct, IdMap, RowData, SubId, Where};
 
 /// Shared handle to one disjunct's counting state; cloned under every
 /// condition key the disjunct contains.
@@ -338,14 +338,14 @@ impl TableIndex {
     /// admission, not residence.
     pub(super) fn matched(
         &self,
-        row: &HashMap<ColumnName, Value>,
+        row: &RowData,
         epoch: u64,
         holders: &[SubId],
         stats: &mut IvmStats,
     ) -> Vec<SubId> {
         let mut fired: Vec<SubId> = Vec::new();
         let mut candidates: Vec<CondRef> = Vec::new();
-        for (column, value) in row {
+        for (column, value) in row.iter() {
             if let Some(index) = self.columns.get(column.as_str()) {
                 stats.columns_probed += 1;
                 index.candidates(value, &mut candidates);

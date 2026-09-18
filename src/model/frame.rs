@@ -18,15 +18,17 @@
 //! where an in-place change has collapsed to the one `Add` a receiver
 //! applies as insert-or-replace.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use super::ids::{IdMap, IdSet};
 use super::query::SubId;
+use super::row::RowData;
+use super::row::RowSchema;
 use super::schema::ColumnName;
-use super::value::{Value, unordered_map_hash};
+use super::value::{Value, unordered_pairs_hash};
 
 /// The identity of a row: its primary-key values — deliberately nothing
 /// else.
@@ -47,8 +49,20 @@ use super::value::{Value, unordered_map_hash};
 /// construction and carried, so hashing a key is hashing one integer.
 #[derive(Clone)]
 pub struct DataFrameKey {
-    pub pkey_value: Arc<HashMap<ColumnName, Value>>,
+    pub pkey_value: Arc<RowData>,
     hash: u64,
+}
+
+impl DataFrameKey {
+    /// A key laid out on `schema` (a table's key columns, shared by every
+    /// row decoded from it) with `values` in that order.
+    pub fn with_schema(schema: Arc<RowSchema>, values: Vec<Value>) -> Self {
+        let pkey_value = RowData::with_schema(schema, values);
+        DataFrameKey {
+            hash: unordered_pairs_hash(pkey_value.iter()),
+            pkey_value: Arc::new(pkey_value),
+        }
+    }
 }
 
 impl PartialEq for DataFrameKey {
@@ -79,10 +93,11 @@ impl fmt::Debug for DataFrameKey {
 }
 
 impl From<HashMap<ColumnName, Value>> for DataFrameKey {
-    /// A key over a finished primary-key map.
+    /// A key over a finished primary-key map (a layout of its own).
     fn from(pkey_value: HashMap<ColumnName, Value>) -> Self {
+        let pkey_value = RowData::from(pkey_value);
         DataFrameKey {
-            hash: unordered_map_hash(&pkey_value),
+            hash: unordered_pairs_hash(pkey_value.iter()),
             pkey_value: Arc::new(pkey_value),
         }
     }
@@ -97,7 +112,7 @@ impl From<HashMap<ColumnName, Value>> for DataFrameKey {
 /// subscription, client and poke of the row refers to.
 #[derive(Clone, PartialEq)]
 pub struct DataFrameRow {
-    pub data: Arc<HashMap<ColumnName, Value>>,
+    pub data: Arc<RowData>,
 }
 
 impl DataFrameRow {
@@ -113,8 +128,18 @@ impl DataFrameRow {
 }
 
 impl From<HashMap<ColumnName, Value>> for DataFrameRow {
-    /// An image over a finished column map.
+    /// An image over a finished column map (a schema of its own).
     fn from(data: HashMap<ColumnName, Value>) -> Self {
+        DataFrameRow {
+            data: Arc::new(RowData::from(data)),
+        }
+    }
+}
+
+impl From<RowData> for DataFrameRow {
+    /// An image over a row already laid out (a decoder's, on the table's
+    /// shared schema).
+    fn from(data: RowData) -> Self {
         DataFrameRow {
             data: Arc::new(data),
         }
@@ -158,7 +183,62 @@ pub struct RowId(pub u64);
 pub struct SharedRow {
     pub key: DataFrameKey,
     pub data: DataFrameRow,
-    pub subscribers: BTreeSet<SubId>,
+    pub subscribers: Holders,
+}
+
+/// The subscriptions holding one row, as a sorted vector: most rows have
+/// one to a few holders, and a set's node per row cost more than the
+/// row's own key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Holders(Vec<SubId>);
+
+impl Holders {
+    /// No holders.
+    pub fn new() -> Self {
+        Holders(Vec::new())
+    }
+
+    /// Add `sub`; whether it was new.
+    pub fn insert(&mut self, sub: SubId) -> bool {
+        match self.0.binary_search(&sub) {
+            Ok(_) => false,
+            Err(at) => {
+                self.0.insert(at, sub);
+                true
+            }
+        }
+    }
+
+    /// Remove `sub`; whether it was there.
+    pub fn remove(&mut self, sub: &SubId) -> bool {
+        match self.0.binary_search(sub) {
+            Ok(at) => {
+                self.0.remove(at);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Whether `sub` holds the row.
+    pub fn contains(&self, sub: &SubId) -> bool {
+        self.0.binary_search(sub).is_ok()
+    }
+
+    /// Whether nobody holds the row.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// How many hold the row.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The holders, ascending.
+    pub fn iter(&self) -> std::slice::Iter<'_, SubId> {
+        self.0.iter()
+    }
 }
 
 impl SharedRow {
@@ -229,7 +309,7 @@ impl TableFrame {
                     SharedRow {
                         key: key.clone(),
                         data,
-                        subscribers: BTreeSet::new(),
+                        subscribers: Holders::new(),
                     },
                 );
                 id

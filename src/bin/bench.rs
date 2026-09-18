@@ -1437,34 +1437,56 @@ fn rss_kb() -> u64 {
         .unwrap_or(0)
 }
 
+/// The columns of a message-like row, in the order a decoder lays them
+/// out: the key first, the rest by name.
+const MESSAGE_COLUMNS: [&str; 14] = [
+    "messageId",
+    "content",
+    "conversationId",
+    "createdAt",
+    "edited",
+    "hasAttachment",
+    "isDeleted",
+    "msgType",
+    "parentMessageId",
+    "senderId",
+    "showInChannel",
+    "updatedAt",
+    "visibleTo",
+    "workspaceId",
+];
+
 /// A message-like row image (fourteen columns, a 160-byte body) under
-/// its key, the shape the application's largest table has.
-fn message_image(id: usize) -> (DataFrameKey, DataFrameRow) {
+/// its key, laid out on the shared `schema` the way a decoded row is.
+fn message_image(
+    schema: &Arc<RowSchema>,
+    key_schema: &Arc<RowSchema>,
+    id: usize,
+) -> (DataFrameKey, DataFrameRow) {
     let text = |prefix: &str| Value::from(format!("{prefix}{id:020}"));
     let body: String = std::iter::repeat_n("the quick brown fox ", 8).collect();
-    let mut data: HashMap<ColumnName, Value> = HashMap::new();
-    data.insert("messageId".into(), text("m"));
-    data.insert("conversationId".into(), text("c"));
-    data.insert("senderId".into(), text("u"));
-    data.insert("workspaceId".into(), text("w"));
-    data.insert("content".into(), Value::from(body));
-    data.insert(
-        "createdAt".into(),
-        Value::Int(1_750_000_000_000 + id as i64),
-    );
-    data.insert(
-        "updatedAt".into(),
-        Value::Int(1_750_000_000_000 + id as i64),
-    );
-    data.insert("isDeleted".into(), Value::Bool(false));
-    data.insert("edited".into(), Value::Bool(false));
-    data.insert("showInChannel".into(), Value::Bool(true));
-    data.insert("hasAttachment".into(), Value::Bool(false));
-    data.insert("msgType".into(), Value::from("TEXT"));
-    data.insert("visibleTo".into(), Value::Null);
-    data.insert("parentMessageId".into(), Value::Null);
-    let key = DataFrameKey::new(HashMap::from([(ColumnName::from("messageId"), text("m"))]));
-    (key, DataFrameRow::from(data))
+    let stamp = Value::Int(1_750_000_000_000 + id as i64);
+    let values = vec![
+        text("m"),
+        Value::from(body),
+        text("c"),
+        stamp.clone(),
+        Value::Bool(false),
+        Value::Bool(false),
+        Value::Bool(false),
+        Value::from("TEXT"),
+        Value::Null,
+        text("u"),
+        Value::Bool(true),
+        stamp,
+        Value::Null,
+        text("w"),
+    ];
+    let key = DataFrameKey::with_schema(key_schema.clone(), vec![text("m")]);
+    (
+        key,
+        DataFrameRow::from(RowData::with_schema(schema.clone(), values)),
+    )
 }
 
 /// Scenario 2d: what a held row costs in memory. The images of 200 000
@@ -1477,7 +1499,11 @@ fn memory_per_row() {
         "\n== 2d. memory per held row ({MEMORY_ROWS} message-like rows of fourteen columns, one subscription holding them) =="
     );
     let baseline = rss_kb();
-    let images: Vec<(DataFrameKey, DataFrameRow)> = (0..MEMORY_ROWS).map(message_image).collect();
+    let schema = RowSchema::new(MESSAGE_COLUMNS.map(ColumnName::from));
+    let key_schema = RowSchema::new([ColumnName::from("messageId")]);
+    let images: Vec<(DataFrameKey, DataFrameRow)> = (0..MEMORY_ROWS)
+        .map(|id| message_image(&schema, &key_schema, id))
+        .collect();
     let with_images = rss_kb();
     let storage = Rc::new(BenchStorage::default());
     for (key, row) in &images {

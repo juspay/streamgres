@@ -77,15 +77,7 @@ pub fn count_sql(query: &SingleTableReadQuery, table: &DbTable, cap: u64) -> Str
 /// The table's columns in a fixed order: primary-key columns first (in
 /// declaration order), then the rest sorted by name.
 pub fn select_columns(table: &DbTable) -> Vec<&crate::model::ColumnName> {
-    let mut columns: Vec<&crate::model::ColumnName> = table.pkey.iter().collect();
-    let mut rest: Vec<&crate::model::ColumnName> = table
-        .columns
-        .keys()
-        .filter(|column| !table.pkey.contains(column))
-        .collect();
-    rest.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-    columns.extend(rest);
-    columns
+    table.row_schema().names().iter().collect()
 }
 
 /// The Postgres type every column of a declared type is cast to on the

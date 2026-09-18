@@ -10,6 +10,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::row::RowSchema;
+
 use super::value::ValueType;
 
 /// The name of a table, as its own type so it can never be confused with
@@ -107,6 +109,13 @@ impl From<String> for ColumnName {
     }
 }
 
+impl AsRef<str> for ColumnName {
+    /// The name as a string slice.
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 impl std::borrow::Borrow<str> for ColumnName {
     /// Lets maps keyed by [`ColumnName`] be queried with a plain `&str`.
     fn borrow(&self) -> &str {
@@ -159,6 +168,11 @@ pub struct DbTable {
     pub name: TableName,
     pub pkey: Vec<ColumnName>,
     pub columns: HashMap<ColumnName, DbColumn>,
+    /// The layout every row decoded from this table shares: the key
+    /// columns first, the rest by name.
+    row_schema: Arc<RowSchema>,
+    /// The layout of the table's keys: the key columns, in order.
+    key_schema: Arc<RowSchema>,
 }
 
 /// The authoritative set of table schemas, by name.
@@ -205,6 +219,17 @@ impl DbColumn {
 }
 
 impl DbTable {
+    /// The layout of this table's rows: the key columns first, the rest
+    /// by name; every row decoded from the table shares it.
+    pub fn row_schema(&self) -> &Arc<RowSchema> {
+        &self.row_schema
+    }
+
+    /// The layout of this table's keys: the key columns, in order.
+    pub fn key_schema(&self) -> &Arc<RowSchema> {
+        &self.key_schema
+    }
+
     /// Build a table, enforcing the schema invariants.
     ///
     /// # Panics
@@ -240,10 +265,20 @@ impl DbTable {
             );
         }
 
+        let mut rest: Vec<ColumnName> = by_name
+            .keys()
+            .filter(|column| !pkey.contains(column))
+            .cloned()
+            .collect();
+        rest.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let row_schema = RowSchema::new(pkey.iter().cloned().chain(rest));
+        let key_schema = RowSchema::new(pkey.iter().cloned());
         DbTable {
             name,
             pkey,
             columns: by_name,
+            row_schema,
+            key_schema,
         }
     }
 
