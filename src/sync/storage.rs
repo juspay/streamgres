@@ -14,6 +14,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 
 use crate::ivm::{evaluate, order_rows};
 use crate::model::Snapshot;
@@ -49,6 +50,16 @@ pub trait Storage {
     /// `order_by` and `limit` (window maintenance depends on getting the
     /// *best* rows); an unlimited query may return rows in any order.
     async fn select(&self, query: &SingleTableReadQuery) -> Result<Snapshot, StorageError>;
+
+    /// [`Storage::select`] for a query already shared: a source that runs
+    /// the read as a task of its own takes the handle instead of copying
+    /// the query. The default reads through the handle.
+    async fn select_shared(
+        &self,
+        query: Arc<SingleTableReadQuery>,
+    ) -> Result<Snapshot, StorageError> {
+        self.select(&query).await
+    }
 
     /// How many rows of `query.table` satisfy `query.filter`, counted no
     /// further than `cap`: the answer is exact below `cap`, and `cap`

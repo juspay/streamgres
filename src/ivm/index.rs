@@ -34,14 +34,13 @@
 //! per shard.
 
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::columns::{ColumnIndex, CondRef};
 use super::predicate::evaluate;
 use super::stats::IvmStats;
-use crate::model::SubId;
-use crate::model::{ColumnName, Condition, Disjunct, Value, Where};
+use crate::model::{ColumnName, Condition, Disjunct, IdMap, SubId, Value, Where};
 
 /// Shared handle to one disjunct's counting state; cloned under every
 /// condition key the disjunct contains.
@@ -99,7 +98,7 @@ pub(super) struct TableIndex {
     columns: HashMap<ColumnName, ColumnIndex>,
     by_disjunct: HashMap<Disjunct, SharedCounter>,
     unconditional: Vec<SubId>,
-    boundaries: HashMap<SubId, Where>,
+    boundaries: IdMap<SubId, Where>,
 }
 
 impl TableIndex {
@@ -322,7 +321,7 @@ impl TableIndex {
     }
 
     /// The subscriptions whose filters the row image satisfies **and**
-    /// whose admission boundary (if any) it passes.
+    /// whose admission boundary (if any) it passes, sorted, each once.
     ///
     /// Looks each column value of the row up in that column's index, which
     /// yields exactly the conditions the value satisfies (each at most
@@ -332,17 +331,17 @@ impl TableIndex {
     /// fresh, monotonically increased write number — it is what lazily
     /// invalidates counts left over from earlier writes. Unconditional
     /// subscribers are always included. Fired candidates are then filtered
-    /// through their `boundaries` entry — except subscribers in `holders`,
-    /// which already hold the written row: the boundary gates admission,
-    /// not residence.
+    /// through their `boundaries` entry — except subscribers in `holders`
+    /// (sorted), which already hold the written row: the boundary gates
+    /// admission, not residence.
     pub(super) fn matched(
         &self,
         row: &HashMap<ColumnName, Value>,
         epoch: u64,
-        holders: &BTreeSet<SubId>,
+        holders: &[SubId],
         stats: &mut IvmStats,
-    ) -> BTreeSet<SubId> {
-        let mut fired = BTreeSet::new();
+    ) -> Vec<SubId> {
+        let mut fired: Vec<SubId> = Vec::new();
         let mut candidates: Vec<CondRef> = Vec::new();
         for (column, value) in row {
             if let Some(index) = self.columns.get(column.as_str()) {
@@ -370,16 +369,18 @@ impl TableIndex {
                 }
             }
         }
-        for subscriber in &self.unconditional {
-            fired.insert(*subscriber);
+        fired.extend(self.unconditional.iter().copied());
+        fired.sort_unstable();
+        fired.dedup();
+        if !self.boundaries.is_empty() {
+            fired.retain(|sub| {
+                holders.binary_search(sub).is_ok()
+                    || self
+                        .boundaries
+                        .get(sub)
+                        .is_none_or(|boundary| evaluate(boundary, row, &mut 0))
+            });
         }
-        fired.retain(|uuid| {
-            holders.contains(uuid)
-                || self
-                    .boundaries
-                    .get(uuid)
-                    .is_none_or(|boundary| evaluate(boundary, row, &mut 0))
-        });
         fired
     }
 }

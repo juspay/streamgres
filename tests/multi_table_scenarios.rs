@@ -68,17 +68,12 @@ fn query(table: &DbTable, filter: Where) -> SingleTableReadQuery {
 
 /// A LEFT JOIN edge to a single-node sub query.
 fn left(sub: SingleTableReadQuery, main_column: &str, sub_column: &str) -> Join {
-    Join::new(MultiTableReadQuery::single(sub), main_column, sub_column)
+    Join::left(MultiTableReadQuery::single(sub), main_column, sub_column)
 }
 
 /// A root with the given LEFT joins and no RIGHT joins.
 fn left_joined(main_table: SingleTableReadQuery, left_joins: Vec<Join>) -> MultiTableReadQuery {
-    MultiTableReadQuery {
-        main_table,
-        left_joins,
-        right_joins: Vec::new(),
-        inner_joins: Vec::new(),
-    }
+    MultiTableReadQuery::new(main_table, left_joins)
 }
 
 /// `OPEN` tickets.
@@ -148,7 +143,7 @@ fn full_row(id: i64, pairs: &[(&str, Value)]) -> DataFrameRow {
         .map(|(column, value)| ((*column).into(), value.clone()))
         .collect();
     data.insert("id".into(), Value::Int(id));
-    DataFrameRow { data }
+    DataFrameRow::from(data)
 }
 
 fn insert(table: &str, id: i64, pairs: &[(&str, Value)]) -> WriteQuery {
@@ -268,7 +263,7 @@ impl Names {
                 } else if let Some(index) = target.part.join_index() {
                     format!("join{index}")
                 } else {
-                    format!("part{:?}", target.part.0)
+                    format!("part{:?}", target.part.path())
                 };
                 let op = match &update.op {
                     DataFrameOperation::Add(key, _) => format!("add:{:?}", key.pkey_value["id"]),
@@ -654,12 +649,10 @@ fn self_join_write_converges_for_the_client() {
             DbColumn::new("mgr", ValueType::Int),
         ],
     );
-    let spec = MultiTableReadQuery {
-        main_table: query(&people, Where::AND(vec![])),
-        left_joins: vec![left(query(&people, Where::AND(vec![])), "mgr", "id")],
-        right_joins: Vec::new(),
-        inner_joins: Vec::new(),
-    };
+    let spec = MultiTableReadQuery::new(
+        query(&people, Where::AND(vec![])),
+        vec![left(query(&people, Where::AND(vec![])), "mgr", "id")],
+    );
     let (mut ivm, storage, names) = engine();
     names.register(&mut ivm, "q", spec);
 
@@ -705,7 +698,7 @@ fn self_join_write_converges_for_the_client() {
 /// newest members (by id, descending) of each team.
 fn tickets_two_newest_members_query() -> MultiTableReadQuery {
     let mut spec = tickets_members_query();
-    let sub = &mut spec.left_joins[0].sub.main_table;
+    let sub = &mut spec.joins[0].sub.main_table;
     sub.order_by = vec![OrderBy::new("id", Order::DESC)];
     sub.limit = 2;
     spec
@@ -941,12 +934,10 @@ fn users_with_profiles() -> MultiTableReadQuery {
 /// OPEN tickets RIGHT JOIN `users` on `assigned_to = users.id`: every user
 /// is visible, a ticket only while its assignee exists.
 fn tickets_right_users_query(users: MultiTableReadQuery) -> MultiTableReadQuery {
-    MultiTableReadQuery {
-        main_table: open_tickets(),
-        left_joins: Vec::new(),
-        right_joins: vec![Join::new(users, "assigned_to", "id")],
-        inner_joins: Vec::new(),
-    }
+    MultiTableReadQuery::new(
+        open_tickets(),
+        vec![Join::right(users, "assigned_to", "id")],
+    )
 }
 
 /// A RIGHT JOIN preserves the child: the snapshot holds every user and
@@ -1108,7 +1099,7 @@ fn nested_left_under_right_cascades() {
             "q/part[0, 0]/add:Int(100)"
         ]
     );
-    assert_eq!(frame_len(&ivm, &names, "q", QueryPart(vec![0, 0])), 1);
+    assert_eq!(frame_len(&ivm, &names, "q", QueryPart::new(&[0, 0])), 1);
 
     assert!(
         write(&mut ivm, &storage, profile(101, 2)).is_empty(),
@@ -1137,7 +1128,7 @@ fn nested_left_under_left_cascades() {
     }
     let spec = left_joined(
         open_tickets(),
-        vec![Join::new(users_with_profiles(), "assigned_to", "id")],
+        vec![Join::left(users_with_profiles(), "assigned_to", "id")],
     );
     assert!(names.register(&mut ivm, "q", spec).is_empty());
 
@@ -1163,7 +1154,11 @@ fn nested_left_under_left_cascades() {
             "q/part[0, 0]/del:Int(100)"
         ]
     );
-    for part in [QueryPart::main(), QueryPart::join(0), QueryPart(vec![0, 0])] {
+    for part in [
+        QueryPart::main(),
+        QueryPart::join(0),
+        QueryPart::new(&[0, 0]),
+    ] {
         assert_eq!(frame_len(&ivm, &names, "q", part), 0);
     }
 }
@@ -1184,17 +1179,15 @@ fn two_edges_driving_one_column_intersect() {
     ] {
         storage.apply(&w);
     }
-    let users = MultiTableReadQuery {
-        main_table: query(&sub_table("users"), Where::AND(vec![])),
-        left_joins: Vec::new(),
-        right_joins: vec![Join::new(
+    let users = MultiTableReadQuery::new(
+        query(&sub_table("users"), Where::AND(vec![])),
+        vec![Join::right(
             MultiTableReadQuery::single(query(&profiles_table(), Where::AND(vec![]))),
             "id",
             "user_id",
         )],
-        inner_joins: Vec::new(),
-    };
-    let spec = left_joined(open_tickets(), vec![Join::new(users, "assigned_to", "id")]);
+    );
+    let spec = left_joined(open_tickets(), vec![Join::left(users, "assigned_to", "id")]);
     let snapshot = names.register(&mut ivm, "q", spec);
     assert_eq!(
         names.tags(&snapshot),
@@ -1219,7 +1212,7 @@ fn two_edges_driving_one_column_intersect() {
         vec!["q/join0/del:Int(1)", "q/main/del:Int(10)"],
         "no ticket names user 1 anymore; its profile is preserved"
     );
-    assert_eq!(frame_len(&ivm, &names, "q", QueryPart(vec![0, 0])), 2);
+    assert_eq!(frame_len(&ivm, &names, "q", QueryPart::new(&[0, 0])), 2);
     let ops = write(&mut ivm, &storage, delete("profiles", 101));
     assert_eq!(
         names.tags(&ops),
@@ -1241,7 +1234,11 @@ fn unregister_removes_nested_parts() {
         tickets_right_users_query(users_with_profiles()),
     );
     ivm.unregister_query(names.id("q"));
-    for part in [QueryPart::main(), QueryPart::join(0), QueryPart(vec![0, 0])] {
+    for part in [
+        QueryPart::main(),
+        QueryPart::join(0),
+        QueryPart::new(&[0, 0]),
+    ] {
         assert!(ivm.engine().rows_for(names.id("q"), part).is_none());
     }
     assert!(write(&mut ivm, &storage, user(3, "c")).is_empty());
@@ -1364,12 +1361,10 @@ fn set_valued_leaf_keeps_its_identity_across_crossings() {
 /// user who does not exist yet, `u2` is held by the engine (it drives the
 /// edge) but hidden until its ticket is open.
 fn tickets_inner_users_query() -> MultiTableReadQuery {
-    MultiTableReadQuery {
-        main_table: open_tickets(),
-        left_joins: Vec::new(),
-        right_joins: Vec::new(),
-        inner_joins: vec![Join::new(users_node(), "assigned_to", "id")],
-    }
+    MultiTableReadQuery::new(
+        open_tickets(),
+        vec![Join::inner(users_node(), "assigned_to", "id")],
+    )
 }
 
 /// INNER keeps neither side alone: the snapshot holds the open tickets
@@ -1446,17 +1441,15 @@ fn exists_inside_or_keeps_rows_another_branch_admits() {
     ] {
         storage.apply(&w);
     }
-    let spec = MultiTableReadQuery {
-        main_table: query(
+    let spec = MultiTableReadQuery::new(
+        query(
             &tickets_table(),
             Where::OR(vec![
                 Where::condition("status", ComparisonOperator::EQ, "OPEN"),
                 Where::exists("assigned_to", 0),
             ]),
         ),
-        left_joins: Vec::new(),
-        right_joins: Vec::new(),
-        inner_joins: vec![Join::new(
+        vec![Join::inner(
             MultiTableReadQuery::single(query(
                 &sub_table("users"),
                 Where::condition("name", ComparisonOperator::EQ, "lead"),
@@ -1464,7 +1457,7 @@ fn exists_inside_or_keeps_rows_another_branch_admits() {
             "assigned_to",
             "id",
         )],
-    };
+    );
     let snapshot = names.register(&mut ivm, "q", spec.clone());
     assert_eq!(
         names.tags(&snapshot),
@@ -1521,25 +1514,21 @@ fn inner_chain_shows_only_rows_reaching_the_root() {
     ] {
         storage.apply(&w);
     }
-    let spec = MultiTableReadQuery {
-        main_table: open_tickets(),
-        left_joins: Vec::new(),
-        right_joins: Vec::new(),
-        inner_joins: vec![Join::new(
-            MultiTableReadQuery {
-                main_table: query(&sub_table("users"), Where::AND(vec![])),
-                left_joins: Vec::new(),
-                right_joins: Vec::new(),
-                inner_joins: vec![Join::new(
+    let spec = MultiTableReadQuery::new(
+        open_tickets(),
+        vec![Join::inner(
+            MultiTableReadQuery::new(
+                query(&sub_table("users"), Where::AND(vec![])),
+                vec![Join::inner(
                     MultiTableReadQuery::single(query(&profiles_table(), Where::AND(vec![]))),
                     "id",
                     "user_id",
                 )],
-            },
+            ),
             "assigned_to",
             "id",
         )],
-    };
+    );
     let snapshot = names.register(&mut ivm, "q", spec);
     assert_eq!(
         names.tags(&snapshot),
@@ -1566,5 +1555,294 @@ fn inner_chain_shows_only_rows_reaching_the_root() {
             "q/main/del:Int(1)",
             "q/part[0, 0]/del:Int(1)"
         ]
+    );
+}
+
+/// The same INNER edge evaluated from the main: the tickets are read
+/// whole and the users narrowed to them, and the client sees exactly the
+/// rows the sub-driven form shows, at every step. A user arriving reveals
+/// the ticket that named it (the match count crossing zero), a ticket
+/// closing retracts its user, a ticket opening fetches and reveals its
+/// user, and a user leaving hides its ticket.
+#[test]
+fn inner_from_main_shows_the_same_rows_as_inner_from_sub() {
+    let (mut ivm, storage, names) = engine();
+    for w in [
+        user(1, "a"),
+        user(2, "b"),
+        ticket(10, "OPEN", 1),
+        ticket(11, "OPEN", 9),
+        ticket(12, "CLOSED", 2),
+    ] {
+        storage.apply(&w);
+    }
+    let spec = MultiTableReadQuery::new(
+        open_tickets(),
+        vec![Join::inner_from_main(users_node(), "assigned_to", "id")],
+    );
+    let snapshot = names.register(&mut ivm, "q", spec.clone());
+    assert_eq!(
+        names.tags(&snapshot),
+        ["q/join0/add:Int(1)", "q/main/add:Int(10)"]
+    );
+    assert_eq!(frame_len(&ivm, &names, "q", QueryPart::main()), 1);
+    assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 1);
+
+    let ops = write(&mut ivm, &storage, user(9, "late"));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/add:Int(9)", "q/main/add:Int(11)"],
+        "the user's arrival opens the gate on the ticket that named it"
+    );
+
+    let ops = write(&mut ivm, &storage, update_ticket(10, "CLOSED", 1));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/del:Int(1)", "q/main/del:Int(10)"]
+    );
+
+    let ops = write(&mut ivm, &storage, update_ticket(12, "OPEN", 2));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/add:Int(2)", "q/main/add:Int(12)"],
+        "the ticket's arrival fetches its user, whose landing reveals the ticket"
+    );
+
+    let ops = write(&mut ivm, &storage, delete("users", 2));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/del:Int(2)", "q/main/del:Int(12)"],
+        "the last match leaving closes the gate"
+    );
+
+    let twin = names.register(&mut ivm, "twin", spec);
+    assert_eq!(
+        names.tags(&twin),
+        ["twin/join0/add:Int(9)", "twin/main/add:Int(11)"],
+        "a twin is served the shown rows only"
+    );
+}
+
+/// `status = 'OPEN' OR EXISTS(users WHERE name = 'lead')` with the edge
+/// driven from the main: the leaf becomes a gate answered per row from the
+/// match count, and the rows shown are the ones the sub-driven form shows
+/// through the whole scenario.
+#[test]
+fn exists_inside_or_gates_from_the_main_too() {
+    let (mut ivm, storage, names) = engine();
+    for w in [
+        user(1, "lead"),
+        user(2, "dev"),
+        ticket(1, "OPEN", 2),
+        ticket(2, "CLOSED", 1),
+        ticket(3, "OPEN", 1),
+        ticket(4, "CLOSED", 2),
+    ] {
+        storage.apply(&w);
+    }
+    let spec = MultiTableReadQuery::new(
+        query(
+            &tickets_table(),
+            Where::OR(vec![
+                Where::condition("status", ComparisonOperator::EQ, "OPEN"),
+                Where::exists("assigned_to", 0),
+            ]),
+        ),
+        vec![Join::inner_from_main(
+            MultiTableReadQuery::single(query(
+                &sub_table("users"),
+                Where::condition("name", ComparisonOperator::EQ, "lead"),
+            )),
+            "assigned_to",
+            "id",
+        )],
+    );
+    let snapshot = names.register(&mut ivm, "q", spec.clone());
+    assert_eq!(
+        names.tags(&snapshot),
+        [
+            "q/join0/add:Int(1)",
+            "q/main/add:Int(1)",
+            "q/main/add:Int(2)",
+            "q/main/add:Int(3)"
+        ]
+    );
+    assert_eq!(
+        frame_len(&ivm, &names, "q", QueryPart::main()),
+        3,
+        "the closed ticket of the dev is held but not shown"
+    );
+
+    let ops = write(&mut ivm, &storage, user(1, "dev"));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/del:Int(1)", "q/main/del:Int(2)"],
+        "the gate re-evaluates: t3 stays through the OPEN branch"
+    );
+
+    let ops = write(&mut ivm, &storage, user(3, "lead"));
+    assert!(
+        ops.is_empty(),
+        "a lead nobody is assigned to is not referenced, so not read"
+    );
+    let ops = write(&mut ivm, &storage, ticket(5, "CLOSED", 3));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/add:Int(3)", "q/main/add:Int(5)"],
+        "the ticket references the lead, whose landing opens the gate"
+    );
+
+    let ops = write(&mut ivm, &storage, update_ticket(1, "CLOSED", 2));
+    assert_eq!(names.tags(&ops), ["q/main/del:Int(1)"]);
+    assert_eq!(
+        names.tags(&names.register(&mut ivm, "twin", spec)),
+        [
+            "twin/join0/add:Int(3)",
+            "twin/main/add:Int(3)",
+            "twin/main/add:Int(5)"
+        ]
+    );
+}
+
+/// Two existence tests in one `OR`, one edge driven from the sub and one
+/// from the main: `EXISTS(users WHERE name = 'lead') OR EXISTS(members)`.
+/// A ticket is shown through either; a member arriving opens the gate for
+/// its team, and the lead stepping down re-evaluates the tickets the
+/// sub-driven edge no longer admits.
+#[test]
+fn mixed_drivers_inside_one_or_gate_together() {
+    let (mut ivm, storage, names) = engine();
+    for w in [
+        user(1, "lead"),
+        insert(
+            "tickets",
+            1,
+            &[
+                ("status", "OPEN".into()),
+                ("assigned_to", Value::Int(1)),
+                ("team_id", Value::Int(5)),
+            ],
+        ),
+        insert(
+            "tickets",
+            2,
+            &[
+                ("status", "OPEN".into()),
+                ("assigned_to", Value::Int(2)),
+                ("team_id", Value::Int(6)),
+            ],
+        ),
+        insert(
+            "tickets",
+            3,
+            &[
+                ("status", "OPEN".into()),
+                ("assigned_to", Value::Int(2)),
+                ("team_id", Value::Int(7)),
+            ],
+        ),
+        member(1, 6),
+    ] {
+        storage.apply(&w);
+    }
+    let spec = MultiTableReadQuery::new(
+        query(
+            &tickets_table(),
+            Where::OR(vec![
+                Where::exists("assigned_to", 0),
+                Where::exists("team_id", 1),
+            ]),
+        ),
+        vec![
+            Join::inner(
+                MultiTableReadQuery::single(query(
+                    &sub_table("users"),
+                    Where::condition("name", ComparisonOperator::EQ, "lead"),
+                )),
+                "assigned_to",
+                "id",
+            ),
+            Join::inner_from_main(
+                MultiTableReadQuery::single(query(&members_table(), Where::AND(vec![]))),
+                "team_id",
+                "team",
+            ),
+        ],
+    );
+    let snapshot = names.register(&mut ivm, "q", spec);
+    assert_eq!(
+        names.tags(&snapshot),
+        [
+            "q/join0/add:Int(1)",
+            "q/join1/add:Int(1)",
+            "q/main/add:Int(1)",
+            "q/main/add:Int(2)"
+        ],
+        "t1 through the lead, t2 through its member; t3 held hidden"
+    );
+
+    let ops = write(&mut ivm, &storage, member(2, 7));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join1/add:Int(2)", "q/main/add:Int(3)"],
+        "the member's arrival opens the main-driven gate for team 7"
+    );
+
+    let ops = write(&mut ivm, &storage, user(1, "dev"));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/del:Int(1)", "q/main/del:Int(1)"],
+        "the sub-driven edge losing the lead re-evaluates t1, which no branch admits"
+    );
+}
+
+/// A main-driven inner edge below a LEFT edge: `tickets LEFT users` where
+/// a user is shown only while it has a profile. The nested gate opens and
+/// closes as profiles come and go, and the user's rows cascade with it.
+#[test]
+fn a_nested_main_driven_inner_edge_gates_its_node() {
+    let (mut ivm, storage, names) = engine();
+    for w in [
+        user(1, "a"),
+        user(2, "b"),
+        profile(1, 1),
+        ticket(10, "OPEN", 1),
+        ticket(11, "OPEN", 2),
+    ] {
+        storage.apply(&w);
+    }
+    let users = MultiTableReadQuery::new(
+        query(&sub_table("users"), Where::AND(vec![])),
+        vec![Join::inner_from_main(
+            MultiTableReadQuery::single(query(&profiles_table(), Where::AND(vec![]))),
+            "id",
+            "user_id",
+        )],
+    );
+    let spec = left_joined(open_tickets(), vec![Join::left(users, "assigned_to", "id")]);
+    let snapshot = names.register(&mut ivm, "q", spec);
+    assert_eq!(
+        names.tags(&snapshot),
+        [
+            "q/join0/add:Int(1)",
+            "q/main/add:Int(10)",
+            "q/main/add:Int(11)",
+            "q/part[0, 0]/add:Int(1)"
+        ],
+        "both tickets stand (LEFT); only the user with a profile is shown"
+    );
+
+    let ops = write(&mut ivm, &storage, profile(2, 2));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/add:Int(2)", "q/part[0, 0]/add:Int(2)"],
+        "the profile opens the gate on its user"
+    );
+
+    let ops = write(&mut ivm, &storage, delete("profiles", 1));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/del:Int(1)", "q/part[0, 0]/del:Int(1)"],
+        "the last profile leaving closes it"
     );
 }

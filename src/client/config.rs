@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use super::plan::Side;
+use super::plan::{Policy, Side};
 use crate::log::Level;
 use crate::model::TableName;
 use crate::sync::pg::Settings;
@@ -37,6 +37,12 @@ pub struct Config {
     /// `XYNE_SYNC_READ_CONNECTIONS`: how many storage reads may hold a
     /// Postgres connection at once; the rest queue (16).
     pub read_connections: usize,
+    /// `XYNE_SYNC_READ_THREADS`: how many threads run the storage reads,
+    /// their connections and their row decoding (2).
+    pub read_threads: usize,
+    /// `XYNE_SYNC_GROUP_THREADS`: how many threads keep the client groups'
+    /// views and build their pokes, each owning a share of the groups (1).
+    pub group_threads: usize,
     /// `XYNE_SYNC_QUERY_URL` (or `ZERO_QUERY_URL`): the application
     /// server's query endpoint, which turns query names into ASTs.
     pub query_url: String,
@@ -77,10 +83,16 @@ pub struct Config {
     /// other side when that one fits, and the query is refused when
     /// neither does; `0` turns the check off.
     pub join_limit: u64,
-    /// `XYNE_SYNC_JOIN_PREFERRED_SIDE`: which side of an INNER join to
-    /// count first, `child` (the subquery, the side that drives unless
-    /// told otherwise) or `parent`.
+    /// `XYNE_SYNC_JOIN_PREFERRED_SIDE`: which side of an INNER join drives
+    /// it when both fit, `child` (the subquery, Zero's `whereExists` as
+    /// translated) or `parent`.
     pub join_preferred_side: Side,
+    /// `XYNE_SYNC_PLAN_TTL_MS`: how long a join plan is remembered before
+    /// the query is counted again (60000).
+    pub plan_ttl: Duration,
+    /// `XYNE_SYNC_PLAN_CACHE`: how many join plans are remembered at most
+    /// (10000).
+    pub plan_cache: usize,
     /// `XYNE_SYNC_LOG`: `error`, `warn`, `info` or `debug` (`info`).
     pub log: Level,
 }
@@ -177,6 +189,26 @@ impl Config {
                 })?,
                 None => 16,
             },
+            read_threads: match first(&["XYNE_SYNC_READ_THREADS"]) {
+                Some(text) => text
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|threads| *threads > 0)
+                    .ok_or_else(|| {
+                        format!("XYNE_SYNC_READ_THREADS must be a positive number, got `{text}`")
+                    })?,
+                None => 2,
+            },
+            group_threads: match first(&["XYNE_SYNC_GROUP_THREADS"]) {
+                Some(text) => text
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|threads| *threads > 0)
+                    .ok_or_else(|| {
+                        format!("XYNE_SYNC_GROUP_THREADS must be a positive number, got `{text}`")
+                    })?,
+                None => 1,
+            },
             query_url,
             mutate_url,
             forward_cookies,
@@ -200,8 +232,23 @@ impl Config {
             },
             join_limit,
             join_preferred_side,
+            plan_ttl: millis("XYNE_SYNC_PLAN_TTL_MS", 60_000)?,
+            plan_cache: match first(&["XYNE_SYNC_PLAN_CACHE"]) {
+                Some(text) => text
+                    .parse()
+                    .map_err(|_| format!("XYNE_SYNC_PLAN_CACHE must be a number, got `{text}`"))?,
+                None => 10_000,
+            },
             log,
         })
+    }
+
+    /// The join planner's settings.
+    pub fn policy(&self) -> Policy {
+        Policy {
+            limit: self.join_limit,
+            preferred: self.join_preferred_side,
+        }
     }
 
     /// The schema the application server records mutations in,
@@ -228,6 +275,7 @@ impl Config {
             heartbeat: self.heartbeat,
             snapshot_rotation: self.snapshot_rotation,
             read_connections: self.read_connections,
+            read_threads: self.read_threads,
             watched: vec![TableName::from(self.clients_table().as_str())],
         }
     }

@@ -85,6 +85,7 @@
 //! always-false boundary (`IN ()`), so it stays permanently empty.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
 
 use super::{SingleTableIVM, SingleTableUpdate};
 use crate::model::{
@@ -653,14 +654,16 @@ impl SingleTableIVM {
                         .map(|row| row.data.clone())
                 })
         };
+        let was: HashSet<&DataFrameKey> = previous.iter().collect();
+        let now: HashSet<&DataFrameKey> = current.iter().collect();
         let mut out = Vec::new();
-        for key in previous.iter().filter(|key| !current.contains(key)) {
+        for key in previous.iter().filter(|key| !now.contains(key)) {
             if let Some(image) = latest(key, false) {
                 out.push(DataFrameOperation::Delete(key.clone(), image));
             }
         }
         for key in &current {
-            if !previous.contains(key) {
+            if !was.contains(key) {
                 if let Some(image) = latest(key, true) {
                     out.push(DataFrameOperation::Add(key.clone(), image));
                 }
@@ -679,16 +682,13 @@ impl SingleTableIVM {
         subs: &[SubId],
         updates: Vec<SingleTableUpdate>,
     ) -> Vec<SingleTableUpdate> {
-        let windowed: Vec<SubId> = subs
+        let mut windowed: Vec<SubId> = subs
             .iter()
             .copied()
             .filter(|sub| self.windows.contains_key(sub))
-            .fold(Vec::new(), |mut seen, sub| {
-                if !seen.contains(&sub) {
-                    seen.push(sub);
-                }
-                seen
-            });
+            .collect();
+        windowed.sort_unstable();
+        windowed.dedup();
         if windowed.is_empty() {
             return updates;
         }

@@ -235,7 +235,9 @@ impl ColumnIndex {
     }
 
     /// Append the conditions a written value satisfies to `out`: for a
-    /// `NULL`, the null tests alone.
+    /// `NULL`, the null tests alone. The value is looked up as it is; a
+    /// copy is made only for the range probe, and only when the column
+    /// has range conditions of the value's class.
     pub(super) fn candidates(&self, value: &Value, out: &mut Vec<CondRef>) {
         use ComparisonOperator::*;
         if value.is_null() {
@@ -244,14 +246,14 @@ impl ColumnIndex {
             }
             return;
         }
-        let Some(key) = value.equality_key() else {
+        let Some(key) = value.equality_key_ref() else {
             return;
         };
-        if let Some(matching) = self.equal.get(&key) {
+        if let Some(matching) = self.equal.get(&*key) {
             out.extend(matching.iter().cloned());
         }
         if !self.unequal_all.is_empty() {
-            let failing = self.unequal.get(&key);
+            let failing = self.unequal.get(&*key);
             out.extend(
                 self.unequal_all
                     .iter()
@@ -262,8 +264,13 @@ impl ColumnIndex {
         let Some(class) = class_of(value) else {
             return;
         };
+        let above = self.above.get(&class);
+        let below = self.below.get(&class);
+        if above.is_none() && below.is_none() {
+            return;
+        }
         let probe = OrdValue(value.clone());
-        if let Some(thresholds) = self.above.get(&class) {
+        if let Some(thresholds) = above {
             for (threshold, conditions) in thresholds.range(..=&probe) {
                 let tying = *threshold == probe;
                 out.extend(
@@ -274,7 +281,7 @@ impl ColumnIndex {
                 );
             }
         }
-        if let Some(thresholds) = self.below.get(&class) {
+        if let Some(thresholds) = below {
             for (threshold, conditions) in thresholds.range(&probe..) {
                 let tying = *threshold == probe;
                 out.extend(

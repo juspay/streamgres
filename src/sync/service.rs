@@ -1,23 +1,29 @@
 //! The asynchronous driver: one task owns the runtime, takes commands
-//! (subscribe, unsubscribe, a committed transaction, a progress mark)
-//! from a channel, hands every delta to an event channel, and runs the storage
-//! reads the runtime asks for. Every read, a registration's snapshot as
-//! much as a join fetch or a window refill, runs as its own task while the
-//! loop keeps routing; the loop never waits on storage, and each result is
-//! brought up to the engine's position when it lands. The runtime is
-//! touched only between awaits. Single-threaded by design: run it on a
-//! [`tokio::task::LocalSet`].
+//! (subscribe, unsubscribe) from a channel and committed transactions
+//! from the feed's, hands every delta to an event channel, and runs the
+//! storage reads the runtime asks for. Every read, a registration's
+//! snapshot as much as a join fetch or a window refill, runs as its own
+//! task while the loop keeps routing; the loop never waits on storage, and
+//! each result is brought up to the engine's position when it lands. The
+//! runtime is touched only between awaits. Single-threaded by design: run
+//! it on a [`tokio::task::LocalSet`].
 //!
 //! Besides the deltas, the events tell a consumer what it needs to batch
 //! and to acknowledge without touching the runtime: which subscription a
 //! registration became, when a subscription's first rows have all
 //! arrived, when a read landed, and where the stream is after each
-//! progress mark. Everything a consumer learns arrives on that one
-//! stream, so a subscription is always named before anything about it
-//! is: no consumer ever meets a [`SubId`] it has not been told about.
+//! transaction, with the writes on the tables the consumer watches for
+//! itself. Everything a consumer learns arrives on that one stream, so a
+//! subscription is always named before anything about it is: no consumer
+//! ever meets a [`SubId`] it has not been told about. The consumer may be
+//! several ([`Service::with_sinks`]), each owning the clients whose ids
+//! are its own modulo the count: a client's events go to its sink alone,
+//! and what concerns everyone (a landing, a commit) goes to every sink.
 
-use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tokio::task::spawn_local;
@@ -26,7 +32,8 @@ use super::runtime::{Runtime, Step};
 use super::storage::{Storage, StorageError};
 use crate::ivm::{ClientUpdate, Engine, Fetch, FetchId};
 use crate::log::log_warn;
-use crate::model::{ClientId, Lsn, SingleTableReadQuery, Snapshot, SubId, WriteQuery};
+use crate::model::{ClientId, IdMap, Lsn, Snapshot, SubId, WriteQuery};
+use crate::stats::Stats;
 
 /// What a client of the service can ask.
 ///
@@ -36,15 +43,9 @@ use crate::model::{ClientId, Lsn, SingleTableReadQuery, Snapshot, SubId, WriteQu
 ///   like every other change.
 /// - `Unregister`: unsubscribe one subscription.
 /// - `UnregisterClient`: a client went away; every subscription of it goes.
-/// - `Commit`: every write of one committed transaction, with the
-///   location of its commit record. A transaction arrives as one command
-///   so nothing can be interleaved inside it: a read that lands while it
-///   is being routed is seen only once the whole commit has been, and a
-///   consumer never meets half a transaction.
-/// - `Progress`: the feed has delivered everything up to `lsn`.
-/// - `Count`: how many rows match `query`, no further than `cap`,
-///   answered as [`Event::Counted`] with the same `token`. What a planner
-///   asks before registering a join, to learn which side to read whole.
+/// - `Transaction`: one committed transaction, which the feed normally
+///   delivers on its own channel ([`Service::with_feed`]) and a caller
+///   without a feed hands in here.
 pub enum Command<Q> {
     Register {
         client: ClientId,
@@ -53,61 +54,109 @@ pub enum Command<Q> {
     },
     Unregister(SubId),
     UnregisterClient(ClientId),
-    Commit {
-        writes: Vec<WriteQuery>,
-        at: Lsn,
-    },
-    Progress(Lsn),
-    Count {
-        query: SingleTableReadQuery,
-        cap: u64,
-        token: u64,
-    },
+    Transaction(Transaction),
 }
 
-/// What the service tells its consumer.
+/// One committed transaction as the feed delivers it: every write of it,
+/// the location of its commit record, the position the feed has delivered
+/// everything up to once it is applied, the writes among them on the
+/// tables the consumer watches for itself, and the instant the feed
+/// decoded it (where the server's own clock on it starts). A transaction
+/// is one step of the engine, so nothing can be interleaved inside it: a
+/// read that lands while it is being routed is seen only once the whole
+/// transaction has been, and a consumer never meets half of one.
+#[derive(Debug)]
+pub struct Transaction {
+    pub writes: Vec<WriteQuery>,
+    pub at: Lsn,
+    pub progress: Lsn,
+    pub watched: Vec<WriteQuery>,
+    pub received: Instant,
+}
+
+impl Transaction {
+    /// A transaction of `writes` committed at `at`, the feed's progress
+    /// mark being that same location, with nothing watched, received now.
+    pub fn new(writes: Vec<WriteQuery>, at: Lsn) -> Self {
+        Transaction {
+            writes,
+            at,
+            progress: at,
+            watched: Vec::new(),
+            received: Instant::now(),
+        }
+    }
+}
+
+/// What the service tells its consumer. Every step's deltas (folded per
+/// client and row) travel inside the event that ends the step, so a
+/// consumer never sees half a step, and a transaction's rows and its
+/// watched writes are one event.
 ///
 /// - `Registered`: the subscription a [`Command::Register`] became, with
-///   that command's `token`. It precedes every other event about the
-///   subscription.
-/// - `Updates`: one step's deltas, folded per client and row.
+///   that command's `token` and the rows it was served at once (a twin's).
+///   It precedes every other event about the subscription.
+/// - `Landed`: a storage read landed, with the deltas it produced.
+/// - `Committed`: a transaction was applied: its deltas for this
+///   consumer, the engine's position, the storage floor, the transaction's
+///   writes on the watched tables, and two instants for the consumer's
+///   clock, when the feed decoded the transaction and when the engine
+///   finished with it. A consumer serves once the position covers the
+///   floor.
 /// - `Hydrated`: subscriptions whose first rows have all arrived (every
 ///   part of their tree is live), each named once.
-/// - `Landed`: a storage read landed; its deltas came just before. A
-///   consumer that batches per landing flushes here.
-/// - `Moved`: the stream passed a progress mark: the engine's position
-///   and the storage floor. A consumer that batches per committed
-///   transaction flushes here, and serves once the position covers the
-///   floor.
 #[derive(Debug)]
 pub enum Event {
     Registered {
         token: u64,
         sub: SubId,
+        updates: Vec<ClientUpdate>,
     },
-    Updates(Vec<ClientUpdate>),
-    Hydrated(Vec<SubId>),
-    Landed,
-    Moved {
+    Landed {
+        updates: Vec<ClientUpdate>,
+    },
+    Committed {
+        updates: Vec<ClientUpdate>,
         position: Lsn,
         floor: Lsn,
+        watched: Vec<WriteQuery>,
+        received: Instant,
+        routed: Instant,
     },
-    Counted {
-        token: u64,
-        count: Result<u64, String>,
-    },
+    Hydrated(Vec<SubId>),
 }
 
-/// The loop's handles: the command inlet and the event outlet.
+/// How a step ended: what its deltas travel inside of.
+enum Outcome {
+    Registered {
+        client: ClientId,
+        token: u64,
+        sub: SubId,
+    },
+    Landed,
+    Committed {
+        position: Lsn,
+        floor: Lsn,
+        watched: Vec<WriteQuery>,
+        received: Instant,
+        routed: Instant,
+    },
+    Nothing,
+}
+
+/// The loop's handles: the command inlet, the feed's transaction inlet
+/// when there is one, and the event outlet.
 pub struct Service<E: Engine, S: Storage> {
     runtime: Runtime<E>,
     storage: Rc<S>,
     commands: mpsc::Receiver<Command<E::Query>>,
-    events: mpsc::UnboundedSender<Event>,
+    feed: Option<mpsc::Receiver<Transaction>>,
+    sinks: Vec<mpsc::UnboundedSender<Event>>,
+    stats: Option<Arc<Stats>>,
     /// Subscriptions registered but not yet reported hydrated, and the
     /// client each belongs to, so a client going away takes its own with
     /// it instead of leaving them to be probed forever.
-    awaiting: HashMap<SubId, ClientId>,
+    awaiting: IdMap<SubId, ClientId>,
     results: mpsc::UnboundedReceiver<(FetchId, Result<Snapshot, StorageError>)>,
     report: mpsc::UnboundedSender<(FetchId, Result<Snapshot, StorageError>)>,
 }
@@ -131,32 +180,70 @@ where
             runtime: Runtime::new(engine),
             storage,
             commands,
-            events,
-            awaiting: HashMap::new(),
+            feed: None,
+            sinks: vec![events],
+            stats: None,
+            awaiting: IdMap::default(),
             results,
             report,
         };
         (service, commands_tx)
     }
 
-    /// Run until every command sender is dropped; returns the runtime for
-    /// inspection.
+    /// Take the committed transactions from `feed` as well.
+    pub fn with_feed(mut self, feed: mpsc::Receiver<Transaction>) -> Self {
+        self.feed = Some(feed);
+        self
+    }
+
+    /// Deliver the events to `sinks` instead, the sink of a client being
+    /// the one at its id modulo their count (at least one sink).
+    pub fn with_sinks(mut self, sinks: Vec<mpsc::UnboundedSender<Event>>) -> Self {
+        if !sinks.is_empty() {
+            self.sinks = sinks;
+        }
+        self
+    }
+
+    /// Record how long each transaction waits for the engine and takes in
+    /// it, and publish the engine's counters, into `stats`.
+    pub fn with_stats(mut self, stats: Arc<Stats>) -> Self {
+        self.stats = Some(stats);
+        self
+    }
+
+    /// Run until every command sender is dropped (or the feed ends);
+    /// returns the runtime for inspection.
     pub async fn run(mut self) -> Runtime<E> {
+        let mut commands = Vec::with_capacity(64);
+        let mut transactions = Vec::with_capacity(64);
         loop {
             tokio::select! {
-                command = self.commands.recv() => match command {
-                    Some(command) => self.handle(command),
-                    None => break,
-                },
+                taken = self.commands.recv_many(&mut commands, 64) => {
+                    if taken == 0 {
+                        break;
+                    }
+                    for command in commands.drain(..) {
+                        self.handle(command);
+                    }
+                }
+                taken = recv_transactions(&mut self.feed, &mut transactions) => {
+                    if taken == 0 {
+                        break;
+                    }
+                    for transaction in transactions.drain(..) {
+                        self.commit(transaction);
+                    }
+                }
                 result = self.results.recv() => match result {
                     Some((id, Ok(snapshot))) => {
                         let step = self.runtime.fetched(id, snapshot);
-                        self.dispatch(step, true);
+                        self.dispatch(step, Outcome::Landed);
                     }
                     Some((id, Err(error))) => {
                         log_warn!("storage read {} failed, parked: {error}", id.0);
                         let step = self.runtime.failed(id);
-                        self.dispatch(step, false);
+                        self.dispatch(step, Outcome::Nothing);
                     }
                     None => break,
                 },
@@ -174,9 +261,8 @@ where
                 token,
             } => {
                 let (sub, step) = self.runtime.register(client, query);
-                let _ = self.events.send(Event::Registered { token, sub });
                 self.awaiting.insert(sub, client);
-                self.dispatch(step, false);
+                self.dispatch(step, Outcome::Registered { client, token, sub });
             }
             Command::Unregister(sub) => {
                 self.runtime.unregister(sub);
@@ -186,38 +272,80 @@ where
                 self.runtime.unregister_client(client);
                 self.awaiting.retain(|_, owner| *owner != client);
             }
-            Command::Commit { writes, at } => {
-                let mut commit = Step::default();
-                for write in writes {
-                    self.storage.absorb(&write, at);
-                    let step = self.runtime.write(&write, at);
-                    commit.updates.extend(step.updates);
-                    commit.selects.extend(step.selects);
-                }
-                self.moved();
-                self.dispatch(commit, false);
-            }
-            Command::Progress(lsn) => {
-                let step = self.runtime.progress(lsn);
-                self.moved();
-                self.dispatch(step, false);
-                let _ = self.events.send(Event::Moved {
-                    position: self.runtime.position(),
-                    floor: self.runtime.floor(),
-                });
-            }
-            Command::Count { query, cap, token } => {
-                let storage = self.storage.clone();
-                let events = self.events.clone();
-                spawn_local(async move {
-                    let count = storage
-                        .count(&query, cap)
-                        .await
-                        .map_err(|error| error.to_string());
-                    let _ = events.send(Event::Counted { token, count });
-                });
-            }
+            Command::Transaction(transaction) => self.commit(transaction),
         }
+    }
+
+    /// Apply one committed transaction as one step: every write routed,
+    /// the progress mark taken, the storage told, the deltas delivered
+    /// together, and the consumer told where the engine now is.
+    fn commit(&mut self, transaction: Transaction) {
+        let Transaction {
+            writes,
+            at,
+            progress,
+            watched,
+            received,
+        } = transaction;
+        let started = Instant::now();
+        let mut step = Step::default();
+        for write in &writes {
+            self.storage.absorb(write, at);
+            let routed = self.runtime.write(write, at);
+            step.updates.extend(routed.updates);
+            step.selects.extend(routed.selects);
+        }
+        let moved = self.runtime.progress(progress);
+        step.updates.extend(moved.updates);
+        step.selects.extend(moved.selects);
+        self.moved();
+        let position = self.runtime.position();
+        let floor = self.runtime.floor();
+        let routed = Instant::now();
+        if let Some(stats) = &self.stats {
+            stats
+                .feed_to_engine
+                .record(started.duration_since(received));
+            stats.engine_step.record(routed.duration_since(started));
+            stats.transactions.fetch_add(1, Ordering::Relaxed);
+            stats
+                .writes
+                .fetch_add(writes.len() as u64, Ordering::Relaxed);
+            stats.publish_engine(self.runtime.engine_stats(), self.runtime.stats());
+        }
+        self.dispatch(
+            step,
+            Outcome::Committed {
+                position,
+                floor,
+                watched,
+                received,
+                routed,
+            },
+        );
+    }
+
+    /// The sink that owns `client`.
+    fn sink_of(&self, client: ClientId) -> &mpsc::UnboundedSender<Event> {
+        &self.sinks[client.0 as usize % self.sinks.len()]
+    }
+
+    /// Send `event` to the sink that owns `client`.
+    fn send_to(&self, client: ClientId, event: Event) {
+        let _ = self.sink_of(client).send(event);
+    }
+
+    /// One step's deltas split by sink, each client's to its own.
+    fn partition(&self, updates: Vec<ClientUpdate>) -> Vec<Vec<ClientUpdate>> {
+        if self.sinks.len() == 1 {
+            return vec![updates];
+        }
+        let mut batches: Vec<Vec<ClientUpdate>> =
+            (0..self.sinks.len()).map(|_| Vec::new()).collect();
+        for update in updates {
+            batches[update.client.0 as usize % self.sinks.len()].push(update);
+        }
+        batches
     }
 
     /// The stream moved: tell the storage, and learn its floor.
@@ -226,37 +354,81 @@ where
         self.runtime.set_floor(self.storage.floor());
     }
 
-    /// Deliver a step's deltas, start each of its reads as a task, name
-    /// the subscriptions that became hydrated, and mark a landing.
-    fn dispatch(&mut self, step: Step, landed: bool) {
-        if !step.updates.is_empty() {
-            let _ = self.events.send(Event::Updates(step.updates));
+    /// Deliver a step's deltas inside the event its `outcome` calls for
+    /// (a registration's to its client's sink; a landing's to the sinks
+    /// with any; a commit's to every sink, empty or not), start each of
+    /// its reads as a task, and name the subscriptions that became
+    /// hydrated.
+    fn dispatch(&mut self, step: Step, outcome: Outcome) {
+        let Step { updates, selects } = step;
+        match outcome {
+            Outcome::Registered { client, token, sub } => {
+                self.send_to(
+                    client,
+                    Event::Registered {
+                        token,
+                        sub,
+                        updates,
+                    },
+                );
+            }
+            Outcome::Landed => {
+                for (sink, batch) in self.sinks.iter().zip(self.partition(updates)) {
+                    if !batch.is_empty() {
+                        let _ = sink.send(Event::Landed { updates: batch });
+                    }
+                }
+            }
+            Outcome::Committed {
+                position,
+                floor,
+                watched,
+                received,
+                routed,
+            } => {
+                for (sink, batch) in self.sinks.iter().zip(self.partition(updates)) {
+                    let _ = sink.send(Event::Committed {
+                        updates: batch,
+                        position,
+                        floor,
+                        watched: watched.clone(),
+                        received,
+                        routed,
+                    });
+                }
+            }
+            Outcome::Nothing => {
+                debug_assert!(updates.is_empty(), "a parked read has no deltas");
+            }
         }
-        for fetch in step.selects {
+        for fetch in selects {
             self.spawn(fetch);
         }
         self.settle_awaiting();
-        if landed {
-            let _ = self.events.send(Event::Landed);
-        }
     }
 
     /// Name the awaited subscriptions whose first rows have all arrived,
-    /// and forget them.
+    /// each to the sink of its client, and forget them.
     fn settle_awaiting(&mut self) {
-        let hydrated: Vec<SubId> = self
+        let hydrated: Vec<(SubId, ClientId)> = self
             .awaiting
-            .keys()
-            .copied()
-            .filter(|sub| self.runtime.engine().hydrated(*sub))
+            .iter()
+            .filter(|(sub, _)| self.runtime.engine().hydrated(**sub))
+            .map(|(sub, client)| (*sub, *client))
             .collect();
         if hydrated.is_empty() {
             return;
         }
-        for sub in &hydrated {
-            self.awaiting.remove(sub);
+        let mut per_sink: Vec<Vec<SubId>> = (0..self.sinks.len()).map(|_| Vec::new()).collect();
+        for (sub, client) in hydrated {
+            self.awaiting.remove(&sub);
+            per_sink[client.0 as usize % self.sinks.len()].push(sub);
         }
-        let _ = self.events.send(Event::Hydrated(hydrated));
+        for (sink, subs) in self.sinks.iter().zip(per_sink) {
+            if !subs.is_empty() {
+                let _ = sink.send(Event::Hydrated(subs));
+            }
+        }
     }
 
     /// Run one read as its own task, reporting the result into the loop.
@@ -264,8 +436,21 @@ where
         let storage = self.storage.clone();
         let report = self.report.clone();
         spawn_local(async move {
-            let result = storage.select(&fetch.query).await;
+            let result = storage.select_shared(fetch.query.clone()).await;
             let _ = report.send((fetch.id, result));
         });
+    }
+}
+
+/// Take up to a batch of transactions from the feed, if there is one; a
+/// service without a feed waits here forever, and a feed that ended
+/// yields nothing.
+async fn recv_transactions(
+    feed: &mut Option<mpsc::Receiver<Transaction>>,
+    buffer: &mut Vec<Transaction>,
+) -> usize {
+    match feed {
+        Some(feed) => feed.recv_many(buffer, 64).await,
+        None => std::future::pending().await,
     }
 }

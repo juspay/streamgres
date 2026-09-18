@@ -203,7 +203,7 @@ impl Q {
         name: &str,
         names: &mut HashMap<QueryPart, String>,
     ) -> MultiTableReadQuery {
-        names.insert(QueryPart(path.clone()), name.to_owned());
+        names.insert(QueryPart::new(&path), name.to_owned());
         let order_by: Vec<OrderBy> = if self.order.is_empty() {
             vec![OrderBy::new(pkey(self.table), Order::ASC)]
         } else {
@@ -239,15 +239,13 @@ impl Q {
             let mut child_path = path.clone();
             child_path.push(index);
             let sub = child.node(child_path, &child_name(&label), names);
-            edges.push(Join::new(sub, edge.source, edge.dest));
+            edges.push(if index < self.left.len() {
+                Join::left(sub, edge.source, edge.dest)
+            } else {
+                Join::inner(sub, edge.source, edge.dest)
+            });
         }
-        let inner_joins = edges.split_off(self.left.len());
-        MultiTableReadQuery {
-            main_table,
-            left_joins: edges,
-            right_joins: Vec::new(),
-            inner_joins,
-        }
+        MultiTableReadQuery::new(main_table, edges)
     }
 
     /// The SQL text of a single-table query, `None` when it has edges (the

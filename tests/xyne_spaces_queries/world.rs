@@ -151,7 +151,7 @@ impl World {
         let path = parts
             .iter()
             .find(|(_, candidate)| candidate.as_str() == part)
-            .map(|(path, _)| path.clone())
+            .map(|(path, _)| *path)
             .unwrap_or_else(|| panic!("no part `{part}` in `{name}`"));
         let mut ids: Vec<String> = self
             .ivm
@@ -256,7 +256,7 @@ fn row(table: &str, pairs: &[(&str, Value)]) -> (DataFrameKey, DataFrameRow) {
         "a row of `{table}` needs its `{}`",
         pkey(table)
     );
-    (key(table, key_value), DataFrameRow { data })
+    (key(table, key_value), DataFrameRow::from(data))
 }
 
 /// The bare text of a one-column identity.

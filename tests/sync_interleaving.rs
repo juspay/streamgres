@@ -54,7 +54,7 @@ fn full_row(id: i64, pairs: &[(&str, Value)]) -> DataFrameRow {
         .map(|(column, value)| ((*column).into(), value.clone()))
         .collect();
     data.insert("id".into(), Value::Int(id));
-    DataFrameRow { data }
+    DataFrameRow::from(data)
 }
 
 fn insert(table: &str, id: i64, pairs: &[(&str, Value)]) -> WriteQuery {
@@ -414,16 +414,14 @@ fn narrowed_join_fetch_defers_to_later_writes() {
     ]);
     let mut runtime = Runtime::new(MultiTableIVM::new());
     runtime.progress(db.head());
-    let spec = MultiTableReadQuery {
-        main_table: open_tickets(),
-        left_joins: vec![Join::new(
+    let spec = MultiTableReadQuery::new(
+        open_tickets(),
+        vec![Join::left(
             MultiTableReadQuery::single(query(&users_table(), Where::AND(vec![]))),
             "assigned_to",
             "id",
         )],
-        right_joins: Vec::new(),
-        inner_joins: Vec::new(),
-    };
+    );
     let (sub, step) = runtime.register(CLIENT, spec);
     settle(&mut runtime, &db, step);
     assert_eq!(
@@ -721,16 +719,14 @@ fn post_order_registration_follows_landings() {
     ]);
     let mut runtime = Runtime::new(MultiTableIVM::new());
     runtime.progress(db.head());
-    let right = MultiTableReadQuery {
-        main_table: open_tickets(),
-        left_joins: Vec::new(),
-        right_joins: vec![Join::new(
+    let right = MultiTableReadQuery::new(
+        open_tickets(),
+        vec![Join::right(
             MultiTableReadQuery::single(query(&users_table(), Where::AND(vec![]))),
             "assigned_to",
             "id",
         )],
-        inner_joins: Vec::new(),
-    };
+    );
     let (sub, step) = runtime.register(CLIENT, right);
     let first = only(&step);
     assert_eq!(first.query.table, "users", "the driving child reads first");
@@ -751,19 +747,17 @@ fn post_order_registration_follows_landings() {
     );
     assert_eq!(runtime.engine().stats().storage_reads, 2);
 
-    let left = MultiTableReadQuery {
-        main_table: query(
+    let left = MultiTableReadQuery::new(
+        query(
             &tickets_table(),
             Where::condition("status", ComparisonOperator::EQ, "OPEN"),
         ),
-        left_joins: vec![Join::new(
+        vec![Join::left(
             MultiTableReadQuery::single(query(&users_table(), Where::AND(vec![]))),
             "assigned_to",
             "id",
         )],
-        right_joins: Vec::new(),
-        inner_joins: Vec::new(),
-    };
+    );
     let before = runtime.engine().stats().storage_reads;
     let (sub, step) = runtime.register(CLIENT, left);
     let main = only(&step);
@@ -888,15 +882,15 @@ fn twin_joining_a_landing_tree_receives_the_rest() {
     db.seed(&[user(7, "meera"), ticket(1, "OPEN", 7, 1)]);
     let mut runtime = Runtime::new(MultiTableIVM::new());
     runtime.progress(db.head());
-    let spec = || MultiTableReadQuery {
-        main_table: open_tickets(),
-        left_joins: vec![Join::new(
-            MultiTableReadQuery::single(query(&users_table(), Where::AND(vec![]))),
-            "assigned_to",
-            "id",
-        )],
-        right_joins: Vec::new(),
-        inner_joins: Vec::new(),
+    let spec = || {
+        MultiTableReadQuery::new(
+            open_tickets(),
+            vec![Join::left(
+                MultiTableReadQuery::single(query(&users_table(), Where::AND(vec![]))),
+                "assigned_to",
+                "id",
+            )],
+        )
     };
     let (first, step) = runtime.register(CLIENT, spec());
     let main = only(&step);

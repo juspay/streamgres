@@ -5,39 +5,83 @@
 //! downstream goes quiet, a WebSocket ping frame at an interval and a
 //! close when nothing at all came back), and the cleanup that hands the
 //! connection's client group back to the group thread. Query names go to
-//! the application server for their ASTs and mutations are forwarded to it
-//! from here, on the server's threads; the group thread only ever sees
-//! finished ASTs.
+//! the application server for their ASTs, the ASTs are translated into the
+//! engine's trees and planned (which side of each join is read whole,
+//! from the plan cache or by counting on the reads pool) and mutations are
+//! forwarded to the application server, all from here, on the server's
+//! threads; the group thread only ever sees planned trees. Nothing is
+//! planned before the engine's first heartbeat: a connection that arrives
+//! earlier waits for it (the writer keeps answering the client's pings
+//! meanwhile), and `/health` says the same thing to whoever starts the
+//! process.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value as Json, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
+use super::ast::{self, Ast, Translated};
 use super::backend::{Backend, Identity, PushOutcome, TransformOutcome};
 use super::config::Config;
 use super::groups::{ConnectReply, DesiredOp, Outbound, Request, Socket};
+use super::plan::{self, PlanCache};
 use super::protocol::{
     self, DeleteClients, InitConnection, PROTOCOL_VERSION, QueryPatchOp, Upstream,
 };
 use crate::log::{log_debug, log_info, log_warn};
+use crate::model::Catalog;
+use crate::stats::Stats;
+use crate::sync::pg::PgStorage;
+use crate::sync::pg::sql::{quote_ident, quote_literal};
 
 /// What every connection shares.
+///
+/// - `requests`: the group threads' inlets, one per thread; a connection
+///   speaks to the thread its client group hashes to.
+/// - `storage`: the engine side's storage handle, for the planner's
+///   counts and the connect-time mutation ids.
+/// - `catalog`: the tables, for translating ASTs.
+/// - `plans`: the join plans remembered across connections.
+/// - `stats`: the server's measurements, served at `/stats`.
+/// - `ready`: whether the engine's position has covered the storage's
+///   snapshots, flipped once by the group threads; queries wait for it.
 pub struct AppState {
     pub config: Arc<Config>,
-    pub requests: mpsc::Sender<Request>,
+    pub requests: Vec<mpsc::Sender<Request>>,
     pub backend: Arc<Backend>,
+    pub storage: Arc<PgStorage>,
+    pub catalog: Arc<Catalog>,
+    pub plans: Arc<PlanCache>,
     pub lmids: Arc<LmidReader>,
+    pub stats: Arc<Stats>,
+    pub ready: watch::Receiver<bool>,
+}
+
+/// One desired-query change between the client's message and the group
+/// thread: a put still carries its AST (the application server's, or the
+/// client's own) until it is translated and planned.
+enum Pending {
+    Put {
+        hash: String,
+        name: String,
+        ttl: Option<f64>,
+        ast: Option<Json>,
+    },
+    Del {
+        hash: String,
+    },
+    Clear,
 }
 
 /// The connect URL's parameters.
@@ -49,14 +93,17 @@ struct ConnectParams {
     wsid: String,
 }
 
-/// The routes: the connect endpoint under the base path, and a health
-/// check.
+/// The routes: the connect endpoint under the base path, a health check
+/// (`503` until the first heartbeat, `200` once queries are served), and
+/// the server's measurements (`/stats`; `?reset=1` also zeroes the
+/// histograms after reading them, so a load run measures itself alone).
 pub fn router(state: Arc<AppState>) -> Router {
     let base = state.config.base_path.clone();
     Router::new()
         .route(&format!("{base}/sync/v{{version}}/connect"), get(connect))
         .route(&format!("{base}/health"), get(health))
         .route("/health", get(health))
+        .route("/stats", get(stats))
         .with_state(state)
 }
 
@@ -79,8 +126,38 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
         .map_err(|error| format!("serving: {error}"))
 }
 
-async fn health() -> &'static str {
-    "ok"
+/// Ready, or not yet: the status the health check answers with.
+async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, &'static str) {
+    readiness(*state.ready.borrow())
+}
+
+/// What `/health` says for a readiness.
+fn readiness(ready: bool) -> (StatusCode, &'static str) {
+    if ready {
+        (StatusCode::OK, "ok")
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "waiting for the change feed's first heartbeat",
+        )
+    }
+}
+
+/// The server's measurements as JSON.
+async fn stats(
+    Query(query): Query<HashMap<String, String>>,
+    State(state): State<Arc<AppState>>,
+) -> axum::Json<Json> {
+    let mut body = state.stats.json();
+    body["plans_cached"] = json!(state.plans.len());
+    body["group_threads"] = json!(state.requests.len());
+    if query
+        .get("reset")
+        .is_some_and(|value| value != "0" && value != "false")
+    {
+        state.stats.reset();
+    }
+    axum::Json(body)
 }
 
 /// The upgrade: keep the handshake header (it must be echoed as the
@@ -123,13 +200,24 @@ async fn connect(
     upgrade.on_upgrade(move |socket| handle(socket, state, params, version, header, cookie, origin))
 }
 
-/// One connection's mutable state on the server side.
+/// One connection's mutable state on the server side; `requests` is the
+/// inlet of the group thread owning its client group.
 struct Conn {
     state: Arc<AppState>,
     params: ConnectParams,
     identity: Identity,
     out: mpsc::UnboundedSender<Outbound>,
+    requests: mpsc::Sender<Request>,
     joined: bool,
+}
+
+/// The group thread that owns `group_id`, among `shards`: a stable hash
+/// of the id, so every connection of a group meets the same thread.
+fn shard_of(group_id: &str, shards: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    group_id.hash(&mut hasher);
+    (hasher.finish() % shards.max(1) as u64) as usize
 }
 
 /// One connection, start to finish.
@@ -145,7 +233,7 @@ async fn handle(
     let (sink, stream) = socket.split();
     let (out, out_rx) = mpsc::unbounded_channel::<Outbound>();
     let pong_interval = state.config.pong_interval;
-    let writer = tokio::spawn(write_loop(sink, out_rx, pong_interval));
+    let writer = tokio::spawn(write_loop(sink, out_rx, pong_interval, state.stats.clone()));
     let wsid = params.wsid.clone();
     let group_id = params.group_id.clone();
     if version != PROTOCOL_VERSION {
@@ -184,6 +272,7 @@ async fn handle(
         }
         None => protocol::Handshake::default(),
     };
+    let requests = state.requests[shard_of(&group_id, state.requests.len())].clone();
     let mut conn = Conn {
         identity: Identity {
             cookie,
@@ -194,6 +283,7 @@ async fn handle(
         state: state.clone(),
         params,
         out: out.clone(),
+        requests: requests.clone(),
         joined: false,
     };
     let schema = handshake
@@ -214,7 +304,7 @@ async fn handle(
         lmids,
         reply: reply_tx,
     };
-    let accepted = match state.requests.send(request).await {
+    let accepted = match requests.send(request).await {
         Ok(()) => matches!(reply_rx.await, Ok(ConnectReply::Accepted)),
         Err(_) => false,
     };
@@ -239,8 +329,7 @@ async fn handle(
     if keep_going {
         conn.read_loop(stream).await;
     }
-    let _ = state
-        .requests
+    let _ = requests
         .send(Request::Disconnect {
             group: group_id,
             wsid,
@@ -255,12 +344,14 @@ fn send(out: &mpsc::UnboundedSender<Outbound>, frame: String) {
     let _ = out.send(Outbound::Text(frame.into()));
 }
 
-/// The writer: frames in order, a `pong` of the server's own whenever the
-/// downstream has been quiet for `pong_interval`, a ping frame on request.
+/// The writer: frames in order, a poke's frames fed together and flushed
+/// once, a `pong` of the server's own whenever the downstream has been
+/// quiet for `pong_interval`, a ping frame on request.
 async fn write_loop(
     mut sink: SplitSink<WebSocket, Message>,
     mut frames: mpsc::UnboundedReceiver<Outbound>,
     pong_interval: Duration,
+    stats: Arc<Stats>,
 ) {
     let mut last_sent = Instant::now();
     let mut idle = tokio::time::interval(pong_interval.max(Duration::from_millis(100)));
@@ -269,10 +360,31 @@ async fn write_loop(
         tokio::select! {
             frame = frames.recv() => match frame {
                 Some(Outbound::Text(text)) => {
-                    if sink.send(Message::Text(text.to_string().into())).await.is_err() {
+                    if sink.send(Message::Text(Utf8Bytes::from(&*text))).await.is_err() {
                         break;
                     }
                     last_sent = Instant::now();
+                }
+                Some(Outbound::Poke { frames: poke, since, sent }) => {
+                    let mut failed = false;
+                    for frame in poke.iter() {
+                        let Ok(text) = Utf8Bytes::try_from(frame.clone()) else {
+                            continue;
+                        };
+                        if sink.feed(Message::Text(text)).await.is_err() {
+                            failed = true;
+                            break;
+                        }
+                    }
+                    if failed || sink.flush().await.is_err() {
+                        break;
+                    }
+                    last_sent = Instant::now();
+                    stats.groups_to_socket.record(last_sent.duration_since(sent));
+                    if let Some(since) = since {
+                        stats.end_to_end.record(last_sent.duration_since(since));
+                    }
+                    stats.frames.fetch_add(poke.len() as u64, Ordering::Relaxed);
                 }
                 Some(Outbound::Ping) => {
                     if sink.send(Message::Ping(Default::default())).await.is_err() {
@@ -374,7 +486,7 @@ impl Conn {
                     group: self.params.group_id.clone(),
                     reply: reply_tx,
                 };
-                if self.state.requests.send(request).await.is_ok()
+                if self.requests.send(request).await.is_ok()
                     && let Ok((cookie, lmids)) = reply_rx.await
                 {
                     send(
@@ -426,7 +538,6 @@ impl Conn {
     async fn delete_clients(&mut self, deleted: &DeleteClients) {
         if !deleted.client_ids.is_empty() {
             let _ = self
-                .state
                 .requests
                 .send(Request::DeleteClients {
                     group: self.params.group_id.clone(),
@@ -437,15 +548,31 @@ impl Conn {
         send(&self.out, protocol::delete_clients(deleted));
     }
 
+    /// Wait until the server serves queries; false only when every group
+    /// thread is gone, which ends the connection.
+    async fn await_ready(&self) -> bool {
+        if *self.state.ready.borrow() {
+            return true;
+        }
+        let mut ready = self.state.ready.clone();
+        ready.wait_for(|ready| *ready).await.is_ok()
+    }
+
     /// Desired-query changes: custom queries go to the application server
-    /// for their ASTs, then everything goes to the engine thread in the
-    /// order the client sent it.
+    /// for their ASTs, every AST is translated and planned here, and
+    /// everything goes to the group thread in the order the client sent
+    /// it. A query that cannot be translated or planned is refused to the
+    /// client from here and passed on as such, so the group still knows
+    /// the hash.
     async fn desired(
         &mut self,
         ops: Vec<QueryPatchOp>,
         schema: Option<protocol::ClientSchema>,
     ) -> bool {
-        let mut prepared: Vec<DesiredOp> = Vec::with_capacity(ops.len());
+        if !self.await_ready().await {
+            return false;
+        }
+        let mut pending: Vec<Pending> = Vec::with_capacity(ops.len());
         let mut requests: Vec<Json> = Vec::new();
         let mut positions: HashMap<String, usize> = HashMap::new();
         for op in ops {
@@ -459,27 +586,27 @@ impl Conn {
                 } => {
                     let name = name.unwrap_or_else(|| "query".to_owned());
                     if ast.is_none() {
-                        positions.insert(hash.clone(), prepared.len());
+                        positions.insert(hash.clone(), pending.len());
                         requests.push(
                             json!({"id": hash, "name": name, "args": args.unwrap_or_default()}),
                         );
                     }
-                    prepared.push(DesiredOp::Put {
+                    pending.push(Pending::Put {
                         hash,
                         name,
                         ttl,
                         ast,
                     });
                 }
-                QueryPatchOp::Del { hash } => prepared.push(DesiredOp::Del { hash }),
-                QueryPatchOp::Clear => prepared.push(DesiredOp::Clear),
+                QueryPatchOp::Del { hash } => pending.push(Pending::Del { hash }),
+                QueryPatchOp::Clear => pending.push(Pending::Clear),
             }
         }
+        let mut errored = Vec::new();
         if !requests.is_empty() {
             let ids: Vec<String> = positions.keys().cloned().collect();
             match self.state.backend.transform(&self.identity, requests).await {
                 TransformOutcome::Queries(results) => {
-                    let mut errored = Vec::new();
                     for result in results {
                         let Some(id) = result.get("id").and_then(Json::as_str) else {
                             continue;
@@ -488,7 +615,7 @@ impl Conn {
                             continue;
                         };
                         if let Some(ast) = result.get("ast") {
-                            if let DesiredOp::Put { ast: slot, .. } = &mut prepared[position] {
+                            if let Pending::Put { ast: slot, .. } = &mut pending[position] {
                                 *slot = Some(ast.clone());
                             }
                         } else {
@@ -499,9 +626,6 @@ impl Conn {
                             );
                             errored.push(result);
                         }
-                    }
-                    if !errored.is_empty() {
-                        send(&self.out, protocol::transform_error(errored));
                     }
                 }
                 TransformOutcome::Failed { status, message } => {
@@ -517,13 +641,57 @@ impl Conn {
                 }
             }
         }
+        let state = &*self.state;
+        let planned = futures_util::future::join_all(pending.iter().map(|op| async move {
+            match op {
+                Pending::Put { ast: Some(ast), .. } => Some(plan_ast(state, ast.clone()).await),
+                _ => None,
+            }
+        }))
+        .await;
+        let mut prepared: Vec<DesiredOp> = Vec::with_capacity(pending.len());
+        for (op, planned) in pending.into_iter().zip(planned) {
+            match op {
+                Pending::Put {
+                    hash,
+                    name,
+                    ttl,
+                    ast,
+                } => {
+                    let planned = match (ast, planned) {
+                        (None, _) => None,
+                        (Some(_), Some(Ok(translated))) => Some(Ok(Box::new(translated))),
+                        (Some(_), failed) => {
+                            let reason = planned_failure(failed);
+                            log_warn!(
+                                "connection {}: query {name} ({hash}) cannot run here: {reason}",
+                                self.params.wsid
+                            );
+                            errored.push(protocol::errored_query(&hash, &name, &reason));
+                            Some(Err(reason))
+                        }
+                    };
+                    prepared.push(DesiredOp::Put {
+                        hash,
+                        name,
+                        ttl,
+                        planned,
+                    });
+                }
+                Pending::Del { hash } => prepared.push(DesiredOp::Del { hash }),
+                Pending::Clear => prepared.push(DesiredOp::Clear),
+            }
+        }
+        if !errored.is_empty() {
+            send(&self.out, protocol::transform_error(errored));
+        }
         let request = Request::Desired {
             group: self.params.group_id.clone(),
             client: self.params.client_id.clone(),
             schema,
             ops: prepared,
         };
-        self.state.requests.send(request).await.is_ok()
+        self.requests.send(request).await.is_ok()
     }
 
     /// A push: forwarded as is; the application server's answer comes
@@ -581,61 +749,80 @@ impl Conn {
     }
 }
 
-/// Reads a client group's last mutation ids from the database at connect
-/// time, on the server's threads, over one lazily opened connection.
+/// One AST into the tree the engine registers: translated against the
+/// catalog, then planned (the cache first, the counts otherwise).
+async fn plan_ast(state: &AppState, ast: Json) -> Result<Translated, String> {
+    let ast: Ast =
+        serde_json::from_value(ast).map_err(|error| format!("malformed AST: {error}"))?;
+    let translated = ast::translate(&ast, &state.catalog)?;
+    plan::plan(
+        translated,
+        state.config.policy(),
+        &state.plans,
+        &*state.storage,
+    )
+    .await
+}
+
+/// The reason a planned put failed, or the absence of a plan spelled out.
+fn planned_failure(planned: Option<Result<Translated, String>>) -> String {
+    match planned {
+        Some(Err(reason)) => reason,
+        _ => "the query was not planned".to_owned(),
+    }
+}
+
+/// Reads a client group's last mutation ids at connect time, on the reads
+/// pool, over the engine side's storage handle.
 pub struct LmidReader {
-    dsn: String,
+    storage: Arc<PgStorage>,
     table: String,
-    client: Mutex<Option<tokio_postgres::Client>>,
 }
 
 impl LmidReader {
-    /// A reader of `<schema>.clients` at `dsn`.
-    pub fn new(dsn: &str, schema: &str) -> Self {
+    /// A reader of `<schema>.clients` through `storage`.
+    pub fn new(storage: Arc<PgStorage>, schema: &str) -> Self {
         LmidReader {
-            dsn: dsn.to_owned(),
-            table: format!("\"{}\".\"clients\"", schema.replace('"', "\"\"")),
-            client: Mutex::new(None),
+            storage,
+            table: format!("{}.{}", quote_ident(schema), quote_ident("clients")),
         }
     }
 
     /// The last mutation id of every client of `group`; empty when the
     /// table cannot be read (the group then starts from the feed's word).
     pub async fn lmids(&self, group: &str) -> Vec<(String, i64)> {
-        let mut guard = self.client.lock().await;
-        if guard.is_none() {
-            match tokio_postgres::connect(&self.dsn, tokio_postgres::NoTls).await {
-                Ok((client, connection)) => {
-                    tokio::spawn(async move {
-                        let _ = connection.await;
-                    });
-                    *guard = Some(client);
-                }
-                Err(error) => {
-                    log_warn!("cannot read last mutation ids: {error}");
-                    return Vec::new();
-                }
-            }
-        }
         let sql = format!(
-            "SELECT \"clientID\", \"lastMutationID\" FROM {} WHERE \"clientGroupID\" = $1",
-            self.table
+            "SELECT \"clientID\", \"lastMutationID\" FROM {} WHERE \"clientGroupID\" = {}",
+            self.table,
+            quote_literal(group)
         );
-        let result = guard
-            .as_ref()
-            .expect("just opened")
-            .query(&sql, &[&group])
-            .await;
-        match result {
+        match self.storage.simple_query(&sql).await {
             Ok(rows) => rows
                 .iter()
-                .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)))
+                .filter_map(|row| {
+                    let client = row.get(0)?.to_owned();
+                    let lmid = row.get(1)?.parse::<i64>().ok()?;
+                    Some((client, lmid))
+                })
                 .collect(),
             Err(error) => {
                 log_warn!("reading last mutation ids of {group}: {error}");
-                *guard = None;
                 Vec::new()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The health check refuses until the first heartbeat and answers
+    /// `ok` after it, so a process manager waits for the feed, not the
+    /// socket.
+    #[test]
+    fn health_follows_readiness() {
+        assert_eq!(readiness(false).0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(readiness(true), (StatusCode::OK, "ok"));
     }
 }

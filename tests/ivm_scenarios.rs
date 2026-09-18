@@ -54,7 +54,7 @@ fn full_row(id: i64, pairs: &[(&str, Value)]) -> DataFrameRow {
         .map(|(col, val)| ((*col).into(), val.clone()))
         .collect();
     data.insert("id".into(), Value::Int(id));
-    DataFrameRow { data }
+    DataFrameRow::from(data)
 }
 
 /// Builds an INSERT [`WriteQuery`] for row `id` with the given column data.

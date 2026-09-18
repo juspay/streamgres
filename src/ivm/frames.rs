@@ -12,7 +12,7 @@ use super::predicate::evaluate;
 use super::window::Window;
 use super::{Fetch, FetchId, FetchKind, SingleTableIVM, SingleTableUpdate, window};
 use crate::model::{
-    ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow,
+    ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow,
     SingleTableReadQuery, SubId, TableName, Value, Where,
 };
 
@@ -21,20 +21,25 @@ impl SingleTableIVM {
     /// narrowed to `column IN values`: one recorded storage read, landed
     /// later through [`SingleTableIVM::land_fetch`]. Until it lands the
     /// subscription publishes no admission boundary; the read serves every
-    /// subscription of its query, twins registered meanwhile included.
-    /// Unknown subscriptions are a no-op.
+    /// subscription of its query, twins registered meanwhile included. A
+    /// set-valued `IN` leaf of the filter on the same column is replaced
+    /// by the narrowed values in the read's filter: the values are members
+    /// of that set (the caller inserted them just before), so the rows are
+    /// the same, and the read renders a handful of literals instead of the
+    /// whole set. Unknown subscriptions are a no-op.
     pub fn fetch(&mut self, sub: SubId, column: &str, values: &[Value]) {
         let Some(query) = self.select_queries.get(&sub) else {
             return;
         };
+        let narrowed = Where::Condition(Condition::new(
+            column,
+            ComparisonOperator::IN,
+            Value::List(values.to_vec()),
+        ));
         let narrowed = SingleTableReadQuery {
             filter: Where::AND(vec![
-                query.filter.clone(),
-                Where::Condition(Condition::new(
-                    column,
-                    ComparisonOperator::IN,
-                    Value::List(values.to_vec()),
-                )),
+                narrow_set_leaves(&query.filter, column, &narrowed),
+                narrowed,
             ]),
             limit: window::storage_limit(query),
             ..query.clone()
@@ -63,7 +68,7 @@ impl SingleTableIVM {
             id,
             sub,
             kind,
-            query,
+            query: std::sync::Arc::new(query),
         });
     }
 
@@ -301,9 +306,20 @@ impl SingleTableIVM {
         self.rows_matching_any(sub, column, std::slice::from_ref(value))
     }
 
-    /// The rows `sub` holds whose `column` equals one of `values` — walked
-    /// off the subscription's held index, so cost scales with its own view,
-    /// not the table.
+    /// Index `column` of `table`'s frame by value from now on, so the rows
+    /// of one join value are found without a scan; the join layer asks
+    /// this for every column a part joins on.
+    pub fn index_column(&mut self, table: &TableName, column: &ColumnName) {
+        self.frames
+            .entry(table.clone())
+            .or_default()
+            .index_column(column);
+    }
+
+    /// The rows `sub` holds whose `column` equals one of `values`: from
+    /// the column's value index when the frame has one (the matches, not
+    /// the view), otherwise walked off the subscription's held index, so
+    /// the cost scales with its own view, never with the table.
     fn rows_matching_any(
         &self,
         sub: SubId,
@@ -319,16 +335,31 @@ impl SingleTableIVM {
         let Some(ids) = self.held.get(&sub) else {
             return Vec::new();
         };
-        ids.iter()
-            .filter_map(|id| frame.row(*id))
-            .filter(|row| {
-                row.data
-                    .data
-                    .get(column)
-                    .is_some_and(|v| values.contains(v))
-            })
-            .map(|row| (row.key.clone(), row.data.clone()))
-            .collect()
+        let mut out = Vec::new();
+        for value in values {
+            let Some(with_value) = frame.rows_with(column, value) else {
+                return ids
+                    .iter()
+                    .filter_map(|id| frame.row(*id))
+                    .filter(|row| {
+                        row.data
+                            .data
+                            .get(column)
+                            .is_some_and(|v| values.contains(v))
+                    })
+                    .map(|row| (row.key.clone(), row.data.clone()))
+                    .collect();
+            };
+            for id in with_value {
+                if !ids.contains(&id) {
+                    continue;
+                }
+                if let Some(row) = frame.row(id) {
+                    out.push((row.key.clone(), row.data.clone()));
+                }
+            }
+        }
+        out
     }
 
     /// The subscription's current view — every shared row it holds, as
@@ -360,5 +391,33 @@ impl SingleTableIVM {
             .and_then(|frame| frame.get(key))
             .map(|row| row.subscribers.iter().copied().collect())
             .unwrap_or_default()
+    }
+}
+
+/// `filter` with every set-valued `IN` leaf on `column` replaced by
+/// `narrowed` (the `column IN values` a narrowed read restricts itself
+/// to); every other leaf stands.
+fn narrow_set_leaves(filter: &Where, column: &str, narrowed: &Where) -> Where {
+    match filter {
+        Where::Condition(condition)
+            if condition.column == column
+                && condition.comparison_operator == ComparisonOperator::IN
+                && matches!(condition.value, Value::Set(_)) =>
+        {
+            narrowed.clone()
+        }
+        Where::Condition(condition) => Where::Condition(condition.clone()),
+        Where::AND(children) => Where::AND(
+            children
+                .iter()
+                .map(|child| narrow_set_leaves(child, column, narrowed))
+                .collect(),
+        ),
+        Where::OR(children) => Where::OR(
+            children
+                .iter()
+                .map(|child| narrow_set_leaves(child, column, narrowed))
+                .collect(),
+        ),
     }
 }

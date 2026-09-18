@@ -6,6 +6,11 @@ rust-version = "1.88"
 license = "Apache-2.0"
 
 [dependencies]
+# The hasher of the engine's integer-keyed maps (subscription, row, read
+# and tree ids): one multiply per key instead of SipHash (see
+# `model::ids`). Keys that are user data keep the default hasher.
+rustc-hash = "2"
+
 # Only `NaiveDate` / `NaiveDateTime` are used (see `Value` in src/model/value.rs).
 # Default features pull in a timezone database and wasm bindings we do not need.
 chrono = { version = "0.4", default-features = false, features = ["std"] }

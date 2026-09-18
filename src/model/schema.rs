@@ -8,6 +8,7 @@
 //! looks like.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::value::ValueType;
 
@@ -18,9 +19,10 @@ use super::value::ValueType;
 /// Constructed from any string-ish value; compares, orders, and hashes
 /// exactly like the underlying name, maps keyed by `TableName` accept a
 /// plain `&str` for lookups, and it compares directly against string
-/// literals.
+/// literals. The name is shared, so a clone is a reference count and the
+/// rows of a table carry their table's name without copying it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct TableName(String);
+pub struct TableName(Arc<str>);
 
 impl TableName {
     /// The name as a borrowed string slice.
@@ -32,14 +34,14 @@ impl TableName {
 impl From<&str> for TableName {
     /// Wraps a borrowed name.
     fn from(name: &str) -> Self {
-        TableName(name.to_owned())
+        TableName(Arc::from(name))
     }
 }
 
 impl From<String> for TableName {
     /// Wraps an owned name.
     fn from(name: String) -> Self {
-        TableName(name)
+        TableName(Arc::from(name))
     }
 }
 
@@ -53,14 +55,14 @@ impl std::borrow::Borrow<str> for TableName {
 impl PartialEq<str> for TableName {
     /// Compares against a bare string name.
     fn eq(&self, other: &str) -> bool {
-        self.0 == other
+        &*self.0 == other
     }
 }
 
 impl PartialEq<&str> for TableName {
     /// Compares against a bare string name.
     fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
+        &*self.0 == *other
     }
 }
 
@@ -78,9 +80,11 @@ impl std::fmt::Display for TableName {
 /// Constructed from any string-ish value; compares, orders, and hashes
 /// exactly like the underlying name, maps keyed by `ColumnName` accept a
 /// plain `&str` for lookups, and it compares directly against string
-/// literals.
+/// literals. The name is shared, so a row image (a map keyed by column
+/// name) is cloned without allocating a name per column, and decoders take
+/// their names from the catalog instead of allocating one per row.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ColumnName(String);
+pub struct ColumnName(Arc<str>);
 
 impl ColumnName {
     /// The name as a borrowed string slice.
@@ -92,14 +96,14 @@ impl ColumnName {
 impl From<&str> for ColumnName {
     /// Wraps a borrowed name.
     fn from(name: &str) -> Self {
-        ColumnName(name.to_owned())
+        ColumnName(Arc::from(name))
     }
 }
 
 impl From<String> for ColumnName {
     /// Wraps an owned name.
     fn from(name: String) -> Self {
-        ColumnName(name)
+        ColumnName(Arc::from(name))
     }
 }
 
@@ -113,14 +117,14 @@ impl std::borrow::Borrow<str> for ColumnName {
 impl PartialEq<str> for ColumnName {
     /// Compares against a bare string name.
     fn eq(&self, other: &str) -> bool {
-        self.0 == other
+        &*self.0 == other
     }
 }
 
 impl PartialEq<&str> for ColumnName {
     /// Compares against a bare string name.
     fn eq(&self, other: &&str) -> bool {
-        self.0 == *other
+        &*self.0 == *other
     }
 }
 
@@ -193,7 +197,7 @@ impl DbColumn {
     /// An unqualified column definition; [`DbTable::new`] fills in `table`.
     pub fn new(name: impl Into<ColumnName>, r#type: ValueType) -> Self {
         DbColumn {
-            table: TableName(String::new()),
+            table: TableName::from(""),
             name: name.into(),
             r#type,
         }

@@ -610,7 +610,7 @@ impl Parser {
             Ok(WriteQuery::INSERT(InsertQuery {
                 table: table.name.clone(),
                 pkey_value: DataFrameKey::new(pkey_value),
-                record: DataFrameRow { data },
+                record: DataFrameRow::from(data),
             }))
         } else if self.eat_word("UPDATE") {
             let table = self.table(catalog)?;
@@ -675,7 +675,7 @@ impl Parser {
             Ok(WriteQuery::UPDATE(UpdateQuery {
                 table: table.name.clone(),
                 pkey_value: DataFrameKey::new(pkey_value),
-                record: DataFrameRow { data },
+                record: DataFrameRow::from(data),
             }))
         } else {
             self.expect_word("DELETE")?;

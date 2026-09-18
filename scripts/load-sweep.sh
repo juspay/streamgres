@@ -26,7 +26,11 @@
 # Environment: LINUX_BIN (required for the pinned runs), CPUS ("2 4 8"),
 # NATIVE (1 to include a native run, default 1), NATIVE_BIN, PORT (4849),
 # CAP_CONNECTIONS ("200 400 800"), CONNECTIONS (200), RATES ("50 100 200 400"),
-# CAP_SECONDS (12), SECONDS_PER_RATE (20), USERS, WRITERS, THREADS, PG_DSN,
+# CHANNELS (1; more spreads the subscribers and the writes over that many
+# channels, so each update reaches CONNECTIONS/CHANNELS subscribers and the
+# ladder measures transactions a second rather than fan-out), GROUP_THREADS (1),
+# TPS (20; the steady phase's transactions a second, so a rate of R puts R/TPS
+# rows in each), CAP_SECONDS (12), SECONDS_PER_RATE (20), USERS, WRITERS, THREADS, PG_DSN,
 # QUERY_URL, MUTATE_URL, E2E_WS, OUT_DIR (results/sweep).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -39,6 +43,9 @@ OUT_DIR=${OUT_DIR:-results/sweep}
 CAP_CONNECTIONS=${CAP_CONNECTIONS:-"200 400 800"}
 CONNECTIONS=${CONNECTIONS:-200}
 RATES=${RATES:-"50 100 200 400"}
+CHANNELS=${CHANNELS:-1}
+GROUP_THREADS=${GROUP_THREADS:-1}
+TPS=${TPS:-20}
 CAP_SECONDS=${CAP_SECONDS:-12}
 SECONDS_PER_RATE=${SECONDS_PER_RATE:-20}
 USERS=${USERS:-10}
@@ -60,8 +67,8 @@ run() {
   echo "-- $label"
   # shellcheck disable=SC2086
   node scripts/load-protocol.mjs --gateway "$ws" $sampler --label "$label" --out "$out" --quiet \
-    --users "$USERS" --writers "$WRITERS" --threads "$THREADS" "$@" 2>&1 |
-    grep -E "hydrated|steady:|channel fan-out|dropped connections" || true
+    --users "$USERS" --writers "$WRITERS" --threads "$THREADS" --channels "$CHANNELS" --tps "$TPS" "$@" 2>&1 |
+    grep -E "hydrated|steady:|channel fan-out|dropped connections|server stages" || true
 }
 
 # Wait out the grace period, so the run just finished has released its
@@ -108,9 +115,9 @@ if [ -n "${LINUX_BIN:-}" ]; then
     docker run -d --name xs-load --network host --cpus "$cpus" -v "$LINUX_BIN:/server:ro" \
       -e XYNE_SYNC_ADDR=0.0.0.0:$PORT -e XYNE_SYNC_SLOT=xyne_load -e XYNE_SYNC_PG_DSN="$PG_DSN" \
       -e XYNE_SYNC_QUERY_URL="$QUERY_URL" -e XYNE_SYNC_MUTATE_URL="$MUTATE_URL" -e XYNE_SYNC_LOG=info \
-      -e XYNE_SYNC_GROUP_TTL_MS="$GROUP_TTL_MS" \
+      -e XYNE_SYNC_GROUP_TTL_MS="$GROUP_TTL_MS" -e XYNE_SYNC_GROUP_THREADS="$GROUP_THREADS" \
       debian:bookworm-slim /server >/dev/null
-    for _ in $(seq 1 60); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.25; done
+    for _ in $(seq 1 240); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.25; done
     echo "== server pinned to $cpus cpu(s)"
     sweep "cpus$cpus" "ws://127.0.0.1:$PORT/sync" "--container xs-load"
     docker logs xs-load > "$OUT_DIR/server-cpus$cpus.log" 2>&1 || true

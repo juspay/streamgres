@@ -16,7 +16,7 @@
 //! been delivered, and the heartbeat's own position is the mark.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -35,7 +35,7 @@ use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, DeleteQuery, InsertQuery, Lsn,
     TableName, UpdateQuery, Value, ValueType, WriteQuery,
 };
-use crate::sync::service::Command;
+use crate::sync::service::{Command, Transaction as Committed};
 use crate::sync::storage::StorageError;
 
 /// The message set the feed asks for: text values, whole transactions
@@ -82,7 +82,7 @@ struct Relation {
 /// The mapping of decoded messages onto catalog writes: the relations
 /// announced so far and the transaction being collected.
 pub struct Decoder {
-    catalog: Rc<Catalog>,
+    catalog: Arc<Catalog>,
     relations: HashMap<i32, Relation>,
     pending: Vec<WriteQuery>,
     heartbeat: Option<String>,
@@ -90,7 +90,7 @@ pub struct Decoder {
 
 impl Decoder {
     /// A decoder over `catalog`.
-    pub fn new(catalog: Rc<Catalog>) -> Self {
+    pub fn new(catalog: Arc<Catalog>) -> Self {
         Decoder {
             catalog,
             relations: HashMap::new(),
@@ -260,8 +260,9 @@ impl Decoder {
 /// replication connection, and the ordinary connection the heartbeats go
 /// through) and the decoding half (the catalog-driven decoder and the
 /// delivered position), together for a single-threaded driver, or split
-/// ([`PgStream::split`]) so the transport runs on a thread of its own and
-/// hands raw events to the decoder over a channel.
+/// ([`PgStream::split`]) so both run on a thread of their own
+/// ([`Transport::stream`]) and hand decoded transactions to the engine
+/// over a channel.
 pub struct PgStream {
     transport: Transport,
     feed: Feed,
@@ -276,8 +277,7 @@ pub struct Transport {
 }
 
 /// The decoding half of a change feed: raw events in, catalog writes and
-/// the delivered position out. It holds the catalog by `Rc`, so it lives
-/// on the engine's thread.
+/// the delivered position out.
 pub struct Feed {
     decoder: Decoder,
     progress: Lsn,
@@ -319,7 +319,7 @@ impl Transport {
     /// yet.
     pub async fn open(dsn: &str, slot: &str) -> Result<Self, StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config).await?;
+        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
         let publication = publication_of(slot);
         let published = client
             .query_opt(
@@ -365,11 +365,21 @@ impl Transport {
         self.feed.update_applied_lsn(pgwire_replication::Lsn(at.0));
     }
 
-    /// Run until `events` has no receiver or the connection ends: forward
-    /// every event as it arrives, acknowledging each commit to the slot,
-    /// and beat the heart every `interval` so the decoder's position keeps
-    /// moving while nothing is written.
-    pub async fn run(mut self, interval: Duration, events: mpsc::Sender<ReplicationEvent>) {
+    /// Run until `out` has no receiver or the connection ends: decode
+    /// every event as it arrives through `feed`, acknowledge each commit
+    /// to the slot, send each transaction on (its writes, its position,
+    /// the feed's progress and the writes on the `watched` tables, once
+    /// per commit; a heartbeat is a transaction with no writes), and beat
+    /// the heart every `interval` so the position keeps moving while
+    /// nothing is written. A dropped connection ends the run quietly (the
+    /// caller reopens the slot); a decoding failure ends it with the error.
+    pub async fn stream(
+        mut self,
+        interval: Duration,
+        mut feed: Feed,
+        watched: &[TableName],
+        out: mpsc::Sender<Committed>,
+    ) -> Result<(), StorageError> {
         let mut ticker = tokio::time::interval(interval);
         loop {
             let event = tokio::select! {
@@ -383,17 +393,31 @@ impl Transport {
             };
             let event = match event {
                 Ok(Some(event)) => event,
-                Ok(None) => return,
+                Ok(None) => return Ok(()),
                 Err(error) => {
                     eprintln!("change feed ended: {error}");
-                    return;
+                    return Ok(());
                 }
             };
-            if let ReplicationEvent::Commit { end_lsn, .. } = &event {
-                self.acknowledge(position(*end_lsn));
-            }
-            if events.send(event).await.is_err() {
-                return;
+            let Some(transaction) = feed.absorb(event)? else {
+                continue;
+            };
+            self.acknowledge(transaction.at);
+            let watched_writes: Vec<WriteQuery> = transaction
+                .writes
+                .iter()
+                .filter(|write| watched.contains(write.table()))
+                .cloned()
+                .collect();
+            let committed = Committed {
+                writes: transaction.writes,
+                at: transaction.at,
+                progress: feed.progress(),
+                watched: watched_writes,
+                received: Instant::now(),
+            };
+            if out.send(committed).await.is_err() {
+                return Ok(());
             }
         }
     }
@@ -401,7 +425,7 @@ impl Transport {
 
 impl Feed {
     /// A decoder for `catalog`, at position zero until the first event.
-    pub fn new(catalog: Rc<Catalog>) -> Self {
+    pub fn new(catalog: Arc<Catalog>) -> Self {
         Feed {
             decoder: Decoder::new(catalog),
             progress: Lsn(0),
@@ -429,7 +453,7 @@ impl Feed {
 
 impl PgStream {
     /// Open the feed of `slot` at `dsn`, decoding with `catalog`.
-    pub async fn open(dsn: &str, slot: &str, catalog: Rc<Catalog>) -> Result<Self, StorageError> {
+    pub async fn open(dsn: &str, slot: &str, catalog: Arc<Catalog>) -> Result<Self, StorageError> {
         Ok(PgStream {
             transport: Transport::open(dsn, slot).await?,
             feed: Feed::new(catalog),
@@ -445,7 +469,7 @@ impl PgStream {
     /// slot first (the drop is retried while it lets go).
     pub async fn drop_slot(dsn: &str, slot: &str) -> Result<(), StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config).await?;
+        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
         client
             .execute(
                 "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = $1 AND active_pid IS NOT NULL",
@@ -521,10 +545,9 @@ impl PgStream {
     }
 
     /// Run on one thread until `commands` has no receiver or the
-    /// connection ends: each transaction goes out as
-    /// [`Command::Commit`] followed by a [`Command::Progress`], and a
-    /// heartbeat every `interval` keeps the position moving while nothing
-    /// is written.
+    /// connection ends: each transaction goes out as one
+    /// [`Command::Transaction`], and a heartbeat every `interval` keeps
+    /// the position moving while nothing is written.
     pub async fn run<Q>(mut self, interval: Duration, commands: mpsc::Sender<Command<Q>>) {
         let mut ticker = tokio::time::interval(interval);
         loop {
@@ -558,18 +581,15 @@ impl PgStream {
                     return;
                 }
             };
+            let committed = Committed {
+                writes: transaction.writes,
+                at: transaction.at,
+                progress: self.feed.progress(),
+                watched: Vec::new(),
+                received: Instant::now(),
+            };
             if commands
-                .send(Command::Commit {
-                    writes: transaction.writes,
-                    at: transaction.at,
-                })
-                .await
-                .is_err()
-            {
-                return;
-            }
-            if commands
-                .send(Command::Progress(self.feed.progress()))
+                .send(Command::Transaction(committed))
                 .await
                 .is_err()
             {
@@ -652,7 +672,7 @@ fn image(
     for name in table.columns.keys() {
         data.entry(name.clone()).or_insert(Value::Null);
     }
-    Ok(DataFrameRow { data })
+    Ok(DataFrameRow::from(data))
 }
 
 /// Convert one text value by its declared type.
@@ -687,8 +707,8 @@ mod tests {
     use crate::model::{ComparisonOperator, DbColumn, DbTable, Where};
 
     /// `probe_t`, the table the session was recorded from.
-    fn catalog() -> Rc<Catalog> {
-        Rc::new(Catalog::new(vec![DbTable::new(
+    fn catalog() -> Arc<Catalog> {
+        Arc::new(Catalog::new(vec![DbTable::new(
             "probe_t",
             ["id"],
             vec![

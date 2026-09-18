@@ -28,12 +28,19 @@
 // Options (env in brackets): --api [E2E_API] --gateway [E2E_GATEWAY] --pg [E2E_PG]
 // --connections N --users K --writers W --batch B (mutations per push in the steady phase, 1)
 // --seed-batch B2 (mutations per push while seeding, 10) --push-timeout MS (30000)
-// --seed M --seed-replies M2 --threads T --rate R
+// --seed M --seed-replies M2 --threads T --rate R --tps T2 (transactions a
+// second in the steady phase when --writes is sql, 20: a transaction carries
+// R/T2 rows, so a ladder that outgrows a query's LIMIT per transaction needs more)
 // --duration S --reply-share F --writes mutations|sql (mutations go through the
 // application server the way a client's do; sql writes the same rows straight into
 // PostgreSQL, so the measured throughput is this server's own pipeline — the
 // replication feed, the engine and the fan-out — with no application server in it)
-// --channel ID --pid PID (sample this process's CPU/RSS)
+// --channel ID --channels C (spread the subscribers and the writes over C DEFAULT
+// channels, the first being --channel or the workspace's oldest and the rest
+// `load-ch-<k>`, created if missing: each update then reaches CONNECTIONS/C
+// subscribers, the shape that measures transactions a second rather than fan-out)
+// --stats URL (the server's /stats; reset when the steady phase starts and read
+// at its end; default: the gateway's host and port) --pid PID (sample this process's CPU/RSS)
 // --container NAME (sample `docker stats` instead) --out FILE (statistics; add --raw for every
 // delivery delay) --label TEXT --quiet
 // The `ws` package is found through E2E_WS, `ws`, or ../node_modules/ws.
@@ -71,9 +78,11 @@ const SEED = +opt('seed', 0);
 const SEED_REPLIES = +opt('seed-replies', 0);
 const THREADS = +opt('threads', 3);
 const RATE = +opt('rate', 20);
+const TPS = Math.max(1, +opt('tps', 20));
 const DURATION = +opt('duration', 30);
 const REPLY_SHARE = +opt('reply-share', 0.3);
 const CHANNEL = opt('channel', '');
+const CHANNELS = Math.max(1, +opt('channels', 1));
 const PID = opt('pid', '');
 const CONTAINER = opt('container', '');
 const OUT = opt('out', '');
@@ -82,6 +91,7 @@ const QUIET = flag('quiet');
 const DUMP = flag('dump-tables');
 const RAW = flag('raw');
 const WRITES = opt('writes', 'mutations');
+const STATS = opt('stats', GATEWAY.replace(/^ws(s?):\/\//, 'http$1://').replace(/\/[^/]*$/, '') + '/stats');
 const t0 = Date.now();
 const log = (...a) => console.log(`${String(Date.now() - t0).padStart(7)}ms`, ...a);
 const debug = (...a) => { if (!QUIET) log(...a); };
@@ -210,7 +220,7 @@ class Conn {
 /// Everything the run learns, in one place.
 const run = {
   label: LABEL, started: new Date().toISOString(),
-  config: { CONNECTIONS, USERS, WRITERS, BATCH, SEED_BATCH, SEED, SEED_REPLIES, THREADS, RATE, DURATION, REPLY_SHARE, GATEWAY },
+  config: { CONNECTIONS, USERS, WRITERS, BATCH, SEED_BATCH, SEED, SEED_REPLIES, THREADS, RATE, DURATION, REPLY_SHARE, CHANNELS, GATEWAY },
   phases: {}, receive: [], receiveThread: [], expected: 0, expectedThread: 0, sent: 0, sentThread: 0, mutationErrors: 0,
 };
 /// Where a delivered row's send time is read from: the ids are client-chosen, so
@@ -247,8 +257,32 @@ for (let i = 0; i < USERS; i++) users.push(await login(`test-user-email-9${Strin
 const workspaceId = users[0].workspaceId;
 const channelId = CHANNEL || psql(`select id from channels where "workspaceId"='${workspaceId}' and "scopeType"='DEFAULT' order by "createdAt" limit 1`);
 if (!channelId) fail('no DEFAULT channel in the workspace');
-for (const u of users) ensureMember(u, channelId);
-log(`${users.length} users are members of channel ${channelId}`);
+/// The channels the subscribers and the writes are spread over: the primary
+/// one first, then `load-ch-<k>`, each a copy of the primary with its own id and
+/// name, created when missing.
+const channelIds = [channelId];
+for (let k = 1; k < CHANNELS; k++) {
+  const name = `load-ch-${k}`;
+  let id = psql(`select id from channels where "workspaceId"='${workspaceId}' and name='${name}' limit 1`);
+  if (!id) {
+    id = `ch-load-${k}-${randomUUID().slice(0, 8)}`;
+    psql(`insert into channels select (json_populate_record(c, '${JSON.stringify({ id, name }).replace(/'/g, "''")}'::json)).* from channels c where id='${channelId}'`);
+  }
+  channelIds.push(id);
+}
+for (const u of users) for (const id of channelIds) ensureMember(u, id);
+/// The channel of subscriber `i` and of write `i`.
+const channelOf = (i) => channelIds[i % CHANNELS];
+/// How many subscribers listen to channel `k`.
+const listeners = (k) => Math.floor(CONNECTIONS / CHANNELS) + (k < CONNECTIONS % CHANNELS ? 1 : 0);
+log(`${users.length} users are members of ${channelIds.length} channel(s) (${channelId}${CHANNELS > 1 ? ' and ' + (CHANNELS - 1) + ' more' : ''})`);
+/// The server's own measurements (its /stats endpoint), or null.
+async function serverStats(reset) {
+  try {
+    const response = await fetch(STATS + (reset ? '?reset=1' : ''));
+    return response.ok ? await response.json() : null;
+  } catch { return null; }
+}
 const writerPatch = [{ op: 'put', hash: 'w-channels', name: 'userVisibleChannelsV3', args: [], ttl: 300000 }];
 const writers = [];
 for (let i = 0; i < WRITERS; i++) writers.push(new Conn(`W${i}`, users[i % users.length], writerPatch, sinkFor('writer')));
@@ -302,8 +336,8 @@ done = phase('hydrate');
 const subscribers = [];
 const subscriberPatch = (i) => [
   { op: 'put', hash: 'q-channels', name: 'userVisibleChannelsV3', args: [], ttl: 300000 },
-  { op: 'put', hash: 'q-latest', name: 'channelLatestMultipleConversationsV3', args: [{ channelId, isMember: true, limit: 25 }], ttl: 300000 },
-  { op: 'put', hash: 'q-page', name: 'channelConversationsPaginatedV3', args: [{ channelId, isMember: true, start: { createdAt: Date.now() - 3_600_000 }, direction: 'forward', limit: 50 }], ttl: 300000 },
+  { op: 'put', hash: 'q-latest', name: 'channelLatestMultipleConversationsV3', args: [{ channelId: channelOf(i), isMember: true, limit: 25 }], ttl: 300000 },
+  { op: 'put', hash: 'q-page', name: 'channelConversationsPaginatedV3', args: [{ channelId: channelOf(i), isMember: true, start: { createdAt: Date.now() - 3_600_000 }, direction: 'forward', limit: 50 }], ttl: 300000 },
   { op: 'put', hash: 'q-users', name: 'getUsersV2', args: [{ lastUpdatedAt: 0 }], ttl: 300000 },
   { op: 'put', hash: 'q-unread', name: 'userUnreadActivities', args: [], ttl: 300000 },
   ...Array.from({ length: Math.min(THREADS, threadPool.length) }, (_, k) => {
@@ -344,17 +378,18 @@ done = phase('steady');
 const threadSubscribers = new Map();
 for (const s of subscribers) for (const h of s.wanted) if (h.startsWith('q-thread-')) { const id = h.slice(9); threadSubscribers.set(id, (threadSubscribers.get(id) ?? 0) + 1); }
 const total = Math.round(RATE * DURATION);
+await serverStats(true);
 steadyStart = Date.now();
 let seq = 0;
-/// Write the steady phase's rows straight into PostgreSQL, in transactions of
-/// `--batch`, at `--rate` rows a second: what the mutators write, without the
-/// application server in the path, so the measurement is this server's own
-/// pipeline. Timestamps go in as UTC, the way the application's own writes store
-/// them, so the rows sort together.
+/// Write the steady phase's rows straight into PostgreSQL, `--tps` transactions
+/// a second carrying `--rate` rows a second between them: what the mutators
+/// write, without the application server in the path, so the measurement is this
+/// server's own pipeline. Timestamps go in as UTC, the way the application's own
+/// writes store them, so the rows sort together.
 async function driveSql(total) {
   const author = users[0];
   const quote = (text) => `'${String(text).replace(/'/g, "''")}'`;
-  const perBatch = Math.max(1, Math.round(RATE / 20));
+  const perBatch = Math.max(1, Math.round(RATE / TPS));
   const deadline = steadyStart + DURATION * 1000 + 5_000;
   let done = 0;
   let due = steadyStart;
@@ -370,8 +405,8 @@ async function driveSql(total) {
       const i = done + k;
       const conversationId = `lcv-${now.toString(36)}-${i}`;
       const messageId = `lm-c-${now.toString(36)}-${i}`;
-      run.sent += 1; run.expected += subscribers.length;
-      rows.push(`(${quote(conversationId)}, ${quote(channelId)}, ${quote(author.userId)}, ${quote(messageId)}, ${quote(workspaceId)}, (now() at time zone 'utc'))`);
+      run.sent += 1; run.expected += listeners(i % CHANNELS);
+      rows.push(`(${quote(conversationId)}, ${quote(channelOf(i))}, ${quote(author.userId)}, ${quote(messageId)}, ${quote(workspaceId)}, (now() at time zone 'utc'))`);
       messages.push(`(${quote(messageId)}, ${quote(conversationId)}, ${quote(author.userId)}, ${quote(workspaceId)}, ${quote(`load conversation ${i} by sql`)}, (now() at time zone 'utc'))`);
     }
     const sql = `SET statement_timeout = '5s'; BEGIN; INSERT INTO messages ("messageId", "conversationId", "senderId", "workspaceId", content, "createdAt") VALUES ${messages.join(', ')}; INSERT INTO conversations ("conversationId", "channelId", "createdBy", "initialMessageId", "workspaceId", "createdAt") VALUES ${rows.join(', ')}; COMMIT;`;
@@ -401,8 +436,8 @@ function nextMutation(w) {
     return ['messages.send', { conversationId, content: `load reply ${i} from ${w.name}`, type: 'USER', timestamp: now, messageId: `lm-r-${now.toString(36)}-${i}` }];
   }
   const conversationId = `lcv-${now.toString(36)}-${i}`;
-  run.sent += 1; run.expected += subscribers.length;
-  return ['conversations.send', { channelId, content: `load conversation ${i} from ${w.name}`, type: 'USER', conversationId, messageId: 'lm-c-' + randomUUID().slice(0, 12), timestamp: now }];
+  run.sent += 1; run.expected += listeners(i % CHANNELS);
+  return ['conversations.send', { channelId: channelOf(i), content: `load conversation ${i} from ${w.name}`, type: 'USER', conversationId, messageId: 'lm-c-' + randomUUID().slice(0, 12), timestamp: now }];
 }
 if (WRITES === 'sql') {
   await driveSql(total);
@@ -440,11 +475,17 @@ run.phases.steady = {
   dropped_connections: subscribers.filter(s => s.closed).length,
   process: samples.length ? { cpu_mean: Math.round(samples.reduce((a, s) => a + s.cpu, 0) / samples.length), cpu_max: Math.max(...samples.map(s => s.cpu)), rss_mb_max: Math.max(...samples.map(s => s.rss_mb)) } : null,
 };
+run.server = await serverStats(false);
 const st = run.phases.steady;
 log(`steady: ${st.mutations} mutations in ${st.ms} ms (${st.per_second}/s); push→lmid ${fmt(st.push_latency)}`);
 log(`channel fan-out: ${st.conversation_fanout.received}/${st.conversation_fanout.expected} rows delivered; ${fmt(st.conversation_fanout.delivery)}`);
 log(`thread fan-out: ${st.thread_fanout.received}/${st.thread_fanout.expected} rows delivered; ${fmt(st.thread_fanout.delivery)}`);
 log(`dropped connections: ${st.dropped_connections}; mutation errors: ${run.mutationErrors}; push timeouts: ${run.pushTimeouts}; process: ${JSON.stringify(st.process)}`);
+if (run.server) {
+  const us = (name) => { const h = run.server.stages_us[name]; return `${h.p50_us}/${h.p99_us}`; };
+  const c = run.server.counts;
+  log(`server stages p50/p99 µs: feed→engine ${us('feed_to_engine')}, engine ${us('engine_step')}, engine→groups ${us('engine_to_groups')}, flush ${us('groups_flush')}, groups→socket ${us('groups_to_socket')}, end-to-end ${us('end_to_end')}; transactions ${c.transactions}, pokes ${c.pokes}, frames ${c.frames}, rows serialized ${c.rows_serialized}, shared ${c.rows_shared}`);
+}
 if (run.mutationErrors) log('first errors:', JSON.stringify(writers.flatMap(w => w.errors).slice(0, 3)));
 if (DUMP) { log('conversation samples:', JSON.stringify(run.samples)); log('puts per table:', JSON.stringify(run.tables)); log('threads:', JSON.stringify(Object.entries(run.threadDetail ?? {}).filter(([, v]) => v.expected !== v.received).map(([k, v]) => `${k}: ${v.received}/${v.expected} subs=${threadSubscribers.get(k)}`))); }
 for (const c of [...writers, ...subscribers]) c.close();

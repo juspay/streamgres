@@ -13,42 +13,100 @@ use std::collections::HashMap;
 use crate::model::{ClientId, DataFrameKey, DataFrameOperation, DataFrameRow, SubId, TableName};
 
 /// Which node of a subscription's join tree a part is: the path of join
-/// indices from the root, a node's left joins numbered first, its right
-/// joins next and its inner joins last. The root is the empty path; a
-/// single-table subscription has only the root.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub struct QueryPart(pub Vec<usize>);
+/// positions from the root. The root is the empty path; a single-table
+/// subscription has only the root.
+///
+/// The path is kept inline, at most [`QueryPart::MAX_DEPTH`] steps of at
+/// most 255 each, so a part is eight bytes, `Copy`, and hashed as one
+/// integer: every delta names its part without an allocation.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct QueryPart {
+    len: u8,
+    path: [u8; QueryPart::MAX_DEPTH],
+}
 
 impl QueryPart {
+    /// The deepest a tree may nest.
+    pub const MAX_DEPTH: usize = 7;
+
     /// The root part.
     pub fn main() -> Self {
-        QueryPart(Vec::new())
+        QueryPart::default()
     }
 
     /// The root's `index`-th join.
     pub fn join(index: usize) -> Self {
-        QueryPart(vec![index])
+        QueryPart::main().child(index)
+    }
+
+    /// The part at `path`; `None` when it nests deeper than
+    /// [`QueryPart::MAX_DEPTH`] or a step is past 255.
+    pub fn try_new(path: &[usize]) -> Option<Self> {
+        if path.len() > Self::MAX_DEPTH {
+            return None;
+        }
+        let mut part = QueryPart::default();
+        for (slot, &step) in part.path.iter_mut().zip(path) {
+            *slot = u8::try_from(step).ok()?;
+        }
+        part.len = path.len() as u8;
+        Some(part)
+    }
+
+    /// The part at `path`.
+    ///
+    /// # Panics
+    ///
+    /// When the path nests deeper than [`QueryPart::MAX_DEPTH`] or a step
+    /// is past 255 (a tree the translation would have refused).
+    pub fn new(path: &[usize]) -> Self {
+        Self::try_new(path).expect("a query part within the engine's depth and width")
+    }
+
+    /// The join positions from the root.
+    pub fn path(&self) -> &[u8] {
+        &self.path[..self.len as usize]
     }
 
     /// Whether this is the root.
     pub fn is_main(&self) -> bool {
-        self.0.is_empty()
+        self.len == 0
     }
 
     /// The join index of a first-level part; `None` for the root and for
     /// nested parts.
     pub fn join_index(&self) -> Option<usize> {
-        match self.0.as_slice() {
-            [index] => Some(*index),
-            _ => None,
-        }
+        (self.len == 1).then_some(self.path[0] as usize)
     }
 
     /// The `index`-th child of this part.
     pub(crate) fn child(&self, index: usize) -> Self {
-        let mut path = self.0.clone();
-        path.push(index);
-        QueryPart(path)
+        let mut child = *self;
+        assert!(
+            (child.len as usize) < Self::MAX_DEPTH,
+            "a query tree nests deeper than {} joins",
+            Self::MAX_DEPTH
+        );
+        child.path[child.len as usize] = u8::try_from(index).expect("a node has at most 256 joins");
+        child.len += 1;
+        child
+    }
+}
+
+impl std::hash::Hash for QueryPart {
+    /// The whole path as one integer.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let mut bytes = [0u8; 8];
+        bytes[0] = self.len;
+        bytes[1..].copy_from_slice(&self.path);
+        state.write_u64(u64::from_le_bytes(bytes));
+    }
+}
+
+impl std::fmt::Debug for QueryPart {
+    /// `QueryPart([1, 0])`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QueryPart({:?})", self.path())
     }
 }
 

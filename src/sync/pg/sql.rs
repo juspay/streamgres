@@ -220,7 +220,7 @@ fn literal(value: &Value) -> String {
 }
 
 /// A single-quoted string literal, quotes doubled.
-fn quote_literal(text: &str) -> String {
+pub fn quote_literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 

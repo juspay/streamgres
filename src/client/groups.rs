@@ -1,10 +1,26 @@
-//! Every client group's view, and the one thread that keeps it. It owns
-//! no engine, no storage and no database connection: it sends the engine
-//! side subscribe and unsubscribe commands and reads back that side's
-//! events (deltas, hydrated subscriptions, landings, stream progress),
+//! Every client group's view, and the threads that keep them. A group
+//! thread owns no engine, no storage and no database connection: it sends
+//! the engine side subscribe and unsubscribe commands and reads back that
+//! side's events (deltas, hydrated subscriptions, landings, commits),
 //! turning both into the pokes a Zero client expects. Connections hand it
-//! requests over a channel (connect, disconnect, desired queries, pulls)
+//! requests over a channel (connect, disconnect, planned queries, pulls)
 //! and receive finished frames.
+//!
+//! # Threads, batches, bytes
+//!
+//! There are `XYNE_SYNC_GROUP_THREADS` of these threads, each owning the
+//! groups whose id hashes to it; a group's engine client id carries the
+//! thread's index in its low digits, so the engine side routes every
+//! event to the thread that owns the client with no table. A thread
+//! wakes, takes everything the connections and the engine side have sent
+//! since, applies all of it, and only then pokes each group that has
+//! something to hear, once: idle, that is one poke per transaction; under
+//! load one poke carries every transaction that arrived meanwhile, which
+//! is what keeps the frame count per connection bounded as the write rate
+//! climbs. Within a flush every row image is serialized to its `rowsPatch`
+//! bytes once and shared by every group's frame that carries it; a group's
+//! frame is a prefix, those fragments, and a suffix, so a poke costs the
+//! bookkeeping and a copy, never a JSON tree per group.
 //!
 //! # A client group's view
 //!
@@ -22,23 +38,23 @@
 //! history) resets the client to a fresh sync.
 //!
 //! The application's mutation ids arrive as writes to its clients table,
-//! which the engine side copies here as one batch per transaction; the
-//! batch is taken when that transaction reports its progress, so a
-//! mutation's rows and its id go out in the same poke and no later
-//! transaction's id rides out early.
+//! which the engine side carries inside the transaction's own
+//! [`Event::Committed`], so a mutation's rows and its id go out in the
+//! same poke and no later transaction's id rides out early.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::io::Write;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
-use serde_json::{Map, Value as Json, json};
-use tokio::sync::{mpsc, oneshot};
+use bytes::Bytes;
+use serde_json::{Value as Json, json};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::spawn_local;
 
-use super::ast::{self, Ast, Translated};
+use super::ast::Translated;
 use super::config::Config;
-use super::plan::{Planner, Policy, Step};
 use super::protocol::{self, ClientSchema};
 use super::wire;
 use crate::ivm::{ClientUpdate, QueryPart};
@@ -47,16 +63,30 @@ use crate::model::{
     Catalog, ClientId, DataFrameKey, DataFrameOperation, DataFrameRow, Lsn, MultiTableReadQuery,
     SubId, TableName, Value, WriteQuery,
 };
+use crate::stats::Stats;
 use crate::sync::{Command, Event};
 
-/// One frame for one connection: a text frame, a WebSocket ping (the
-/// liveness probe a browser answers on its own), or the close.
+/// What goes out on one connection: a text frame, one poke (its frames
+/// written together, one flush; `since` is when the feed decoded the
+/// oldest transaction it carries, `sent` when it was handed over, both
+/// for the server's own clock), a WebSocket ping (the liveness probe a
+/// browser answers on its own), or the close.
 #[derive(Debug, Clone)]
 pub enum Outbound {
     Text(Arc<str>),
+    Poke {
+        frames: Arc<[Bytes]>,
+        since: Option<Instant>,
+        sent: Instant,
+    },
     Ping,
     Close,
 }
+
+/// The columns a client's schema declares per table: what a row is
+/// shipped with when the schema is known. Interned by content, so groups
+/// with the same schema share one and their serialized rows.
+type Columns = HashMap<String, HashSet<String>>;
 
 /// A connection's handle: the client it speaks for and where its frames
 /// go.
@@ -67,15 +97,16 @@ pub struct Socket {
 }
 
 /// One change to a client's desired queries, ready for this thread: a
-/// custom query already transformed into its AST, or the reason it could
-/// not be.
+/// query already translated and planned (`Some(Ok)`), one that could not
+/// be and whose client has been told (`Some(Err)`), or a hash the client
+/// re-desires without an AST (`None`).
 #[derive(Debug)]
 pub enum DesiredOp {
     Put {
         hash: String,
         name: String,
         ttl: Option<f64>,
-        ast: Option<Json>,
+        planned: Option<Result<Box<Translated>, String>>,
     },
     Del {
         hash: String,
@@ -151,17 +182,6 @@ pub enum ConnectReply {
     },
 }
 
-/// One query between its translation and its registration: the planner
-/// deciding which side of its joins is read whole, and where its answer
-/// goes.
-struct Planning {
-    group: String,
-    client: String,
-    hash: String,
-    name: String,
-    planner: Planner,
-}
-
 /// One row operation bound for a group.
 enum RowOp {
     Put(TableName, DataFrameKey, DataFrameRow),
@@ -204,7 +224,7 @@ struct Group {
     hidden: HashMap<SubId, HashSet<QueryPart>>,
     rows: HashMap<(TableName, DataFrameKey), HashSet<(SubId, QueryPart)>>,
     lmids: HashMap<String, i64>,
-    columns: Option<HashMap<String, HashSet<String>>>,
+    columns: Option<Arc<Columns>>,
     queued_desired: HashMap<String, Vec<Json>>,
     queued_got: Vec<Json>,
     queued_lmids: HashMap<String, i64>,
@@ -233,52 +253,56 @@ impl Group {
         }
     }
 
-    /// Send one frame to every connection of the group.
-    fn broadcast(&self, frame: &Arc<str>) {
+    /// Send one poke's frames to every connection of the group.
+    fn broadcast(&self, frames: &Arc<[Bytes]>, since: Option<Instant>) {
+        let sent = Instant::now();
         for socket in self.sockets.values() {
-            let _ = socket.sink.send(Outbound::Text(frame.clone()));
+            let _ = socket.sink.send(Outbound::Poke {
+                frames: frames.clone(),
+                since,
+                sent,
+            });
         }
     }
 
-    /// Send one frame to the connections of one client.
-    fn send_to_client(&self, client: &str, frame: &Arc<str>) {
-        for socket in self
-            .sockets
-            .values()
-            .filter(|socket| socket.client == client)
-        {
-            let _ = socket.sink.send(Outbound::Text(frame.clone()));
-        }
-    }
-
-    /// Remember the client's schema as the columns to ship per table.
-    fn adopt_schema(&mut self, schema: &ClientSchema) {
-        self.columns = Some(
-            schema
-                .tables
-                .iter()
-                .map(|(table, spec)| (table.clone(), spec.columns.keys().cloned().collect()))
-                .collect(),
-        );
+    /// The address of the group's column set, the key its serialized rows
+    /// are shared under; zero when no schema is known.
+    fn schema_key(&self) -> usize {
+        self.columns
+            .as_ref()
+            .map_or(0, |columns| Arc::as_ptr(columns) as usize)
     }
 }
 
-/// The client-group thread's state.
+/// One group thread's state.
+///
+/// - `shard` / `shards`: this thread's index and how many there are; the
+///   engine client ids it hands out are `shard + shards × n`.
+/// - `schemas`: the client column sets seen, interned by content.
+/// - `stats`: where the flushes and the pokes are timed; `oldest` is when
+///   the feed decoded the oldest transaction applied since the last flush,
+///   the start of the clock every poke of the next flush carries.
 pub struct Groups {
     config: Arc<Config>,
-    catalog: Rc<Catalog>,
+    catalog: Arc<Catalog>,
+    shard: usize,
+    shards: usize,
+    schemas: HashMap<Vec<(String, Vec<String>)>, Arc<Columns>>,
+    stats: Arc<Stats>,
+    oldest: Option<Instant>,
     /// Commands to the engine side, in the order they were made.
     commands: mpsc::UnboundedSender<Command<MultiTableReadQuery>>,
     requests: mpsc::Sender<Request>,
     ready: bool,
+    /// Flipped once, when this thread starts serving; the connections and
+    /// the health check watch it.
+    readiness: watch::Sender<bool>,
     backlog: Vec<Request>,
     groups: HashMap<String, Group>,
     by_client: HashMap<ClientId, String>,
     by_sub: HashMap<SubId, (String, String)>,
     /// Registrations in flight, by the token they were sent with.
     awaiting: HashMap<u64, (String, String)>,
-    /// Plans waiting on a count, by the token the count was asked with.
-    plans: HashMap<u64, Planning>,
     next_client: u64,
     pending: HashMap<ClientId, Vec<ClientUpdate>>,
     lmid_changes: HashMap<String, HashMap<String, i64>>,
@@ -289,35 +313,42 @@ pub struct Groups {
     next_generation: u64,
 }
 
-/// Run the client-group thread until every request sender is gone. Must
-/// run inside a `LocalSet`.
+/// Run group thread `shard` of `shards` until every request sender is
+/// gone: take what the connections and the engine side sent, in batches,
+/// apply it, and flush once per batch. Must run inside a `LocalSet`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: Arc<Config>,
-    catalog: Rc<Catalog>,
-    engine: crate::sync::pg::Started,
+    catalog: Arc<Catalog>,
+    shard: usize,
+    shards: usize,
+    commands: mpsc::Sender<Command<MultiTableReadQuery>>,
+    mut events: mpsc::UnboundedReceiver<Event>,
     mut requests_rx: mpsc::Receiver<Request>,
     requests: mpsc::Sender<Request>,
+    stats: Arc<Stats>,
+    readiness: watch::Sender<bool>,
 ) {
-    let crate::sync::pg::Started {
-        commands,
-        mut events,
-        mut watched,
-    } = engine;
     let (outbox, outbox_rx) = mpsc::unbounded_channel();
     spawn_local(forward(outbox_rx, commands));
     let mut core = Groups {
         clients_table: TableName::from(config.clients_table().as_str()),
         config,
         catalog,
+        shard,
+        shards: shards.max(1),
+        schemas: HashMap::new(),
+        stats,
+        oldest: None,
         commands: outbox,
         requests,
         ready: false,
+        readiness,
         backlog: Vec::new(),
         groups: HashMap::new(),
         by_client: HashMap::new(),
         by_sub: HashMap::new(),
         awaiting: HashMap::new(),
-        plans: HashMap::new(),
         next_client: 1,
         pending: HashMap::new(),
         lmid_changes: HashMap::new(),
@@ -325,18 +356,33 @@ pub async fn run(
         next_poke: 1,
         next_generation: 0,
     };
-    log_info!("client groups up; waiting for the first heartbeat before serving queries");
+    log_info!(
+        "client groups {}/{} up; waiting for the first heartbeat before serving queries",
+        shard + 1,
+        shards.max(1)
+    );
+    let mut taken_requests = Vec::with_capacity(256);
+    let mut taken_events = Vec::with_capacity(1024);
     loop {
         tokio::select! {
-            request = requests_rx.recv() => match request {
-                Some(request) => core.handle(request),
-                None => break,
-            },
-            event = events.recv() => match event {
-                Some(event) => core.event(event, &mut watched),
-                None => break,
-            },
+            taken = requests_rx.recv_many(&mut taken_requests, 256) => {
+                if taken == 0 {
+                    break;
+                }
+                for request in taken_requests.drain(..) {
+                    core.handle(request);
+                }
+            }
+            taken = events.recv_many(&mut taken_events, 1024) => {
+                if taken == 0 {
+                    break;
+                }
+                for event in taken_events.drain(..) {
+                    core.event(event);
+                }
+            }
         }
+        core.flush();
     }
 }
 
@@ -368,7 +414,6 @@ impl Groups {
             } => {
                 let outcome = self.connect(&group, wsid, socket, base_cookie, schema, lmids);
                 let _ = reply.send(outcome);
-                self.flush();
             }
             Request::Disconnect { group, wsid } => self.disconnect(&group, &wsid),
             Request::Desired { .. } if !self.ready => self.backlog.push(request),
@@ -377,15 +422,11 @@ impl Groups {
                 client,
                 schema,
                 ops,
-            } => {
-                self.desired(&group, &client, schema, ops);
-                self.flush();
-            }
+            } => self.desired(&group, &client, schema, ops),
             Request::DeleteClients { group, clients } => {
                 for client in clients {
                     self.clear_client(&group, &client);
                 }
-                self.flush();
             }
             Request::Pull { group, reply } => {
                 let answer = self
@@ -400,29 +441,22 @@ impl Groups {
                 group,
                 hash,
                 generation,
-            } => {
-                self.expire_query(&group, &hash, generation);
-                self.flush();
-            }
+            } => self.expire_query(&group, &hash, generation),
         }
     }
 
     /// One event from the engine side.
-    fn event(&mut self, event: Event, watched: &mut mpsc::UnboundedReceiver<Vec<WriteQuery>>) {
+    fn event(&mut self, event: Event) {
         match event {
-            Event::Registered { token, sub } => self.registered(token, sub),
-            Event::Updates(updates) => {
-                for update in updates {
-                    if let Some(group) = self.by_client.get(&update.client) {
-                        self.dirty.insert(group.clone());
-                    }
-                    self.pending.entry(update.client).or_default().push(update);
-                }
+            Event::Registered {
+                token,
+                sub,
+                updates,
+            } => {
+                self.registered(token, sub);
+                self.absorb(updates);
             }
-            // A query completes either because a read landed (an
-            // `Event::Landed` follows) or because an existing tree already
-            // held its rows, in which case nothing else would poke the
-            // group until the next write or heartbeat: flush here.
+            Event::Landed { updates } => self.absorb(updates),
             Event::Hydrated(subs) => {
                 for sub in subs {
                     let Some((group_id, hash)) = self.by_sub.get(&sub).cloned() else {
@@ -439,123 +473,39 @@ impl Groups {
                         self.dirty.insert(group_id);
                     }
                 }
-                self.flush();
             }
-            Event::Landed => self.flush(),
-            Event::Counted { token, count } => self.counted(token, count),
-            Event::Moved { position, floor } => {
-                if let Ok(batch) = watched.try_recv() {
-                    for write in batch {
-                        if write.table() == &self.clients_table {
-                            self.note_lmid(&write);
-                        }
+            Event::Committed {
+                updates,
+                position,
+                floor,
+                watched,
+                received,
+                routed,
+            } => {
+                self.absorb(updates);
+                self.stats.engine_to_groups.record(routed.elapsed());
+                self.oldest = Some(match self.oldest {
+                    Some(oldest) => oldest.min(received),
+                    None => received,
+                });
+                for write in &watched {
+                    if write.table() == &self.clients_table {
+                        self.note_lmid(write);
                     }
                 }
-                self.flush();
                 self.serve_when_covered(position, floor);
             }
         }
     }
 
-    /// The join policy the configuration sets.
-    fn policy(&self) -> Policy {
-        Policy {
-            limit: self.config.join_limit,
-            preferred: self.config.join_preferred_side,
-        }
-    }
-
-    /// Drive one query's plan: ask the engine side for the count it needs
-    /// next, or act on its decision.
-    fn plan(&mut self, token: u64, mut planning: Planning) {
-        match planning.planner.step() {
-            Step::Count(query, cap) => {
-                log_debug!(
-                    "group {}: query {} ({}) counts {} up to {cap}",
-                    planning.group,
-                    planning.name,
-                    planning.hash,
-                    query.table
-                );
-                self.plans.insert(token, planning);
-                self.command(Command::Count { query, cap, token });
+    /// Keep one step's deltas for their groups' next pokes.
+    fn absorb(&mut self, updates: Vec<ClientUpdate>) {
+        for update in updates {
+            if let Some(group) = self.by_client.get(&update.client) {
+                self.dirty.insert(group.clone());
             }
-            Step::Done(Ok(translated)) => self.register_planned(token, planning, translated),
-            Step::Done(Err(reason)) => self.refuse(token, planning, &reason),
+            self.pending.entry(update.client).or_default().push(update);
         }
-    }
-
-    /// A count the engine side answered, for a plan in flight.
-    fn counted(&mut self, token: u64, count: Result<u64, String>) {
-        let Some(mut planning) = self.plans.remove(&token) else {
-            return;
-        };
-        match count {
-            Ok(count) => {
-                planning.planner.answer(count);
-                self.plan(token, planning);
-            }
-            Err(error) => self.refuse(
-                token,
-                planning,
-                &format!("counting its rows failed: {error}"),
-            ),
-        }
-    }
-
-    /// The plan is in: register the query in the shape the planner chose,
-    /// unless the query was released while the plan was being made.
-    fn register_planned(&mut self, token: u64, planning: Planning, translated: Translated) {
-        let Some(group) = self.groups.get_mut(&planning.group) else {
-            return;
-        };
-        let Some(state) = group.queries.get_mut(&planning.hash) else {
-            return;
-        };
-        if state.awaiting != token {
-            return;
-        }
-        state.hidden = translated.hidden;
-        let engine_client = group.client;
-        self.awaiting
-            .insert(token, (planning.group.clone(), planning.hash.clone()));
-        self.command(Command::Register {
-            client: engine_client,
-            query: translated.query,
-            token,
-        });
-        log_debug!(
-            "group {}: query {} ({}) registering",
-            planning.group,
-            planning.name,
-            planning.hash
-        );
-    }
-
-    /// The plan refused the query: the client is told why, and the query
-    /// stays known to the group with no subscription behind it.
-    fn refuse(&mut self, token: u64, planning: Planning, reason: &str) {
-        log_warn!(
-            "group {}: query {} ({}) refused: {reason}",
-            planning.group,
-            planning.name,
-            planning.hash
-        );
-        let Some(group) = self.groups.get_mut(&planning.group) else {
-            return;
-        };
-        if let Some(state) = group.queries.get_mut(&planning.hash)
-            && state.awaiting == token
-        {
-            state.awaiting = 0;
-        }
-        let frame: Arc<str> = protocol::transform_error(vec![protocol::errored_query(
-            &planning.hash,
-            &planning.name,
-            reason,
-        )])
-        .into();
-        group.send_to_client(&planning.client, &frame);
     }
 
     /// Start serving once the engine's position covers the storage's
@@ -565,6 +515,7 @@ impl Groups {
             return;
         }
         self.ready = true;
+        self.readiness.send_replace(true);
         log_info!("serving: engine at {position}, storage snapshot at {floor}");
         let backlog = std::mem::take(&mut self.backlog);
         for request in backlog {
@@ -619,7 +570,7 @@ impl Groups {
             _ => {}
         }
         if !self.groups.contains_key(group_id) {
-            let client = ClientId(self.next_client);
+            let client = ClientId(self.shard as u64 + self.shards as u64 * self.next_client);
             self.next_client += 1;
             self.groups.insert(group_id.to_owned(), Group::new(client));
             self.by_client.insert(client, group_id.to_owned());
@@ -630,9 +581,10 @@ impl Groups {
         }
         self.next_generation += 1;
         let generation = self.next_generation;
+        let columns = schema.as_ref().map(|schema| self.intern_schema(schema));
         let group = self.groups.get_mut(group_id).expect("just ensured");
-        if let Some(schema) = &schema {
-            group.adopt_schema(schema);
+        if let Some(columns) = columns {
+            group.columns = Some(columns);
         }
         for (client, lmid) in lmids {
             let known = group.lmids.entry(client.clone()).or_insert(0);
@@ -699,7 +651,6 @@ impl Groups {
             self.command(Command::UnregisterClient(group.client));
             self.by_client.remove(&group.client);
             self.by_sub.retain(|_, (owner, _)| owner != group_id);
-            self.plans.retain(|_, planning| planning.group != group_id);
             self.pending.remove(&group.client);
             self.lmid_changes.remove(group_id);
             self.dirty.remove(group_id);
@@ -719,10 +670,8 @@ impl Groups {
             return;
         }
         if let Some(schema) = &schema {
-            self.groups
-                .get_mut(group_id)
-                .expect("checked")
-                .adopt_schema(schema);
+            let columns = self.intern_schema(schema);
+            self.groups.get_mut(group_id).expect("checked").columns = Some(columns);
         }
         for op in ops {
             match op {
@@ -730,8 +679,8 @@ impl Groups {
                     hash,
                     name,
                     ttl,
-                    ast,
-                } => self.put(group_id, client, hash, &name, ttl, ast),
+                    planned,
+                } => self.put(group_id, client, hash, &name, ttl, planned),
                 DesiredOp::Del { hash } => self.del(group_id, client, &hash),
                 DesiredOp::Clear => self.clear_client(group_id, client),
             }
@@ -739,7 +688,9 @@ impl Groups {
     }
 
     /// One client now desires `hash`; register it for the group when it
-    /// is new.
+    /// is new and it arrived planned (a query that could not be planned or
+    /// translated is known to the group with no subscription behind it;
+    /// its client was told by the connection).
     fn put(
         &mut self,
         group_id: &str,
@@ -747,7 +698,7 @@ impl Groups {
         hash: String,
         name: &str,
         ttl: Option<f64>,
-        ast: Option<Json>,
+        planned: Option<Result<Box<Translated>, String>>,
     ) {
         let lifetime = lifetime_of(ttl);
         self.mark(group_id);
@@ -775,7 +726,7 @@ impl Groups {
             state.ttl = lifetime;
             return;
         }
-        let Some(ast) = ast else {
+        let Some(Ok(translated)) = planned else {
             group.queries.insert(
                 hash,
                 QueryState {
@@ -789,52 +740,28 @@ impl Groups {
             );
             return;
         };
-        let translated: Result<Translated, String> = serde_json::from_value::<Ast>(ast)
-            .map_err(|error| format!("malformed AST: {error}"))
-            .and_then(|ast| ast::translate(&ast, &self.catalog));
-        match translated {
-            Ok(translated) => {
-                self.next_generation += 1;
-                let generation = self.next_generation;
-                group.queries.insert(
-                    hash.clone(),
-                    QueryState {
-                        sub: None,
-                        awaiting: generation,
-                        hidden: translated.hidden.clone(),
-                        got: false,
-                        ttl: lifetime,
-                        inactive: 0,
-                    },
-                );
-                let planning = Planning {
-                    group: group_id.to_owned(),
-                    client: client.to_owned(),
-                    hash: hash.clone(),
-                    name: name.to_owned(),
-                    planner: Planner::new(translated, self.policy()),
-                };
-                self.plan(generation, planning);
-            }
-            Err(message) => {
-                log_warn!("group {group_id}: query {name} ({hash}) cannot run here: {message}");
-                group.queries.insert(
-                    hash.clone(),
-                    QueryState {
-                        sub: None,
-                        awaiting: 0,
-                        hidden: HashSet::new(),
-                        got: false,
-                        ttl: lifetime,
-                        inactive: 0,
-                    },
-                );
-                let frame: Arc<str> =
-                    protocol::transform_error(vec![protocol::errored_query(&hash, name, &message)])
-                        .into();
-                group.send_to_client(client, &frame);
-            }
-        }
+        self.next_generation += 1;
+        let token = self.next_generation;
+        group.queries.insert(
+            hash.clone(),
+            QueryState {
+                sub: None,
+                awaiting: token,
+                hidden: translated.hidden,
+                got: false,
+                ttl: lifetime,
+                inactive: 0,
+            },
+        );
+        let engine_client = group.client;
+        self.awaiting
+            .insert(token, (group_id.to_owned(), hash.clone()));
+        self.command(Command::Register {
+            client: engine_client,
+            query: translated.query,
+            token,
+        });
+        log_debug!("group {group_id}: query {name} ({hash}) registering");
     }
 
     /// The engine side registered a query: adopt the subscription, unless
@@ -1014,8 +941,37 @@ impl Groups {
             .insert(client, lmid);
     }
 
+    /// The client's schema as the columns to ship per table, shared with
+    /// every group that declared the same.
+    fn intern_schema(&mut self, schema: &ClientSchema) -> Arc<Columns> {
+        let mut key: Vec<(String, Vec<String>)> = schema
+            .tables
+            .iter()
+            .map(|(table, spec)| {
+                let mut columns: Vec<String> = spec.columns.keys().cloned().collect();
+                columns.sort();
+                (table.clone(), columns)
+            })
+            .collect();
+        key.sort();
+        self.schemas
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::new(
+                    schema
+                        .tables
+                        .iter()
+                        .map(|(table, spec)| {
+                            (table.clone(), spec.columns.keys().cloned().collect())
+                        })
+                        .collect(),
+                )
+            })
+            .clone()
+    }
+
     /// Turn everything accumulated into one poke per group that has
-    /// anything to hear.
+    /// anything to hear, every row serialized once for all of them.
     fn flush(&mut self) {
         let stray: Vec<ClientId> = self
             .pending
@@ -1026,15 +982,31 @@ impl Groups {
         for client in stray {
             self.pending.remove(&client);
         }
+        if self.dirty.is_empty() {
+            self.oldest = None;
+            return;
+        }
+        let started = Instant::now();
+        let since = self.oldest.take();
         let mut touched: Vec<String> = self.dirty.drain().collect();
         touched.sort();
+        let mut fragments: HashMap<(usize, usize), Bytes> = HashMap::new();
         for group_id in touched {
-            self.poke(&group_id);
+            self.poke(&group_id, &mut fragments, since);
         }
+        self.stats.groups_flush.record(started.elapsed());
     }
 
-    /// Assemble and send one group's poke, if there is anything in it.
-    fn poke(&mut self, group_id: &str) {
+    /// Assemble and send one group's poke, if there is anything in it;
+    /// `fragments` are the row entries already serialized in this flush,
+    /// by image and column set, and `since` when the oldest transaction
+    /// of the flush was decoded.
+    fn poke(
+        &mut self,
+        group_id: &str,
+        fragments: &mut HashMap<(usize, usize), Bytes>,
+        since: Option<Instant>,
+    ) {
         let lmid_changes = self.lmid_changes.remove(group_id).unwrap_or_default();
         let Some(group) = self.groups.get_mut(group_id) else {
             return;
@@ -1100,63 +1072,105 @@ impl Groups {
         let base = (group.version > 0).then(|| protocol::cookie(group.version));
         group.version += 1;
         let cookie = protocol::cookie(group.version);
-        let mut frames: Vec<Arc<str>> = Vec::new();
-        frames.push(protocol::poke_start(&poke_id, base.as_deref()).into());
+        let per_part = self.config.rows_per_part.max(1);
+        let mut frames: Vec<Bytes> = Vec::with_capacity(rows.len().div_ceil(per_part) + 3);
+        frames.push(Bytes::from(protocol::poke_start(&poke_id, base.as_deref())));
         let got_count = got.len();
-        let mut first = Map::new();
+        let mut head: Vec<u8> = Vec::new();
         if !desired.is_empty() {
-            first.insert("desiredQueriesPatches".to_owned(), json!(desired));
+            head.extend_from_slice(b",\"desiredQueriesPatches\":");
+            let _ = serde_json::to_writer(&mut head, &desired);
         }
         if !got.is_empty() {
-            first.insert("gotQueriesPatch".to_owned(), Json::Array(got));
+            head.extend_from_slice(b",\"gotQueriesPatch\":");
+            let _ = serde_json::to_writer(&mut head, &got);
         }
         if !lmids.is_empty() {
-            first.insert("lastMutationIDChanges".to_owned(), json!(lmids));
+            head.extend_from_slice(b",\"lastMutationIDChanges\":");
+            let _ = serde_json::to_writer(&mut head, &lmids);
         }
-        let mut first = Some(first);
+        let mut head = Some(head);
         if rows.is_empty() {
-            frames.push(protocol::poke_part(&poke_id, first.take().unwrap_or_default()).into());
+            frames.push(part_frame(&poke_id, head.take(), &[]));
         }
+        let schema = group.schema_key();
         let mut puts = 0usize;
         let mut dels = 0usize;
-        for chunk in rows.chunks(self.config.rows_per_part.max(1)) {
-            let mut body = first.take().unwrap_or_default();
-            let mut patch = Vec::with_capacity(chunk.len());
+        for chunk in rows.chunks(per_part) {
+            let mut entries: Vec<Bytes> = Vec::with_capacity(chunk.len());
             for op in chunk {
                 match op {
                     RowOp::Put(table, _, row) => {
-                        puts += 1;
-                        let allowed = group
-                            .columns
-                            .as_ref()
-                            .and_then(|columns| columns.get(table.as_str()));
-                        let value = match self.catalog.table(table.as_str()) {
-                            Some(declared) => wire::row_json(row, declared, allowed),
-                            None => continue,
+                        let Some(declared) = self.catalog.table(table.as_str()) else {
+                            continue;
                         };
-                        patch.push(
-                            json!({"op": "put", "tableName": table.as_str(), "value": value}),
-                        );
+                        puts += 1;
+                        let (shared, serialized) =
+                            (&self.stats.rows_shared, &self.stats.rows_serialized);
+                        let fragment =
+                            match fragments.entry((Arc::as_ptr(&row.data) as usize, schema)) {
+                                std::collections::hash_map::Entry::Occupied(entry) => {
+                                    shared.fetch_add(1, Ordering::Relaxed);
+                                    entry.into_mut()
+                                }
+                                std::collections::hash_map::Entry::Vacant(entry) => {
+                                    serialized.fetch_add(1, Ordering::Relaxed);
+                                    let allowed = group
+                                        .columns
+                                        .as_ref()
+                                        .and_then(|columns| columns.get(table.as_str()));
+                                    let mut bytes = Vec::with_capacity(256);
+                                    wire::write_put(&mut bytes, declared, row, allowed);
+                                    entry.insert(Bytes::from(bytes))
+                                }
+                            };
+                        entries.push(fragment.clone());
                     }
                     RowOp::Del(table, key) => {
                         dels += 1;
-                        patch.push(json!({"op": "del", "tableName": table.as_str(), "id": wire::key_json(key)}));
+                        let mut bytes = Vec::with_capacity(64);
+                        wire::write_del(&mut bytes, table.as_str(), key);
+                        entries.push(Bytes::from(bytes));
                     }
                 }
             }
-            body.insert("rowsPatch".to_owned(), Json::Array(patch));
-            frames.push(protocol::poke_part(&poke_id, body).into());
+            frames.push(part_frame(&poke_id, head.take(), &entries));
         }
-        frames.push(protocol::poke_end(&poke_id, &cookie).into());
+        frames.push(Bytes::from(protocol::poke_end(&poke_id, &cookie)));
         log_debug!(
             "group {group_id}: poke {poke_id} {} -> {cookie}: {puts} puts, {dels} dels, {got_count} got, {} lmids",
             base.as_deref().unwrap_or("null"),
             lmids.len()
         );
-        for frame in &frames {
-            group.broadcast(frame);
-        }
+        self.stats.pokes.fetch_add(1, Ordering::Relaxed);
+        let frames: Arc<[Bytes]> = frames.into();
+        group.broadcast(&frames, since);
     }
+}
+
+/// One `pokePart` frame: the poke id, the query-state and mutation-id
+/// fields of the poke's first part (`head`, already as JSON fields), and
+/// the row entries, already serialized, as its `rowsPatch`.
+fn part_frame(poke_id: &str, head: Option<Vec<u8>>, entries: &[Bytes]) -> Bytes {
+    let size = 64
+        + head.as_ref().map_or(0, Vec::len)
+        + entries.iter().map(Bytes::len).sum::<usize>()
+        + entries.len();
+    let mut frame: Vec<u8> = Vec::with_capacity(size);
+    frame.extend_from_slice(b"[\"pokePart\",{\"pokeID\":");
+    let _ = serde_json::to_writer(&mut frame, poke_id);
+    if let Some(head) = head {
+        frame.extend_from_slice(&head);
+    }
+    frame.extend_from_slice(b",\"rowsPatch\":[");
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            frame.push(b',');
+        }
+        let _ = frame.write_all(entry);
+    }
+    frame.extend_from_slice(b"]}]");
+    Bytes::from(frame)
 }
 
 /// Keep one operation per row, the last one, in first-seen order.

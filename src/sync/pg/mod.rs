@@ -16,11 +16,23 @@
 //! connection that minted it, held until the last read that adopted it
 //! has finished.
 //!
+//! # One round trip, on the reads pool
+//!
+//! A read is one simple-query batch, `BEGIN … READ ONLY; SET TRANSACTION
+//! SNAPSHOT '…'; SELECT …; COMMIT`, so the rows are back after a single
+//! round trip; the columns arrive as text, cast by the `SELECT` to the
+//! forms the feed already decodes, and are decoded the same way. The
+//! rendering of the SQL, the connection I/O and the decoding all run as
+//! tasks of the runtime the storage was opened on (a small pool of
+//! threads in the server, the caller's own runtime in tests), never on
+//! the engine's thread, which only awaits the result. The storage is
+//! `Send + Sync`, so the same handle answers the engine's reads, the
+//! planner's counts from a connection task and a plain query.
+//!
 //! [`stream::PgStream`] delivers the change feed from a permanent logical
 //! slot over a replication connection and positions every write at the
 //! end of its commit record, the same scale the aliases' consistent
-//! points are on. Everything here runs on the engine's thread inside a
-//! `tokio::task::LocalSet`.
+//! points are on.
 
 pub mod catalog;
 pub mod replication;
@@ -29,15 +41,14 @@ pub mod stream;
 pub mod text;
 pub mod threads;
 
-use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
-use tokio::task::spawn_local;
-use tokio_postgres::{Client, Config, IsolationLevel, NoTls, Row};
+use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow};
 
 use super::storage::{Storage, StorageError};
 use crate::log::log_warn;
@@ -126,8 +137,8 @@ impl From<tokio_postgres::Error> for StorageError {
 /// first, waiting for the stream to pass their consistent points.
 #[derive(Default)]
 struct Aliases {
-    current: Option<Rc<Alias>>,
-    waiting: VecDeque<Rc<Alias>>,
+    current: Option<Arc<Alias>>,
+    waiting: VecDeque<Arc<Alias>>,
 }
 
 impl Aliases {
@@ -140,7 +151,8 @@ impl Aliases {
     }
 }
 
-/// Read access to a Postgres database.
+/// What every read shares: the connection settings, the pooled idle
+/// connections, the permits, the aliases and the runtime the work runs on.
 ///
 /// - `config`: how to connect; one connection is opened per read in
 ///   flight and kept for reuse in `idle`, since each read is its own
@@ -151,55 +163,69 @@ impl Aliases {
 ///   and the rows decode by.
 /// - `aliases`: the current alias and the ones waiting to become it; a
 ///   read clones the current handle and keeps it until it is done.
-/// - `rotation`: how often a fresh alias is minted.
-/// - `alive`: cleared on drop, which ends the minting task.
+/// - `rotation`: how often a fresh alias is minted, in milliseconds.
+/// - `alive`: cleared when the storage drops, which ends the minting task.
+/// - `runtime`: where the reads, the connections and the minter run.
+struct Pool {
+    config: Config,
+    catalog: Arc<Catalog>,
+    idle: Mutex<Vec<Client>>,
+    permits: Arc<Semaphore>,
+    aliases: Mutex<Aliases>,
+    rotation: AtomicU64,
+    alive: AtomicBool,
+    runtime: Handle,
+}
+
+/// Read access to a Postgres database; see the module docs.
+///
+/// - `pool`: what the reads share (cloned into every read task).
 /// - `delay`: a test hook: hold every snapshot open this long before
 ///   reading, so writes can be committed behind it deliberately.
 pub struct PgStorage {
-    config: Config,
-    catalog: Rc<Catalog>,
-    idle: RefCell<Vec<Client>>,
-    permits: Rc<Semaphore>,
-    aliases: Rc<RefCell<Aliases>>,
-    rotation: Rc<Cell<Duration>>,
-    alive: Rc<Cell<bool>>,
+    pool: Arc<Pool>,
     delay: Option<Duration>,
 }
 
 impl Drop for PgStorage {
     /// End the minting task.
     fn drop(&mut self) {
-        self.alive.set(false);
+        self.pool.alive.store(false, Ordering::Relaxed);
     }
 }
 
 impl PgStorage {
+    /// Connect on the current runtime; see [`PgStorage::connect_on`].
+    pub async fn connect(dsn: &str, catalog: Arc<Catalog>) -> Result<Self, StorageError> {
+        Self::connect_on(dsn, catalog, Handle::current()).await
+    }
+
     /// Connect once (validating `dsn`) and keep that connection for the
     /// first read; mint the first alias (it becomes current with the first
     /// [`Storage::advance`] past its point) and keep minting one every
-    /// [`PgStorage::with_rotation`] interval (250 ms by default).
-    pub async fn connect(dsn: &str, catalog: Rc<Catalog>) -> Result<Self, StorageError> {
+    /// [`PgStorage::with_rotation`] interval (250 ms by default). Every
+    /// read, connection and mint from then on runs as a task of `runtime`.
+    pub async fn connect_on(
+        dsn: &str,
+        catalog: Arc<Catalog>,
+        runtime: Handle,
+    ) -> Result<Self, StorageError> {
         let config: Config = dsn.parse()?;
-        let client = open(&config).await?;
-        let storage = PgStorage {
+        let client = open(&config, &runtime).await?;
+        let pool = Arc::new(Pool {
             config,
             catalog,
-            idle: RefCell::new(vec![client]),
-            permits: Rc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
-            aliases: Rc::new(RefCell::new(Aliases::default())),
-            rotation: Rc::new(Cell::new(Duration::from_millis(250))),
-            alive: Rc::new(Cell::new(true)),
-            delay: None,
-        };
-        let first = Rc::new(mint(&storage.config).await?);
-        storage.aliases.borrow_mut().waiting.push_back(first);
-        rotate(
-            storage.config.clone(),
-            storage.aliases.clone(),
-            storage.rotation.clone(),
-            storage.alive.clone(),
-        );
-        Ok(storage)
+            idle: Mutex::new(vec![client]),
+            permits: Arc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
+            aliases: Mutex::new(Aliases::default()),
+            rotation: AtomicU64::new(250),
+            alive: AtomicBool::new(true),
+            runtime,
+        });
+        let first = Arc::new(mint(&pool.config).await?);
+        pool.lock_aliases().waiting.push_back(first);
+        rotate(pool.clone());
+        Ok(PgStorage { pool, delay: None })
     }
 
     /// Hold every snapshot open for `delay` before reading (tests).
@@ -209,48 +235,60 @@ impl PgStorage {
     }
 
     /// Let at most `limit` reads hold a connection at once (at least one).
-    pub fn with_read_connections(mut self, limit: usize) -> Self {
-        self.permits = Rc::new(Semaphore::new(limit.max(1)));
-        self
+    pub fn with_read_connections(self, limit: usize) -> Self {
+        let pool = Arc::new(Pool {
+            config: self.pool.config.clone(),
+            catalog: self.pool.catalog.clone(),
+            idle: Mutex::new(std::mem::take(&mut *self.pool.lock_idle())),
+            permits: Arc::new(Semaphore::new(limit.max(1))),
+            aliases: Mutex::new(std::mem::take(&mut *self.pool.lock_aliases())),
+            rotation: AtomicU64::new(self.pool.rotation.load(Ordering::Relaxed)),
+            alive: AtomicBool::new(true),
+            runtime: self.pool.runtime.clone(),
+        });
+        rotate(pool.clone());
+        let delay = self.delay;
+        drop(self);
+        PgStorage { pool, delay }
     }
 
     /// Mint a fresh alias every `every`.
     pub fn with_rotation(self, every: Duration) -> Self {
-        self.rotation.set(every);
+        self.pool
+            .rotation
+            .store(every.as_millis().max(1) as u64, Ordering::Relaxed);
         self
     }
 
     /// The current alias's consistent point, for inspection; `None` until
     /// the stream has passed the first alias.
     pub fn alias_position(&self) -> Option<Lsn> {
-        self.aliases
-            .borrow()
+        self.pool
+            .lock_aliases()
             .current
             .as_ref()
             .map(|alias| alias.lsn)
     }
 
-    /// The current alias, or an error while the stream has not passed
-    /// the first one yet (the runtime parks the read and asks again).
-    fn current_alias(&self) -> Result<Rc<Alias>, StorageError> {
-        self.aliases.borrow().current.clone().ok_or_else(|| {
-            StorageError("no snapshot at or below the stream's position yet".to_owned())
+    /// Run one plain statement (no snapshot, autocommit) on a pooled
+    /// connection and return its rows as text; for the few reads that are
+    /// not the engine's (a client's mutation ids at connect time).
+    pub async fn simple_query(&self, sql: &str) -> Result<Vec<SimpleQueryRow>, StorageError> {
+        let pool = self.pool.clone();
+        let sql = sql.to_owned();
+        run_on(&self.pool.runtime, async move {
+            let _permit = pool.permit().await?;
+            let client = pool.acquire().await?;
+            let outcome = client.simple_query(&sql).await;
+            match outcome {
+                Ok(messages) => {
+                    pool.release(client);
+                    Ok(rows_of(messages))
+                }
+                Err(error) => Err(error.into()),
+            }
         })
-    }
-
-    /// An idle connection, or a new one.
-    async fn acquire(&self) -> Result<Client, StorageError> {
-        let idle = self.idle.borrow_mut().pop();
-        match idle {
-            Some(client) => Ok(client),
-            None => open(&self.config).await,
-        }
-    }
-
-    /// Return a connection after a successful read; a failed read's
-    /// connection is dropped instead, in case it is broken.
-    fn release(&self, client: Client) {
-        self.idle.borrow_mut().push(client);
+        .await
     }
 }
 
@@ -259,46 +297,58 @@ impl Storage for PgStorage {
     /// alias's exported snapshot; the `SELECT` runs against that snapshot
     /// and is positioned at the alias's consistent point.
     async fn select(&self, query: &SingleTableReadQuery) -> Result<Snapshot, StorageError> {
-        let table = self.catalog.table(query.table.as_str()).ok_or_else(|| {
-            StorageError(format!("table `{}` is not in the catalog", query.table))
-        })?;
-        let alias = self.current_alias()?;
-        let _permit = self
-            .permits
-            .acquire()
-            .await
-            .map_err(|_| StorageError("the read pool is closed".to_owned()))?;
-        let mut client = self.acquire().await?;
-        let result = read_snapshot(&mut client, table, query, &alias, self.delay).await;
-        if result.is_ok() {
-            self.release(client);
-        }
-        result
+        self.select_shared(Arc::new(query.clone())).await
+    }
+
+    /// The read as a task of the pool, the shared query moved into it.
+    async fn select_shared(
+        &self,
+        query: Arc<SingleTableReadQuery>,
+    ) -> Result<Snapshot, StorageError> {
+        let pool = self.pool.clone();
+        let delay = self.delay;
+        run_on(&self.pool.runtime, async move {
+            let table = pool.table(&query)?;
+            let alias = pool.current_alias()?;
+            let sql = sql::select_sql(&query, table);
+            let rows = pool.read(&alias, &sql, delay).await?;
+            let rows = rows
+                .iter()
+                .map(|row| decode_row(row, table))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Snapshot {
+                rows,
+                at: alias.lsn,
+            })
+        })
+        .await
     }
 
     /// `SELECT count(*)` over at most `cap` matching rows, on the same
     /// snapshot a read would use.
     async fn count(&self, query: &SingleTableReadQuery, cap: u64) -> Result<u64, StorageError> {
-        let table = self.catalog.table(query.table.as_str()).ok_or_else(|| {
-            StorageError(format!("table `{}` is not in the catalog", query.table))
-        })?;
-        let alias = self.current_alias()?;
-        let _permit = self
-            .permits
-            .acquire()
-            .await
-            .map_err(|_| StorageError("the read pool is closed".to_owned()))?;
-        let mut client = self.acquire().await?;
-        let result = count_snapshot(&mut client, table, query, &alias, cap).await;
-        if result.is_ok() {
-            self.release(client);
-        }
-        result
+        let pool = self.pool.clone();
+        let query = query.clone();
+        run_on(&self.pool.runtime, async move {
+            let table = pool.table(&query)?;
+            let alias = pool.current_alias()?;
+            let sql = sql::count_sql(&query, table, cap);
+            let rows = pool.read(&alias, &sql, None).await?;
+            let text = rows
+                .first()
+                .and_then(|row| row.get(0))
+                .ok_or_else(|| StorageError("the count returned no row".to_owned()))?;
+            let count: i64 = text
+                .parse()
+                .map_err(|_| StorageError(format!("`{text}` is not a count")))?;
+            Ok(count.max(0) as u64)
+        })
+        .await
     }
 
     /// Flip to the newest minted alias the stream has passed.
     fn advance(&self, feed: Lsn) {
-        self.aliases.borrow_mut().advance(feed);
+        self.pool.lock_aliases().advance(feed);
     }
 
     /// The current alias's consistent point; zero while there is none.
@@ -307,26 +357,137 @@ impl Storage for PgStorage {
     }
 }
 
-/// Keep minting aliases every `rotation` until `alive` clears, pausing
-/// while enough are already waiting for the stream; a failed mint is
-/// reported and tried again at the next tick.
-fn rotate(
-    config: Config,
-    aliases: Rc<RefCell<Aliases>>,
-    rotation: Rc<Cell<Duration>>,
-    alive: Rc<Cell<bool>>,
-) {
-    spawn_local(async move {
-        while alive.get() {
-            tokio::time::sleep(rotation.get()).await;
-            if !alive.get() {
+impl Pool {
+    /// The aliases, read through a poisoned lock (the state is only ever
+    /// changed whole).
+    fn lock_aliases(&self) -> std::sync::MutexGuard<'_, Aliases> {
+        self.aliases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The idle connections, likewise.
+    fn lock_idle(&self) -> std::sync::MutexGuard<'_, Vec<Client>> {
+        self.idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The catalog table of `query`.
+    fn table(&self, query: &SingleTableReadQuery) -> Result<&DbTable, StorageError> {
+        self.catalog
+            .table(query.table.as_str())
+            .ok_or_else(|| StorageError(format!("table `{}` is not in the catalog", query.table)))
+    }
+
+    /// The current alias, or an error while the stream has not passed
+    /// the first one yet (the runtime parks the read and asks again).
+    fn current_alias(&self) -> Result<Arc<Alias>, StorageError> {
+        self.lock_aliases().current.clone().ok_or_else(|| {
+            StorageError("no snapshot at or below the stream's position yet".to_owned())
+        })
+    }
+
+    /// A permit to hold a connection.
+    async fn permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StorageError> {
+        self.permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| StorageError("the read pool is closed".to_owned()))
+    }
+
+    /// An idle connection, or a new one.
+    async fn acquire(&self) -> Result<Client, StorageError> {
+        let idle = self.lock_idle().pop();
+        match idle {
+            Some(client) => Ok(client),
+            None => open(&self.config, &self.runtime).await,
+        }
+    }
+
+    /// Return a connection after a successful statement; a failed one's
+    /// connection is dropped instead, in case it is broken or mid-abort.
+    fn release(&self, client: Client) {
+        self.lock_idle().push(client);
+    }
+
+    /// Run one positioned statement as a single simple-query batch: the
+    /// read-only transaction opened, the alias's exported snapshot
+    /// imported as its first statement, `sql` run against it, and the
+    /// transaction committed, all in one round trip; the rows of `sql`
+    /// come back as text.
+    async fn read(
+        &self,
+        alias: &Alias,
+        sql: &str,
+        delay: Option<Duration>,
+    ) -> Result<Vec<SimpleQueryRow>, StorageError> {
+        let _permit = self.permit().await?;
+        let client = self.acquire().await?;
+        let mut batch = format!(
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '{}';",
+            alias.snapshot.replace('\'', "''")
+        );
+        if let Some(delay) = delay {
+            batch.push_str(&format!(" SELECT pg_sleep({});", delay.as_secs_f64()));
+        }
+        batch.push(' ');
+        batch.push_str(sql);
+        batch.push_str("; COMMIT");
+        match client.simple_query(&batch).await {
+            Ok(messages) => {
+                self.release(client);
+                Ok(rows_of(messages))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+/// Run `work` as a task of `runtime` and wait for its result here.
+async fn run_on<T: Send + 'static>(
+    runtime: &Handle,
+    work: impl std::future::Future<Output = Result<T, StorageError>> + Send + 'static,
+) -> Result<T, StorageError> {
+    match runtime.spawn(work).await {
+        Ok(outcome) => outcome,
+        Err(error) => Err(StorageError(format!("the read task ended: {error}"))),
+    }
+}
+
+/// The data rows of the last statement of a simple-query batch that
+/// returned any (the positioned `SELECT`; a `pg_sleep` before it returns a
+/// row of its own, and the `COMMIT` after it returns none).
+fn rows_of(messages: Vec<SimpleQueryMessage>) -> Vec<SimpleQueryRow> {
+    let mut rows = Vec::new();
+    for message in messages {
+        match message {
+            SimpleQueryMessage::RowDescription(_) => rows.clear(),
+            SimpleQueryMessage::Row(row) => rows.push(row),
+            _ => {}
+        }
+    }
+    rows
+}
+
+/// Keep minting aliases every rotation interval until the storage drops,
+/// pausing while enough are already waiting for the stream; a failed mint
+/// is reported and tried again at the next tick.
+fn rotate(pool: Arc<Pool>) {
+    let runtime = pool.runtime.clone();
+    runtime.spawn(async move {
+        while pool.alive.load(Ordering::Relaxed) {
+            let every = Duration::from_millis(pool.rotation.load(Ordering::Relaxed));
+            tokio::time::sleep(every).await;
+            if !pool.alive.load(Ordering::Relaxed) {
                 break;
             }
-            if aliases.borrow().waiting.len() >= WAITING_ALIASES {
+            if pool.lock_aliases().waiting.len() >= WAITING_ALIASES {
                 continue;
             }
-            match mint(&config).await {
-                Ok(fresh) => aliases.borrow_mut().waiting.push_back(Rc::new(fresh)),
+            match mint(&pool.config).await {
+                Ok(fresh) => pool.lock_aliases().waiting.push_back(Arc::new(fresh)),
                 Err(error) => {
                     log_warn!("snapshot minting failed, keeping the current alias: {error}")
                 }
@@ -335,84 +496,15 @@ fn rotate(
     });
 }
 
-/// Open one connection and drive it on the local task set.
-async fn open(config: &Config) -> Result<Client, StorageError> {
+/// Open one connection and drive it as a task of `runtime`.
+async fn open(config: &Config, runtime: &Handle) -> Result<Client, StorageError> {
     let (client, connection) = config.connect(NoTls).await?;
-    spawn_local(async move {
+    runtime.spawn(async move {
         if let Err(error) = connection.await {
             log_warn!("postgres connection ended: {error}");
         }
     });
     Ok(client)
-}
-
-/// Run one positioned read on `client`: import the alias's exported
-/// snapshot as the transaction's first statement, run the `SELECT`
-/// against it, and position the result at the alias's consistent point.
-async fn read_snapshot(
-    client: &mut Client,
-    table: &DbTable,
-    query: &SingleTableReadQuery,
-    alias: &Alias,
-    delay: Option<Duration>,
-) -> Result<Snapshot, StorageError> {
-    let transaction = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::RepeatableRead)
-        .read_only(true)
-        .start()
-        .await?;
-    transaction
-        .batch_execute(&format!(
-            "SET TRANSACTION SNAPSHOT '{}'",
-            alias.snapshot.replace('\'', "''")
-        ))
-        .await?;
-    if let Some(delay) = delay {
-        transaction
-            .execute("SELECT pg_sleep($1)", &[&delay.as_secs_f64()])
-            .await?;
-    }
-    let rows = transaction
-        .query(&sql::select_sql(query, table), &[])
-        .await?;
-    transaction.commit().await?;
-    let rows = rows
-        .iter()
-        .map(|row| decode_row(row, table))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Snapshot {
-        rows,
-        at: alias.lsn,
-    })
-}
-
-/// The capped count of `query`'s rows on `alias`'s snapshot.
-async fn count_snapshot(
-    client: &mut Client,
-    table: &DbTable,
-    query: &SingleTableReadQuery,
-    alias: &Alias,
-    cap: u64,
-) -> Result<u64, StorageError> {
-    let transaction = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::RepeatableRead)
-        .read_only(true)
-        .start()
-        .await?;
-    transaction
-        .batch_execute(&format!(
-            "SET TRANSACTION SNAPSHOT '{}'",
-            alias.snapshot.replace('\'', "''")
-        ))
-        .await?;
-    let row = transaction
-        .query_one(&sql::count_sql(query, table, cap), &[])
-        .await?;
-    transaction.commit().await?;
-    let count: i64 = row.get(0);
-    Ok(count.max(0) as u64)
 }
 
 /// Parse Postgres's `X/Y`.
@@ -421,12 +513,20 @@ pub fn parse_lsn(text: &str) -> Result<Lsn, StorageError> {
 }
 
 /// One result row, in [`sql::select_columns`] order, as the engine's
-/// (identity, image) pair.
-fn decode_row(row: &Row, table: &DbTable) -> Result<(DataFrameKey, DataFrameRow), StorageError> {
-    let mut data: HashMap<ColumnName, Value> = HashMap::new();
-    for (index, column) in sql::select_columns(table).into_iter().enumerate() {
+/// (identity, image) pair; the names come from the catalog, so no name is
+/// allocated per row.
+fn decode_row(
+    row: &SimpleQueryRow,
+    table: &DbTable,
+) -> Result<(DataFrameKey, DataFrameRow), StorageError> {
+    let columns = sql::select_columns(table);
+    let mut data: HashMap<ColumnName, Value> = HashMap::with_capacity(columns.len());
+    for (index, column) in columns.into_iter().enumerate() {
         let declared = &table.columns[column].r#type;
-        let value = decode_value(row, index, declared)?;
+        let value = match row.get(index) {
+            Some(text) => decode_text(text, declared)?,
+            None => Value::Null,
+        };
         data.insert(column.clone(), value);
     }
     let key = DataFrameKey::new(
@@ -435,31 +535,38 @@ fn decode_row(row: &Row, table: &DbTable) -> Result<(DataFrameKey, DataFrameRow)
             .iter()
             .map(|column| (column.clone(), data[column].clone())),
     );
-    Ok((key, DataFrameRow { data }))
+    Ok((key, DataFrameRow::from(data)))
 }
 
-/// One column of a result row, decoded by the cast its declared type was
-/// read with (list and map columns are read as their text form).
-fn decode_value(row: &Row, index: usize, declared: &ValueType) -> Result<Value, StorageError> {
-    let value = match declared {
-        ValueType::Int => row.try_get::<_, Option<i64>>(index)?.map(Value::Int),
-        ValueType::Float => row.try_get::<_, Option<f64>>(index)?.map(Value::Float),
-        ValueType::String | ValueType::Json | ValueType::Map(_, _) => {
-            row.try_get::<_, Option<String>>(index)?.map(Value::String)
+/// One column of a result row in its text form, decoded by the cast its
+/// declared type was read with ([`sql::select_expr`]): a time column
+/// arrives as its epoch milliseconds, a JSON, list or map column as JSON
+/// text, the rest in Postgres's text form for the cast type.
+fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> {
+    let unreadable = || StorageError(format!("`{text}` is not a {declared:?}"));
+    Ok(match declared {
+        ValueType::Int | ValueType::Timestamp => {
+            Value::Int(text.parse().map_err(|_| unreadable())?)
         }
-        ValueType::List(inner) => row
-            .try_get::<_, Option<String>>(index)?
-            .map(|text| text::json_list(&text, inner)),
-        ValueType::Timestamp => row.try_get::<_, Option<i64>>(index)?.map(Value::Int),
-        ValueType::Bool => row.try_get::<_, Option<bool>>(index)?.map(Value::Bool),
-        ValueType::Date => row
-            .try_get::<_, Option<chrono::NaiveDate>>(index)?
-            .map(Value::Date),
-        ValueType::Datetime => row
-            .try_get::<_, Option<chrono::NaiveDateTime>>(index)?
-            .map(Value::Datetime),
-    };
-    Ok(value.unwrap_or(Value::Null))
+        ValueType::Float => Value::Float(text.parse().map_err(|_| unreadable())?),
+        ValueType::String | ValueType::Json | ValueType::Map(_, _) => {
+            Value::String(text.to_owned())
+        }
+        ValueType::List(inner) => text::json_list(text, inner),
+        ValueType::Bool => Value::Bool(match text {
+            "t" | "true" => true,
+            "f" | "false" => false,
+            _ => return Err(unreadable()),
+        }),
+        ValueType::Date => Value::Date(
+            chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| unreadable())?,
+        ),
+        ValueType::Datetime => Value::Datetime(
+            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S"))
+                .map_err(|_| unreadable())?,
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -472,7 +579,7 @@ mod tests {
     #[test]
     fn aliases_flip_only_behind_the_feed() {
         let alias = |lsn: u64| {
-            Rc::new(Alias {
+            Arc::new(Alias {
                 snapshot: format!("snap-{lsn}"),
                 lsn: Lsn(lsn),
                 _minter: ReplicationConnection::detached(),
@@ -492,5 +599,39 @@ mod tests {
         aliases.advance(Lsn(30));
         assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(30)));
         assert!(aliases.waiting.is_empty());
+    }
+
+    /// The text forms the casts produce decode to the engine's values.
+    #[test]
+    fn text_columns_decode_by_declared_type() {
+        assert_eq!(decode_text("42", &ValueType::Int).unwrap(), Value::Int(42));
+        assert_eq!(
+            decode_text("1700000000123", &ValueType::Timestamp).unwrap(),
+            Value::Int(1_700_000_000_123)
+        );
+        assert_eq!(
+            decode_text("1.5", &ValueType::Float).unwrap(),
+            Value::Float(1.5)
+        );
+        assert!(
+            matches!(decode_text("NaN", &ValueType::Float).unwrap(), Value::Float(f) if f.is_nan())
+        );
+        assert_eq!(
+            decode_text("t", &ValueType::Bool).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            decode_text("[1,2]", &ValueType::List(Box::new(ValueType::Int))).unwrap(),
+            Value::List(vec![Value::Int(1), Value::Int(2)])
+        );
+        assert_eq!(
+            decode_text("2026-09-11", &ValueType::Date).unwrap(),
+            Value::Date(chrono::NaiveDate::from_ymd_opt(2026, 9, 11).unwrap())
+        );
+        assert!(matches!(
+            decode_text("2026-09-11 10:00:00.5", &ValueType::Datetime).unwrap(),
+            Value::Datetime(_)
+        ));
+        assert!(decode_text("x", &ValueType::Int).is_err());
     }
 }

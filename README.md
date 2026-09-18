@@ -54,16 +54,17 @@ every later delta continues from.
 | Shared frames: one frame per table, rows tagged with holders as compact ids (`RowId`, `SubId`); held mirror; twin registration served from the frame through a query-keyed index | ✅ done | `src/ivm/frames.rs`, `src/ivm/registry.rs` |
 | `ORDER BY` / `LIMIT` windows: compound order, the page of `L` to the client over a buffer of `2L`, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
 | In-place condition edits: a literal `IN` swapped inside its disjuncts, or a set-valued `IN` (`Value::Set`) gaining/losing one member in O(1) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
-| Join tree: `LEFT`, `RIGHT` and `INNER` edges at any depth, existence tests placed anywhere in a node's filter (`EXISTS` inside `OR`), set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns; a child row is shown only under a shown parent; a LEFT child's `ORDER BY` / `LIMIT` is a window **per parent row** (`related` with a limit) | ✅ done | `src/ivm/multi.rs` |
-| Join planning: before a query registers, every node that would be read whole is counted (capped at the limit); an INNER edge is turned around when its child is too big and its parent fits, and a query neither side of which fits is refused with the reason; `XYNE_SYNC_JOIN_LIMIT`, `XYNE_SYNC_JOIN_PREFERRED_SIDE` | ✅ done | `src/client/plan.rs` |
-| Client-addressed output: every subscription belongs to a `ClientId`; one step's operations are folded per client and row (`ClientUpdate { client, table, op, targets }`), so a row image travels to a client once | ✅ done | `src/ivm/update.rs` |
+| Join tree: one vector of edges, each with its **driver** (`Main` or `Sub`) and `is_inner`, so LEFT, RIGHT and the two inner forms (driven from the sub, driven from the main) at any depth; existence tests placed anywhere in a node's filter (`EXISTS` inside `OR`, bound to the set when the sub drives, a per-row gate on the match count when the main does); set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns; a value index on every join column so a crossing costs the matches, not the part; a driven child's `ORDER BY` / `LIMIT` is a window **per parent row** (`related` with a limit) | ✅ done | `src/ivm/multi.rs` |
+| Join planning: every node that would be read whole is counted, in one concurrent batch capped at the limit; a fixed point picks each inner edge's driver (the side that fits, the preferred side when both do; a paged main never drives), the root never moves, and a query with a side nothing can bound is refused with the reason; decisions are cached by tree (`XYNE_SYNC_JOIN_LIMIT`, `XYNE_SYNC_JOIN_PREFERRED_SIDE`, `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE`), and run on the connection's own task | ✅ done | `src/client/plan.rs` |
+| Client-addressed output: every subscription belongs to a `ClientId`; one step's operations are folded per client and row (`ClientUpdate { client, table, op, targets }`), so a row image travels to a client once; images and keys are shared handles (`Arc`), so nothing on the path copies a row | ✅ done | `src/ivm/update.rs`, `src/model/frame.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
 | Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; the runtime holds the one position and brings every read up to it before landing; no read ever blocks the stream; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
 | In-memory storage answering at once, honoring `ORDER BY` + `LIMIT`; per-table routing between memory and PostgreSQL (`XYNE_SYNC_MEMORY_TABLES`) | ✅ done | `src/sync/storage.rs`, `src/sync/sources.rs` |
 | **PostgreSQL**: reads from the exported snapshot of a rotating temporary replication slot, flipped forward only once the feed has passed it; a streaming `pgoutput` change feed over a replication connection with heartbeat progress marks; live tests and a bench scenario against a real server | ✅ done | `src/sync/pg/` |
 | Routing counters + benchmark harness | ✅ done | `src/ivm/stats.rs`, `src/bin/bench.rs` |
 | **xyne-spaces coverage**: the dashboard's 283 synced queries (and the ACL predicates added to them) rebuilt as tests on a catalog generated from the application's schema; `IS NULL`, `EXISTS` inside `OR` and `whereExists` closed, four expressiveness gaps left and pinned | ✅ tests, ⏳ gaps | `tests/xyne_spaces_queries/` |
-| **Client side** speaking Zero's sync protocol (v51, the `@rocicorp/zero` 1.9 client): connect handshake, ping/pong and liveness, desired queries through the app server's query endpoint, pokes per client group, mutations through its mutate endpoint, `lastMutationID` off the app's clients table; it owns no engine and no database connection, reaching both only through [`sync::Service`]'s channels; verified from the xyne-spaces UI with three users (roles, resource access, channels, threads, reactions, tickets) and load-tested at 200 subscribers up to 75 mutations/s | ✅ done (no history across restarts) | `src/client/`, `src/sync/pg/threads.rs`, [docs/live-verification-2026-09-15.md](docs/live-verification-2026-09-15.md) |
+| **Client side** speaking Zero's sync protocol (v51, the `@rocicorp/zero` 1.9 client): connect handshake, ping/pong and liveness, desired queries through the app server's query endpoint, pokes per client group, mutations through its mutate endpoint, `lastMutationID` off the app's clients table; it owns no engine and no database connection, reaching both only through [`sync::Service`]'s channels; verified from the xyne-spaces UI with three users (roles, resource access, channels, threads, reactions, tickets) and load-tested (see below) | ✅ done (no history across restarts) | `src/client/`, `src/sync/pg/threads.rs`, [docs/live-verification-2026-09-15.md](docs/live-verification-2026-09-15.md) |
+| **The pipeline as threads**: the feed thread decodes and hands the engine one transaction per commit; the engine thread routes and nothing else; a reads pool runs the storage (one round trip per read); `XYNE_SYNC_GROUP_THREADS` group threads keep the views and build pokes, each row serialized once per flush and frames assembled as bytes; connections translate and plan their own queries; per-stage latency histograms at `/stats` | ✅ done | `src/client/mod.rs`, `src/stats.rs`, [docs/pipeline-2026-09-18.md](docs/pipeline-2026-09-18.md) |
 | Batching of one write's narrowed reads | ⏳ pending | paper §13 |
 | Parser `JOIN` syntax | ⏳ pending | multi-table queries are built programmatically |
 | Table-sharded multithreading | ⏳ pending | paper §10.3; engine is single-threaded by design |
@@ -347,24 +348,33 @@ dashboard (`@rocicorp/zero` 1.9, sync protocol 51) connects to it unchanged.
 
 Everything in `src/client/` is about clients: their protocol, their ASTs,
 their application server, their groups' views. It owns no engine, no storage
-and no database connection. It drives the engine through the two channels of
+and no database connection. It drives the engine through the channels of
 [`sync::Service`] — commands in (register, unregister), events out (deltas,
-the subscription a registration became, hydration, landings, stream
-progress) — which `sync/pg/threads.rs` wires to PostgreSQL. That seam is why
-the two halves can sit on one thread today (every value the engine holds is
-thread-bound) and on two tomorrow without either side changing.
+the subscription a registration became, hydration, landings, commits) —
+which `sync/pg/threads.rs` wires to PostgreSQL.
 
-- **Threads.** A *feed thread* holds the replication connection, forwards raw
-  `pgoutput` events and emits a heartbeat at an interval so the engine's
-  position moves while nothing is written. The *engine thread* owns the
-  runtime, decodes the events, runs every storage read as a task on its own
-  local set (nothing blocks; a read lands when it returns), keeps every client
-  group's view and builds the pokes. Every value the engine holds is
-  thread-bound, so this is the only thread that touches writes, queries or
-  deltas; it hands connections finished frames. The *server threads* (a
-  multi-threaded tokio runtime) run the WebSocket connections: the handshake,
-  the message loop, the liveness rules, and the HTTP calls to the application
-  server for query ASTs and mutations.
+- **Threads.** Five stages, each on its own core budget, joined by channels
+  that carry shared handles rather than copies
+  ([docs/pipeline-2026-09-18.md](docs/pipeline-2026-09-18.md) has the design
+  and the measurements). The *feed thread* holds the replication connection,
+  decodes the `pgoutput` events into rows and hands the engine **one
+  transaction per commit**, with a heartbeat so the position moves while
+  nothing is written. The *engine thread* owns the runtime and the engine and
+  does nothing but route: no decoding, no SQL, no JSON. The *reads pool*
+  (`XYNE_SYNC_READ_THREADS`) renders the SQL, runs every storage read as one
+  simple-query round trip on a pooled connection, decodes the rows, answers
+  the planner's counts and the connect-time reads, and mints the snapshots.
+  The *group threads* (`XYNE_SYNC_GROUP_THREADS`, each owning the client
+  groups that hash to it; the engine routes events by the shard in the client
+  id) keep the views and build the pokes: a thread takes everything sent since
+  its last wakeup, applies it, and pokes each group once, every row serialized
+  once per flush and a group's frame assembled from those bytes. The *server
+  threads* (a multi-threaded tokio runtime) run the WebSocket connections: the
+  handshake, the message loop, the liveness rules, the HTTP calls to the
+  application server, the translation and planning of every query, and the
+  writes to the socket (a poke's frames fed together, one flush). Every value
+  crosses these threads by handle: `Value` is `Send`, and a row image is one
+  allocation shared by the frame, every subscription and every poke.
 - **A connection.** `GET <base>/sync/v51/connect?clientID&clientGroupID&…`
   with the first message base64-encoded in `Sec-WebSocket-Protocol` (echoed
   back, as the browser requires) or sent as the first frame. The server
@@ -387,20 +397,22 @@ thread-bound) and on two tomorrow without either side changing.
   Subqueries the client marks as permission checks register but their rows are not
   shipped, as the reference server withholds them.
 - **Planning.** Before a translated query registers, `client/plan.rs` decides
-  which side of each join is read whole. A node nothing drives (the root
-  with no `RIGHT` or `INNER` child, a `RIGHT` or `INNER` child with none of
-  its own) holds all its rows; the planner asks the engine side to count
-  each such node, no further than `XYNE_SYNC_JOIN_LIMIT` + 1 (100 000 by
-  default, so a big table is never scanned whole). A node with a page holds
-  its window and is never counted. When an `INNER` child is over the limit
-  and the root has no page, the edge is **turned around**: the child becomes
-  the root, the parent its `INNER` child, so the parent is read whole and
-  the child narrowed to the parent's keys — the same rows shown either way,
-  the hidden parts following their nodes. `XYNE_SYNC_JOIN_PREFERRED_SIDE`
-  says which side to count first (`child`, the side that drives unless told
-  otherwise, or `parent`). A query neither side of which fits is refused
-  with a `transformError` naming the sides, and a `LEFT` or `RIGHT` query
-  whose driving side is over the limit is refused the same way.
+  which side of each inner edge drives it, on the connection's own task. A
+  node nothing drives is read whole; the planner counts every such node in
+  one concurrent batch on the reads pool, no further than
+  `XYNE_SYNC_JOIN_LIMIT` + 1 (100 000 by default, so a big table is never
+  scanned whole), a node with a page being bounded by its window and a
+  driven node by its driver. A fixed point then settles the inner edges: an
+  edge with one bounded side is driven from it, one with two takes
+  `XYNE_SYNC_JOIN_PREFERRED_SIDE` (`child`, the client's `whereExists` as
+  translated, or `parent`), a paged main never drives (its window would be
+  gated after the fact), and an edge left with no bounded side refuses the
+  query with a `transformError` naming the sides. The root never moves:
+  the decision is the `driver` field of the edge, so part paths, hidden
+  parts and `EXISTS` leaves stay where the translation put them, and a
+  nested `EXISTS` is planned like one at the root. Decisions are cached by
+  tree for `XYNE_SYNC_PLAN_TTL_MS` (60 s), at most `XYNE_SYNC_PLAN_CACHE`
+  (10 000) of them, so the counts run once per distinct tree.
 - **Related windows.** A `related` subquery with `orderBy`/`limit` is the
   best *n* rows per parent row, as the client means it: the engine registers one
   windowed part per referenced parent value, so every window is maintained
@@ -409,9 +421,12 @@ thread-bound) and on two tomorrow without either side changing.
 - **Pokes.** Per client group `client/groups.rs` keeps, for every row shipped, the
   subscription parts holding it, so a row is `del`ed only when its last
   holder lets go and a row several queries share ships once. A poke goes out
-  per committed transaction (a mutation's rows and its `lastMutationID`,
-  read off the application's `xyne_0.clients` table, travel together), per
-  landed read, and per query change; `gotQueriesPatch` follows a query once
+  per flush of the group thread: idle, that is per committed transaction (a
+  mutation's rows and its `lastMutationID`, read off the application's
+  `xyne_0.clients` table and carried inside the same transaction's commit
+  event, travel together); under load one poke covers every transaction that
+  arrived since the last flush, which keeps the frame count per connection
+  bounded as the write rate climbs. `gotQueriesPatch` follows a query once
   every part of its tree is live. Versions are the client's lexicographic cookies.
   The server keeps no history: a client reconnecting with the group's
   current cookie continues; with any other (a restart, changes it missed) it
@@ -441,11 +456,27 @@ thread-bound) and on two tomorrow without either side changing.
   Postgres connection at once; the rest queue in the server instead of at
   the server's `max_connections`. A burst of two hundred connections opening
   at once used to exhaust a default Postgres and park the reads it refused.
+  A read is one simple-query batch (`BEGIN … READ ONLY; SET TRANSACTION
+  SNAPSHOT; SELECT; COMMIT`), so its rows are back after one round trip, and
+  a read narrowed to one join value renders that value instead of the whole
+  set it belongs to.
+- **Readiness.** `GET /health` answers `503` until the engine's position
+  has covered the storage's first snapshot and `200` from then on; a
+  connection that arrives earlier waits for that moment before any of its
+  queries is planned, so a client never sees a refusal for having been
+  first.
+- **Measurements.** `GET /stats` serves the server's own clock on every
+  stage (feed to engine, the engine's step, engine to groups, the flush,
+  groups to socket, and end to end inside the server, as p50/p90/p99 in
+  microseconds), the counters (transactions, pokes, frames, rows serialized
+  and rows shared within a flush) and the engine's routing counters;
+  `?reset=1` zeroes the histograms after reading, which the load harness
+  does at the start of its steady phase.
 
 Configuration is by `XYNE_SYNC_*` variables (see [.env.example](.env.example);
 the names a reference-server deployment sets are accepted for the database
 and endpoint URLs). `XYNE_SYNC_LOG=debug` writes a line per poke per client
-group from the engine thread and costs throughput; keep it for bring-up. Not
+group and costs throughput; keep it for bring-up. Not
 yet: history across reconnects (every reconnect after a missed change is a
 fresh sync, and a Zero client that is told so drops its local database, unsent
 mutations included, so a restart while people are typing loses their
@@ -507,24 +538,30 @@ one thread; scenarios 2 to 4 use a bench-local in-memory storage double,
 scenario 1 registers against an empty store so frames fill from writes alone,
 scenario 5 runs against PostgreSQL 15 on the same machine over the streaming
 feed, scenario 6 runs three xyne-spaces query shapes on the real catalog over
-synthetic data; raw output with peak memory in
-[paper/bench-2026-09-15-order-limit.txt](paper/bench-2026-09-15-order-limit.txt)
-(the whole run; earlier runs beside it), analysis in paper §9. Scenarios 1
-to 5 below quote the 2026-09-14 run; on 2026-09-15 the same machine ran
-every scenario about 40% slower, the 2026-09-14 code included when rebuilt
-and rerun beside the current one, so the day's numbers are comparable among
-themselves and the relative results hold):
+synthetic data; raw output in
+[paper/bench-2026-09-18-pipeline.txt](paper/bench-2026-09-18-pipeline.txt),
+with the same day's run of the tree before the pipeline rework beside it as
+[paper/bench-2026-09-18-before-pipeline.txt](paper/bench-2026-09-18-before-pipeline.txt),
+earlier runs beside them, analysis in paper §9 and the before/after table in
+[docs/pipeline-2026-09-18.md](docs/pipeline-2026-09-18.md) §10. Scenarios 1
+to 4 and 6 quote the 2026-09-18 run, whose whole-run time is 10.4 s against
+52.9 s for the tree before it on the same machine; scenario 5 quotes the
+same day's run over PostgreSQL,
+[paper/bench-2026-09-18-postgres.txt](paper/bench-2026-09-18-postgres.txt).
+Timings moved by up to 40% between days on this shared
+workstation, so numbers from one day compare among themselves and the
+relative results hold):
 
 | Scenario | Result |
 | --- | --- |
-| Routing, 100 → 10 000 subscriptions | a write touches only the 3 to 4 conditions it satisfies (one probe per column) while the table carries 67 to 85; routing alone costs 0.9 / 2.0 / 13.0 µs per write at 100 / 1 000 / 10 000 subscriptions, delivery included 3.0 / 13.5 / 107.5 µs for an insert, and what grows is the impacted count (1.2 → 92 subscriptions per write), not the lookup |
-| Registration, 100 → 10 000 subscriptions | 2.7 / 2.2 / 1.4 µs, flat: the twin lookup is one probe of the query-keyed index; peak memory of the whole run 0.51 GB, 0.76 GB with scenario 6 |
-| Twin registration (400-row snapshot) | 547 µs from the shared frame vs 1 517 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
-| Window, `ORDER BY … LIMIT 50` over 100 000 rows | the client receives the page: 50 rows at registration over a buffer of 100; non-qualifying writes rejected inside the index at 0.9 µs (12 operations for 10 000 writes); under targeted writes, every delete on the page, the page moves on 9 192 of 10 000 writes (two operations each, the row leaving and the buffered one taking its place) with ten storage refills, and the cost is those refill scans of the storage double (10 × ~90 ms across 10 000 writes) |
-| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | identical subscriptions share one tree, so a ticket insert costs 117 µs for all 1 000 with 1.8 set edits per write instead of 52.5; the remaining cost is delivery, one operation per subscriber |
-| xyne-spaces shapes (1 000 users, 500 channels, 50 000 conversations, 100 000 messages, 10 000 tickets on 20 boards; 7 000 subscriptions in 6 020 trees) | `browsableChannels` (`EXISTS` inside `OR`, participants attached) registers in 14.8 ms and ships the 2 250 rows it asks for (about 108 channels and their participants per user); `conversationMessages` under the channel-access chain (three `INNER` edges, the last inside an `OR`) registers in 1.2 ms with three reads; the board view (`IS NULL` twice, two `LEFT` edges, a page of 50 by `createdAt DESC, id ASC`) is a 0.5 ms twin copy of 150 rows. A message insert routes in 13.6 µs over 7 000 subscriptions (73 000 writes/s); a membership change costs 1.9 ms, moving 10.7 set members, fetching 5.3 uncovered channels and fanning its participant row out to the 230 subscriptions showing that channel (a public channel is shown by all 1 000 users); an in-place ticket update 56 µs: beyond the buffer's frontier it is rejected inside the index, behind the page it changes nothing the client sees, on the page it is one `Add` per subscriber of its board (5.2 client updates per write) |
-| Over PostgreSQL (`LEFT JOIN`, 1 000 users, 2 000 tickets), streaming feed | a registration costs its two reads and their landing and nothing else: 3.0 ms end to end (1.8 ms in storage, 1.1 ms in the runtime), a twin 369 µs; 5 000 inserts committed in transactions of 100 stream from commit to delivery at 5 544 writes/s, split between the engine (107 µs per write for 1 001 subscribers, client grouping included), 339 sequential narrowed reads (one per newly referenced user, 229 ms) and 5 ms of feed and decoding; a registration whose snapshot is held open for 300 ms while 500 writes commit and are delivered behind it lands at once with 41 of its 148 rows brought up to the newer image, none dropped, and frames equal to the tables |
-| The server over the wire (`scripts/load-protocol.mjs`: clients holding the chat screen's eight queries each, updates fanning out to every one of them) | 4 000 clients hold **32 000 subscriptions**, registering at **2 000 to 3 300 queries a second**; 200 clients take **200 updates a second — 40 000 client rows a second — with every row delivered and a 99th percentile under 81 ms**, and the engine thread saturates at about 400 updates a second (80 000 rows a second native, 61 000 pinned), losing nothing. Pinned to 2, 4 or 8 CPUs the figures are identical, which is what a one-thread engine predicts. Through the application server the ceiling is its own, about 95 mutations a second. Details in [docs/load-2026-09-16.md](docs/load-2026-09-16.md), raw results in [paper/load-2026-09-16/](paper/load-2026-09-16/) |
+| Routing, 100 → 10 000 subscriptions | a write touches only the 3 to 4 conditions it satisfies (one probe per column) while the table carries 67 to 85; routing alone costs 0.9 / 1.7 / 3.7 µs per write at 100 / 1 000 / 10 000 subscriptions, delivery included 1.3 / 4.3 / 27.9 µs for an insert, and what grows is the impacted count (1.2 → 92 subscriptions per write), not the lookup |
+| Registration, 100 → 10 000 subscriptions | 7.4 / 2.2 / 1.5 µs, flat: the twin lookup is one probe of the query-keyed index; peak memory of the whole run 1.40 GB on 2026-09-18 (1.85 GB on 2026-09-15 for the same scenarios; 0.51 GB without scenario 6) |
+| Twin registration (400-row snapshot) | 123 µs from the shared frame vs 400 µs from (in-memory) storage; 1 000 twins hold 400 rows once |
+| Window, `ORDER BY … LIMIT 50` over 100 000 rows | the client receives the page: 50 rows at registration over a buffer of 100; non-qualifying writes rejected inside the index at 0.21 µs (12 operations for 10 000 writes); under targeted writes, every delete on the page, the page moves on 9 192 of 10 000 writes (two operations each, the row leaving and the buffered one taking its place) with ten storage refills, 28 µs per write with those refill scans of the storage double included |
+| `LEFT JOIN`, 1 000 identical + 100 distinct subscriptions | identical subscriptions share one tree, so a ticket insert costs 36 µs for all 1 000 with 1.8 set edits per write instead of 52.5, and an update of a user row that 722 join operations depend on 203 µs; the remaining cost is delivery, one operation per subscriber |
+| xyne-spaces shapes (1 000 users, 500 channels, 50 000 conversations, 100 000 messages, 10 000 tickets on 20 boards; 7 000 subscriptions in 6 020 trees) | `browsableChannels` (`EXISTS` inside `OR`, participants attached) registers in 2.4 ms and ships the 2 250 rows it asks for (about 108 channels and their participants per user); `conversationMessages` under the channel-access chain (three `INNER` edges, the last inside an `OR`) registers in 0.36 ms with three reads; the board view (`IS NULL` twice, two `LEFT` edges, a page of 50 by `createdAt DESC, id ASC`) is an 89 µs twin copy of 150 rows. A message insert routes in 11.3 µs over 7 000 subscriptions (88 000 writes/s); a membership change costs 0.29 ms, moving 10.7 set members, fetching 5.3 uncovered channels and fanning its participant row out to the 230 subscriptions showing that channel (a public channel is shown by all 1 000 users); an in-place ticket update 4.8 µs: beyond the buffer's frontier it is rejected inside the index, behind the page it changes nothing the client sees, on the page it is one `Add` per subscriber of its board (5.2 client updates per write) |
+| Over PostgreSQL (`LEFT JOIN`, 1 000 users, 2 000 tickets), streaming feed | a registration costs its two reads and their landing and nothing else: 2.4 ms end to end (1.8 ms in storage, 0.4 ms in the runtime), a twin 79 µs; 5 000 inserts committed in transactions of 100 stream from commit to delivery in 162 ms, 26 748 writes/s (5 544 on 2026-09-14), split between the engine (21.6 µs per write for 1 001 subscribers, client grouping included; 107 before), 339 narrowed reads through the reads pool (one per newly referenced user, 41 ms; 229 ms when sequential) and 6 ms of feed and decoding; a registration whose snapshot is held open for 300 ms while 500 writes commit and are delivered behind it lands at once with 41 of its 148 rows brought up to the newer image, none dropped, and frames equal to the tables |
+| The server over the wire (`scripts/load-protocol.mjs`: clients holding the chat screen's eight queries each, writes committed straight into PostgreSQL) | 200 clients, 1 600 subscriptions, hydrated in 0.2 to 0.3 s. One channel, every update to all 200 clients: **1 000 updates a second — 200 000 client rows a second — every row delivered, 28 ms median and 34 ms at the 99th percentile, at 1.2 cores**, the generator's limit on this machine, not the server's (400 a second cost 65% of one core with a 99th percentile of 68 ms; on 2026-09-16 that rate was the saturation point with a median of 1.2 s). Twenty channels: **7 400 updates a second, all delivered, at 1.7 cores** (4 000 a second at 67% of a core with a 99th percentile of 50 ms). Inside the server a transaction takes 1.5 ms from the feed to the last frame written at low rates (engine 26 to 40 µs per update where one tree shows the channel, 130 to 210 where ten do; 1.3 to 1.8 µs per client row on the group thread); the 24 ms floor a client sees is the harness's `psql` per batch, PostgreSQL's decoding and the Node client. Pinned to 2, 4 and 8 CPUs the figures agree below 2 000 updates a second and separate above it (2 cores at 103%, 8 at 76% for 4 000 a second). Earlier: 4 000 clients held 32 000 subscriptions at about 120 KB each (2026-09-16), and through the application server the ceiling is its own, about 95 mutations a second. Details in [docs/pipeline-2026-09-18.md](docs/pipeline-2026-09-18.md) §10 and [docs/load-2026-09-16.md](docs/load-2026-09-16.md), raw results in [paper/load-2026-09-18/](paper/load-2026-09-18/) and [paper/load-2026-09-16/](paper/load-2026-09-16/) |
 
 ### Using the engine programmatically
 
@@ -642,16 +679,20 @@ paper/
   bench-2026-09-12-row-currency.txt, bench-2026-09-11-async-storage.txt,
   bench-2026-09-08-list-edges.txt, bench-2026-09-07-before-frontier.txt   earlier runs, kept for the record
 docs/
+  pipeline-2026-09-18.md   the pipeline as threads: design, the join model, the hot-path list, the measurements
+  load-2026-09-16.md       the load test before the pipeline change, for the record
+  live-verification-2026-09-15.md   the UI verification with three users
   pg-lsn-cdc-lab.md        hands-on lab: LSNs, MVCC snapshots, the CDC handoff
 src/
   lib.rs                   crate docs, module map, roadmap
   main.rs                  demo binary: SQL in, routed operations + counters out
   model/
-    value.rs               Value / ValueType, manual Eq+Hash (floats, maps)
-    schema.rs              Catalog / DbTable / DbColumn, TableName + ColumnName newtypes
-    query.rs               SingleTableReadQuery / WriteQuery, Where / Condition, SubId, ClientId
-    frame.rs               DataFrameKey / DataFrameRow / DataFrameOperation + the shared TableFrame
+    value.rs               Value / ValueType, manual Eq+Hash (floats, maps); SharedSet behind a lock, so values are Send
+    schema.rs              Catalog / DbTable / DbColumn, TableName + ColumnName newtypes over shared strings
+    query.rs               SingleTableReadQuery / WriteQuery, Where / Condition, Join { driver, is_inner }, SubId, ClientId
+    frame.rs               DataFrameKey / DataFrameRow (shared, immutable) / DataFrameOperation + the shared TableFrame with its value indexes
     position.rs            Lsn and Snapshot: where a write or a read's rows sit, as WAL locations
+    ids.rs                 IdMap / IdSet: the engine's integer-keyed maps on a one-multiply hasher
   ivm/
     mod.rs                 SingleTableIVM: the routing core (analyze + incremental_update)
     engine.rs              Fetch requests and the Engine trait the runtime drives
@@ -661,7 +702,7 @@ src/
     index.rs               TableIndex: shared DNF disjunct counters, boundaries, in-place edits
     columns.rs             per-column value index: equality, inequality and range lookups
     window.rs              ORDER BY / LIMIT: compound order, the page over a doubled buffer, boundary publishing, evict/refill
-    multi.rs               MultiTableIVM: the join tree (LEFT / RIGHT / INNER edges, the gate, EXISTS binding) over the single engine
+    multi.rs               MultiTableIVM: the join tree (edges by driver, the gates, EXISTS binding, driven windows) over the single engine
     predicate.rs           Where-tree evaluation, NULL semantics
     stats.rs               IvmStats counters + per-write diffing
   sync/
@@ -669,25 +710,26 @@ src/
     sources.rs             Sources: per-table routing between memory and Postgres (XYNE_SYNC_MEMORY_TABLES)
     runtime.rs             Runtime: the single owner, the one position, bringing results up to it, SyncStats
     local.rs               Local: the synchronous driver
-    service.rs             Service: the async command loop (tokio LocalSet) and the event stream it answers on
-    pg/mod.rs              PgStorage: positioned REPEATABLE READ snapshots from exported-snapshot aliases
+    service.rs             Service: the async command loop (tokio LocalSet), the feed's transactions, the event streams per consumer
+    pg/mod.rs              PgStorage: positioned REPEATABLE READ snapshots from exported-snapshot aliases, one round trip per read, on the reads pool
     pg/replication.rs      a minimal replication-protocol connection (mints the aliases)
     pg/sql.rs              model to SQL rendering
     pg/stream.rs           PgStream: the streaming pgoutput feed (Transport + Feed halves), positioned writes, heartbeat progress marks
     pg/catalog.rs          the catalog read from information_schema, typed the way the protocol types Postgres
     pg/text.rs             the text forms of times, JSON arrays and array literals
-    pg/threads.rs          the engine side over Postgres: the feed thread, the storage, the Service, the decoder
+    pg/threads.rs          the engine side over Postgres: the feed thread (decoding), the storage on the pool, the Service
   client/
-    mod.rs                 the threads and their wiring
+    mod.rs                 the threads and their wiring: feed, engine, reads pool, group threads, server
     config.rs              XYNE_SYNC_* configuration
     protocol.rs            Zero's sync protocol v51: messages, handshake header, cookies
     ast.rs                 the client's query AST to the engine's query tree
-    plan.rs                which side of a join is read whole: counts, turning an INNER edge, refusing
-    wire.rs                rows and keys as the wire carries them
+    plan.rs                the driver of every inner edge: one batch of counts, a fixed point, refusal, the plan cache
+    wire.rs                rows and keys as the wire carries them, written straight into bytes
     backend.rs             the query and mutate endpoints of the application server
-    groups.rs              client groups, held rows, pokes: a consumer of the service's events
-    connection.rs          one WebSocket connection: handshake, message loop, liveness
+    groups.rs              the group threads: client groups, held rows, drain-and-flush, pokes serialized once
+    connection.rs          one WebSocket connection: handshake, message loop, liveness, translate + plan, the writer
   log.rs                   a leveled stderr log
+  stats.rs                 per-stage latency histograms and counters, served at /stats
   parser/
     mod.rs                 lexer + recursive-descent parser, schema-aware against model::Catalog
   bin/
@@ -695,7 +737,7 @@ src/
     bench.rs               benchmark harness
 tests/
   ivm_scenarios.rs         single-table routing, windows, twin sharing, per-client grouping (assertable spec)
-  multi_table_scenarios.rs join reference/fetch/prune, self-join, nested, RIGHT and INNER edges, EXISTS inside OR
+  multi_table_scenarios.rs join reference/fetch/prune, self-join, nested, RIGHT and both INNER forms, EXISTS inside OR, per-parent windows
   sync_interleaving.rs     reads out while writes stream: bring-up from the floor, parking, refill, post-order
   pg_live.rs               live Postgres: snapshot held open behind writes, async service with a mirrored table
   xyne_spaces_queries/     the xyne-spaces registry (283 queries) and ACL shapes on a catalog generated
@@ -747,6 +789,16 @@ they are discussed rather than discovered:
 8. **One heartbeat per poll**: the feed's progress mark costs a tiny
    committed transaction per poll (or per interval under the service); a
    server that forbids `pg_logical_emit_message` needs another mark.
+9. **Values are `Send` through a lock, not a copy**: `SharedSet` is an
+   `Arc<RwLock<..>>` so a row, a query or a delta can cross a thread; the
+   engine itself stays single-threaded (its index counters are `Rc`). Row
+   images and keys are immutable `Arc` maps (a key carries its hash), and
+   names are `Arc<str>`: a clone anywhere is a reference count. `Join` has a
+   `driver` and `is_inner` in place of three vectors; an `EXISTS` leaf names
+   the node's i-th inner edge, whichever side drives it.
+10. **A paged node never drives an inner edge**: a gate on a windowed node
+    would show fewer rows than the page; such a query is driven from the
+    other side or refused. A sub with a page may still drive, as before.
 
 ---
 

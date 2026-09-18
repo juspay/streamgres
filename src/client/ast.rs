@@ -1,7 +1,8 @@
 //! Zero's query AST, as the application server returns it, translated
 //! into the engine's query tree: `related` edges become LEFT joins,
-//! `EXISTS` subqueries in the filter become INNER joins with an `EXISTS`
-//! leaf in their place, a keyset `start` becomes the `WHERE` it means, the
+//! `EXISTS` subqueries in the filter become INNER joins driven from the
+//! sub (the planner may flip them) with an `EXISTS` leaf in their place, a
+//! keyset `start` becomes the `WHERE` it means, the
 //! root's `limit` becomes its window and a `related` node's `limit` its
 //! window per parent row (the engine's driven windows), the primary key is
 //! appended to the ordering when absent so pages are deterministic, and
@@ -131,8 +132,15 @@ fn node(
     let table = catalog
         .table(&ast.table)
         .ok_or_else(|| format!("unknown table `{}`", ast.table))?;
+    let part = QueryPart::try_new(&path).ok_or_else(|| {
+        format!(
+            "the query nests deeper than {} joins under `{}`",
+            QueryPart::MAX_DEPTH,
+            ast.table
+        )
+    })?;
     if concealed {
-        hidden.insert(QueryPart(path.clone()));
+        hidden.insert(part);
     }
     let mut inner: Vec<&CorrelatedSubquery> = Vec::new();
     let filter = match &ast.filter {
@@ -176,31 +184,27 @@ fn node(
     };
     let main_table = SingleTableReadQuery::new(table.name.clone(), normalize(filter), order, limit);
     let left_count = ast.related.len();
-    let mut left_joins = Vec::with_capacity(left_count);
+    let mut joins = Vec::with_capacity(left_count + inner.len());
     for (index, sub) in ast.related.iter().enumerate() {
         let mut child_path = path.clone();
         child_path.push(index);
-        left_joins.push(edge(sub, child_path, concealed, catalog, hidden)?);
+        joins.push(edge(sub, child_path, concealed, false, catalog, hidden)?);
     }
-    let mut inner_joins = Vec::with_capacity(inner.len());
     for (offset, sub) in inner.iter().enumerate() {
         let mut child_path = path.clone();
         child_path.push(left_count + offset);
-        inner_joins.push(edge(sub, child_path, concealed, catalog, hidden)?);
+        joins.push(edge(sub, child_path, concealed, true, catalog, hidden)?);
     }
-    Ok(MultiTableReadQuery {
-        main_table,
-        left_joins,
-        right_joins: Vec::new(),
-        inner_joins,
-    })
+    Ok(MultiTableReadQuery::new(main_table, joins))
 }
 
-/// One join edge and the subtree under it.
+/// One join edge and the subtree under it: a LEFT edge for `related`, an
+/// INNER edge driven from the sub for `EXISTS`.
 fn edge(
     sub: &CorrelatedSubquery,
     child_path: Vec<usize>,
     concealed_parent: bool,
+    is_inner: bool,
     catalog: &Catalog,
     hidden: &mut HashSet<QueryPart>,
 ) -> Result<Join, String> {
@@ -215,11 +219,11 @@ fn edge(
     }
     let concealed = concealed_parent || sub.system.as_deref() == Some("permissions");
     let child = node(&sub.subquery, child_path, concealed, catalog, hidden)?;
-    Ok(Join::new(
-        child,
-        parent_column.as_str(),
-        child_column.as_str(),
-    ))
+    Ok(if is_inner {
+        Join::inner(child, parent_column.as_str(), child_column.as_str())
+    } else {
+        Join::left(child, parent_column.as_str(), child_column.as_str())
+    })
 }
 
 /// A predicate node as a `Where`; `EXISTS` subqueries are collected into
@@ -524,26 +528,28 @@ mod tests {
             2,
             "the primary key is appended"
         );
-        assert_eq!(root.left_joins.len(), 1);
-        assert_eq!(root.inner_joins.len(), 1);
+        assert_eq!(root.joins.len(), 2);
+        assert!(!root.joins[0].is_inner, "related is a LEFT edge");
+        assert!(root.joins[1].is_inner, "EXISTS is an INNER edge");
         assert_eq!(
-            root.left_joins[0].sub.main_table.limit, 1,
+            root.joins[1].driver,
+            crate::model::Driver::Sub,
+            "as translated, the sub drives an EXISTS"
+        );
+        assert_eq!(
+            root.joins[0].sub.main_table.limit, 1,
             "a related limit is kept, as a window per parent row"
         );
-        assert_eq!(
-            root.inner_joins[0].sub.inner_joins.len(),
-            1,
-            "nested EXISTS"
-        );
+        assert_eq!(root.joins[1].sub.joins.len(), 1, "nested EXISTS");
         assert!(
-            translated.hidden.contains(&QueryPart(vec![1])),
+            translated.hidden.contains(&QueryPart::join(1)),
             "the permission part is hidden"
         );
         assert!(
-            translated.hidden.contains(&QueryPart(vec![1, 0])),
+            translated.hidden.contains(&QueryPart::new(&[1, 0])),
             "and its subtree"
         );
-        assert!(!translated.hidden.contains(&QueryPart(vec![0])));
+        assert!(!translated.hidden.contains(&QueryPart::join(0)));
         let rendered = format!("{:?}", root.main_table.filter);
         assert!(
             rendered.contains("EXISTS"),

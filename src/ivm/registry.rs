@@ -178,8 +178,9 @@ impl SingleTableIVM {
 
     /// Remove a subscription: its routing-index entries and its tag on
     /// every shared row it holds — walked off its held index, not by
-    /// scanning the table — dropping rows nobody holds anymore. A table
-    /// index that routes nothing afterwards is dropped too; a read not yet
+    /// scanning the table — dropping rows nobody holds anymore (the frame
+    /// itself stays, with the value indexes asked of it). A table index
+    /// that routes nothing afterwards is dropped too; a read not yet
     /// taken by the runtime passes to a twin waiting on it or is
     /// withdrawn, and a read already out lands for the twins waiting on
     /// it or as a no-op. Unknown subscriptions are a no-op.
@@ -230,13 +231,6 @@ impl SingleTableIVM {
                 }
                 frame.drop_if_unheld(id);
             }
-        }
-        if self
-            .frames
-            .get(&query.table)
-            .is_some_and(|frame| frame.is_empty())
-        {
-            self.frames.remove(&query.table);
         }
     }
 

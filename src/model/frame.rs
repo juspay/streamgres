@@ -19,8 +19,11 @@
 //! applies as insert-or-replace.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
+use super::ids::{IdMap, IdSet};
 use super::query::SubId;
 use super::schema::ColumnName;
 use super::value::{Value, unordered_map_hash};
@@ -36,40 +39,94 @@ use super::value::{Value, unordered_map_hash};
 /// per wire operation, or — for a query id — split one shared row into
 /// many identities and undo the sharing.
 ///
-/// Used as a `HashMap` key, hence the manual `Hash` (a `HashMap` field has
-/// order-independent equality, so the hash must be order-independent too —
-/// see `unordered_map_hash` in `model::value`).
-#[derive(Debug, Clone, PartialEq)]
+/// The values are immutable once built and shared: a clone is a reference
+/// count, so a key travels to every subscription and client of a row
+/// without being copied. The order-independent hash of the map (a
+/// `HashMap` field has order-independent equality, so the hash must be
+/// too — see `unordered_map_hash` in `model::value`) is computed once at
+/// construction and carried, so hashing a key is hashing one integer.
+#[derive(Clone)]
 pub struct DataFrameKey {
-    pub pkey_value: HashMap<ColumnName, Value>,
+    pub pkey_value: Arc<HashMap<ColumnName, Value>>,
+    hash: u64,
+}
+
+impl PartialEq for DataFrameKey {
+    /// Equal primary-key maps; the carried hash rejects most unequal
+    /// pairs without touching the maps.
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pkey_value, &other.pkey_value)
+            || (self.hash == other.hash && self.pkey_value == other.pkey_value)
+    }
 }
 
 impl Eq for DataFrameKey {}
 
 impl Hash for DataFrameKey {
-    /// Hashes the primary-key map order-independently so equal keys hash
-    /// identically regardless of `HashMap` iteration order.
+    /// The hash computed at construction.
     fn hash<H: Hasher>(&self, state: &mut H) {
-        unordered_map_hash(&self.pkey_value).hash(state);
+        state.write_u64(self.hash);
+    }
+}
+
+impl fmt::Debug for DataFrameKey {
+    /// The primary-key map alone.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DataFrameKey")
+            .field("pkey_value", &*self.pkey_value)
+            .finish()
+    }
+}
+
+impl From<HashMap<ColumnName, Value>> for DataFrameKey {
+    /// A key over a finished primary-key map.
+    fn from(pkey_value: HashMap<ColumnName, Value>) -> Self {
+        DataFrameKey {
+            hash: unordered_map_hash(&pkey_value),
+            pkey_value: Arc::new(pkey_value),
+        }
     }
 }
 
 /// One full row image. v1 has no column projection
 /// (`SingleTableReadQuery` selects whole rows), so this is the whole row.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// The image is immutable once built and shared: a clone is a reference
+/// count. A row decoded from the feed or from storage is allocated once
+/// and that one allocation is what the frame holds and what every
+/// subscription, client and poke of the row refers to.
+#[derive(Clone, PartialEq)]
 pub struct DataFrameRow {
-    pub data: HashMap<ColumnName, Value>,
+    pub data: Arc<HashMap<ColumnName, Value>>,
 }
 
 impl DataFrameRow {
     /// Builds a row image from `(column, value)` pairs.
     pub fn new(pairs: impl IntoIterator<Item = (impl Into<ColumnName>, Value)>) -> Self {
-        DataFrameRow {
-            data: pairs
+        DataFrameRow::from(
+            pairs
                 .into_iter()
                 .map(|(column, value)| (column.into(), value))
-                .collect(),
+                .collect::<HashMap<_, _>>(),
+        )
+    }
+}
+
+impl From<HashMap<ColumnName, Value>> for DataFrameRow {
+    /// An image over a finished column map.
+    fn from(data: HashMap<ColumnName, Value>) -> Self {
+        DataFrameRow {
+            data: Arc::new(data),
         }
+    }
+}
+
+impl fmt::Debug for DataFrameRow {
+    /// The column map alone.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DataFrameRow")
+            .field("data", &*self.data)
+            .finish()
     }
 }
 
@@ -117,11 +174,15 @@ impl SharedRow {
 /// rows tagged with its id, and reaches the client only as operations.
 /// Every (subscription, row) pair is stored as two small integers (a tag
 /// on the row, an entry in the subscription's held index), never as a
-/// copy of the key or the subscription's name.
+/// copy of the key or the subscription's name. Columns the engine asks
+/// for ([`TableFrame::index_column`], the join columns) are indexed by
+/// value, so the rows carrying one join value are found without a scan;
+/// the indexes follow every row in, every image change and every row out.
 #[derive(Default)]
 pub struct TableFrame {
-    ids: HashMap<DataFrameKey, RowId>,
-    rows: HashMap<RowId, SharedRow>,
+    ids: IdMap<DataFrameKey, RowId>,
+    rows: IdMap<RowId, SharedRow>,
+    indexes: HashMap<ColumnName, HashMap<Value, IdSet<RowId>>>,
     next_id: u64,
 }
 
@@ -141,7 +202,9 @@ impl TableFrame {
         self.rows.get(&id)
     }
 
-    /// The shared row under `id`, mutably.
+    /// The shared row under `id`, mutably, for its subscriber tags; an
+    /// image changes through [`TableFrame::replace_image`], which keeps
+    /// the value indexes in step.
     pub fn row_mut(&mut self, id: RowId) -> Option<&mut SharedRow> {
         self.rows.get_mut(&id)
     }
@@ -158,12 +221,14 @@ impl TableFrame {
             None => {
                 let id = RowId(self.next_id);
                 self.next_id += 1;
+                let data = data();
                 self.ids.insert(key.clone(), id);
+                self.index_row(id, &data);
                 self.rows.insert(
                     id,
                     SharedRow {
                         key: key.clone(),
-                        data: data(),
+                        data,
                         subscribers: BTreeSet::new(),
                     },
                 );
@@ -171,6 +236,25 @@ impl TableFrame {
             }
         };
         (id, self.rows.get_mut(&id).expect("inserted or found above"))
+    }
+
+    /// Give the row under `id` the image `data`, moving it between value
+    /// buckets where an indexed column changed; the same image (the same
+    /// allocation) changes nothing. Reports whether the row exists.
+    pub fn replace_image(&mut self, id: RowId, data: DataFrameRow) -> bool {
+        let Some(row) = self.rows.get(&id) else {
+            return false;
+        };
+        if Arc::ptr_eq(&row.data.data, &data.data) {
+            return true;
+        }
+        let old = row.data.clone();
+        self.unindex_row(id, &old);
+        self.index_row(id, &data);
+        if let Some(row) = self.rows.get_mut(&id) {
+            row.data = data;
+        }
+        true
     }
 
     /// Drop the row under `id` if no subscription holds it; reports
@@ -182,8 +266,60 @@ impl TableFrame {
             .is_some_and(|row| row.subscribers.is_empty());
         if unheld && let Some(row) = self.rows.remove(&id) {
             self.ids.remove(&row.key);
+            self.unindex_row(id, &row.data);
         }
         unheld
+    }
+
+    /// Index `column` by value from now on (and over the rows already
+    /// held); asking again for an indexed column changes nothing.
+    pub fn index_column(&mut self, column: &ColumnName) {
+        if self.indexes.contains_key(column) {
+            return;
+        }
+        let mut by_value: HashMap<Value, IdSet<RowId>> = HashMap::new();
+        for (id, row) in &self.rows {
+            if let Some(value) = row.data.data.get(column) {
+                by_value.entry(value.clone()).or_default().insert(*id);
+            }
+        }
+        self.indexes.insert(column.clone(), by_value);
+    }
+
+    /// The ids of the rows whose `column` is `value`, from the column's
+    /// index; `None` when the column is not indexed (the caller scans).
+    pub fn rows_with(&self, column: &str, value: &Value) -> Option<Vec<RowId>> {
+        let by_value = self.indexes.get(column)?;
+        Some(
+            by_value
+                .get(value)
+                .map(|ids| ids.iter().copied().collect())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// File `id` under `data`'s value in every indexed column.
+    fn index_row(&mut self, id: RowId, data: &DataFrameRow) {
+        for (column, by_value) in self.indexes.iter_mut() {
+            if let Some(value) = data.data.get(column) {
+                by_value.entry(value.clone()).or_default().insert(id);
+            }
+        }
+    }
+
+    /// Unfile `id` from `data`'s value in every indexed column.
+    fn unindex_row(&mut self, id: RowId, data: &DataFrameRow) {
+        for (column, by_value) in self.indexes.iter_mut() {
+            let Some(value) = data.data.get(column) else {
+                continue;
+            };
+            if let Some(ids) = by_value.get_mut(value) {
+                ids.remove(&id);
+                if ids.is_empty() {
+                    by_value.remove(value);
+                }
+            }
+        }
     }
 
     /// Whether the frame holds no rows.
@@ -200,12 +336,12 @@ impl TableFrame {
 impl DataFrameKey {
     /// Builds a row identity from `(primary-key column, value)` pairs.
     pub fn new(pkey_value: impl IntoIterator<Item = (impl Into<ColumnName>, Value)>) -> Self {
-        DataFrameKey {
-            pkey_value: pkey_value
+        DataFrameKey::from(
+            pkey_value
                 .into_iter()
                 .map(|(column, value)| (column.into(), value))
-                .collect(),
-        }
+                .collect::<HashMap<_, _>>(),
+        )
     }
 }
 

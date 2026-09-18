@@ -14,16 +14,38 @@ use std::collections::HashMap;
 
 use crate::model::{ColumnName, ComparisonOperator, Condition, Value, Where};
 
-/// Evaluate a full `Where` tree against a row image.
+/// Evaluate a full `Where` tree against a row image; an `EXISTS` leaf is
+/// never true here (see [`evaluate_with`] for a caller that can answer
+/// it).
 ///
 /// `AND` and `OR` short-circuit, so `evaluated` counts conditions actually
 /// looked at, not the size of the tree. `AND(vec![])` is `true`,
 /// `OR(vec![])` is `false`.
 pub fn evaluate(filter: &Where, row: &HashMap<ColumnName, Value>, evaluated: &mut u64) -> bool {
+    evaluate_with(filter, row, evaluated, &|_| false)
+}
+
+/// [`evaluate`] with the `EXISTS` leaves answered by `exists` (the join
+/// layer answers them from its per-edge counts when it decides whether a
+/// row is shown); every other leaf evaluates as usual.
+pub fn evaluate_with(
+    filter: &Where,
+    row: &HashMap<ColumnName, Value>,
+    evaluated: &mut u64,
+    exists: &dyn Fn(&Condition) -> bool,
+) -> bool {
     match filter {
+        Where::Condition(c) if c.comparison_operator == ComparisonOperator::EXISTS => {
+            *evaluated += 1;
+            exists(c)
+        }
         Where::Condition(c) => eval_condition(c, row, evaluated),
-        Where::AND(children) => children.iter().all(|child| evaluate(child, row, evaluated)),
-        Where::OR(children) => children.iter().any(|child| evaluate(child, row, evaluated)),
+        Where::AND(children) => children
+            .iter()
+            .all(|child| evaluate_with(child, row, evaluated, exists)),
+        Where::OR(children) => children
+            .iter()
+            .any(|child| evaluate_with(child, row, evaluated, exists)),
     }
 }
 

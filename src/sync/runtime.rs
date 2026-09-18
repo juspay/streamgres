@@ -30,7 +30,7 @@ use std::fmt;
 
 use crate::ivm::{ClientUpdate, Engine, Fetch, FetchId, evaluate, order_rows};
 use crate::model::{
-    ClientId, DataFrameKey, DataFrameRow, Lsn, Snapshot, SubId, TableName, WriteQuery,
+    ClientId, DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
 };
 
 /// What one runtime step produced: deltas to deliver, and reads the
@@ -110,7 +110,7 @@ impl fmt::Display for SyncStats {
 /// - `stats`: the runtime's counters.
 pub struct Runtime<E: Engine> {
     engine: E,
-    in_flight: HashMap<FetchId, InFlight>,
+    in_flight: IdMap<FetchId, InFlight>,
     recent: VecDeque<Delivered>,
     position: Lsn,
     floor: Lsn,
@@ -122,7 +122,7 @@ impl<E: Engine> Runtime<E> {
     pub fn new(engine: E) -> Self {
         Runtime {
             engine,
-            in_flight: HashMap::new(),
+            in_flight: IdMap::default(),
             recent: VecDeque::new(),
             position: Lsn(0),
             floor: Lsn(0),
@@ -144,6 +144,11 @@ impl<E: Engine> Runtime<E> {
     /// The runtime's counters.
     pub fn stats(&self) -> &SyncStats {
         &self.stats
+    }
+
+    /// The engine's routing counters.
+    pub fn engine_stats(&self) -> &crate::ivm::IvmStats {
+        self.engine.stats()
     }
 
     /// Where the engine is: the location of the last write routed or

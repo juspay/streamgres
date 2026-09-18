@@ -14,21 +14,25 @@
 //! - [`position`] — where a write, a read, or a frame row sits in the
 //!   source's history: one WAL location ([`Lsn`]; [`Snapshot`] for a
 //!   read's result)
+//! - [`ids`] — the maps and sets keyed by the engine's own small ids,
+//!   on a hasher that costs one multiply
 //!
 //! Structure changes here ripple through the whole engine (these types are
 //! index keys in `crate::ivm`), so keep field changes deliberate and discuss
 //! them in an issue first — see "Design notes" in the README.
 
 pub mod frame;
+pub mod ids;
 pub mod position;
 pub mod query;
 pub mod schema;
 pub mod value;
 
 pub use frame::{DataFrameKey, DataFrameOperation, DataFrameRow};
+pub use ids::{IdMap, IdSet};
 pub use position::{Lsn, Snapshot};
 pub use query::{
-    ClientId, ComparisonOperator, Condition, DeleteQuery, Disjunct, InsertQuery, Join,
+    ClientId, ComparisonOperator, Condition, DeleteQuery, Disjunct, Driver, InsertQuery, Join,
     MultiTableReadQuery, Order, OrderBy, SingleTableReadQuery, SubId, UpdateQuery, Where,
     WriteQuery,
 };

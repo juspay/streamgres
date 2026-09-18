@@ -2,9 +2,9 @@
 //! store: a subscription is named before anything is said about it, a
 //! registration served from a tree the engine already holds needs no
 //! storage read and still reports itself complete, and one committed
-//! transaction reaches the consumer as one batch of deltas whatever else
-//! is happening. These are the properties the client side builds its
-//! pokes on; each was a live defect before it was pinned here.
+//! transaction reaches the consumer as one event carrying every delta of
+//! it whatever else is happening. These are the properties the client side
+//! builds its pokes on; each was a live defect before it was pinned here.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::task::{LocalSet, spawn_local};
 use xyne_sync::ivm::MultiTableIVM;
 use xyne_sync::model::*;
-use xyne_sync::sync::{Command, Event, Lsn, MemoryStorage, Service, SubId};
+use xyne_sync::sync::{Command, Event, Lsn, MemoryStorage, Service, SubId, Transaction};
 
 /// The one client every subscription here belongs to.
 const CLIENT: ClientId = ClientId(1);
@@ -36,12 +36,10 @@ fn pkey(id: i64) -> HashMap<ColumnName, Value> {
 
 /// One full ticket row: every column the table declares.
 fn ticket(id: i64, status: &str) -> DataFrameRow {
-    DataFrameRow {
-        data: HashMap::from([
-            ("id".into(), Value::Int(id)),
-            ("status".into(), Value::String(status.to_owned())),
-        ]),
-    }
+    DataFrameRow::from(HashMap::from([
+        ("id".into(), Value::Int(id)),
+        ("status".into(), Value::String(status.to_owned())),
+    ]))
 }
 
 /// An insert of `ticket(id, status)`.
@@ -94,26 +92,32 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
         .iter()
         .map(|event| match event {
             Event::Registered { .. } => "registered",
-            Event::Updates(_) => "updates",
             Event::Hydrated(_) => "hydrated",
-            Event::Landed => "landed",
-            Event::Moved { .. } => "moved",
-            Event::Counted { .. } => "counted",
+            Event::Landed { .. } => "landed",
+            Event::Committed { .. } => "committed",
         })
         .collect()
 }
 
-/// The rows of every `Updates` event, as ids.
+/// The deltas an event carries.
+fn updates_of(event: &Event) -> &[xyne_sync::ivm::ClientUpdate] {
+    match event {
+        Event::Registered { updates, .. }
+        | Event::Landed { updates }
+        | Event::Committed { updates, .. } => updates,
+        Event::Hydrated(_) => &[],
+    }
+}
+
+/// The rows added by every event, as ids.
 fn ids(events: &[Event]) -> Vec<i64> {
     let mut out = Vec::new();
     for event in events {
-        if let Event::Updates(updates) = event {
-            for update in updates {
-                if let DataFrameOperation::Add(key, _) = &update.op
-                    && let Some(Value::Int(id)) = key.pkey_value.get(&ColumnName::from("id"))
-                {
-                    out.push(*id);
-                }
+        for update in updates_of(event) {
+            if let DataFrameOperation::Add(key, _) = &update.op
+                && let Some(Value::Int(id)) = key.pkey_value.get(&ColumnName::from("id"))
+            {
+                out.push(*id);
             }
         }
     }
@@ -124,7 +128,7 @@ fn ids(events: &[Event]) -> Vec<i64> {
 /// The subscription a registration became, and the token it answers.
 fn registered(events: &[Event]) -> Option<(u64, SubId)> {
     events.iter().find_map(|event| match event {
-        Event::Registered { token, sub } => Some((*token, *sub)),
+        Event::Registered { token, sub, .. } => Some((*token, *sub)),
         _ => None,
     })
 }
@@ -193,7 +197,9 @@ fn a_twin_registration_completes_without_a_read() {
             .expect("send");
         let first = drain(&mut events).await;
         assert!(
-            first.iter().any(|event| matches!(event, Event::Landed)),
+            first
+                .iter()
+                .any(|event| matches!(event, Event::Landed { .. })),
             "the first registration reads storage, got {:?}",
             shapes(&first)
         );
@@ -220,17 +226,20 @@ fn a_twin_registration_completes_without_a_read() {
             shapes(&twin)
         );
         assert!(
-            !twin.iter().any(|event| matches!(event, Event::Landed)),
+            !twin
+                .iter()
+                .any(|event| matches!(event, Event::Landed { .. })),
             "the twin needs no storage read, got {:?}",
             shapes(&twin)
         );
     });
 }
 
-/// One committed transaction reaches the consumer as one batch of
-/// deltas: the driver routes every write of a commit in a single
-/// synchronous step, so nothing a client is told can be cut in the middle
-/// of a commit, and the rows of that commit travel together.
+/// One committed transaction reaches the consumer as one event carrying
+/// every delta of it: the driver routes every write of a commit in a
+/// single synchronous step, so nothing a client is told can be cut in the
+/// middle of a commit, and the rows of that commit travel together with
+/// its position.
 #[test]
 fn a_commit_arrives_as_one_batch() {
     block_on(async {
@@ -248,21 +257,25 @@ fn a_commit_arrives_as_one_batch() {
         drain(&mut events).await;
 
         commands
-            .send(Command::Commit {
-                writes: vec![insert(10, "OPEN"), insert(11, "OPEN"), insert(12, "DONE")],
-                at: Lsn(100),
-            })
+            .send(Command::Transaction(Transaction::new(
+                vec![insert(10, "OPEN"), insert(11, "OPEN"), insert(12, "DONE")],
+                Lsn(100),
+            )))
             .await
             .expect("send");
         let seen = drain(&mut events).await;
 
         assert_eq!(
-            shapes(&seen)
-                .iter()
-                .filter(|shape| **shape == "updates")
+            seen.iter()
+                .filter(|event| !updates_of(event).is_empty())
                 .count(),
             1,
-            "the commit's rows travel as one batch, got {:?}",
+            "the commit's rows travel in one event, got {:?}",
+            shapes(&seen)
+        );
+        assert!(
+            matches!(seen.last(), Some(Event::Committed { updates, .. }) if updates.len() == 2),
+            "and that event is the commit itself, got {:?}",
             shapes(&seen)
         );
         assert_eq!(
@@ -273,89 +286,43 @@ fn a_commit_arrives_as_one_batch() {
     });
 }
 
-/// A progress mark reports where the engine now is, which is what a
+/// A committed transaction reports where the engine now is (the feed's
+/// progress mark) and carries the watched writes it held, which is what a
 /// consumer batching per transaction flushes on.
 #[test]
-fn progress_reports_the_position() {
+fn a_commit_reports_the_position_and_the_watched_writes() {
     block_on(async {
         let storage = Rc::new(MemoryStorage::new());
         let (commands, mut events) = start(storage);
 
         commands
-            .send(Command::Commit {
+            .send(Command::Transaction(Transaction {
                 writes: vec![insert(1, "OPEN")],
                 at: Lsn(42),
-            })
-            .await
-            .expect("send");
-        commands
-            .send(Command::Progress(Lsn(42)))
+                progress: Lsn(50),
+                watched: vec![insert(1, "OPEN")],
+                received: std::time::Instant::now(),
+            }))
             .await
             .expect("send");
         let seen = drain(&mut events).await;
 
-        let moved = seen.iter().find_map(|event| match event {
-            Event::Moved { position, .. } => Some(*position),
+        let committed = seen.iter().find_map(|event| match event {
+            Event::Committed {
+                position, watched, ..
+            } => Some((*position, watched.len())),
             _ => None,
         });
         assert_eq!(
-            moved,
-            Some(Lsn(42)),
-            "the progress mark is reported, got {:?}",
+            committed,
+            Some((Lsn(50), 1)),
+            "the progress mark and the watched write are reported, got {:?}",
             shapes(&seen)
         );
-    });
-}
-
-/// A count is answered on the event stream with the token it was asked
-/// with, exact below the cap and the cap itself beyond it, so a planner
-/// never makes the store count a big table to the end.
-#[test]
-fn a_count_stops_at_the_cap() {
-    block_on(async {
-        let storage = Rc::new(MemoryStorage::new());
-        for id in 1..=5 {
-            storage.apply(&insert(id, "OPEN"));
-        }
-        storage.apply(&insert(6, "DONE"));
-        let (commands, mut events) = start(storage);
-        let open = open_tickets().main_table;
-
-        commands
-            .send(Command::Count {
-                query: open.clone(),
-                cap: 3,
-                token: 11,
-            })
-            .await
-            .expect("send");
-        commands
-            .send(Command::Count {
-                query: open,
-                cap: 100,
-                token: 12,
-            })
-            .await
-            .expect("send");
-        let seen = drain(&mut events).await;
-
-        let counts: Vec<(u64, u64)> = seen
-            .iter()
-            .filter_map(|event| match event {
-                Event::Counted {
-                    token,
-                    count: Ok(count),
-                } => Some((*token, *count)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            counts.len(),
-            2,
-            "both counts answered, got {:?}",
+        assert!(
+            matches!(seen.as_slice(), [Event::Committed { updates, .. }] if updates.is_empty()),
+            "the commit is the one event; nobody subscribed, so it carries no delta, got {:?}",
             shapes(&seen)
         );
-        assert!(counts.contains(&(11, 3)), "capped at 3: {counts:?}");
-        assert!(counts.contains(&(12, 5)), "exact below the cap: {counts:?}");
     });
 }

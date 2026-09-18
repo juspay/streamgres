@@ -60,6 +60,7 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -1238,16 +1239,14 @@ impl JoinBench {
 /// The join spec: `tickets WHERE <main> LEFT JOIN users ON assigned_to =
 /// users.id`.
 fn join_spec(main: Where) -> MultiTableReadQuery {
-    MultiTableReadQuery {
-        main_table: unbounded(&tickets_table(), main),
-        left_joins: vec![Join::new(
+    MultiTableReadQuery::new(
+        unbounded(&tickets_table(), main),
+        vec![Join::left(
             MultiTableReadQuery::single(unbounded(&users_table(), Where::AND(vec![]))),
             "assigned_to",
             "id",
         )],
-        right_joins: Vec::new(),
-        inner_joins: Vec::new(),
-    }
+    )
 }
 
 /// Scenario 4: the LEFT JOIN layer under ticket inserts, ticket
@@ -1531,7 +1530,7 @@ async fn pg_load(admin: &tokio_postgres::Client) {
 
 /// Scenario 5 (see [`postgres`]), over freshly loaded tables.
 async fn pg_run(dsn: &str) -> PgRow {
-    let catalog = Rc::new(Catalog::new(vec![tickets_table(), users_table()]));
+    let catalog = Arc::new(Catalog::new(vec![tickets_table(), users_table()]));
     let (admin, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
         .await
         .expect("connect");
@@ -1764,7 +1763,7 @@ fn xy_row(table: &str, pairs: &[(&str, Value)]) -> (DataFrameKey, DataFrameRow) 
         data.insert(ColumnName::from(*column), value.clone());
     }
     let key = DataFrameKey::new([(xyne::pkey(table), data[xyne::pkey(table)].clone())]);
-    (key, DataFrameRow { data })
+    (key, DataFrameRow::from(data))
 }
 
 /// An INSERT of one xyne row.
@@ -1806,25 +1805,30 @@ fn xy_query(table: &str, filter: Where) -> SingleTableReadQuery {
 }
 
 /// A join edge along the schema relationship `name` of `table`.
-fn xy_join(table: &str, name: &str, sub: MultiTableReadQuery) -> Join {
+fn xy_left(table: &str, name: &str, sub: MultiTableReadQuery) -> Join {
     let rel = xyne::rel(table, name);
-    Join::new(sub, rel.source, rel.dest)
+    Join::left(sub, rel.source, rel.dest)
+}
+
+/// The INNER edge (driven from the sub) of the xyne relationship `name`
+/// of `table` to `sub`.
+fn xy_inner(table: &str, name: &str, sub: MultiTableReadQuery) -> Join {
+    let rel = xyne::rel(table, name);
+    Join::inner(sub, rel.source, rel.dest)
 }
 
 /// The channel-access rule for `user`: public, or a channel the user
 /// participates in, the existence test inside the `OR`.
 fn xy_channel_access(user: &str) -> MultiTableReadQuery {
-    MultiTableReadQuery {
-        main_table: xy_query(
+    MultiTableReadQuery::new(
+        xy_query(
             "channels",
             Where::OR(vec![
                 Where::condition("visibility", EQ, "PUBLIC"),
                 Where::exists(xyne::rel("channels", "participants").source, 0),
             ]),
         ),
-        left_joins: Vec::new(),
-        right_joins: Vec::new(),
-        inner_joins: vec![xy_join(
+        vec![xy_inner(
             "channels",
             "participants",
             MultiTableReadQuery::single(xy_query(
@@ -1832,7 +1836,7 @@ fn xy_channel_access(user: &str) -> MultiTableReadQuery {
                 Where::condition("userId", EQ, user),
             )),
         )],
-    }
+    )
 }
 
 /// `browsableChannels` for `user`: regular channels the user may see, with
@@ -1843,7 +1847,7 @@ fn xy_browsable(user: &str) -> MultiTableReadQuery {
         Where::condition("scopeType", EQ, "DEFAULT"),
         spec.main_table.filter,
     ]);
-    spec.left_joins.push(xy_join(
+    spec.joins.push(xy_left(
         "channels",
         "participants",
         MultiTableReadQuery::single(xy_query("channel_participants", Where::AND(vec![]))),
@@ -1855,8 +1859,8 @@ fn xy_browsable(user: &str) -> MultiTableReadQuery {
 /// the visibility rule on the messages, the conversation an INNER edge,
 /// its channel another, the channel's access rule a third.
 fn xy_thread(user: &str, conversation: &str) -> MultiTableReadQuery {
-    MultiTableReadQuery {
-        main_table: xy_query(
+    MultiTableReadQuery::new(
+        xy_query(
             "messages",
             Where::AND(vec![
                 Where::condition("conversationId", EQ, conversation),
@@ -1866,30 +1870,30 @@ fn xy_thread(user: &str, conversation: &str) -> MultiTableReadQuery {
                 ]),
             ]),
         ),
-        left_joins: Vec::new(),
-        right_joins: Vec::new(),
-        inner_joins: vec![xy_join(
+        vec![xy_inner(
             "messages",
             "conversation",
-            MultiTableReadQuery {
-                main_table: xy_query(
+            MultiTableReadQuery::new(
+                xy_query(
                     "conversations",
                     Where::condition("conversationId", EQ, conversation),
                 ),
-                left_joins: Vec::new(),
-                right_joins: Vec::new(),
-                inner_joins: vec![xy_join("conversations", "channel", xy_channel_access(user))],
-            },
+                vec![xy_inner(
+                    "conversations",
+                    "channel",
+                    xy_channel_access(user),
+                )],
+            ),
         )],
-    }
+    )
 }
 
 /// The board view of `board`: a page of [`XY_BOARD_PAGE`] root,
 /// non-Support tickets, newest first with `id` as the tiebreak, with
 /// their assignments and stage ETAs.
 fn xy_board(board: &str) -> MultiTableReadQuery {
-    MultiTableReadQuery {
-        main_table: SingleTableReadQuery::new(
+    MultiTableReadQuery::new(
+        SingleTableReadQuery::new(
             "tickets",
             Where::AND(vec![
                 Where::condition("boardId", EQ, board),
@@ -1905,21 +1909,19 @@ fn xy_board(board: &str) -> MultiTableReadQuery {
             ],
             XY_BOARD_PAGE,
         ),
-        left_joins: vec![
-            xy_join(
+        vec![
+            xy_left(
                 "tickets",
                 "assignments",
                 MultiTableReadQuery::single(xy_query("ticket_assignments", Where::AND(vec![]))),
             ),
-            xy_join(
+            xy_left(
                 "tickets",
                 "stageEtaEntries",
                 MultiTableReadQuery::single(xy_query("ticket_stage_eta", Where::AND(vec![]))),
             ),
         ],
-        right_joins: Vec::new(),
-        inner_joins: Vec::new(),
-    }
+    )
 }
 
 /// The memberships of the synthetic workspace as `(participant id,

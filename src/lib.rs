@@ -20,6 +20,7 @@
 //! | [`parser`] | SQL text → query model: schema-aware parsing against a [`parser::Catalog`]. |
 //! | [`client`] | The client side: the WebSocket server a Zero client connects to, the sync protocol, the AST translation, and each client group's view. It drives the engine only through [`sync::Service`]'s two channels. |
 //! | [`log`] | The leveled log the binary and the client side write to. |
+//! | [`stats`] | The server's own measurements: per-stage latency histograms and counters, served at `/stats`. |
 //!
 //! The demo binary (`src/main.rs`) runs a scripted scenario — SQL text in,
 //! routed operations out — and prints, per write, which subscriptions were
@@ -44,17 +45,24 @@
 //!    protocol over WebSockets ([`client`]) against an unmodified Zero
 //!    client, with the engine reached only through [`sync::Service`]
 //! 7. ✅ Windows below the root (a `related` node's `ORDER BY` / `LIMIT`
-//!    as a window per parent row) and the join planner (which side is read
-//!    whole, by counting; an `INNER` edge turned around when the parent is
-//!    the small side; refusal past the limit) ([`client::plan`])
-//! 8. History across reconnects, so a client that missed changes resumes
+//!    as a window per parent row) and the join planner (every edge with a
+//!    driver, the inner edge evaluated from either side; the driver chosen
+//!    by counting, cached per tree; refusal past the limit)
+//!    ([`client::plan`], [`model::Join`])
+//! 8. ✅ The pipeline as threads: `Send` values and shared row images, the
+//!    feed thread decoding, the engine thread routing alone, a reads pool
+//!    (one round trip per read), group threads that serialize each row
+//!    once and assemble pokes as bytes, translation and planning on the
+//!    connection, per-stage histograms at `/stats` ([`stats`])
+//! 9. History across reconnects, so a client that missed changes resumes
 //!    instead of starting a fresh sync
-//! 9. Batching of one write's narrowed reads, parser `JOIN` syntax,
-//!    table sharding across threads
+//! 10. Batching of one write's narrowed reads, parser `JOIN` syntax,
+//!     table sharding of the engine across threads
 
 pub mod client;
 pub mod ivm;
 pub mod log;
 pub mod model;
 pub mod parser;
+pub mod stats;
 pub mod sync;

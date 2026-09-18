@@ -25,6 +25,6 @@ pub use crate::model::{ClientId, SubId};
 pub use crate::model::{Lsn, Snapshot};
 pub use local::Local;
 pub use runtime::{Runtime, Step, SyncStats};
-pub use service::{Command, Event, Service};
+pub use service::{Command, Event, Service, Transaction};
 pub use sources::{MEMORY_TABLES_VAR, Sources};
 pub use storage::{MemoryStorage, Storage, StorageError};

@@ -126,16 +126,17 @@ mod window;
 pub use crate::model::{ClientId, SubId};
 pub use engine::{Engine, Fetch, FetchId, FetchKind};
 pub use multi::{MultiTableIVM, MultiTableUpdate};
-pub use predicate::{eval_condition, evaluate};
+pub use predicate::{eval_condition, evaluate, evaluate_with};
 pub use stats::IvmStats;
 pub use update::{ClientUpdate, QueryPart, Target};
 pub use window::{order_cmp, order_rows};
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 use crate::model::frame::{RowId, TableFrame};
 use crate::model::{
-    DataFrameKey, DataFrameOperation, DataFrameRow, SingleTableReadQuery, TableName, WriteQuery,
+    DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, SingleTableReadQuery, TableName,
+    WriteQuery,
 };
 use index::TableIndex;
 use update::{Raw, group};
@@ -197,17 +198,17 @@ pub struct SingleTableUpdate {
 /// - `next_fetch`: the next read id to hand out; never reused.
 /// - `stats`: operation counters; not part of the sync state.
 pub struct SingleTableIVM {
-    select_queries: HashMap<SubId, SingleTableReadQuery>,
+    select_queries: IdMap<SubId, SingleTableReadQuery>,
     by_query: HashMap<SingleTableReadQuery, BTreeSet<SubId>>,
     frames: HashMap<TableName, TableFrame>,
-    held: HashMap<SubId, HashSet<RowId>>,
-    windows: HashMap<SubId, Window>,
+    held: IdMap<SubId, IdSet<RowId>>,
+    windows: IdMap<SubId, Window>,
     tables: HashMap<TableName, TableIndex>,
-    pending: HashMap<SubId, u32>,
-    readers: HashMap<FetchId, Vec<SubId>>,
+    pending: IdMap<SubId, u32>,
+    readers: IdMap<FetchId, Vec<SubId>>,
     requests: Vec<Fetch>,
-    clients: HashMap<SubId, ClientId>,
-    by_client: HashMap<ClientId, BTreeSet<SubId>>,
+    clients: IdMap<SubId, ClientId>,
+    by_client: IdMap<ClientId, BTreeSet<SubId>>,
     write_epoch: u64,
     next_sub: u64,
     next_fetch: u64,
@@ -238,17 +239,17 @@ impl SingleTableIVM {
     /// An empty engine.
     pub fn new() -> Self {
         SingleTableIVM {
-            select_queries: HashMap::new(),
+            select_queries: IdMap::default(),
             by_query: HashMap::new(),
             frames: HashMap::new(),
-            held: HashMap::new(),
-            windows: HashMap::new(),
+            held: IdMap::default(),
+            windows: IdMap::default(),
             tables: HashMap::new(),
-            pending: HashMap::new(),
-            readers: HashMap::new(),
+            pending: IdMap::default(),
+            readers: IdMap::default(),
             requests: Vec::new(),
-            clients: HashMap::new(),
-            by_client: HashMap::new(),
+            clients: IdMap::default(),
+            by_client: IdMap::default(),
             write_epoch: 0,
             next_sub: 0,
             next_fetch: 0,
@@ -342,12 +343,17 @@ impl SingleTableIVM {
 
         if !impacts.is_empty() {
             let frame = self.frames.entry(table).or_default();
+            let matched_any = impacts.iter().any(|impact| impact.matches_after);
+            if let Some(image) = row_image.filter(|_| matched_any) {
+                let (id, _) = frame.entry(&key, || image.clone());
+                frame.replace_image(id, image.clone());
+            }
             for impact in &impacts {
                 if impact.matches_after {
-                    let data = row_image.expect("checked above").clone();
-                    let (id, row) = frame.entry(&key, || data.clone());
-                    row.data = data;
-                    row.subscribers.insert(impact.sub);
+                    let id = frame.id_of(&key).expect("materialized just above");
+                    if let Some(row) = frame.row_mut(id) {
+                        row.subscribers.insert(impact.sub);
+                    }
                     self.held.entry(impact.sub).or_default().insert(id);
                 } else if let Some(id) = frame.id_of(&key) {
                     if let Some(row) = frame.row_mut(id) {
@@ -468,35 +474,32 @@ impl SingleTableIVM {
     /// index under a freshly bumped write epoch — the index itself also
     /// applies each candidate's admission boundary, exempting holders;
     /// deletes carry no row image and skip it entirely. Way 2 (row held
-    /// before the write) checks the shared row's subscriber tags per
-    /// same-table subscription — catches updates moving a row out, and
-    /// deletes. Every returned [`Impact`] has at least one of the two
-    /// facts set.
+    /// before the write) reads the shared row's subscriber tags — catches
+    /// updates moving a row out, and deletes. Both come sorted and are
+    /// merged, so every returned [`Impact`] has at least one of the two
+    /// facts set and the impacts are in id order.
     fn analyze(
         &mut self,
         table_name: &TableName,
         key: &DataFrameKey,
         row_image: Option<&DataFrameRow>,
     ) -> Vec<Impact> {
-        let table_name = table_name.clone();
-        let key = key.clone();
-
-        let mut holding: BTreeSet<SubId> = BTreeSet::new();
-        let holders: Vec<SubId> = self
+        let holding: Vec<SubId> = self
             .frames
-            .get(&table_name)
-            .and_then(|frame| frame.get(&key))
-            .map(|row| row.subscribers.iter().copied().collect())
+            .get(table_name)
+            .and_then(|frame| frame.get(key))
+            .map(|row| {
+                row.subscribers
+                    .iter()
+                    .copied()
+                    .filter(|sub| self.select_queries.contains_key(sub))
+                    .collect()
+            })
             .unwrap_or_default();
-        for sub in holders {
-            if self.select_queries.contains_key(&sub) {
-                self.stats.membership_probes += 1;
-                self.stats.membership_hits += 1;
-                holding.insert(sub);
-            }
-        }
+        self.stats.membership_probes += holding.len() as u64;
+        self.stats.membership_hits += holding.len() as u64;
 
-        let mut matched: BTreeSet<SubId> = BTreeSet::new();
+        let mut matched: Vec<SubId> = Vec::new();
         if let Some(row) = row_image {
             debug_assert!(
                 key.pkey_value
@@ -505,19 +508,44 @@ impl SingleTableIVM {
                 "a write's record must carry its own primary-key values"
             );
             self.write_epoch += 1;
-            if let Some(table_index) = self.tables.get(&table_name) {
+            if let Some(table_index) = self.tables.get(table_name) {
                 matched =
                     table_index.matched(&row.data, self.write_epoch, &holding, &mut self.stats);
             }
         }
 
-        let mut impacts = Vec::new();
-        for sub in matched.union(&holding) {
+        let mut impacts = Vec::with_capacity(matched.len() + holding.len());
+        let (mut m, mut h) = (0usize, 0usize);
+        while m < matched.len() || h < holding.len() {
+            let (sub, matches_after, present_before) = match (matched.get(m), holding.get(h)) {
+                (Some(a), Some(b)) if a == b => {
+                    m += 1;
+                    h += 1;
+                    (*a, true, true)
+                }
+                (Some(a), Some(b)) if a < b => {
+                    m += 1;
+                    (*a, true, false)
+                }
+                (Some(_), Some(b)) => {
+                    h += 1;
+                    (*b, false, true)
+                }
+                (Some(a), None) => {
+                    m += 1;
+                    (*a, true, false)
+                }
+                (None, Some(b)) => {
+                    h += 1;
+                    (*b, false, true)
+                }
+                (None, None) => break,
+            };
             self.stats.queries_impacted += 1;
             impacts.push(Impact {
-                sub: *sub,
-                matches_after: matched.contains(sub),
-                present_before: holding.contains(sub),
+                sub,
+                matches_after,
+                present_before,
             });
         }
         impacts
@@ -582,5 +610,10 @@ impl Engine for SingleTableIVM {
     /// Registered, with no read out.
     fn hydrated(&self, sub: SubId) -> bool {
         self.select_queries.contains_key(&sub) && !self.is_pending(sub)
+    }
+
+    /// [`SingleTableIVM::stats`].
+    fn stats(&self) -> &IvmStats {
+        &self.stats
     }
 }

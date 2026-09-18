@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -16,7 +17,9 @@ use tokio_postgres::{Client, NoTls};
 use xyne_sync::ivm::{ClientUpdate, Fetch, MultiTableIVM, QueryPart};
 use xyne_sync::model::*;
 use xyne_sync::sync::pg::{PgStorage, PgStream};
-use xyne_sync::sync::{Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId};
+use xyne_sync::sync::{
+    Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
+};
 
 /// The one client of these scenarios.
 const CLIENT: ClientId = ClientId(7);
@@ -83,14 +86,14 @@ impl Names {
 
     /// `OPEN` tickets LEFT JOIN users on `assigned_to = users.id`.
     fn spec(&self) -> MultiTableReadQuery {
-        MultiTableReadQuery {
-            main_table: SingleTableReadQuery::new(
+        MultiTableReadQuery::new(
+            SingleTableReadQuery::new(
                 self.tickets.as_str(),
                 Where::condition("status", ComparisonOperator::EQ, "OPEN"),
                 OrderBy::new("id", Order::ASC),
                 u32::MAX,
             ),
-            left_joins: vec![Join::new(
+            vec![Join::left(
                 MultiTableReadQuery::single(SingleTableReadQuery::new(
                     self.users.as_str(),
                     Where::AND(vec![]),
@@ -100,9 +103,7 @@ impl Names {
                 "assigned_to",
                 "id",
             )],
-            right_joins: Vec::new(),
-            inner_joins: Vec::new(),
-        }
+        )
     }
 }
 
@@ -266,7 +267,7 @@ fn registration_behind_open_snapshot() {
     block_on(async {
         let names = Names::new("wal");
         let client = prepare(&dsn, &names).await;
-        let catalog = Rc::new(names.catalog());
+        let catalog = Arc::new(names.catalog());
         let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
             .await
             .expect("open stream");
@@ -385,11 +386,11 @@ fn service_streams_end_to_end() {
     block_on(async {
         let names = Names::new("service");
         let client = prepare(&dsn, &names).await;
-        let catalog = Rc::new(names.catalog());
+        let catalog = Arc::new(names.catalog());
         let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
             .await
             .expect("open stream");
-        let pg = Rc::new(
+        let pg = Arc::new(
             PgStorage::connect(&dsn, catalog.clone())
                 .await
                 .expect("connect"),
@@ -408,15 +409,18 @@ fn service_streams_end_to_end() {
             let batch = stream.poll().await.expect("poll");
             for (write, at) in batch.writes {
                 commands
-                    .send(Command::Commit {
-                        writes: vec![write],
-                        at,
-                    })
+                    .send(Command::Transaction(Transaction::new(vec![write], at)))
                     .await
                     .expect("send");
             }
             commands
-                .send(Command::Progress(batch.progress))
+                .send(Command::Transaction(Transaction {
+                    writes: Vec::new(),
+                    at: batch.progress,
+                    progress: batch.progress,
+                    watched: Vec::new(),
+                    received: Instant::now(),
+                }))
                 .await
                 .expect("send");
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -442,7 +446,7 @@ fn service_streams_end_to_end() {
             .expect("send");
         let sub: SubId = loop {
             match events.recv().await.expect("service ended") {
-                Event::Registered { token, sub } => {
+                Event::Registered { token, sub, .. } => {
                     assert_eq!(token, 1, "the token comes back unchanged");
                     break sub;
                 }
@@ -481,12 +485,16 @@ fn service_streams_end_to_end() {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
-                Ok(Some(Event::Updates(batch))) => {
+                Ok(Some(
+                    Event::Landed { updates: batch }
+                    | Event::Committed { updates: batch, .. }
+                    | Event::Registered { updates: batch, .. },
+                )) => {
                     for update in batch {
                         assert_eq!(update.client, CLIENT);
                         for target in &update.targets {
                             assert_eq!(target.sub, sub);
-                            let frame = frames.entry(target.part.clone()).or_default();
+                            let frame = frames.entry(target.part).or_default();
                             match &update.op {
                                 DataFrameOperation::Add(key, row) => {
                                     frame.insert(key.clone(), row.clone());
@@ -538,7 +546,7 @@ fn reads_queue_at_the_connection_bound() {
     block_on(async {
         let names = Names::new("pool");
         let client = prepare(&dsn, &names).await;
-        let catalog = Rc::new(names.catalog());
+        let catalog = Arc::new(names.catalog());
         let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
             .await
             .expect("open stream");
@@ -588,7 +596,7 @@ fn a_count_stops_at_the_cap_on_the_snapshot() {
     block_on(async {
         let names = Names::new("count");
         let client = prepare(&dsn, &names).await;
-        let catalog = Rc::new(names.catalog());
+        let catalog = Arc::new(names.catalog());
         let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
             .await
             .expect("open stream");

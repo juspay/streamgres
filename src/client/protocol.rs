@@ -360,12 +360,6 @@ pub fn poke_start(poke_id: &str, base_cookie: Option<&str>) -> String {
     )
 }
 
-/// `pokePart` with the given (already assembled) body fields.
-pub fn poke_part(poke_id: &str, mut body: serde_json::Map<String, Json>) -> String {
-    body.insert("pokeID".to_owned(), Json::String(poke_id.to_owned()));
-    frame("pokePart", Json::Object(body))
-}
-
 /// `pokeEnd`.
 pub fn poke_end(poke_id: &str, cookie: &str) -> String {
     frame("pokeEnd", json!({"pokeID": poke_id, "cookie": cookie}))

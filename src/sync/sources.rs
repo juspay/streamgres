@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use super::pg::PgStorage;
 use super::storage::{MemoryStorage, Storage, StorageError};
@@ -21,22 +22,23 @@ pub const MEMORY_TABLES_VAR: &str = "XYNE_SYNC_MEMORY_TABLES";
 ///
 /// - `memory`: the mirror; fed by [`Storage::absorb`] and warmed from
 ///   Postgres by [`Sources::warm`].
-/// - `pg`: the database.
+/// - `pg`: the database, shared with whoever else reads it (the planner's
+///   counts, the connect-time reads).
 /// - `cached`: the tables the mirror answers for.
 /// - `catalog`: the tables' declared shapes, for the warm-up reads.
 pub struct Sources {
     memory: Rc<MemoryStorage>,
-    pg: Rc<PgStorage>,
+    pg: Arc<PgStorage>,
     cached: HashSet<TableName>,
-    catalog: Rc<Catalog>,
+    catalog: Arc<Catalog>,
 }
 
 impl Sources {
     /// Postgres for every table but `cached`, which the memory mirror
     /// answers for once warmed.
     pub fn new(
-        pg: Rc<PgStorage>,
-        catalog: Rc<Catalog>,
+        pg: Arc<PgStorage>,
+        catalog: Arc<Catalog>,
         cached: impl IntoIterator<Item = TableName>,
     ) -> Self {
         Sources {
@@ -111,6 +113,18 @@ impl Storage for Sources {
             self.memory.select(query).await
         } else {
             self.pg.select(query).await
+        }
+    }
+
+    /// The mirror for a cached table, Postgres (taking the handle) otherwise.
+    async fn select_shared(
+        &self,
+        query: Arc<SingleTableReadQuery>,
+    ) -> Result<Snapshot, StorageError> {
+        if self.is_cached(&query.table) {
+            self.memory.select(&query).await
+        } else {
+            self.pg.select_shared(query).await
         }
     }
 

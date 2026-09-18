@@ -14,11 +14,10 @@
 //!   hash combines per-entry hashes with an order-independent fold.
 
 use chrono::{NaiveDate, NaiveDateTime};
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 
 /// A dynamically-typed database value.
 ///
@@ -173,9 +172,11 @@ const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
 /// same set (identity), which keeps a leaf's identity stable while its
 /// contents change and lets identical subscriptions share one edge.
 /// Members are stored by [`Value::equality_key`], so `Int(5)` and
-/// `Float(5.0)` are one member.
+/// `Float(5.0)` are one member. The set is behind a lock so that a value
+/// holding one is `Send`: the engine thread alone mutates it, and the
+/// threads that render or serialize a query only read it.
 #[derive(Clone, Debug, Default)]
-pub struct SharedSet(Rc<RefCell<HashSet<Value>>>);
+pub struct SharedSet(Arc<RwLock<HashSet<Value>>>);
 
 impl SharedSet {
     /// An empty set.
@@ -187,13 +188,13 @@ impl SharedSet {
     pub fn contains(&self, value: &Value) -> bool {
         value
             .equality_key()
-            .is_some_and(|key| self.0.borrow().contains(&key))
+            .is_some_and(|key| self.read().contains(&key))
     }
 
     /// Add `value`; reports whether it was new (`NULL` is never added).
     pub fn insert(&self, value: &Value) -> bool {
         match value.equality_key() {
-            Some(key) => self.0.borrow_mut().insert(key),
+            Some(key) => self.write().insert(key),
             None => false,
         }
     }
@@ -201,36 +202,51 @@ impl SharedSet {
     /// Remove `value`; reports whether it was a member.
     pub fn remove(&self, value: &Value) -> bool {
         match value.equality_key() {
-            Some(key) => self.0.borrow_mut().remove(&key),
+            Some(key) => self.write().remove(&key),
             None => false,
         }
     }
 
     /// The current members, as their equality keys, in no particular order.
     pub fn members(&self) -> Vec<Value> {
-        self.0.borrow().iter().cloned().collect()
+        self.read().iter().cloned().collect()
     }
 
     /// How many members the set holds.
     pub fn len(&self) -> usize {
-        self.0.borrow().len()
+        self.read().len()
     }
 
     /// Whether the set is empty.
     pub fn is_empty(&self) -> bool {
-        self.0.borrow().is_empty()
+        self.read().is_empty()
+    }
+
+    /// The members for reading; a poisoned lock (a panic while writing)
+    /// is read through, since the set is only ever mutated whole.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashSet<Value>> {
+        self.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The members for writing; see [`SharedSet::read`] on poisoning.
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashSet<Value>> {
+        self.0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The set's identity, for ordering and hashing.
     fn address(&self) -> usize {
-        Rc::as_ptr(&self.0) as *const () as usize
+        Arc::as_ptr(&self.0) as *const () as usize
     }
 }
 
 impl PartialEq for SharedSet {
     /// Identity: the same set, not equal contents.
     fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -250,12 +266,18 @@ impl Value {
     /// itself otherwise. Two values are `loose_eq` iff their keys are equal,
     /// which is what lets hash maps and sets stand in for equality tests.
     pub fn equality_key(&self) -> Option<Value> {
+        self.equality_key_ref().map(std::borrow::Cow::into_owned)
+    }
+
+    /// [`Value::equality_key`] without a copy: the value itself borrowed
+    /// when it is its own key, an owned integer for an integral float.
+    pub fn equality_key_ref(&self) -> Option<std::borrow::Cow<'_, Value>> {
         match self {
             Value::Null => None,
             Value::Float(f) if f.fract() == 0.0 && f.abs() <= EXACT_INTEGER_LIMIT => {
-                Some(Value::Int(*f as i64))
+                Some(std::borrow::Cow::Owned(Value::Int(*f as i64)))
             }
-            other => Some(other.clone()),
+            other => Some(std::borrow::Cow::Borrowed(other)),
         }
     }
 }
@@ -410,6 +432,20 @@ mod tests {
     fn int_float_coercion_is_loose_only() {
         assert!(Value::Int(5).loose_eq(&Value::Float(5.0)));
         assert_ne!(Value::Int(5), Value::Float(5.0));
+    }
+
+    /// A value, and so a row, a key, a query and a write, can cross a
+    /// thread boundary: the shared set is behind a lock, not an `Rc`.
+    #[test]
+    fn values_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Value>();
+        assert_send_sync::<SharedSet>();
+        assert_send_sync::<crate::model::DataFrameRow>();
+        assert_send_sync::<crate::model::DataFrameKey>();
+        assert_send_sync::<crate::model::WriteQuery>();
+        assert_send_sync::<crate::model::MultiTableReadQuery>();
+        assert_send_sync::<crate::ivm::ClientUpdate>();
     }
 
     /// [`Value::compare`] returns `None` for anything involving `Null`,

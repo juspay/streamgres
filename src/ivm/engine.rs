@@ -9,6 +9,8 @@
 //! (single-table and join tree) expose to that runtime, and every delta
 //! they emit is addressed to a client ([`super::ClientUpdate`]).
 
+use std::sync::Arc;
+
 use super::ClientUpdate;
 use crate::model::{ClientId, DataFrameKey, DataFrameRow, SingleTableReadQuery, SubId, WriteQuery};
 
@@ -40,13 +42,15 @@ pub enum FetchKind {
 /// - `sub`: the (inner) subscription whose rows the read feeds.
 /// - `kind`: why it was asked for.
 /// - `query`: exactly what to run; its `limit` is what the window
-///   bookkeeping treats as the requested row count.
+///   bookkeeping treats as the requested row count. Shared, so the read
+///   travels to the runtime, the driver and the storage's task without
+///   the filter tree being copied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fetch {
     pub id: FetchId,
     pub sub: SubId,
     pub kind: FetchKind,
-    pub query: SingleTableReadQuery,
+    pub query: Arc<SingleTableReadQuery>,
 }
 
 /// What an engine exposes to the runtime: subscribe, route, land reads,
@@ -84,4 +88,7 @@ pub trait Engine {
     /// waits on is still out and, for a tree, every part is live. False
     /// for a subscription the engine does not know.
     fn hydrated(&self, sub: SubId) -> bool;
+
+    /// The engine's routing counters.
+    fn stats(&self) -> &super::IvmStats;
 }

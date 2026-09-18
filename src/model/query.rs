@@ -64,63 +64,144 @@ impl std::fmt::Display for ClientId {
     }
 }
 
+/// Which side of a join edge drives it: whose held rows decide the join
+/// values that are *referenced*. The other side, the driven one, holds
+/// only rows matching a referenced value (its filter carries
+/// `driven_column IN <referenced values>`), so it is never read whole.
+///
+/// - `Main`: the enclosing node's rows pick the sub rows (the client's
+///   `related`, a LEFT join, and an inner join evaluated from the parent).
+/// - `Sub`: the sub rows pick the enclosing node's rows (a RIGHT join, and
+///   an inner join evaluated from the child, the client's `whereExists` as
+///   translated).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Driver {
+    Main,
+    Sub,
+}
+
 /// One join edge of a [`MultiTableReadQuery`]: rows of `sub`'s main table
 /// attach to rows of the enclosing node where
 /// `sub.<sub_table_column> = enclosing.<main_table_column>`.
 ///
-/// `sub` is a full multi-table query, so a leaf is a node whose join
-/// vectors are empty and nesting costs nothing. Which of the enclosing
-/// node's vectors lists the edge decides what is preserved: a LEFT edge
-/// keeps every enclosing row and attaches the matching sub rows; a RIGHT
-/// edge keeps every sub row and shows enclosing rows only while a sub row
-/// matches them; an INNER edge shows an enclosing row only while a sub
-/// row matches it and a sub row only while a shown enclosing row matches
-/// it, evaluated from the sub side (`whereExists` in the client's terms, with
-/// the sub rows delivered). An INNER edge's test may be placed anywhere
-/// in the enclosing node's `WHERE` through an
-/// [`ComparisonOperator::EXISTS`] leaf naming it; unnamed, it is
-/// conjoined. Below the root, a LEFT join's sub node may carry an
-/// `order_by` / `limit` of its own: it is a window **per enclosing row**,
-/// the best *n* sub rows for each value the enclosing rows reference
-/// (`related` with a limit in the client's terms). A RIGHT or INNER sub node is
-/// read whole, so its limit is an ordinary window on that node. A `NULL`
-/// (or missing) join value never matches, consistent with the engine's
-/// NULL semantics.
-#[derive(Debug, Clone, PartialEq)]
+/// `sub` is a full multi-table query, so a leaf is a node whose `joins`
+/// are empty and nesting costs nothing. Two flags spell the edge out:
+///
+/// - `driver`: which side's rows decide the referenced join values; the
+///   other side holds only rows matching one of them.
+/// - `is_inner`: whether the driver's rows need a match to be shown. An
+///   outer edge keeps them (the other side being null is fine for the
+///   driver's row); an inner edge shows a driver row only while a driven
+///   row carries its join value.
+///
+/// | `driver` | `is_inner` | Reads as | Meaning |
+/// |---|---|---|---|
+/// | `Main` | `false` | LEFT | main rows stand; sub rows exist for referenced values and are shown under a shown main row |
+/// | `Sub` | `false` | RIGHT | sub rows stand; main rows exist only for values some sub row carries |
+/// | `Sub` | `true` | INNER, from the sub | main rows exist only for values some sub row carries; sub rows shown under a shown main row |
+/// | `Main` | `true` | INNER, from the main | sub rows exist for referenced values; a main row is shown only while a sub row matches it |
+///
+/// The two inner forms show the client the same rows and differ only in
+/// which side is read whole, which is the choice a planner makes by
+/// flipping `driver`; nothing else in the tree moves when it does. An
+/// inner edge's test may be placed anywhere in the enclosing node's
+/// `WHERE` through a [`ComparisonOperator::EXISTS`] leaf naming it;
+/// unnamed, it is conjoined. Below the root, the sub node of an edge the
+/// main drives may carry an `order_by` / `limit` of its own: it is a
+/// window **per enclosing row**, the best *n* sub rows for each value the
+/// enclosing rows reference (`related` with a limit in the client's terms). A
+/// sub node that drives its edge is read whole, so its limit is an
+/// ordinary window on that node. A `NULL` (or missing) join value never
+/// matches, consistent with the engine's NULL semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Join {
     pub sub: MultiTableReadQuery,
     pub main_table_column: ColumnName,
     pub sub_table_column: ColumnName,
+    pub driver: Driver,
+    pub is_inner: bool,
 }
 
 impl Join {
     /// Builds an edge attaching `sub` on
-    /// `enclosing.<main_table_column> = sub.<sub_table_column>`.
+    /// `enclosing.<main_table_column> = sub.<sub_table_column>`, driven
+    /// by `driver`, inner or outer.
     pub fn new(
         sub: MultiTableReadQuery,
         main_table_column: impl Into<ColumnName>,
         sub_table_column: impl Into<ColumnName>,
+        driver: Driver,
+        is_inner: bool,
     ) -> Self {
         Join {
             sub,
             main_table_column: main_table_column.into(),
             sub_table_column: sub_table_column.into(),
+            driver,
+            is_inner,
         }
+    }
+
+    /// A LEFT edge: the main rows drive and stand on their own.
+    pub fn left(
+        sub: MultiTableReadQuery,
+        main_table_column: impl Into<ColumnName>,
+        sub_table_column: impl Into<ColumnName>,
+    ) -> Self {
+        Join::new(
+            sub,
+            main_table_column,
+            sub_table_column,
+            Driver::Main,
+            false,
+        )
+    }
+
+    /// A RIGHT edge: the sub rows drive and stand on their own.
+    pub fn right(
+        sub: MultiTableReadQuery,
+        main_table_column: impl Into<ColumnName>,
+        sub_table_column: impl Into<ColumnName>,
+    ) -> Self {
+        Join::new(sub, main_table_column, sub_table_column, Driver::Sub, false)
+    }
+
+    /// An INNER edge evaluated from the sub: the sub rows drive and are
+    /// shown only under a shown main row (the client's `whereExists`).
+    pub fn inner(
+        sub: MultiTableReadQuery,
+        main_table_column: impl Into<ColumnName>,
+        sub_table_column: impl Into<ColumnName>,
+    ) -> Self {
+        Join::new(sub, main_table_column, sub_table_column, Driver::Sub, true)
+    }
+
+    /// An INNER edge evaluated from the main: the main rows drive and are
+    /// shown only while a sub row matches them.
+    pub fn inner_from_main(
+        sub: MultiTableReadQuery,
+        main_table_column: impl Into<ColumnName>,
+        sub_table_column: impl Into<ColumnName>,
+    ) -> Self {
+        Join::new(sub, main_table_column, sub_table_column, Driver::Main, true)
+    }
+
+    /// Whether the main rows drive the edge (the sub is the driven side).
+    pub fn main_drives(&self) -> bool {
+        self.driver == Driver::Main
     }
 }
 
 /// A multi-table subscription: a tree whose every node is a single-table
-/// query and every edge a LEFT, RIGHT or INNER join. The root is the query
-/// the client subscribed to; its `order_by` / `limit` apply to the root's
-/// rows. A node's parts are numbered left joins first, then right, then
-/// inner. Structurally identical trees compare equal, the basis of
-/// sharing.
-#[derive(Debug, Clone, PartialEq)]
+/// query and every edge a [`Join`]. The root is the query the client
+/// subscribed to; its `order_by` / `limit` apply to the root's rows. A
+/// node's parts are numbered by the position of their edge in `joins`.
+/// Structurally identical trees compare equal, the basis of sharing; two
+/// trees that differ only in an edge's `driver` are two trees.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MultiTableReadQuery {
     pub main_table: SingleTableReadQuery,
-    pub left_joins: Vec<Join>,
-    pub right_joins: Vec<Join>,
-    pub inner_joins: Vec<Join>,
+    pub joins: Vec<Join>,
 }
 
 impl MultiTableReadQuery {
@@ -128,10 +209,28 @@ impl MultiTableReadQuery {
     pub fn single(main_table: SingleTableReadQuery) -> Self {
         MultiTableReadQuery {
             main_table,
-            left_joins: Vec::new(),
-            right_joins: Vec::new(),
-            inner_joins: Vec::new(),
+            joins: Vec::new(),
         }
+    }
+
+    /// A tree of `main_table` with `joins` under it.
+    pub fn new(main_table: SingleTableReadQuery, joins: Vec<Join>) -> Self {
+        MultiTableReadQuery { main_table, joins }
+    }
+
+    /// Whether the tree has any edge.
+    pub fn has_joins(&self) -> bool {
+        !self.joins.is_empty()
+    }
+
+    /// The positions in `joins` of the node's inner edges, in order: what
+    /// an `EXISTS` leaf's index counts through.
+    pub fn inner_positions(&self) -> impl Iterator<Item = usize> + '_ {
+        self.joins
+            .iter()
+            .enumerate()
+            .filter(|(_, join)| join.is_inner)
+            .map(|(position, _)| position)
     }
 }
 
@@ -260,11 +359,13 @@ impl Disjunct {
 ///
 /// `EXISTS` is the existence test of a multi-table query, placed where the
 /// author wants it in the tree: `column EXISTS Int(i)` names the node's
-/// `inner_joins[i]`, whose `main_table_column` must be `column`. At
-/// registration the join layer binds it in place into `column IN <set>`,
-/// the set of join values the inner query currently produces, so from
-/// then on it is an ordinary set-valued `IN`. Unbound, or with any other
-/// operand, it is never true.
+/// `i`-th inner edge (counting the edges with `is_inner` set, in the order
+/// of `joins`; the count is unchanged by which side drives), whose
+/// `main_table_column` must be `column`. At registration the join layer
+/// honors it by the edge's driver: bound in place into `column IN <set>`,
+/// the set of join values the sub currently produces, when the sub drives;
+/// evaluated as "a sub row matches this row" when the main drives. Unbound,
+/// or with any other operand, it is never true.
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ComparisonOperator {
@@ -339,7 +440,7 @@ impl Where {
         Where::condition(column, ComparisonOperator::IS_NOT, Value::Null)
     }
 
-    /// The existence test of the node's `inner_joins[index]`, on the
+    /// The existence test of the node's `index`-th inner edge, on the
     /// node's join column `column`; see [`ComparisonOperator::EXISTS`].
     pub fn exists(column: impl Into<ColumnName>, index: usize) -> Self {
         Where::condition(column, ComparisonOperator::EXISTS, Value::Int(index as i64))
@@ -393,6 +494,37 @@ impl Where {
                 for child in children {
                     child.replace_condition(old, new);
                 }
+            }
+        }
+    }
+
+    /// The tree with every leaf `is_true` accepts taken as true: an `OR`
+    /// holding one is true, a clause that became true drops out of its
+    /// `AND`, and a tree that is nothing but true is the empty `AND`.
+    pub fn assuming_true(&self, is_true: &dyn Fn(&Condition) -> bool) -> Where {
+        self.assume(is_true)
+            .unwrap_or_else(|| Where::AND(Vec::new()))
+    }
+
+    /// [`Where::assuming_true`]'s recursion; `None` is "true".
+    fn assume(&self, is_true: &dyn Fn(&Condition) -> bool) -> Option<Where> {
+        match self {
+            Where::Condition(condition) => {
+                (!is_true(condition)).then(|| Where::Condition(condition.clone()))
+            }
+            Where::AND(children) => {
+                let kept: Vec<Where> = children
+                    .iter()
+                    .filter_map(|child| child.assume(is_true))
+                    .collect();
+                (!kept.is_empty()).then_some(Where::AND(kept))
+            }
+            Where::OR(children) => {
+                let mut kept = Vec::with_capacity(children.len());
+                for child in children {
+                    kept.push(child.assume(is_true)?);
+                }
+                Some(Where::OR(kept))
             }
         }
     }
