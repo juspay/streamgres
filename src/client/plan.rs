@@ -13,7 +13,13 @@
 //! side winning unless the other is at most half its size: a project's
 //! few boards drive the workspace's stages, not the reverse); an edge
 //! with one bounded side is driven from it; an edge left with none
-//! refuses the query. The root never changes: the decision is a `driver`
+//! refuses the query. The edges are settled from the root down, and a
+//! node something already drives from above (a LEFT child, the sub of an
+//! edge settled for its main) drives the edges below it: its rows are the
+//! few its driver's values reach, whatever the table holds, so the access
+//! rule under a conversation's messages is read narrowed link by link
+//! (the message's conversation, that conversation's channel, the reader's
+//! participation in it) rather than from the rule's own side. The root never changes: the decision is a `driver`
 //! per edge ([`Join::driver`]), so part paths, hidden parts and `EXISTS`
 //! leaves all stay where the translation put them, and an inner edge at
 //! any depth is planned the same way as one at the root.
@@ -178,9 +184,16 @@ impl Planner {
         let mut bounded: Vec<bool> = (0..self.nodes.len())
             .map(|index| paged[index] || counts[index].is_some())
             .collect();
+        let mut above: Vec<Option<usize>> = vec![None; self.nodes.len()];
+        for (index, edge) in self.edges.iter().enumerate() {
+            above[edge.child] = Some(index);
+        }
+        let mut order: Vec<usize> = (0..self.edges.len()).collect();
+        order.sort_by_key(|&index| self.nodes[self.edges[index].parent].path.len());
         loop {
             let mut changed = false;
-            for edge in self.edges.iter_mut() {
+            for &index in &order {
+                let edge = &self.edges[index];
                 if !edge.is_inner || edge.decided {
                     let (from, to) = match edge.driver {
                         Driver::Main => (edge.parent, edge.child),
@@ -193,12 +206,18 @@ impl Planner {
                     continue;
                 }
                 let (parent, child) = (edge.parent, edge.child);
+                let driven_from_above = above[parent].is_some_and(|up| {
+                    let up = &self.edges[up];
+                    up.decided && up.driver == Driver::Main
+                });
                 let chosen = if paged[parent] {
                     Some(if counts[child].is_some() || paged[child] {
                         Driver::Sub
                     } else {
                         Driver::Main
                     })
+                } else if driven_from_above && bounded[parent] {
+                    Some(Driver::Main)
                 } else {
                     match (bounded[parent], bounded[child]) {
                         (true, false) => Some(Driver::Main),
@@ -215,6 +234,7 @@ impl Planner {
                     }
                 };
                 if let Some(driver) = chosen {
+                    let edge = &mut self.edges[index];
                     edge.driver = driver;
                     edge.decided = true;
                     let to = match driver {
@@ -654,14 +674,9 @@ mod tests {
         assert_eq!(outcome.expect("planned").joins[0].driver, Driver::Main);
     }
 
-    /// The access rule of a message: `messages WHERE id = ? LIMIT 1` under
-    /// `EXISTS conversations (EXISTS channels)`, the conversations
-    /// unfiltered and huge, the channels few. The channels may drive the
-    /// conversations, but conversations bounded only that way (every
-    /// conversation of every channel) never drive the page: the page
-    /// drives them.
-    #[test]
-    fn a_page_is_not_driven_through_an_unmeasured_fan_out() {
+    /// `messages WHERE <own> LIMIT limit` under `EXISTS conversations
+    /// (EXISTS channels)`: the access rule of a message.
+    fn message_under_the_access_rule(limit: u32) -> MultiTableReadQuery {
         let channels = MultiTableReadQuery::single(node(
             "channels",
             Where::condition("workspaceId", ComparisonOperator::EQ, "w"),
@@ -671,23 +686,29 @@ mod tests {
             node("conversations", Where::exists("channelId", 0), u32::MAX),
             vec![Join::inner(channels, "channelId", "id")],
         );
-        let query = MultiTableReadQuery::new(
+        MultiTableReadQuery::new(
             node(
                 "messages",
                 Where::AND(vec![
                     Where::condition("id", ComparisonOperator::EQ, "m1"),
                     Where::exists("conversationId", 0),
                 ]),
-                1,
+                limit,
             ),
-            vec![Join::inner(
-                conversations,
-                "conversationId",
-                "conversationId",
-            )],
-        );
+            vec![Join::inner(conversations, "conversationId", "conversationId")],
+        )
+    }
+
+    /// `messages WHERE id = ? LIMIT 1` under the access rule, the
+    /// conversations unfiltered and huge, the channels few. The page
+    /// drives the conversations, and the conversations, driven from above,
+    /// drive the channels in turn: every link is read narrowed from the
+    /// row outwards. The channels never drive the conversations (every
+    /// conversation of every channel) into the page.
+    #[test]
+    fn a_page_is_not_driven_through_an_unmeasured_fan_out() {
         let (asked, outcome) = drive(
-            Planner::new(query, policy(100, Side::Parent)),
+            Planner::new(message_under_the_access_rule(1), policy(100, Side::Parent)),
             &[("conversations", 101), ("channels", 20)],
         );
         assert_eq!(asked, vec!["conversations", "channels"]);
@@ -695,9 +716,40 @@ mod tests {
         assert_eq!(planned.joins[0].driver, Driver::Main, "the page drives");
         assert_eq!(
             planned.joins[0].sub.joins[0].driver,
-            Driver::Sub,
-            "the few channels still narrow the conversations"
+            Driver::Main,
+            "the conversation it reaches drives the channels"
         );
+    }
+
+    /// The same rule under an unpaged root that fits: a node driven from
+    /// above drives the edges below it, however much smaller the sub's
+    /// own count is than the node's (a conversation's messages reach one
+    /// conversation, whatever the table holds).
+    #[test]
+    fn a_node_driven_from_above_drives_below() {
+        for preferred in [Side::Parent, Side::Child] {
+            let (_, outcome) = drive(
+                Planner::new(message_under_the_access_rule(u32::MAX), policy(100, preferred)),
+                &[("messages", 5), ("conversations", 90), ("channels", 3)],
+            );
+            let planned = outcome.expect("planned");
+            assert_eq!(planned.joins[0].driver, Driver::Main, "{preferred:?}");
+            assert_eq!(planned.joins[0].sub.joins[0].driver, Driver::Main, "{preferred:?}");
+        }
+    }
+
+    /// With nothing small at the root the rule's own side is all there is:
+    /// the channels drive the conversations and those the messages (and
+    /// the read limit is what stops it if the fan-out is large).
+    #[test]
+    fn a_big_root_is_driven_from_the_small_end_of_the_chain() {
+        let (_, outcome) = drive(
+            Planner::new(message_under_the_access_rule(u32::MAX), policy(100, Side::Parent)),
+            &[("messages", 101), ("conversations", 101), ("channels", 3)],
+        );
+        let planned = outcome.expect("planned");
+        assert_eq!(planned.joins[0].driver, Driver::Sub);
+        assert_eq!(planned.joins[0].sub.joins[0].driver, Driver::Sub);
     }
 
     /// A paged root with a small child keeps the child driving.
