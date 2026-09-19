@@ -5,6 +5,7 @@
 //! database and application-server URLs also accept the `ZERO_` names a
 //! zero-cache deployment already sets, so one `.env` serves both.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use super::plan::{Policy, Side};
@@ -91,11 +92,19 @@ pub struct Config {
     /// subquery drives, Zero's `whereExists` as translated).
     pub join_preferred_side: Side,
     /// `XYNE_SYNC_PLAN_TTL_MS`: how long a join plan is remembered before
-    /// the query is counted again (60000).
+    /// the query is counted again (600000).
     pub plan_ttl: Duration,
     /// `XYNE_SYNC_PLAN_CACHE`: how many join plans are remembered at most
     /// (10000).
     pub plan_cache: usize,
+    /// `XYNE_SYNC_PLAN_FILE`: where the query shapes asked for are kept
+    /// between runs, to be planned again before the next process says it
+    /// is ready (unset: nothing is kept or replayed).
+    pub plan_file: Option<PathBuf>,
+    /// `XYNE_SYNC_WARM_START_MS`: the most time spent planning the kept
+    /// shapes before the process says it is ready (20000; 0 keeps shapes
+    /// but plans none at startup).
+    pub warm_start: Duration,
     /// `XYNE_SYNC_LOG`: `error`, `warn`, `info` or `debug` (`info`).
     pub log: Level,
 }
@@ -235,13 +244,15 @@ impl Config {
             },
             join_limit,
             join_preferred_side,
-            plan_ttl: millis("XYNE_SYNC_PLAN_TTL_MS", 60_000)?,
+            plan_ttl: millis("XYNE_SYNC_PLAN_TTL_MS", 600_000)?,
             plan_cache: match first(&["XYNE_SYNC_PLAN_CACHE"]) {
                 Some(text) => text
                     .parse()
                     .map_err(|_| format!("XYNE_SYNC_PLAN_CACHE must be a number, got `{text}`"))?,
                 None => 10_000,
             },
+            plan_file: first(&["XYNE_SYNC_PLAN_FILE"]).map(PathBuf::from),
+            warm_start: millis("XYNE_SYNC_WARM_START_MS", 20_000)?,
             log,
         })
     }

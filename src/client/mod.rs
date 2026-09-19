@@ -54,15 +54,17 @@ pub mod connection;
 pub mod groups;
 pub mod plan;
 pub mod protocol;
+pub mod warm;
 pub mod wire;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 pub use config::Config;
 
-use crate::log::{self, log_error, log_info};
+use crate::log::{self, log_error, log_info, log_warn};
 use crate::sync::pg::threads;
 
 /// Run the server with `config` until ctrl-c; returns the reason it could
@@ -184,6 +186,13 @@ pub fn serve(config: Config) -> Result<(), String> {
         &config.upstream_schema(),
     ));
     let plans = Arc::new(plan::PlanCache::new(config.plan_ttl, config.plan_cache));
+    let warm = Arc::new(warm::WarmStart::new(
+        config.plan_file.clone(),
+        config.plan_cache,
+    ));
+    let warm_budget = config.warm_start;
+    let (warmed_tx, warmed) =
+        tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
     let state = Arc::new(connection::AppState {
         config,
         requests,
@@ -194,8 +203,60 @@ pub fn serve(config: Config) -> Result<(), String> {
         lmids,
         stats,
         ready,
+        warm: warm.clone(),
+        warmed,
     });
     drop(readiness);
+    if warm.enabled() {
+        let shapes = warm.load();
+        let saver = warm.clone();
+        server.spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                saver.save();
+            }
+        });
+        if !warm_budget.is_zero() {
+            let state = state.clone();
+            server.spawn(async move {
+                let mut ready = state.ready.clone();
+                while !*ready.borrow() {
+                    if ready.changed().await.is_err() {
+                        return;
+                    }
+                }
+                let started = std::time::Instant::now();
+                let count = shapes.len();
+                let replayed = warm::WarmStart::replay(
+                    shapes,
+                    &state.catalog,
+                    state.config.policy(),
+                    &state.plans,
+                    &*state.storage,
+                    warm_budget,
+                    8,
+                )
+                .await;
+                if replayed.skipped > 0 {
+                    log_warn!(
+                        "warm start: {} of {count} kept shapes planned in {:?} ({} failed); {} left when the budget ran out",
+                        replayed.planned,
+                        started.elapsed(),
+                        replayed.failed,
+                        replayed.skipped
+                    );
+                } else {
+                    log_info!(
+                        "warm start: {} of {count} kept shapes planned in {:?} ({} failed)",
+                        replayed.planned,
+                        started.elapsed(),
+                        replayed.failed
+                    );
+                }
+                let _ = warmed_tx.send(true);
+            });
+        }
+    }
     log_info!("client side up");
     let served = server.block_on(connection::serve(state));
     drop(reads);

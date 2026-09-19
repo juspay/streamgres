@@ -29,6 +29,7 @@ use axum::routing::get;
 use axum::serve::ListenerExt;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use serde_json::{Value as Json, json};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -37,6 +38,7 @@ use super::backend::{Backend, Identity, PushOutcome, TransformOutcome};
 use super::config::Config;
 use super::groups::{ConnectReply, DesiredOp, Outbound, Request, Socket};
 use super::plan::{self, PlanCache};
+use super::warm::WarmStart;
 use super::protocol::{
     self, DeleteClients, InitConnection, PROTOCOL_VERSION, QueryPatchOp, Upstream,
 };
@@ -67,6 +69,8 @@ pub struct AppState {
     pub lmids: Arc<LmidReader>,
     pub stats: Arc<Stats>,
     pub ready: watch::Receiver<bool>,
+    pub warm: Arc<WarmStart>,
+    pub warmed: watch::Receiver<bool>,
 }
 
 /// One desired-query change between the client's message and the group
@@ -172,9 +176,11 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
         "listening on http://{address}{}/sync/v{PROTOCOL_VERSION}/connect",
         state.config.base_path
     );
-    let serving = axum::serve(listener, router(state)).with_graceful_shutdown(async {
+    let warm = state.warm.clone();
+    let serving = axum::serve(listener, router(state)).with_graceful_shutdown(async move {
         signalled().await;
         log_info!("shutting down: closing the clients, {DRAIN_GRACE:?} at most");
+        warm.save();
         shutdown().send_replace(true);
     });
     let grace = async {
@@ -197,7 +203,7 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
 
 /// Ready, or not yet: the status the health check answers with.
 async fn health(State(state): State<Arc<AppState>>) -> (StatusCode, &'static str) {
-    readiness(*state.ready.borrow())
+    readiness(*state.ready.borrow() && *state.warmed.borrow())
 }
 
 /// What `/health` says for a readiness.
@@ -736,7 +742,11 @@ impl Conn {
         let state = &*self.state;
         let planned = futures_util::future::join_all(pending.iter().map(|op| async move {
             match op {
-                Pending::Put { ast: Some(ast), .. } => Some(plan_ast(state, ast.clone()).await),
+                Pending::Put {
+                    ast: Some(ast),
+                    name,
+                    ..
+                } => Some(plan_ast(state, name, ast.clone()).await),
                 _ => None,
             }
         }))
@@ -842,12 +852,14 @@ impl Conn {
 }
 
 /// One AST into the tree the engine registers: translated against the
-/// catalog, then planned (the cache first, the counts otherwise).
-async fn plan_ast(state: &AppState, ast: Json) -> Result<Translated, String> {
-    let ast: Ast =
-        serde_json::from_value(ast).map_err(|error| format!("malformed AST: {error}"))?;
+/// catalog, then planned (the cache first, the counts otherwise); a shape
+/// that translates is kept for the next process's warm start.
+async fn plan_ast(state: &AppState, name: &str, ast: Json) -> Result<Translated, String> {
+    let parsed: Ast =
+        Ast::deserialize(&ast).map_err(|error| format!("malformed AST: {error}"))?;
     let started = Instant::now();
-    let translated = ast::translate(&ast, &state.catalog)?;
+    let translated = ast::translate(&parsed, &state.catalog)?;
+    state.warm.record(name, &ast);
     let planned = plan::plan(
         translated,
         state.config.policy(),
