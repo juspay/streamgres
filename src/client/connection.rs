@@ -38,6 +38,7 @@ use super::backend::{Backend, Identity, PushOutcome, TransformOutcome};
 use super::config::Config;
 use super::groups::{ConnectReply, DesiredOp, Outbound, Request, Socket};
 use super::plan::{self, PlanCache};
+use super::transform::TransformCache;
 use super::warm::WarmStart;
 use super::protocol::{
     self, DeleteClients, InitConnection, PROTOCOL_VERSION, QueryPatchOp, Upstream,
@@ -71,6 +72,7 @@ pub struct AppState {
     pub ready: watch::Receiver<bool>,
     pub warm: Arc<WarmStart>,
     pub warmed: watch::Receiver<bool>,
+    pub transforms: Arc<TransformCache>,
 }
 
 /// One desired-query change between the client's message and the group
@@ -670,6 +672,7 @@ impl Conn {
         let mut pending: Vec<Pending> = Vec::with_capacity(ops.len());
         let mut requests: Vec<Json> = Vec::new();
         let mut positions: HashMap<String, usize> = HashMap::new();
+        let mut asked: HashMap<String, (String, Json)> = HashMap::new();
         for op in ops {
             match op {
                 QueryPatchOp::Put {
@@ -680,11 +683,24 @@ impl Conn {
                     ast,
                 } => {
                     let name = name.unwrap_or_else(|| "query".to_owned());
+                    let mut ast = ast;
                     if ast.is_none() {
-                        positions.insert(hash.clone(), pending.len());
-                        requests.push(
-                            json!({"id": hash, "name": name, "args": args.unwrap_or_default()}),
-                        );
+                        let args = Json::Array(args.unwrap_or_default());
+                        match self.state.transforms.lookup(&self.identity, &name, &args) {
+                            Some(cached) => {
+                                self.state.stats.transform_hits.fetch_add(1, Ordering::Relaxed);
+                                ast = Some(cached);
+                            }
+                            None => {
+                                self.state
+                                    .stats
+                                    .transform_misses
+                                    .fetch_add(1, Ordering::Relaxed);
+                                positions.insert(hash.clone(), pending.len());
+                                requests.push(json!({"id": hash, "name": name, "args": args}));
+                                asked.insert(hash.clone(), (name.clone(), args));
+                            }
+                        }
                     }
                     pending.push(Pending::Put {
                         hash,
@@ -713,6 +729,11 @@ impl Conn {
                             continue;
                         };
                         if let Some(ast) = result.get("ast") {
+                            if let Some((name, args)) = asked.get(id) {
+                                self.state
+                                    .transforms
+                                    .store(&self.identity, name, args, ast.clone());
+                            }
                             if let Pending::Put { ast: slot, .. } = &mut pending[position] {
                                 *slot = Some(ast.clone());
                             }

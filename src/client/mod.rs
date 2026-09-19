@@ -54,6 +54,7 @@ pub mod connection;
 pub mod groups;
 pub mod plan;
 pub mod protocol;
+pub mod transform;
 pub mod warm;
 pub mod wire;
 
@@ -190,6 +191,10 @@ pub fn serve(config: Config) -> Result<(), String> {
         config.plan_file.clone(),
         config.plan_cache,
     ));
+    let transforms = Arc::new(transform::TransformCache::new(
+        config.transform_ttl,
+        config.transform_cache,
+    ));
     let warm_budget = config.warm_start;
     let (warmed_tx, warmed) =
         tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
@@ -205,6 +210,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         ready,
         warm: warm.clone(),
         warmed,
+        transforms,
     });
     drop(readiness);
     if warm.enabled() {

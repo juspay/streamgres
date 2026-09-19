@@ -97,6 +97,12 @@ pub struct Config {
     /// `XYNE_SYNC_PLAN_CACHE`: how many join plans are remembered at most
     /// (10000).
     pub plan_cache: usize,
+    /// `XYNE_SYNC_TRANSFORM_TTL_MS`: how long the application server's
+    /// transform of a query is kept per identity (300000; 0 keeps none).
+    pub transform_ttl: Duration,
+    /// `XYNE_SYNC_TRANSFORM_CACHE`: how many transforms are kept at most
+    /// (20000).
+    pub transform_cache: usize,
     /// `XYNE_SYNC_PLAN_FILE`: where the query shapes asked for are kept
     /// between runs, to be planned again before the next process says it
     /// is ready (unset: nothing is kept or replayed).
@@ -250,6 +256,13 @@ impl Config {
                     .parse()
                     .map_err(|_| format!("XYNE_SYNC_PLAN_CACHE must be a number, got `{text}`"))?,
                 None => 10_000,
+            },
+            transform_ttl: millis("XYNE_SYNC_TRANSFORM_TTL_MS", 300_000)?,
+            transform_cache: match first(&["XYNE_SYNC_TRANSFORM_CACHE"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("XYNE_SYNC_TRANSFORM_CACHE must be a number, got `{text}`")
+                })?,
+                None => 20_000,
             },
             plan_file: first(&["XYNE_SYNC_PLAN_FILE"]).map(PathBuf::from),
             warm_start: millis("XYNE_SYNC_WARM_START_MS", 20_000)?,

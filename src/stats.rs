@@ -205,6 +205,8 @@ pub struct Stats {
     pub frames: AtomicU64,
     pub rows_serialized: AtomicU64,
     pub rows_shared: AtomicU64,
+    pub transform_hits: AtomicU64,
+    pub transform_misses: AtomicU64,
     engine: Mutex<Engine>,
 }
 
@@ -240,6 +242,8 @@ impl Stats {
             frames: AtomicU64::new(0),
             rows_serialized: AtomicU64::new(0),
             rows_shared: AtomicU64::new(0),
+            transform_hits: AtomicU64::new(0),
+            transform_misses: AtomicU64::new(0),
             engine: Mutex::new(Engine::default()),
         }
     }
@@ -318,6 +322,8 @@ impl Stats {
                 "frames": self.frames.load(Ordering::Relaxed),
                 "rows_serialized": self.rows_serialized.load(Ordering::Relaxed),
                 "rows_shared": self.rows_shared.load(Ordering::Relaxed),
+                "transform_hits": self.transform_hits.load(Ordering::Relaxed),
+                "transform_misses": self.transform_misses.load(Ordering::Relaxed),
             },
             "engine": {
                 "writes_processed": engine.ivm.writes_processed,
