@@ -9,7 +9,11 @@
 //! used when the capacity is reached. The TTL is minutes rather than
 //! zero-cache's seconds: the AST changes only when the application's code
 //! does, and what the user may see is decided by the rows the engine
-//! evaluates live, not by the AST's age.
+//! evaluates live, not by the AST's age. An entry keeps the AST as its
+//! JSON text, not as a parsed tree: the text is a few kilobytes where the
+//! tree, with a node and a string per key, was ten to fifty times that,
+//! which at twenty thousand entries was gigabytes; a hit parses the text
+//! again, in microseconds.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -20,9 +24,9 @@ use serde_json::{Value as Json, json};
 
 use super::backend::Identity;
 
-/// One kept transform.
+/// One kept transform: the AST as JSON text.
 struct Entry {
-    ast: Json,
+    ast: String,
     at: Instant,
     tick: u64,
 }
@@ -76,7 +80,9 @@ impl TransformCache {
             Some(entry) if entry.at.elapsed() <= self.ttl => {
                 let old = entry.tick;
                 entry.tick = tick;
-                Some((entry.ast.clone(), old))
+                serde_json::from_str::<Json>(&entry.ast)
+                    .ok()
+                    .map(|ast| (ast, old))
             }
             _ => None,
         };
@@ -118,7 +124,7 @@ impl TransformCache {
         state.entries.insert(
             key,
             Entry {
-                ast,
+                ast: ast.to_string(),
                 at: Instant::now(),
                 tick,
             },

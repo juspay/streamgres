@@ -25,6 +25,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use crate::log::{Level, log_event, log_warn};
+
 /// PostgreSQL's epoch (2000-01-01) in microseconds since the Unix epoch.
 const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
 
@@ -34,7 +36,6 @@ use tokio::task::spawn_local;
 use super::runtime::{Runtime, Step};
 use super::storage::{Storage, StorageError};
 use crate::ivm::{ClientUpdate, Engine, Fetch, FetchId};
-use crate::log::log_warn;
 use crate::model::frame::SharedRow;
 use crate::model::{ClientId, DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, WriteQuery};
 use crate::stats::Stats;
@@ -185,6 +186,7 @@ pub struct Service<E: Engine, S: Storage> {
     /// release of a large subscription or the landing of a large read
     /// costs the engine its bookkeeping and not the allocator's work.
     reaper: std::sync::mpsc::Sender<Dead>,
+    lag_warned: Option<Instant>,
     results: mpsc::UnboundedReceiver<(FetchId, Result<Snapshot, StorageError>)>,
     report: mpsc::UnboundedSender<(FetchId, Result<Snapshot, StorageError>)>,
 }
@@ -215,6 +217,7 @@ where
             issued: IdMap::default(),
             swept: Instant::now(),
             reaper: spawn_reaper(),
+            lag_warned: None,
             results,
             report,
         };
@@ -405,8 +408,29 @@ where
                     .unwrap_or(0);
                 let lag = u64::try_from(now_unix - committed_unix).unwrap_or(0);
                 stats.feed_lag.record(Duration::from_micros(lag));
+                if lag >= 5_000_000
+                    && self
+                        .lag_warned
+                        .is_none_or(|warned| warned.elapsed() >= Duration::from_secs(60))
+                {
+                    self.lag_warned = Some(Instant::now());
+                    log_warn!(
+                        "the feed is {:.1} s behind PostgreSQL's commits at position {}",
+                        lag as f64 / 1_000_000.0,
+                        at.0
+                    );
+                }
             }
             stats.feed_lsn.store(at.0, Ordering::Relaxed);
+            log_event!(
+                Level::Debug,
+                "transaction routed",
+                position = at.0,
+                writes = writes.len(),
+                client_updates = step.updates.len(),
+                reads = step.selects.len(),
+                ms = format!("{:.2}", routed.duration_since(started).as_secs_f64() * 1000.0)
+            );
             stats
                 .feed_last_message_ms
                 .store(crate::stats::now_ms(), Ordering::Relaxed);

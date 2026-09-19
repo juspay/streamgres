@@ -15,7 +15,7 @@ that do the work, and how to read it.
 | **select**: plan | the decision | the counts on PostgreSQL | from cache, counted, refused | – |
 | **select**: IVM | register step, landing step, release step | the read's round trip | reads issued, landed, refused, served by a twin | rows per read, rows held |
 | **select**: client | flush, socket write | – | pokes, frames | rows serialized, rows shared |
-| **update**: feed | decoding a transaction | commit → arrival (replication lag) | transactions, writes, bytes | – |
+| **update**: feed | decoding a transaction | commit → arrival (replication lag) | transactions, writes | – |
 | **update**: IVM | the engine's step | waiting for the engine (inbox) | subscriptions impacted, narrowed reads | client updates |
 | **update**: client | flush, socket write | – | pokes | rows serialized |
 | **mutation** | – | the push's round trip; push → acknowledgement | pushes ok / failed | – |
@@ -78,7 +78,7 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_feed_to_engine_seconds` | decoded → taken up by the engine (the inbox's wait) |
 | `xyne_sync_engine_step_seconds{step=write}` | routing one transaction |
 | `xyne_sync_engine_to_groups_seconds`, `xyne_sync_groups_flush_seconds`, `xyne_sync_groups_to_socket_seconds`, `xyne_sync_end_to_end_seconds` | the client side's stages and the whole path inside the server |
-| `xyne_sync_feed_transactions_total`, `xyne_sync_feed_writes_total`, `xyne_sync_feed_bytes_total` | what came through the feed |
+| `xyne_sync_feed_transactions_total`, `xyne_sync_feed_writes_total` | what came through the feed |
 | `xyne_sync_writes_impacting_total`, `xyne_sync_client_updates_total{op=add,delete}`, `xyne_sync_narrowed_reads_total` | routing counters |
 | `xyne_sync_pokes_total`, `xyne_sync_frames_total`, `xyne_sync_rows_serialized_total`, `xyne_sync_rows_shared_total` | the client side's output |
 | `xyne_sync_feed_lsn`, `xyne_sync_feed_heartbeat_age_seconds` | where the feed is and how long since it last spoke |
@@ -113,13 +113,13 @@ object per line, `{"ts","level","thread","msg", ...fields}`.
 | event | level | fields |
 | --- | --- | --- |
 | server up, feed connected, ready, warm start, drain | info | address, slot, position, shapes planned |
-| connection opened / closed | info | wsid, group, client, user, origin; on close: seconds open, close reason, pokes and rows sent |
-| query registered | debug | wsid, group, name, hash, transform (hit/miss/ms), plan (cached/counted/ms), hydration (cold/warm/ms), rows |
+| connection opened / closed | info | wsid, group, client, whether authenticated, origin; on close: seconds open and the close reason (client, error, server) |
+| query hydrated | debug | group, name, hash, kind (cold or warm), ms from registration to rows present |
 | slow query | warn | the same, when hydration exceeds `XYNE_SYNC_SLOW_QUERY_MS` (1 000) |
 | query refused or errored | warn | wsid, name, hash, reason (as today) |
-| transaction routed | debug | position, tables, writes, subscriptions impacted, ms |
+| transaction routed | debug | position, writes, client updates, reads asked, ms |
 | feed lag | warn | when commit → engine exceeds 5 s, once per minute |
-| push forwarded | debug (warn when failed or slower than the slow threshold) | wsid, group, mutations, ms, result |
+| push forwarded | debug (warn when failed or slower than the slow threshold) | wsid, group, mutations, ms, failed |
 | summary | info, every minute | connections, groups, clients, subscriptions, rows held, RSS, engine busy %, feed lag, transform and plan hit rates, registrations/s, transactions/s, pokes/s, log drops |
 
 The reference server's equivalents, for whoever reads both: its `slow hydrate`
@@ -136,7 +136,41 @@ JSON log with `component` and `worker` fields map onto the rows above.
 | `XYNE_SYNC_SLOW_QUERY_MS` | `1000` | a query hydrating slower than this is logged at warn |
 | `XYNE_SYNC_METRICS_INTERVAL_MS` | `10000` | the sampler's period; the summary line every sixth sample; `0` turns the sampler off |
 
-## 6. What it costs
+## 6. What it costs, measured
+
+### Locally (Apple M4 Max, the server over the wire, `scripts/load-sweep.sh`)
+
+The same sweep as the paper's table of 2026-09-18 (200 sync-protocol
+clients holding the chat screen's queries, rows committed straight into
+PostgreSQL), on the observability build with JSON logs on and the
+sampler at its default; raw results in
+`paper/load-2026-09-19/sweep-observability/`.
+
+| shape | rows/s | delivery p50 / p99 (ms) | server end to end p50 / p99 (ms) | cores | 2026-09-18: p50 / p99 / server / cores |
+| --- | --- | --- | --- | --- | --- |
+| one channel | 200 | 22 / 26 | 2.6 / 4.1 | 0.30 | 28 / 35 / 4.1 / 0.38 |
+| one channel | 400 | 26 / 31 | 5.1 / 7.2 | 0.50 | 36 / 68 / 7.2 / 0.65 |
+| one channel | 800 | 28 / 35 | 6.1 / 8.2 | 0.40 | 30 / 37 / 5.1 / 0.95 (at 40 tx/s) |
+| twenty channels | 1 000 | 22 / 26 | 1.5 / 2.0 | 0.17 | 29 / 36 / 2.6 / 0.21 |
+| twenty channels | 4 000 | 32 / 37 | 5.1 / 6.1 | 0.51 | 43 / 50 / 7.2 / 0.67 |
+| twenty channels | 8 000 | 45 / 56 | 8.2 / 10.2 | 0.98 | 94 / 129 / 20.5 / 1.68 (at 7 400) |
+
+Hydration of 200 / 400 / 800 clients: 136 / 211 / 408 ms at the median.
+Nothing got slower; the day's engine fixes made most of it faster. The
+800-row one-channel run delivered two thirds of its rows inside the
+window for the same reason as on the rig: the single Node driver parsing
+160 000 rows a second, with the server's own path at 6 ms.
+
+During the sweep the log wrote 1 840 connection-opened and 1 632
+connection-closed lines (all closed by the client), zero slow-query
+warnings, and dropped nothing; the gauges read 208 sockets open (200
+subscribers and 8 writers), 208 groups, 492 MB resident.
+
+### On the rig
+
+PENDING.
+
+## 7. What it costs, by construction
 
 Nothing on the hot paths that was not already there: the histograms
 existed; the new counters are one atomic add each at points that already

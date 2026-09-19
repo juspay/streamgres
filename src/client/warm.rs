@@ -6,6 +6,9 @@
 //! keyed by the tree that AST translates to, so a shape planned here is a
 //! cache hit for the first client that asks for it again. The file is
 //! written every minute while shapes change and once more on shutdown.
+//! A shape's AST is kept as its JSON text (a `RawValue`), in memory and
+//! in the file alike: a few kilobytes each, where the parsed tree was
+//! ten to fifty times that, and ten thousand of those was a gigabyte.
 
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -18,6 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
+use serde_json::value::RawValue;
 
 use super::ast::{self, Ast};
 use super::plan::{self, PlanCache, Policy};
@@ -25,12 +29,13 @@ use crate::log::log_warn;
 use crate::model::Catalog;
 use crate::sync::Storage;
 
-/// One shape: a query's name, the AST the application server gave for it,
-/// and when it was last asked for (seconds since the epoch).
+/// One shape: a query's name, the AST the application server gave for it
+/// (as JSON text), and when it was last asked for (seconds since the
+/// epoch).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Shape {
     pub name: String,
-    pub ast: Json,
+    pub ast: Box<RawValue>,
     pub last: u64,
 }
 
@@ -92,7 +97,7 @@ impl WarmStart {
         shapes.truncate(self.capacity);
         let mut seen = self.lock();
         for shape in &shapes {
-            seen.insert(key_of(&shape.name, &shape.ast), shape.clone());
+            seen.insert(key_of(&shape.name, shape.ast.get()), shape.clone());
         }
         shapes
     }
@@ -103,7 +108,8 @@ impl WarmStart {
             return;
         }
         let now = now_secs();
-        let key = key_of(name, ast);
+        let text = ast.to_string();
+        let key = key_of(name, &text);
         let mut seen = self.lock();
         match seen.get_mut(&key) {
             Some(shape) => {
@@ -122,11 +128,14 @@ impl WarmStart {
                         seen.remove(&oldest);
                     }
                 }
+                let Ok(raw) = RawValue::from_string(text) else {
+                    return;
+                };
                 seen.insert(
                     key,
                     Shape {
                         name: name.to_owned(),
-                        ast: ast.clone(),
+                        ast: raw,
                         last: now,
                     },
                 );
@@ -180,7 +189,7 @@ impl WarmStart {
         let mut outcome = Replayed::default();
         let mut work = stream::iter(shapes.into_iter())
             .map(|shape| async move {
-                let ast: Ast = match serde_json::from_value(shape.ast) {
+                let ast: Ast = match serde_json::from_str(shape.ast.get()) {
                     Ok(ast) => ast,
                     Err(_) => return false,
                 };
@@ -210,10 +219,10 @@ impl WarmStart {
 }
 
 /// The key of a shape: a hash of its name and its AST's text.
-fn key_of(name: &str, ast: &Json) -> u64 {
+fn key_of(name: &str, ast_text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     name.hash(&mut hasher);
-    ast.to_string().hash(&mut hasher);
+    ast_text.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -290,7 +299,10 @@ mod tests {
         let loaded = again.load();
         let ids: Vec<String> = loaded
             .iter()
-            .map(|shape| shape.ast["where"]["right"]["value"].as_str().unwrap().to_owned())
+            .map(|shape| {
+                let ast: Json = serde_json::from_str(shape.ast.get()).unwrap();
+                ast["where"]["right"]["value"].as_str().unwrap().to_owned()
+            })
             .collect();
         assert!(ids.contains(&"b".to_owned()) && ids.contains(&"c".to_owned()), "{ids:?}");
         assert!(!ids.contains(&"a".to_owned()));
@@ -324,20 +336,21 @@ mod tests {
             limit: 1000,
             preferred: super::super::plan::Side::Parent,
         };
+        let raw = |ast: Json| RawValue::from_string(ast.to_string()).unwrap();
         let shapes = vec![
             Shape {
                 name: "conversationMessages".into(),
-                ast: thread("a"),
+                ast: raw(thread("a")),
                 last: 2,
             },
             Shape {
                 name: "conversationMessages".into(),
-                ast: thread("b"),
+                ast: raw(thread("b")),
                 last: 1,
             },
             Shape {
                 name: "broken".into(),
-                ast: json!({ "table": "nowhere" }),
+                ast: raw(json!({ "table": "nowhere" })),
                 last: 0,
             },
         ];
