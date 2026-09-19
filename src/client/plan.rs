@@ -8,20 +8,29 @@
 //! configured limit plus one and all in one batch, and then settles the
 //! inner edges by a fixed point: a node is *bounded* when its count is
 //! within the limit, when it has a page, or when it is the driven side of
-//! an edge whose driver is bounded; an inner edge with one bounded side
-//! that may drive is driven from it, an edge with two takes the preferred
-//! side, and an edge left with none refuses the query. The root never
-//! changes: the decision is a `driver` per edge ([`Join::driver`]), so
-//! part paths, hidden parts and `EXISTS` leaves all stay where the
-//! translation put them, and an inner edge at any depth is planned the
-//! same way as one at the root.
+//! an edge whose driver is bounded. An inner edge whose sides both fit by
+//! their own counts is driven from the **smaller** one (the preferred
+//! side winning unless the other is at most half its size: a project's
+//! few boards drive the workspace's stages, not the reverse); an edge
+//! with one bounded side is driven from it; an edge left with none
+//! refuses the query. The root never changes: the decision is a `driver`
+//! per edge ([`Join::driver`]), so part paths, hidden parts and `EXISTS`
+//! leaves all stay where the translation put them, and an inner edge at
+//! any depth is planned the same way as one at the root.
 //!
-//! A main with a page never drives an inner edge: its rows would be gated
-//! after the window admitted them, and a page of fifty could show fewer.
-//! Such a node is driven from its sub or the query is refused, which is
-//! the rule a paged root had before. A sub with a page may drive, as it
-//! could before (its gate can hide rows of its window; such parts are
-//! hidden permission subqueries in practice).
+//! **A main with a page.** A sub that fits by its own count drives it:
+//! its values restrict the page inside the page's own filter, so the
+//! window is exact and reads only rows the sub admits (a channel's
+//! conversations driving the page of its attachments). Any other sub is
+//! driven *by* the page: the page reads its window, the sub is narrowed
+//! to the window's values, and the engine keeps the page to the rows the
+//! sub admits, reaching past the ones it rejects (see the `window`
+//! module). That is the plan for `WHERE id = ? … LIMIT 1` under an access
+//! rule that walks `conversations`: four small reads from the row
+//! outwards, where driving from the rule's side reads every conversation
+//! of every channel the user may see. A node bounded only because a
+//! bounded node drives it is not small in any measured sense (the
+//! fan-out is unknown), so it never drives a page.
 //!
 //! The planner does no I/O: it hands out the counts it wants and takes
 //! the answers back, so the caller runs them wherever it can and the
@@ -156,17 +165,23 @@ impl Planner {
             return Ok(self.query);
         }
         let limit = self.policy.limit;
-        let mut bounded: Vec<bool> = self
+        let paged: Vec<bool> = self
             .nodes
             .iter()
-            .map(|node| {
-                node.query.limit != u32::MAX || node.count.is_some_and(|count| count <= limit)
-            })
+            .map(|node| node.query.limit != u32::MAX)
+            .collect();
+        let counts: Vec<Option<u64>> = self
+            .nodes
+            .iter()
+            .map(|node| node.count.filter(|count| *count <= limit))
+            .collect();
+        let mut bounded: Vec<bool> = (0..self.nodes.len())
+            .map(|index| paged[index] || counts[index].is_some())
             .collect();
         loop {
             let mut changed = false;
             for edge in self.edges.iter_mut() {
-                if !edge.is_inner {
+                if !edge.is_inner || edge.decided {
                     let (from, to) = match edge.driver {
                         Driver::Main => (edge.parent, edge.child),
                         Driver::Sub => (edge.child, edge.parent),
@@ -177,35 +192,38 @@ impl Planner {
                     }
                     continue;
                 }
-                if edge.decided {
-                    let (from, to) = match edge.driver {
-                        Driver::Main => (edge.parent, edge.child),
-                        Driver::Sub => (edge.child, edge.parent),
-                    };
-                    if bounded[from] && !bounded[to] {
-                        bounded[to] = true;
-                        changed = true;
+                let (parent, child) = (edge.parent, edge.child);
+                let chosen = if paged[parent] {
+                    Some(if counts[child].is_some() || paged[child] {
+                        Driver::Sub
+                    } else {
+                        Driver::Main
+                    })
+                } else {
+                    match (bounded[parent], bounded[child]) {
+                        (true, false) => Some(Driver::Main),
+                        (false, true) => Some(Driver::Sub),
+                        (true, true) => Some(match (counts[parent], counts[child]) {
+                            (Some(main), Some(sub)) => smaller(main, sub, self.policy.preferred),
+                            (Some(_), None) if !paged[child] => Driver::Main,
+                            _ => match self.policy.preferred {
+                                Side::Parent => Driver::Main,
+                                Side::Child => Driver::Sub,
+                            },
+                        }),
+                        (false, false) => None,
                     }
-                    continue;
-                }
-                let parent_may = self.nodes[edge.parent].query.limit == u32::MAX;
-                let chosen = match (bounded[edge.parent], bounded[edge.child]) {
-                    (true, false) if parent_may => Some(Driver::Main),
-                    (false, true) => Some(Driver::Sub),
-                    (true, true) => match self.policy.preferred {
-                        Side::Parent if parent_may => Some(Driver::Main),
-                        _ => Some(Driver::Sub),
-                    },
-                    _ => None,
                 };
                 if let Some(driver) = chosen {
                     edge.driver = driver;
                     edge.decided = true;
                     let to = match driver {
-                        Driver::Main => edge.child,
-                        Driver::Sub => edge.parent,
+                        Driver::Main => child,
+                        Driver::Sub => parent,
                     };
-                    bounded[to] = true;
+                    if !bounded[to] {
+                        bounded[to] = true;
+                    }
                     changed = true;
                 }
             }
@@ -222,7 +240,7 @@ impl Planner {
             .filter(|&index| !bounded[index])
             .collect();
         if !undecided.is_empty() || !over.is_empty() {
-            return Err(self.refusal(&undecided, &over));
+            return Err(self.refusal(&over));
         }
         let decisions: Vec<(Vec<usize>, usize, Driver)> = self
             .edges
@@ -244,10 +262,8 @@ impl Planner {
         Ok(self.query)
     }
 
-    /// The reason for refusing: every node that came out over the limit,
-    /// and, when a paged main could not drive an edge whose other side is
-    /// too large, that page's table.
-    fn refusal(&self, undecided: &[&PlanEdge], over: &[usize]) -> String {
+    /// The reason for refusing: every node that came out over the limit.
+    fn refusal(&self, over: &[usize]) -> String {
         let limit = self.policy.limit;
         let named: Vec<String> = self
             .nodes
@@ -258,20 +274,22 @@ impl Planner {
             })
             .map(|(_, node)| format!("{} holds more than {limit}", node.query.table))
             .collect();
-        let paged = undecided
-            .iter()
-            .find(|edge| self.nodes[edge.parent].query.limit != u32::MAX)
-            .map(|edge| self.nodes[edge.parent].query.table.clone());
-        match paged {
-            Some(table) => format!(
-                "the query's page can only be driven from {table}'s own side, and the other side is too large to read whole ({})",
-                named.join(", ")
-            ),
-            None => format!(
-                "the query would read more than {limit} rows into memory ({})",
-                named.join(", ")
-            ),
-        }
+        format!(
+            "the query would read more than {limit} rows into memory ({})",
+            named.join(", ")
+        )
+    }
+}
+
+/// Which side of an inner edge drives it when both fit by their own
+/// counts: the smaller one, the preferred side winning unless the other
+/// is at most half its size.
+fn smaller(main: u64, sub: u64, preferred: Side) -> Driver {
+    match preferred {
+        Side::Parent if sub < main && sub.saturating_mul(2) <= main => Driver::Sub,
+        Side::Parent => Driver::Main,
+        Side::Child if main < sub && main.saturating_mul(2) <= sub => Driver::Main,
+        Side::Child => Driver::Sub,
     }
 }
 
@@ -614,20 +632,62 @@ mod tests {
         assert!(reason.contains("messages holds more than 100"), "{reason}");
     }
 
-    /// A root with a page is never counted and may not drive: a big
-    /// child refuses the query, and the reason says why.
+    /// A root with a page is never counted; a child too big to restrict
+    /// it is driven by the page (the engine keeps the page to the rows the
+    /// child admits).
     #[test]
-    fn a_paged_root_cannot_drive() {
+    fn a_paged_root_drives_a_big_child() {
         let (asked, outcome) = drive(
             Planner::new(messages_in_channel(50).query, policy(100, Side::Child)),
             &[("conversations", 101)],
         );
         assert_eq!(asked, vec!["conversations"]);
-        let reason = outcome.expect_err("refused");
-        assert!(reason.contains("page can only be driven"), "{reason}");
-        assert!(
-            reason.contains("conversations holds more than 100"),
-            "{reason}"
+        assert_eq!(outcome.expect("planned").joins[0].driver, Driver::Main);
+    }
+
+    /// The access rule of a message: `messages WHERE id = ? LIMIT 1` under
+    /// `EXISTS conversations (EXISTS channels)`, the conversations
+    /// unfiltered and huge, the channels few. The channels may drive the
+    /// conversations, but conversations bounded only that way (every
+    /// conversation of every channel) never drive the page: the page
+    /// drives them.
+    #[test]
+    fn a_page_is_not_driven_through_an_unmeasured_fan_out() {
+        let channels = MultiTableReadQuery::single(node(
+            "channels",
+            Where::condition("workspaceId", ComparisonOperator::EQ, "w"),
+            u32::MAX,
+        ));
+        let conversations = MultiTableReadQuery::new(
+            node("conversations", Where::exists("channelId", 0), u32::MAX),
+            vec![Join::inner(channels, "channelId", "id")],
+        );
+        let query = MultiTableReadQuery::new(
+            node(
+                "messages",
+                Where::AND(vec![
+                    Where::condition("id", ComparisonOperator::EQ, "m1"),
+                    Where::exists("conversationId", 0),
+                ]),
+                1,
+            ),
+            vec![Join::inner(
+                conversations,
+                "conversationId",
+                "conversationId",
+            )],
+        );
+        let (asked, outcome) = drive(
+            Planner::new(query, policy(100, Side::Parent)),
+            &[("conversations", 101), ("channels", 20)],
+        );
+        assert_eq!(asked, vec!["conversations", "channels"]);
+        let planned = outcome.expect("planned");
+        assert_eq!(planned.joins[0].driver, Driver::Main, "the page drives");
+        assert_eq!(
+            planned.joins[0].sub.joins[0].driver,
+            Driver::Sub,
+            "the few channels still narrow the conversations"
         );
     }
 
@@ -645,7 +705,8 @@ mod tests {
         );
     }
 
-    /// Preferring the parent flips the edge when both sides fit.
+    /// Preferring the parent flips the edge when both sides fit and the
+    /// child is not much the smaller.
     #[test]
     fn a_preferred_parent_that_fits_drives() {
         let (_, outcome) = drive(
@@ -653,9 +714,36 @@ mod tests {
                 messages_in_channel(u32::MAX).query,
                 policy(100, Side::Parent),
             ),
-            &[("messages", 40), ("conversations", 5)],
+            &[("messages", 40), ("conversations", 30)],
         );
         assert_eq!(outcome.expect("planned").joins[0].driver, Driver::Main);
+    }
+
+    /// With both sides measured the smaller one drives, whichever is
+    /// preferred: a project's few boards drive the workspace's stages, a
+    /// conversation's few messages drive the channels of the access rule.
+    #[test]
+    fn the_smaller_side_drives() {
+        for (messages, conversations, preferred, expected) in [
+            (90, 5, Side::Parent, Driver::Sub),
+            (90, 46, Side::Parent, Driver::Main),
+            (5, 90, Side::Parent, Driver::Main),
+            (5, 90, Side::Child, Driver::Main),
+            (46, 90, Side::Child, Driver::Sub),
+            (90, 5, Side::Child, Driver::Sub),
+            (0, 0, Side::Parent, Driver::Main),
+            (0, 0, Side::Child, Driver::Sub),
+        ] {
+            let (_, outcome) = drive(
+                Planner::new(messages_in_channel(u32::MAX).query, policy(100, preferred)),
+                &[("messages", messages), ("conversations", conversations)],
+            );
+            assert_eq!(
+                outcome.expect("planned").joins[0].driver,
+                expected,
+                "{messages} messages, {conversations} conversations, preferring {preferred:?}"
+            );
+        }
     }
 
     /// Preferring the parent when it is too big falls back to the child.
