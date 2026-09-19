@@ -166,9 +166,48 @@ connection-closed lines (all closed by the client), zero slow-query
 warnings, and dropped nothing; the gauges read 208 sockets open (200
 subscribers and 8 writers), 208 groups, 492 MB resident.
 
-### On the rig
+### On the rig (the production-shaped database, `prod-scale-2026-09-19.md`'s setup)
 
-PENDING.
+The same hot ladder as section 3 of that report, seed 7 so the queries
+and arguments repeat this morning's runs, with JSON logs on and the
+sampler at its default:
+
+| clients | steady select p50 / p90 / p99 | first screen p50 / p99 | this morning, same seed, before the transform cache and this layer |
+| --- | --- | --- | --- |
+| 100 | 9 / 20 / 26 ms | 22 / 40 ms | 10 / 22 / 31 |
+| 200 | 15 / 30 / 51 ms | 22 / 83 ms | 21 / 45 / 84 |
+| 300 | 41 / 122 / 364 ms | 39 / 700 ms | 139 / 436 / 1 081 |
+
+The 300 rung is three times better than this morning's because the
+transform cache takes a third of the registrations off the
+development-mode backend, whose round trip is 16 ms at the median here
+where it was 65; nothing else changed on that path. At every rung the
+warnings were the known refusals (the row budget's, the planner's, the
+`LIKE` queries, the harness's own bad arguments), one line per refused
+registration, and no line was dropped.
+
+Our own driver's update ladder (200 clients, rows committed into one
+channel, then over twenty) delivered every row at the same latencies as
+before the layer: 156 / 153 / 176 ms at the median for 50 / 200 / 400
+committed rows a second (10 000 to 80 000 delivered a second), 155 and
+162 ms over twenty channels at 1 000 and 4 000. The log wrote 18 330 JSON
+lines over the hour without dropping one; the thread CPU seconds the
+sampler read from `/proc` put the engine at 178 s, the reads at 112, the
+server tasks at 54 and the group threads at 43 for the whole sequence,
+which is the engine's share said directly. The one thing the layer found
+was not the layer's cost but the caches': the process stood at 9.9 GB
+with nothing held, which is what holding thirty thousand ASTs as parsed
+trees costs. Both caches keep JSON text now (commit 523cf36), and the
+same three rungs on a fresh process read:
+
+| clients | resident set after the rung | with the caches as parsed trees | this morning, without the caches | steady select p50 / p90 / p99 |
+| --- | --- | --- | --- | --- |
+| 100 | 1.3 GB (11 000 transforms, 8 600 shapes kept) | 2.9 GB | 1.25 GB | 9 / 20 / 27 ms |
+| 200 | 2.5 GB (20 000 transforms, 10 000 shapes) | 5.5 GB | 2.2 GB | 14 / 30 / 49 ms |
+| 300 | 3.6 GB | 7.8 GB | 3.2 GB | 40 / 124 / 325 ms |
+
+The caches now cost about 0.3 GB at their full size; the latencies are
+the same as with the trees.
 
 ## 7. What it costs, by construction
 
