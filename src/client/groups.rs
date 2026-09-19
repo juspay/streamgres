@@ -973,9 +973,16 @@ impl Groups {
         for socket in group.sockets.values() {
             let _ = socket.sink.send(Outbound::Text(text.clone()));
         }
-        log_warn!(
-            "group {group_id}: query {} ({hash}) refused: {reason}",
-            state.name
+        let kind = self.stats.note_refusal(&state.name, reason);
+        log_event!(
+            Level::Warn,
+            "query refused",
+            name = state.name,
+            hash = hash,
+            kind = kind,
+            at = "read",
+            group = group_id,
+            reason = reason
         );
     }
 

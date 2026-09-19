@@ -847,9 +847,17 @@ impl Conn {
                         (Some(_), Some(Ok(translated))) => Some(Ok(Box::new(translated))),
                         (Some(_), failed) => {
                             let reason = planned_failure(failed);
-                            log_warn!(
-                                "connection {}: query {name} ({hash}) cannot run here: {reason}",
-                                self.params.wsid
+                            let kind = self.state.stats.note_refusal(&name, &reason);
+                            log_event!(
+                                Level::Warn,
+                                "query refused",
+                                name = name,
+                                hash = hash,
+                                kind = kind,
+                                at = "plan",
+                                group = self.params.group_id,
+                                connection = self.params.wsid,
+                                reason = reason
                             );
                             errored.push(protocol::errored_query(&hash, &name, &reason));
                             Some(Err(reason))
@@ -975,7 +983,25 @@ async fn plan_ast(state: &AppState, name: &str, ast: Json) -> Result<Translated,
         &*state.storage,
     )
     .await;
-    state.stats.plan.record(started.elapsed());
+    let elapsed = started.elapsed();
+    state.stats.plan.record(elapsed);
+    if let Ok(translated) = &planned {
+        let page_drives = plan::page_drives(&translated.query);
+        if page_drives {
+            state
+                .stats
+                .plans_page_driven
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        log_event!(
+            Level::Debug,
+            "query planned",
+            name = name,
+            table = translated.query.main_table.table,
+            page_drives = page_drives,
+            ms = format!("{:.2}", elapsed.as_secs_f64() * 1000.0)
+        );
+    }
     planned
 }
 

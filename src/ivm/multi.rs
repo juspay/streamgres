@@ -409,7 +409,7 @@ pub struct MultiTableIVM {
     clients: IdMap<SubId, ClientId>,
     by_client: IdMap<ClientId, BTreeSet<SubId>>,
     dirty: Vec<TreeId>,
-    in_flight: Vec<(SubId, DataFrameKey)>,
+    in_flight: HashSet<(SubId, DataFrameKey)>,
 }
 
 /// Whether a held row of `part` is shown to clients: the root always, a
@@ -706,6 +706,14 @@ fn downward_edges(tree: &Tree, part: &QueryPart) -> Vec<(usize, ColumnName)> {
         .collect()
 }
 
+/// Whether the rows of `part` act on the edge above it at all.
+fn acts_above(tree: &Tree, part: &QueryPart) -> bool {
+    tree.nodes[part].parent.is_some_and(|index| {
+        let edge = &tree.edges[index];
+        edge.driver == Driver::Sub || edge.gates_parent()
+    })
+}
+
 /// The edge above `part` when the part's rows act on it, with the part's
 /// join column and whether the part drives the edge (a sub-driven edge,
 /// whose set its values fill) or gates the parent (an inner edge the main
@@ -803,7 +811,7 @@ impl MultiTableIVM {
             clients: IdMap::default(),
             by_client: IdMap::default(),
             dirty: Vec::new(),
-            in_flight: Vec::new(),
+            in_flight: HashSet::new(),
         }
     }
 
@@ -1253,7 +1261,13 @@ impl MultiTableIVM {
         pair_moves(&mut tagged);
         let arriving: Vec<(SubId, DataFrameKey)> = tagged
             .iter()
-            .filter(|(_, _, _, update)| matches!(update.op, DataFrameOperation::Add(_, _)))
+            .filter(|(tree_id, _, _, update)| {
+                matches!(update.op, DataFrameOperation::Add(_, _))
+                    && self
+                        .trees
+                        .get(tree_id)
+                        .is_some_and(|tree| tree.edges.iter().any(|edge| edge.is_inner))
+            })
             .map(|(_, _, _, update)| (update.query, update.op.key().clone()))
             .collect();
         self.in_flight.extend(arriving);
@@ -1556,15 +1570,15 @@ impl MultiTableIVM {
         row: &DataFrameRow,
         out: &mut Vec<MultiTableUpdate>,
     ) {
-        let (shown, open) = {
+        let (shown, rises) = {
             let tree = &self.trees[&tree_id];
             (
                 shown_in(tree, part, row),
-                gate_open(tree, &tree.nodes[part], row),
+                acts_above(tree, part) && gate_open(tree, &tree.nodes[part], row),
             )
         };
         self.touch_page(tree_id, part);
-        if open {
+        if rises {
             self.rise(tree_id, part, key, row, out);
         }
         for (edge, column) in downward_edges(&self.trees[&tree_id], part) {
@@ -1657,12 +1671,8 @@ impl MultiTableIVM {
     /// The `Add` of `key` into `inner` is being handled: the row is no
     /// longer in flight.
     fn landed_in_flight(&mut self, inner: SubId, key: &DataFrameKey) {
-        if let Some(position) = self
-            .in_flight
-            .iter()
-            .position(|(sub, other)| *sub == inner && other == key)
-        {
-            self.in_flight.swap_remove(position);
+        if !self.in_flight.is_empty() {
+            self.in_flight.remove(&(inner, key.clone()));
         }
     }
 
@@ -1768,7 +1778,7 @@ impl MultiTableIVM {
         row: &DataFrameRow,
         out: &mut Vec<MultiTableUpdate>,
     ) {
-        if upward_edge(&self.trees[&tree_id], part).is_none() {
+        if !acts_above(&self.trees[&tree_id], part) {
             return;
         }
         let recorded = self
@@ -1791,7 +1801,7 @@ impl MultiTableIVM {
         row: &DataFrameRow,
         out: &mut Vec<MultiTableUpdate>,
     ) {
-        if upward_edge(&self.trees[&tree_id], part).is_none() {
+        if !acts_above(&self.trees[&tree_id], part) {
             return;
         }
         let recorded = self
@@ -2266,12 +2276,7 @@ impl MultiTableIVM {
                 .single
                 .visible_rows_matching(inner, column.as_str(), value);
             if !self.in_flight.is_empty() {
-                rows.retain(|(key, _)| {
-                    !self
-                        .in_flight
-                        .iter()
-                        .any(|(sub, other)| *sub == inner && other == key)
-                });
+                rows.retain(|(key, _)| !self.in_flight.contains(&(inner, key.clone())));
             }
             rows
         };

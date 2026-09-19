@@ -68,6 +68,10 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_read_rows` | rows per storage read (histogram over counts) |
 | `xyne_sync_reads_total{outcome=issued,landed,refused,shared}` | storage reads, and registrations served from a twin without one |
 | `xyne_sync_subscriptions`, `xyne_sync_trees` | what the engine holds |
+| `xyne_sync_queries_refused_total{reason=unsupported,plan_limit,read_limit,other}` | queries the server refused, by why: the translation cannot express it (`LIKE`, `NOT EXISTS`), the planner found no side of a join small enough to read, a read came back over the row limit, anything else |
+| `xyne_sync_plans_total{kind=page_drives}` | plans in which a node with a `LIMIT` drives an inner edge (the page is kept to the rows the edge admits) |
+| `xyne_sync_page_rows_rejected_total`, `xyne_sync_pages_capped_total` | rows a join gate rejected inside a page, each making the page reach one row further; pages that stopped reaching after 2 000 rejected rows |
+| `xyne_sync_window_refills_total` | refill reads asked for by drained windows |
 
 ### Update
 
@@ -116,11 +120,21 @@ object per line, `{"ts","level","thread","msg", ...fields}`.
 | connection opened / closed | info | wsid, group, client, whether authenticated, origin; on close: seconds open and the close reason (client, error, server) |
 | query hydrated | debug | group, name, hash, kind (cold or warm), ms from registration to rows present |
 | slow query | warn | the same, when hydration exceeds `XYNE_SYNC_SLOW_QUERY_MS` (1 000) |
-| query refused or errored | warn | wsid, name, hash, reason (as today) |
+| query refused | warn | name, hash, kind (`unsupported`, `plan_limit`, `read_limit`, `other`), at (`plan`: before it registered; `read`: a read it depended on), group, connection, the reason in full |
+| query planned | debug | name, the root's table, whether a page drives an inner edge, ms |
 | transaction routed | debug | position, writes, client updates, reads asked, ms |
 | feed lag | warn | when commit → engine exceeds 5 s, once per minute |
 | push forwarded | debug (warn when failed or slower than the slow threshold) | wsid, group, mutations, ms, failed |
-| summary | info, every minute | connections, groups, clients, subscriptions, rows held, RSS, engine busy %, feed lag, transform and plan hit rates, registrations/s, transactions/s, pokes/s, log drops |
+| summary | info, every minute | connections, groups, clients, subscriptions, rows held, RSS, engine busy %, feed lag, transform and plan hit rates, registrations/s, transactions/s, pokes/s, queries refused and page rows rejected since the last line, log drops |
+
+**The queries to rewrite.** `/stats` carries `refused_queries`: every
+query *name* the server has refused since it started, most refused first,
+with its class, how often, when last, and the last reason in full (the
+first 256 names; the counters count the rest). A query that is refused
+is one the application should not be asking as written: a whole
+knowledge base with every file in it to show a count, a search by
+`LIKE` over a JSON text. The list is the application's to-do, read from
+the server that pays for the queries.
 
 The reference server's equivalents, for whoever reads both: its `slow hydrate`
 warnings (its slow-hydrate threshold), its sync, replication and server

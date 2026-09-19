@@ -281,6 +281,15 @@ impl Planner {
     }
 }
 
+/// Whether some node of `query` with a page drives an inner edge: the
+/// plan whose page the engine keeps to the rows the edge admits.
+pub fn page_drives(query: &MultiTableReadQuery) -> bool {
+    let paged = query.main_table.limit != u32::MAX;
+    query.joins.iter().any(|join| {
+        (paged && join.is_inner && join.driver == Driver::Main) || page_drives(&join.sub)
+    })
+}
+
 /// Which side of an inner edge drives it when both fit by their own
 /// counts: the smaller one, the preferred side winning unless the other
 /// is at most half its size.
@@ -717,6 +726,21 @@ mod tests {
             &[("messages", 40), ("conversations", 30)],
         );
         assert_eq!(outcome.expect("planned").joins[0].driver, Driver::Main);
+    }
+
+    /// A planned page that drives is reported as such, at any depth.
+    #[test]
+    fn a_driving_page_is_reported() {
+        let (_, outcome) = drive(
+            Planner::new(messages_in_channel(50).query, policy(100, Side::Child)),
+            &[("conversations", 101)],
+        );
+        assert!(page_drives(&outcome.expect("planned")));
+        let (_, outcome) = drive(
+            Planner::new(messages_in_channel(50).query, policy(100, Side::Child)),
+            &[("conversations", 5)],
+        );
+        assert!(!page_drives(&outcome.expect("planned")));
     }
 
     /// With both sides measured the smaller one drives, whichever is

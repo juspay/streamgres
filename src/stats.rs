@@ -271,6 +271,11 @@ pub struct Stats {
     pub transform_hits: AtomicU64,
     pub transform_misses: AtomicU64,
     pub transform_errors: AtomicU64,
+    pub refused_unsupported: AtomicU64,
+    pub refused_plan_limit: AtomicU64,
+    pub refused_read_limit: AtomicU64,
+    pub refused_other: AtomicU64,
+    pub plans_page_driven: AtomicU64,
     pub pushes_ok: AtomicU64,
     pub pushes_failed: AtomicU64,
     pub connections_opened: AtomicU64,
@@ -290,6 +295,43 @@ pub struct Stats {
     engine: Mutex<Engine>,
     pushes: Mutex<HashMap<String, Vec<PendingPush>>>,
     sampled: Mutex<Sampled>,
+    refused: Mutex<HashMap<String, RefusedQuery>>,
+}
+
+/// One query name the server refused: why (the class and the last reason
+/// in full), how often, and when last. The report of the queries the
+/// application should rewrite.
+#[derive(Debug, Clone)]
+pub struct RefusedQuery {
+    pub kind: &'static str,
+    pub reason: String,
+    pub count: u64,
+    pub last_ms: u64,
+}
+
+/// How many refused query names are kept; past it new names are counted
+/// but not listed.
+const REFUSED_NAMES: usize = 256;
+
+/// The class of a refusal, from its reason: `unsupported` (something the
+/// translation does not express: `LIKE`, `NOT EXISTS`, a compound join
+/// key), `plan_limit` (the planner found no side of a join small enough
+/// to read), `read_limit` (a read came back larger than the row limit),
+/// `other` (a count that failed, an AST that does not parse).
+pub fn refusal_kind(reason: &str) -> &'static str {
+    if reason.contains("would read more than") {
+        "plan_limit"
+    } else if reason.contains("returned more than") {
+        "read_limit"
+    } else if reason.contains("not supported")
+        || reason.contains("unknown ")
+        || reason.contains("nests deeper")
+        || reason.contains("without columns")
+    {
+        "unsupported"
+    } else {
+        "other"
+    }
 }
 
 impl Default for Stats {
@@ -334,6 +376,11 @@ impl Stats {
             transform_hits: AtomicU64::new(0),
             transform_misses: AtomicU64::new(0),
             transform_errors: AtomicU64::new(0),
+            refused_unsupported: AtomicU64::new(0),
+            refused_plan_limit: AtomicU64::new(0),
+            refused_read_limit: AtomicU64::new(0),
+            refused_other: AtomicU64::new(0),
+            plans_page_driven: AtomicU64::new(0),
             pushes_ok: AtomicU64::new(0),
             pushes_failed: AtomicU64::new(0),
             connections_opened: AtomicU64::new(0),
@@ -353,6 +400,7 @@ impl Stats {
             engine: Mutex::new(Engine::default()),
             pushes: Mutex::new(HashMap::new()),
             sampled: Mutex::new(Sampled::default()),
+            refused: Mutex::new(HashMap::new()),
         }
     }
 
@@ -504,6 +552,11 @@ impl Stats {
             ("transform_hits", load(&self.transform_hits)),
             ("transform_misses", load(&self.transform_misses)),
             ("transform_errors", load(&self.transform_errors)),
+            ("refused_unsupported", load(&self.refused_unsupported)),
+            ("refused_plan_limit", load(&self.refused_plan_limit)),
+            ("refused_read_limit", load(&self.refused_read_limit)),
+            ("refused_other", load(&self.refused_other)),
+            ("plans_page_driven", load(&self.plans_page_driven)),
             ("pushes_ok", load(&self.pushes_ok)),
             ("pushes_failed", load(&self.pushes_failed)),
             ("connections_opened", load(&self.connections_opened)),
@@ -547,6 +600,59 @@ impl Stats {
             ("feed_heartbeat_age_ms", heartbeat_age_ms),
             ("process_rss_bytes", load(&self.process_rss_bytes)),
         ]
+    }
+
+    /// Count one refusal of the query `name` for `reason`, returning its
+    /// class: the counter of the class, and the per-name report.
+    pub fn note_refusal(&self, name: &str, reason: &str) -> &'static str {
+        let kind = refusal_kind(reason);
+        let counter = match kind {
+            "unsupported" => &self.refused_unsupported,
+            "plan_limit" => &self.refused_plan_limit,
+            "read_limit" => &self.refused_read_limit,
+            _ => &self.refused_other,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut refused) = self.refused.lock() {
+            let room = refused.len() < REFUSED_NAMES;
+            match refused.get_mut(name) {
+                Some(entry) => {
+                    entry.kind = kind;
+                    entry.reason = reason.to_owned();
+                    entry.count += 1;
+                    entry.last_ms = now_ms();
+                }
+                None if room => {
+                    refused.insert(
+                        name.to_owned(),
+                        RefusedQuery {
+                            kind,
+                            reason: reason.to_owned(),
+                            count: 1,
+                            last_ms: now_ms(),
+                        },
+                    );
+                }
+                None => {}
+            }
+        }
+        kind
+    }
+
+    /// The refused query names, most refused first.
+    pub fn refused_queries(&self) -> Vec<(String, RefusedQuery)> {
+        let mut refused: Vec<(String, RefusedQuery)> = self
+            .refused
+            .lock()
+            .map(|refused| {
+                refused
+                    .iter()
+                    .map(|(name, entry)| (name.clone(), entry.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        refused.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(&b.0)));
+        refused
     }
 
     /// Everything, as the `/stats` endpoint serves it.
@@ -594,6 +700,19 @@ impl Stats {
             .iter()
             .map(|(name, seconds)| (name.clone(), json!(seconds)))
             .collect();
+        let refused: Vec<Json> = self
+            .refused_queries()
+            .into_iter()
+            .map(|(name, entry)| {
+                json!({
+                    "name": name,
+                    "kind": entry.kind,
+                    "count": entry.count,
+                    "last_ms": entry.last_ms,
+                    "reason": entry.reason,
+                })
+            })
+            .collect();
         json!({
             "uptime_s": self.started.elapsed().as_secs(),
             "stages_us": stages,
@@ -607,6 +726,7 @@ impl Stats {
             },
             "threads_cpu_s": thread_cpu,
             "groups_inbox": sampled.groups_inbox,
+            "refused_queries": refused,
             "engine": {
                 "writes_processed": engine.ivm.writes_processed,
                 "queries_registered": engine.ivm.queries_registered,
@@ -845,6 +965,18 @@ impl Stats {
                 "pushes",
                 now.pushes.saturating_sub(previous.pushes).to_string(),
             ),
+            (
+                "queries_refused",
+                now.refused.saturating_sub(previous.refused).to_string(),
+            ),
+            (
+                "page_rows_rejected",
+                engine
+                    .ivm
+                    .window_rejections
+                    .saturating_sub(previous.page_rows_rejected)
+                    .to_string(),
+            ),
             ("log_dropped", now.log_dropped.to_string()),
         ];
         ("summary".to_owned(), fields)
@@ -869,6 +1001,15 @@ impl Stats {
             engine_inbox: load(&self.engine_inbox),
             rss_bytes: load(&self.process_rss_bytes),
             log_dropped: crate::log::dropped(),
+            refused: load(&self.refused_unsupported)
+                + load(&self.refused_plan_limit)
+                + load(&self.refused_read_limit)
+                + load(&self.refused_other),
+            page_rows_rejected: self
+                .engine
+                .lock()
+                .map(|engine| engine.ivm.window_rejections)
+                .unwrap_or(0),
         }
     }
 }
@@ -891,6 +1032,8 @@ pub struct Snapshot {
     pub engine_inbox: u64,
     pub rss_bytes: u64,
     pub log_dropped: u64,
+    pub refused: u64,
+    pub page_rows_rejected: u64,
 }
 
 /// Milliseconds since the epoch.
@@ -982,6 +1125,26 @@ fn counter_name(name: &str) -> (String, &'static str) {
         "transform_errors" => (
             "xyne_sync_transforms_total".to_owned(),
             "{result=\"error\"}",
+        ),
+        "refused_unsupported" => (
+            "xyne_sync_queries_refused_total".to_owned(),
+            "{reason=\"unsupported\"}",
+        ),
+        "refused_plan_limit" => (
+            "xyne_sync_queries_refused_total".to_owned(),
+            "{reason=\"plan_limit\"}",
+        ),
+        "refused_read_limit" => (
+            "xyne_sync_queries_refused_total".to_owned(),
+            "{reason=\"read_limit\"}",
+        ),
+        "refused_other" => (
+            "xyne_sync_queries_refused_total".to_owned(),
+            "{reason=\"other\"}",
+        ),
+        "plans_page_driven" => (
+            "xyne_sync_plans_total".to_owned(),
+            "{kind=\"page_drives\"}",
         ),
         "pushes_ok" => ("xyne_sync_pushes_total".to_owned(), "{result=\"ok\"}"),
         "pushes_failed" => ("xyne_sync_pushes_total".to_owned(), "{result=\"failed\"}"),
@@ -1183,5 +1346,36 @@ mod tests {
         assert_eq!(field("transactions_per_s"), "2.0");
         assert_eq!(field("transform_hit_pct"), "75.0");
         assert_eq!(field("engine_busy_pct"), "5.0");
+    }
+    /// A refusal is classed by its reason, counted under its class, and
+    /// reported by query name with its last reason, most refused first.
+    #[test]
+    fn refusals_are_classed_counted_and_reported_by_name() {
+        let stats = Stats::new();
+        let plan = "the query would read more than 100000 rows into memory (messages holds more than 100000)";
+        let read = "a read on `collection_items` returned more than 100000 rows";
+        assert_eq!(stats.note_refusal("bigJoin", plan), "plan_limit");
+        assert_eq!(stats.note_refusal("kbRoot", read), "read_limit");
+        assert_eq!(stats.note_refusal("kbRoot", read), "read_limit");
+        assert_eq!(
+            stats.note_refusal("search", "ILIKE is not supported (a condition on `name`)"),
+            "unsupported"
+        );
+        assert_eq!(
+            stats.note_refusal("odd", "counting the rows of tickets failed: timeout"),
+            "other"
+        );
+        let refused = stats.refused_queries();
+        assert_eq!(refused[0].0, "kbRoot");
+        assert_eq!(refused[0].1.count, 2);
+        assert_eq!(refused[0].1.kind, "read_limit");
+        assert_eq!(refused.len(), 4);
+        let text = stats.prometheus();
+        assert!(text.contains("xyne_sync_queries_refused_total{reason=\"read_limit\"} 2"));
+        assert!(text.contains("xyne_sync_queries_refused_total{reason=\"plan_limit\"} 1"));
+        assert!(text.contains("xyne_sync_queries_refused_total{reason=\"unsupported\"} 1"));
+        let json = stats.json();
+        assert_eq!(json["refused_queries"][0]["name"], "kbRoot");
+        assert_eq!(json["refused_queries"][0]["reason"], read);
     }
 }
