@@ -277,12 +277,16 @@ impl TableIndex {
     /// A set-valued condition already indexed here gained `value`: file it
     /// under that one key (a set past the filing limit is probed instead
     /// and needs nothing). The set itself is the caller's to mutate;
-    /// nothing else in the index moves.
+    /// nothing else in the index moves. The column's index is made anew
+    /// when it is gone: an empty set files nothing, so the last other
+    /// condition leaving the column drops the column's index from under
+    /// it.
     pub(super) fn set_insert(&mut self, condition: &Condition, value: &Value) {
-        if let Some(linked) = self.by_condition.get(condition)
-            && let Some(column) = self.columns.get_mut(&condition.column)
-        {
-            column.file_key(&linked.handle, value);
+        if let Some(linked) = self.by_condition.get(condition) {
+            self.columns
+                .entry(condition.column.clone())
+                .or_default()
+                .file_key(&linked.handle, value);
         }
     }
 

@@ -538,7 +538,10 @@ impl Stats {
             ("clients", load(&self.clients)),
             ("engine_inbox", load(&self.engine_inbox)),
             ("plan_cache_entries", load(&self.plan_cache_entries)),
-            ("transform_cache_entries", load(&self.transform_cache_entries)),
+            (
+                "transform_cache_entries",
+                load(&self.transform_cache_entries),
+            ),
             ("warm_shapes", load(&self.warm_shapes)),
             ("feed_lsn", load(&self.feed_lsn)),
             ("feed_heartbeat_age_ms", heartbeat_age_ms),
@@ -615,6 +618,8 @@ impl Stats {
                 "storage_reads": engine.ivm.storage_reads,
                 "window_evictions": engine.ivm.window_evictions,
                 "window_refills": engine.ivm.window_refills,
+                "window_rejections": engine.ivm.window_rejections,
+                "window_capped": engine.ivm.window_capped,
                 "snapshots_shared": engine.ivm.snapshots_shared,
                 "reads_issued": engine.sync.reads_issued,
                 "reads_landed": engine.sync.reads_landed,
@@ -749,6 +754,9 @@ impl Stats {
             ("reads_landed_total", engine.sync.reads_landed),
             ("reads_refused_total", engine.sync.reads_refused),
             ("reads_shared_total", engine.ivm.snapshots_shared),
+            ("window_refills_total", engine.ivm.window_refills),
+            ("page_rows_rejected_total", engine.ivm.window_rejections),
+            ("pages_capped_total", engine.ivm.window_capped),
             ("registrations_total", engine.ivm.queries_registered),
             ("client_updates_add_total", engine.ivm.ops_add),
             ("client_updates_delete_total", engine.ivm.ops_delete),
@@ -771,10 +779,13 @@ impl Stats {
         let now = self.snapshot();
         let secs = since.as_secs_f64().max(0.001);
         let rate = |a: u64, b: u64| (a.saturating_sub(b)) as f64 / secs;
-        let engine_busy =
-            (now.engine_busy_us.saturating_sub(previous.engine_busy_us)) as f64 / 1_000_000.0 / secs;
+        let engine_busy = (now.engine_busy_us.saturating_sub(previous.engine_busy_us)) as f64
+            / 1_000_000.0
+            / secs;
         let hits = now.transform_hits.saturating_sub(previous.transform_hits);
-        let misses = now.transform_misses.saturating_sub(previous.transform_misses);
+        let misses = now
+            .transform_misses
+            .saturating_sub(previous.transform_misses);
         let transform_hit_rate = if hits + misses == 0 {
             0.0
         } else {
@@ -821,13 +832,19 @@ impl Stats {
                 "transactions_per_s",
                 format!("{:.1}", rate(now.transactions, previous.transactions)),
             ),
-            ("pokes_per_s", format!("{:.1}", rate(now.pokes, previous.pokes))),
+            (
+                "pokes_per_s",
+                format!("{:.1}", rate(now.pokes, previous.pokes)),
+            ),
             (
                 "rows_sent_per_s",
                 format!("{:.0}", rate(now.rows_serialized, previous.rows_serialized)),
             ),
             ("transform_hit_pct", format!("{transform_hit_rate:.1}")),
-            ("pushes", now.pushes.saturating_sub(previous.pushes).to_string()),
+            (
+                "pushes",
+                now.pushes.saturating_sub(previous.pushes).to_string(),
+            ),
             ("log_dropped", now.log_dropped.to_string()),
         ];
         ("summary".to_owned(), fields)
@@ -962,7 +979,10 @@ fn counter_name(name: &str) -> (String, &'static str) {
     match name {
         "transform_hits" => ("xyne_sync_transforms_total".to_owned(), "{result=\"hit\"}"),
         "transform_misses" => ("xyne_sync_transforms_total".to_owned(), "{result=\"miss\"}"),
-        "transform_errors" => ("xyne_sync_transforms_total".to_owned(), "{result=\"error\"}"),
+        "transform_errors" => (
+            "xyne_sync_transforms_total".to_owned(),
+            "{result=\"error\"}",
+        ),
         "pushes_ok" => ("xyne_sync_pushes_total".to_owned(), "{result=\"ok\"}"),
         "pushes_failed" => ("xyne_sync_pushes_total".to_owned(), "{result=\"failed\"}"),
         "connections_opened" => (
@@ -1082,8 +1102,14 @@ mod tests {
             line("xyne_sync_transforms_total{result=\"hit\"}"),
             "xyne_sync_transforms_total{result=\"hit\"} 3"
         );
-        assert_eq!(line("xyne_sync_connections_open "), "xyne_sync_connections_open 7");
-        assert_eq!(line("xyne_sync_subscriptions "), "xyne_sync_subscriptions 12");
+        assert_eq!(
+            line("xyne_sync_connections_open "),
+            "xyne_sync_connections_open 7"
+        );
+        assert_eq!(
+            line("xyne_sync_subscriptions "),
+            "xyne_sync_subscriptions 12"
+        );
         assert_eq!(
             line("xyne_sync_rows_held{table=\"messages\"}"),
             "xyne_sync_rows_held{table=\"messages\"} 900"
@@ -1098,7 +1124,8 @@ mod tests {
             "{cumulative:?}"
         );
         assert_eq!(
-            text.matches("# TYPE xyne_sync_engine_step_seconds histogram").count(),
+            text.matches("# TYPE xyne_sync_engine_step_seconds histogram")
+                .count(),
             1,
             "one TYPE line per metric"
         );

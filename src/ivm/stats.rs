@@ -53,6 +53,10 @@ use std::fmt;
 /// Window maintenance:
 /// - `window_evictions`: rows evicted past a window's doubled buffer.
 /// - `window_refills`: refill reads asked for by drained windows.
+/// - `window_rejections`: rows a join gate rejected inside a page, each
+///   making the page reach one row further.
+/// - `window_capped`: windows that stopped growing past their rejected
+///   rows (a page whose gate turns away thousands of rows).
 ///
 /// Emitted operations:
 /// - `ops_add`: `Add` operations emitted (row entered a result set, or
@@ -77,6 +81,8 @@ pub struct IvmStats {
     pub storage_reads: u64,
     pub window_evictions: u64,
     pub window_refills: u64,
+    pub window_rejections: u64,
+    pub window_capped: u64,
     pub ops_add: u64,
     pub ops_delete: u64,
 }
@@ -103,6 +109,8 @@ impl IvmStats {
             storage_reads: self.storage_reads - earlier.storage_reads,
             window_evictions: self.window_evictions - earlier.window_evictions,
             window_refills: self.window_refills - earlier.window_refills,
+            window_rejections: self.window_rejections - earlier.window_rejections,
+            window_capped: self.window_capped - earlier.window_capped,
             ops_add: self.ops_add - earlier.ops_add,
             ops_delete: self.ops_delete - earlier.ops_delete,
         }
@@ -175,6 +183,11 @@ impl fmt::Display for IvmStats {
             f,
             "window evictions / refills . {} / {}",
             self.window_evictions, self.window_refills
+        )?;
+        writeln!(
+            f,
+            "page rows rejected / capped  {} / {}",
+            self.window_rejections, self.window_capped
         )?;
         write!(
             f,

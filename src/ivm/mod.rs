@@ -660,9 +660,14 @@ impl Engine for SingleTableIVM {
         self.addressed(updates)
     }
 
-    /// [`SingleTableIVM::land_fetch`], grouped per client.
-    fn land(&mut self, fetch: &Fetch, rows: &[(DataFrameKey, DataFrameRow)]) -> Vec<ClientUpdate> {
-        let updates = self.land_fetch(fetch, rows);
+    /// [`SingleTableIVM::land_read`], grouped per client.
+    fn land(
+        &mut self,
+        fetch: &Fetch,
+        rows: &[(DataFrameKey, DataFrameRow)],
+        worst_read: Option<&DataFrameRow>,
+    ) -> Vec<ClientUpdate> {
+        let updates = self.land_read(fetch, rows, worst_read);
         self.addressed(updates)
     }
 

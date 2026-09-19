@@ -260,9 +260,9 @@ impl<E: Engine> Runtime<E> {
             snapshot.at,
             self.position
         );
-        let rows = self.bring_up(&flight.fetch, snapshot.rows, snapshot.at);
+        let (rows, worst_read) = self.bring_up(&flight.fetch, snapshot.rows, snapshot.at);
         self.stats.reads_landed += 1;
-        step.updates = self.engine.land(&flight.fetch, &rows);
+        step.updates = self.engine.land(&flight.fetch, &rows, worst_read.as_ref());
         self.landed.push(rows);
         self.collect(&mut step);
         self.trim();
@@ -356,14 +356,17 @@ impl<E: Engine> Runtime<E> {
     /// snapshot did not have that a write since brought into the filter
     /// is added (it was routed to nobody if the subscription did not exist
     /// yet). Rows the writes never touched stand. Under a window whose
-    /// read came back full, a late row worse than the worst row read is
-    /// left to a refill, so the frontier the landing sets stays honest.
+    /// read came back full, a row a write since moved worse than the worst
+    /// row read, or brought in there, is left to a refill, so the frontier
+    /// the landing sets stays honest; the worst row read comes back beside
+    /// the rows for that frontier, since the rows alone, some of them
+    /// dropped here, no longer say the read was full.
     fn bring_up(
         &mut self,
         fetch: &Fetch,
         rows: Vec<(DataFrameKey, DataFrameRow)>,
         at: Lsn,
-    ) -> Vec<(DataFrameKey, DataFrameRow)> {
+    ) -> (Vec<(DataFrameKey, DataFrameRow)>, Option<DataFrameRow>) {
         let table: &TableName = &fetch.query.table;
         let query = &fetch.query;
         let worst_read = (query.limit != u32::MAX && rows.len() >= query.limit as usize)
@@ -402,8 +405,15 @@ impl<E: Engine> Runtime<E> {
                 self.stats.rows_added += 1;
                 continue;
             };
+            let beyond = |image: &DataFrameRow| {
+                worst_read.as_ref().is_some_and(|worst| {
+                    order_rows(&query.order_by, image, worst) == std::cmp::Ordering::Greater
+                })
+            };
             match delivered.write.new_row_image() {
-                Some(image) if evaluate(&fetch.query.filter, &image.data, &mut 0) => {
+                Some(image)
+                    if evaluate(&fetch.query.filter, &image.data, &mut 0) && !beyond(image) =>
+                {
                     if let Some((_, row)) = rows[position].as_mut() {
                         *row = image.clone();
                         self.stats.rows_refreshed += 1;
@@ -417,7 +427,7 @@ impl<E: Engine> Runtime<E> {
                 }
             }
         }
-        rows.into_iter().flatten().collect()
+        (rows.into_iter().flatten().collect(), worst_read)
     }
 
     /// Forget delivered writes no read can still be positioned below:

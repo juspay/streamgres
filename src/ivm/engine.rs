@@ -97,7 +97,15 @@ pub trait Engine {
     /// engine's position by the runtime: each row is adopted into the
     /// shared frame if the frame does not hold it and tagged for the
     /// reading subscription.
-    fn land(&mut self, fetch: &Fetch, rows: &[(DataFrameKey, DataFrameRow)]) -> Vec<ClientUpdate>;
+    /// `worst_read` is the worst row the read returned when it came back
+    /// full, before it was brought up to date (`None` when it came back
+    /// short): what a window's frontier is set from.
+    fn land(
+        &mut self,
+        fetch: &Fetch,
+        rows: &[(DataFrameKey, DataFrameRow)],
+        worst_read: Option<&DataFrameRow>,
+    ) -> Vec<ClientUpdate>;
 
     /// Take the reads recorded since the last call, in the order they were
     /// asked for.

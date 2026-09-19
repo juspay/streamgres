@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use xyne_sync::ivm::{ClientUpdate, MultiTableIVM, QueryPart, SubId};
+use xyne_sync::ivm::{ClientUpdate, Engine, MultiTableIVM, QueryPart, SubId};
 use xyne_sync::model::*;
 use xyne_sync::sync::{Local, MemoryStorage};
 
@@ -1845,4 +1845,348 @@ fn a_nested_main_driven_inner_edge_gates_its_node() {
         ["q/join0/del:Int(1)", "q/part[0, 0]/del:Int(1)"],
         "the last profile leaving closes it"
     );
+}
+
+/// A chain of inner edges all evaluated from the main: a ticket is shown
+/// only while its user is shown, and a user only while it has a profile,
+/// so a held user whose own gate is closed opens nothing above it.
+#[test]
+fn a_main_driven_inner_chain_shows_only_rows_reaching_the_leaf() {
+    let (mut ivm, storage, names) = engine();
+    for w in [
+        user(1, "a"),
+        user(2, "b"),
+        ticket(1, "OPEN", 1),
+        ticket(2, "OPEN", 2),
+        profile(1, 1),
+    ] {
+        storage.apply(&w);
+    }
+    let spec = MultiTableReadQuery::new(
+        open_tickets(),
+        vec![Join::inner_from_main(
+            MultiTableReadQuery::new(
+                query(&sub_table("users"), Where::AND(vec![])),
+                vec![Join::inner_from_main(
+                    MultiTableReadQuery::single(query(&profiles_table(), Where::AND(vec![]))),
+                    "id",
+                    "user_id",
+                )],
+            ),
+            "assigned_to",
+            "id",
+        )],
+    );
+    let snapshot = names.register(&mut ivm, "q", spec);
+    assert_eq!(
+        names.tags(&snapshot),
+        [
+            "q/join0/add:Int(1)",
+            "q/main/add:Int(1)",
+            "q/part[0, 0]/add:Int(1)"
+        ],
+        "ticket 2's user has no profile, so neither is shown"
+    );
+    let ops = write(&mut ivm, &storage, profile(2, 2));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/add:Int(2)",
+            "q/main/add:Int(2)",
+            "q/part[0, 0]/add:Int(2)"
+        ]
+    );
+    let ops = write(&mut ivm, &storage, delete("profiles", 1));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/del:Int(1)",
+            "q/main/del:Int(1)",
+            "q/part[0, 0]/del:Int(1)"
+        ]
+    );
+}
+
+/// A sub-driven inner edge over a main-driven one: the users drive the
+/// tickets, and a user is itself gated by its profiles. A held user whose
+/// gate is closed must not drive: its ticket is not shown.
+#[test]
+fn a_gated_driver_drives_only_with_its_gate_open() {
+    let (mut ivm, storage, names) = engine();
+    for w in [
+        user(1, "a"),
+        user(2, "b"),
+        ticket(1, "OPEN", 1),
+        ticket(2, "OPEN", 2),
+        profile(1, 1),
+    ] {
+        storage.apply(&w);
+    }
+    let spec = MultiTableReadQuery::new(
+        open_tickets(),
+        vec![Join::inner(
+            MultiTableReadQuery::new(
+                query(&sub_table("users"), Where::AND(vec![])),
+                vec![Join::inner_from_main(
+                    MultiTableReadQuery::single(query(&profiles_table(), Where::AND(vec![]))),
+                    "id",
+                    "user_id",
+                )],
+            ),
+            "assigned_to",
+            "id",
+        )],
+    );
+    let snapshot = names.register(&mut ivm, "q", spec);
+    assert_eq!(
+        names.tags(&snapshot),
+        [
+            "q/join0/add:Int(1)",
+            "q/main/add:Int(1)",
+            "q/part[0, 0]/add:Int(1)"
+        ],
+        "user 2 has no profile, so it drives nothing"
+    );
+    let ops = write(&mut ivm, &storage, profile(2, 2));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/add:Int(2)",
+            "q/main/add:Int(2)",
+            "q/part[0, 0]/add:Int(2)"
+        ]
+    );
+    let ops = write(&mut ivm, &storage, delete("profiles", 1));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/del:Int(1)",
+            "q/main/del:Int(1)",
+            "q/part[0, 0]/del:Int(1)"
+        ]
+    );
+}
+
+/// The two first OPEN tickets whose assignee exists: a page that drives
+/// its own inner edge.
+fn first_two_tickets_with_a_user() -> MultiTableReadQuery {
+    let mut main_table = open_tickets();
+    main_table.limit = 2;
+    MultiTableReadQuery::new(
+        main_table,
+        vec![Join::inner_from_main(
+            MultiTableReadQuery::single(query(&sub_table("users"), Where::AND(vec![]))),
+            "assigned_to",
+            "id",
+        )],
+    )
+}
+
+/// The ids of the rows a subscription's part shows, sorted.
+fn shown_ids(ivm: &Ivm, names: &Names, name: &str, part: QueryPart) -> Vec<i64> {
+    let mut ids: Vec<i64> = ivm
+        .engine()
+        .rows_for(names.id(name), part)
+        .unwrap_or_default()
+        .keys()
+        .map(|key| match key.pkey_value["id"] {
+            Value::Int(id) => id,
+            _ => panic!("an integer key"),
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// A page that drives an inner edge is the best rows *the edge admits*:
+/// tickets whose assignee does not exist take no place in it, the page
+/// reaches past them, and it draws back when one of them is admitted.
+#[test]
+fn a_page_under_a_gate_holds_the_best_rows_the_gate_admits() {
+    let (mut ivm, storage, names) = engine();
+    for id in 1..=8 {
+        storage.apply(&ticket(id, "OPEN", id));
+    }
+    for id in [3, 6, 7] {
+        storage.apply(&user(id, "u"));
+    }
+    let snapshot = names.register(&mut ivm, "q", first_two_tickets_with_a_user());
+    assert_eq!(
+        names.tags(&snapshot),
+        [
+            "q/join0/add:Int(3)",
+            "q/join0/add:Int(6)",
+            "q/main/add:Int(3)",
+            "q/main/add:Int(6)"
+        ],
+        "tickets 1, 2, 4 and 5 have no user: the page reaches to 3 and 6"
+    );
+    assert!(ivm.engine().hydrated(names.id("q")));
+
+    let ops = write(&mut ivm, &storage, user(1, "a"));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/add:Int(1)",
+            "q/join0/del:Int(6)",
+            "q/main/add:Int(1)",
+            "q/main/del:Int(6)"
+        ],
+        "ticket 1 is admitted and takes the first place; ticket 6 leaves the page"
+    );
+
+    let ops = write(&mut ivm, &storage, delete("users", 3));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/add:Int(6)",
+            "q/join0/del:Int(3)",
+            "q/main/add:Int(6)",
+            "q/main/del:Int(3)"
+        ],
+        "ticket 3 is rejected again and the page reaches back to 6"
+    );
+
+    let ops = write(&mut ivm, &storage, delete("tickets", 1));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/add:Int(7)",
+            "q/join0/del:Int(1)",
+            "q/main/add:Int(7)",
+            "q/main/del:Int(1)"
+        ],
+        "a shown ticket leaving is replaced by the next admitted one"
+    );
+
+    let ops = write(&mut ivm, &storage, delete("users", 6));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/del:Int(6)", "q/main/del:Int(6)"],
+        "nothing further is admitted: the page holds what there is"
+    );
+    assert_eq!(shown_ids(&ivm, &names, "q", QueryPart::main()), [7]);
+    assert!(ivm.engine().hydrated(names.id("q")));
+}
+
+/// The page under a gate shows, at every step, what the same query shows
+/// without a limit cut to its first rows: checked over a run of writes
+/// that open and close gates and move rows in and out of the page.
+#[test]
+fn a_page_under_a_gate_is_the_unlimited_result_cut_to_the_limit() {
+    let (mut ivm, storage, names) = engine();
+    for id in 1..=30 {
+        storage.apply(&ticket(id, "OPEN", id % 7));
+    }
+    for id in [2, 5] {
+        storage.apply(&user(id, "u"));
+    }
+    let mut unlimited = first_two_tickets_with_a_user();
+    unlimited.main_table.limit = u32::MAX;
+    let mut paged = first_two_tickets_with_a_user();
+    paged.main_table.limit = 4;
+    names.register(&mut ivm, "all", unlimited);
+    names.register(&mut ivm, "page", paged);
+    let check = |ivm: &Ivm, step: &str| {
+        let all = shown_ids(ivm, &names, "all", QueryPart::main());
+        let page = shown_ids(ivm, &names, "page", QueryPart::main());
+        let expected: Vec<i64> = all.iter().copied().take(4).collect();
+        assert_eq!(page, expected, "after {step}");
+    };
+    check(&ivm, "registration");
+    let steps: Vec<(&str, WriteQuery)> = vec![
+        ("user 0 arrives", user(0, "z")),
+        ("user 2 leaves", delete("users", 2)),
+        ("ticket 5 closes", update_ticket(5, "DONE", 5)),
+        ("user 1 arrives", user(1, "a")),
+        ("ticket 1 leaves", delete("tickets", 1)),
+        ("user 0 leaves", delete("users", 0)),
+        ("user 5 leaves", delete("users", 5)),
+        ("user 1 leaves", delete("users", 1)),
+        ("user 6 arrives", user(6, "f")),
+        ("ticket 6 moves to user 3", update_ticket(6, "OPEN", 3)),
+        ("user 3 arrives", user(3, "c")),
+        ("ticket 40 arrives", ticket(40, "OPEN", 3)),
+        ("ticket 3 leaves", delete("tickets", 3)),
+    ];
+    for (step, w) in steps {
+        write(&mut ivm, &storage, w);
+        check(&ivm, step);
+    }
+}
+
+/// A page per parent row under a gate, the shape of "the latest
+/// conversation of every channel whose first message I may see": each
+/// team shows its newest member *that has a profile*, reaching past the
+/// newer members without one.
+#[test]
+fn a_page_per_parent_under_a_gate_reaches_past_rejected_rows() {
+    let (mut ivm, storage, names) = engine();
+    for id in 1..=4 {
+        storage.apply(&member(id, 5));
+    }
+    storage.apply(&member(9, 6));
+    storage.apply(&profile(100, 2));
+    let mut members = query(&members_table(), Where::AND(vec![]));
+    members.order_by = vec![OrderBy::new("id", Order::DESC)];
+    members.limit = 1;
+    let spec = left_joined(
+        open_tickets(),
+        vec![Join::left(
+            MultiTableReadQuery::new(
+                members,
+                vec![Join::inner_from_main(
+                    MultiTableReadQuery::single(query(&profiles_table(), Where::AND(vec![]))),
+                    "id",
+                    "user_id",
+                )],
+            ),
+            "team_id",
+            "team",
+        )],
+    );
+    names.register(&mut ivm, "q", spec);
+
+    let ops = write(&mut ivm, &storage, team_ticket(10, 5));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/add:Int(2)",
+            "q/main/add:Int(10)",
+            "q/part[0, 0]/add:Int(100)"
+        ],
+        "members 4 and 3 have no profile: team 5's page reaches to member 2"
+    );
+
+    let ops = write(&mut ivm, &storage, profile(101, 4));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/add:Int(4)",
+            "q/join0/del:Int(2)",
+            "q/part[0, 0]/add:Int(101)",
+            "q/part[0, 0]/del:Int(100)"
+        ],
+        "member 4 is admitted and is newer: it takes the page"
+    );
+
+    let ops = write(&mut ivm, &storage, team_ticket(11, 6));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/main/add:Int(11)"],
+        "team 6's only member has no profile: its page is empty"
+    );
+
+    let ops = write(&mut ivm, &storage, delete("profiles", 101));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/add:Int(2)",
+            "q/join0/del:Int(4)",
+            "q/part[0, 0]/add:Int(100)",
+            "q/part[0, 0]/del:Int(101)"
+        ],
+        "member 4 is rejected again and the page reaches back to member 2"
+    );
+    assert!(ivm.engine().hydrated(names.id("q")));
 }

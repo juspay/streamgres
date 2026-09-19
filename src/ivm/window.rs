@@ -59,6 +59,26 @@
 //! client); buffer rows below the prefix produce nothing. A twin registration and
 //! [`SingleTableIVM::rows_for`] see the same prefix.
 //!
+//! **A page under a gate.** In the join layer a windowed part may drive an
+//! inner edge, and the rows that edge rejects (no sub row matches them)
+//! must not take a place in the page: the page is the best `L` rows *the
+//! gate lets through*, as the client's `Take` above its `Exists` computes it.
+//! The join layer therefore tells the window which of the rows it was
+//! shown are **rejected** ([`SingleTableIVM::reject_rows`]), and the
+//! window counts without them: what it shows is the **span**, the shortest
+//! prefix holding `L` rows that are not rejected (the rejected rows inside
+//! it included: the layer above must go on seeing them, so that a gate
+//! opening later is noticed, and it shows none of them to a client);
+//! capacity, the refill trigger and the refill's size count the rows not
+//! rejected. A row is rejected only once the reads that could admit it
+//! have landed, so a row just fetched holds its place until then, and the
+//! span grows one settled round at a time: rows rejected, more rows
+//! shown, their sub rows fetched, and again. A window rejecting more than
+//! [`REJECTED_LIMIT`] rows stops growing (its page then holds fewer than
+//! `L` rows; `window_capped` counts it): a page whose gate turns away
+//! thousands of rows for every one it admits is a query to rewrite, not
+//! to serve.
+//!
 //! A storage read lands some time after it is asked for, and writes route
 //! in between. While one is out the window publishes **no boundary** (so
 //! no write the read will not return is turned away; arrivals are
@@ -96,14 +116,23 @@ use crate::model::{
 /// The ORDER BY / LIMIT state of one subscription: its held rows' order
 /// values (one per `ORDER BY` column), best → worst, the storage frontier
 /// the boundary and the refill threshold are anchored at, and the keys
-/// last delivered to the client (the best-`L` prefix at the last step).
+/// last delivered to the client (the span at the last step), the held
+/// rows the join layer's gate rejects, which take no place in the page,
+/// and whether the last refill brought nothing new (`stalled`: no further
+/// refill is asked for until the held rows change).
 pub(super) struct Window {
     order: Vec<OrderBy>,
     user_limit: usize,
     entries: Vec<(Vec<Value>, DataFrameKey)>,
     frontier: Option<Vec<Value>>,
     shown: Vec<DataFrameKey>,
+    rejected: HashSet<DataFrameKey>,
+    stalled: bool,
 }
+
+/// The most rows a window may hold rejected before it stops growing past
+/// them.
+pub(super) const REJECTED_LIMIT: usize = 2_000;
 
 impl Window {
     /// An empty window for `query`; `None` when the query has no finite,
@@ -119,7 +148,42 @@ impl Window {
             entries: Vec::new(),
             frontier: None,
             shown: Vec::new(),
+            rejected: HashSet::new(),
+            stalled: false,
         })
+    }
+
+    /// How many held rows are not rejected: the rows capacity, the refill
+    /// trigger and the refill's size count.
+    fn accepted(&self) -> usize {
+        self.entries.len().saturating_sub(self.rejected.len())
+    }
+
+    /// Replace the rejected rows with those of `keys` the window holds;
+    /// reports whether anything changed.
+    pub(super) fn set_rejected(&mut self, keys: HashSet<DataFrameKey>) -> bool {
+        let keys: HashSet<DataFrameKey> = self
+            .entries
+            .iter()
+            .filter(|(_, key)| keys.contains(key))
+            .map(|(_, key)| key.clone())
+            .collect();
+        if keys == self.rejected {
+            return false;
+        }
+        self.rejected = keys;
+        self.stalled = false;
+        true
+    }
+
+    /// How many rows are rejected.
+    pub(super) fn rejected_count(&self) -> usize {
+        self.rejected.len()
+    }
+
+    /// Whether the window has stopped growing past its rejected rows.
+    pub(super) fn capped(&self) -> bool {
+        self.rejected.len() >= REJECTED_LIMIT
     }
 
     /// The buffer capacity: twice the user's limit.
@@ -140,13 +204,18 @@ impl Window {
     /// after their equals (stable). Idempotent: a key already present is
     /// re-inserted at its new value's position, never duplicated.
     pub(super) fn insert(&mut self, value: Vec<Value>, key: DataFrameKey) {
+        let rejected = self.rejected.contains(&key);
         self.remove(&key);
+        if rejected {
+            self.rejected.insert(key.clone());
+        }
         let position = self
             .entries
             .iter()
             .position(|(existing, _)| is_worse(existing, &value, &self.order))
             .unwrap_or(self.entries.len());
         self.entries.insert(position, (value, key));
+        self.stalled = false;
     }
 
     /// Carry the page `previous` last delivered over to this window, so
@@ -154,15 +223,31 @@ impl Window {
     /// rather than the whole page again.
     pub(super) fn adopt_page(&mut self, previous: Window) {
         self.shown = previous.shown;
+        self.rejected = previous.rejected;
     }
 
-    /// The keys of the best `L` held rows: what the client is shown.
+    /// Forget rejected keys the window no longer holds (after a rebuild).
+    pub(super) fn retain_rejected(&mut self) {
+        let held: HashSet<&DataFrameKey> = self.entries.iter().map(|(_, key)| key).collect();
+        self.rejected.retain(|key| held.contains(key));
+    }
+
+    /// The keys of the span: the shortest prefix of the held rows with
+    /// `L` rows not rejected, the rejected ones inside it included. With
+    /// nothing rejected, the best `L` held rows.
     pub(super) fn shown_prefix(&self) -> Vec<DataFrameKey> {
-        self.entries
-            .iter()
-            .take(self.user_limit)
-            .map(|(_, key)| key.clone())
-            .collect()
+        let mut span = Vec::new();
+        let mut accepted = 0usize;
+        for (_, key) in &self.entries {
+            if accepted == self.user_limit {
+                break;
+            }
+            if !self.rejected.contains(key) {
+                accepted += 1;
+            }
+            span.push(key.clone());
+        }
+        span
     }
 
     /// Record the current prefix as delivered, returning the previous and
@@ -184,6 +269,8 @@ impl Window {
         {
             Some(index) => {
                 self.entries.remove(index);
+                self.rejected.remove(key);
+                self.stalled = false;
                 true
             }
             None => false,
@@ -194,10 +281,11 @@ impl Window {
     /// recorded as the frontier (it is back in storage, unheld) — the
     /// engine untags it and emits its `Delete`.
     pub(super) fn pop_overflow(&mut self) -> Option<DataFrameKey> {
-        if self.entries.len() <= self.capacity() {
+        if self.accepted() <= self.capacity() {
             return None;
         }
         let (value, key) = self.entries.pop()?;
+        self.rejected.remove(&key);
         self.cover(value);
         Some(key)
     }
@@ -216,36 +304,21 @@ impl Window {
         }
     }
 
-    /// The worst order value among fetched rows.
-    fn worst_of(&self, fetched: &[(DataFrameKey, DataFrameRow)]) -> Option<Vec<Value>> {
-        fetched
-            .iter()
-            .map(|(_, row)| self.order_value(row))
-            .reduce(|worst, value| {
-                if is_worse(&value, &worst, &self.order) {
-                    value
-                } else {
-                    worst
-                }
-            })
-    }
-
-    /// Record a landed storage read that asked for `requested` rows: a
-    /// full result proves rows beyond its worst value exist unheld, so the
-    /// frontier pulls in to it (from absent, it is set); a short result
-    /// says nothing beyond what evictions already recorded. A read of the
-    /// whole filter cleared the frontier when it was asked for, so for it
-    /// a full result sets the frontier to its worst value (pulled in by
-    /// any eviction meanwhile) and a short one leaves storage exhausted.
-    pub(super) fn note_fetch(
-        &mut self,
-        requested: usize,
-        fetched: &[(DataFrameKey, DataFrameRow)],
-    ) {
-        if fetched.len() >= requested
-            && let Some(worst) = self.worst_of(fetched)
-        {
-            self.cover(worst);
+    /// Record a landed storage read. `worst_read` is the worst row the
+    /// read returned when it came back full, as storage returned it and
+    /// before the runtime brought the result up to date: rows beyond it
+    /// exist unheld, so the frontier pulls in to it (from absent, it is
+    /// set). `None` is a read that came back short, which says nothing
+    /// beyond what evictions already recorded. A read of the whole filter
+    /// cleared the frontier when it was asked for, so for it a full
+    /// result sets the frontier to its worst value (pulled in by any
+    /// eviction meanwhile) and a short one leaves storage exhausted. The
+    /// rows that land may be fewer than the read returned (a write since
+    /// took some out): fullness is the read's, not theirs.
+    pub(super) fn note_fetch(&mut self, worst_read: Option<&DataFrameRow>) {
+        if let Some(worst) = worst_read {
+            let value = self.order_value(worst);
+            self.cover(value);
         }
     }
 
@@ -287,6 +360,9 @@ impl Window {
     /// the threshold returns again and the upsert dedups; an unenforceable
     /// frontier yields an unthresholded read sized to capacity.
     pub(super) fn refill_plan(&self) -> Option<(u32, Option<Where>)> {
+        if self.capped() {
+            return None;
+        }
         let frontier = self.frontier.as_ref()?;
         if !enforceable(frontier) {
             return Some((self.capacity() as u32, None));
@@ -308,15 +384,45 @@ impl Window {
         Some((limit, Some(threshold)))
     }
 
-    /// Whether the buffer has drained to the user's limit — the refill
-    /// trigger, checked after removals.
+    /// How many rows that are not rejected lie strictly inside the
+    /// frontier, where every matching row of storage is known to be held;
+    /// all of them when storage is exhausted. A held row whose value
+    /// worsened in place past the frontier keeps its slot but is not
+    /// among them: storage may hold better rows that were never fetched.
+    fn covered(&self) -> usize {
+        match &self.frontier {
+            None => self.accepted(),
+            Some(frontier) => self
+                .entries
+                .iter()
+                .filter(|(value, key)| {
+                    is_worse(frontier, value, &self.order) && !self.rejected.contains(key)
+                })
+                .count(),
+        }
+    }
+
+    /// The refill trigger: the rows not rejected have drained to the
+    /// user's limit, or fewer than the limit of them are inside the
+    /// frontier (the page would otherwise reach into rows that worsened
+    /// in place past it, over better rows storage still holds). Not while
+    /// the last refill brought nothing new.
     pub(super) fn needs_refill(&self) -> bool {
-        self.entries.len() <= self.user_limit
+        !self.stalled && (self.accepted() <= self.user_limit || self.covered() < self.user_limit)
+    }
+
+    /// Record that a landed refill tagged `added` new rows: none means
+    /// storage has nothing the window lacks, and asking again would ask
+    /// for the same rows.
+    pub(super) fn note_refill(&mut self, added: usize) {
+        if added == 0 {
+            self.stalled = true;
+        }
     }
 
     /// How many rows a refill should fetch to restore full capacity.
     pub(super) fn missing(&self) -> u32 {
-        self.capacity().saturating_sub(self.entries.len()) as u32
+        self.capacity().saturating_sub(self.accepted()) as u32
     }
 }
 
@@ -517,7 +623,61 @@ impl SingleTableIVM {
                 }
             }
         }
+        window.retain_rejected();
         self.windows.insert(sub, window);
+    }
+
+    /// The rows `sub`'s window holds rejected, and its state in words
+    /// (held rows, frontier, whether a read is out): what an audit of the
+    /// join layer compares its gates with.
+    pub(super) fn page_state(&self, sub: SubId) -> Option<(HashSet<DataFrameKey>, String)> {
+        let window = self.windows.get(&sub)?;
+        Some((
+            window.rejected.clone(),
+            format!(
+                "{} held, frontier {:?}, stalled {}, read out {}",
+                window.entries.len(),
+                window.frontier,
+                window.stalled,
+                self.is_pending(sub)
+            ),
+        ))
+    }
+
+    /// Tell `sub`'s window which of the rows it shows the join layer's
+    /// gate rejects (see the module header): the span is recomputed
+    /// without them, overflow is evicted, a refill is asked for when the
+    /// rows not rejected have drained to the limit, the boundary is
+    /// republished, and the difference between the span before and after
+    /// comes back as operations, rows entering it as `Add`s and rows
+    /// leaving it as `Delete`s. Nothing for a subscription without a
+    /// window or an unchanged set.
+    pub fn reject_rows(
+        &mut self,
+        sub: SubId,
+        rejected: HashSet<DataFrameKey>,
+    ) -> Vec<SingleTableUpdate> {
+        let Some(window) = self.windows.get_mut(&sub) else {
+            return Vec::new();
+        };
+        let before = window.rejected_count();
+        let was_capped = window.capped();
+        if !window.set_rejected(rejected) {
+            return Vec::new();
+        }
+        let after = window.rejected_count();
+        let capped = window.capped();
+        self.stats.window_rejections += after.saturating_sub(before) as u64;
+        if capped && !was_capped {
+            self.stats.window_capped += 1;
+        }
+        let evictions = self.evict_overflow(sub);
+        if self.windows.get(&sub).is_some_and(Window::needs_refill) {
+            self.refill(sub);
+        }
+        self.sync_boundary(sub);
+        let ops = self.gate_window(sub, evictions);
+        self.tagged(sub, ops)
     }
 
     /// Untag worst-held rows until the subscription is back at buffer
@@ -621,7 +781,11 @@ impl SingleTableIVM {
     /// view: the difference between the prefix delivered last time and the
     /// best-`L` prefix now, plus the raw operations of a row that stays in
     /// the prefix (a rewrite's `Delete` + `Add` pair, which the join layer
-    /// diffs; see the module header). A subscription without a window
+    /// diffs; see the module header). A row leaving carries the image it
+    /// was last delivered with (the step's first `Delete` of it: a row
+    /// rewritten and pushed out in one step leaves with its old image, the
+    /// one the layer above counted its join values from), a row entering
+    /// its newest. A subscription without a window
     /// passes its operations through.
     pub(super) fn gate_window(
         &mut self,
@@ -636,35 +800,43 @@ impl SingleTableIVM {
             .select_queries
             .get(&sub)
             .and_then(|query| self.frames.get(&query.table));
-        let latest = |key: &DataFrameKey, adds: bool| -> Option<DataFrameRow> {
+        let held = |key: &DataFrameKey| -> Option<DataFrameRow> {
+            frame
+                .and_then(|frame| frame.get(key))
+                .map(|row| row.data.clone())
+        };
+        let entering = |key: &DataFrameKey| -> Option<DataFrameRow> {
             raw.iter()
                 .rev()
-                .find_map(|op| match (op, adds) {
-                    (DataFrameOperation::Add(candidate, row), true)
-                    | (DataFrameOperation::Delete(candidate, row), false)
-                        if candidate == key =>
-                    {
+                .find_map(|op| match op {
+                    DataFrameOperation::Add(candidate, row) if candidate == key => {
                         Some(row.clone())
                     }
                     _ => None,
                 })
-                .or_else(|| {
-                    frame
-                        .and_then(|frame| frame.get(key))
-                        .map(|row| row.data.clone())
+                .or_else(|| held(key))
+        };
+        let leaving = |key: &DataFrameKey| -> Option<DataFrameRow> {
+            raw.iter()
+                .find_map(|op| match op {
+                    DataFrameOperation::Delete(candidate, row) if candidate == key => {
+                        Some(row.clone())
+                    }
+                    _ => None,
                 })
+                .or_else(|| held(key))
         };
         let was: HashSet<&DataFrameKey> = previous.iter().collect();
         let now: HashSet<&DataFrameKey> = current.iter().collect();
         let mut out = Vec::new();
         for key in previous.iter().filter(|key| !now.contains(key)) {
-            if let Some(image) = latest(key, false) {
+            if let Some(image) = leaving(key) {
                 out.push(DataFrameOperation::Delete(key.clone(), image));
             }
         }
         for key in &current {
             if !was.contains(key) {
-                if let Some(image) = latest(key, true) {
+                if let Some(image) = entering(key) {
                     out.push(DataFrameOperation::Add(key.clone(), image));
                 }
             } else {

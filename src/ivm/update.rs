@@ -158,7 +158,7 @@ impl Folded {
         let (held, targets) = slot.get_or_insert_with(|| (image.clone(), Vec::new()));
         debug_assert!(
             held == image,
-            "one step gives every holder of a row the same image"
+            "one step gives every holder of a row the same image: {held:?} and {image:?} for {target:?} beside {targets:?}"
         );
         if !targets.contains(target) {
             targets.push(target.clone());

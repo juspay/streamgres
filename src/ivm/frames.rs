@@ -100,13 +100,29 @@ impl SingleTableIVM {
         fetch: &Fetch,
         rows: &[(DataFrameKey, DataFrameRow)],
     ) -> Vec<SingleTableUpdate> {
+        let worst = worst_of_full(fetch, rows);
+        self.land_read(fetch, rows, worst.as_ref())
+    }
+
+    /// [`SingleTableIVM::land_fetch`] with the read's own coverage:
+    /// `worst_read` is the worst row a read that came back full returned,
+    /// before the runtime brought the result up to date (`None` for a
+    /// read that came back short). A window's frontier is set from it, so
+    /// a full read some of whose rows a later write took out is not taken
+    /// for storage running dry.
+    pub fn land_read(
+        &mut self,
+        fetch: &Fetch,
+        rows: &[(DataFrameKey, DataFrameRow)],
+        worst_read: Option<&DataFrameRow>,
+    ) -> Vec<SingleTableUpdate> {
         let readers = self
             .readers
             .remove(&fetch.id)
             .unwrap_or_else(|| vec![fetch.sub]);
         let mut updates = Vec::new();
         for sub in readers {
-            updates.extend(self.land_for(sub, fetch, rows));
+            updates.extend(self.land_for(sub, fetch, rows, worst_read));
         }
         updates
     }
@@ -117,6 +133,7 @@ impl SingleTableIVM {
         sub: SubId,
         fetch: &Fetch,
         rows: &[(DataFrameKey, DataFrameRow)],
+        worst_read: Option<&DataFrameRow>,
     ) -> Vec<SingleTableUpdate> {
         let Some(query) = self.select_queries.get(&sub).cloned() else {
             return Vec::new();
@@ -127,7 +144,10 @@ impl SingleTableIVM {
             updates.extend(self.land_row(sub, &table, &query.filter, key, row));
         }
         if let Some(window) = self.windows.get_mut(&sub) {
-            window.note_fetch(fetch.query.limit as usize, rows);
+            window.note_fetch(worst_read);
+            if fetch.kind == FetchKind::Refill {
+                window.note_refill(updates.len());
+            }
         }
         let outstanding = match self.pending.get_mut(&sub) {
             Some(count) => {
@@ -233,7 +253,9 @@ impl SingleTableIVM {
     /// Untag every row `sub` holds whose `column` equals one of `values`
     /// and that its filter no longer matches: the prune after a set-valued
     /// leaf lost those values. A row another branch of the filter still
-    /// admits stays. Returns the `Delete` operations.
+    /// admits stays. Returns the `Delete` operations and, for a windowed
+    /// subscription, the `Add`s of the rows that move up into its page; a
+    /// window drained to its limit asks for its refill.
     pub fn prune_rows(
         &mut self,
         sub: SubId,
@@ -250,6 +272,12 @@ impl SingleTableIVM {
         let ops = self.remove_rows_where(sub, column, values, |row| {
             !evaluate(&filter, &row.data, &mut 0)
         });
+        if !ops.is_empty() {
+            if self.windows.get(&sub).is_some_and(Window::needs_refill) {
+                self.refill(sub);
+            }
+            self.sync_boundary(sub);
+        }
         self.gate_window(sub, ops)
     }
 
@@ -275,6 +303,25 @@ impl SingleTableIVM {
             }
         }
         ops
+    }
+
+    /// The rows `sub` holds whose `column` equals `value`, as the layer
+    /// above sees the subscription: for a windowed one only the rows of
+    /// its span, since the buffer below it was never shown to anyone.
+    pub fn visible_rows_matching(
+        &self,
+        sub: SubId,
+        column: &str,
+        value: &Value,
+    ) -> Vec<(DataFrameKey, DataFrameRow)> {
+        let rows = self.rows_matching(sub, column, value);
+        match self.windows.get(&sub).map(Window::shown_prefix) {
+            Some(span) => rows
+                .into_iter()
+                .filter(|(key, _)| span.contains(key))
+                .collect(),
+            None => rows,
+        }
     }
 
     /// The rows `sub` holds whose `column` equals `value`.
@@ -373,6 +420,22 @@ impl SingleTableIVM {
             .map(|row| row.subscribers.iter().copied().collect())
             .unwrap_or_default()
     }
+}
+
+/// The worst of `rows` under the read's order when the read came back
+/// full (as many rows as it asked for): what a caller that lands a
+/// result as storage returned it passes for the read's coverage.
+pub(super) fn worst_of_full(
+    fetch: &Fetch,
+    rows: &[(DataFrameKey, DataFrameRow)],
+) -> Option<DataFrameRow> {
+    if fetch.query.limit == u32::MAX || rows.len() < fetch.query.limit as usize {
+        return None;
+    }
+    rows.iter()
+        .map(|(_, row)| row)
+        .max_by(|a, b| window::order_rows(&fetch.query.order_by, a, b))
+        .cloned()
 }
 
 /// `filter` with every set-valued `IN` leaf on `column` replaced by
