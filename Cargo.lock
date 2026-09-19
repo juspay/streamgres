@@ -2024,6 +2024,7 @@ dependencies = [
  "chrono",
  "fallible-iterator",
  "futures-util",
+ "libc",
  "percent-encoding",
  "pgoutput",
  "pgwire-replication",

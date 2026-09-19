@@ -19,6 +19,8 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # sync driver (`src/sync/service.rs`).
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
+# For raising the open-file limit at startup (`src/bin/server.rs`).
+libc = "0.2"
 
 # The Postgres storage backend and change feed (`src/sync/pg`).
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
