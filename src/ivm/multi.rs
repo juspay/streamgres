@@ -1808,13 +1808,15 @@ impl Engine for MultiTableIVM {
         }
     }
 
-    /// [`SingleTableIVM::take_dead`] of the inner engine.
+    /// What the engine holds: its subscriptions, its trees and the rows
+    /// in its frames per table.
     fn footprint(&self) -> Footprint {
         let mut footprint = self.single.footprint();
         footprint.trees = self.trees.len() as u64;
         footprint
     }
 
+    /// [`SingleTableIVM::take_dead`] of the inner engine.
     fn take_dead(&mut self) -> Vec<SharedRow> {
         self.single.take_dead()
     }

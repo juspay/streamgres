@@ -621,7 +621,8 @@ impl Engine for SingleTableIVM {
         self.readers_of(fetch)
     }
 
-    /// The rows dropped since the last call, to be freed elsewhere.
+    /// What the engine holds: its subscriptions, its trees and the rows
+    /// in its frames per table.
     fn footprint(&self) -> Footprint {
         let mut rows_by_table: Vec<(String, u64)> = self
             .frames
@@ -636,6 +637,7 @@ impl Engine for SingleTableIVM {
         }
     }
 
+    /// The rows dropped since the last call, to be freed elsewhere.
     fn take_dead(&mut self) -> Vec<SharedRow> {
         std::mem::take(&mut self.graveyard)
     }
