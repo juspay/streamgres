@@ -70,7 +70,8 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_subscriptions`, `xyne_sync_trees` | what the engine holds |
 | `xyne_sync_queries_refused_total{reason=unsupported,plan_limit,read_limit,other}` | queries the server refused, by why: the translation cannot express it (`LIKE`, `NOT EXISTS`), the planner found no side of a join small enough to read, a read came back over the row limit, anything else |
 | `xyne_sync_plans_total{kind=page_drives}` | plans in which a node with a `LIMIT` drives an inner edge (the page is kept to the rows the edge admits) |
-| `xyne_sync_page_rows_rejected_total`, `xyne_sync_pages_capped_total` | rows a join gate rejected inside a page, each making the page reach one row further; pages that stopped reaching after 2 000 rejected rows |
+| `xyne_sync_page_rows_rejected_total`, `xyne_sync_pages_capped_total` | rows a join gate rejected inside a page, each making the page reach one row further; pages that stopped reaching (eight rejected rows for every row of the page, between 64 and 512) |
+| `xyne_sync_queries_short_total{reason=page_capped}` | subscriptions served a page short of its limit because it was capped |
 | `xyne_sync_window_refills_total` | refill reads asked for by drained windows |
 
 ### Update
@@ -122,6 +123,7 @@ object per line, `{"ts","level","thread","msg", ...fields}`.
 | slow query | warn | the same, when hydration exceeds `XYNE_SYNC_SLOW_QUERY_MS` (1 000) |
 | query refused | warn | name, hash, kind (`unsupported`, `plan_limit`, `read_limit`, `other`), at (`plan`: before it registered; `read`: a read it depended on), group, connection, the reason in full |
 | query planned | debug | name, the root's table, whether a page drives an inner edge, ms |
+| page capped | warn | name, hash, group: a page of the query stopped reaching past the rows its join rejects; it is served, short of its limit |
 | transaction routed | debug | position, writes, client updates, reads asked, ms |
 | feed lag | warn | when commit → engine exceeds 5 s, once per minute |
 | push forwarded | debug (warn when failed or slower than the slow threshold) | wsid, group, mutations, ms, failed |
@@ -130,8 +132,9 @@ object per line, `{"ts","level","thread","msg", ...fields}`.
 **The queries to rewrite.** `/stats` carries `refused_queries`: every
 query *name* the server has refused since it started, most refused first,
 with its class, how often, when last, and the last reason in full (the
-first 256 names; the counters count the rest). A query that is refused
-is one the application should not be asking as written: a whole
+first 256 names; the counters count the rest); a query served with a
+capped page is listed there too, as `page_capped`. A query that is
+refused is one the application should not be asking as written: a whole
 knowledge base with every file in it to show a count, a search by
 `LIKE` over a JSON text. The list is the application's to-do, read from
 the server that pays for the queries.

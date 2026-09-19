@@ -2190,3 +2190,63 @@ fn a_page_per_parent_under_a_gate_reaches_past_rejected_rows() {
     );
     assert!(ivm.engine().hydrated(names.id("q")));
 }
+
+/// A page whose gate turns nearly every row away reaches past them in
+/// refills that grow, asks for the rows' subs in one read per round, and
+/// stops after 64 rejected rows (eight per row of the page, at least 64):
+/// the page is served short and its subscription is handed out to be
+/// reported.
+#[test]
+fn a_page_whose_gate_rejects_hundreds_of_rows_is_capped_and_reported() {
+    let (mut ivm, storage, names) = engine();
+    for id in 1..=700 {
+        storage.apply(&ticket(id, "OPEN", 10_000 + id));
+    }
+    storage.apply(&ticket(701, "OPEN", 7));
+    storage.apply(&user(7, "g"));
+    let snapshot = names.register(&mut ivm, "q", first_two_tickets_with_a_user());
+    assert!(
+        names.tags(&snapshot).is_empty(),
+        "ticket 701 lies behind 700 rejected rows: the page stops before it"
+    );
+    assert!(ivm.engine().hydrated(names.id("q")));
+    let capped = ivm.engine_mut().take_capped();
+    assert_eq!(capped.len(), 1, "reported once, with its client");
+    assert_eq!(capped[0].0, names.id("q"));
+    assert!(ivm.engine_mut().take_capped().is_empty());
+    let stats = ivm.engine().stats();
+    assert_eq!(stats.window_capped, 1);
+    assert!(
+        (64..=200).contains(&stats.window_rejections),
+        "the refills stop at 64 rejected rows and the rows already buffered are walked: {}",
+        stats.window_rejections
+    );
+    assert!(
+        stats.window_refills <= 8,
+        "the refills double with the rows rejected: {}",
+        stats.window_refills
+    );
+    assert!(
+        stats.storage_reads <= 80,
+        "one read of the users per round of two rows, and the refills: {}",
+        stats.storage_reads
+    );
+}
+
+/// The join values a landing references are asked for in one narrowed
+/// read of the driven part, however many they are.
+#[test]
+fn the_values_of_one_step_are_fetched_in_one_read() {
+    let (mut ivm, storage, names) = engine();
+    for id in 1..=50 {
+        storage.apply(&user(id, "u"));
+        storage.apply(&ticket(id, "OPEN", id));
+    }
+    names.register(&mut ivm, "q", tickets_users_query());
+    assert_eq!(frame_len(&ivm, &names, "q", QueryPart::join(0)), 50);
+    assert_eq!(
+        ivm.engine().stats().storage_reads,
+        2,
+        "the tickets' snapshot, and one read for the fifty users they name"
+    );
+}

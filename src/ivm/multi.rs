@@ -360,6 +360,8 @@ impl Node {
 /// - `pages`: the parts that are pages under a gate (a finite limit and
 ///   inner edges the node drives), whose windows are told which rows the
 ///   gate rejects once the tree's reads have landed.
+/// - `capped`: whether one of those pages has stopped reaching past its
+///   rejected rows (reported once).
 struct Tree {
     spec: Rc<MultiTableReadQuery>,
     subscribers: Vec<SubId>,
@@ -369,6 +371,7 @@ struct Tree {
     rank: IdMap<QueryPart, usize>,
     post_order: Vec<QueryPart>,
     pages: Vec<QueryPart>,
+    capped: bool,
 }
 
 /// How many rounds of rejecting rows and showing more one step may take
@@ -398,6 +401,12 @@ struct TreeId(u64);
 ///   whose reads landed in this step, settled before the step returns.
 /// - `in_flight`: the rows the inner engine holds whose `Add` this layer
 ///   has not reached yet within the step being forwarded.
+/// - `wanted`: the join values newly referenced in this step, per driven
+///   inner part and column, asked for in one narrowed read each when the
+///   step ends instead of one read per value.
+/// - `capped`: the subscriptions of trees a page of which has stopped
+///   reaching past its rejected rows, until [`Engine::take_capped`] takes
+///   them.
 pub struct MultiTableIVM {
     single: SingleTableIVM,
     trees: IdMap<TreeId, Tree>,
@@ -410,6 +419,8 @@ pub struct MultiTableIVM {
     by_client: IdMap<ClientId, BTreeSet<SubId>>,
     dirty: Vec<TreeId>,
     in_flight: HashSet<(SubId, DataFrameKey)>,
+    wanted: Vec<(SubId, ColumnName, Vec<Value>)>,
+    capped: Vec<SubId>,
 }
 
 /// Whether a held row of `part` is shown to clients: the root always, a
@@ -498,6 +509,7 @@ fn build_tree(spec: Rc<MultiTableReadQuery>) -> Tree {
         rank: IdMap::default(),
         post_order: Vec::new(),
         pages: Vec::new(),
+        capped: false,
     };
     add_node(&mut tree, &spec, QueryPart::main(), None);
 
@@ -812,6 +824,8 @@ impl MultiTableIVM {
             by_client: IdMap::default(),
             dirty: Vec::new(),
             in_flight: HashSet::new(),
+            wanted: Vec::new(),
+            capped: Vec::new(),
         }
     }
 
@@ -866,6 +880,7 @@ impl MultiTableIVM {
         self.by_sub.insert(sub, tree_id);
         self.register_part(tree_id, QueryPart::main(), &mut out);
         self.mark_dirty(tree_id);
+        self.fetch_wanted();
         self.settle_pages(&mut out);
         (sub, out)
     }
@@ -1130,6 +1145,7 @@ impl MultiTableIVM {
                 self.landed(tree_id, &part, &mut out);
             }
         }
+        self.fetch_wanted();
         self.settle_pages(&mut out);
         out
     }
@@ -1228,6 +1244,7 @@ impl MultiTableIVM {
     pub fn incremental_update(&mut self, write: &WriteQuery) -> Vec<MultiTableUpdate> {
         let applied = self.single.incremental_update(write);
         let mut out = self.forward(applied);
+        self.fetch_wanted();
         self.settle_pages(&mut out);
         out
     }
@@ -1755,6 +1772,14 @@ impl MultiTableIVM {
             moved = true;
             let forwarded = self.forward(ops);
             out.extend(forwarded);
+            self.fetch_wanted();
+            if self.single.page_capped(inner)
+                && let Some(tree) = self.trees.get_mut(&tree_id)
+                && !tree.capped
+            {
+                tree.capped = true;
+                self.capped.extend(tree.subscribers.iter().copied());
+            }
         }
         moved
     }
@@ -2105,7 +2130,8 @@ impl MultiTableIVM {
     /// A driver row now carries `value` on `edge`: bump `left`, and on the
     /// 0 → 1 crossing, if every edge reading the same set now references
     /// the value, add it to the set (one index filing) and ask for the
-    /// value's driven rows (one narrowed storage read); when it lands
+    /// value's driven rows (in the step's one narrowed read of that part,
+    /// [`Self::fetch_wanted`]); when it lands
     /// ([`Self::land_fetch`]) they are forwarded and arrive at the driven
     /// node. Before the driven part is registered the set is filled
     /// directly; registration files it whole. A fanned node gains a part
@@ -2159,8 +2185,25 @@ impl MultiTableIVM {
             return;
         }
         for inner in inners {
-            self.single
-                .fetch(inner, column.as_str(), std::slice::from_ref(&value));
+            match self
+                .wanted
+                .iter_mut()
+                .find(|(sub, wanted, _)| *sub == inner && *wanted == column)
+            {
+                Some((_, _, values)) => values.push(value.clone()),
+                None => self.wanted.push((inner, column.clone(), vec![value.clone()])),
+            }
+        }
+    }
+
+    /// Ask for the rows of every join value referenced since the last
+    /// call: one narrowed read per driven inner part and column, whatever
+    /// the number of values. Called before a step returns and between the
+    /// rounds of [`Self::settle_pages`], so a read is out as soon as the
+    /// rows it will bring are waited for.
+    fn fetch_wanted(&mut self) {
+        for (inner, column, values) in std::mem::take(&mut self.wanted) {
+            self.single.fetch(inner, column.as_str(), &values);
         }
     }
 
@@ -2421,6 +2464,15 @@ impl Engine for MultiTableIVM {
     /// [`SingleTableIVM::take_dead`] of the inner engine.
     fn take_dead(&mut self) -> Vec<SharedRow> {
         self.single.take_dead()
+    }
+
+    /// The subscriptions whose tree has a page that stopped reaching past
+    /// its rejected rows since the last call, with their clients.
+    fn take_capped(&mut self) -> Vec<(SubId, ClientId)> {
+        std::mem::take(&mut self.capped)
+            .into_iter()
+            .filter_map(|sub| self.clients.get(&sub).map(|client| (sub, *client)))
+            .collect()
     }
 
     /// Every subscription of every tree with a part reading the fetch.

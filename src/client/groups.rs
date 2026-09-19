@@ -554,6 +554,7 @@ impl Groups {
             }
             Event::Landed { updates } => self.absorb(updates),
             Event::Refused { sub, reason } => self.refused(sub, &reason),
+            Event::Capped { sub } => self.capped(sub),
             Event::Hydrated(subs) => {
                 for sub in subs {
                     let Some((group_id, hash)) = self.by_sub.get(&sub).cloned() else {
@@ -939,6 +940,30 @@ impl Groups {
         } else {
             self.command(Command::Unregister(sub));
         }
+    }
+
+    /// A page of the query stopped reaching past the rows its join gate
+    /// rejects: the query is served, its page short, and it is reported by
+    /// name as one to rewrite.
+    fn capped(&mut self, sub: SubId) {
+        let Some((group_id, hash)) = self.by_sub.get(&sub).cloned() else {
+            return;
+        };
+        let name = self
+            .groups
+            .get(&group_id)
+            .and_then(|group| group.queries.get(&hash))
+            .map(|state| state.name.clone())
+            .unwrap_or_default();
+        self.stats.note_short_page(&name);
+        log_event!(
+            Level::Warn,
+            "page capped",
+            name = name,
+            hash = hash,
+            group = group_id,
+            reason = crate::stats::SHORT_PAGE
+        );
     }
 
     /// The engine side refused a read a query depended on: the query's

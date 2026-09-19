@@ -269,6 +269,12 @@ impl<E: Engine> Runtime<E> {
         step
     }
 
+    /// [`Engine::take_capped`]: the subscriptions one of whose pages
+    /// stopped reaching past its rejected rows since the last call.
+    pub fn take_capped(&mut self) -> Vec<(SubId, ClientId)> {
+        self.engine.take_capped()
+    }
+
     /// [`Engine::take_dead`]: the rows dropped since the last call.
     pub fn take_dead(&mut self) -> Vec<SharedRow> {
         self.engine.take_dead()

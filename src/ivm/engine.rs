@@ -85,6 +85,14 @@ pub trait Engine {
     /// them), handed out so the caller can free them off this thread.
     fn take_dead(&mut self) -> Vec<SharedRow>;
 
+    /// The subscriptions one of whose pages has stopped reaching past the
+    /// rows its join gate rejects since the last call (the page then holds
+    /// fewer rows than asked for), with their clients: queries to report
+    /// by name. None for an engine without joins.
+    fn take_capped(&mut self) -> Vec<(SubId, ClientId)> {
+        Vec::new()
+    }
+
     /// What the engine holds right now: its subscriptions, its shared
     /// trees and the rows in its frames per table.
     fn footprint(&self) -> Footprint;

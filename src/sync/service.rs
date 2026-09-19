@@ -119,6 +119,9 @@ impl Transaction {
 ///   floor.
 /// - `Hydrated`: subscriptions whose first rows have all arrived (every
 ///   part of their tree is live), each named once.
+/// - `Capped`: a page of the subscription stopped reaching past the rows
+///   its join gate rejects, so it holds fewer rows than asked for: a
+///   query to report by name. The subscription stays.
 #[derive(Debug)]
 pub enum Event {
     Registered {
@@ -143,6 +146,9 @@ pub enum Event {
         routed: Instant,
     },
     Hydrated(Vec<SubId>),
+    Capped {
+        sub: SubId,
+    },
 }
 
 /// How a step ended: what its deltas travel inside of.
@@ -552,6 +558,9 @@ where
         }
         for fetch in selects {
             self.spawn(fetch);
+        }
+        for (sub, client) in self.runtime.take_capped() {
+            self.send_to(client, Event::Capped { sub });
         }
         if self.swept.elapsed() >= Duration::from_secs(1) {
             self.swept = Instant::now();

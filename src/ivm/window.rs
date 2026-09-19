@@ -73,11 +73,13 @@
 //! rejected. A row is rejected only once the reads that could admit it
 //! have landed, so a row just fetched holds its place until then, and the
 //! span grows one settled round at a time: rows rejected, more rows
-//! shown, their sub rows fetched, and again. A window rejecting more than
-//! [`REJECTED_LIMIT`] rows stops growing (its page then holds fewer than
-//! `L` rows; `window_capped` counts it): a page whose gate turns away
-//! thousands of rows for every one it admits is a query to rewrite, not
-//! to serve.
+//! shown, their sub rows fetched, and again. A window rejecting eight rows
+//! for every row of its page (at least 64, at most [`REJECTED_LIMIT`])
+//! stops growing (its page then holds fewer than
+//! `L` rows; `window_capped` counts it, and the join layer names the
+//! subscriptions): a page whose gate turns away hundreds of rows for
+//! every one it admits is a query to rewrite, not to serve, and every
+//! rejected row is a row held.
 //!
 //! A storage read lands some time after it is asked for, and writes route
 //! in between. While one is out the window publishes **no boundary** (so
@@ -131,8 +133,8 @@ pub(super) struct Window {
 }
 
 /// The most rows a window may hold rejected before it stops growing past
-/// them.
-pub(super) const REJECTED_LIMIT: usize = 2_000;
+/// them, whatever its limit; see [`Window::rejected_limit`].
+pub(super) const REJECTED_LIMIT: usize = 512;
 
 impl Window {
     /// An empty window for `query`; `None` when the query has no finite,
@@ -181,14 +183,27 @@ impl Window {
         self.rejected.len()
     }
 
-    /// Whether the window has stopped growing past its rejected rows.
-    pub(super) fn capped(&self) -> bool {
-        self.rejected.len() >= REJECTED_LIMIT
+    /// How many rejected rows stop the window growing past them: eight
+    /// for every row of the page, no fewer than 64 and no more than
+    /// [`REJECTED_LIMIT`]. The page reaches one page further per round
+    /// (a round is a read of the rows' subs), so this bounds the rounds
+    /// as well as the rows held: a page of one row gives up after 64
+    /// rounds, a page of fifty after about ten.
+    fn rejected_limit(&self) -> usize {
+        (self.user_limit * 8).clamp(64, REJECTED_LIMIT)
     }
 
-    /// The buffer capacity: twice the user's limit.
+    /// Whether the window has stopped growing past its rejected rows.
+    pub(super) fn capped(&self) -> bool {
+        self.rejected.len() >= self.rejected_limit()
+    }
+
+    /// The buffer capacity in rows not rejected: twice the user's limit,
+    /// and as many again as the gate has rejected so far, so a page whose
+    /// gate turns most rows away keeps a buffer in proportion and reaches
+    /// past them in refills that double rather than one refill per round.
     fn capacity(&self) -> usize {
-        self.user_limit * 2
+        self.user_limit * 2 + self.rejected.len()
     }
 
     /// The order value of a row image: one value per `ORDER BY` column
@@ -357,8 +372,10 @@ impl Window {
     /// worse than the frontier" (`>` / `<` by direction with the earlier
     /// columns tied, inclusive on the last column) and the limit is the
     /// missing count plus the held rows at or beyond the frontier, which
-    /// the threshold returns again and the upsert dedups; an unenforceable
-    /// frontier yields an unthresholded read sized to capacity.
+    /// the threshold returns again and the upsert dedups (the capacity
+    /// grows with the rows rejected, and the refills with it); an
+    /// unenforceable frontier yields an unthresholded read sized to
+    /// capacity.
     pub(super) fn refill_plan(&self) -> Option<(u32, Option<Where>)> {
         if self.capped() {
             return None;
@@ -625,6 +642,11 @@ impl SingleTableIVM {
         }
         window.retain_rejected();
         self.windows.insert(sub, window);
+    }
+
+    /// Whether `sub`'s window has stopped reaching past its rejected rows.
+    pub(super) fn page_capped(&self, sub: SubId) -> bool {
+        self.windows.get(&sub).is_some_and(Window::capped)
     }
 
     /// The rows `sub`'s window holds rejected, and its state in words

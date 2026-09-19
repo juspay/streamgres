@@ -275,6 +275,7 @@ pub struct Stats {
     pub refused_plan_limit: AtomicU64,
     pub refused_read_limit: AtomicU64,
     pub refused_other: AtomicU64,
+    pub pages_short: AtomicU64,
     pub plans_page_driven: AtomicU64,
     pub pushes_ok: AtomicU64,
     pub pushes_failed: AtomicU64,
@@ -308,6 +309,9 @@ pub struct RefusedQuery {
     pub count: u64,
     pub last_ms: u64,
 }
+
+/// What a capped page is reported with.
+pub const SHORT_PAGE: &str = "the page's join rejects more than eight rows for every row of the page; it is served short of its limit";
 
 /// How many refused query names are kept; past it new names are counted
 /// but not listed.
@@ -380,6 +384,7 @@ impl Stats {
             refused_plan_limit: AtomicU64::new(0),
             refused_read_limit: AtomicU64::new(0),
             refused_other: AtomicU64::new(0),
+            pages_short: AtomicU64::new(0),
             plans_page_driven: AtomicU64::new(0),
             pushes_ok: AtomicU64::new(0),
             pushes_failed: AtomicU64::new(0),
@@ -557,6 +562,7 @@ impl Stats {
             ("refused_read_limit", load(&self.refused_read_limit)),
             ("refused_other", load(&self.refused_other)),
             ("plans_page_driven", load(&self.plans_page_driven)),
+            ("pages_short", load(&self.pages_short)),
             ("pushes_ok", load(&self.pushes_ok)),
             ("pushes_failed", load(&self.pushes_failed)),
             ("connections_opened", load(&self.connections_opened)),
@@ -637,6 +643,34 @@ impl Stats {
             }
         }
         kind
+    }
+
+    /// Count one subscription of the query `name` whose page was capped:
+    /// it is served, short of its limit, and listed beside the refused
+    /// queries as one to rewrite.
+    pub fn note_short_page(&self, name: &str) {
+        self.pages_short.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut refused) = self.refused.lock() {
+            let room = refused.len() < REFUSED_NAMES;
+            match refused.get_mut(name) {
+                Some(entry) => {
+                    entry.count += 1;
+                    entry.last_ms = now_ms();
+                }
+                None if room => {
+                    refused.insert(
+                        name.to_owned(),
+                        RefusedQuery {
+                            kind: "page_capped",
+                            reason: SHORT_PAGE.to_owned(),
+                            count: 1,
+                            last_ms: now_ms(),
+                        },
+                    );
+                }
+                None => {}
+            }
+        }
     }
 
     /// The refused query names, most refused first.
@@ -1141,6 +1175,10 @@ fn counter_name(name: &str) -> (String, &'static str) {
         "refused_other" => (
             "xyne_sync_queries_refused_total".to_owned(),
             "{reason=\"other\"}",
+        ),
+        "pages_short" => (
+            "xyne_sync_queries_short_total".to_owned(),
+            "{reason=\"page_capped\"}",
         ),
         "plans_page_driven" => (
             "xyne_sync_plans_total".to_owned(),

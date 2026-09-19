@@ -98,6 +98,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
             Event::Landed { .. } => "landed",
             Event::Refused { .. } => "refused",
             Event::Committed { .. } => "committed",
+            Event::Capped { .. } => "capped",
         })
         .collect()
 }
@@ -108,7 +109,7 @@ fn updates_of(event: &Event) -> &[xyne_sync::ivm::ClientUpdate] {
         Event::Registered { updates, .. }
         | Event::Landed { updates }
         | Event::Committed { updates, .. } => updates,
-        Event::Hydrated(_) | Event::Refused { .. } => &[],
+        Event::Hydrated(_) | Event::Refused { .. } | Event::Capped { .. } => &[],
     }
 }
 
