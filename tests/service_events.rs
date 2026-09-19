@@ -305,6 +305,8 @@ fn a_commit_reports_the_position_and_the_watched_writes() {
                 progress: Lsn(50),
                 watched: vec![insert(1, "OPEN")],
                 received: std::time::Instant::now(),
+                committed_at_micros: 0,
+                decode: std::time::Duration::ZERO,
             }))
             .await
             .expect("send");

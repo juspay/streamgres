@@ -382,6 +382,12 @@ impl Storage for PgStorage {
             if rows.len() >= row_limit / 5 {
                 log_info!("read on `{}` returned {} rows", query.table, rows.len());
             }
+            if let Some(stats) = crate::stats::Stats::global() {
+                stats.read_rows.record_value(rows.len() as u64);
+                stats
+                    .rows_read
+                    .fetch_add(rows.len() as u64, Ordering::Relaxed);
+            }
             let rows = rows
                 .iter()
                 .map(|row| decode_row(row, table))

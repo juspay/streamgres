@@ -69,6 +69,8 @@ pub struct Transaction {
     pub at: Lsn,
     pub writes: Vec<WriteQuery>,
     pub heartbeat: Option<String>,
+    pub committed_at_micros: i64,
+    pub decode: Duration,
 }
 
 /// One published table as the feed described it: the catalog table it
@@ -86,6 +88,7 @@ pub struct Decoder {
     relations: HashMap<i32, Relation>,
     pending: Vec<WriteQuery>,
     heartbeat: Option<String>,
+    decode: Duration,
 }
 
 impl Decoder {
@@ -96,21 +99,40 @@ impl Decoder {
             relations: HashMap::new(),
             pending: Vec::new(),
             heartbeat: None,
+            decode: Duration::ZERO,
         }
     }
 
-    /// Absorb one event; a `Commit` yields the finished transaction.
+    /// Absorb one event; a `Commit` yields the finished transaction, which
+    /// carries the time the feed thread spent decoding it.
     pub fn absorb(&mut self, event: ReplicationEvent) -> Result<Option<Transaction>, StorageError> {
+        let started = Instant::now();
+        let mut outcome = self.absorb_event(event);
+        self.decode += started.elapsed();
+        if let Ok(Some(transaction)) = &mut outcome {
+            transaction.decode = std::mem::take(&mut self.decode);
+        }
+        outcome
+    }
+
+    /// Absorb one event.
+    fn absorb_event(&mut self, event: ReplicationEvent) -> Result<Option<Transaction>, StorageError> {
         match event {
             ReplicationEvent::Begin { .. } => {
                 self.pending.clear();
                 self.heartbeat = None;
                 Ok(None)
             }
-            ReplicationEvent::Commit { end_lsn, .. } => Ok(Some(Transaction {
+            ReplicationEvent::Commit {
+                end_lsn,
+                commit_time_micros,
+                ..
+            } => Ok(Some(Transaction {
                 at: position(end_lsn),
                 writes: std::mem::take(&mut self.pending),
                 heartbeat: self.heartbeat.take(),
+                committed_at_micros: commit_time_micros,
+                decode: Duration::ZERO,
             })),
             ReplicationEvent::Message {
                 transactional: true,
@@ -415,6 +437,8 @@ impl Transport {
                 progress: feed.progress(),
                 watched: watched_writes,
                 received: Instant::now(),
+                committed_at_micros: transaction.committed_at_micros,
+                decode: transaction.decode,
             };
             if out.send(committed).await.is_err() {
                 return Ok(());
@@ -587,6 +611,8 @@ impl PgStream {
                 progress: self.feed.progress(),
                 watched: Vec::new(),
                 received: Instant::now(),
+                committed_at_micros: transaction.committed_at_micros,
+                decode: transaction.decode,
             };
             if commands
                 .send(Command::Transaction(committed))

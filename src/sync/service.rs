@@ -25,6 +25,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+/// PostgreSQL's epoch (2000-01-01) in microseconds since the Unix epoch.
+const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
+
 use tokio::sync::mpsc;
 use tokio::task::spawn_local;
 
@@ -73,6 +76,8 @@ pub struct Transaction {
     pub progress: Lsn,
     pub watched: Vec<WriteQuery>,
     pub received: Instant,
+    pub committed_at_micros: i64,
+    pub decode: Duration,
 }
 
 impl Transaction {
@@ -85,6 +90,8 @@ impl Transaction {
             progress: at,
             watched: Vec::new(),
             received: Instant::now(),
+            committed_at_micros: 0,
+            decode: Duration::ZERO,
         }
     }
 }
@@ -244,6 +251,11 @@ where
         loop {
             tokio::select! {
                 taken = self.commands.recv_many(&mut commands, 64) => {
+                    if let Some(stats) = &self.stats {
+                        stats
+                            .engine_inbox
+                            .store(self.commands.len() as u64, Ordering::Relaxed);
+                    }
                     if taken == 0 {
                         break;
                     }
@@ -361,6 +373,8 @@ where
             progress,
             watched,
             received,
+            committed_at_micros,
+            decode,
         } = transaction;
         let started = Instant::now();
         let mut step = Step::default();
@@ -382,11 +396,26 @@ where
                 .feed_to_engine
                 .record(started.duration_since(received));
             stats.engine_step.record(routed.duration_since(started));
+            stats.feed_decode.record(decode);
+            if committed_at_micros > 0 {
+                let committed_unix = committed_at_micros.saturating_add(PG_EPOCH_UNIX_MICROS);
+                let now_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| i64::try_from(since.as_micros()).unwrap_or(i64::MAX))
+                    .unwrap_or(0);
+                let lag = u64::try_from(now_unix - committed_unix).unwrap_or(0);
+                stats.feed_lag.record(Duration::from_micros(lag));
+            }
+            stats.feed_lsn.store(at.0, Ordering::Relaxed);
+            stats
+                .feed_last_message_ms
+                .store(crate::stats::now_ms(), Ordering::Relaxed);
             stats.transactions.fetch_add(1, Ordering::Relaxed);
             stats
                 .writes
                 .fetch_add(writes.len() as u64, Ordering::Relaxed);
             stats.publish_engine(self.runtime.engine_stats(), self.runtime.stats());
+            stats.publish_footprint(self.runtime.engine_footprint());
         }
         self.dispatch(
             step,

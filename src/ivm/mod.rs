@@ -124,7 +124,7 @@ mod update;
 mod window;
 
 pub use crate::model::{ClientId, SubId};
-pub use engine::{Engine, Fetch, FetchId, FetchKind};
+pub use engine::{Engine, Fetch, FetchId, FetchKind, Footprint};
 pub use multi::{MultiTableIVM, MultiTableUpdate};
 pub use predicate::{eval_condition, evaluate, evaluate_with};
 pub use stats::IvmStats;
@@ -622,6 +622,20 @@ impl Engine for SingleTableIVM {
     }
 
     /// The rows dropped since the last call, to be freed elsewhere.
+    fn footprint(&self) -> Footprint {
+        let mut rows_by_table: Vec<(String, u64)> = self
+            .frames
+            .iter()
+            .map(|(table, frame)| (table.to_string(), frame.len() as u64))
+            .collect();
+        rows_by_table.sort();
+        Footprint {
+            subscriptions: self.select_queries.len() as u64,
+            trees: 0,
+            rows_by_table,
+        }
+    }
+
     fn take_dead(&mut self) -> Vec<SharedRow> {
         std::mem::take(&mut self.graveyard)
     }

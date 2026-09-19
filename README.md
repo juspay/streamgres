@@ -66,6 +66,7 @@ every later delta continues from.
 | **Client side** speaking Zero's sync protocol (v51, the `@rocicorp/zero` 1.9 client): connect handshake, ping/pong and liveness, desired queries through the app server's query endpoint, pokes per client group, mutations through its mutate endpoint, `lastMutationID` off the app's clients table; it owns no engine and no database connection, reaching both only through [`sync::Service`]'s channels; verified from the xyne-spaces UI with three users (roles, resource access, channels, threads, reactions, tickets) and load-tested (see below) | ✅ done (no history across restarts) | `src/client/`, `src/sync/pg/threads.rs`, [docs/live-verification-2026-09-15.md](docs/live-verification-2026-09-15.md) |
 | **The pipeline as threads**: the feed thread decodes and hands the engine one transaction per commit; the engine thread routes and nothing else; a reads pool runs the storage (one round trip per read); `XYNE_SYNC_GROUP_THREADS` group threads keep the views and build pokes, each row serialized once per flush and frames assembled as bytes; connections translate and plan their own queries; per-stage latency histograms at `/stats` | ✅ done | `src/client/mod.rs`, `src/stats.rs`, [docs/pipeline-2026-09-18.md](docs/pipeline-2026-09-18.md) |
 | **Warm start**: the query shapes asked for kept in a file and planned again before readiness, so a restart's first clients hit the plan cache | ✅ done | `src/client/warm.rs` |
+| **Transform cache** per identity, query and arguments; **observability**: lock-free stage histograms and counters, `/metrics` in Prometheus format, a sampler thread with a summary line, structured logs through an asynchronous queue | ✅ done | `src/client/transform.rs`, `src/stats.rs`, `src/log.rs`, `src/client/sampler.rs`, [docs/observability.md](docs/observability.md) |
 | **Measured on production-shaped data**: the fixes for releases, memory and acknowledgements, both reference-server deployments under the same shapes, our own driver over the data, and the client-count ladders | ✅ measured | [docs/prod-scale-2026-09-18.md](docs/prod-scale-2026-09-18.md), [docs/prod-scale-2026-09-19.md](docs/prod-scale-2026-09-19.md) |
 | Batching of one write's narrowed reads | ⏳ pending | paper §13 |
 | Parser `JOIN` syntax | ⏳ pending | multi-table queries are built programmatically |
@@ -490,17 +491,30 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   poke is several frames and Nagle's algorithm with delayed
   acknowledgements would hold the later ones back by tens of
   milliseconds.
-- **Measurements.** `GET /stats` serves the server's own clock on every
-  stage (feed to engine, the engine's step, engine to groups, the flush,
-  groups to socket, and end to end inside the server, as p50/p90/p99 in
-  microseconds), the query path's own stages (the application server's
-  transform, planning, hydration per query split into cold, when the
-  registration read storage, and warm, when the held frames answered it,
-  the engine's register and land steps, and a storage read's round trip),
-  the counters (transactions, pokes, frames, rows serialized
-  and rows shared within a flush) and the engine's routing counters;
-  `?reset=1` zeroes the histograms after reading, which the load harness
-  does at the start of its steady phase.
+- **Transform cache.** The application server's AST for a query is kept
+  per identity, name and arguments for `XYNE_SYNC_TRANSFORM_TTL_MS`
+  (5 min; the reference server keeps its own for 5 s), at most
+  `XYNE_SYNC_TRANSFORM_CACHE` (20 000) entries, so a shape asked for again
+  skips the round trip; failed transforms are never kept
+  (`client/transform.rs`). Measured on the rig: 0.6 % hits on five
+  minutes of real sessions, 32 to 37 % on the statistical mix, where it
+  took a third of the backend's round trips away and the steady select
+  from 21 to 15 ms at the median.
+- **Observability** ([docs/observability.md](docs/observability.md)).
+  Every stage of both paths is a lock-free histogram and every count an
+  atomic, recorded by the thread doing the work; `GET /stats` serves them
+  as JSON (the load harness's format; `?reset=1` zeroes the histograms
+  after reading, which the harness does at the start of its steady phase,
+  so do not combine it with scraping), `GET /metrics` in Prometheus
+  exposition format (durations in seconds, `_total` counters, gauges for
+  what is open, held and queued, `rows_held{table}`,
+  `thread_cpu_seconds_total{thread}`), and a `xyne-sync-metrics` thread
+  samples the process every `XYNE_SYNC_METRICS_INTERVAL_MS` (10 s) and
+  writes a one-line summary every minute. Logs go through a bounded queue
+  to a `xyne-sync-log` thread (a full queue drops and counts, never
+  blocks), as text or JSON lines (`XYNE_SYNC_LOG_FORMAT`), with structured
+  events for connections opened and closed, queries hydrated (at debug;
+  at warn past `XYNE_SYNC_SLOW_QUERY_MS`), pushes and the warm start.
 
 Configuration is by `XYNE_SYNC_*` variables (see [.env.example](.env.example);
 the names a reference-server deployment sets are accepted for the database

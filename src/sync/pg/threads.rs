@@ -129,7 +129,7 @@ pub fn spawn_feed(
                                 Ok(()) => log_warn!("change feed dropped; reopening the slot"),
                                 Err(error) => {
                                     log_error!("change feed failed: {error}");
-                                    std::process::exit(1);
+                                    crate::log::exit(1);
                                 }
                             }
                         }
@@ -143,7 +143,7 @@ pub fn spawn_feed(
                 }
             });
             log_error!("change feed thread stopped: the engine is gone");
-            std::process::exit(1);
+            crate::log::exit(1);
         })
         .map_err(|error| format!("feed thread: {error}"))?;
     Ok(transactions)

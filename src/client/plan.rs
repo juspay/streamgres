@@ -449,11 +449,14 @@ pub async fn plan<S: Storage + ?Sized>(
     }
     let mut planner = Planner::new(query.clone(), policy);
     let wanted = planner.counts();
-    let answers = join_all(
-        wanted
-            .iter()
-            .map(|(_, count_query, cap)| storage.count(count_query, *cap)),
-    )
+    let answers = join_all(wanted.iter().map(|(_, count_query, cap)| async move {
+        let started = Instant::now();
+        let answer = storage.count(count_query, *cap).await;
+        if let Some(stats) = crate::stats::Stats::global() {
+            stats.count_io.record(started.elapsed());
+        }
+        answer
+    }))
     .await;
     let mut failed = None;
     for ((index, _, _), answer) in wanted.iter().zip(answers) {

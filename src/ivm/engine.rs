@@ -85,6 +85,10 @@ pub trait Engine {
     /// them), handed out so the caller can free them off this thread.
     fn take_dead(&mut self) -> Vec<SharedRow>;
 
+    /// What the engine holds right now: its subscriptions, its shared
+    /// trees and the rows in its frames per table.
+    fn footprint(&self) -> Footprint;
+
     /// Route one write to every subscription it affects, grouped per
     /// client.
     fn route(&mut self, write: &WriteQuery) -> Vec<ClientUpdate>;
@@ -106,4 +110,13 @@ pub trait Engine {
 
     /// The engine's routing counters.
     fn stats(&self) -> &super::IvmStats;
+}
+
+/// What an engine holds: subscriptions (parts, for a multi-table
+/// engine), shared trees, and the rows in the shared frames per table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Footprint {
+    pub subscriptions: u64,
+    pub trees: u64,
+    pub rows_by_table: Vec<(String, u64)>,
 }

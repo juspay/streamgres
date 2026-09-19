@@ -54,6 +54,7 @@ pub mod connection;
 pub mod groups;
 pub mod plan;
 pub mod protocol;
+pub mod sampler;
 pub mod transform;
 pub mod warm;
 pub mod wire;
@@ -72,6 +73,7 @@ use crate::sync::pg::threads;
 /// not start.
 pub fn serve(config: Config) -> Result<(), String> {
     log::set_level(config.log);
+    log::set_format(config.log_format);
     let config = Arc::new(config);
     let settings = config.engine_settings();
     let server = tokio::runtime::Builder::new_multi_thread()
@@ -90,6 +92,7 @@ pub fn serve(config: Config) -> Result<(), String> {
     let feed = threads::spawn_feed(settings.clone(), catalog.clone())?;
     let shards = config.group_threads.max(1);
     let stats = crate::stats::Stats::shared();
+    crate::stats::Stats::install(&stats);
 
     let engine_catalog = catalog.clone();
     let engine_stats = stats.clone();
@@ -120,7 +123,7 @@ pub fn serve(config: Config) -> Result<(), String> {
                             Ok(_) => log_error!("the engine's service stopped"),
                             Err(error) => log_error!("the engine's service panicked: {error}"),
                         }
-                        std::process::exit(1);
+                        crate::log::exit(1);
                     }
                     Err(error) => {
                         let _ = started_tx.send(Err(error));
@@ -176,7 +179,7 @@ pub fn serve(config: Config) -> Result<(), String> {
                     Ok(()) => log_error!("group thread {shard} stopped"),
                     Err(_) => log_error!("group thread {shard} panicked"),
                 }
-                std::process::exit(1);
+                crate::log::exit(1);
             })
             .map_err(|error| format!("group thread {shard}: {error}"))?;
     }
@@ -196,6 +199,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         config.transform_cache,
     ));
     let warm_budget = config.warm_start;
+    let metrics_interval = config.metrics_interval;
     let (warmed_tx, warmed) =
         tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
     let state = Arc::new(connection::AppState {
@@ -263,6 +267,7 @@ pub fn serve(config: Config) -> Result<(), String> {
             });
         }
     }
+    sampler::spawn(state.clone(), metrics_interval);
     log_info!("client side up");
     let served = server.block_on(connection::serve(state));
     drop(reads);

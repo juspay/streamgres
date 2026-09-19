@@ -43,7 +43,7 @@ use super::warm::WarmStart;
 use super::protocol::{
     self, DeleteClients, InitConnection, PROTOCOL_VERSION, QueryPatchOp, Upstream,
 };
-use crate::log::{log_debug, log_info, log_warn};
+use crate::log::{Level, log_debug, log_event, log_info, log_warn};
 use crate::model::Catalog;
 use crate::stats::Stats;
 use crate::sync::pg::PgStorage;
@@ -113,7 +113,23 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/{probe}"), get(health))
             .route(&format!("/{probe}"), get(health));
     }
-    router.route("/stats", get(stats)).with_state(state)
+    router
+        .route("/stats", get(stats))
+        .route("/metrics", get(metrics))
+        .with_state(state)
+}
+
+/// The server's measurements in Prometheus exposition format.
+async fn metrics(
+    State(state): State<Arc<AppState>>,
+) -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        state.stats.prometheus(),
+    )
 }
 
 /// How long the listener waits for the sockets to close after a
@@ -410,7 +426,44 @@ async fn handle(
         keep_going = conn.init(init, true).await;
     }
     if keep_going {
-        conn.read_loop(stream).await;
+        let opened = Instant::now();
+        conn.state
+            .stats
+            .connections_opened
+            .fetch_add(1, Ordering::Relaxed);
+        conn.state
+            .stats
+            .connections_open
+            .fetch_add(1, Ordering::Relaxed);
+        log_event!(
+            Level::Info,
+            "connection opened",
+            wsid = conn.params.wsid,
+            group = conn.params.group_id,
+            client = conn.params.client_id,
+            authenticated = conn.identity.token.is_some() || conn.identity.cookie.is_some(),
+            origin = conn.identity.origin.as_deref().unwrap_or("")
+        );
+        let reason = conn.read_loop(stream).await;
+        conn.state
+            .stats
+            .connections_open
+            .fetch_sub(1, Ordering::Relaxed);
+        match reason {
+            "client" => &conn.state.stats.connections_closed_by_client,
+            "error" => &conn.state.stats.connections_closed_by_error,
+            _ => &conn.state.stats.connections_closed_by_server,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        log_event!(
+            Level::Info,
+            "connection closed",
+            wsid = conn.params.wsid,
+            group = conn.params.group_id,
+            client = conn.params.client_id,
+            reason = reason,
+            seconds = format!("{:.1}", opened.elapsed().as_secs_f64())
+        );
     }
     let _ = requests
         .send(Request::Disconnect {
@@ -509,13 +562,14 @@ impl Conn {
     /// The reader: every frame resets the liveness clock; a ping frame
     /// goes out at the configured interval, and a connection that has
     /// answered nothing for the client timeout is closed.
-    async fn read_loop(&mut self, mut stream: SplitStream<WebSocket>) {
+    async fn read_loop(&mut self, mut stream: SplitStream<WebSocket>) -> &'static str {
         let ping_interval = self.state.config.ping_interval.max(Duration::from_secs(1));
         let timeout = self.state.config.client_timeout;
         let mut last_inbound = Instant::now();
         let mut ticker = tokio::time::interval(ping_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ticker.tick().await;
+        let mut reason = "server";
         loop {
             tokio::select! {
                 frame = stream.next() => match frame {
@@ -530,10 +584,12 @@ impl Conn {
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         log_debug!("connection {}: closed by the client", self.params.wsid);
+                        reason = "client";
                         break;
                     }
                     Some(Err(error)) => {
                         log_debug!("connection {}: {error}", self.params.wsid);
+                        reason = "error";
                         break;
                     }
                 },
@@ -550,6 +606,7 @@ impl Conn {
                 }
             }
         }
+        reason
     }
 
     /// One upstream message; false when the connection should end.
@@ -743,6 +800,10 @@ impl Conn {
                                 self.params.wsid,
                                 result.get("message").and_then(Json::as_str).unwrap_or("")
                             );
+                            self.state
+                                .stats
+                                .transform_errors
+                                .fetch_add(1, Ordering::Relaxed);
                             errored.push(result);
                         }
                     }
@@ -828,7 +889,33 @@ impl Conn {
                 self.params.group_id
             );
         }
-        match self.state.backend.push(&self.identity, &push.body).await {
+        let started = Instant::now();
+        for mutation in &push.mutation_ids {
+            self.state.stats.push_sent(&mutation.client_id, mutation.id);
+        }
+        let outcome = self.state.backend.push(&self.identity, &push.body).await;
+        let elapsed = started.elapsed();
+        self.state.stats.push.record(elapsed);
+        let failed = matches!(outcome, PushOutcome::Failed { .. });
+        if failed {
+            self.state.stats.pushes_failed.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.state.stats.pushes_ok.fetch_add(1, Ordering::Relaxed);
+        }
+        log_event!(
+            if failed || elapsed >= self.state.config.slow_query {
+                Level::Warn
+            } else {
+                Level::Debug
+            },
+            "push forwarded",
+            wsid = self.params.wsid,
+            group = self.params.group_id,
+            mutations = push.mutation_ids.len(),
+            ms = format!("{:.1}", elapsed.as_secs_f64() * 1000.0),
+            failed = failed
+        );
+        match outcome {
             PushOutcome::Response(json) => {
                 if let Some(mutations) = json.get("mutations") {
                     send(

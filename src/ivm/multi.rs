@@ -143,6 +143,7 @@ use std::rc::Rc;
 use super::predicate::evaluate_with;
 use super::stats::IvmStats;
 use super::update::{Raw, Target, group};
+use super::engine::Footprint;
 use super::{ClientUpdate, Engine, Fetch, QueryPart, SingleTableIVM, SingleTableUpdate};
 use crate::model::frame::SharedRow;
 use crate::model::{
@@ -1808,6 +1809,12 @@ impl Engine for MultiTableIVM {
     }
 
     /// [`SingleTableIVM::take_dead`] of the inner engine.
+    fn footprint(&self) -> Footprint {
+        let mut footprint = self.single.footprint();
+        footprint.trees = self.trees.len() as u64;
+        footprint
+    }
+
     fn take_dead(&mut self) -> Vec<SharedRow> {
         self.single.take_dead()
     }

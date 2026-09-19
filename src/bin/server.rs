@@ -14,7 +14,7 @@ fn main() {
     let outcome = xyne_sync::client::Config::from_env().and_then(xyne_sync::client::serve);
     if let Err(error) = outcome {
         eprintln!("{error}");
-        std::process::exit(1);
+        xyne_sync::log::exit(1);
     }
 }
 

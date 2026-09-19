@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::plan::{Policy, Side};
-use crate::log::Level;
+use crate::log::{Format, Level};
 use crate::model::TableName;
 use crate::sync::pg::Settings;
 
@@ -113,6 +113,15 @@ pub struct Config {
     pub warm_start: Duration,
     /// `XYNE_SYNC_LOG`: `error`, `warn`, `info` or `debug` (`info`).
     pub log: Level,
+    /// `XYNE_SYNC_LOG_FORMAT`: `text` or `json` (`text`).
+    pub log_format: Format,
+    /// `XYNE_SYNC_SLOW_QUERY_MS`: a query hydrating slower than this, or a
+    /// push slower than this, is logged at warn (1000).
+    pub slow_query: Duration,
+    /// `XYNE_SYNC_METRICS_INTERVAL_MS`: how often the metrics thread samples
+    /// the process (10000; 0 turns it off); the summary line goes out every
+    /// sixth sample.
+    pub metrics_interval: Duration,
 }
 
 impl Config {
@@ -180,6 +189,15 @@ impl Config {
             Some(other) => {
                 return Err(format!(
                     "XYNE_SYNC_LOG must be error, warn, info or debug, got `{other}`"
+                ));
+            }
+        };
+        let log_format = match first(&["XYNE_SYNC_LOG_FORMAT"]).as_deref() {
+            None | Some("text") => Format::Text,
+            Some("json") => Format::Json,
+            Some(other) => {
+                return Err(format!(
+                    "XYNE_SYNC_LOG_FORMAT must be text or json, got `{other}`"
                 ));
             }
         };
@@ -267,6 +285,9 @@ impl Config {
             plan_file: first(&["XYNE_SYNC_PLAN_FILE"]).map(PathBuf::from),
             warm_start: millis("XYNE_SYNC_WARM_START_MS", 20_000)?,
             log,
+            log_format,
+            slow_query: millis("XYNE_SYNC_SLOW_QUERY_MS", 1_000)?,
+            metrics_interval: millis("XYNE_SYNC_METRICS_INTERVAL_MS", 10_000)?,
         })
     }
 

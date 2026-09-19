@@ -155,6 +155,11 @@ impl<E: Engine> Runtime<E> {
     }
 
     /// The engine's routing counters.
+    pub fn engine_footprint(&self) -> crate::ivm::Footprint {
+        self.engine.footprint()
+    }
+
+    /// The engine's own counters.
     pub fn engine_stats(&self) -> &crate::ivm::IvmStats {
         self.engine.stats()
     }

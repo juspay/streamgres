@@ -420,6 +420,8 @@ fn service_streams_end_to_end() {
                     progress: batch.progress,
                     watched: Vec::new(),
                     received: Instant::now(),
+                    committed_at_micros: 0,
+                    decode: std::time::Duration::ZERO,
                 }))
                 .await
                 .expect("send");

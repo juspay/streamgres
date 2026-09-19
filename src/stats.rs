@@ -1,29 +1,35 @@
 //! What the server measures about itself: how long each stage of the
 //! pipeline takes for a committed transaction, from the feed thread
-//! decoding it to the last frame of the poke it produced being written,
-//! and the counters that say how much work went through. Every stage
-//! records into a lock-free histogram; the client side serves the whole
-//! picture at `/stats`, so the server's own share of a delivery delay can
-//! be read apart from PostgreSQL's and the client's.
+//! decoding it to the last frame of the poke it produced being written;
+//! the query path's stages, so a hydration's time splits into the
+//! application server's, PostgreSQL's and the engine's own; the counters
+//! that say how much work went through; and the gauges that say what the
+//! process holds. Every duration and count is recorded into lock-free
+//! atomics by the thread doing the work (one `fetch_add` a sample); the
+//! reading, as `/stats` JSON, `/metrics` in Prometheus exposition format,
+//! or the periodic summary line, is done elsewhere, from the atomics.
 //!
 //! A histogram has four buckets per power of two, so a percentile is
 //! exact to within a fifth of its value, and it costs one atomic add per
-//! sample.
+//! sample. `docs/observability.md` is the catalogue.
 
+use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value as Json, json};
 
-use crate::ivm::IvmStats;
+use crate::ivm::{Footprint, IvmStats};
 use crate::sync::SyncStats;
 
 /// How many buckets a histogram has: four per power of two of a `u64`,
 /// plus one for zero.
 const BUCKETS: usize = 1 + 64 * 4;
 
-/// A distribution of durations in microseconds, four buckets per octave.
+/// A distribution of durations in microseconds (or of counts), four
+/// buckets per octave.
 pub struct Histogram {
     buckets: Vec<AtomicU64>,
     count: AtomicU64,
@@ -63,11 +69,15 @@ impl Histogram {
 
     /// Record one duration.
     pub fn record(&self, elapsed: Duration) {
-        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
-        self.buckets[bucket_of(micros)].fetch_add(1, Ordering::Relaxed);
+        self.record_value(u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX));
+    }
+
+    /// Record one value (microseconds, or a count for a histogram of counts).
+    pub fn record_value(&self, value: u64) {
+        self.buckets[bucket_of(value)].fetch_add(1, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.sum.fetch_add(micros, Ordering::Relaxed);
-        self.max.fetch_max(micros, Ordering::Relaxed);
+        self.sum.fetch_add(value, Ordering::Relaxed);
+        self.max.fetch_max(value, Ordering::Relaxed);
     }
 
     /// The distribution so far.
@@ -102,6 +112,25 @@ impl Histogram {
         }
     }
 
+    /// The count and the sum of every sample so far.
+    pub fn count_and_sum(&self) -> (u64, u64) {
+        (
+            self.count.load(Ordering::Relaxed),
+            self.sum.load(Ordering::Relaxed),
+        )
+    }
+
+    /// How many samples were at most `limit` (a bucket straddling the
+    /// limit counts whole, so the answer is exact to within one bucket).
+    fn at_most(&self, limit: u64) -> u64 {
+        self.buckets
+            .iter()
+            .enumerate()
+            .take_while(|(index, _)| lower_bound(*index) <= limit)
+            .map(|(_, bucket)| bucket.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// Forget every sample.
     pub fn reset(&self) {
         for bucket in &self.buckets {
@@ -113,22 +142,22 @@ impl Histogram {
     }
 }
 
-/// The bucket of `micros`: zero in the first, then four per octave (the
+/// The bucket of `value`: zero in the first, then four per octave (the
 /// two lowest octaves have one value each and use their first quarter).
-fn bucket_of(micros: u64) -> usize {
-    if micros == 0 {
+fn bucket_of(value: u64) -> usize {
+    if value == 0 {
         return 0;
     }
-    let exponent = 63 - micros.leading_zeros() as usize;
+    let exponent = 63 - value.leading_zeros() as usize;
     let quarter = if exponent >= 2 {
-        ((micros >> (exponent - 2)) & 3) as usize
+        ((value >> (exponent - 2)) & 3) as usize
     } else {
         0
     };
     1 + exponent * 4 + quarter
 }
 
-/// The smallest duration a bucket holds.
+/// The smallest value a bucket holds.
 fn lower_bound(index: usize) -> u64 {
     if index == 0 {
         return 0;
@@ -142,16 +171,35 @@ fn lower_bound(index: usize) -> u64 {
     }
 }
 
-/// The engine's own counters, as last published by the service.
+/// The engine's own counters and what it holds, as last published by
+/// the service.
 #[derive(Default, Clone)]
 struct Engine {
     ivm: IvmStats,
     sync: SyncStats,
+    footprint: Footprint,
 }
+
+/// A push awaiting the `lastMutationIDChanges` that acknowledges it.
+struct PendingPush {
+    mutation: i64,
+    at: Instant,
+}
+
+/// What only sampling or the group threads can report.
+#[derive(Default, Clone)]
+struct Sampled {
+    thread_cpu: Vec<(String, f64)>,
+    groups_inbox: Vec<u64>,
+}
+
+static GLOBAL: OnceLock<Arc<Stats>> = OnceLock::new();
 
 /// Every measurement of the server, shared by the threads that take them.
 ///
 /// Durations, per committed transaction unless said otherwise:
+/// - `feed_decode`: the feed thread decoding it.
+/// - `feed_lag`: from PostgreSQL's commit time to the engine taking it up.
 /// - `feed_to_engine`: from the feed thread decoding it to the engine
 ///   thread taking it up.
 /// - `engine_step`: the engine routing it (every write, the reads asked
@@ -170,6 +218,7 @@ struct Engine {
 ///   of a desired-queries change (per change that named custom queries).
 /// - `plan`: translating and planning one query on the connection task
 ///   (a cache hit is microseconds; a miss counts on the reads pool).
+/// - `count_io`: one planner count on PostgreSQL.
 /// - `hydrate_cold` / `hydrate_warm`: from a query's registration being
 ///   sent to the engine to its first rows all present, per query; cold
 ///   when the registration issued storage reads, warm when the frames
@@ -179,12 +228,21 @@ struct Engine {
 ///   queries, the rows only they held dropped (compute).
 /// - `read_io`: one storage read from being issued to its rows being back
 ///   on the engine thread (the pool's queue, PostgreSQL, decoding).
+/// - `read_rows`: rows per storage read.
 /// - `land_step`: the engine landing one read's rows (compute).
 ///
+/// Durations of a mutation: `push`, the application server's round trip,
+/// and `mutation_ack`, from the push to the poke that acknowledges it.
+///
 /// Counts: transactions and writes routed, pokes and frames written, rows
-/// serialized and rows found already serialized in the same flush.
+/// serialized and rows found already serialized in the same flush,
+/// transforms answered from the cache and not, pushes by outcome,
+/// connections opened and closed by reason. Gauges: what is open, held
+/// and queued right now.
 pub struct Stats {
     started: Instant,
+    pub feed_decode: Histogram,
+    pub feed_lag: Histogram,
     pub feed_to_engine: Histogram,
     pub engine_step: Histogram,
     pub engine_to_groups: Histogram,
@@ -193,21 +251,45 @@ pub struct Stats {
     pub end_to_end: Histogram,
     pub transform: Histogram,
     pub plan: Histogram,
+    pub count_io: Histogram,
     pub hydrate_cold: Histogram,
     pub hydrate_warm: Histogram,
     pub register_step: Histogram,
     pub unregister_step: Histogram,
     pub read_io: Histogram,
+    pub read_rows: Histogram,
     pub land_step: Histogram,
+    pub push: Histogram,
+    pub mutation_ack: Histogram,
     pub transactions: AtomicU64,
     pub writes: AtomicU64,
     pub pokes: AtomicU64,
     pub frames: AtomicU64,
     pub rows_serialized: AtomicU64,
     pub rows_shared: AtomicU64,
+    pub rows_read: AtomicU64,
     pub transform_hits: AtomicU64,
     pub transform_misses: AtomicU64,
+    pub transform_errors: AtomicU64,
+    pub pushes_ok: AtomicU64,
+    pub pushes_failed: AtomicU64,
+    pub connections_opened: AtomicU64,
+    pub connections_closed_by_client: AtomicU64,
+    pub connections_closed_by_error: AtomicU64,
+    pub connections_closed_by_server: AtomicU64,
+    pub connections_open: AtomicU64,
+    pub client_groups: AtomicU64,
+    pub clients: AtomicU64,
+    pub engine_inbox: AtomicU64,
+    pub plan_cache_entries: AtomicU64,
+    pub transform_cache_entries: AtomicU64,
+    pub warm_shapes: AtomicU64,
+    pub feed_lsn: AtomicU64,
+    pub feed_last_message_ms: AtomicU64,
+    pub process_rss_bytes: AtomicU64,
     engine: Mutex<Engine>,
+    pushes: Mutex<HashMap<String, Vec<PendingPush>>>,
+    sampled: Mutex<Sampled>,
 }
 
 impl Default for Stats {
@@ -222,6 +304,8 @@ impl Stats {
     pub fn new() -> Self {
         Stats {
             started: Instant::now(),
+            feed_decode: Histogram::new(),
+            feed_lag: Histogram::new(),
             feed_to_engine: Histogram::new(),
             engine_step: Histogram::new(),
             engine_to_groups: Histogram::new(),
@@ -230,27 +314,62 @@ impl Stats {
             end_to_end: Histogram::new(),
             transform: Histogram::new(),
             plan: Histogram::new(),
+            count_io: Histogram::new(),
             hydrate_cold: Histogram::new(),
             hydrate_warm: Histogram::new(),
             register_step: Histogram::new(),
             unregister_step: Histogram::new(),
             read_io: Histogram::new(),
+            read_rows: Histogram::new(),
             land_step: Histogram::new(),
+            push: Histogram::new(),
+            mutation_ack: Histogram::new(),
             transactions: AtomicU64::new(0),
             writes: AtomicU64::new(0),
             pokes: AtomicU64::new(0),
             frames: AtomicU64::new(0),
             rows_serialized: AtomicU64::new(0),
             rows_shared: AtomicU64::new(0),
+            rows_read: AtomicU64::new(0),
             transform_hits: AtomicU64::new(0),
             transform_misses: AtomicU64::new(0),
+            transform_errors: AtomicU64::new(0),
+            pushes_ok: AtomicU64::new(0),
+            pushes_failed: AtomicU64::new(0),
+            connections_opened: AtomicU64::new(0),
+            connections_closed_by_client: AtomicU64::new(0),
+            connections_closed_by_error: AtomicU64::new(0),
+            connections_closed_by_server: AtomicU64::new(0),
+            connections_open: AtomicU64::new(0),
+            client_groups: AtomicU64::new(0),
+            clients: AtomicU64::new(0),
+            engine_inbox: AtomicU64::new(0),
+            plan_cache_entries: AtomicU64::new(0),
+            transform_cache_entries: AtomicU64::new(0),
+            warm_shapes: AtomicU64::new(0),
+            feed_lsn: AtomicU64::new(0),
+            feed_last_message_ms: AtomicU64::new(0),
+            process_rss_bytes: AtomicU64::new(0),
             engine: Mutex::new(Engine::default()),
+            pushes: Mutex::new(HashMap::new()),
+            sampled: Mutex::new(Sampled::default()),
         }
     }
 
     /// Fresh measurements behind a shared handle.
     pub fn shared() -> Arc<Self> {
         Arc::new(Self::new())
+    }
+
+    /// Make `stats` the process's measurements, reachable from code that
+    /// has no handle (the reads pool, the planner); the first call wins.
+    pub fn install(stats: &Arc<Self>) {
+        let _ = GLOBAL.set(stats.clone());
+    }
+
+    /// The process's measurements, if installed.
+    pub fn global() -> Option<&'static Arc<Self>> {
+        GLOBAL.get()
     }
 
     /// Publish the engine's counters (the service does, once per commit).
@@ -261,26 +380,170 @@ impl Stats {
         }
     }
 
-    /// Forget every duration recorded so far; the counters stay.
-    pub fn reset(&self) {
-        for histogram in [
-            &self.feed_to_engine,
+    /// Publish what the engine holds (the service does, once per commit).
+    pub fn publish_footprint(&self, footprint: Footprint) {
+        if let Ok(mut engine) = self.engine.lock() {
+            engine.footprint = footprint;
+        }
+    }
+
+    /// Note a push of `mutation` by `client`, awaiting its acknowledgement.
+    pub fn push_sent(&self, client: &str, mutation: i64) {
+        if let Ok(mut pushes) = self.pushes.lock() {
+            let pending = pushes.entry(client.to_owned()).or_default();
+            pending.retain(|push| push.at.elapsed() < Duration::from_secs(120));
+            pending.push(PendingPush {
+                mutation,
+                at: Instant::now(),
+            });
+        }
+    }
+
+    /// Note that `client`'s last mutation id reached `lmid`: every push of
+    /// a mutation at or below it is acknowledged now.
+    pub fn lmid_seen(&self, client: &str, lmid: i64) {
+        if let Ok(mut pushes) = self.pushes.lock() {
+            let Some(pending) = pushes.get_mut(client) else {
+                return;
+            };
+            let now = Instant::now();
+            pending.retain(|push| {
+                if push.mutation <= lmid {
+                    self.mutation_ack.record(now.duration_since(push.at));
+                    false
+                } else {
+                    true
+                }
+            });
+            if pending.is_empty() {
+                pushes.remove(client);
+            }
+        }
+    }
+
+    /// Publish the CPU seconds by thread name the sampler read.
+    pub fn publish_thread_cpu(&self, thread_cpu: Vec<(String, f64)>) {
+        if let Ok(mut sampled) = self.sampled.lock() {
+            sampled.thread_cpu = thread_cpu;
+        }
+    }
+
+    /// Publish one group thread's inbox depth.
+    pub fn set_groups_inbox(&self, shard: usize, depth: u64) {
+        if let Ok(mut sampled) = self.sampled.lock() {
+            if sampled.groups_inbox.len() <= shard {
+                sampled.groups_inbox.resize(shard + 1, 0);
+            }
+            sampled.groups_inbox[shard] = depth;
+        }
+    }
+
+    /// Seconds since the measurements started.
+    pub fn uptime(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    /// The engine's busy time so far: the sum of its steps.
+    pub fn engine_busy(&self) -> Duration {
+        let micros: u64 = [
             &self.engine_step,
-            &self.engine_to_groups,
-            &self.groups_flush,
-            &self.groups_to_socket,
-            &self.end_to_end,
-            &self.transform,
-            &self.plan,
-            &self.hydrate_cold,
-            &self.hydrate_warm,
             &self.register_step,
             &self.unregister_step,
-            &self.read_io,
             &self.land_step,
-        ] {
+        ]
+        .iter()
+        .map(|histogram| histogram.count_and_sum().1)
+        .sum();
+        Duration::from_micros(micros)
+    }
+
+    /// Forget every duration recorded so far; the counters stay.
+    pub fn reset(&self) {
+        for (_, histogram) in self.histograms() {
             histogram.reset();
         }
+    }
+
+    /// Every histogram with its `/stats` name.
+    fn histograms(&self) -> Vec<(&'static str, &Histogram)> {
+        vec![
+            ("feed_decode", &self.feed_decode),
+            ("feed_lag", &self.feed_lag),
+            ("feed_to_engine", &self.feed_to_engine),
+            ("engine_step", &self.engine_step),
+            ("engine_to_groups", &self.engine_to_groups),
+            ("groups_flush", &self.groups_flush),
+            ("groups_to_socket", &self.groups_to_socket),
+            ("end_to_end", &self.end_to_end),
+            ("transform", &self.transform),
+            ("plan", &self.plan),
+            ("count_io", &self.count_io),
+            ("hydrate_cold", &self.hydrate_cold),
+            ("hydrate_warm", &self.hydrate_warm),
+            ("register_step", &self.register_step),
+            ("unregister_step", &self.unregister_step),
+            ("read_io", &self.read_io),
+            ("read_rows", &self.read_rows),
+            ("land_step", &self.land_step),
+            ("push", &self.push),
+            ("mutation_ack", &self.mutation_ack),
+        ]
+    }
+
+    /// Every counter with its `/stats` name.
+    fn counters(&self) -> Vec<(&'static str, u64)> {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        vec![
+            ("transactions", load(&self.transactions)),
+            ("writes", load(&self.writes)),
+            ("pokes", load(&self.pokes)),
+            ("frames", load(&self.frames)),
+            ("rows_serialized", load(&self.rows_serialized)),
+            ("rows_shared", load(&self.rows_shared)),
+            ("rows_read", load(&self.rows_read)),
+            ("transform_hits", load(&self.transform_hits)),
+            ("transform_misses", load(&self.transform_misses)),
+            ("transform_errors", load(&self.transform_errors)),
+            ("pushes_ok", load(&self.pushes_ok)),
+            ("pushes_failed", load(&self.pushes_failed)),
+            ("connections_opened", load(&self.connections_opened)),
+            (
+                "connections_closed_by_client",
+                load(&self.connections_closed_by_client),
+            ),
+            (
+                "connections_closed_by_error",
+                load(&self.connections_closed_by_error),
+            ),
+            (
+                "connections_closed_by_server",
+                load(&self.connections_closed_by_server),
+            ),
+            ("log_dropped", crate::log::dropped()),
+        ]
+    }
+
+    /// Every gauge with its `/stats` name.
+    fn gauges(&self) -> Vec<(&'static str, u64)> {
+        let load = |gauge: &AtomicU64| gauge.load(Ordering::Relaxed);
+        let last = load(&self.feed_last_message_ms);
+        let heartbeat_age_ms = if last == 0 {
+            0
+        } else {
+            now_ms().saturating_sub(last)
+        };
+        vec![
+            ("connections_open", load(&self.connections_open)),
+            ("client_groups", load(&self.client_groups)),
+            ("clients", load(&self.clients)),
+            ("engine_inbox", load(&self.engine_inbox)),
+            ("plan_cache_entries", load(&self.plan_cache_entries)),
+            ("transform_cache_entries", load(&self.transform_cache_entries)),
+            ("warm_shapes", load(&self.warm_shapes)),
+            ("feed_lsn", load(&self.feed_lsn)),
+            ("feed_heartbeat_age_ms", heartbeat_age_ms),
+            ("process_rss_bytes", load(&self.process_rss_bytes)),
+        ]
     }
 
     /// Everything, as the `/stats` endpoint serves it.
@@ -297,34 +560,50 @@ impl Stats {
             .lock()
             .map(|engine| engine.clone())
             .unwrap_or_default();
+        let sampled = self
+            .sampled
+            .lock()
+            .map(|sampled| sampled.clone())
+            .unwrap_or_default();
+        let stages: serde_json::Map<String, Json> = self
+            .histograms()
+            .into_iter()
+            .map(|(name, histogram)| (name.to_owned(), summary(histogram)))
+            .collect();
+        let counts: serde_json::Map<String, Json> = self
+            .counters()
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), json!(value)))
+            .collect();
+        let gauges: serde_json::Map<String, Json> = self
+            .gauges()
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), json!(value)))
+            .collect();
+        let rows_held: serde_json::Map<String, Json> = engine
+            .footprint
+            .rows_by_table
+            .iter()
+            .map(|(table, rows)| (table.clone(), json!(rows)))
+            .collect();
+        let thread_cpu: serde_json::Map<String, Json> = sampled
+            .thread_cpu
+            .iter()
+            .map(|(name, seconds)| (name.clone(), json!(seconds)))
+            .collect();
         json!({
             "uptime_s": self.started.elapsed().as_secs(),
-            "stages_us": {
-                "feed_to_engine": summary(&self.feed_to_engine),
-                "engine_step": summary(&self.engine_step),
-                "engine_to_groups": summary(&self.engine_to_groups),
-                "groups_flush": summary(&self.groups_flush),
-                "groups_to_socket": summary(&self.groups_to_socket),
-                "end_to_end": summary(&self.end_to_end),
-                "transform": summary(&self.transform),
-                "plan": summary(&self.plan),
-                "hydrate_cold": summary(&self.hydrate_cold),
-                "hydrate_warm": summary(&self.hydrate_warm),
-                "register_step": summary(&self.register_step),
-                "unregister_step": summary(&self.unregister_step),
-                "read_io": summary(&self.read_io),
-                "land_step": summary(&self.land_step),
+            "stages_us": stages,
+            "counts": counts,
+            "gauges": gauges,
+            "engine_busy_s": self.engine_busy().as_secs_f64(),
+            "held": {
+                "subscriptions": engine.footprint.subscriptions,
+                "trees": engine.footprint.trees,
+                "rows_by_table": rows_held,
             },
-            "counts": {
-                "transactions": self.transactions.load(Ordering::Relaxed),
-                "writes": self.writes.load(Ordering::Relaxed),
-                "pokes": self.pokes.load(Ordering::Relaxed),
-                "frames": self.frames.load(Ordering::Relaxed),
-                "rows_serialized": self.rows_serialized.load(Ordering::Relaxed),
-                "rows_shared": self.rows_shared.load(Ordering::Relaxed),
-                "transform_hits": self.transform_hits.load(Ordering::Relaxed),
-                "transform_misses": self.transform_misses.load(Ordering::Relaxed),
-            },
+            "threads_cpu_s": thread_cpu,
+            "groups_inbox": sampled.groups_inbox,
             "engine": {
                 "writes_processed": engine.ivm.writes_processed,
                 "queries_registered": engine.ivm.queries_registered,
@@ -345,6 +624,366 @@ impl Stats {
                 "rows_added": engine.sync.rows_added,
             },
         })
+    }
+
+    /// Everything, in Prometheus exposition format: durations in seconds
+    /// with cumulative buckets (exact to within one of our quarter-octave
+    /// buckets), counts as `_total`, the rest as gauges.
+    pub fn prometheus(&self) -> String {
+        let mut out = String::with_capacity(16 * 1024);
+        let engine = self
+            .engine
+            .lock()
+            .map(|engine| engine.clone())
+            .unwrap_or_default();
+        let sampled = self
+            .sampled
+            .lock()
+            .map(|sampled| sampled.clone())
+            .unwrap_or_default();
+        let mut typed: Vec<&str> = Vec::new();
+        for (name, histogram) in self.histograms() {
+            let (metric, seconds) = if name == "read_rows" {
+                ("xyne_sync_read_rows", false)
+            } else {
+                (metric_of(name), true)
+            };
+            if !typed.contains(&metric) {
+                typed.push(metric);
+                let _ = writeln!(out, "# HELP {metric} {}", stage_help(name));
+                let _ = writeln!(out, "# TYPE {metric} histogram");
+            }
+            let labels = stage_labels(name);
+            let plain = labels.trim_end_matches(',');
+            let bounds: &[u64] = if seconds {
+                &SECONDS_BOUNDS_US
+            } else {
+                &COUNT_BOUNDS
+            };
+            for bound in bounds {
+                let le = if seconds {
+                    format!("{}", *bound as f64 / 1_000_000.0)
+                } else {
+                    bound.to_string()
+                };
+                let _ = writeln!(
+                    out,
+                    "{metric}_bucket{{{labels}le=\"{le}\"}} {}",
+                    histogram.at_most(*bound)
+                );
+            }
+            let (count, sum) = histogram.count_and_sum();
+            let _ = writeln!(out, "{metric}_bucket{{{labels}le=\"+Inf\"}} {count}");
+            let braced = if plain.is_empty() {
+                String::new()
+            } else {
+                format!("{{{plain}}}")
+            };
+            if seconds {
+                let _ = writeln!(out, "{metric}_sum{braced} {}", sum as f64 / 1_000_000.0);
+            } else {
+                let _ = writeln!(out, "{metric}_sum{braced} {sum}");
+            }
+            let _ = writeln!(out, "{metric}_count{braced} {count}");
+        }
+        for (name, value) in self.counters() {
+            let (metric, labels) = counter_name(name);
+            if !typed.contains(&metric.as_str()) {
+                let _ = writeln!(out, "# TYPE {metric} counter");
+            }
+            let _ = writeln!(out, "{metric}{labels} {value}");
+            typed.push(Box::leak(metric.into_boxed_str()));
+        }
+        for (name, value) in self.gauges() {
+            if name == "feed_heartbeat_age_ms" {
+                let _ = writeln!(out, "# TYPE xyne_sync_feed_heartbeat_age_seconds gauge");
+                let _ = writeln!(
+                    out,
+                    "xyne_sync_feed_heartbeat_age_seconds {}",
+                    value as f64 / 1000.0
+                );
+            } else {
+                let _ = writeln!(out, "# TYPE xyne_sync_{name} gauge");
+                let _ = writeln!(out, "xyne_sync_{name} {value}");
+            }
+        }
+        let _ = writeln!(out, "# TYPE xyne_sync_uptime_seconds gauge");
+        let _ = writeln!(
+            out,
+            "xyne_sync_uptime_seconds {}",
+            self.started.elapsed().as_secs()
+        );
+        let _ = writeln!(out, "# TYPE xyne_sync_engine_busy_seconds_total counter");
+        let _ = writeln!(
+            out,
+            "xyne_sync_engine_busy_seconds_total {}",
+            self.engine_busy().as_secs_f64()
+        );
+        let _ = writeln!(out, "# TYPE xyne_sync_subscriptions gauge");
+        let _ = writeln!(
+            out,
+            "xyne_sync_subscriptions {}",
+            engine.footprint.subscriptions
+        );
+        let _ = writeln!(out, "# TYPE xyne_sync_trees gauge");
+        let _ = writeln!(out, "xyne_sync_trees {}", engine.footprint.trees);
+        let _ = writeln!(out, "# TYPE xyne_sync_rows_held gauge");
+        for (table, rows) in &engine.footprint.rows_by_table {
+            let _ = writeln!(out, "xyne_sync_rows_held{{table=\"{table}\"}} {rows}");
+        }
+        let _ = writeln!(out, "# TYPE xyne_sync_thread_cpu_seconds_total counter");
+        for (thread, seconds) in &sampled.thread_cpu {
+            let _ = writeln!(
+                out,
+                "xyne_sync_thread_cpu_seconds_total{{thread=\"{thread}\"}} {seconds}"
+            );
+        }
+        let _ = writeln!(out, "# TYPE xyne_sync_groups_inbox gauge");
+        for (shard, depth) in sampled.groups_inbox.iter().enumerate() {
+            let _ = writeln!(out, "xyne_sync_groups_inbox{{shard=\"{shard}\"}} {depth}");
+        }
+        for (name, value) in [
+            ("writes_impacting_total", engine.ivm.queries_impacted),
+            ("narrowed_reads_total", engine.ivm.storage_reads),
+            ("reads_issued_total", engine.sync.reads_issued),
+            ("reads_landed_total", engine.sync.reads_landed),
+            ("reads_refused_total", engine.sync.reads_refused),
+            ("reads_shared_total", engine.ivm.snapshots_shared),
+            ("registrations_total", engine.ivm.queries_registered),
+            ("client_updates_add_total", engine.ivm.ops_add),
+            ("client_updates_delete_total", engine.ivm.ops_delete),
+        ] {
+            let _ = writeln!(out, "# TYPE xyne_sync_{name} counter");
+            let _ = writeln!(out, "xyne_sync_{name} {value}");
+        }
+        out
+    }
+
+    /// One line that says how the server is doing, for the log every
+    /// minute: what is open and held, the engine's share of a core since
+    /// the previous snapshot, the feed's lag, the caches' hit rates and
+    /// the rates of work.
+    pub fn summary_line(
+        &self,
+        previous: &Snapshot,
+        since: Duration,
+    ) -> (String, Vec<(&'static str, String)>) {
+        let now = self.snapshot();
+        let secs = since.as_secs_f64().max(0.001);
+        let rate = |a: u64, b: u64| (a.saturating_sub(b)) as f64 / secs;
+        let engine_busy =
+            (now.engine_busy_us.saturating_sub(previous.engine_busy_us)) as f64 / 1_000_000.0 / secs;
+        let hits = now.transform_hits.saturating_sub(previous.transform_hits);
+        let misses = now.transform_misses.saturating_sub(previous.transform_misses);
+        let transform_hit_rate = if hits + misses == 0 {
+            0.0
+        } else {
+            100.0 * hits as f64 / (hits + misses) as f64
+        };
+        let engine = self
+            .engine
+            .lock()
+            .map(|engine| engine.clone())
+            .unwrap_or_default();
+        let feed_lag = self.feed_lag.summary();
+        let fields = vec![
+            ("connections", now.connections_open.to_string()),
+            ("groups", now.client_groups.to_string()),
+            ("clients", now.clients.to_string()),
+            ("subscriptions", engine.footprint.subscriptions.to_string()),
+            ("trees", engine.footprint.trees.to_string()),
+            (
+                "rows_held",
+                engine
+                    .footprint
+                    .rows_by_table
+                    .iter()
+                    .map(|(_, rows)| rows)
+                    .sum::<u64>()
+                    .to_string(),
+            ),
+            ("rss_mb", (now.rss_bytes / (1024 * 1024)).to_string()),
+            ("engine_busy_pct", format!("{:.1}", 100.0 * engine_busy)),
+            ("engine_inbox", now.engine_inbox.to_string()),
+            (
+                "feed_lag_p50_ms",
+                format!("{:.1}", feed_lag.p50_us as f64 / 1000.0),
+            ),
+            (
+                "registrations_per_s",
+                format!("{:.1}", rate(now.registrations, previous.registrations)),
+            ),
+            (
+                "releases_per_s",
+                format!("{:.1}", rate(now.releases, previous.releases)),
+            ),
+            (
+                "transactions_per_s",
+                format!("{:.1}", rate(now.transactions, previous.transactions)),
+            ),
+            ("pokes_per_s", format!("{:.1}", rate(now.pokes, previous.pokes))),
+            (
+                "rows_sent_per_s",
+                format!("{:.0}", rate(now.rows_serialized, previous.rows_serialized)),
+            ),
+            ("transform_hit_pct", format!("{transform_hit_rate:.1}")),
+            ("pushes", now.pushes.saturating_sub(previous.pushes).to_string()),
+            ("log_dropped", now.log_dropped.to_string()),
+        ];
+        ("summary".to_owned(), fields)
+    }
+
+    /// The counters the summary line differences.
+    pub fn snapshot(&self) -> Snapshot {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        Snapshot {
+            engine_busy_us: u64::try_from(self.engine_busy().as_micros()).unwrap_or(u64::MAX),
+            registrations: self.register_step.count_and_sum().0,
+            releases: self.unregister_step.count_and_sum().0,
+            transactions: load(&self.transactions),
+            pokes: load(&self.pokes),
+            rows_serialized: load(&self.rows_serialized),
+            transform_hits: load(&self.transform_hits),
+            transform_misses: load(&self.transform_misses),
+            pushes: load(&self.pushes_ok) + load(&self.pushes_failed),
+            connections_open: load(&self.connections_open),
+            client_groups: load(&self.client_groups),
+            clients: load(&self.clients),
+            engine_inbox: load(&self.engine_inbox),
+            rss_bytes: load(&self.process_rss_bytes),
+            log_dropped: crate::log::dropped(),
+        }
+    }
+}
+
+/// The counters a summary line is computed from.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Snapshot {
+    pub engine_busy_us: u64,
+    pub registrations: u64,
+    pub releases: u64,
+    pub transactions: u64,
+    pub pokes: u64,
+    pub rows_serialized: u64,
+    pub transform_hits: u64,
+    pub transform_misses: u64,
+    pub pushes: u64,
+    pub connections_open: u64,
+    pub client_groups: u64,
+    pub clients: u64,
+    pub engine_inbox: u64,
+    pub rss_bytes: u64,
+    pub log_dropped: u64,
+}
+
+/// Milliseconds since the epoch.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// The `le` boundaries of a duration histogram, in microseconds.
+const SECONDS_BOUNDS_US: [u64; 18] = [
+    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 250_000, 500_000,
+    1_000_000, 2_500_000, 5_000_000, 10_000_000, 30_000_000, 60_000_000,
+];
+
+/// The `le` boundaries of a histogram of counts.
+const COUNT_BOUNDS: [u64; 10] = [1, 10, 50, 100, 500, 1_000, 5_000, 10_000, 50_000, 100_000];
+
+/// A stage's Prometheus metric name; stages sharing a metric differ by a
+/// label ([`stage_labels`]).
+fn metric_of(stage: &str) -> &'static str {
+    match stage {
+        "feed_decode" => "xyne_sync_feed_decode_seconds",
+        "feed_lag" => "xyne_sync_feed_lag_seconds",
+        "feed_to_engine" => "xyne_sync_feed_to_engine_seconds",
+        "engine_step" | "register_step" | "unregister_step" | "land_step" => {
+            "xyne_sync_engine_step_seconds"
+        }
+        "engine_to_groups" => "xyne_sync_engine_to_groups_seconds",
+        "groups_flush" => "xyne_sync_groups_flush_seconds",
+        "groups_to_socket" => "xyne_sync_groups_to_socket_seconds",
+        "end_to_end" => "xyne_sync_end_to_end_seconds",
+        "transform" => "xyne_sync_transform_seconds",
+        "plan" => "xyne_sync_plan_seconds",
+        "count_io" => "xyne_sync_count_seconds",
+        "hydrate_cold" | "hydrate_warm" => "xyne_sync_hydrate_seconds",
+        "read_io" => "xyne_sync_read_seconds",
+        "push" => "xyne_sync_push_seconds",
+        "mutation_ack" => "xyne_sync_mutation_ack_seconds",
+        _ => "xyne_sync_unknown_seconds",
+    }
+}
+
+/// The label that tells apart stages sharing a metric, with its trailing
+/// comma, or nothing.
+fn stage_labels(stage: &str) -> &'static str {
+    match stage {
+        "engine_step" => "step=\"write\",",
+        "register_step" => "step=\"register\",",
+        "unregister_step" => "step=\"unregister\",",
+        "land_step" => "step=\"land\",",
+        "hydrate_cold" => "kind=\"cold\",",
+        "hydrate_warm" => "kind=\"warm\",",
+        _ => "",
+    }
+}
+
+/// One line of help per stage.
+fn stage_help(stage: &str) -> &'static str {
+    match stage {
+        "feed_decode" => "the feed thread decoding one transaction",
+        "feed_lag" => "PostgreSQL's commit time to the engine taking the transaction up",
+        "feed_to_engine" => "a decoded transaction's wait for the engine thread",
+        "engine_step" | "register_step" | "unregister_step" | "land_step" => {
+            "the engine's own compute per step"
+        }
+        "engine_to_groups" => "the engine's commit event's wait for a group thread",
+        "groups_flush" => "one flush of a group thread",
+        "groups_to_socket" => "a poke's wait from the writer to its last frame written",
+        "end_to_end" => "the oldest transaction of a poke to its last frame written",
+        "transform" => "one round trip to the application server for ASTs",
+        "plan" => "translating and planning one query",
+        "count_io" => "one planner count on PostgreSQL",
+        "hydrate_cold" | "hydrate_warm" => "a query's registration to its rows present",
+        "read_io" => "a storage read from issue to its rows back on the engine thread",
+        "read_rows" => "rows per storage read",
+        "push" => "the application server's push round trip",
+        "mutation_ack" => "a push to the poke acknowledging it",
+        _ => "",
+    }
+}
+
+/// A counter's Prometheus name and labels.
+fn counter_name(name: &str) -> (String, &'static str) {
+    match name {
+        "transform_hits" => ("xyne_sync_transforms_total".to_owned(), "{result=\"hit\"}"),
+        "transform_misses" => ("xyne_sync_transforms_total".to_owned(), "{result=\"miss\"}"),
+        "transform_errors" => ("xyne_sync_transforms_total".to_owned(), "{result=\"error\"}"),
+        "pushes_ok" => ("xyne_sync_pushes_total".to_owned(), "{result=\"ok\"}"),
+        "pushes_failed" => ("xyne_sync_pushes_total".to_owned(), "{result=\"failed\"}"),
+        "connections_opened" => (
+            "xyne_sync_connections_total".to_owned(),
+            "{event=\"opened\"}",
+        ),
+        "connections_closed_by_client" => (
+            "xyne_sync_connections_total".to_owned(),
+            "{event=\"closed\",reason=\"client\"}",
+        ),
+        "connections_closed_by_error" => (
+            "xyne_sync_connections_total".to_owned(),
+            "{event=\"closed\",reason=\"error\"}",
+        ),
+        "connections_closed_by_server" => (
+            "xyne_sync_connections_total".to_owned(),
+            "{event=\"closed\",reason=\"server\"}",
+        ),
+        "transactions" => ("xyne_sync_feed_transactions_total".to_owned(), ""),
+        "writes" => ("xyne_sync_feed_writes_total".to_owned(), ""),
+        other => (format!("xyne_sync_{other}_total"), ""),
     }
 }
 
@@ -380,7 +1019,142 @@ mod tests {
         assert!((448..=512).contains(&summary.p50_us), "{summary:?}");
         assert!((896..=1000).contains(&summary.p99_us), "{summary:?}");
         assert_eq!(summary.max_us, 1000);
+        assert_eq!(histogram.at_most(1000), 1000);
+        assert!(
+            (500..=640).contains(&histogram.at_most(500)),
+            "{}",
+            histogram.at_most(500)
+        );
         histogram.reset();
         assert_eq!(histogram.summary().count, 0);
+    }
+
+    #[test]
+    fn the_exposition_has_cumulative_buckets_counters_and_gauges() {
+        let stats = Stats::new();
+        for ms in [1u64, 5, 20, 400] {
+            stats.hydrate_cold.record(Duration::from_millis(ms));
+        }
+        stats.read_rows.record_value(75);
+        stats.transform_hits.fetch_add(3, Ordering::Relaxed);
+        stats.connections_open.store(7, Ordering::Relaxed);
+        stats.publish_footprint(Footprint {
+            subscriptions: 12,
+            trees: 4,
+            rows_by_table: vec![("messages".to_owned(), 900)],
+        });
+        let text = stats.prometheus();
+        let line = |needle: &str| {
+            text.lines()
+                .find(|line| line.starts_with(needle))
+                .unwrap_or_else(|| panic!("no line starting with {needle}\n{text}"))
+                .to_owned()
+        };
+        assert_eq!(
+            line("xyne_sync_hydrate_seconds_bucket{kind=\"cold\",le=\"0.0025\"}"),
+            "xyne_sync_hydrate_seconds_bucket{kind=\"cold\",le=\"0.0025\"} 1"
+        );
+        assert_eq!(
+            line("xyne_sync_hydrate_seconds_bucket{kind=\"cold\",le=\"0.025\"}"),
+            "xyne_sync_hydrate_seconds_bucket{kind=\"cold\",le=\"0.025\"} 3"
+        );
+        assert_eq!(
+            line("xyne_sync_hydrate_seconds_bucket{kind=\"cold\",le=\"+Inf\"}"),
+            "xyne_sync_hydrate_seconds_bucket{kind=\"cold\",le=\"+Inf\"} 4"
+        );
+        assert_eq!(
+            line("xyne_sync_hydrate_seconds_count{kind=\"cold\"}"),
+            "xyne_sync_hydrate_seconds_count{kind=\"cold\"} 4"
+        );
+        assert_eq!(
+            line("xyne_sync_hydrate_seconds_sum{kind=\"cold\"}"),
+            "xyne_sync_hydrate_seconds_sum{kind=\"cold\"} 0.426"
+        );
+        assert_eq!(
+            line("xyne_sync_read_rows_bucket{le=\"100\"}"),
+            "xyne_sync_read_rows_bucket{le=\"100\"} 1"
+        );
+        assert_eq!(
+            line("xyne_sync_read_rows_bucket{le=\"50\"}"),
+            "xyne_sync_read_rows_bucket{le=\"50\"} 0"
+        );
+        assert_eq!(
+            line("xyne_sync_transforms_total{result=\"hit\"}"),
+            "xyne_sync_transforms_total{result=\"hit\"} 3"
+        );
+        assert_eq!(line("xyne_sync_connections_open "), "xyne_sync_connections_open 7");
+        assert_eq!(line("xyne_sync_subscriptions "), "xyne_sync_subscriptions 12");
+        assert_eq!(
+            line("xyne_sync_rows_held{table=\"messages\"}"),
+            "xyne_sync_rows_held{table=\"messages\"} 900"
+        );
+        let cumulative: Vec<u64> = text
+            .lines()
+            .filter(|line| line.starts_with("xyne_sync_hydrate_seconds_bucket{kind=\"cold\""))
+            .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
+            .collect();
+        assert!(
+            cumulative.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{cumulative:?}"
+        );
+        assert_eq!(
+            text.matches("# TYPE xyne_sync_engine_step_seconds histogram").count(),
+            1,
+            "one TYPE line per metric"
+        );
+        let json = stats.json();
+        assert_eq!(json["held"]["subscriptions"], 12);
+        assert_eq!(json["counts"]["transform_hits"], 3);
+        assert_eq!(json["gauges"]["connections_open"], 7);
+    }
+
+    #[test]
+    fn a_push_is_acknowledged_by_the_mutation_id_that_covers_it() {
+        let stats = Stats::new();
+        stats.push_sent("c1", 3);
+        stats.push_sent("c1", 4);
+        stats.push_sent("c2", 1);
+        stats.lmid_seen("c1", 3);
+        assert_eq!(
+            stats.mutation_ack.summary().count,
+            1,
+            "only the mutation at or below the id"
+        );
+        stats.lmid_seen("c1", 9);
+        assert_eq!(stats.mutation_ack.summary().count, 2);
+        stats.lmid_seen("c3", 9);
+        assert_eq!(
+            stats.mutation_ack.summary().count,
+            2,
+            "an unknown client acknowledges nothing"
+        );
+        stats.lmid_seen("c2", 1);
+        assert_eq!(stats.mutation_ack.summary().count, 3);
+        assert!(
+            stats.pushes.lock().unwrap().is_empty(),
+            "everything acknowledged is forgotten"
+        );
+    }
+
+    #[test]
+    fn the_summary_line_reports_rates_since_the_previous_snapshot() {
+        let stats = Stats::new();
+        let before = stats.snapshot();
+        stats.transactions.fetch_add(20, Ordering::Relaxed);
+        stats.transform_hits.fetch_add(3, Ordering::Relaxed);
+        stats.transform_misses.fetch_add(1, Ordering::Relaxed);
+        stats.engine_step.record(Duration::from_millis(500));
+        let (message, fields) = stats.summary_line(&before, Duration::from_secs(10));
+        assert_eq!(message, "summary");
+        let field = |key: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(field("transactions_per_s"), "2.0");
+        assert_eq!(field("transform_hit_pct"), "75.0");
+        assert_eq!(field("engine_busy_pct"), "5.0");
     }
 }

@@ -58,7 +58,7 @@ use super::config::Config;
 use super::protocol::{self, ClientSchema};
 use super::wire;
 use crate::ivm::{ClientUpdate, QueryPart};
-use crate::log::{log_debug, log_info, log_warn};
+use crate::log::{Level, log_debug, log_event, log_info, log_warn};
 use crate::model::{
     Catalog, ClientId, DataFrameKey, DataFrameOperation, DataFrameRow, Lsn, MultiTableReadQuery,
     RowData, SubId, TableName, Value, WriteQuery,
@@ -460,6 +460,7 @@ pub async fn run(
     loop {
         tokio::select! {
             taken = requests_rx.recv_many(&mut taken_requests, 256) => {
+                core.stats.set_groups_inbox(shard, requests_rx.len() as u64);
                 if taken == 0 {
                     break;
                 }
@@ -570,7 +571,18 @@ impl Groups {
                         } else {
                             &self.stats.hydrate_warm
                         };
-                        hydrate.record(state.since.elapsed());
+                        let elapsed = state.since.elapsed();
+                        hydrate.record(elapsed);
+                        let slow = elapsed >= self.config.slow_query;
+                        log_event!(
+                            if slow { Level::Warn } else { Level::Debug },
+                            if slow { "slow query" } else { "query hydrated" },
+                            group = group_id,
+                            name = state.name,
+                            hash = hash,
+                            kind = if state.cold { "cold" } else { "warm" },
+                            ms = format!("{:.1}", elapsed.as_secs_f64() * 1000.0)
+                        );
                         group.queued_got.push(json!({"op": "put", "hash": hash}));
                         self.dirty.insert(group_id);
                     }
@@ -675,6 +687,7 @@ impl Groups {
             let client = ClientId(self.shard as u64 + self.shards as u64 * self.next_client);
             self.next_client += 1;
             self.groups.insert(group_id.to_owned(), Group::new(client));
+            self.stats.client_groups.fetch_add(1, Ordering::Relaxed);
             self.by_client.insert(client, group_id.to_owned());
             log_info!(
                 "client group {group_id} opened as engine client {}",
@@ -702,7 +715,9 @@ impl Groups {
             "connection {wsid} joined client group {group_id} as client {}",
             socket.client
         );
-        group.sockets.insert(wsid, socket);
+        if group.sockets.insert(wsid, socket).is_none() {
+            self.stats.clients.fetch_add(1, Ordering::Relaxed);
+        }
         self.mark(group_id);
         ConnectReply::Accepted
     }
@@ -713,7 +728,9 @@ impl Groups {
         let Some(group) = self.groups.get_mut(group_id) else {
             return;
         };
-        group.sockets.remove(wsid);
+        if group.sockets.remove(wsid).is_some() {
+            self.stats.clients.fetch_sub(1, Ordering::Relaxed);
+        }
         log_info!("connection {wsid} left client group {group_id}");
         if group.sockets.is_empty() {
             self.next_generation += 1;
@@ -750,6 +767,10 @@ impl Groups {
     /// Forget a group and every subscription it had.
     fn drop_group(&mut self, group_id: &str) {
         if let Some(group) = self.groups.remove(group_id) {
+            self.stats.client_groups.fetch_sub(1, Ordering::Relaxed);
+            self.stats
+                .clients
+                .fetch_sub(group.sockets.len() as u64, Ordering::Relaxed);
             self.command(Command::UnregisterClient(group.client));
             self.by_client.remove(&group.client);
             self.by_sub.retain(|_, (owner, _)| owner != group_id);
@@ -1091,6 +1112,7 @@ impl Groups {
             Some(Value::Float(lmid)) => *lmid as i64,
             _ => return,
         };
+        self.stats.lmid_seen(&client, lmid);
         self.dirty.insert(group.clone());
         self.lmid_changes
             .entry(group)
