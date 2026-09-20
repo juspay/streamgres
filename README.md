@@ -66,7 +66,8 @@ every later delta continues from.
 | **Client side** speaking Zero's sync protocol (v51, the `@rocicorp/zero` 1.9 client): connect handshake, ping/pong and liveness, desired queries through the app server's query endpoint, pokes per client group, mutations through its mutate endpoint, `lastMutationID` off the app's clients table; it owns no engine and no database connection, reaching both only through [`sync::Service`]'s channels; verified from the xyne-spaces UI with three users (roles, resource access, channels, threads, reactions, tickets) and load-tested (see below) | ✅ done (no history across restarts) | `src/client/`, `src/sync/pg/threads.rs`, [docs/live-verification-2026-09-15.md](docs/live-verification-2026-09-15.md) |
 | **The pipeline as threads**: the feed thread decodes and hands the engine one transaction per commit; the engine thread routes and nothing else; a reads pool runs the storage (one round trip per read); `XYNE_SYNC_GROUP_THREADS` group threads keep the views and build pokes, each row serialized once per flush and frames assembled as bytes; connections translate and plan their own queries; per-stage latency histograms at `/stats` | ✅ done | `src/client/mod.rs`, `src/stats.rs`, [docs/pipeline-2026-09-18.md](docs/pipeline-2026-09-18.md) |
 | **Warm start**: the query shapes asked for kept in a file and planned again before readiness, so a restart's first clients hit the plan cache | ✅ done | `src/client/warm.rs` |
-| **Transform cache** per identity, query and arguments; **observability**: lock-free stage histograms and counters, `/metrics` in Prometheus format, a sampler thread with a summary line, structured logs through an asynchronous queue | ✅ done | `src/client/transform.rs`, `src/stats.rs`, `src/log.rs`, `src/client/sampler.rs`, [docs/observability.md](docs/observability.md) |
+| **Transform cache** per identity, query and arguments; **observability**: lock-free stage histograms and counters, `/metrics` in Prometheus format, a sampler thread with a summary line, structured logs through an asynchronous queue; the same metrics and logs **pushed over OTLP** by a thread of their own, configured by the `OTEL_*` variables the reference server is configured by; reads counted against the row limit, with the queries nearing it reported by name | ✅ done | `src/client/transform.rs`, `src/stats.rs`, `src/metric.rs`, `src/otel.rs`, `src/log.rs`, `src/client/sampler.rs`, [docs/observability.md](docs/observability.md) |
+| **Image, CI, deployment**: a slim image run unprivileged; on every pull request the lints, the whole suite with the live PostgreSQL scenarios, the benchmark against the base branch, and the image exercised end to end (sync, schema refusal, heavy reads, the OTLP push into a real collector); images published to GHCR | ✅ done | `docker/server/Dockerfile`, `.github/workflows/`, `scripts/smoke.mjs`, `scripts/bench-compare.py`, [docs/deploy.md](docs/deploy.md) |
 | **Measured on production-shaped data**: the fixes for releases, memory and acknowledgements, both reference-server deployments under the same shapes, our own driver over the data, and the client-count ladders | ✅ measured | [docs/prod-scale-2026-09-18.md](docs/prod-scale-2026-09-18.md), [docs/prod-scale-2026-09-19.md](docs/prod-scale-2026-09-19.md) |
 | Batching of one write's narrowed reads | ⏳ pending | paper §13 |
 | Parser `JOIN` syntax | ⏳ pending | multi-table queries are built programmatically |
@@ -565,6 +566,8 @@ XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5499/xyne_bench cargo run --rel
 cp .env.example .env              # set XYNE_SYNC_PG_DSN and the two endpoint URLs
 cargo run --release --bin server
 node scripts/e2e-protocol.mjs   # two dev users, real mutations, fan-out, reconnects; PASS when the chain holds
+node scripts/smoke.mjs --prepare && node scripts/smoke.mjs   # no application needed: a PostgreSQL, the server (XYNE_SYNC_READ_ROW_LIMIT=600),
+                                     # a scripted Zero client; sync, schema refusal, heavy reads, and with SMOKE_COLLECTOR the OTLP push. CI runs it on the image
 node scripts/ui/ui-u2-channel.mjs    # one of the Playwright scripts that drive the dashboard with three users (scripts/ui/)
 node scripts/load-protocol.mjs --connections 200 --seed 3000 --seed-replies 2000 --rate 50 --duration 60 \
   --pid $(pgrep -f target/release/server)   # socket-level load: seed, hydrate, steady fan-out, CPU/RSS samples
@@ -794,8 +797,10 @@ src/
     groups.rs              the group threads: client groups, held rows, drain-and-flush, pokes serialized once
     schema.rs              the client's schema against the catalog, judged as the reference server judges it: serve or SchemaVersionNotSupported
     connection.rs          one WebSocket connection: handshake, the schema's judgment, message loop, liveness, translate + plan, the writer
-  log.rs                   a leveled stderr log
-  stats.rs                 per-stage latency histograms and counters, served at /stats
+  log.rs                   a leveled stderr log, tapped by the telemetry exporter
+  stats.rs                 per-stage latency histograms, counters and gauges; reads against the row limit; the catalogue
+  metric.rs                one metric, whatever carries it: the catalogue's types and the Prometheus text
+  otel.rs                  the push to a collector: OTEL_* configuration as the reference server reads it, OTLP/HTTP JSON, the exporter thread
   parser/
     mod.rs                 lexer + recursive-descent parser, schema-aware against model::Catalog
   bin/
