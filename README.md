@@ -27,7 +27,7 @@ clients                       Xyne-Sync engine                       PostgreSQL
   │                              │      slot, streamed, commit order)     │
   │                              ├─ route: which views does this touch?   │
   │                              ├─ patch: emit Add / Delete per view     │
-  │<─ [Add(new) → q1, q2] ───────┤   (grouped per client, one image each) │
+  │<─ [Add(new) → q1, q2] ───────┤   (folded per row, one image each)     │
 ```
 
 Recomputing every subscribed query on every write scales as
@@ -56,7 +56,7 @@ every later delta continues from.
 | In-place condition edits: a literal `IN` swapped inside its disjuncts, or a set-valued `IN` (`Value::Set`) gaining/losing one member in O(1) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
 | Join tree: one vector of edges, each with its **driver** (`Main` or `Sub`) and `is_inner`, so LEFT, RIGHT and the two inner forms (driven from the sub, driven from the main) at any depth; existence tests placed anywhere in a node's filter (`EXISTS` inside `OR`, bound to the set when the sub drives, a per-row gate on the match count when the main does); set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns; a value index on every join column so a crossing costs the matches, not the part; a driven child's `ORDER BY` / `LIMIT` is a window **per parent row** (`related` with a limit) | ✅ done | `src/ivm/multi.rs` |
 | Join planning: every node that would be read whole is counted, in one concurrent batch capped at the limit; the inner edges are settled from the root down (the side that fits; the smaller side when both do; a node already driven from above drives the edges below it; a main with a page is restricted by a sub that fits and drives any other, the engine keeping the page to the rows the sub admits), the root never moves, and a query with a side nothing can bound is refused with the reason; decisions are cached by tree (`XYNE_SYNC_JOIN_LIMIT`, `XYNE_SYNC_JOIN_PREFERRED_SIDE`, `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE`), and run on the connection's own task | ✅ done | `src/client/plan.rs` |
-| Client-addressed output: every subscription belongs to a `ClientId`; one step's operations are folded per client and row (`ClientUpdate { client, table, op, targets }`), so a row image travels to a client once; images and keys are shared handles (`Arc`), so nothing on the path copies a row | ✅ done | `src/ivm/update.rs`, `src/model/frame.rs` |
+| Client-free output: the engine knows subscriptions, never clients. One step's operations are folded per row (`Delta { table, op, audiences }`), each audience one part of one tree with **all its subscribers as the tree's shared list** (`Subs::Many(Arc<[SubId]>)`), so an operation costs the engine the same for one subscriber and for ten thousand; the service routes each delta to the group threads owning its subscriptions, and the group thread's row ledger decides what each client is sent (a row once per client group, whatever brought it); images and keys are shared handles (`Arc`), so nothing on the path copies a row | ✅ done | `src/ivm/update.rs`, `src/model/frame.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
 | Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; the runtime holds the one position and brings every read up to it before landing; no read ever blocks the stream; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
 | In-memory storage answering at once, honoring `ORDER BY` + `LIMIT`; per-table routing between memory and PostgreSQL (`XYNE_SYNC_MEMORY_TABLES`) | ✅ done | `src/sync/storage.rs`, `src/sync/sources.rs` |
@@ -87,10 +87,10 @@ The pipeline is `SQL text → typed query model → IVM routing → operations`.
 - `Value`: the dynamic cell type (`Int` is `i64`; manual `Eq`/`Hash` for
   floats and maps; `Set` is the engine's identity-compared shared set).
   `TableName` and `ColumnName` are newtypes. A subscription is addressed by
-  `SubId`, a `u64` the engine hands out at registration and never reuses, and
-  belongs to a `ClientId`, the transport's handle for one connection. The
-  client's own subscription names live in the transport, which maps them to
-  `SubId`s and back.
+  `SubId`, a `u64` the engine hands out at registration and never reuses.
+  The engine knows nothing of clients: connections, client groups and the
+  client's own subscription names live in the transport, which maps them
+  to `SubId`s and back.
 - `DataFrameKey` (primary-key values, identity only), `DataFrameRow` (a
   **full** row image, every column including the key), both keyed by
   `ColumnName`; `DataFrameOperation` (`Add(key, row)` / `Delete(key, row)`).
@@ -250,8 +250,9 @@ node may drive further edges, so the same handling cascades through the tree.
 Registration is a post-order walk (right and inner children, node, left
 children); within a write every driven part is forwarded before its driver,
 and a replace pair is diffed per edge so a kept value never churns through
-zero. What leaves the layer is the same client-grouped `ClientUpdate`, each
-target naming the subscription and the part.
+zero. What leaves the layer is the same per-row `Delta`, each audience
+naming the part and the tree's subscribers (one shared list, not a copy
+per subscriber).
 
 ### 4. Runtime and storage (`src/sync/`)
 
@@ -394,8 +395,11 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   out anyway (so a client waiting behind a slow request still sees the server
   alive); a WebSocket ping frame goes out every `XYNE_SYNC_PING_INTERVAL_MS`
   and a connection that has sent nothing back for `XYNE_SYNC_CLIENT_TIMEOUT_MS`
-  is closed and leaves its client group. A group's subscriptions outlive its
-  last connection by `XYNE_SYNC_GROUP_TTL_MS`, then are released.
+  is closed and leaves its client group. A group's subscriptions, and its
+  record of the rows it was sent, outlive its last connection by
+  `XYNE_SYNC_GROUP_TTL_MS` (a minute by default, an hour in `.env.example`),
+  then are released; a client back within it is caught up, one back later
+  starts a fresh sync.
 - **Queries.** A desired query arrives as a name and arguments; the client side
   posts them to the application server's query endpoint (with the
   connection's cookies and origin, the way the reference server does) and gets query
@@ -505,7 +509,8 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   milliseconds.
 - **Transform cache.** The application server's AST for a query is kept
   per identity, name and arguments for `XYNE_SYNC_TRANSFORM_TTL_MS`
-  (5 min; the reference server keeps its own for 5 s), at most
+  (60 s; the reference server keeps its own for 5 s; the rig's hit rates below
+  were measured at 5 min), at most
   `XYNE_SYNC_TRANSFORM_CACHE` (20 000) entries, so a shape asked for again
   skips the round trip; failed transforms are never kept
   (`client/transform.rs`). Measured on the rig: 0.6 % hits on five
@@ -641,13 +646,12 @@ let storage = Rc::new(MemoryStorage::new());
 let mut ivm = Local::new(SingleTableIVM::new(), storage.clone());   // the synchronous driver
 
 let query = parse_read("SELECT * FROM tickets WHERE status = 'OPEN'", &catalog).unwrap();
-let client = ClientId(1);
-let (q_open, snapshot) = ivm.register_query(client, query);  // (SubId, Vec<ClientUpdate>), read landed inline
+let (q_open, snapshot) = ivm.register_query(query);          // (SubId, Vec<Delta>), read landed inline
 
 let write = parse_write("INSERT INTO tickets (id, status) VALUES (1, 'OPEN')", &catalog).unwrap();
 storage.apply(&write);                                       // commit first …
 let updates = ivm.incremental_update(&write);                // … notify second
-// updates: Vec<ClientUpdate { client, table, op, targets: Vec<Target { sub, part }> }>
+// updates: Vec<Delta { table, op, audiences: Vec<Audience { part, subs }> }>; update.targets() lists (sub, part)
 ```
 
 Against Postgres, build a `Service` over `MultiTableIVM` and `Sources` (a
@@ -750,14 +754,14 @@ src/
   model/
     value.rs               Value / ValueType, manual Eq+Hash (floats, maps); SharedSet behind a lock, so values are Send
     schema.rs              Catalog / DbTable / DbColumn, TableName + ColumnName newtypes over shared strings
-    query.rs               SingleTableReadQuery / WriteQuery, Where / Condition, Join { driver, is_inner }, SubId, ClientId
+    query.rs               SingleTableReadQuery / WriteQuery, Where / Condition, Join { driver, is_inner }, SubId
     frame.rs               DataFrameKey / DataFrameRow (shared, immutable) / DataFrameOperation + the shared TableFrame with its value indexes
     position.rs            Lsn and Snapshot: where a write or a read's rows sit, as WAL locations
     ids.rs                 IdMap / IdSet: the engine's integer-keyed maps on a one-multiply hasher
   ivm/
     mod.rs                 SingleTableIVM: the routing core (analyze + incremental_update)
     engine.rs              Fetch requests and the Engine trait the runtime drives
-    update.rs              QueryPart, Target, ClientUpdate: per-client grouping of one step's operations
+    update.rs              QueryPart, Subs, Audience, Delta: the per-row fold of one step's operations, subscribers as shared lists
     registry.rs            subscription lifecycle: register/unregister/replace, twin sharing
     frames.rs              frame surgery + inspection: issue/land reads, adopt/upsert/remove rows, rows_for
     index.rs               TableIndex: shared DNF disjunct counters, boundaries, in-place edits
@@ -788,7 +792,8 @@ src/
     wire.rs                rows and keys as the wire carries them, written straight into bytes
     backend.rs             the query and mutate endpoints of the application server
     groups.rs              the group threads: client groups, held rows, drain-and-flush, pokes serialized once
-    connection.rs          one WebSocket connection: handshake, message loop, liveness, translate + plan, the writer
+    schema.rs              the client's schema against the catalog, judged as the reference server judges it: serve or SchemaVersionNotSupported
+    connection.rs          one WebSocket connection: handshake, the schema's judgment, message loop, liveness, translate + plan, the writer
   log.rs                   a leveled stderr log
   stats.rs                 per-stage latency histograms and counters, served at /stats
   parser/
@@ -797,7 +802,7 @@ src/
     server.rs              the sync server binary
     bench.rs               benchmark harness
 tests/
-  ivm_scenarios.rs         single-table routing, windows, twin sharing, per-client grouping (assertable spec)
+  ivm_scenarios.rs         single-table routing, windows, twin sharing, per-row folding (assertable spec)
   multi_table_scenarios.rs join reference/fetch/prune, self-join, nested, RIGHT and both INNER forms, EXISTS inside OR, per-parent windows
   sync_interleaving.rs     reads out while writes stream: bring-up from the floor, parking, refill, post-order
   pg_live.rs               live Postgres: snapshot held open behind writes, async service with a mirrored table

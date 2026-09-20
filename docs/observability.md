@@ -104,7 +104,7 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_process_rss_bytes` | resident set, sampled |
 | `xyne_sync_thread_cpu_seconds_total{thread}` | CPU by thread name (engine, groups, reads, server, feed, reaper, log, metrics), sampled; the engine's rate is its utilisation |
 | `xyne_sync_rows_held{table}` | rows in the shared frames per table |
-| `xyne_sync_connections_open`, `xyne_sync_connections_total{event=opened,closed}` | sockets |
+| `xyne_sync_connections_open`, `xyne_sync_connections_total{event=opened,closed,refused}` | sockets; `event="refused",reason="client_schema"` counts clients whose schema the server cannot serve, which climbs when a client build is deployed ahead of its database |
 | `xyne_sync_client_groups`, `xyne_sync_clients` | what the group threads hold |
 | `xyne_sync_plan_cache_entries`, `xyne_sync_transform_cache_entries`, `xyne_sync_warm_shapes` | the caches |
 | `xyne_sync_log_dropped_total` | lines the log queue refused |
@@ -119,6 +119,7 @@ object per line, `{"ts","level","thread","msg", ...fields}`.
 | --- | --- | --- |
 | server up, feed connected, ready, warm start, drain | info | address, slot, position, shapes planned |
 | connection opened / closed | info | wsid, group, client, whether authenticated, origin; on close: seconds open and the close reason (client, error, server) |
+| connection refused | warn | wsid, group, client, kind (`SchemaVersionNotSupported`), how many mismatches and the first three: the client's schema names a table, column, column type or primary key the server cannot serve, and the client was told so and closed, as the reference server does (what the server has beyond the client's schema is no mismatch) |
 | query hydrated | debug | group, name, hash, kind (cold or warm), ms from registration to rows present |
 | slow query | warn | the same, when hydration exceeds `XYNE_SYNC_SLOW_QUERY_MS` (1 000) |
 | query refused | warn | name, hash, kind (`unsupported`, `plan_limit`, `read_limit`, `other`), at (`plan`: before it registered; `read`: a read it depended on), group, connection, the reason in full |
