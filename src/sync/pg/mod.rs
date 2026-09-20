@@ -78,7 +78,7 @@ const DEFAULT_READ_CONNECTIONS: usize = 16;
 const DEFAULT_READ_ROW_LIMIT: usize = 100_000;
 
 /// [`DEFAULT_READ_ROW_LIMIT`], or the environment's override.
-fn read_row_limit() -> usize {
+pub fn read_row_limit() -> usize {
     std::env::var("XYNE_SYNC_READ_ROW_LIMIT")
         .ok()
         .and_then(|value| value.trim().parse().ok())
@@ -383,10 +383,7 @@ impl Storage for PgStorage {
                 log_info!("read on `{}` returned {} rows", query.table, rows.len());
             }
             if let Some(stats) = crate::stats::Stats::global() {
-                stats.read_rows.record_value(rows.len() as u64);
-                stats
-                    .rows_read
-                    .fetch_add(rows.len() as u64, Ordering::Relaxed);
+                stats.note_read(rows.len() as u64);
             }
             let rows = rows
                 .iter()

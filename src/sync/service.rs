@@ -42,7 +42,9 @@ use super::runtime::{Runtime, Step};
 use super::storage::{Storage, StorageError};
 use crate::ivm::{Audience, Delta, Engine, Fetch, FetchId, Subs};
 use crate::model::frame::SharedRow;
-use crate::model::{DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, WriteQuery};
+use crate::model::{
+    DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
+};
 use crate::stats::Stats;
 
 /// What a client of the service can ask.
@@ -126,6 +128,10 @@ impl Transaction {
 /// - `Capped`: a page of the subscription stopped reaching past the rows
 ///   its join gate rejects, so it holds fewer rows than asked for: a
 ///   query to report by name. The subscription stays.
+/// - `Heavy`: a read the subscription's tree waited on came back with at
+///   least half the row limit: a query to report by name before it grows
+///   into the limit and is refused. Sent once per read, to the owner of
+///   one subscription of the tree.
 #[derive(Debug)]
 pub enum Event {
     Registered {
@@ -152,6 +158,11 @@ pub enum Event {
     Hydrated(Vec<SubId>),
     Capped {
         sub: SubId,
+    },
+    Heavy {
+        sub: SubId,
+        table: TableName,
+        rows: u64,
     },
 }
 
@@ -295,6 +306,7 @@ where
                             stats.read_io.record(started.duration_since(issued));
                         }
                         let waiting = self.runtime.waiting_on(id);
+                        self.note_heavy(id, snapshot.rows.len() as u64, &waiting);
                         let step = self.runtime.fetched(id, snapshot);
                         if let Some(stats) = &self.stats {
                             stats.land_step.record(started.elapsed());
@@ -482,6 +494,28 @@ where
     }
 
     /// Send `event` to sink `sink`.
+    /// A read of at least half the row limit is told to the owner of one
+    /// subscription waiting on it, which knows the query's name.
+    fn note_heavy(&self, id: FetchId, rows: u64, waiting: &[SubId]) {
+        let heavy = self
+            .stats
+            .as_ref()
+            .and_then(|stats| stats.heavy_read_rows())
+            .is_some_and(|from| rows >= from);
+        if !heavy {
+            return;
+        }
+        let Some(table) = self.runtime.reading(id) else {
+            return;
+        };
+        let owned = waiting
+            .iter()
+            .find_map(|sub| self.owners.get(sub).map(|sink| (*sub, *sink)));
+        if let Some((sub, sink)) = owned {
+            self.send_to(sink, Event::Heavy { sub, table, rows });
+        }
+    }
+
     fn send_to(&self, sink: usize, event: Event) {
         if let Some(sink) = self.sinks.get(sink) {
             let _ = sink.send(event);

@@ -545,6 +545,7 @@ impl Groups {
             Event::Landed { updates } => self.absorb(updates),
             Event::Refused { sub, reason } => self.refused(sub, &reason),
             Event::Capped { sub } => self.capped(sub),
+            Event::Heavy { sub, table, rows } => self.heavy(sub, table.as_str(), rows),
             Event::Hydrated(subs) => {
                 for sub in subs {
                     let Some((group_id, hash)) = self.by_sub.get(&sub).cloned() else {
@@ -958,6 +959,37 @@ impl Groups {
             hash = hash,
             group = group_id,
             reason = crate::stats::SHORT_PAGE
+        );
+    }
+
+    /// A read the query waited on took at least half the row limit: the
+    /// query is served, and it is reported by name, with the table and the
+    /// share of the limit, as one to narrow before it is refused.
+    fn heavy(&mut self, sub: SubId, table: &str, rows: u64) {
+        let Some((group_id, hash)) = self.by_sub.get(&sub).cloned() else {
+            return;
+        };
+        let name = self
+            .groups
+            .get(&group_id)
+            .and_then(|group| group.queries.get(&hash))
+            .map(|state| state.name.clone())
+            .unwrap_or_default();
+        let percent = self.stats.note_heavy_read(&name, table, rows);
+        log_event!(
+            if percent >= 80 {
+                Level::Warn
+            } else {
+                Level::Info
+            },
+            "heavy read",
+            name = name,
+            hash = hash,
+            group = group_id,
+            table = table,
+            rows = rows,
+            limit = self.stats.read_row_limit.load(Ordering::Relaxed),
+            percent = percent
         );
     }
 

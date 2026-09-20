@@ -51,6 +51,7 @@ fn run(state: Arc<AppState>, interval: Duration) {
             let (message, fields) = stats.summary_line(&previous, last_summary.elapsed());
             crate::log::event(Level::Info, message, fields);
             previous = stats.snapshot();
+            stats.rotate_read_peak();
             last_summary = Instant::now();
         }
     }
@@ -114,7 +115,9 @@ pub fn thread_cpu_seconds() -> Vec<(String, f64)> {
                 let (Some(utime), Some(stime)) = (fields.get(11), fields.get(12)) else {
                     continue;
                 };
-                let seconds = (utime.parse::<f64>().unwrap_or(0.0) + stime.parse::<f64>().unwrap_or(0.0)) / ticks;
+                let seconds = (utime.parse::<f64>().unwrap_or(0.0)
+                    + stime.parse::<f64>().unwrap_or(0.0))
+                    / ticks;
                 let name = thread_label(comm.trim());
                 *by_name.entry(name).or_insert(0.0) += seconds;
             }

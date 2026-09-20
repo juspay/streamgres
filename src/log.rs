@@ -4,13 +4,16 @@
 //! thread drains to stderr in batches. A full queue drops the line and
 //! counts the drop rather than making the caller wait, so a flood of
 //! lines never slows the thread that logged them; the count is a metric.
+//! When the telemetry exporter taps it ([`tap`]), the log thread hands
+//! every line it has written to the exporter's queue as well, so stderr
+//! and the collector see the same lines.
 //! Lines are `text` (`HH:MM:SS.mmm LEVEL [thread] message key=value`) or
 //! `json` (one object per line with `ts`, `level`, `thread`, `msg` and
 //! the event's fields); `log_error!`, `log_warn!`, `log_info!` and
 //! `log_debug!` format like `println!`, and `log_event!` adds fields.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -55,6 +58,8 @@ static FORMAT: AtomicU8 = AtomicU8::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static QUEUED: AtomicU64 = AtomicU64::new(0);
 static SENDER: OnceLock<Mutex<SyncSender<Item>>> = OnceLock::new();
+static TAP: OnceLock<tokio::sync::mpsc::Sender<Line>> = OnceLock::new();
+static TAP_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// The current thread's name, read once.
@@ -93,6 +98,18 @@ pub fn enabled(level: Level) -> bool {
 /// How many lines the queue has refused so far.
 pub fn dropped() -> u64 {
     DROPPED.load(Ordering::Relaxed)
+}
+
+/// Send every line the log thread writes to `tap` as well (the telemetry
+/// exporter's queue); a full queue drops the line for the tap alone and
+/// counts it. The first tap stays.
+pub fn tap(tap: tokio::sync::mpsc::Sender<Line>) {
+    let _ = TAP.set(tap);
+}
+
+/// How many lines the tap's queue has refused so far.
+pub fn tap_dropped() -> u64 {
+    TAP_DROPPED.load(Ordering::Relaxed)
 }
 
 /// How many lines were handed to the log thread so far.
@@ -189,6 +206,11 @@ fn write_loop(receiver: Receiver<Item>) {
             match item {
                 Item::Line(line) => {
                     let _ = out.write_all(render(&line, format()).as_bytes());
+                    if let Some(tap) = TAP.get()
+                        && tap.try_send(line).is_err()
+                    {
+                        TAP_DROPPED.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Item::Flush(ack) => acks.push(ack),
             }
@@ -226,8 +248,16 @@ pub fn render(line: &Line, format: Format) -> String {
         }
         Format::Json => {
             let mut object = serde_json::Map::new();
-            object.insert("ts".into(), line.at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true).into());
-            object.insert("level".into(), tag(line.level).trim().to_ascii_lowercase().into());
+            object.insert(
+                "ts".into(),
+                line.at
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                    .into(),
+            );
+            object.insert(
+                "level".into(),
+                tag(line.level).trim().to_ascii_lowercase().into(),
+            );
             object.insert("thread".into(), line.thread.clone().into());
             object.insert("msg".into(), line.message.clone().into());
             for (key, value) in &line.fields {
@@ -241,7 +271,7 @@ pub fn render(line: &Line, format: Format) -> String {
 }
 
 /// A field's value as JSON: a number when it reads as one, else text.
-fn field_value(value: &str) -> serde_json::Value {
+pub fn field_value(value: &str) -> serde_json::Value {
     if let Ok(integer) = value.parse::<i64>() {
         return integer.into();
     }
@@ -325,7 +355,12 @@ mod tests {
             level,
             thread: "xyne-sync-engine".to_owned(),
             message: "query registered".to_owned(),
-            fields: vec![("name", "channelMessages".to_owned()), ("ms", "12.5".to_owned()), ("rows", "40".to_owned()), ("reason", "row budget hit".to_owned())],
+            fields: vec![
+                ("name", "channelMessages".to_owned()),
+                ("ms", "12.5".to_owned()),
+                ("rows", "40".to_owned()),
+                ("reason", "row budget hit".to_owned()),
+            ],
         }
     }
 

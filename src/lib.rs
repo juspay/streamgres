@@ -62,7 +62,9 @@
 pub mod client;
 pub mod ivm;
 pub mod log;
+pub mod metric;
 pub mod model;
+pub mod otel;
 pub mod parser;
 pub mod stats;
 pub mod sync;

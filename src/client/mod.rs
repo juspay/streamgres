@@ -94,6 +94,10 @@ pub fn serve(config: Config) -> Result<(), String> {
     let shards = config.group_threads.max(1);
     let stats = crate::stats::Stats::shared();
     crate::stats::Stats::install(&stats);
+    stats.read_row_limit.store(
+        crate::sync::pg::read_row_limit() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 
     let engine_catalog = catalog.clone();
     let engine_stats = stats.clone();
@@ -268,6 +272,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         }
     }
     sampler::spawn(state.clone(), metrics_interval);
+    crate::otel::spawn(crate::otel::Config::from_env(), state.stats.clone());
     log_info!("client side up");
     let served = server.block_on(connection::serve(state));
     drop(reads);

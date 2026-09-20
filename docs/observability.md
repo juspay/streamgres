@@ -47,6 +47,20 @@ Every cell is a metric below; the rows of the table are the labels.
   ever blocking the thread that logged. Format is `text` or `json`
   (`XYNE_SYNC_LOG_FORMAT`); every line carries its time, level, the
   thread that wrote it and, for structured events, its fields.
+- **One catalogue, two carriers.** The measurements are listed once
+  (`Stats::metrics`, `src/metric.rs`) and written out as Prometheus text
+  for whoever scrapes `/metrics`, and as OTLP for the collector the
+  server pushes to: the same names, labels and values either way.
+- **Pushing is a thread, configured as the reference server's is.** `xyne-sync-otel`
+  (`src/otel.rs`) reads the standard `OTEL_*` variables the reference server reads
+  (section 5): every `OTEL_METRIC_EXPORT_INTERVAL` it posts the catalogue
+  to the collector over OTLP/HTTP as JSON, the reference server's own default
+  protocol, as cumulative sums, gauges and explicit-bounds histograms;
+  and when the logs exporter is on, the log thread hands every line it
+  has written to a bounded queue the exporter drains in batches, beside
+  stderr, as the reference server tees its log. A collector that is slow or gone
+  costs a dropped batch, a counted failure and one warn line a minute,
+  never a wait on a thread that serves clients. Traces are not produced.
 
 ## 3. The metrics
 
@@ -66,6 +80,10 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_engine_step_seconds{step=register,land,unregister}` | the engine's own compute per step |
 | `xyne_sync_read_seconds` | a storage read from issue to its rows back on the engine thread (queue + PostgreSQL + decode) |
 | `xyne_sync_read_rows` | rows per storage read (histogram over counts) |
+| `xyne_sync_read_row_limit` | the row limit of one storage read, as configured (`XYNE_SYNC_READ_ROW_LIMIT`) |
+| `xyne_sync_read_rows_max` | the largest storage read of the last minute or two (a window closed every minute, the one before kept), so the ratio to the limit is one division |
+| `xyne_sync_reads_near_limit_total{over=50,80}` | storage reads that returned at least half, and at least four fifths, of the row limit; exact, where the histogram's bounds are coarse |
+| `xyne_sync_query_read_rows_max{name,table}`, `xyne_sync_query_heavy_reads_total{name}` | per query name, for queries whose subscriptions waited on a read of at least half the limit: the largest such read with its table, and how many; at most 256 names, also `/stats.heavy_queries` |
 | `xyne_sync_reads_total{outcome=issued,landed,refused,shared}` | storage reads, and registrations served from a twin without one |
 | `xyne_sync_subscriptions`, `xyne_sync_trees` | what the engine holds |
 | `xyne_sync_queries_refused_total{reason=unsupported,plan_limit,read_limit,other}` | queries the server refused, by why: the translation cannot express it (`LIKE`, `NOT EXISTS`), the planner found no side of a join small enough to read, a read came back over the row limit, anything else |
@@ -120,6 +138,8 @@ object per line, `{"ts","level","thread","msg", ...fields}`.
 | server up, feed connected, ready, warm start, drain | info | address, slot, position, shapes planned |
 | connection opened / closed | info | wsid, group, client, whether authenticated, origin; on close: seconds open and the close reason (client, error, server) |
 | connection refused | warn | wsid, group, client, kind (`SchemaVersionNotSupported`), how many mismatches and the first three: the client's schema names a table, column, column type or primary key the server cannot serve, and the client was told so and closed, as the reference server does (what the server has beyond the client's schema is no mismatch) |
+| heavy read | info, warn from 80 % | name, hash, group, table, rows, limit, percent: a read the query waited on returned at least half the row limit; once per read, under the query that waited on it |
+| telemetry export started / failed | info / warn, at most once a minute | the endpoints and the interval; the signal, the error and the failures so far |
 | query hydrated | debug | group, name, hash, kind (cold or warm), ms from registration to rows present |
 | slow query | warn | the same, when hydration exceeds `XYNE_SYNC_SLOW_QUERY_MS` (1 000) |
 | query refused | warn | name, hash, kind (`unsupported`, `plan_limit`, `read_limit`, `other`), at (`plan`: before it registered; `read`: a read it depended on), group, connection, the reason in full |
@@ -153,6 +173,61 @@ JSON log with `component` and `worker` fields map onto the rows above.
 | `XYNE_SYNC_LOG_FORMAT` | `text` | `text` or `json` |
 | `XYNE_SYNC_SLOW_QUERY_MS` | `1000` | a query hydrating slower than this is logged at warn |
 | `XYNE_SYNC_METRICS_INTERVAL_MS` | `10000` | the sampler's period; the summary line every sixth sample; `0` turns the sampler off |
+
+The push to a collector is configured by the variables the reference server is
+configured by, read as it and the OpenTelemetry specification read them;
+the sandbox's block for the reference server works unchanged:
+
+```
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+OTEL_METRICS_EXPORTER=otlp
+OTEL_LOGS_EXPORTER=none
+OTEL_TRACES_EXPORTER=none
+OTEL_METRIC_EXPORT_INTERVAL=5000
+```
+
+| variable | default | meaning |
+| --- | --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | unset | the collector's OTLP/HTTP base URL; `/v1/metrics` and `/v1/logs` are appended. Setting it turns both signals on |
+| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | unset | one signal's full URL, used as it is; setting one turns that signal on |
+| `OTEL_METRICS_EXPORTER`, `OTEL_LOGS_EXPORTER` | `otlp` once anything above is set | `otlp` or `none`; setting one to `otlp` with no endpoint sends to `http://localhost:4318` |
+| `OTEL_TRACES_EXPORTER` | | accepted and ignored: no traces are produced |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/json` | what is spoken is OTLP/HTTP with JSON, whatever is asked; a collector's HTTP receiver takes JSON and protobuf on the same port, and `grpc` is answered with a note at startup |
+| `OTEL_EXPORTER_OTLP_HEADERS` (and `_METRICS_HEADERS`, `_LOGS_HEADERS`) | none | `k=v,k=v`, values percent-decoded: a tenant or an authorization header |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | one request's time limit, ms |
+| `OTEL_METRIC_EXPORT_INTERVAL` | `60000` | the metrics period, ms (the sandbox runs the reference server at 5000) |
+| `OTEL_BLRP_SCHEDULE_DELAY`, `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BLRP_MAX_QUEUE_SIZE` | `1000`, `512`, `2048` | the log batch: its longest wait, its size, and the queue past which records are dropped and counted |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | `xyne-sync`, none | the resource; `service.version` (the crate's, with the image's `SOURCE_COMMIT`) and `service.instance.id` / `host.name` (from `HOSTNAME`, the pod) are added |
+| `OTEL_SDK_DISABLED` | `false` | `true` turns the push off whatever else is set |
+
+The exporter reports on itself: `xyne_sync_otel_metric_exports_total`,
+`xyne_sync_otel_log_exports_total`, `xyne_sync_otel_export_failures_total`
+and `xyne_sync_otel_logs_dropped_total`, and the events
+`telemetry export started` and `telemetry export failed`.
+
+### Alerts worth having
+
+```
+# A query is within a fifth of the read limit: narrow it before it is refused.
+xyne_sync_read_rows_max / xyne_sync_read_row_limit >= 0.8
+increase(xyne_sync_reads_near_limit_total{over="80"}[5m]) > 0
+# Which one: the label names it; the `heavy read` log event has the hash and the group.
+max by (name, table) (xyne_sync_query_read_rows_max) / scalar(xyne_sync_read_row_limit) >= 0.8
+# A query was refused outright.
+increase(xyne_sync_queries_refused_total[5m]) > 0
+# The engine thread, the one that does not scale out, is running out of core.
+rate(xyne_sync_engine_busy_seconds_total[5m]) > 0.7
+# Writes reach clients late.
+histogram_quantile(0.99, sum by (le) (rate(xyne_sync_end_to_end_seconds_bucket[5m]))) > 0.5
+# The feed is behind PostgreSQL, or silent.
+histogram_quantile(0.99, sum by (le) (rate(xyne_sync_feed_lag_seconds_bucket[5m]))) > 5
+xyne_sync_feed_heartbeat_age_seconds > 30
+# Memory against the container's limit (set the number to 75 % of it).
+xyne_sync_process_rss_bytes > 6e9
+# Clients built for another database are being turned away.
+increase(xyne_sync_connections_total{event="refused"}[5m]) > 0
+```
 
 ## 6. What it costs, measured
 

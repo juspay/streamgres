@@ -281,6 +281,13 @@ impl<E: Engine> Runtime<E> {
         std::mem::take(&mut self.landed)
     }
 
+    /// The table read `id` is on, while the runtime waits for it.
+    pub fn reading(&self, id: FetchId) -> Option<TableName> {
+        self.in_flight
+            .get(&id)
+            .map(|flight| flight.fetch.query.table.clone())
+    }
+
     /// The subscriptions whose hydration may complete when read `id`
     /// lands; nothing when the runtime is not waiting for it.
     pub fn waiting_on(&self, id: FetchId) -> Vec<SubId> {

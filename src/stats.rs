@@ -14,7 +14,6 @@
 //! sample. `docs/observability.md` is the catalogue.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -22,6 +21,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value as Json, json};
 
 use crate::ivm::{Footprint, IvmStats};
+use crate::metric::{Catalogue, Kind, Metric, Value};
 use crate::sync::SyncStats;
 
 /// How many buckets a histogram has: four per power of two of a `u64`,
@@ -286,6 +286,22 @@ pub struct Stats {
     /// Connections refused because the client's schema names what the
     /// server cannot serve (`SchemaVersionNotSupported`).
     pub connections_refused_schema: AtomicU64,
+    /// Storage reads that came back with at least half, and at least four
+    /// fifths, of the row limit: the queries to look at before they are
+    /// refused.
+    pub reads_over_half: AtomicU64,
+    pub reads_over_80: AtomicU64,
+    /// The row limit of one storage read, as configured.
+    pub read_row_limit: AtomicU64,
+    read_rows_peak: AtomicU64,
+    read_rows_peak_before: AtomicU64,
+    /// OTLP export requests the collector accepted, by signal, and those
+    /// that failed.
+    pub otel_metric_exports: AtomicU64,
+    pub otel_log_exports: AtomicU64,
+    pub otel_export_failures: AtomicU64,
+    started_unix_ms: u64,
+    histograms_since_ms: AtomicU64,
     pub connections_open: AtomicU64,
     pub client_groups: AtomicU64,
     pub clients: AtomicU64,
@@ -300,6 +316,19 @@ pub struct Stats {
     pushes: Mutex<HashMap<String, Vec<PendingPush>>>,
     sampled: Mutex<Sampled>,
     refused: Mutex<HashMap<String, RefusedQuery>>,
+    heavy: Mutex<HashMap<String, HeavyQuery>>,
+}
+
+/// One query name whose subscriptions waited on a read of at least half
+/// the row limit: the largest such read, the table it was on, how often
+/// and when last. The report of the queries to narrow before they grow
+/// into the limit and are refused.
+#[derive(Debug, Clone)]
+pub struct HeavyQuery {
+    pub table: String,
+    pub rows: u64,
+    pub count: u64,
+    pub last_ms: u64,
 }
 
 /// One query name the server refused: why (the class and the last reason
@@ -396,6 +425,16 @@ impl Stats {
             connections_closed_by_error: AtomicU64::new(0),
             connections_closed_by_server: AtomicU64::new(0),
             connections_refused_schema: AtomicU64::new(0),
+            reads_over_half: AtomicU64::new(0),
+            reads_over_80: AtomicU64::new(0),
+            read_row_limit: AtomicU64::new(0),
+            read_rows_peak: AtomicU64::new(0),
+            read_rows_peak_before: AtomicU64::new(0),
+            otel_metric_exports: AtomicU64::new(0),
+            otel_log_exports: AtomicU64::new(0),
+            otel_export_failures: AtomicU64::new(0),
+            started_unix_ms: now_ms(),
+            histograms_since_ms: AtomicU64::new(now_ms()),
             connections_open: AtomicU64::new(0),
             client_groups: AtomicU64::new(0),
             clients: AtomicU64::new(0),
@@ -410,6 +449,7 @@ impl Stats {
             pushes: Mutex::new(HashMap::new()),
             sampled: Mutex::new(Sampled::default()),
             refused: Mutex::new(HashMap::new()),
+            heavy: Mutex::new(HashMap::new()),
         }
     }
 
@@ -519,6 +559,19 @@ impl Stats {
         for (_, histogram) in self.histograms() {
             histogram.reset();
         }
+        self.histograms_since_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    /// When the process started, in nanoseconds since the Unix epoch: what
+    /// a cumulative counter counts from.
+    pub fn started_unix_nanos(&self) -> u128 {
+        u128::from(self.started_unix_ms) * 1_000_000
+    }
+
+    /// When the histograms were last emptied ([`Stats::reset`], or the
+    /// start), in nanoseconds since the Unix epoch.
+    pub fn histograms_since_unix_nanos(&self) -> u128 {
+        u128::from(self.histograms_since_ms.load(Ordering::Relaxed)) * 1_000_000
     }
 
     /// Every histogram with its `/stats` name.
@@ -586,7 +639,13 @@ impl Stats {
                 "connections_refused_schema",
                 load(&self.connections_refused_schema),
             ),
+            ("reads_over_half", load(&self.reads_over_half)),
+            ("reads_over_80", load(&self.reads_over_80)),
             ("log_dropped", crate::log::dropped()),
+            ("otel_metric_exports", load(&self.otel_metric_exports)),
+            ("otel_log_exports", load(&self.otel_log_exports)),
+            ("otel_export_failures", load(&self.otel_export_failures)),
+            ("otel_logs_dropped", crate::log::tap_dropped()),
         ]
     }
 
@@ -613,7 +672,104 @@ impl Stats {
             ("feed_lsn", load(&self.feed_lsn)),
             ("feed_heartbeat_age_ms", heartbeat_age_ms),
             ("process_rss_bytes", load(&self.process_rss_bytes)),
+            ("read_row_limit", load(&self.read_row_limit)),
+            ("read_rows_max", self.read_rows_max()),
         ]
+    }
+
+    /// Count one storage read of `rows` rows: the distribution, the total,
+    /// the largest of the current window, and whether it came within half
+    /// or a fifth of the row limit.
+    pub fn note_read(&self, rows: u64) {
+        self.read_rows.record_value(rows);
+        self.rows_read.fetch_add(rows, Ordering::Relaxed);
+        self.read_rows_peak.fetch_max(rows, Ordering::Relaxed);
+        let limit = self.read_row_limit.load(Ordering::Relaxed);
+        if limit == 0 {
+            return;
+        }
+        if rows.saturating_mul(2) >= limit {
+            self.reads_over_half.fetch_add(1, Ordering::Relaxed);
+        }
+        if rows.saturating_mul(5) >= limit.saturating_mul(4) {
+            self.reads_over_80.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The largest storage read of the current window and the one before
+    /// it, so a large read stays visible for a minute or two whoever
+    /// reads the gauge and however often.
+    pub fn read_rows_max(&self) -> u64 {
+        self.read_rows_peak
+            .load(Ordering::Relaxed)
+            .max(self.read_rows_peak_before.load(Ordering::Relaxed))
+    }
+
+    /// Close the current window of [`Stats::read_rows_max`]; the metrics
+    /// thread does, once a minute.
+    pub fn rotate_read_peak(&self) {
+        let closed = self.read_rows_peak.swap(0, Ordering::Relaxed);
+        self.read_rows_peak_before.store(closed, Ordering::Relaxed);
+    }
+
+    /// From how many rows a read is heavy (half the row limit), when a
+    /// limit is known.
+    pub fn heavy_read_rows(&self) -> Option<u64> {
+        match self.read_row_limit.load(Ordering::Relaxed) {
+            0 => None,
+            limit => Some(limit.div_ceil(2)),
+        }
+    }
+
+    /// Record that a subscription of the query `name` waited on a read of
+    /// `rows` rows of `table`, a heavy one; the share of the row limit it
+    /// took, in percent.
+    pub fn note_heavy_read(&self, name: &str, table: &str, rows: u64) -> u64 {
+        if let Ok(mut heavy) = self.heavy.lock() {
+            let room = heavy.len() < REFUSED_NAMES;
+            match heavy.get_mut(name) {
+                Some(entry) => {
+                    entry.count += 1;
+                    entry.last_ms = now_ms();
+                    if rows > entry.rows {
+                        entry.rows = rows;
+                        entry.table = table.to_owned();
+                    }
+                }
+                None if room => {
+                    heavy.insert(
+                        name.to_owned(),
+                        HeavyQuery {
+                            table: table.to_owned(),
+                            rows,
+                            count: 1,
+                            last_ms: now_ms(),
+                        },
+                    );
+                }
+                None => {}
+            }
+        }
+        match self.read_row_limit.load(Ordering::Relaxed) {
+            0 => 0,
+            limit => rows.saturating_mul(100) / limit,
+        }
+    }
+
+    /// The query names with heavy reads, the largest read first.
+    pub fn heavy_queries(&self) -> Vec<(String, HeavyQuery)> {
+        let mut heavy: Vec<(String, HeavyQuery)> = self
+            .heavy
+            .lock()
+            .map(|heavy| {
+                heavy
+                    .iter()
+                    .map(|(name, entry)| (name.clone(), entry.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        heavy.sort_by(|a, b| b.1.rows.cmp(&a.1.rows).then_with(|| a.0.cmp(&b.0)));
+        heavy
     }
 
     /// Count one refusal of the query `name` for `reason`, returning its
@@ -755,6 +911,21 @@ impl Stats {
                 })
             })
             .collect();
+        let limit = self.read_row_limit.load(Ordering::Relaxed);
+        let heavy: Vec<Json> = self
+            .heavy_queries()
+            .into_iter()
+            .map(|(name, entry)| {
+                json!({
+                    "name": name,
+                    "table": entry.table,
+                    "rows": entry.rows,
+                    "percent_of_limit": if limit == 0 { 0 } else { entry.rows.saturating_mul(100) / limit },
+                    "count": entry.count,
+                    "last_ms": entry.last_ms,
+                })
+            })
+            .collect();
         json!({
             "uptime_s": self.started.elapsed().as_secs(),
             "stages_us": stages,
@@ -769,6 +940,7 @@ impl Stats {
             "threads_cpu_s": thread_cpu,
             "groups_inbox": sampled.groups_inbox,
             "refused_queries": refused,
+            "heavy_queries": heavy,
             "engine": {
                 "writes_processed": engine.ivm.writes_processed,
                 "queries_registered": engine.ivm.queries_registered,
@@ -793,11 +965,11 @@ impl Stats {
         })
     }
 
-    /// Everything, in Prometheus exposition format: durations in seconds
-    /// with cumulative buckets (exact to within one of our quarter-octave
-    /// buckets), counts as `_total`, the rest as gauges.
-    pub fn prometheus(&self) -> String {
-        let mut out = String::with_capacity(16 * 1024);
+    /// Everything, as the metrics both carriers write out: durations in
+    /// seconds over fixed bounds (each count exact to within one of our
+    /// quarter-octave buckets), counts as `_total`, the rest as gauges.
+    pub fn metrics(&self) -> Vec<Metric> {
+        let mut catalogue = Catalogue::default();
         let engine = self
             .engine
             .lock()
@@ -808,106 +980,126 @@ impl Stats {
             .lock()
             .map(|sampled| sampled.clone())
             .unwrap_or_default();
-        let mut typed: Vec<&str> = Vec::new();
         for (name, histogram) in self.histograms() {
-            let (metric, seconds) = if name == "read_rows" {
-                ("xyne_sync_read_rows", false)
+            let seconds = name != "read_rows";
+            let (metric, unit, scale, bounds): (&str, &'static str, f64, &[u64]) = if seconds {
+                (metric_of(name), "s", 1_000_000.0, &SECONDS_BOUNDS_US)
             } else {
-                (metric_of(name), true)
+                ("xyne_sync_read_rows", "", 1.0, &COUNT_BOUNDS)
             };
-            if !typed.contains(&metric) {
-                typed.push(metric);
-                let _ = writeln!(out, "# HELP {metric} {}", stage_help(name));
-                let _ = writeln!(out, "# TYPE {metric} histogram");
-            }
-            let labels = stage_labels(name);
-            let plain = labels.trim_end_matches(',');
-            let bounds: &[u64] = if seconds {
-                &SECONDS_BOUNDS_US
-            } else {
-                &COUNT_BOUNDS
-            };
-            for bound in bounds {
-                let le = if seconds {
-                    format!("{}", *bound as f64 / 1_000_000.0)
-                } else {
-                    bound.to_string()
-                };
-                let _ = writeln!(
-                    out,
-                    "{metric}_bucket{{{labels}le=\"{le}\"}} {}",
-                    histogram.at_most(*bound)
-                );
-            }
+            let cumulative: Vec<u64> = bounds
+                .iter()
+                .map(|bound| histogram.at_most(*bound))
+                .collect();
             let (count, sum) = histogram.count_and_sum();
-            let _ = writeln!(out, "{metric}_bucket{{{labels}le=\"+Inf\"}} {count}");
-            let braced = if plain.is_empty() {
-                String::new()
-            } else {
-                format!("{{{plain}}}")
-            };
-            if seconds {
-                let _ = writeln!(out, "{metric}_sum{braced} {}", sum as f64 / 1_000_000.0);
-            } else {
-                let _ = writeln!(out, "{metric}_sum{braced} {sum}");
-            }
-            let _ = writeln!(out, "{metric}_count{braced} {count}");
+            let count = count.max(cumulative.last().copied().unwrap_or(0));
+            catalogue.point(
+                metric,
+                Kind::Histogram,
+                unit,
+                stage_help(name),
+                stage_labels(name),
+                Value::Distribution {
+                    bounds: bounds.iter().map(|bound| *bound as f64 / scale).collect(),
+                    cumulative,
+                    count,
+                    sum: sum as f64 / scale,
+                    max: histogram.summary().max_us as f64 / scale,
+                },
+            );
         }
         for (name, value) in self.counters() {
             let (metric, labels) = counter_name(name);
-            if !typed.contains(&metric.as_str()) {
-                let _ = writeln!(out, "# TYPE {metric} counter");
-            }
-            let _ = writeln!(out, "{metric}{labels} {value}");
-            typed.push(Box::leak(metric.into_boxed_str()));
-        }
-        for (name, value) in self.gauges() {
-            if name == "feed_heartbeat_age_ms" {
-                let _ = writeln!(out, "# TYPE xyne_sync_feed_heartbeat_age_seconds gauge");
-                let _ = writeln!(
-                    out,
-                    "xyne_sync_feed_heartbeat_age_seconds {}",
-                    value as f64 / 1000.0
-                );
-            } else {
-                let _ = writeln!(out, "# TYPE xyne_sync_{name} gauge");
-                let _ = writeln!(out, "xyne_sync_{name} {value}");
-            }
-        }
-        let _ = writeln!(out, "# TYPE xyne_sync_uptime_seconds gauge");
-        let _ = writeln!(
-            out,
-            "xyne_sync_uptime_seconds {}",
-            self.started.elapsed().as_secs()
-        );
-        let _ = writeln!(out, "# TYPE xyne_sync_engine_busy_seconds_total counter");
-        let _ = writeln!(
-            out,
-            "xyne_sync_engine_busy_seconds_total {}",
-            self.engine_busy().as_secs_f64()
-        );
-        let _ = writeln!(out, "# TYPE xyne_sync_subscriptions gauge");
-        let _ = writeln!(
-            out,
-            "xyne_sync_subscriptions {}",
-            engine.footprint.subscriptions
-        );
-        let _ = writeln!(out, "# TYPE xyne_sync_trees gauge");
-        let _ = writeln!(out, "xyne_sync_trees {}", engine.footprint.trees);
-        let _ = writeln!(out, "# TYPE xyne_sync_rows_held gauge");
-        for (table, rows) in &engine.footprint.rows_by_table {
-            let _ = writeln!(out, "xyne_sync_rows_held{{table=\"{table}\"}} {rows}");
-        }
-        let _ = writeln!(out, "# TYPE xyne_sync_thread_cpu_seconds_total counter");
-        for (thread, seconds) in &sampled.thread_cpu {
-            let _ = writeln!(
-                out,
-                "xyne_sync_thread_cpu_seconds_total{{thread=\"{thread}\"}} {seconds}"
+            catalogue.point(
+                &metric,
+                Kind::Counter,
+                "",
+                measure_help(name),
+                labels,
+                Value::Int(value),
             );
         }
-        let _ = writeln!(out, "# TYPE xyne_sync_groups_inbox gauge");
+        for (name, value) in self.gauges() {
+            match name {
+                "feed_heartbeat_age_ms" => catalogue.point(
+                    "xyne_sync_feed_heartbeat_age_seconds",
+                    Kind::Gauge,
+                    "s",
+                    measure_help(name),
+                    Vec::new(),
+                    Value::Float(value as f64 / 1000.0),
+                ),
+                _ => catalogue.point(
+                    &format!("xyne_sync_{name}"),
+                    Kind::Gauge,
+                    if name.ends_with("_bytes") { "By" } else { "" },
+                    measure_help(name),
+                    Vec::new(),
+                    Value::Int(value),
+                ),
+            }
+        }
+        catalogue.point(
+            "xyne_sync_uptime_seconds",
+            Kind::Gauge,
+            "s",
+            "since the process started",
+            Vec::new(),
+            Value::Int(self.started.elapsed().as_secs()),
+        );
+        catalogue.point(
+            "xyne_sync_engine_busy_seconds_total",
+            Kind::Counter,
+            "s",
+            "the engine thread's own compute; its rate is the engine's share of one core",
+            Vec::new(),
+            Value::Float(self.engine_busy().as_secs_f64()),
+        );
+        catalogue.point(
+            "xyne_sync_subscriptions",
+            Kind::Gauge,
+            "",
+            "subscriptions the engine holds",
+            Vec::new(),
+            Value::Int(engine.footprint.subscriptions),
+        );
+        catalogue.point(
+            "xyne_sync_trees",
+            Kind::Gauge,
+            "",
+            "join trees the engine holds, each shared by the subscriptions of one query shape",
+            Vec::new(),
+            Value::Int(engine.footprint.trees),
+        );
+        for (table, rows) in &engine.footprint.rows_by_table {
+            catalogue.point(
+                "xyne_sync_rows_held",
+                Kind::Gauge,
+                "",
+                "rows in the shared frames, per table",
+                vec![("table", table.clone())],
+                Value::Int(*rows),
+            );
+        }
+        for (thread, seconds) in &sampled.thread_cpu {
+            catalogue.point(
+                "xyne_sync_thread_cpu_seconds_total",
+                Kind::Counter,
+                "s",
+                "CPU time by thread name, sampled; a thread's rate is its share of one core",
+                vec![("thread", thread.clone())],
+                Value::Float(*seconds),
+            );
+        }
         for (shard, depth) in sampled.groups_inbox.iter().enumerate() {
-            let _ = writeln!(out, "xyne_sync_groups_inbox{{shard=\"{shard}\"}} {depth}");
+            catalogue.point(
+                "xyne_sync_groups_inbox",
+                Kind::Gauge,
+                "",
+                "events waiting for a group thread",
+                vec![("shard", shard.to_string())],
+                Value::Int(*depth),
+            );
         }
         for (name, value) in [
             ("writes_impacting_total", engine.ivm.queries_impacted),
@@ -923,10 +1115,40 @@ impl Stats {
             ("client_updates_add_total", engine.ivm.ops_add),
             ("client_updates_delete_total", engine.ivm.ops_delete),
         ] {
-            let _ = writeln!(out, "# TYPE xyne_sync_{name} counter");
-            let _ = writeln!(out, "xyne_sync_{name} {value}");
+            catalogue.point(
+                &format!("xyne_sync_{name}"),
+                Kind::Counter,
+                "",
+                measure_help(name),
+                Vec::new(),
+                Value::Int(value),
+            );
         }
-        out
+        for (name, entry) in self.heavy_queries() {
+            catalogue.point(
+                "xyne_sync_query_read_rows_max",
+                Kind::Gauge,
+                "",
+                "the largest storage read a query's subscription waited on, for queries that took at least half the row limit",
+                vec![("name", name.clone()), ("table", entry.table.clone())],
+                Value::Int(entry.rows),
+            );
+            catalogue.point(
+                "xyne_sync_query_heavy_reads_total",
+                Kind::Counter,
+                "",
+                "storage reads of at least half the row limit, by the query that waited on them",
+                vec![("name", name)],
+                Value::Int(entry.count),
+            );
+        }
+        catalogue.into_metrics()
+    }
+
+    /// [`Stats::metrics`] in Prometheus exposition format, as `/metrics`
+    /// serves it.
+    pub fn prometheus(&self) -> String {
+        crate::metric::prometheus(&self.metrics())
     }
 
     /// One line that says how the server is doing, for the log every
@@ -1120,18 +1342,18 @@ fn metric_of(stage: &str) -> &'static str {
     }
 }
 
-/// The label that tells apart stages sharing a metric, with its trailing
-/// comma, or nothing.
-fn stage_labels(stage: &str) -> &'static str {
-    match stage {
-        "engine_step" => "step=\"write\",",
-        "register_step" => "step=\"register\",",
-        "unregister_step" => "step=\"unregister\",",
-        "land_step" => "step=\"land\",",
-        "hydrate_cold" => "kind=\"cold\",",
-        "hydrate_warm" => "kind=\"warm\",",
-        _ => "",
-    }
+/// The label that tells apart stages sharing a metric, or none.
+fn stage_labels(stage: &str) -> Vec<(&'static str, String)> {
+    let (key, value) = match stage {
+        "engine_step" => ("step", "write"),
+        "register_step" => ("step", "register"),
+        "unregister_step" => ("step", "unregister"),
+        "land_step" => ("step", "land"),
+        "hydrate_cold" => ("kind", "cold"),
+        "hydrate_warm" => ("kind", "warm"),
+        _ => return Vec::new(),
+    };
+    vec![(key, value.to_owned())]
 }
 
 /// One line of help per stage.
@@ -1159,61 +1381,106 @@ fn stage_help(stage: &str) -> &'static str {
     }
 }
 
-/// A counter's Prometheus name and labels.
-fn counter_name(name: &str) -> (String, &'static str) {
-    match name {
-        "transform_hits" => ("xyne_sync_transforms_total".to_owned(), "{result=\"hit\"}"),
-        "transform_misses" => ("xyne_sync_transforms_total".to_owned(), "{result=\"miss\"}"),
-        "transform_errors" => (
-            "xyne_sync_transforms_total".to_owned(),
-            "{result=\"error\"}",
-        ),
-        "refused_unsupported" => (
-            "xyne_sync_queries_refused_total".to_owned(),
-            "{reason=\"unsupported\"}",
-        ),
-        "refused_plan_limit" => (
-            "xyne_sync_queries_refused_total".to_owned(),
-            "{reason=\"plan_limit\"}",
-        ),
-        "refused_read_limit" => (
-            "xyne_sync_queries_refused_total".to_owned(),
-            "{reason=\"read_limit\"}",
-        ),
-        "refused_other" => (
-            "xyne_sync_queries_refused_total".to_owned(),
-            "{reason=\"other\"}",
-        ),
-        "pages_short" => (
-            "xyne_sync_queries_short_total".to_owned(),
-            "{reason=\"page_capped\"}",
-        ),
-        "plans_page_driven" => ("xyne_sync_plans_total".to_owned(), "{kind=\"page_drives\"}"),
-        "pushes_ok" => ("xyne_sync_pushes_total".to_owned(), "{result=\"ok\"}"),
-        "pushes_failed" => ("xyne_sync_pushes_total".to_owned(), "{result=\"failed\"}"),
-        "connections_opened" => (
-            "xyne_sync_connections_total".to_owned(),
-            "{event=\"opened\"}",
-        ),
-        "connections_closed_by_client" => (
-            "xyne_sync_connections_total".to_owned(),
-            "{event=\"closed\",reason=\"client\"}",
-        ),
-        "connections_closed_by_error" => (
-            "xyne_sync_connections_total".to_owned(),
-            "{event=\"closed\",reason=\"error\"}",
-        ),
-        "connections_closed_by_server" => (
-            "xyne_sync_connections_total".to_owned(),
-            "{event=\"closed\",reason=\"server\"}",
-        ),
+/// A counter's metric name and labels.
+fn counter_name(name: &str) -> (String, Vec<(&'static str, String)>) {
+    let (metric, labels): (&str, &[(&'static str, &str)]) = match name {
+        "transform_hits" => ("transforms", &[("result", "hit")]),
+        "transform_misses" => ("transforms", &[("result", "miss")]),
+        "transform_errors" => ("transforms", &[("result", "error")]),
+        "refused_unsupported" => ("queries_refused", &[("reason", "unsupported")]),
+        "refused_plan_limit" => ("queries_refused", &[("reason", "plan_limit")]),
+        "refused_read_limit" => ("queries_refused", &[("reason", "read_limit")]),
+        "refused_other" => ("queries_refused", &[("reason", "other")]),
+        "pages_short" => ("queries_short", &[("reason", "page_capped")]),
+        "plans_page_driven" => ("plans", &[("kind", "page_drives")]),
+        "pushes_ok" => ("pushes", &[("result", "ok")]),
+        "pushes_failed" => ("pushes", &[("result", "failed")]),
+        "connections_opened" => ("connections", &[("event", "opened")]),
+        "connections_closed_by_client" => {
+            ("connections", &[("event", "closed"), ("reason", "client")])
+        }
+        "connections_closed_by_error" => {
+            ("connections", &[("event", "closed"), ("reason", "error")])
+        }
+        "connections_closed_by_server" => {
+            ("connections", &[("event", "closed"), ("reason", "server")])
+        }
         "connections_refused_schema" => (
-            "xyne_sync_connections_total".to_owned(),
-            "{event=\"refused\",reason=\"client_schema\"}",
+            "connections",
+            &[("event", "refused"), ("reason", "client_schema")],
         ),
-        "transactions" => ("xyne_sync_feed_transactions_total".to_owned(), ""),
-        "writes" => ("xyne_sync_feed_writes_total".to_owned(), ""),
-        other => (format!("xyne_sync_{other}_total"), ""),
+        "reads_over_half" => ("reads_near_limit", &[("over", "50")]),
+        "reads_over_80" => ("reads_near_limit", &[("over", "80")]),
+        "transactions" => ("feed_transactions", &[]),
+        "writes" => ("feed_writes", &[]),
+        other => (other, &[]),
+    };
+    (
+        format!("xyne_sync_{metric}_total"),
+        labels
+            .iter()
+            .map(|(key, value)| (*key, (*value).to_owned()))
+            .collect(),
+    )
+}
+
+/// One line of help per counter and gauge, by its `/stats` name.
+fn measure_help(name: &str) -> &'static str {
+    match name {
+        "transactions" => "committed transactions the feed delivered",
+        "writes" => "row writes inside those transactions",
+        "pokes" => "pokes written to client groups",
+        "frames" => "WebSocket frames written",
+        "rows_serialized" => "row images turned into JSON",
+        "rows_shared" => "row images found already serialized in the same flush",
+        "rows_read" => "rows storage reads returned",
+        "transform_hits" | "transform_misses" | "transform_errors" => {
+            "query transforms by outcome: answered from the cache, asked of the application server, failed"
+        }
+        "refused_unsupported" | "refused_plan_limit" | "refused_read_limit" | "refused_other" => {
+            "queries refused, by class of reason"
+        }
+        "pages_short" => "pages served short of their limit",
+        "plans_page_driven" => "plans in which a page drives its own join",
+        "pushes_ok" | "pushes_failed" => "pushes forwarded to the application server, by outcome",
+        "connections_opened"
+        | "connections_closed_by_client"
+        | "connections_closed_by_error"
+        | "connections_closed_by_server"
+        | "connections_refused_schema" => "client connections by event and reason",
+        "reads_over_half" | "reads_over_80" => {
+            "storage reads that returned at least this percentage of the row limit"
+        }
+        "log_dropped" => "log lines dropped because the log queue was full",
+        "otel_metric_exports" | "otel_log_exports" => "OTLP export requests the collector accepted",
+        "otel_export_failures" => "OTLP export requests that failed",
+        "otel_logs_dropped" => "log records dropped because the OTLP queue was full",
+        "connections_open" => "client connections open now",
+        "client_groups" => "client groups the group threads hold",
+        "clients" => "clients connected across those groups",
+        "engine_inbox" => "commands waiting for the engine thread",
+        "plan_cache_entries" => "join plans remembered",
+        "transform_cache_entries" => "query transforms remembered",
+        "warm_shapes" => "query shapes kept for a warm start",
+        "feed_lsn" => "the feed's position in PostgreSQL's log",
+        "feed_heartbeat_age_ms" => "since the feed last heard from PostgreSQL",
+        "process_rss_bytes" => "the process's resident memory",
+        "read_row_limit" => "the row limit of one storage read, as configured",
+        "read_rows_max" => "the largest storage read of the last minute or two",
+        "writes_impacting_total" => "writes that changed at least one subscription",
+        "narrowed_reads_total" => "storage reads the engine asked for",
+        "reads_issued_total" | "reads_landed_total" | "reads_refused_total" => {
+            "storage reads by what became of them"
+        }
+        "reads_shared_total" => "registrations answered from rows already held",
+        "window_refills_total" => "pages that read again to stay full",
+        "page_rows_rejected_total" => "page rows their join rejected",
+        "pages_capped_total" => "pages that stopped reading past rejected rows",
+        "registrations_total" => "queries registered with the engine",
+        "client_updates_add_total" | "client_updates_delete_total" => {
+            "row operations the engine emitted"
+        }
+        _ => "",
     }
 }
 
@@ -1424,5 +1691,62 @@ mod tests {
         let json = stats.json();
         assert_eq!(json["refused_queries"][0]["name"], "kbRoot");
         assert_eq!(json["refused_queries"][0]["reason"], read);
+    }
+
+    /// A read is counted against the row limit: the largest of the window
+    /// is a gauge that survives one rotation, reads at half and at four
+    /// fifths of the limit are counted apart, and a heavy read is reported
+    /// under its query's name with the largest read and its table.
+    #[test]
+    fn reads_are_measured_against_the_row_limit() {
+        let stats = Stats::new();
+        stats.read_row_limit.store(1_000, Ordering::Relaxed);
+        assert_eq!(stats.heavy_read_rows(), Some(500));
+        for rows in [10, 499, 500, 799, 800, 1_000] {
+            stats.note_read(rows);
+        }
+        assert_eq!(stats.reads_over_half.load(Ordering::Relaxed), 4);
+        assert_eq!(stats.reads_over_80.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.read_rows_max(), 1_000);
+        stats.rotate_read_peak();
+        stats.note_read(20);
+        assert_eq!(
+            stats.read_rows_max(),
+            1_000,
+            "the window before still shows"
+        );
+        stats.rotate_read_peak();
+        assert_eq!(stats.read_rows_max(), 20);
+
+        assert_eq!(
+            stats.note_heavy_read("channelMessages", "messages", 600),
+            60
+        );
+        assert_eq!(
+            stats.note_heavy_read("channelMessages", "conversations", 900),
+            90
+        );
+        assert_eq!(stats.note_heavy_read("kbRoot", "collection_items", 500), 50);
+        let heavy = stats.heavy_queries();
+        assert_eq!(heavy[0].0, "channelMessages");
+        assert_eq!((heavy[0].1.rows, heavy[0].1.count), (900, 2));
+        assert_eq!(heavy[0].1.table, "conversations");
+
+        let text = stats.prometheus();
+        assert!(text.contains("xyne_sync_read_row_limit 1000\n"));
+        assert!(text.contains("xyne_sync_reads_near_limit_total{over=\"50\"} 4\n"));
+        assert!(text.contains("xyne_sync_reads_near_limit_total{over=\"80\"} 2\n"));
+        assert!(text.contains(
+            "xyne_sync_query_read_rows_max{name=\"channelMessages\",table=\"conversations\"} 900\n"
+        ));
+        assert!(text.contains("xyne_sync_query_heavy_reads_total{name=\"kbRoot\"} 1\n"));
+        let json = stats.json();
+        assert_eq!(json["heavy_queries"][0]["percent_of_limit"], 90);
+        assert_eq!(json["gauges"]["read_row_limit"], 1_000);
+
+        let unlimited = Stats::new();
+        unlimited.note_read(5_000_000);
+        assert_eq!(unlimited.heavy_read_rows(), None);
+        assert_eq!(unlimited.reads_over_half.load(Ordering::Relaxed), 0);
     }
 }

@@ -96,6 +96,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
             Event::Refused { .. } => "refused",
             Event::Committed { .. } => "committed",
             Event::Capped { .. } => "capped",
+            Event::Heavy { .. } => "heavy",
         })
         .collect()
 }
@@ -106,7 +107,9 @@ fn updates_of(event: &Event) -> &[xyne_sync::ivm::Delta] {
         Event::Registered { updates, .. }
         | Event::Landed { updates }
         | Event::Committed { updates, .. } => updates,
-        Event::Hydrated(_) | Event::Refused { .. } | Event::Capped { .. } => &[],
+        Event::Hydrated(_) | Event::Refused { .. } | Event::Capped { .. } | Event::Heavy { .. } => {
+            &[]
+        }
     }
 }
 
@@ -567,5 +570,71 @@ fn deltas_reach_the_sink_that_owns_each_subscription() {
         );
         let heard = drain(&mut second).await;
         assert_eq!(ids(&heard), vec![3], "the other still hears");
+    });
+}
+
+/// A read that comes back with at least half the row limit is told, once,
+/// to the owner of a subscription waiting on it, with the table and the
+/// row count, so the transport can name the query; a small read is not.
+#[test]
+fn a_heavy_read_is_told_to_the_subscriptions_owner() {
+    block_on(async {
+        let storage = Rc::new(MemoryStorage::new());
+        for id in 1..=6 {
+            storage.apply(&insert(id, "OPEN"));
+        }
+        storage.apply(&insert(7, "DONE"));
+        let stats = xyne_sync::stats::Stats::shared();
+        stats
+            .read_row_limit
+            .store(10, std::sync::atomic::Ordering::Relaxed);
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let (service, commands) = Service::new(MultiTableIVM::new(), storage, events_tx);
+        spawn_local(service.with_stats(stats.clone()).run());
+
+        commands
+            .send(Command::Register {
+                sink: 0,
+                query: open_tickets(),
+                token: 1,
+            })
+            .await
+            .expect("send");
+        let seen = drain(&mut events).await;
+        let (_, sub) = registered(&seen).expect("registered");
+        let heavy: Vec<_> = seen
+            .iter()
+            .filter_map(|event| match event {
+                Event::Heavy { sub, table, rows } => Some((*sub, table.as_str().to_owned(), *rows)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            heavy,
+            vec![(sub, "tickets".to_owned(), 6)],
+            "{:?}",
+            shapes(&seen)
+        );
+
+        let done = MultiTableReadQuery::single(SingleTableReadQuery::new(
+            "tickets",
+            Where::condition("status", ComparisonOperator::EQ, "DONE"),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        ));
+        commands
+            .send(Command::Register {
+                sink: 0,
+                query: done,
+                token: 2,
+            })
+            .await
+            .expect("send");
+        let seen = drain(&mut events).await;
+        assert!(
+            !shapes(&seen).contains(&"heavy"),
+            "one row of a limit of ten is no heavy read, got {:?}",
+            shapes(&seen)
+        );
     });
 }
