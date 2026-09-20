@@ -16,10 +16,10 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use xyne_sync::ivm::{ClientUpdate, MultiTableIVM, QueryPart, SubId};
+use xyne_sync::ivm::{Delta, MultiTableIVM, QueryPart, SubId};
 use xyne_sync::model::{
-    Catalog, ClientId, ColumnName, DataFrameKey, DataFrameOperation, DataFrameRow, DeleteQuery,
-    InsertQuery, UpdateQuery, Value, WriteQuery,
+    Catalog, ColumnName, DataFrameKey, DataFrameOperation, DataFrameRow, DeleteQuery, InsertQuery,
+    UpdateQuery, Value, WriteQuery,
 };
 use xyne_sync::parser::parse_read;
 use xyne_sync::sync::{Local, MemoryStorage};
@@ -59,7 +59,6 @@ pub struct World {
     catalog: Catalog,
     subs: HashMap<String, SubId>,
     parts: HashMap<SubId, (String, HashMap<QueryPart, String>)>,
-    clients: u64,
 }
 
 impl World {
@@ -72,7 +71,6 @@ impl World {
             catalog: catalog(),
             subs: HashMap::new(),
             parts: HashMap::new(),
-            clients: 0,
         }
     }
 
@@ -97,9 +95,7 @@ impl World {
             );
         }
         let (spec, parts) = scoped.build();
-        self.clients += 1;
-        let client = ClientId(self.clients);
-        let (sub, updates) = self.ivm.register_query(client, spec);
+        let (sub, updates) = self.ivm.register_query(spec);
         self.subs.insert(name.to_owned(), sub);
         self.parts.insert(sub, (name.to_owned(), parts));
         self.tags(&updates)
@@ -171,10 +167,10 @@ impl World {
     }
 
     /// Render updates as sorted tags, one per targeted part.
-    fn tags(&self, updates: &[ClientUpdate]) -> Vec<String> {
+    fn tags(&self, updates: &[Delta]) -> Vec<String> {
         let mut tags: Vec<String> = updates
             .iter()
-            .flat_map(|update| update.targets.iter().map(move |target| (update, target)))
+            .flat_map(|update| update.targets().map(move |target| (update, target)))
             .map(|(update, target)| {
                 let (name, parts) = &self.parts[&target.sub];
                 let part = &parts[&target.part];

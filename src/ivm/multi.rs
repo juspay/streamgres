@@ -127,8 +127,12 @@
 //! Subscriptions with an identical spec share one tree: one inner part
 //! per node, one set of edges and counts, one crossing per event. A later
 //! identical registration is served its snapshot from the shared parts'
-//! shown rows, and every operation a part produces is emitted once per
-//! subscriber of its tree. The tree is dropped with its last subscriber.
+//! shown rows, and every operation a part produces is emitted **once**,
+//! for all the tree's subscribers together: it carries the tree's
+//! subscriber list by reference ([`Subs::Many`]), so a write costs the
+//! layer the same whether one subscription shares the tree or ten
+//! thousand do, and resolving the list to clients is the transport's
+//! work. The tree is dropped with its last subscriber.
 //!
 //! # Counts, crossings, cascades
 //!
@@ -170,33 +174,34 @@
 //! [`MultiTableIVM::land_fetch`], which cascades the landed rows' arrivals
 //! exactly as it cascades a write's.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::cell::OnceCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::engine::Footprint;
 use super::predicate::evaluate_with;
 use super::stats::IvmStats;
-use super::update::{Raw, Target, group};
-use super::{ClientUpdate, Engine, Fetch, QueryPart, SingleTableIVM, SingleTableUpdate};
+use super::update::{Audience, Raw, Subs, fold};
+use super::{Delta, Engine, Fetch, QueryPart, SingleTableIVM, SingleTableUpdate};
 use crate::model::frame::SharedRow;
 use crate::model::{
-    ClientId, ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameOperation,
-    DataFrameRow, Driver, IdMap, Join, MultiTableReadQuery, SharedSet, SingleTableReadQuery, SubId,
-    TableName, Value, Where, WriteQuery,
+    ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow,
+    Driver, IdMap, Join, MultiTableReadQuery, SharedSet, SingleTableReadQuery, SubId, TableName,
+    Value, Where, WriteQuery,
 };
 
-/// One operation for one part of one multi-table subscription — the
-/// join layer's own unit, grouped per client before it leaves the engine
-/// ([`ClientUpdate`]).
+/// One operation for one part of a tree, the join layer's own unit, folded
+/// per row before it leaves the engine ([`Delta`]).
 ///
-/// - `query`: which subscription (the engine id `register_query` returned).
+/// - `subs`: who it is for: every subscriber of the tree, as the tree's
+///   shared list, or the one subscription a snapshot is served to.
 /// - `table`: the table the operation lands on.
 /// - `part`: which node of the tree produced it — kept beside the table
 ///   because a self-join makes the table alone ambiguous.
 /// - `op`: the delta itself.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultiTableUpdate {
-    pub query: SubId,
+    pub subs: Subs,
     pub table: TableName,
     pub part: QueryPart,
     pub op: DataFrameOperation,
@@ -349,7 +354,10 @@ impl Node {
 /// One registered spec and every subscription sharing it.
 ///
 /// - `spec`: the tree as registered.
-/// - `subscribers`: the subscription ids sharing it, in registration order.
+/// - `subscribers`: the subscription ids sharing it, in registration order,
+///   and `audience`, that list as every operation of the tree carries it
+///   (built when first needed, dropped when the subscribers change), so an
+///   operation costs the same for one subscriber and for ten thousand.
 /// - `nodes`: every part by path.
 /// - `edges`: every join edge; nodes refer to them by index.
 /// - `leaves`: the shared set behind each leaf, by [`LeafKey`].
@@ -365,6 +373,7 @@ impl Node {
 struct Tree {
     spec: Rc<MultiTableReadQuery>,
     subscribers: Vec<SubId>,
+    audience: OnceCell<Subs>,
     nodes: IdMap<QueryPart, Node>,
     edges: Vec<Edge>,
     leaves: HashMap<LeafKey, SharedSet>,
@@ -394,9 +403,6 @@ struct TreeId(u64);
 /// - `next_sub`: the next subscription id to hand out; never reused.
 /// - `parts`: inner part id → (tree id, part), the reverse map every
 ///   routed operation goes through.
-/// - `clients`: subscription id → the client it belongs to, and
-///   `by_client` the reverse, for addressing deltas and for a client's
-///   disconnect.
 /// - `dirty`: the trees with a page under a gate whose rows moved or
 ///   whose reads landed in this step, settled before the step returns.
 /// - `in_flight`: the rows the inner engine holds whose `Add` this layer
@@ -407,6 +413,9 @@ struct TreeId(u64);
 /// - `capped`: the subscriptions of trees a page of which has stopped
 ///   reaching past its rejected rows, until [`Engine::take_capped`] takes
 ///   them.
+///
+/// The layer knows subscriptions, not clients: whose a subscription is,
+/// the transport keeps.
 pub struct MultiTableIVM {
     single: SingleTableIVM,
     trees: IdMap<TreeId, Tree>,
@@ -415,8 +424,6 @@ pub struct MultiTableIVM {
     by_sub: IdMap<SubId, TreeId>,
     next_sub: u64,
     parts: IdMap<SubId, (TreeId, QueryPart)>,
-    clients: IdMap<SubId, ClientId>,
-    by_client: IdMap<ClientId, BTreeSet<SubId>>,
     dirty: Vec<TreeId>,
     in_flight: HashSet<(SubId, DataFrameKey)>,
     wanted: Vec<(SubId, ColumnName, Vec<Value>)>,
@@ -503,6 +510,7 @@ fn build_tree(spec: Rc<MultiTableReadQuery>) -> Tree {
     let mut tree = Tree {
         spec: spec.clone(),
         subscribers: Vec::new(),
+        audience: OnceCell::new(),
         nodes: IdMap::default(),
         edges: Vec::new(),
         leaves: HashMap::new(),
@@ -820,8 +828,6 @@ impl MultiTableIVM {
             by_sub: IdMap::default(),
             next_sub: 0,
             parts: IdMap::default(),
-            clients: IdMap::default(),
-            by_client: IdMap::default(),
             dirty: Vec::new(),
             in_flight: HashSet::new(),
             wanted: Vec::new(),
@@ -847,6 +853,7 @@ impl MultiTableIVM {
             self.by_sub.insert(sub, tree_id);
             let tree = self.trees.get_mut(&tree_id).expect("indexed by spec");
             tree.subscribers.push(sub);
+            tree.audience = OnceCell::new();
             for part in &tree.post_order {
                 let node = &tree.nodes[part];
                 for inner in node.inner_parts() {
@@ -858,7 +865,7 @@ impl MultiTableIVM {
                             continue;
                         }
                         out.push(MultiTableUpdate {
-                            query: sub,
+                            subs: Subs::One(sub),
                             table: node.query.table.clone(),
                             part: *part,
                             op: DataFrameOperation::Add(key, row),
@@ -1222,6 +1229,7 @@ impl MultiTableIVM {
             return;
         };
         tree.subscribers.retain(|subscriber| *subscriber != sub);
+        tree.audience = OnceCell::new();
         if !tree.subscribers.is_empty() {
             return;
         }
@@ -1551,8 +1559,9 @@ impl MultiTableIVM {
         self.emit_raw(tree_id, part, table, op, out);
     }
 
-    /// Forward one part operation to every subscriber of its tree, the
-    /// caller having decided it is shown (or was, for a retraction).
+    /// Forward one part operation to every subscriber of its tree at once
+    /// (one update carrying the tree's shared list), the caller having
+    /// decided it is shown (or was, for a retraction).
     fn emit_raw(
         &self,
         tree_id: TreeId,
@@ -1564,14 +1573,15 @@ impl MultiTableIVM {
         let Some(tree) = self.trees.get(&tree_id) else {
             return;
         };
-        for subscriber in &tree.subscribers {
-            out.push(MultiTableUpdate {
-                query: *subscriber,
-                table: table.clone(),
-                part: *part,
-                op: op.clone(),
-            });
-        }
+        out.push(MultiTableUpdate {
+            subs: tree
+                .audience
+                .get_or_init(|| Subs::of(&tree.subscribers))
+                .clone(),
+            table: table.clone(),
+            part: *part,
+            op,
+        });
     }
 
     /// A row now held by `part`: reference its join value on every edge
@@ -2191,7 +2201,9 @@ impl MultiTableIVM {
                 .find(|(sub, wanted, _)| *sub == inner && *wanted == column)
             {
                 Some((_, _, values)) => values.push(value.clone()),
-                None => self.wanted.push((inner, column.clone(), vec![value.clone()])),
+                None => self
+                    .wanted
+                    .push((inner, column.clone(), vec![value.clone()])),
             }
         }
     }
@@ -2393,23 +2405,18 @@ impl MultiTableIVM {
 }
 
 impl MultiTableIVM {
-    /// Address per-subscription operations to their clients and group
-    /// them per client and row.
-    fn addressed(&self, updates: Vec<MultiTableUpdate>) -> Vec<ClientUpdate> {
-        group(
+    /// One step's per-part operations folded per row.
+    fn folded(&self, updates: Vec<MultiTableUpdate>) -> Vec<Delta> {
+        fold(
             updates
                 .into_iter()
-                .filter_map(|update| {
-                    let client = *self.clients.get(&update.query)?;
-                    Some(Raw {
-                        client,
-                        table: update.table,
-                        target: Target {
-                            sub: update.query,
-                            part: update.part,
-                        },
-                        op: update.op,
-                    })
+                .map(|update| Raw {
+                    table: update.table,
+                    audience: Audience {
+                        part: update.part,
+                        subs: update.subs,
+                    },
+                    op: update.op,
                 })
                 .collect(),
         )
@@ -2419,38 +2426,15 @@ impl MultiTableIVM {
 impl Engine for MultiTableIVM {
     type Query = MultiTableReadQuery;
 
-    /// [`MultiTableIVM::register_query`], its snapshot addressed to
-    /// `client`.
-    fn subscribe(
-        &mut self,
-        client: ClientId,
-        query: MultiTableReadQuery,
-    ) -> (SubId, Vec<ClientUpdate>) {
+    /// [`MultiTableIVM::register_query`], its snapshot as deltas.
+    fn subscribe(&mut self, query: MultiTableReadQuery) -> (SubId, Vec<Delta>) {
         let (sub, updates) = self.register_query(query);
-        self.clients.insert(sub, client);
-        self.by_client.entry(client).or_default().insert(sub);
-        (sub, self.addressed(updates))
+        (sub, self.folded(updates))
     }
 
     /// [`MultiTableIVM::unregister_query`].
     fn unsubscribe(&mut self, sub: SubId) {
-        if let Some(client) = self.clients.remove(&sub)
-            && let Some(subs) = self.by_client.get_mut(&client)
-        {
-            subs.remove(&sub);
-            if subs.is_empty() {
-                self.by_client.remove(&client);
-            }
-        }
         self.unregister_query(sub);
-    }
-
-    /// Every subscription of `client`, unregistered.
-    fn unsubscribe_client(&mut self, client: ClientId) {
-        for sub in self.by_client.remove(&client).unwrap_or_default() {
-            self.clients.remove(&sub);
-            self.unregister_query(sub);
-        }
     }
 
     /// What the engine holds: its subscriptions, its trees and the rows
@@ -2467,12 +2451,9 @@ impl Engine for MultiTableIVM {
     }
 
     /// The subscriptions whose tree has a page that stopped reaching past
-    /// its rejected rows since the last call, with their clients.
-    fn take_capped(&mut self) -> Vec<(SubId, ClientId)> {
+    /// its rejected rows since the last call.
+    fn take_capped(&mut self) -> Vec<SubId> {
         std::mem::take(&mut self.capped)
-            .into_iter()
-            .filter_map(|sub| self.clients.get(&sub).map(|client| (sub, *client)))
-            .collect()
     }
 
     /// Every subscription of every tree with a part reading the fetch.
@@ -2488,40 +2469,37 @@ impl Engine for MultiTableIVM {
 
     /// Every subscription of every tree with a part reading the refused
     /// fetch, unsubscribed.
-    fn refuse(&mut self, fetch: &Fetch) -> Vec<(SubId, ClientId)> {
-        let trees = self.trees_reading(fetch);
+    fn refuse(&mut self, fetch: &Fetch) -> Vec<SubId> {
         let mut gone = Vec::new();
-        for tree_id in trees {
+        for tree_id in self.trees_reading(fetch) {
             let subs = self
                 .trees
                 .get(&tree_id)
                 .map(|tree| tree.subscribers.clone())
                 .unwrap_or_default();
             for sub in subs {
-                if let Some(client) = self.clients.get(&sub).copied() {
-                    gone.push((sub, client));
-                }
-                self.unsubscribe(sub);
+                self.unregister_query(sub);
+                gone.push(sub);
             }
         }
         gone
     }
 
-    /// [`MultiTableIVM::incremental_update`], grouped per client.
-    fn route(&mut self, write: &WriteQuery) -> Vec<ClientUpdate> {
+    /// [`MultiTableIVM::incremental_update`], folded per row.
+    fn route(&mut self, write: &WriteQuery) -> Vec<Delta> {
         let updates = self.incremental_update(write);
-        self.addressed(updates)
+        self.folded(updates)
     }
 
-    /// [`MultiTableIVM::land_read`], grouped per client.
+    /// [`MultiTableIVM::land_read`], folded per row.
     fn land(
         &mut self,
         fetch: &Fetch,
         rows: &[(DataFrameKey, DataFrameRow)],
         worst_read: Option<&DataFrameRow>,
-    ) -> Vec<ClientUpdate> {
+    ) -> Vec<Delta> {
         let updates = self.land_read(fetch, rows, worst_read);
-        self.addressed(updates)
+        self.folded(updates)
     }
 
     /// [`MultiTableIVM::take_requests`].

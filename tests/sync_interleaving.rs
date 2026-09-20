@@ -39,9 +39,6 @@ fn users_table() -> DbTable {
     )
 }
 
-/// The one client every subscription here belongs to.
-const CLIENT: ClientId = ClientId(1);
-
 fn pkey(id: i64) -> HashMap<ColumnName, Value> {
     HashMap::from([("id".into(), Value::Int(id))])
 }
@@ -205,11 +202,7 @@ fn column_of(
 /// Run every read a step handed out against the database as it is right
 /// now and land it, repeating until nothing is out; the updates of every
 /// step, in order.
-fn settle<E: Engine>(
-    runtime: &mut Runtime<E>,
-    db: &Db,
-    step: Step,
-) -> Vec<xyne_sync::ivm::ClientUpdate> {
+fn settle<E: Engine>(runtime: &mut Runtime<E>, db: &Db, step: Step) -> Vec<xyne_sync::ivm::Delta> {
     let mut updates = step.updates;
     let mut queue = step.selects;
     while !queue.is_empty() {
@@ -256,7 +249,7 @@ fn registration_result_is_brought_up_to_the_engine() {
     let mut runtime = Runtime::new(SingleTableIVM::new());
     runtime.progress(db.head());
 
-    let (sub, step) = runtime.register(CLIENT, open_tickets());
+    let (sub, step) = runtime.register(open_tickets());
     assert!(
         step.updates.is_empty(),
         "nothing is at hand until the read lands"
@@ -302,7 +295,7 @@ fn covered_writes_are_adopted_without_duplicate_operations() {
     let mut runtime = Runtime::new(SingleTableIVM::new());
     runtime.progress(db.head());
 
-    let (sub, step) = runtime.register(CLIENT, open_tickets());
+    let (sub, step) = runtime.register(open_tickets());
     let read = only(&step);
 
     let touched = ticket_update(1, "OPEN", 7, 99);
@@ -365,7 +358,7 @@ fn a_read_behind_earlier_writes_is_brought_up_from_the_floor() {
     stream(&mut runtime, &mut db, &delete("tickets", 2));
     assert_eq!(runtime.buffered(), 2, "kept: the floor is still at zero");
 
-    let (sub, step) = runtime.register(CLIENT, open_tickets());
+    let (sub, step) = runtime.register(open_tickets());
     let read = only(&step);
     let landed = runtime.fetched(
         read.id,
@@ -422,7 +415,7 @@ fn narrowed_join_fetch_defers_to_later_writes() {
             "id",
         )],
     );
-    let (sub, step) = runtime.register(CLIENT, spec);
+    let (sub, step) = runtime.register(spec);
     settle(&mut runtime, &db, step);
     assert_eq!(
         ids(runtime.engine().rows_for(sub, QueryPart::join(0))),
@@ -487,7 +480,7 @@ fn refill_in_flight_keeps_the_window_exact() {
         OrderBy::new("points", Order::ASC),
         2,
     );
-    let (sub, step) = runtime.register(CLIENT, windowed);
+    let (sub, step) = runtime.register(windowed);
     settle(&mut runtime, &db, step);
     assert_eq!(
         ids(runtime.engine().rows_for(sub)),
@@ -574,22 +567,23 @@ fn registrations_while_the_read_is_out_share_it() {
     ]);
     let mut runtime = Runtime::new(SingleTableIVM::new());
     runtime.progress(db.head());
-    let (a, step) = runtime.register(CLIENT, open_tickets());
+    let (a, step) = runtime.register(open_tickets());
     let read = only(&step);
-    let (b, step) = runtime.register(ClientId(2), open_tickets());
+    let (b, step) = runtime.register(open_tickets());
     assert!(
         step.selects.is_empty(),
         "no second read, got {:?}",
         step.selects
     );
     assert!(step.updates.is_empty());
-    let (c, step) = runtime.register(ClientId(3), open_tickets());
+    let (c, step) = runtime.register(open_tickets());
     assert!(step.selects.is_empty());
 
     let snapshot = db.snapshot(&read);
     let streamed = stream(&mut runtime, &mut db, &ticket(4, "OPEN", 7, 4)).updates;
+    assert_eq!(streamed.len(), 1, "one delta for the one row");
     assert_eq!(
-        streamed.len(),
+        streamed[0].target_count(),
         3,
         "routed natively to all three while the read is out"
     );
@@ -601,10 +595,13 @@ fn registrations_while_the_read_is_out_share_it() {
             BTreeSet::from([1, 2, 4])
         );
     }
-    assert_eq!(
-        landed.updates.len(),
-        6,
-        "rows 1 and 2 for each of the three"
+    assert_eq!(landed.updates.len(), 2, "rows 1 and 2");
+    assert!(
+        landed
+            .updates
+            .iter()
+            .all(|update| update.target_count() == 3),
+        "each for all three"
     );
     assert_eq!(runtime.stats().reads_issued, 1);
     assert_eq!(runtime.engine().stats().snapshots_shared, 2);
@@ -626,7 +623,7 @@ fn writes_between_the_snapshot_and_the_registration_land_too() {
 
     stream(&mut runtime, &mut db, &ticket(2, "OPEN", 7, 2));
     stream(&mut runtime, &mut db, &ticket(3, "DONE", 7, 3));
-    let (sub, step) = runtime.register(CLIENT, open_tickets());
+    let (sub, step) = runtime.register(open_tickets());
     let read = only(&step);
     let landed = runtime.fetched(
         read.id,
@@ -675,7 +672,7 @@ fn late_writes_respect_a_full_window() {
 
     stream(&mut runtime, &mut db, &ticket(5, "OPEN", 7, 5));
     stream(&mut runtime, &mut db, &ticket(45, "OPEN", 7, 45));
-    let (sub, step) = runtime.register(CLIENT, windowed);
+    let (sub, step) = runtime.register(windowed);
     let read = only(&step);
     runtime.fetched(
         read.id,
@@ -727,7 +724,7 @@ fn post_order_registration_follows_landings() {
             "id",
         )],
     );
-    let (sub, step) = runtime.register(CLIENT, right);
+    let (sub, step) = runtime.register(right);
     let first = only(&step);
     assert_eq!(first.query.table, "users", "the driving child reads first");
     let step = runtime.fetched(first.id, db.snapshot(&first));
@@ -759,7 +756,7 @@ fn post_order_registration_follows_landings() {
         )],
     );
     let before = runtime.engine().stats().storage_reads;
-    let (sub, step) = runtime.register(CLIENT, left);
+    let (sub, step) = runtime.register(left);
     let main = only(&step);
     assert_eq!(main.query.table, "tickets");
     let step = runtime.fetched(main.id, db.snapshot(&main));
@@ -792,7 +789,7 @@ fn parked_reads_unregistration_and_pending_twins() {
     let mut runtime = Runtime::new(SingleTableIVM::new());
     runtime.progress(db.head());
 
-    let (sub, step) = runtime.register(CLIENT, open_tickets());
+    let (sub, step) = runtime.register(open_tickets());
     let read = only(&step);
     let parked = runtime.failed(read.id);
     assert!(parked.selects.is_empty(), "parked, not re-issued at once");
@@ -803,13 +800,10 @@ fn parked_reads_unregistration_and_pending_twins() {
     runtime.fetched(read.id, db.snapshot(&read));
     assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([1]));
 
-    let (doomed, step) = runtime.register(
-        CLIENT,
-        query(
-            &tickets_table(),
-            Where::condition("points", ComparisonOperator::GTE, 0),
-        ),
-    );
+    let (doomed, step) = runtime.register(query(
+        &tickets_table(),
+        Where::condition("points", ComparisonOperator::GTE, 0),
+    ));
     let read = only(&step);
     runtime.unregister(doomed);
     let landed = runtime.fetched(read.id, db.snapshot(&read));
@@ -817,21 +811,15 @@ fn parked_reads_unregistration_and_pending_twins() {
     assert_eq!(runtime.outstanding(), 0);
     assert!(runtime.engine().rows_for(doomed).is_none());
 
-    let (first, step) = runtime.register(
-        CLIENT,
-        query(
-            &tickets_table(),
-            Where::condition("assigned_to", ComparisonOperator::EQ, 7),
-        ),
-    );
+    let (first, step) = runtime.register(query(
+        &tickets_table(),
+        Where::condition("assigned_to", ComparisonOperator::EQ, 7),
+    ));
     let first_read = only(&step);
-    let (second, step) = runtime.register(
-        CLIENT,
-        query(
-            &tickets_table(),
-            Where::condition("assigned_to", ComparisonOperator::EQ, 7),
-        ),
-    );
+    let (second, step) = runtime.register(query(
+        &tickets_table(),
+        Where::condition("assigned_to", ComparisonOperator::EQ, 7),
+    ));
     assert!(
         step.selects.is_empty(),
         "the twin joins the read that is out, got {:?}",
@@ -853,13 +841,10 @@ fn parked_reads_unregistration_and_pending_twins() {
         BTreeSet::from([1, 2])
     );
 
-    let (third, step) = runtime.register(
-        CLIENT,
-        query(
-            &tickets_table(),
-            Where::condition("assigned_to", ComparisonOperator::EQ, 7),
-        ),
-    );
+    let (third, step) = runtime.register(query(
+        &tickets_table(),
+        Where::condition("assigned_to", ComparisonOperator::EQ, 7),
+    ));
     assert!(
         step.selects.is_empty(),
         "with both landed, the twin path serves it"
@@ -892,21 +877,17 @@ fn twin_joining_a_landing_tree_receives_the_rest() {
             )],
         )
     };
-    let (first, step) = runtime.register(CLIENT, spec());
+    let (first, step) = runtime.register(spec());
     let main = only(&step);
-    let (second, step) = runtime.register(CLIENT, spec());
+    let (second, step) = runtime.register(spec());
     assert!(
         step.selects.is_empty() && step.updates.is_empty(),
         "shares the tree, nothing landed yet"
     );
 
     let step = runtime.fetched(main.id, db.snapshot(&main));
-    assert_eq!(step.updates.len(), 1, "one delta for the one client");
-    let subs: BTreeSet<SubId> = step.updates[0]
-        .targets
-        .iter()
-        .map(|target| target.sub)
-        .collect();
+    assert_eq!(step.updates.len(), 1, "one delta for the one row");
+    let subs: BTreeSet<SubId> = step.updates[0].targets().map(|target| target.sub).collect();
     assert_eq!(
         subs,
         BTreeSet::from([first, second]),
@@ -915,7 +896,7 @@ fn twin_joining_a_landing_tree_receives_the_rest() {
     let child = only(&step);
     let step = runtime.fetched(child.id, db.snapshot(&child));
     assert_eq!(step.updates.len(), 1);
-    assert_eq!(step.updates[0].targets.len(), 2);
+    assert_eq!(step.updates[0].target_count(), 2);
     for sub in [first, second] {
         assert_eq!(
             ids(runtime.engine().rows_for(sub, QueryPart::main())),

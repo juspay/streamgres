@@ -64,7 +64,6 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use xyne_sync::ivm::{Fetch, IvmStats, MultiTableIVM, SingleTableIVM, evaluate, order_rows};
 use xyne_sync::model::ComparisonOperator::{EQ, GTE};
 use xyne_sync::model::*;
@@ -76,15 +75,6 @@ use xyne_sync::sync::{Local, Lsn, Runtime, Snapshot, Storage, StorageError};
 #[path = "../../tests/xyne_spaces_queries/catalog.rs"]
 #[allow(dead_code)]
 mod xyne;
-
-/// Clients handed out so far: every registration in the bench is its own
-/// client, so per-client grouping never merges two subscriptions' deltas.
-static CLIENTS: AtomicU64 = AtomicU64::new(0);
-
-/// A fresh client id.
-fn client() -> ClientId {
-    ClientId(CLIENTS.fetch_add(1, AtomicOrdering::Relaxed))
-}
 
 /// The single-table engine under the synchronous driver over bench storage.
 type Single = Local<SingleTableIVM, BenchStorage>;
@@ -756,7 +746,7 @@ fn routing_scale(n: usize) -> RoutingReport {
     }
     let started = Instant::now();
     for filter in filters {
-        ivm.register_query(client(), unbounded(&tickets_table, filter));
+        ivm.register_query(unbounded(&tickets_table, filter));
     }
     let registration = started.elapsed();
     let registered = ivm.engine().stats().clone();
@@ -886,15 +876,15 @@ fn twin_sharing() {
     for _ in 0..TWIN_STORAGE_SAMPLES {
         let mut fresh: Single = Local::new(SingleTableIVM::new(), storage.clone());
         let started = Instant::now();
-        snapshot_rows = fresh.register_query(client(), query.clone()).1.len();
+        snapshot_rows = fresh.register_query(query.clone()).1.len();
         storage_path += started.elapsed();
     }
 
     let mut ivm: Single = Local::new(SingleTableIVM::new(), storage.clone());
-    let (first, _) = ivm.register_query(client(), query.clone());
+    let (first, _) = ivm.register_query(query.clone());
     let started = Instant::now();
     for _ in 0..TWIN_COPIES {
-        ivm.register_query(client(), query.clone());
+        ivm.register_query(query.clone());
     }
     let twin_path = started.elapsed();
 
@@ -1086,7 +1076,7 @@ fn window() {
         WINDOW_LIMIT,
     );
     let started = Instant::now();
-    let (_window_sub, snapshot) = ivm.register_query(client(), query);
+    let (_window_sub, snapshot) = ivm.register_query(query);
     let registration = started.elapsed();
     let snapshot: Vec<DataFrameOperation> = snapshot.into_iter().map(|update| update.op).collect();
     let mut mirror = Mirror::default();
@@ -1185,7 +1175,7 @@ impl JoinBench {
             let started = Instant::now();
             let updates = self.ivm.incremental_update(write);
             elapsed += started.elapsed();
-            for target in updates.iter().flat_map(|update| update.targets.iter()) {
+            for target in updates.iter().flat_map(|update| update.targets()) {
                 if target.part.is_main() {
                     main_ops += 1;
                 } else {
@@ -1277,7 +1267,7 @@ fn left_join() {
     let mut twin_ops = 0;
     for _ in 0..JOIN_TWINS {
         twin_ops += ivm
-            .register_query(client(), join_spec(Where::condition("status", EQ, "OPEN")))
+            .register_query(join_spec(Where::condition("status", EQ, "OPEN")))
             .1
             .len();
     }
@@ -1285,7 +1275,7 @@ fn left_join() {
     let after_twins = ivm.engine().stats().clone();
     let started = Instant::now();
     for index in 0..JOIN_DISTINCT {
-        ivm.register_query(client(), join_spec(distinct_join_filter(index)));
+        ivm.register_query(join_spec(distinct_join_filter(index)));
     }
     let distinct = started.elapsed();
     let after_distinct = ivm.engine().stats().clone();
@@ -1535,7 +1525,7 @@ fn memory_per_row() {
         OrderBy::new("messageId", Order::ASC),
         u32::MAX,
     );
-    let (sub, ops) = ivm.register_query(client(), query);
+    let (sub, ops) = ivm.register_query(query);
     let held = ops.len();
     drop(ops);
     let with_frame = rss_kb();
@@ -1597,7 +1587,7 @@ fn release_cost() {
                 Where::condition("points", GTE, points),
             ]),
         );
-        let (sub, ops) = ivm.register_query(client(), query);
+        let (sub, ops) = ivm.register_query(query);
         held += ops.len();
         subs.push(sub);
     }
@@ -1807,12 +1797,12 @@ async fn pg_run(dsn: &str) -> PgRow {
     moved(&mut runtime, &storage);
 
     let started = Instant::now();
-    let (_, step) = runtime.register(client(), join_spec(Where::condition("status", EQ, "OPEN")));
+    let (_, step) = runtime.register(join_spec(Where::condition("status", EQ, "OPEN")));
     let registration_cost = pg_drain(&mut runtime, &storage, &mut stream, step.selects, 0).await;
     let registration = started.elapsed();
     let started = Instant::now();
     for _ in 0..JOIN_TWINS {
-        runtime.register(client(), join_spec(Where::condition("status", EQ, "OPEN")));
+        runtime.register(join_spec(Where::condition("status", EQ, "OPEN")));
     }
     let twin = started.elapsed() / JOIN_TWINS as u32;
 
@@ -1853,7 +1843,7 @@ async fn pg_run(dsn: &str) -> PgRow {
     );
     let before = runtime.stats().clone();
     let started = Instant::now();
-    let (_, step) = runtime.register(client(), join_spec(Where::condition("team", EQ, 7i64)));
+    let (_, step) = runtime.register(join_spec(Where::condition("team", EQ, 7i64)));
     let main = step
         .selects
         .into_iter()
@@ -2348,7 +2338,7 @@ fn xy_register(
     let started = Instant::now();
     let mut ops = 0u64;
     for index in 0..count {
-        ops += ivm.register_query(client(), spec(index)).1.len() as u64;
+        ops += ivm.register_query(spec(index)).1.len() as u64;
     }
     let elapsed = started.elapsed();
     let after = ivm.engine().stats().diff(&before);
@@ -2375,7 +2365,10 @@ fn xy_route(
         let started = Instant::now();
         let updates = ivm.incremental_update(write);
         elapsed += started.elapsed();
-        delivered += updates.len() as u64;
+        delivered += updates
+            .iter()
+            .map(|update| update.target_count() as u64)
+            .sum::<u64>();
     }
     let run = Run {
         label: label.to_owned(),

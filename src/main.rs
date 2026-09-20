@@ -17,7 +17,7 @@
 //! `src/parser/mod.rs`.
 
 use std::rc::Rc;
-use xyne_sync::ivm::{ClientId, IvmStats, SingleTableIVM, SubId};
+use xyne_sync::ivm::{IvmStats, SingleTableIVM, SubId};
 use xyne_sync::model::*;
 use xyne_sync::parser::{Catalog, parse_read, parse_write, point_at};
 use xyne_sync::sync::{Local, MemoryStorage};
@@ -57,7 +57,7 @@ fn main() {
         println!("  {uuid:<14} {sql}");
         let query =
             parse_read(sql, &catalog).unwrap_or_else(|error| panic!("{}", point_at(sql, &error)));
-        let (id, _) = ivm.register_query(ClientId(1), query);
+        let (id, _) = ivm.register_query(query);
         names.push((id, uuid));
     }
     println!(
@@ -147,7 +147,7 @@ fn run_write(
     let cost = ivm.engine().stats().diff(&before);
 
     let mut found: Vec<&str> = Vec::new();
-    for target in ops.iter().flat_map(|update| update.targets.iter()) {
+    for target in ops.iter().flat_map(|update| update.targets()) {
         let name = name_of(target.sub);
         if !found.contains(&name) {
             found.push(name);
@@ -163,17 +163,12 @@ fn run_write(
     println!("   expected : {expected_impacted:?}");
     println!("   impacted : {found:?}   [{verdict}]");
     for update in &ops {
-        let mut names: Vec<&str> = update
-            .targets
-            .iter()
-            .map(|target| name_of(target.sub))
-            .collect();
+        let mut names: Vec<&str> = update.targets().map(|target| name_of(target.sub)).collect();
         names.sort_unstable();
         println!(
-            "   op       : {:<14} <- {} (client {})",
+            "   op       : {:<14} <- {}",
             names.join(", "),
-            fmt_op(&update.op),
-            update.client
+            fmt_op(&update.op)
         );
     }
     println!("   cost     : {}", cost.routing_summary());

@@ -8,7 +8,7 @@
 //!   authoritative schema home; queries reference tables by name and
 //!   resolve them in the catalog
 //! - [`query`] — [`SingleTableReadQuery`] / [`WriteQuery`], the `Where`
-//!   predicate tree, and the [`SubId`] / [`ClientId`] handles
+//!   predicate tree, and the [`SubId`] handle
 //! - [`frame`] — row identities, images, the [`DataFrameOperation`] delta
 //!   unit, and the engine's shared [`frame::TableFrame`] materialization
 //! - [`position`] — where a write, a read, or a frame row sits in the
@@ -33,7 +33,7 @@ pub use frame::{DataFrameKey, DataFrameOperation, DataFrameRow};
 pub use ids::{IdMap, IdSet};
 pub use position::{Lsn, Snapshot};
 pub use query::{
-    ClientId, ComparisonOperator, Condition, DeleteQuery, Disjunct, Driver, InsertQuery, Join,
+    ComparisonOperator, Condition, DeleteQuery, Disjunct, Driver, InsertQuery, Join,
     MultiTableReadQuery, Order, OrderBy, SingleTableReadQuery, SubId, UpdateQuery, Where,
     WriteQuery,
 };

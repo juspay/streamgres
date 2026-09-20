@@ -13,10 +13,10 @@
 //! operations on the same key are applied in stream order — a row changing
 //! in place is `Delete(old)` immediately followed by `Add(new)`, and a row
 //! admitted and then evicted within one step ships its `Add` before its
-//! `Delete`. Operations on different rows commute. What a client receives
-//! is the per-client grouping of that stream (see `ivm::ClientUpdate`),
-//! where an in-place change has collapsed to the one `Add` a receiver
-//! applies as insert-or-replace.
+//! `Delete`. Operations on different rows commute. What leaves the engine
+//! is the per-row fold of that stream (see `ivm::Delta`), where an
+//! in-place change has collapsed to the one `Add` a receiver applies as
+//! insert-or-replace.
 
 use std::collections::HashMap;
 use std::fmt;

@@ -28,10 +28,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-use crate::ivm::{ClientUpdate, Engine, Fetch, FetchId, evaluate, order_rows};
+use crate::ivm::{Delta, Engine, Fetch, FetchId, evaluate, order_rows};
 use crate::model::frame::SharedRow;
 use crate::model::{
-    ClientId, DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
+    DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
 };
 
 /// What one runtime step produced: deltas to deliver, and reads the
@@ -39,7 +39,7 @@ use crate::model::{
 /// [`Runtime::failed`]).
 #[derive(Debug, Default)]
 pub struct Step {
-    pub updates: Vec<ClientUpdate>,
+    pub updates: Vec<Delta>,
     pub selects: Vec<Fetch>,
 }
 
@@ -186,10 +186,10 @@ impl<E: Engine> Runtime<E> {
         self.in_flight.len()
     }
 
-    /// Register a subscription for `client`: its id, whatever of its
-    /// snapshot the engine had at hand, and the reads the rest needs.
-    pub fn register(&mut self, client: ClientId, query: E::Query) -> (SubId, Step) {
-        let (sub, updates) = self.engine.subscribe(client, query);
+    /// Register a subscription: its id, whatever of its snapshot the
+    /// engine had at hand, and the reads the rest needs.
+    pub fn register(&mut self, query: E::Query) -> (SubId, Step) {
+        let (sub, updates) = self.engine.subscribe(query);
         let mut step = Step {
             updates,
             selects: Vec::new(),
@@ -201,11 +201,6 @@ impl<E: Engine> Runtime<E> {
     /// Remove a subscription; its reads still out land as no-ops.
     pub fn unregister(&mut self, sub: SubId) {
         self.engine.unsubscribe(sub);
-    }
-
-    /// Remove every subscription of `client`.
-    pub fn unregister_client(&mut self, client: ClientId) {
-        self.engine.unsubscribe_client(client);
     }
 
     /// Route one write committed at `at`, remembering it for reads
@@ -271,7 +266,7 @@ impl<E: Engine> Runtime<E> {
 
     /// [`Engine::take_capped`]: the subscriptions one of whose pages
     /// stopped reaching past its rejected rows since the last call.
-    pub fn take_capped(&mut self) -> Vec<(SubId, ClientId)> {
+    pub fn take_capped(&mut self) -> Vec<SubId> {
         self.engine.take_capped()
     }
 
@@ -296,9 +291,9 @@ impl<E: Engine> Runtime<E> {
     }
 
     /// The driver refused read `id` (it will never succeed): forget it and
-    /// unsubscribe everything that was waiting on it, named with the
-    /// client of each so it can be told.
-    pub fn refused(&mut self, id: FetchId) -> Vec<(SubId, ClientId)> {
+    /// unsubscribe everything that was waiting on it, named so the owner
+    /// of each can be told.
+    pub fn refused(&mut self, id: FetchId) -> Vec<SubId> {
         let Some(flight) = self.in_flight.remove(&id) else {
             return Vec::new();
         };

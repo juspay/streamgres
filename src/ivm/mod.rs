@@ -4,7 +4,7 @@
 //! id ([`SubId`]); every incoming [`WriteQuery`] is routed to the
 //! subscriptions it affects, and each affected subscription receives the
 //! minimal [`DataFrameOperation`]s that bring its result set up to date,
-//! grouped per client ([`ClientUpdate`]).
+//! folded per row with every subscription they apply to ([`Delta`]).
 //!
 //! # Shared frames
 //!
@@ -74,8 +74,8 @@
 //! Every emitted operation is self-contained: a `Delete` carries the row
 //! image it removed, and an in-place replacement is the adjacent
 //! `Delete(old)` + `Add(new)` pair inside the engine (the join layer diffs
-//! it); per client the pair folds into the one `Add` (see the `update`
-//! module).
+//! it); leaving the engine the pair folds into the one `Add` (see the
+//! `update` module).
 //!
 //! # Scope notes
 //!
@@ -123,12 +123,12 @@ mod stats;
 mod update;
 mod window;
 
-pub use crate::model::{ClientId, SubId};
+pub use crate::model::SubId;
 pub use engine::{Engine, Fetch, FetchId, FetchKind, Footprint};
 pub use multi::{MultiTableIVM, MultiTableUpdate};
 pub use predicate::{eval_condition, evaluate, evaluate_with};
 pub use stats::IvmStats;
-pub use update::{ClientUpdate, QueryPart, Target};
+pub use update::{Audience, Delta, QueryPart, Subs, Target};
 pub use window::{order_cmp, order_rows};
 
 use std::collections::{BTreeSet, HashMap};
@@ -139,12 +139,12 @@ use crate::model::{
     WriteQuery,
 };
 use index::TableIndex;
-use update::{Raw, group};
+use update::{Raw, fold};
 use window::Window;
 
 /// One operation for one single-table subscription — what
 /// [`SingleTableIVM::incremental_update`] emits; the join layer consumes
-/// these for its parts, and the [`Engine`] impl groups them per client.
+/// these for its parts, and the [`Engine`] impl folds them per row.
 ///
 /// - `query`: which subscription (the engine id `register_query` returned).
 /// - `table`: the table the operation lands on — the written table, which
@@ -188,9 +188,6 @@ pub struct SingleTableUpdate {
 ///   that asked and every subscription of its query, joined by twins
 ///   registered while it is out.
 /// - `requests`: the reads asked for since the runtime last took them.
-/// - `clients`: subscription id → its client, and `by_client` the
-///   reverse, kept only for subscriptions registered through the
-///   [`Engine`] seam (the join layer's inner parts have none).
 /// - `write_epoch`: monotonic write number; disjunct counters are lazily
 ///   invalidated by comparing against it, so no per-write reset sweep is
 ///   needed.
@@ -211,8 +208,6 @@ pub struct SingleTableIVM {
     pending: IdMap<SubId, u32>,
     readers: IdMap<FetchId, Vec<SubId>>,
     requests: Vec<Fetch>,
-    clients: IdMap<SubId, ClientId>,
-    by_client: IdMap<ClientId, BTreeSet<SubId>>,
     write_epoch: u64,
     next_sub: u64,
     next_fetch: u64,
@@ -253,8 +248,6 @@ impl SingleTableIVM {
             pending: IdMap::default(),
             readers: IdMap::default(),
             requests: Vec::new(),
-            clients: IdMap::default(),
-            by_client: IdMap::default(),
             write_epoch: 0,
             next_sub: 0,
             next_fetch: 0,
@@ -435,24 +428,19 @@ impl SingleTableIVM {
             .collect()
     }
 
-    /// Address per-subscription updates to their clients (subscriptions
-    /// without one, the join layer's inner parts, produce nothing here)
-    /// and group them per client and row.
-    fn addressed(&self, updates: Vec<SingleTableUpdate>) -> Vec<ClientUpdate> {
-        group(
+    /// One step's per-subscription updates folded per row: what the
+    /// [`Engine`] seam hands out.
+    fn folded(&self, updates: Vec<SingleTableUpdate>) -> Vec<Delta> {
+        fold(
             updates
                 .into_iter()
-                .filter_map(|update| {
-                    let client = *self.clients.get(&update.query)?;
-                    Some(Raw {
-                        client,
-                        table: update.table,
-                        target: Target {
-                            sub: update.query,
-                            part: QueryPart::main(),
-                        },
-                        op: update.op,
-                    })
+                .map(|update| Raw {
+                    table: update.table,
+                    audience: Audience {
+                        part: QueryPart::main(),
+                        subs: Subs::One(update.query),
+                    },
+                    op: update.op,
                 })
                 .collect(),
         )
@@ -581,39 +569,16 @@ fn complete_image(new: Option<&DataFrameRow>, old: Option<&DataFrameRow>) -> Opt
 impl Engine for SingleTableIVM {
     type Query = SingleTableReadQuery;
 
-    /// [`SingleTableIVM::register_query`], its snapshot addressed to
-    /// `client`.
-    fn subscribe(
-        &mut self,
-        client: ClientId,
-        query: SingleTableReadQuery,
-    ) -> (SubId, Vec<ClientUpdate>) {
+    /// [`SingleTableIVM::register_query`], its snapshot as deltas.
+    fn subscribe(&mut self, query: SingleTableReadQuery) -> (SubId, Vec<Delta>) {
         let (sub, ops) = self.register_query(query);
-        self.clients.insert(sub, client);
-        self.by_client.entry(client).or_default().insert(sub);
         let updates = self.tagged(sub, ops);
-        (sub, self.addressed(updates))
+        (sub, self.folded(updates))
     }
 
     /// [`SingleTableIVM::unregister_query`].
     fn unsubscribe(&mut self, sub: SubId) {
-        if let Some(client) = self.clients.remove(&sub)
-            && let Some(subs) = self.by_client.get_mut(&client)
-        {
-            subs.remove(&sub);
-            if subs.is_empty() {
-                self.by_client.remove(&client);
-            }
-        }
         self.unregister_query(sub);
-    }
-
-    /// Every subscription of `client`, unregistered.
-    fn unsubscribe_client(&mut self, client: ClientId) {
-        for sub in self.by_client.remove(&client).unwrap_or_default() {
-            self.clients.remove(&sub);
-            self.unregister_query(sub);
-        }
     }
 
     /// [`SingleTableIVM::readers_of`].
@@ -643,32 +608,29 @@ impl Engine for SingleTableIVM {
     }
 
     /// Every reader of the refused fetch, unsubscribed.
-    fn refuse(&mut self, fetch: &Fetch) -> Vec<(SubId, ClientId)> {
-        let mut gone = Vec::new();
-        for sub in self.readers_of(fetch) {
-            if let Some(client) = self.clients.get(&sub).copied() {
-                gone.push((sub, client));
-            }
-            self.unsubscribe(sub);
+    fn refuse(&mut self, fetch: &Fetch) -> Vec<SubId> {
+        let gone = self.readers_of(fetch);
+        for sub in &gone {
+            self.unregister_query(*sub);
         }
         gone
     }
 
-    /// [`SingleTableIVM::incremental_update`], grouped per client.
-    fn route(&mut self, write: &WriteQuery) -> Vec<ClientUpdate> {
+    /// [`SingleTableIVM::incremental_update`], folded per row.
+    fn route(&mut self, write: &WriteQuery) -> Vec<Delta> {
         let updates = self.incremental_update(write);
-        self.addressed(updates)
+        self.folded(updates)
     }
 
-    /// [`SingleTableIVM::land_read`], grouped per client.
+    /// [`SingleTableIVM::land_read`], folded per row.
     fn land(
         &mut self,
         fetch: &Fetch,
         rows: &[(DataFrameKey, DataFrameRow)],
         worst_read: Option<&DataFrameRow>,
-    ) -> Vec<ClientUpdate> {
+    ) -> Vec<Delta> {
         let updates = self.land_read(fetch, rows, worst_read);
-        self.addressed(updates)
+        self.folded(updates)
     }
 
     /// [`SingleTableIVM::take_requests`].

@@ -55,6 +55,7 @@ pub mod groups;
 pub mod plan;
 pub mod protocol;
 pub mod sampler;
+pub mod schema;
 pub mod transform;
 pub mod warm;
 pub mod wire;
@@ -200,8 +201,7 @@ pub fn serve(config: Config) -> Result<(), String> {
     ));
     let warm_budget = config.warm_start;
     let metrics_interval = config.metrics_interval;
-    let (warmed_tx, warmed) =
-        tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
+    let (warmed_tx, warmed) = tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
     let state = Arc::new(connection::AppState {
         config,
         requests,

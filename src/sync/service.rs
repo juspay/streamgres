@@ -16,10 +16,15 @@
 //! itself. Everything a consumer learns arrives on that one stream, so a
 //! subscription is always named before anything about it is: no consumer
 //! ever meets a [`SubId`] it has not been told about. The consumer may be
-//! several ([`Service::with_sinks`]), each owning the clients whose ids
-//! are its own modulo the count: a client's events go to its sink alone,
-//! and what concerns everyone (a landing, a commit) goes to every sink.
+//! several ([`Service::with_sinks`]): a registration says which sink asked
+//! for it, the service remembers the sink of every subscription, and what
+//! concerns a subscription (its deltas, its refusal, its completion) goes
+//! to that sink alone, each delta cut down to the subscriptions the sink
+//! owns; what concerns everyone (a commit) goes to every sink. The engine
+//! under the service never learns of clients or sinks: it names
+//! subscriptions, and this is where a subscription finds its way home.
 
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -35,30 +40,29 @@ use tokio::task::spawn_local;
 
 use super::runtime::{Runtime, Step};
 use super::storage::{Storage, StorageError};
-use crate::ivm::{ClientUpdate, Engine, Fetch, FetchId};
+use crate::ivm::{Audience, Delta, Engine, Fetch, FetchId, Subs};
 use crate::model::frame::SharedRow;
-use crate::model::{ClientId, DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, WriteQuery};
+use crate::model::{DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, WriteQuery};
 use crate::stats::Stats;
 
 /// What a client of the service can ask.
 ///
-/// - `Register`: subscribe for `client`; the subscription's id comes back
-///   as [`Event::Registered`] carrying `token` unchanged, before any
-///   event about that subscription, and its first rows arrive as updates
-///   like every other change.
+/// - `Register`: subscribe, on behalf of sink `sink` (the index of the
+///   asking consumer among [`Service::with_sinks`]'s; zero when there is
+///   one); the subscription's id comes back to that sink as
+///   [`Event::Registered`] carrying `token` unchanged, before any event
+///   about that subscription, and its first rows arrive as updates like
+///   every other change.
 /// - `Unregister`: unsubscribe one subscription.
-/// - `UnregisterClient`: a client went away; every subscription of it goes.
+/// - `UnregisterAll`: unsubscribe several in one step (a client group
+///   that went away names its own).
 /// - `Transaction`: one committed transaction, which the feed normally
 ///   delivers on its own channel ([`Service::with_feed`]) and a caller
 ///   without a feed hands in here.
 pub enum Command<Q> {
-    Register {
-        client: ClientId,
-        query: Q,
-        token: u64,
-    },
+    Register { sink: usize, query: Q, token: u64 },
     Unregister(SubId),
-    UnregisterClient(ClientId),
+    UnregisterAll(Vec<SubId>),
     Transaction(Transaction),
 }
 
@@ -127,18 +131,18 @@ pub enum Event {
     Registered {
         token: u64,
         sub: SubId,
-        updates: Vec<ClientUpdate>,
+        updates: Vec<Delta>,
         reads: usize,
     },
     Landed {
-        updates: Vec<ClientUpdate>,
+        updates: Vec<Delta>,
     },
     Refused {
         sub: SubId,
         reason: String,
     },
     Committed {
-        updates: Vec<ClientUpdate>,
+        updates: Vec<Delta>,
         position: Lsn,
         floor: Lsn,
         watched: Vec<WriteQuery>,
@@ -154,7 +158,7 @@ pub enum Event {
 /// How a step ended: what its deltas travel inside of.
 enum Outcome {
     Registered {
-        client: ClientId,
+        sink: usize,
         token: u64,
         sub: SubId,
         reads: usize,
@@ -179,10 +183,11 @@ pub struct Service<E: Engine, S: Storage> {
     feed: Option<mpsc::Receiver<Transaction>>,
     sinks: Vec<mpsc::UnboundedSender<Event>>,
     stats: Option<Arc<Stats>>,
-    /// Subscriptions registered but not yet reported hydrated, and the
-    /// client each belongs to, so a client going away takes its own with
-    /// it instead of leaving them to be probed forever.
-    awaiting: IdMap<SubId, ClientId>,
+    /// The sink every live subscription belongs to: where its deltas and
+    /// whatever else concerns it are sent.
+    owners: IdMap<SubId, usize>,
+    /// Subscriptions registered but not yet reported hydrated.
+    awaiting: IdMap<SubId, ()>,
     /// When each read in flight was handed to the driver, for `read_io`.
     issued: IdMap<FetchId, Instant>,
     /// When every awaited subscription was last checked for completion;
@@ -219,6 +224,7 @@ where
             feed: None,
             sinks: vec![events],
             stats: None,
+            owners: IdMap::default(),
             awaiting: IdMap::default(),
             issued: IdMap::default(),
             swept: Instant::now(),
@@ -236,8 +242,8 @@ where
         self
     }
 
-    /// Deliver the events to `sinks` instead, the sink of a client being
-    /// the one at its id modulo their count (at least one sink).
+    /// Deliver the events to `sinks` instead (at least one): a
+    /// subscription's go to the sink its registration named.
     pub fn with_sinks(mut self, sinks: Vec<mpsc::UnboundedSender<Event>>) -> Self {
         if !sinks.is_empty() {
             self.sinks = sinks;
@@ -301,15 +307,17 @@ where
                         self.issued.remove(&id);
                         if let Some(reason) = error.refusal() {
                             log_warn!("storage read {} refused: {reason}", id.0);
-                            for (sub, client) in self.runtime.refused(id) {
+                            for sub in self.runtime.refused(id) {
                                 self.awaiting.remove(&sub);
-                                self.send_to(
-                                    client,
-                                    Event::Refused {
-                                        sub,
-                                        reason: reason.to_owned(),
-                                    },
-                                );
+                                if let Some(sink) = self.owners.remove(&sub) {
+                                    self.send_to(
+                                        sink,
+                                        Event::Refused {
+                                            sub,
+                                            reason: reason.to_owned(),
+                                        },
+                                    );
+                                }
                             }
                         } else {
                             log_warn!("storage read {} failed, parked: {error}", id.0);
@@ -327,22 +335,20 @@ where
     /// Apply one command to the runtime and dispatch what it produced.
     fn handle(&mut self, command: Command<E::Query>) {
         match command {
-            Command::Register {
-                client,
-                query,
-                token,
-            } => {
+            Command::Register { sink, query, token } => {
                 let started = Instant::now();
-                let (sub, step) = self.runtime.register(client, query);
+                let sink = sink.min(self.sinks.len() - 1);
+                let (sub, step) = self.runtime.register(query);
                 let reads = step.selects.len();
                 if let Some(stats) = &self.stats {
                     stats.register_step.record(started.elapsed());
                 }
-                self.awaiting.insert(sub, client);
+                self.owners.insert(sub, sink);
+                self.awaiting.insert(sub, ());
                 self.dispatch(
                     step,
                     Outcome::Registered {
-                        client,
+                        sink,
                         token,
                         sub,
                         reads,
@@ -350,25 +356,23 @@ where
                 );
                 self.settle(&[sub]);
             }
-            Command::Unregister(sub) => {
-                let started = Instant::now();
-                self.runtime.unregister(sub);
-                self.awaiting.remove(&sub);
-                self.reap();
-                if let Some(stats) = &self.stats {
-                    stats.unregister_step.record(started.elapsed());
-                }
-            }
-            Command::UnregisterClient(client) => {
-                let started = Instant::now();
-                self.runtime.unregister_client(client);
-                self.awaiting.retain(|_, owner| *owner != client);
-                self.reap();
-                if let Some(stats) = &self.stats {
-                    stats.unregister_step.record(started.elapsed());
-                }
-            }
+            Command::Unregister(sub) => self.unregister(&[sub]),
+            Command::UnregisterAll(subs) => self.unregister(&subs),
             Command::Transaction(transaction) => self.commit(transaction),
+        }
+    }
+
+    /// Unsubscribe `subs` as one step.
+    fn unregister(&mut self, subs: &[SubId]) {
+        let started = Instant::now();
+        for sub in subs {
+            self.runtime.unregister(*sub);
+            self.awaiting.remove(sub);
+            self.owners.remove(sub);
+        }
+        self.reap();
+        if let Some(stats) = &self.stats {
+            stats.unregister_step.record(started.elapsed());
         }
     }
 
@@ -435,7 +439,10 @@ where
                 writes = writes.len(),
                 client_updates = step.updates.len(),
                 reads = step.selects.len(),
-                ms = format!("{:.2}", routed.duration_since(started).as_secs_f64() * 1000.0)
+                ms = format!(
+                    "{:.2}",
+                    routed.duration_since(started).as_secs_f64() * 1000.0
+                )
             );
             stats
                 .feed_last_message_ms
@@ -474,25 +481,67 @@ where
         }
     }
 
-    /// The sink that owns `client`.
-    fn sink_of(&self, client: ClientId) -> &mpsc::UnboundedSender<Event> {
-        &self.sinks[client.0 as usize % self.sinks.len()]
+    /// Send `event` to sink `sink`.
+    fn send_to(&self, sink: usize, event: Event) {
+        if let Some(sink) = self.sinks.get(sink) {
+            let _ = sink.send(event);
+        }
     }
 
-    /// Send `event` to the sink that owns `client`.
-    fn send_to(&self, client: ClientId, event: Event) {
-        let _ = self.sink_of(client).send(event);
-    }
-
-    /// One step's deltas split by sink, each client's to its own.
-    fn partition(&self, updates: Vec<ClientUpdate>) -> Vec<Vec<ClientUpdate>> {
+    /// One step's deltas split by sink: each delta goes to the sinks that
+    /// own any of its subscriptions, its audiences cut down to those. A
+    /// tree's shared list is split once per step, however many of the
+    /// step's deltas carry it; with one sink nothing is split at all.
+    fn partition(&self, updates: Vec<Delta>) -> Vec<Vec<Delta>> {
         if self.sinks.len() == 1 {
             return vec![updates];
         }
-        let mut batches: Vec<Vec<ClientUpdate>> =
-            (0..self.sinks.len()).map(|_| Vec::new()).collect();
-        for update in updates {
-            batches[update.client.0 as usize % self.sinks.len()].push(update);
+        let sinks = self.sinks.len();
+        let mut batches: Vec<Vec<Delta>> = (0..sinks).map(|_| Vec::new()).collect();
+        let mut split: HashMap<usize, Vec<Option<Subs>>> = HashMap::new();
+        for delta in updates {
+            let mut audiences: Vec<Vec<Audience>> = (0..sinks).map(|_| Vec::new()).collect();
+            for audience in &delta.audiences {
+                match &audience.subs {
+                    Subs::One(sub) => {
+                        if let Some(&sink) = self.owners.get(sub) {
+                            audiences[sink].push(audience.clone());
+                        }
+                    }
+                    Subs::Many(list) => {
+                        let parts = split.entry(list.as_ptr() as usize).or_insert_with(|| {
+                            let mut owned: Vec<Vec<SubId>> =
+                                (0..sinks).map(|_| Vec::new()).collect();
+                            for sub in list.iter() {
+                                if let Some(&sink) = self.owners.get(sub) {
+                                    owned[sink].push(*sub);
+                                }
+                            }
+                            owned
+                                .into_iter()
+                                .map(|subs| (!subs.is_empty()).then(|| Subs::of(&subs)))
+                                .collect()
+                        });
+                        for (sink, subs) in parts.iter().enumerate() {
+                            if let Some(subs) = subs {
+                                audiences[sink].push(Audience {
+                                    part: audience.part,
+                                    subs: subs.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            for (sink, audiences) in audiences.into_iter().enumerate() {
+                if !audiences.is_empty() {
+                    batches[sink].push(Delta {
+                        table: delta.table.clone(),
+                        op: delta.op.clone(),
+                        audiences,
+                    });
+                }
+            }
         }
         batches
     }
@@ -512,13 +561,13 @@ where
         let Step { updates, selects } = step;
         match outcome {
             Outcome::Registered {
-                client,
+                sink,
                 token,
                 sub,
                 reads,
             } => {
                 self.send_to(
-                    client,
+                    sink,
                     Event::Registered {
                         token,
                         sub,
@@ -559,8 +608,10 @@ where
         for fetch in selects {
             self.spawn(fetch);
         }
-        for (sub, client) in self.runtime.take_capped() {
-            self.send_to(client, Event::Capped { sub });
+        for sub in self.runtime.take_capped() {
+            if let Some(&sink) = self.owners.get(&sub) {
+                self.send_to(sink, Event::Capped { sub });
+            }
         }
         if self.swept.elapsed() >= Duration::from_secs(1) {
             self.swept = Instant::now();
@@ -570,29 +621,27 @@ where
     }
 
     /// Name those of `candidates` that are awaited and whose first rows
-    /// have all arrived, each to the sink of its client, and forget them.
+    /// have all arrived, each to the sink that owns it, and forget them.
     /// A step names the subscriptions it could have completed (the one it
     /// registered, the ones waiting on the read it landed); every awaited
     /// subscription is checked at most once a second besides, so the check
     /// never grows with the number still hydrating.
     fn settle(&mut self, candidates: &[SubId]) {
-        let hydrated: Vec<(SubId, ClientId)> = candidates
+        let hydrated: Vec<(SubId, usize)> = candidates
             .iter()
             .filter_map(|sub| {
-                let client = *self.awaiting.get(sub)?;
-                self.runtime
-                    .engine()
-                    .hydrated(*sub)
-                    .then_some((*sub, client))
+                self.awaiting.get(sub)?;
+                let sink = *self.owners.get(sub)?;
+                self.runtime.engine().hydrated(*sub).then_some((*sub, sink))
             })
             .collect();
         if hydrated.is_empty() {
             return;
         }
         let mut per_sink: Vec<Vec<SubId>> = (0..self.sinks.len()).map(|_| Vec::new()).collect();
-        for (sub, client) in hydrated {
+        for (sub, sink) in hydrated {
             self.awaiting.remove(&sub);
-            per_sink[client.0 as usize % self.sinks.len()].push(sub);
+            per_sink[sink].push(sub);
         }
         for (sink, subs) in self.sinks.iter().zip(per_sink) {
             if !subs.is_empty() {

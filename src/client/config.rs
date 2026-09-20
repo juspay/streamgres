@@ -98,7 +98,8 @@ pub struct Config {
     /// (10000).
     pub plan_cache: usize,
     /// `XYNE_SYNC_TRANSFORM_TTL_MS`: how long the application server's
-    /// transform of a query is kept per identity (300000; 0 keeps none).
+    /// transform of a query is kept per identity (60000; zero-cache keeps
+    /// its own for 5000; 0 keeps none).
     pub transform_ttl: Duration,
     /// `XYNE_SYNC_TRANSFORM_CACHE`: how many transforms are kept at most
     /// (20000).
@@ -275,7 +276,7 @@ impl Config {
                     .map_err(|_| format!("XYNE_SYNC_PLAN_CACHE must be a number, got `{text}`"))?,
                 None => 10_000,
             },
-            transform_ttl: millis("XYNE_SYNC_TRANSFORM_TTL_MS", 300_000)?,
+            transform_ttl: millis("XYNE_SYNC_TRANSFORM_TTL_MS", 60_000)?,
             transform_cache: match first(&["XYNE_SYNC_TRANSFORM_CACHE"]) {
                 Some(text) => text.parse().map_err(|_| {
                     format!("XYNE_SYNC_TRANSFORM_CACHE must be a number, got `{text}`")

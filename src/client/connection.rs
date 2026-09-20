@@ -38,11 +38,12 @@ use super::backend::{Backend, Identity, PushOutcome, TransformOutcome};
 use super::config::Config;
 use super::groups::{ConnectReply, DesiredOp, Outbound, Request, Socket};
 use super::plan::{self, PlanCache};
-use super::transform::TransformCache;
-use super::warm::WarmStart;
 use super::protocol::{
     self, DeleteClients, InitConnection, PROTOCOL_VERSION, QueryPatchOp, Upstream,
 };
+use super::schema;
+use super::transform::TransformCache;
+use super::warm::WarmStart;
 use crate::log::{Level, log_debug, log_event, log_info, log_warn};
 use crate::model::Catalog;
 use crate::stats::Stats;
@@ -385,10 +386,17 @@ async fn handle(
         requests: requests.clone(),
         joined: false,
     };
-    let schema = handshake
+    let declared = handshake
         .init
         .as_ref()
-        .and_then(|init| init.client_schema.clone());
+        .and_then(|init| init.client_schema.as_ref());
+    if let Some(declared) = declared
+        && !admits(&state, &conn.params, &out, declared)
+    {
+        let _ = out.send(Outbound::Close);
+        let _ = writer.await;
+        return;
+    }
     let lmids = state.lmids.lmids(&group_id).await;
     let (reply_tx, reply_rx) = oneshot::channel();
     let request = Request::Connect {
@@ -399,7 +407,6 @@ async fn handle(
             sink: out.clone(),
         },
         base_cookie: conn.params.base_cookie.clone(),
-        schema,
         lmids,
         reply: reply_tx,
     };
@@ -473,6 +480,39 @@ async fn handle(
         .await;
     let _ = out.send(Outbound::Close);
     let _ = writer.await;
+}
+
+/// Whether the server can serve a client that declares `declared`. When
+/// it cannot, the client is told everything that does not fit
+/// (`SchemaVersionNotSupported`, on which a Zero client reloads for a build
+/// that fits, as it does with zero-cache), and the refusal is counted and
+/// logged with its first findings; the caller closes the connection.
+fn admits(
+    state: &AppState,
+    params: &ConnectParams,
+    out: &mpsc::UnboundedSender<Outbound>,
+    declared: &protocol::ClientSchema,
+) -> bool {
+    let found = schema::mismatches(&state.catalog, declared);
+    if found.is_empty() {
+        return true;
+    }
+    state
+        .stats
+        .connections_refused_schema
+        .fetch_add(1, Ordering::Relaxed);
+    log_event!(
+        Level::Warn,
+        "connection refused",
+        wsid = params.wsid,
+        group = params.group_id,
+        client = params.client_id,
+        kind = schema::KIND,
+        mismatches = found.len(),
+        first = found.iter().take(3).cloned().collect::<Vec<_>>().join(" ")
+    );
+    send(out, protocol::error(schema::KIND, &found.join("\n")));
+    false
 }
 
 /// Queue one text frame.
@@ -625,7 +665,7 @@ impl Conn {
                 true
             }
             Upstream::InitConnection(init) => self.init(*init, false).await,
-            Upstream::ChangeDesiredQueries(ops) => self.desired(ops, None).await,
+            Upstream::ChangeDesiredQueries(ops) => self.desired(ops).await,
             Upstream::DeleteClients(deleted) => {
                 self.delete_clients(&deleted).await;
                 true
@@ -661,9 +701,17 @@ impl Conn {
         }
     }
 
-    /// The first message: endpoint overrides, deleted clients, the desired
-    /// queries (and the schema, unless it already went with the connect).
-    async fn init(&mut self, init: InitConnection, schema_sent: bool) -> bool {
+    /// The first message: the client's schema (judged here unless it came
+    /// with the connect and already was), endpoint overrides, deleted
+    /// clients, the desired queries. False when the schema is one the
+    /// server cannot serve, which ends the connection.
+    async fn init(&mut self, init: InitConnection, judged: bool) -> bool {
+        if let Some(declared) = &init.client_schema
+            && !judged
+            && !admits(&self.state, &self.params, &self.out, declared)
+        {
+            return false;
+        }
         if let Some(url) = init.user_query_url {
             self.identity.query_url = Some(url);
         }
@@ -679,12 +727,7 @@ impl Conn {
         if let Some(deleted) = &init.deleted {
             self.delete_clients(deleted).await;
         }
-        let schema = if schema_sent {
-            None
-        } else {
-            init.client_schema
-        };
-        self.desired(init.desired_queries_patch, schema).await
+        self.desired(init.desired_queries_patch).await
     }
 
     /// Clients the client says are gone: their queries go, and the client
@@ -718,11 +761,7 @@ impl Conn {
     /// it. A query that cannot be translated or planned is refused to the
     /// client from here and passed on as such, so the group still knows
     /// the hash.
-    async fn desired(
-        &mut self,
-        ops: Vec<QueryPatchOp>,
-        schema: Option<protocol::ClientSchema>,
-    ) -> bool {
+    async fn desired(&mut self, ops: Vec<QueryPatchOp>) -> bool {
         if !self.await_ready().await {
             return false;
         }
@@ -745,7 +784,10 @@ impl Conn {
                         let args = Json::Array(args.unwrap_or_default());
                         match self.state.transforms.lookup(&self.identity, &name, &args) {
                             Some(cached) => {
-                                self.state.stats.transform_hits.fetch_add(1, Ordering::Relaxed);
+                                self.state
+                                    .stats
+                                    .transform_hits
+                                    .fetch_add(1, Ordering::Relaxed);
                                 ast = Some(cached);
                             }
                             None => {
@@ -787,9 +829,12 @@ impl Conn {
                         };
                         if let Some(ast) = result.get("ast") {
                             if let Some((name, args)) = asked.get(id) {
-                                self.state
-                                    .transforms
-                                    .store(&self.identity, name, args, ast.clone());
+                                self.state.transforms.store(
+                                    &self.identity,
+                                    name,
+                                    args,
+                                    ast.clone(),
+                                );
                             }
                             if let Pending::Put { ast: slot, .. } = &mut pending[position] {
                                 *slot = Some(ast.clone());
@@ -880,7 +925,6 @@ impl Conn {
         let request = Request::Desired {
             group: self.params.group_id.clone(),
             client: self.params.client_id.clone(),
-            schema,
             ops: prepared,
         };
         self.requests.send(request).await.is_ok()
@@ -906,7 +950,10 @@ impl Conn {
         self.state.stats.push.record(elapsed);
         let failed = matches!(outcome, PushOutcome::Failed { .. });
         if failed {
-            self.state.stats.pushes_failed.fetch_add(1, Ordering::Relaxed);
+            self.state
+                .stats
+                .pushes_failed
+                .fetch_add(1, Ordering::Relaxed);
         } else {
             self.state.stats.pushes_ok.fetch_add(1, Ordering::Relaxed);
         }
@@ -971,8 +1018,7 @@ impl Conn {
 /// catalog, then planned (the cache first, the counts otherwise); a shape
 /// that translates is kept for the next process's warm start.
 async fn plan_ast(state: &AppState, name: &str, ast: Json) -> Result<Translated, String> {
-    let parsed: Ast =
-        Ast::deserialize(&ast).map_err(|error| format!("malformed AST: {error}"))?;
+    let parsed: Ast = Ast::deserialize(&ast).map_err(|error| format!("malformed AST: {error}"))?;
     let started = Instant::now();
     let translated = ast::translate(&parsed, &state.catalog)?;
     state.warm.record(name, &ast);

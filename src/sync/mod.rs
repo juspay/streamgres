@@ -21,7 +21,7 @@ mod service;
 mod sources;
 mod storage;
 
-pub use crate::model::{ClientId, SubId};
+pub use crate::model::SubId;
 pub use crate::model::{Lsn, Snapshot};
 pub use local::Local;
 pub use runtime::{Runtime, Step, SyncStats};

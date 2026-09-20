@@ -1,12 +1,11 @@
 //! Rows and keys as the wire carries them: JSON objects keyed by column,
 //! with a JSON column's text embedded as the JSON it holds, a time as its
-//! milliseconds, and only the columns the client's schema declares when
-//! that schema is known. The row-patch entries of a poke are written
-//! straight into bytes ([`write_put`], [`write_del`]), once per row and
-//! shared by every group's frame that carries the row; the JSON-tree
-//! forms stay for the small messages and the tests.
+//! milliseconds, and every column the row carries, whoever receives it.
+//! The row-patch entries of a poke are written straight into bytes
+//! ([`write_put`], [`write_del`]), once per row and shared by every
+//! group's frame that carries the row; the JSON-tree forms stay for the
+//! small messages and the tests.
 
-use std::collections::HashSet;
 use std::io::Write;
 
 use serde_json::{Map, Value as Json};
@@ -14,22 +13,15 @@ use serde_json::{Map, Value as Json};
 use crate::model::{DataFrameKey, DataFrameRow, DbTable, Value, ValueType};
 
 /// Append the `rowsPatch` entry putting `row` into `table`:
-/// `{"op":"put","tableName":…,"value":{…}}`, with only the `allowed`
-/// columns when the client's schema is known.
-pub fn write_put(
-    out: &mut Vec<u8>,
-    table: &DbTable,
-    row: &DataFrameRow,
-    allowed: Option<&HashSet<String>>,
-) {
+/// `{"op":"put","tableName":…,"value":{…}}`, every column the row
+/// carries. The bytes depend on the row alone, never on who receives it,
+/// so one serialization serves every client.
+pub fn write_put(out: &mut Vec<u8>, table: &DbTable, row: &DataFrameRow) {
     out.extend_from_slice(b"{\"op\":\"put\",\"tableName\":");
     write_text(out, table.name.as_str());
     out.extend_from_slice(b",\"value\":{");
     let mut first = true;
     for (column, value) in row.data.iter() {
-        if allowed.is_some_and(|allowed| !allowed.contains(column.as_str())) {
-            continue;
-        }
         if !first {
             out.push(b',');
         }
@@ -127,12 +119,9 @@ fn write_text(out: &mut Vec<u8>, text: &str) {
 }
 
 /// A row as a JSON object.
-pub fn row_json(row: &DataFrameRow, table: &DbTable, allowed: Option<&HashSet<String>>) -> Json {
+pub fn row_json(row: &DataFrameRow, table: &DbTable) -> Json {
     let mut object = Map::with_capacity(row.data.len());
     for (column, value) in row.data.iter() {
-        if allowed.is_some_and(|allowed| !allowed.contains(column.as_str())) {
-            continue;
-        }
         let declared = table.column(column.as_str()).map(|column| &column.r#type);
         object.insert(column.as_str().to_owned(), value_json(value, declared));
     }
@@ -250,17 +239,13 @@ mod tests {
             ("at".into(), Value::Int(1_000)),
             ("extra".into(), Value::Int(7)),
         ]));
-        let allowed: HashSet<String> = ["id", "meta", "at"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        let json = row_json(&row, &table, Some(&allowed));
+        let json = row_json(&row, &table);
         assert_eq!(json["meta"]["k"][1], 2);
         assert_eq!(json["at"], 1_000);
-        assert!(json.get("extra").is_none());
+        assert_eq!(json["extra"], 7, "every column the row carries is written");
 
         let mut bytes = Vec::new();
-        write_put(&mut bytes, &table, &row, Some(&allowed));
+        write_put(&mut bytes, &table, &row);
         let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(written["op"], "put");
         assert_eq!(written["tableName"], "t");

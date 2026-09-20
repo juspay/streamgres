@@ -452,7 +452,7 @@ mod tests {
         assert_send_sync::<crate::model::DataFrameKey>();
         assert_send_sync::<crate::model::WriteQuery>();
         assert_send_sync::<crate::model::MultiTableReadQuery>();
-        assert_send_sync::<crate::ivm::ClientUpdate>();
+        assert_send_sync::<crate::ivm::Delta>();
     }
 
     /// [`Value::compare`] returns `None` for anything involving `Null`,

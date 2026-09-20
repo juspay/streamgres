@@ -14,15 +14,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, NoTls};
-use xyne_sync::ivm::{ClientUpdate, Fetch, MultiTableIVM, QueryPart};
+use xyne_sync::ivm::{Delta, Fetch, MultiTableIVM, QueryPart};
 use xyne_sync::model::*;
 use xyne_sync::sync::pg::{PgStorage, PgStream};
 use xyne_sync::sync::{
     Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
 };
-
-/// The one client of these scenarios.
-const CLIENT: ClientId = ClientId(7);
 
 /// The database under test, if any.
 fn dsn() -> Option<String> {
@@ -220,7 +217,7 @@ async fn drain(
     storage: &PgStorage,
     stream: &mut PgStream,
     mut pending: Vec<Fetch>,
-) -> Vec<ClientUpdate> {
+) -> Vec<Delta> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut updates = Vec::new();
     loop {
@@ -294,7 +291,7 @@ fn registration_behind_open_snapshot() {
             .await
             .expect("open transaction");
 
-        let (sub, step) = runtime.register(CLIENT, names.spec());
+        let (sub, step) = runtime.register(names.spec());
         assert_eq!(step.selects.len(), 1);
         let main = step.selects[0].clone();
         let query = main.query.clone();
@@ -440,7 +437,7 @@ fn service_streams_end_to_end() {
 
         commands
             .send(Command::Register {
-                client: CLIENT,
+                sink: 0,
                 query: names.spec(),
                 token: 1,
             })
@@ -493,8 +490,7 @@ fn service_streams_end_to_end() {
                     | Event::Registered { updates: batch, .. },
                 )) => {
                     for update in batch {
-                        assert_eq!(update.client, CLIENT);
-                        for target in &update.targets {
+                        for target in update.targets() {
                             assert_eq!(target.sub, sub);
                             let frame = frames.entry(target.part).or_default();
                             match &update.op {
@@ -561,7 +557,7 @@ fn reads_queue_at_the_connection_bound() {
         );
         let mut runtime = Runtime::new(MultiTableIVM::new());
         catch_up(&mut runtime, &mut stream, &[storage.as_ref()]).await;
-        let (_, step) = runtime.register(CLIENT, names.spec());
+        let (_, step) = runtime.register(names.spec());
         let query = step.selects[0].query.clone();
         let started = Instant::now();
         let reads: Vec<_> = (0..6)

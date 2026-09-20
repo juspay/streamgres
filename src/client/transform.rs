@@ -6,9 +6,12 @@
 //! per-identity endpoint and headers), the query's name and its
 //! arguments, as zero-cache keys its own; a failed transform is never
 //! kept; an entry expires after the TTL or leaves as the least recently
-//! used when the capacity is reached. The TTL is minutes rather than
-//! zero-cache's seconds: the AST changes only when the application's code
-//! does, and what the user may see is decided by the rows the engine
+//! used when the capacity is reached. The TTL defaults to a minute, so a
+//! deploy of the application that changes a query's shape reaches every
+//! client within one (zero-cache keeps its own for five seconds, which on
+//! the rig cost a hydration about 8 ms at the median: twice the calls to
+//! the backend, each slower). The AST changes only when the application's
+//! code does, and what the user may see is decided by the rows the engine
 //! evaluates live, not by the AST's age. An entry keeps the AST as its
 //! JSON text, not as a parsed tree: the text is a few kilobytes where the
 //! tree, with a node and a string per key, was ten to fifty times that,
@@ -198,21 +201,36 @@ mod tests {
         let alice = identity("alice");
         let args = json!([{"channelId": "c1", "limit": 25}]);
         assert!(cache.lookup(&alice, "channelMessages", &args).is_none());
-        cache.store(&alice, "channelMessages", &args, json!({"table": "messages"}));
+        cache.store(
+            &alice,
+            "channelMessages",
+            &args,
+            json!({"table": "messages"}),
+        );
         assert_eq!(
             cache.lookup(&alice, "channelMessages", &args),
             Some(json!({"table": "messages"}))
         );
-        assert!(cache.lookup(&identity("bob"), "channelMessages", &args).is_none());
+        assert!(
+            cache
+                .lookup(&identity("bob"), "channelMessages", &args)
+                .is_none()
+        );
         assert!(cache.lookup(&alice, "channelMembers", &args).is_none());
         assert!(
             cache
-                .lookup(&alice, "channelMessages", &json!([{"channelId": "c2", "limit": 25}]))
+                .lookup(
+                    &alice,
+                    "channelMessages",
+                    &json!([{"channelId": "c2", "limit": 25}])
+                )
                 .is_none()
         );
         let reordered = json!([{"limit": 25, "channelId": "c1"}]);
         assert!(
-            cache.lookup(&alice, "channelMessages", &reordered).is_some(),
+            cache
+                .lookup(&alice, "channelMessages", &reordered)
+                .is_some(),
             "the same arguments in another order are the same key"
         );
         assert_eq!(cache.hits_and_misses(), (2, 4));
@@ -227,7 +245,10 @@ mod tests {
         assert!(cache.lookup(&alice, "a", &json!([])).is_some());
         cache.store(&alice, "c", &json!([]), json!(3));
         assert_eq!(cache.len(), 2);
-        assert!(cache.lookup(&alice, "b", &json!([])).is_none(), "b was the least recently used");
+        assert!(
+            cache.lookup(&alice, "b", &json!([])).is_none(),
+            "b was the least recently used"
+        );
         assert!(cache.lookup(&alice, "a", &json!([])).is_some());
         std::thread::sleep(Duration::from_millis(30));
         assert!(cache.lookup(&alice, "a", &json!([])).is_none(), "expired");
@@ -241,6 +262,10 @@ mod tests {
         cache.store(&alice, "a", &json!([]), json!(1));
         assert!(cache.is_empty());
         assert!(cache.lookup(&alice, "a", &json!([])).is_none());
-        assert_eq!(cache.hits_and_misses(), (0, 0), "an unused cache counts nothing");
+        assert_eq!(
+            cache.hits_and_misses(),
+            (0, 0),
+            "an unused cache counts nothing"
+        );
     }
 }

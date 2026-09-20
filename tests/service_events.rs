@@ -18,9 +18,6 @@ use xyne_sync::sync::{
     Command, Event, Lsn, MemoryStorage, Service, Storage, StorageError, SubId, Transaction,
 };
 
-/// The one client every subscription here belongs to.
-const CLIENT: ClientId = ClientId(1);
-
 /// Run `body` on a current-thread runtime with a local task set (the
 /// driver and its storage are single-threaded).
 fn block_on<F: std::future::Future>(body: F) -> F::Output {
@@ -104,7 +101,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
 }
 
 /// The deltas an event carries.
-fn updates_of(event: &Event) -> &[xyne_sync::ivm::ClientUpdate] {
+fn updates_of(event: &Event) -> &[xyne_sync::ivm::Delta] {
     match event {
         Event::Registered { updates, .. }
         | Event::Landed { updates }
@@ -152,7 +149,7 @@ fn a_registration_is_named_before_its_rows() {
 
         commands
             .send(Command::Register {
-                client: CLIENT,
+                sink: 0,
                 query: open_tickets(),
                 token: 7,
             })
@@ -193,7 +190,7 @@ fn a_twin_registration_completes_without_a_read() {
 
         commands
             .send(Command::Register {
-                client: CLIENT,
+                sink: 0,
                 query: open_tickets(),
                 token: 1,
             })
@@ -210,7 +207,7 @@ fn a_twin_registration_completes_without_a_read() {
 
         commands
             .send(Command::Register {
-                client: ClientId(2),
+                sink: 0,
                 query: open_tickets(),
                 token: 2,
             })
@@ -252,7 +249,7 @@ fn a_commit_arrives_as_one_batch() {
 
         commands
             .send(Command::Register {
-                client: CLIENT,
+                sink: 0,
                 query: open_tickets(),
                 token: 1,
             })
@@ -373,7 +370,7 @@ fn a_refused_read_unregisters_the_subscription_and_says_why() {
         spawn_local(service.run());
         commands
             .send(Command::Register {
-                client: CLIENT,
+                sink: 0,
                 query: open_tickets(),
                 token: 3,
             })
@@ -448,7 +445,7 @@ fn a_twin_joining_a_read_in_flight_completes_when_it_lands() {
         for token in [1u64, 2] {
             commands
                 .send(Command::Register {
-                    client: CLIENT,
+                    sink: 0,
                     query: open_tickets(),
                     token,
                 })
@@ -487,5 +484,88 @@ fn a_twin_joining_a_read_in_flight_completes_when_it_lands() {
             "the row lands, got {:?}",
             ids(&after)
         );
+    });
+}
+
+/// Two consumers, one tree: subscriptions of one query registered from two
+/// sinks share the engine's tree, and each sink hears of its own alone.
+/// A registration is answered to the sink that asked; a write's delta
+/// reaches both, each copy naming only that sink's subscriptions (three
+/// of them on the first sink, as one shared list); a subscription let go
+/// hears nothing more; and a group of subscriptions released together
+/// leaves its sink silent while the other still hears.
+#[test]
+fn deltas_reach_the_sink_that_owns_each_subscription() {
+    block_on(async {
+        let storage = Rc::new(MemoryStorage::new());
+        storage.apply(&insert(1, "OPEN"));
+        let (first_tx, mut first) = mpsc::unbounded_channel();
+        let (second_tx, mut second) = mpsc::unbounded_channel();
+        let (service, commands) =
+            Service::new(MultiTableIVM::new(), storage.clone(), first_tx.clone());
+        spawn_local(service.with_sinks(vec![first_tx, second_tx]).run());
+
+        let mut owned: Vec<Vec<SubId>> = vec![Vec::new(), Vec::new()];
+        for (token, sink) in [(1u64, 0usize), (2, 0), (3, 0), (4, 1)] {
+            commands
+                .send(Command::Register {
+                    sink,
+                    query: open_tickets(),
+                    token,
+                })
+                .await
+                .expect("send");
+            let (mine, other) = if sink == 0 {
+                (&mut first, &mut second)
+            } else {
+                (&mut second, &mut first)
+            };
+            let seen = drain(mine).await;
+            let (answered, sub) = registered(&seen).expect("answered to the sink that asked");
+            assert_eq!(answered, token);
+            assert_eq!(ids(&seen), vec![1], "with its row");
+            assert!(
+                registered(&drain(other).await).is_none(),
+                "the other sink hears nothing of it"
+            );
+            owned[sink].push(sub);
+        }
+
+        storage.apply(&insert(2, "OPEN"));
+        commands
+            .send(Command::Transaction(Transaction::new(
+                vec![insert(2, "OPEN")],
+                Lsn(1),
+            )))
+            .await
+            .expect("send");
+        for (sink, events) in [(0usize, &mut first), (1, &mut second)] {
+            let seen = drain(events).await;
+            let deltas: Vec<_> = seen.iter().flat_map(updates_of).collect();
+            assert_eq!(deltas.len(), 1, "one delta for the one row, sink {sink}");
+            let mut named: Vec<SubId> = deltas[0].targets().map(|target| target.sub).collect();
+            named.sort();
+            assert_eq!(named, owned[sink], "naming that sink's subscriptions alone");
+        }
+
+        commands
+            .send(Command::UnregisterAll(owned[0].clone()))
+            .await
+            .expect("send");
+        storage.apply(&insert(3, "OPEN"));
+        commands
+            .send(Command::Transaction(Transaction::new(
+                vec![insert(3, "OPEN")],
+                Lsn(2),
+            )))
+            .await
+            .expect("send");
+        let quiet = drain(&mut first).await;
+        assert!(
+            quiet.iter().flat_map(updates_of).next().is_none(),
+            "the released sink has nothing left to hear"
+        );
+        let heard = drain(&mut second).await;
+        assert_eq!(ids(&heard), vec![3], "the other still hears");
     });
 }

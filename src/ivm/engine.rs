@@ -6,14 +6,16 @@
 //! point the engine has reached, and lands the rest through
 //! [`Engine::land`]. Positions never enter the engine: what lands is
 //! current by construction. [`Engine`] is what the two engines
-//! (single-table and join tree) expose to that runtime, and every delta
-//! they emit is addressed to a client ([`super::ClientUpdate`]).
+//! (single-table and join tree) expose to that runtime. An engine knows
+//! subscriptions and nothing of the clients behind them: every delta it
+//! emits names the subscriptions it applies to ([`super::Delta`]), and
+//! whose they are is the transport's business.
 
 use std::sync::Arc;
 
-use super::ClientUpdate;
+use super::Delta;
 use crate::model::frame::SharedRow;
-use crate::model::{ClientId, DataFrameKey, DataFrameRow, SingleTableReadQuery, SubId, WriteQuery};
+use crate::model::{DataFrameKey, DataFrameRow, SingleTableReadQuery, SubId, WriteQuery};
 
 /// The engine's handle for one storage read it asked for; unique for the
 /// life of the engine.
@@ -60,21 +62,18 @@ pub trait Engine {
     /// The subscription spec this engine registers.
     type Query;
 
-    /// Register a subscription for `client`: its id, and whatever of its
-    /// initial result set is available at once (a twin's rows; nothing
-    /// when a read was requested instead).
-    fn subscribe(&mut self, client: ClientId, query: Self::Query) -> (SubId, Vec<ClientUpdate>);
+    /// Register a subscription: its id, and whatever of its initial
+    /// result set is available at once (a twin's rows; nothing when a read
+    /// was requested instead).
+    fn subscribe(&mut self, query: Self::Query) -> (SubId, Vec<Delta>);
 
     /// Remove a subscription; reads still in flight for it land as no-ops.
     fn unsubscribe(&mut self, sub: SubId);
 
-    /// Remove every subscription of `client` (it disconnected).
-    fn unsubscribe_client(&mut self, client: ClientId);
-
     /// The read `fetch` will never be served: remove every subscription
-    /// that was waiting on it (all of a shared tree's) and name them with
-    /// their clients, so each can be told.
-    fn refuse(&mut self, fetch: &Fetch) -> Vec<(SubId, ClientId)>;
+    /// that was waiting on it (all of a shared tree's) and name them, so
+    /// the owner of each can be told.
+    fn refuse(&mut self, fetch: &Fetch) -> Vec<SubId>;
 
     /// The subscriptions whose first rows may complete when `fetch` lands
     /// (all of a shared tree's), so a consumer checks those and not every
@@ -87,9 +86,9 @@ pub trait Engine {
 
     /// The subscriptions one of whose pages has stopped reaching past the
     /// rows its join gate rejects since the last call (the page then holds
-    /// fewer rows than asked for), with their clients: queries to report
-    /// by name. None for an engine without joins.
-    fn take_capped(&mut self) -> Vec<(SubId, ClientId)> {
+    /// fewer rows than asked for): queries to report by name. None for an
+    /// engine without joins.
+    fn take_capped(&mut self) -> Vec<SubId> {
         Vec::new()
     }
 
@@ -99,7 +98,7 @@ pub trait Engine {
 
     /// Route one write to every subscription it affects, grouped per
     /// client.
-    fn route(&mut self, write: &WriteQuery) -> Vec<ClientUpdate>;
+    fn route(&mut self, write: &WriteQuery) -> Vec<Delta>;
 
     /// Land the rows a requested read returned, already brought up to the
     /// engine's position by the runtime: each row is adopted into the
@@ -113,7 +112,7 @@ pub trait Engine {
         fetch: &Fetch,
         rows: &[(DataFrameKey, DataFrameRow)],
         worst_read: Option<&DataFrameRow>,
-    ) -> Vec<ClientUpdate>;
+    ) -> Vec<Delta>;
 
     /// Take the reads recorded since the last call, in the order they were
     /// asked for.

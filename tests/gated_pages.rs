@@ -399,9 +399,8 @@ fn run(seed: u64, steps: usize) {
     }
     let registered: Vec<(&str, MultiTableReadQuery, SubId)> = specs()
         .into_iter()
-        .enumerate()
-        .map(|(index, (name, spec))| {
-            let (sub, _) = ivm.register_query(ClientId(index as u64 + 1), spec.clone());
+        .map(|(name, spec)| {
+            let (sub, _) = ivm.register_query(spec.clone());
             (name, spec, sub)
         })
         .collect();
@@ -475,7 +474,7 @@ fn run_late(seed: u64, steps: usize) {
         if only.is_some_and(|only| only != index) {
             continue;
         }
-        let (sub, step) = runtime.register(ClientId(index as u64 + 1), spec.clone());
+        let (sub, step) = runtime.register(spec.clone());
         asked(step.selects, &storage, lsn, &mut out);
         registered.push((name, spec, sub));
     }

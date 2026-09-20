@@ -12,9 +12,9 @@ use std::task::{Context, Poll, Waker};
 
 use super::runtime::{Runtime, Step};
 use super::storage::Storage;
-use crate::ivm::{ClientUpdate, Engine};
+use crate::ivm::{Delta, Engine};
 use crate::model::frame::SharedRow;
-use crate::model::{ClientId, Lsn, SubId, WriteQuery};
+use crate::model::{Lsn, SubId, WriteQuery};
 
 /// A runtime over an engine and an immediately-answering storage.
 ///
@@ -37,14 +37,10 @@ impl<E: Engine, S: Storage> Local<E, S> {
         }
     }
 
-    /// Register a subscription for `client` and return its id and its
-    /// complete initial snapshot, every read it needed already landed.
-    pub fn register_query(
-        &mut self,
-        client: ClientId,
-        query: E::Query,
-    ) -> (SubId, Vec<ClientUpdate>) {
-        let (sub, step) = self.runtime.register(client, query);
+    /// Register a subscription and return its id and its complete
+    /// initial snapshot, every read it needed already landed.
+    pub fn register_query(&mut self, query: E::Query) -> (SubId, Vec<Delta>) {
+        let (sub, step) = self.runtime.register(query);
         (sub, self.settle(step))
     }
 
@@ -55,16 +51,9 @@ impl<E: Engine, S: Storage> Local<E, S> {
         self.runtime.take_dead()
     }
 
-    /// Remove every subscription of `client`; the rows only they held
-    /// come back to be freed by the caller.
-    pub fn unregister_client(&mut self, client: ClientId) -> Vec<SharedRow> {
-        self.runtime.unregister_client(client);
-        self.runtime.take_dead()
-    }
-
     /// Route one write at the next tick of the driver's clock and return
     /// every delta it led to, reads included.
-    pub fn incremental_update(&mut self, write: &WriteQuery) -> Vec<ClientUpdate> {
+    pub fn incremental_update(&mut self, write: &WriteQuery) -> Vec<Delta> {
         self.clock += 1;
         let step = self.runtime.write(write, Lsn(self.clock));
         self.moved();
@@ -73,7 +62,7 @@ impl<E: Engine, S: Storage> Local<E, S> {
 
     /// Run the reads the engine asked for through a direct maintenance
     /// call ([`Local::engine_mut`]) and return the deltas they led to.
-    pub fn pump(&mut self) -> Vec<ClientUpdate> {
+    pub fn pump(&mut self) -> Vec<Delta> {
         let step = self.runtime.pump();
         self.settle(step)
     }
@@ -107,7 +96,7 @@ impl<E: Engine, S: Storage> Local<E, S> {
 
     /// Run every read a step handed out, land it, and keep going until no
     /// read is left, collecting the deltas in order.
-    fn settle(&mut self, step: Step) -> Vec<ClientUpdate> {
+    fn settle(&mut self, step: Step) -> Vec<Delta> {
         let mut updates = step.updates;
         let mut queue: VecDeque<_> = step.selects.into();
         while let Some(fetch) = queue.pop_front() {

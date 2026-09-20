@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use xyne_sync::ivm::{ClientUpdate, Engine, MultiTableIVM, QueryPart, SubId};
+use xyne_sync::ivm::{Delta, Engine, MultiTableIVM, QueryPart, SubId};
 use xyne_sync::model::*;
 use xyne_sync::sync::{Local, MemoryStorage};
 
@@ -204,7 +204,7 @@ fn team_ticket(id: i64, team: i64) -> WriteQuery {
 
 /// Mirror the write into storage, then route it — commit first, notify
 /// second, like a real database.
-fn write(ivm: &mut Ivm, storage: &MemoryStorage, w: WriteQuery) -> Vec<ClientUpdate> {
+fn write(ivm: &mut Ivm, storage: &MemoryStorage, w: WriteQuery) -> Vec<Delta> {
     storage.apply(&w);
     ivm.incremental_update(&w)
 }
@@ -225,17 +225,15 @@ struct Names {
 }
 
 impl Names {
-    /// Register `spec` under `name`, for a client of its own, returning
-    /// its snapshot.
+    /// Register `spec` under `name`, returning its snapshot.
     fn register(
         &self,
         ivm: &mut Ivm,
         name: impl Into<String>,
         spec: MultiTableReadQuery,
-    ) -> Vec<ClientUpdate> {
+    ) -> Vec<Delta> {
         let name = name.into();
-        let client = ClientId(self.ids.borrow().len() as u64 + 1);
-        let (id, ops) = ivm.register_query(client, spec);
+        let (id, ops) = ivm.register_query(spec);
         self.ids.borrow_mut().insert(name.clone(), id);
         self.names.borrow_mut().insert(id, name);
         ops
@@ -253,10 +251,10 @@ impl Names {
 
     /// Compact rendering of updates, one tag per targeted part, for
     /// order-insensitive assertions.
-    fn tags(&self, ops: &[ClientUpdate]) -> Vec<String> {
+    fn tags(&self, ops: &[Delta]) -> Vec<String> {
         let mut rendered: Vec<String> = ops
             .iter()
-            .flat_map(|update| update.targets.iter().map(move |target| (update, target)))
+            .flat_map(|update| update.targets().map(move |target| (update, target)))
             .map(|(update, target)| {
                 let part = if target.part.is_main() {
                     "main".to_owned()
@@ -278,13 +276,13 @@ impl Names {
 }
 
 /// The part of the one target an update has.
-fn part_of(update: &ClientUpdate) -> &QueryPart {
+fn part_of(update: &Delta) -> &QueryPart {
     assert_eq!(
-        update.targets.len(),
+        update.target_count(),
         1,
         "one target expected, got {update:?}"
     );
-    &update.targets[0].part
+    &update.audiences[0].part
 }
 
 fn frame_len(ivm: &Ivm, names: &Names, name: &str, part: QueryPart) -> usize {
@@ -671,12 +669,11 @@ fn self_join_write_converges_for_the_client() {
         &storage,
         update("people", 2, &[("mgr", Value::Int(1))]),
     );
-    let join0_key2: Vec<&ClientUpdate> = ops
+    let join0_key2: Vec<&Delta> = ops
         .iter()
         .filter(|update| {
             update
-                .targets
-                .iter()
+                .targets()
                 .any(|target| target.part == QueryPart::join(0))
                 && update.op.key().pkey_value["id"] == Value::Int(2)
         })
@@ -2211,8 +2208,7 @@ fn a_page_whose_gate_rejects_hundreds_of_rows_is_capped_and_reported() {
     );
     assert!(ivm.engine().hydrated(names.id("q")));
     let capped = ivm.engine_mut().take_capped();
-    assert_eq!(capped.len(), 1, "reported once, with its client");
-    assert_eq!(capped[0].0, names.id("q"));
+    assert_eq!(capped, [names.id("q")], "reported once");
     assert!(ivm.engine_mut().take_capped().is_empty());
     let stats = ivm.engine().stats();
     assert_eq!(stats.window_capped, 1);

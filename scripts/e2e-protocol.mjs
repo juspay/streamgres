@@ -7,7 +7,8 @@
 // through the real conversations.send mutation, subscribes to its thread, B
 // subscribes to the same thread from another client group, A replies (B must see
 // it), A drops the thread query (with ttl 0 so the release is immediate), A reconnects with its current cookie (no reset) and once with a stale one
-// (reset). Exits 0 on PASS.
+// (reset); a client whose schema fits is served whole rows, and one whose schema names
+// what the server does not have is refused with SchemaVersionNotSupported. Exits 0 on PASS.
 //
 //   node scripts/e2e-protocol.mjs
 //
@@ -55,9 +56,9 @@ function ensureMember(user, channelId) {
 }
 
 /// One protocol connection with its own view of the rows it was sent.
-function connect(name, user, group, client, { baseCookie = '', lmid = 0, patch = [], onFrame }) {
+function connect(name, user, group, client, { baseCookie = '', lmid = 0, patch = [], clientSchema, onFrame }) {
   const state = { name, rows: {}, got: new Set(), lmid: 0, cookie: null, pokes: 0, pongs: 0, pushResponses: 0, errors: [], closed: false, ws: null };
-  const init = ['initConnection', { desiredQueriesPatch: patch, activeClients: [client] }];
+  const init = ['initConnection', { desiredQueriesPatch: patch, activeClients: [client], ...(clientSchema ? { clientSchema } : {}) }];
   const sec = encodeURIComponent(Buffer.from(JSON.stringify({ initConnectionMessage: init, authToken: undefined })).toString('base64'));
   const url = `${GATEWAY}/sync/v51/connect?clientID=${client}&clientGroupID=${group}&userID=${user.userId}&baseCookie=${encodeURIComponent(baseCookie)}&ts=1&lmid=${lmid}&wsid=${name}&profileID=p1`;
   const ws = new WebSocket(url, [sec], { headers: { Cookie: user.cookie, Origin: 'http://localhost:5173' } });
@@ -176,7 +177,44 @@ function advance() {
       log(`A2 reconnected at cookie ${a2.cookie} without a reset (${Object.values(a2.rows).reduce((n, m) => n + m.size, 0)} rows re-sent)`);
       stage = 'stale';
       const stale = connect('A3', A, groupA, 'ca', { baseCookie: '0001', lmid: 2, patch: [], onFrame: (s, tag) => {
-        if (tag === 'error' && s.errors[0]?.kind === 'InvalidConnectionRequestBaseCookie') { log('A3 with a stale cookie was told to start over, as intended'); stage = 'done'; advance(); }
+        if (tag === 'error' && s.errors[0]?.kind === 'InvalidConnectionRequestBaseCookie') { log('A3 with a stale cookie was told to start over, as intended'); stage = 'schema-fits'; advance(); }
+      } });
+      return;
+    }
+    case 'schema-fits': {
+      stage = 'schema-fits-wait';
+      const fits = { tables: { channels: { columns: { id: { type: 'string' }, name: { type: 'string' } }, primaryKey: ['id'] } } };
+      const s1 = connect('S1', A, 'gs-' + randomUUID().slice(0, 8), 'cs1', { clientSchema: fits, patch: [{ op: 'put', hash: 'h1', name: 'browsableChannels', args: [], ttl: 300000 }], onFrame: (s, tag) => {
+        if (tag === 'error') return fail('a client whose schema fits was refused: ' + JSON.stringify(s.errors[0]));
+        if (stage === 'schema-fits-wait' && s.got.has('h1')) {
+          const row = [...(s.rows.channels?.values() ?? [])][0];
+          if (!row || Object.keys(row).length <= 2) return fail('rows should travel whole, whatever the client schema declares');
+          log(`S1 declared two columns of channels and was served whole rows (${Object.keys(row).length} columns)`);
+          s.ws.close(1000); stage = 'schema-ahead'; advance();
+        }
+      } });
+      return;
+    }
+    case 'schema-ahead': {
+      stage = 'schema-ahead-wait';
+      const ahead = { tables: {
+        channels: { columns: { id: { type: 'string' }, noSuchColumn: { type: 'string' }, name: { type: 'number' } }, primaryKey: ['name'] },
+        no_such_table: { columns: { id: { type: 'string' } }, primaryKey: ['id'] },
+      } };
+      connect('S2', A, 'gs-' + randomUUID().slice(0, 8), 'cs2', { clientSchema: ahead, patch: [{ op: 'put', hash: 'h1', name: 'browsableChannels', args: [], ttl: 300000 }], onFrame: (s, tag) => {
+        if (tag === 'pokeEnd') return fail('a client whose schema the server cannot serve was served');
+        if (tag === 'error') {
+          const { kind, message } = s.errors[0];
+          if (kind !== 'SchemaVersionNotSupported') return fail('expected SchemaVersionNotSupported, got ' + kind);
+          for (const needle of ['"no_such_table" table does not exist', '"noSuchColumn" column does not exist', 'upstream type "string" does not match the client type "number"', 'primaryKey <name>']) {
+            if (!message.includes(needle)) return fail('the refusal does not say: ' + needle);
+          }
+        }
+        if (tag === 'close') {
+          if (s.errors.length !== 1) return fail('S2 was closed without being told why');
+          log('S2 named a table, a column, a type and a key the server does not have: refused with SchemaVersionNotSupported and closed');
+          stage = 'done'; advance();
+        }
       } });
       return;
     }

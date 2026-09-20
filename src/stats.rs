@@ -283,6 +283,9 @@ pub struct Stats {
     pub connections_closed_by_client: AtomicU64,
     pub connections_closed_by_error: AtomicU64,
     pub connections_closed_by_server: AtomicU64,
+    /// Connections refused because the client's schema names what the
+    /// server cannot serve (`SchemaVersionNotSupported`).
+    pub connections_refused_schema: AtomicU64,
     pub connections_open: AtomicU64,
     pub client_groups: AtomicU64,
     pub clients: AtomicU64,
@@ -392,6 +395,7 @@ impl Stats {
             connections_closed_by_client: AtomicU64::new(0),
             connections_closed_by_error: AtomicU64::new(0),
             connections_closed_by_server: AtomicU64::new(0),
+            connections_refused_schema: AtomicU64::new(0),
             connections_open: AtomicU64::new(0),
             client_groups: AtomicU64::new(0),
             clients: AtomicU64::new(0),
@@ -577,6 +581,10 @@ impl Stats {
             (
                 "connections_closed_by_server",
                 load(&self.connections_closed_by_server),
+            ),
+            (
+                "connections_refused_schema",
+                load(&self.connections_refused_schema),
             ),
             ("log_dropped", crate::log::dropped()),
         ]
@@ -1180,10 +1188,7 @@ fn counter_name(name: &str) -> (String, &'static str) {
             "xyne_sync_queries_short_total".to_owned(),
             "{reason=\"page_capped\"}",
         ),
-        "plans_page_driven" => (
-            "xyne_sync_plans_total".to_owned(),
-            "{kind=\"page_drives\"}",
-        ),
+        "plans_page_driven" => ("xyne_sync_plans_total".to_owned(), "{kind=\"page_drives\"}"),
         "pushes_ok" => ("xyne_sync_pushes_total".to_owned(), "{result=\"ok\"}"),
         "pushes_failed" => ("xyne_sync_pushes_total".to_owned(), "{result=\"failed\"}"),
         "connections_opened" => (
@@ -1201,6 +1206,10 @@ fn counter_name(name: &str) -> (String, &'static str) {
         "connections_closed_by_server" => (
             "xyne_sync_connections_total".to_owned(),
             "{event=\"closed\",reason=\"server\"}",
+        ),
+        "connections_refused_schema" => (
+            "xyne_sync_connections_total".to_owned(),
+            "{event=\"refused\",reason=\"client_schema\"}",
         ),
         "transactions" => ("xyne_sync_feed_transactions_total".to_owned(), ""),
         "writes" => ("xyne_sync_feed_writes_total".to_owned(), ""),

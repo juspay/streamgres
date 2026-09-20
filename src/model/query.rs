@@ -50,20 +50,6 @@ impl std::fmt::Display for SubId {
     }
 }
 
-/// The engine's handle for one connected client: the transport hands it in
-/// with every registration, and every delta the engine emits is addressed
-/// to one client (see `ivm::ClientUpdate`), so a row two of a client's
-/// queries hold travels to that client once.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ClientId(pub u64);
-
-impl std::fmt::Display for ClientId {
-    /// The bare number.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// Which side of a join edge drives it: whose held rows decide the join
 /// values that are *referenced*. The other side, the driven one, holds
 /// only rows matching a referenced value (its filter carries

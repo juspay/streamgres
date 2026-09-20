@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use std::rc::Rc;
-use xyne_sync::ivm::{ClientUpdate, SingleTableIVM, SubId};
+use xyne_sync::ivm::{Delta, SingleTableIVM, SubId};
 use xyne_sync::model::*;
 use xyne_sync::sync::{Local, MemoryStorage};
 
@@ -144,7 +144,7 @@ fn open_ticket_row() -> Vec<(&'static str, Value)> {
 
 /// Test-side directory from readable names to the engine's subscription
 /// ids and back: the role the transport layer plays in production. Every
-/// subscription is its own client unless a test says otherwise.
+/// subscription is on its own: the engine knows nothing of clients.
 #[derive(Default)]
 struct Names {
     ids: RefCell<HashMap<String, SubId>>,
@@ -152,7 +152,7 @@ struct Names {
 }
 
 impl Names {
-    /// Register `query` under `name` for a client of its own, returning
+    /// Register `query` under `name`, returning
     /// its snapshot as bare operations.
     fn register(
         &self,
@@ -160,21 +160,8 @@ impl Names {
         name: impl Into<String>,
         query: SingleTableReadQuery,
     ) -> Vec<DataFrameOperation> {
-        let client = ClientId(self.ids.borrow().len() as u64 + 1);
-        self.register_for(ivm, client, name, query)
-    }
-
-    /// Register `query` under `name` for `client`, returning its snapshot
-    /// as bare operations.
-    fn register_for(
-        &self,
-        ivm: &mut Ivm,
-        client: ClientId,
-        name: impl Into<String>,
-        query: SingleTableReadQuery,
-    ) -> Vec<DataFrameOperation> {
         let name = name.into();
-        let (id, updates) = ivm.register_query(client, query);
+        let (id, updates) = ivm.register_query(query);
         self.ids.borrow_mut().insert(name.clone(), id);
         self.names.borrow_mut().insert(id, name);
         updates.into_iter().map(|update| update.op).collect()
@@ -192,9 +179,9 @@ impl Names {
 
     /// The impacted subscriptions of an update batch by name, deduplicated
     /// and sorted.
-    fn impacted(&self, ops: &[ClientUpdate]) -> Vec<String> {
+    fn impacted(&self, ops: &[Delta]) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for target in ops.iter().flat_map(|update| update.targets.iter()) {
+        for target in ops.iter().flat_map(|update| update.targets()) {
             let name = self.name(target.sub);
             if !out.contains(&name) {
                 out.push(name);
@@ -205,11 +192,8 @@ impl Names {
     }
 
     /// Whether an update names subscription `name`.
-    fn targets(&self, update: &ClientUpdate, name: &str) -> bool {
-        update
-            .targets
-            .iter()
-            .any(|target| target.sub == self.id(name))
+    fn targets(&self, update: &Delta, name: &str) -> bool {
+        update.targets().any(|target| target.sub == self.id(name))
     }
 
     /// The names of `ids`, sorted.
@@ -1640,76 +1624,55 @@ fn routing_probes_columns_instead_of_evaluating_every_condition() {
     assert!(cost.columns_probed >= 1);
 }
 
-/// Deltas are addressed per client: two subscriptions of one client
-/// holding one row receive it once, the update naming both; a
-/// subscription of another client gets its own; and a client's
-/// disconnect drops every subscription it had.
+/// Deltas are folded per row: three subscriptions holding one row
+/// receive it as one delta naming all three, whoever they belong to (the
+/// engine knows subscriptions, not clients); a row that leaves one
+/// subscription and is rewritten for the others is a `Delete` for the one
+/// and one `Add` for the rest; and a subscription let go hears nothing
+/// more.
 #[test]
-fn updates_are_grouped_per_client() {
+fn updates_are_folded_per_row() {
     let tickets = table("tickets");
     let mut ivm = Local::new(SingleTableIVM::new(), Rc::new(MemoryStorage::new()));
     let names = Names::default();
-    let one = ClientId(1);
-    let two = ClientId(2);
-    names.register_for(
+    names.register(
         &mut ivm,
-        one,
-        "one-open",
+        "open",
         query(
             &tickets,
             Where::condition("status", ComparisonOperator::EQ, "OPEN"),
         ),
     );
-    names.register_for(
-        &mut ivm,
-        one,
-        "one-all",
-        query(&tickets, Where::AND(vec![])),
-    );
-    names.register_for(
-        &mut ivm,
-        two,
-        "two-all",
-        query(&tickets, Where::AND(vec![])),
-    );
+    names.register(&mut ivm, "all", query(&tickets, Where::AND(vec![])));
+    names.register(&mut ivm, "also-all", query(&tickets, Where::AND(vec![])));
 
     let ops = ivm.incremental_update(&insert(&tickets, 1, &open_ticket_row()));
-    assert_eq!(ops.len(), 2, "one delta per client, got {ops:?}");
-    let for_one = ops
-        .iter()
-        .find(|update| update.client == one)
-        .expect("client one");
-    assert_eq!(
-        for_one.targets.len(),
-        2,
-        "both of client one's subscriptions"
+    assert_eq!(ops.len(), 1, "one delta for the row, got {ops:?}");
+    assert_eq!(ops[0].target_count(), 3, "naming every subscription");
+    assert!(
+        names.targets(&ops[0], "open")
+            && names.targets(&ops[0], "all")
+            && names.targets(&ops[0], "also-all")
     );
-    assert!(names.targets(for_one, "one-open") && names.targets(for_one, "one-all"));
-    let for_two = ops
-        .iter()
-        .find(|update| update.client == two)
-        .expect("client two");
-    assert_eq!(for_two.targets.len(), 1);
 
     let mut done_row = open_ticket_row();
     done_row[0] = ("status", "DONE".into());
     let ops = ivm.incremental_update(&update(&tickets, 1, &done_row));
-    let for_one: Vec<&ClientUpdate> = ops.iter().filter(|update| update.client == one).collect();
     assert_eq!(
-        for_one.len(),
+        ops.len(),
         2,
-        "client one: the row leaves one-open and is replaced for one-all, got {for_one:?}"
+        "the row leaves `open` and is replaced for the other two, got {ops:?}"
     );
-    assert!(matches!(for_one[0].op, DataFrameOperation::Delete(..)));
-    assert!(names.targets(for_one[0], "one-open"));
-    assert!(matches!(for_one[1].op, DataFrameOperation::Add(..)));
-    assert!(names.targets(for_one[1], "one-all"));
+    assert!(matches!(ops[0].op, DataFrameOperation::Delete(..)));
+    assert_eq!(names.impacted(&ops[..1]), ["open"]);
+    assert!(matches!(ops[1].op, DataFrameOperation::Add(..)));
+    assert_eq!(names.impacted(&ops[1..]), ["all", "also-all"]);
 
-    ivm.unregister_client(one);
-    assert!(ivm.engine().rows_for(names.id("one-all")).is_none());
+    ivm.unregister_query(names.id("all"));
+    assert!(ivm.engine().rows_for(names.id("all")).is_none());
     let ops = ivm.incremental_update(&delete(&tickets, 1));
     assert_eq!(ops.len(), 1);
-    assert_eq!(ops[0].client, two);
+    assert_eq!(names.impacted(&ops), ["also-all"]);
 }
 
 /// A column the change feed left out of an update (a large value
