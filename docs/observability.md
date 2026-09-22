@@ -86,7 +86,7 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_query_read_rows_max{name,table}`, `xyne_sync_query_heavy_reads_total{name}` | per query name, for queries whose subscriptions waited on a read of at least half the limit: the largest such read with its table, and how many; at most 256 names, also `/stats.heavy_queries` |
 | `xyne_sync_reads_total{outcome=issued,landed,refused,shared}` | storage reads, and registrations served from a twin without one |
 | `xyne_sync_subscriptions`, `xyne_sync_trees` | what the engine holds |
-| `xyne_sync_queries_refused_total{reason=unsupported,plan_limit,read_limit,other}` | queries the server refused, by why: the translation cannot express it (`LIKE`, `NOT EXISTS`), the planner found no side of a join small enough to read, a read came back over the row limit, anything else |
+| `xyne_sync_queries_refused_total{reason=unsupported,plan_limit,read_limit,read_timeout,other}` | queries the server refused, by why: the translation cannot express it (`LIKE`, `NOT EXISTS`), the planner found no side of a join small enough to read, a read came back over the row limit, a read or a count ran past `XYNE_SYNC_READ_TIMEOUT_MS`, anything else |
 | `xyne_sync_plans_total{kind=page_drives}` | plans in which a node with a `LIMIT` drives an inner edge (the page is kept to the rows the edge admits) |
 | `xyne_sync_page_rows_rejected_total`, `xyne_sync_pages_capped_total` | rows a join gate rejected inside a page, each making the page reach one row further; pages that stopped reaching (eight rejected rows for every row of the page, between 64 and 512) |
 | `xyne_sync_queries_short_total{reason=page_capped}` | subscriptions served a page short of its limit because it was capped |
@@ -104,7 +104,7 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_feed_transactions_total`, `xyne_sync_feed_writes_total` | what came through the feed |
 | `xyne_sync_writes_impacting_total`, `xyne_sync_client_updates_total{op=add,delete}`, `xyne_sync_narrowed_reads_total` | routing counters |
 | `xyne_sync_pokes_total`, `xyne_sync_frames_total`, `xyne_sync_rows_serialized_total`, `xyne_sync_rows_shared_total` | the client side's output |
-| `xyne_sync_feed_lsn`, `xyne_sync_feed_heartbeat_age_seconds` | where the feed is and how long since it last spoke |
+| `xyne_sync_feed_lsn`, `xyne_sync_feed_heartbeat_age_seconds` | where the feed is, and how long since PostgreSQL was last heard on the replication connection (a transaction, or a keepalive saying how far its log has been gone through; nothing is written to the database to be heard). On a primary the read snapshots alone keep it under their rotation |
 | `xyne_sync_engine_inbox`, `xyne_sync_groups_inbox{shard}` | queue depths, sampled |
 
 ### Mutation
@@ -122,6 +122,7 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_process_rss_bytes` | resident set, sampled |
 | `xyne_sync_thread_cpu_seconds_total{thread}` | CPU by thread name (engine, groups, reads, server, feed, reaper, log, metrics), sampled; the engine's rate is its utilisation |
 | `xyne_sync_rows_held{table}` | rows in the shared frames per table |
+| `xyne_sync_connects_total{owed=nothing,state,log,start_over}` | connections by what they were owed since their cookie: nothing (the usual reconnect: a group with no connection stands still), the group's whole state (a tab without a cookie joining a group under way), the logged pokes after an older cookie, or told to start over and sync afresh; `start_over` climbing is clients paying a full download |
 | `xyne_sync_connections_open`, `xyne_sync_connections_total{event=opened,closed,refused}` | sockets; `event="refused",reason="client_schema"` counts clients whose schema the server cannot serve, which climbs when a client build is deployed ahead of its database |
 | `xyne_sync_client_groups`, `xyne_sync_clients` | what the group threads hold |
 | `xyne_sync_plan_cache_entries`, `xyne_sync_transform_cache_entries`, `xyne_sync_warm_shapes` | the caches |
@@ -137,16 +138,20 @@ object per line, `{"ts","level","thread","msg", ...fields}`.
 | --- | --- | --- |
 | server up, feed connected, ready, warm start, drain | info | address, slot, position, shapes planned |
 | connection opened / closed | info | wsid, group, client, whether authenticated, origin; on close: seconds open and the close reason (client, error, server) |
+| client told to start over | info | wsid, group, the cookie it offered and why it cannot be caught up from it (no state for the group, a cookie the log no longer reaches, a cookie this server never wrote); the client drops its store and syncs afresh |
+| connection caught up from the group's state / from the group's log | info | wsid, group, the cookies it went from and to, and the rows and queries, or the pokes, it was sent: a tab that joined a group under way without a cookie, or returned behind it |
 | connection refused | warn | wsid, group, client, kind (`SchemaVersionNotSupported`), how many mismatches and the first three: the client's schema names a table, column, column type or primary key the server cannot serve, and the client was told so and closed, as the reference server does (what the server has beyond the client's schema is no mismatch) |
 | heavy read | info, warn from 80 % | name, hash, group, table, rows, limit, percent: a read the query waited on returned at least half the row limit; once per read, under the query that waited on it |
 | telemetry export started / failed | info / warn, at most once a minute | the endpoints and the interval; the signal, the error and the failures so far |
 | query hydrated | debug | group, name, hash, kind (cold or warm), ms from registration to rows present |
 | slow query | warn | the same, when hydration exceeds `XYNE_SYNC_SLOW_QUERY_MS` (1 000) |
-| query refused | warn | name, hash, kind (`unsupported`, `plan_limit`, `read_limit`, `other`), at (`plan`: before it registered; `read`: a read it depended on), group, connection, the reason in full |
+| query refused | warn | name, hash, kind (`unsupported`, `plan_limit`, `read_limit`, `read_timeout`, `other`), at (`plan`: before it registered; `read`: a read it depended on), group, connection, the reason in full |
 | query planned | debug | name, the root's table, whether a page drives an inner edge, ms |
 | page capped | warn | name, hash, group: a page of the query stopped reaching past the rows its join rejects; it is served, short of its limit |
 | transaction routed | debug | position, writes, client updates, reads asked, ms |
 | feed lag | warn | when commit → engine exceeds 5 s, once per minute |
+| change feed silent, connection given up / dropped, reopening the slot | warn | nothing heard for 10 s and PostgreSQL says no walsender holds the slot any more: the connection died without either end being told; the slot is reopened and resumes after the last confirmed position |
+| read past its time | warn | what ran (a read on a table, a count, a statement) and the limit; the query that needed it is refused with `kind=read_timeout` |
 | push forwarded | debug (warn when failed or slower than the slow threshold) | wsid, group, mutations, ms, failed |
 | summary | info, every minute | connections, groups, clients, subscriptions, rows held, RSS, engine busy %, feed lag, transform and plan hit rates, registrations/s, transactions/s, pokes/s, queries refused and page rows rejected since the last line, log drops |
 
@@ -222,7 +227,9 @@ rate(xyne_sync_engine_busy_seconds_total[5m]) > 0.7
 histogram_quantile(0.99, sum by (le) (rate(xyne_sync_end_to_end_seconds_bucket[5m]))) > 0.5
 # The feed is behind PostgreSQL, or silent.
 histogram_quantile(0.99, sum by (le) (rate(xyne_sync_feed_lag_seconds_bucket[5m]))) > 5
-xyne_sync_feed_heartbeat_age_seconds > 30
+xyne_sync_feed_heartbeat_age_seconds > 90
+# Storage reads are running past the read timeout.
+increase(xyne_sync_queries_refused_total{reason="read_timeout"}[5m]) > 0
 # Memory against the container's limit (set the number to 75 % of it).
 xyne_sync_process_rss_bytes > 6e9
 # Clients built for another database are being turned away.

@@ -60,7 +60,7 @@ every later delta continues from.
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
 | Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; the runtime holds the one position and brings every read up to it before landing; no read ever blocks the stream; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
 | In-memory storage answering at once, honoring `ORDER BY` + `LIMIT`; per-table routing between memory and PostgreSQL (`XYNE_SYNC_MEMORY_TABLES`) | ✅ done | `src/sync/storage.rs`, `src/sync/sources.rs` |
-| **PostgreSQL**: reads from the exported snapshot of a rotating temporary replication slot, flipped forward only once the feed has passed it; a streaming `pgoutput` change feed over a replication connection with heartbeat progress marks; live tests and a bench scenario against a real server | ✅ done | `src/sync/pg/` |
+| **PostgreSQL**: reads from the exported snapshot of a rotating temporary replication slot, flipped forward only once the feed has passed it; a streaming `pgoutput` change feed over a replication connection whose position comes from commits and PostgreSQL's own keepalives, so nothing is written to the database and a primary, a logical replica and a physical standby are followed alike; a feed whose connection died unannounced is found (nobody holds its slot any more) and reopened; every read bounded by a timeout; live tests and a bench scenario against a real server | ✅ done | `src/sync/pg/` |
 | Routing counters + benchmark harness | ✅ done | `src/ivm/stats.rs`, `src/bin/bench.rs` |
 | **xyne-spaces coverage**: the dashboard's 283 synced queries (and the ACL predicates added to them) rebuilt as tests on a catalog generated from the application's schema; `IS NULL`, `EXISTS` inside `OR` and `whereExists` closed, four expressiveness gaps left and pinned | ✅ tests, ⏳ gaps | `tests/xyne_spaces_queries/` |
 | **Client side** speaking Zero's sync protocol (v51, the `@rocicorp/zero` 1.9 client): connect handshake, ping/pong and liveness, desired queries through the app server's query endpoint, pokes per client group, mutations through its mutate endpoint, `lastMutationID` off the app's clients table; it owns no engine and no database connection, reaching both only through [`sync::Service`]'s channels; verified from the xyne-spaces UI with three users (roles, resource access, channels, threads, reactions, tickets) and load-tested (see below) | ✅ done (no history across restarts) | `src/client/`, `src/sync/pg/threads.rs`, [docs/live-verification-2026-09-15.md](docs/live-verification-2026-09-15.md) |
@@ -333,15 +333,21 @@ floor.
   Every change becomes a full-image insert/update or a key-only delete
   **positioned at the end of its transaction's commit record**, the scale the
   aliases' consistent points are on: a snapshot at consistent point `X` holds
-  exactly the writes positioned at or below `X`. Progress marks come from
-  **heartbeats**: a poll commits a tiny `pg_logical_emit_message` and consumes
-  the feed until that heartbeat comes back; decoding emits whole transactions
-  in commit order, so everything committed before it has been delivered by
-  then, and the heartbeat's position is the mark. A primary-key change becomes
+  exactly the writes positioned at or below `X`. The feed **writes nothing**:
+  its position comes from each commit and from the keepalives PostgreSQL
+  sends whenever it has gone through log that held nothing for the slot
+  (decoding emits whole transactions in commit order, so everything committed
+  at or below either has been delivered); both are confirmed back to the
+  slot. A poll asks the server where its log ends (a read) and consumes the
+  feed until it has been delivered that far. A feed silent for ten seconds
+  asks whether a walsender still holds its slot; a slot nobody holds means a
+  connection that died unannounced: the slot is reopened, and the
+  transactions the server sends a second time are applied once. A primary-key change becomes
   delete + insert; tables with large TOASTed columns need `REPLICA IDENTITY
   FULL`; a `TRUNCATE` on a published table stops the feed. `PgStream::run`
-  feeds a `Service`'s command channel and heartbeats on an interval so the
-  mark keeps moving while the tables are quiet.
+  feeds a `Service`'s command channel, and tells it the feed's position on
+  an interval so the engine, and the snapshots waiting on it, keep moving
+  while the tables are quiet.
 - Requirements: `wal_level = logical`; `max_replication_slots` and
   `max_wal_senders` headroom for the feed's slot plus the live aliases (up to
   three per storage instance at a rotation boundary); a role that may create
@@ -371,8 +377,8 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   ([docs/pipeline-2026-09-18.md](docs/pipeline-2026-09-18.md) has the design
   and the measurements). The *feed thread* holds the replication connection,
   decodes the `pgoutput` events into rows and hands the engine **one
-  transaction per commit**, with a heartbeat so the position moves while
-  nothing is written. The *engine thread* owns the runtime and the engine and
+  transaction per commit**, and the feed's position a few times a second so
+  the engine keeps up while nothing is written. The *engine thread* owns the runtime and the engine and
   does nothing but route: no decoding, no SQL, no JSON. The *reads pool*
   (`XYNE_SYNC_READ_THREADS`) renders the SQL, runs every storage read as one
   simple-query round trip on a pooled connection, decodes the rows, answers
@@ -399,8 +405,20 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   is closed and leaves its client group. A group's subscriptions, and its
   record of the rows it was sent, outlive its last connection by
   `XYNE_SYNC_GROUP_TTL_MS` (a minute by default, an hour in `.env.example`),
-  then are released; a client back within it is caught up, one back later
-  starts a fresh sync.
+  then are released. A client is owed everything after its cookie: a group
+  with no connection stands still (its changes wait, coalesced, and its
+  version does not move), so a client back within the lifetime is sent
+  the net of what it missed; a tab that joins a group under way without a
+  cookie is sent the group's whole state from its row ledger, the other
+  tabs undisturbed; a tab behind its group is replayed the pokes it missed
+  from the group's log (`XYNE_SYNC_GROUP_LOG_BYTES`); anything else
+  starts a fresh sync (`docs/client-resume-2026-09-21.md`).
+- **Bounded waits.** A storage read is given `XYNE_SYNC_READ_TIMEOUT_MS`
+  (10 s): PostgreSQL cancels the statement, the pool stops waiting, and the
+  query that needed it is refused by name rather than read again. A call
+  to the application server is given `XYNE_SYNC_BACKEND_TIMEOUT_MS` (30 s)
+  and is not repeated when it ran out of it
+  (`docs/feed-json-timeouts-2026-09-22.md`).
 - **Queries.** A desired query arrives as a name and arguments; the client side
   posts them to the application server's query endpoint (with the
   connection's cookies and origin, the way the reference server does) and gets query
@@ -440,7 +458,8 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   translates (its name and the application server's AST for it) is kept
   in that file, written every minute and on shutdown; the next process
   plans the kept shapes again, eight at a time for at most
-  `XYNE_SYNC_WARM_START_MS` (20 s), after the feed's first heartbeat and
+  `XYNE_SYNC_WARM_START_MS` (20 s), after the feed has passed the first
+  read snapshot and
   before `/health` turns `200`, so the first client of each shape after a
   restart hits the plan cache instead of paying the counts (`client/warm.rs`).
 - **Related windows.** A `related` subquery with `orderBy`/`limit` is the
@@ -474,7 +493,15 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   (`ValueType::Timestamp`, read through `extract(epoch …)` and parsed off the
   feed's text), `json` and `jsonb` travel as their text and are embedded as
   JSON on the wire (`ValueType::Json`), arrays as JSON arrays, enums and
-  uuids as strings; `bytea` is left out.
+  uuids as strings; `bytea` is left out. A JSON value has **one standard
+  text** wherever it comes from (`sync/pg/text.rs`): the text `jsonb`
+  writes, with a number as its plain digits (`1.50`, `1.5` and `15e-1` are
+  all `1.5`). A read selects `column::jsonb::text` (nothing for a `jsonb`
+  column, the conversion for a `json` one), the feed trims padded fractions
+  off a `jsonb` cell in one pass and rewrites a `json` cell (it knows which
+  from the column's type in the relation message), and a query's literal is
+  written the same way, so a filter on a JSON column means in the engine
+  what `column::jsonb = literal::jsonb` means in PostgreSQL.
 
 - **Query lifetimes.** A query nobody desires any more stays registered
   for the `ttl` the client gave it (capped at ten minutes, five when
@@ -567,7 +594,10 @@ cp .env.example .env              # set XYNE_SYNC_PG_DSN and the two endpoint UR
 cargo run --release --bin server
 node scripts/e2e-protocol.mjs   # two dev users, real mutations, fan-out, reconnects; PASS when the chain holds
 node scripts/smoke.mjs --prepare && node scripts/smoke.mjs   # no application needed: a PostgreSQL, the server (XYNE_SYNC_READ_ROW_LIMIT=600),
-                                     # a scripted Zero client; sync, schema refusal, heavy reads, and with SMOKE_COLLECTOR the OTLP push. CI runs it on the image
+                                     # a scripted Zero client; sync, a JSON filter, a client back after writes, late and lagging tabs,
+                                     # schema refusal, heavy reads, and with SMOKE_COLLECTOR the OTLP push. CI runs it on the image
+node scripts/load-smoke.mjs --connections 300 --writes 100 --duration 20 --away 100   # the same setup under load: delivery latency, the
+                                     # server's stage timings, and how connections that leave and return are answered
 node scripts/ui/ui-u2-channel.mjs    # one of the Playwright scripts that drive the dashboard with three users (scripts/ui/)
 node scripts/load-protocol.mjs --connections 200 --seed 3000 --seed-replies 2000 --rate 50 --duration 60 \
   --pid $(pgrep -f target/release/server)   # socket-level load: seed, hydrate, steady fan-out, CPU/RSS samples
@@ -782,7 +812,7 @@ src/
     pg/mod.rs              PgStorage: positioned REPEATABLE READ snapshots from exported-snapshot aliases, one round trip per read, on the reads pool
     pg/replication.rs      a minimal replication-protocol connection (mints the aliases)
     pg/sql.rs              model to SQL rendering
-    pg/stream.rs           PgStream: the streaming pgoutput feed (Transport + Feed halves), positioned writes, heartbeat progress marks
+    pg/stream.rs           PgStream: the streaming pgoutput feed (Transport + Feed halves), positioned writes, the position from commits and keepalives, the silent-feed watch
     pg/catalog.rs          the catalog read from information_schema, typed the way the protocol types Postgres
     pg/text.rs             the text forms of times, JSON arrays and array literals
     pg/threads.rs          the engine side over Postgres: the feed thread (decoding), the storage on the pool, the Service
@@ -794,7 +824,7 @@ src/
     plan.rs                the driver of every inner edge: one batch of counts, a fixed point, refusal, the plan cache
     wire.rs                rows and keys as the wire carries them, written straight into bytes
     backend.rs             the query and mutate endpoints of the application server
-    groups.rs              the group threads: client groups, held rows, drain-and-flush, pokes serialized once
+    groups.rs              the group threads: client groups, held rows, drain-and-flush, pokes serialized once; what a connecting client is owed since its cookie
     schema.rs              the client's schema against the catalog, judged as the reference server judges it: serve or SchemaVersionNotSupported
     connection.rs          one WebSocket connection: handshake, the schema's judgment, message loop, liveness, translate + plan, the writer
   log.rs                   a leveled stderr log, tapped by the telemetry exporter
@@ -830,7 +860,7 @@ Nine crates, all permissively licensed; the reason for each is beside it in
 | `serde`, `serde_json` | the protocol's messages and the ASTs | MIT OR Apache-2.0 |
 | `reqwest` (rustls) | the calls to the application server | MIT OR Apache-2.0 |
 | `base64`, `percent-encoding` | the handshake header | MIT OR Apache-2.0 |
-| `tokio-postgres` | SQL reads, slot and publication management, heartbeats | MIT OR Apache-2.0 |
+| `tokio-postgres` | SQL reads, slot and publication checks, asking the server where its log ends | MIT OR Apache-2.0 |
 | `postgres-protocol`, `fallible-iterator`, `bytes` | the replication-protocol connection that mints exported snapshots | MIT OR Apache-2.0, MIT OR Apache-2.0, MIT |
 | `pgwire-replication` | the change feed's replication connection (`START_REPLICATION`, feedback, transaction boundaries); TLS features off | Apache-2.0 OR MIT |
 | `pgoutput` | decoding the `pgoutput` row messages | MIT |
@@ -857,9 +887,12 @@ they are discussed rather than discovered:
    (insert-or-replace); no operation carries an ordering position.
 7. **Window ties and `NULL`s are pragmatic**, not SQL-exact (strict boundary,
    `NULL`/`NaN` largest, unenforceable boundary dropped).
-8. **One heartbeat per poll**: the feed's progress mark costs a tiny
-   committed transaction per poll (or per interval under the service); a
-   server that forbids `pg_logical_emit_message` needs another mark.
+8. **The feed's position on an idle database is PostgreSQL's keepalive**:
+   it is sent when the log moves past what the feed has confirmed, so a
+   database where nothing at all is written says nothing, and the position
+   stands still with the log. On a physical standby a fresh read snapshot
+   waits for the primary's next running-transactions record (every 15 s
+   while the primary writes), so snapshots rotate at that pace there.
 9. **Values are `Send` through a lock, not a copy**: `SharedSet` is an
    `Arc<RwLock<..>>` so a row, a query or a delta can cross a thread; the
    engine itself stays single-threaded (its index counters are `Rc`). Row

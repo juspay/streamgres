@@ -65,7 +65,7 @@ listed with their defaults so the manifest can carry them explicitly.
 
 | variable | value |
 |---|---|
-| `XYNE_SYNC_PG_DSN` | the application's PostgreSQL, the primary, reached directly (no PgBouncer: logical replication does not pass through it). The same value the reference server has as its upstream database |
+| `XYNE_SYNC_PG_DSN` | the application's PostgreSQL, reached directly (no PgBouncer: logical replication does not pass through it). The primary, as the reference server's upstream database is, or a replica of it, logical or physical: the server writes nothing to the database it follows (section 4) |
 | `XYNE_SYNC_QUERY_URL` | the backend's query endpoint, `http://<backend>:3001/api/sync/query`, as the reference server has it |
 | `XYNE_SYNC_MUTATE_URL` | the backend's push endpoint, `http://<backend>:3001/api/sync/push` |
 | `XYNE_SYNC_APP_ID` | the same app id the reference server runs with (default: see `src/client/config.rs`); with the shard it names the schema (`<app>_<shard>`) the backend records mutation ids in |
@@ -100,7 +100,8 @@ listed with their defaults so the manifest can carry them explicitly.
 | `XYNE_SYNC_SHARD` | `0` | |
 | `XYNE_SYNC_SLOT` | `xyne_sync` | the permanent replication slot; the publication is `<slot>_pub` |
 | `XYNE_SYNC_FORWARD_COOKIES` | `true` | the connection's cookies go to the backend's endpoints |
-| `XYNE_SYNC_HEARTBEAT_MS` | `1000` | the feed's heartbeat |
+| `XYNE_SYNC_READ_TIMEOUT_MS` | `10000` | how long one storage read may take before PostgreSQL is told to cancel it and the query that needed it is refused by name (`reason="read_timeout"`); `0` sets no limit |
+| `XYNE_SYNC_BACKEND_TIMEOUT_MS` | `30000` | how long one call to the backend (a transform, a push) may take; a call that timed out is not made again; `0` sets no limit |
 | `XYNE_SYNC_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is minted |
 | `XYNE_SYNC_JOIN_LIMIT` | `100000` | the most rows the planner lets one side of a join read |
 | `XYNE_SYNC_JOIN_PREFERRED_SIDE` | `parent` | which side of an inner join drives when both fit |
@@ -108,6 +109,7 @@ listed with their defaults so the manifest can carry them explicitly.
 | `XYNE_SYNC_TRANSFORM_TTL_MS`, `XYNE_SYNC_TRANSFORM_CACHE` | `60000`, `20000` | the backend's query transforms remembered per identity; the reference server keeps its own for 5 s, which cost a hydration about 8 ms at the median on the test rig |
 | `XYNE_SYNC_WARM_START_MS` | `20000` | the most time spent planning the kept shapes at start |
 | `XYNE_SYNC_PING_INTERVAL_MS`, `XYNE_SYNC_CLIENT_TIMEOUT_MS`, `XYNE_SYNC_PONG_INTERVAL_MS` | `30000`, `45000`, `3000` | liveness of a connection |
+| `XYNE_SYNC_GROUP_LOG_BYTES` | `262144` | bytes of its most recent pokes a client group keeps, so a tab that returns behind its group is sent what it missed instead of starting over; `0` keeps none |
 | `XYNE_SYNC_MAX_MESSAGE_BYTES` | `16777216` | the largest inbound message |
 | `XYNE_SYNC_ROWS_PER_PART` | `500` | row operations per poke part |
 | `XYNE_SYNC_LOG` | `info` | `error`, `warn`, `info`, `debug` |
@@ -122,10 +124,41 @@ listed with their defaults so the manifest can carry them explicitly.
   permanent slot, and short-lived ones, `xyne_sync_snap_*`, behind the read
   snapshots), about 40 connections (`XYNE_SYNC_READ_CONNECTIONS` plus the
   feed and a handful).
-- The role needs `REPLICATION`, `SELECT` on the served schemas, and at the
-  first start the right to `CREATE PUBLICATION xyne_sync_pub FOR ALL
-  TABLES`, which only a superuser has; on a managed database create that
-  publication once by hand and the server finds it.
+- The role needs `REPLICATION` and `SELECT` on the served schemas.
+- **The server writes nothing to the database it follows.** It reads rows,
+  and it reads the change feed, whose position comes from what PostgreSQL
+  sends anyway (each commit, and the keepalives that say how far the log
+  has been gone through). So `XYNE_SYNC_PG_DSN` may name the primary, a
+  logical replica, or a physical standby (PostgreSQL 16 or later, which is
+  when a standby learned logical decoding).
+- **The slot and the publication are created only when they are missing.**
+  At start the server looks for the publication `<slot>_pub` and the slot
+  `<slot>`; what exists is used as it is. To keep creation in your own
+  hands, run once, on the primary:
+
+  ```sql
+  CREATE PUBLICATION xyne_sync_pub FOR ALL TABLES;
+  ```
+
+  and on the server `XYNE_SYNC_PG_DSN` names (the standby itself, when it
+  is one):
+
+  ```sql
+  SELECT pg_create_logical_replication_slot('xyne_sync', 'pgoutput');
+  ```
+
+  `CREATE PUBLICATION ... FOR ALL TABLES` needs a superuser, and a standby
+  cannot run it at all (it reaches the standby through replication); a
+  server started against a standby without it stops and says which
+  statement to run on the primary.
+- On a physical standby a read snapshot (a temporary slot,
+  `xyne_sync_snap_*`) waits for the primary's next running-transactions
+  record, which a busy primary writes every 15 s; reads keep using the
+  snapshot they have until the next one is ready, so this costs memory for
+  the writes kept in between and no correctness. `SELECT
+  pg_log_standby_snapshot()` on the primary (PostgreSQL 16) forces one.
+  Set `hot_standby_feedback = on` on the standby so the primary's vacuum
+  does not cancel the snapshots.
 - Tables without a primary key are left out, as are columns of types the
   wire cannot carry (`bytea`); the startup log lists both.
 - **Connections to PostgreSQL are not encrypted.** If the database
@@ -153,14 +186,16 @@ from. The ones to have on day one:
 | a query was refused | `increase(xyne_sync_queries_refused_total[5m]) > 0`; `/stats.refused_queries` and the `query refused` event name it |
 | the engine is running out of its one core | `rate(xyne_sync_engine_busy_seconds_total[5m]) > 0.7` |
 | writes reach clients late | p99 of `xyne_sync_end_to_end_seconds` above 0.5 s |
-| the feed is behind or silent | p99 of `xyne_sync_feed_lag_seconds` above 5 s; `xyne_sync_feed_heartbeat_age_seconds > 30` |
+| the feed is behind or silent | p99 of `xyne_sync_feed_lag_seconds` above 5 s; `xyne_sync_feed_heartbeat_age_seconds > 90`. The server handles a dead connection itself: after 10 s of silence it asks PostgreSQL whether a walsender still holds its slot, and reopens the slot when none does, which PostgreSQL decides after `wal_sender_timeout` (60 s by default; keep it set) without hearing from the peer (the `change feed ... giving the connection up` warning). The alert is for when that does not help. On a standby of a primary that writes nothing at all the age grows although nothing is wrong |
+| reads are timing out | `increase(xyne_sync_queries_refused_total{reason="read_timeout"}[5m]) > 0`: a storage read ran past `XYNE_SYNC_READ_TIMEOUT_MS`; the `query refused` event names the query and the table |
 | memory | `xyne_sync_process_rss_bytes > 6e9` |
 | clients built for another database | `increase(xyne_sync_connections_total{event="refused"}[5m]) > 0` |
 
 ## 6. Probes, ports, shutdown
 
 - `GET /health` (also `/healthz`, `/readyz`, and each under the base
-  path): `503` until the change feed's first heartbeat and the warm start,
+  path): `503` until the change feed has passed the first read snapshot
+  (a fraction of a second) and the warm start,
   `200` after. Use it for readiness and liveness; give startup 60 s.
 - One port, 4848: the WebSocket under `<base path>/sync/v51/connect`, and
   `/health`, `/metrics`, `/stats`. Keep `/metrics` and `/stats` inside the
