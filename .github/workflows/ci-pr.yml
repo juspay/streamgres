@@ -102,6 +102,15 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
 
+      # The base branch is checked out before the cache step: the cache
+      # restores ../base/target, which would otherwise create ../base and
+      # make the worktree step refuse a path that already exists; and the
+      # cache key then sees the base branch's lock file too.
+      - name: Check out the base branch beside the repository
+        run: |
+          git worktree remove --force ../base 2>/dev/null || rm -rf ../base
+          git worktree add --detach ../base "origin/${{ github.base_ref }}"
+
       - name: Install rust cache
         uses: Swatinem/rust-cache@v2.7.7
         with:
@@ -113,9 +122,7 @@ jobs:
         run: cargo build --release --locked --bin bench
 
       - name: Build the benchmark of the base branch
-        run: |
-          git worktree add ../base "origin/${{ github.base_ref }}"
-          cargo build --release --locked --bin bench --manifest-path ../base/Cargo.toml
+        run: cargo build --release --locked --bin bench --manifest-path ../base/Cargo.toml
 
       - name: Run both, alternating, five rounds
         run: |
