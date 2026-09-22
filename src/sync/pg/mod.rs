@@ -101,6 +101,44 @@ pub fn read_row_limit() -> usize {
         .unwrap_or(DEFAULT_READ_ROW_LIMIT)
 }
 
+/// How the kernel probes a connection to the database while it is silent,
+/// so that whatever is between (a NAT, a load balancer) does not drop it as
+/// idle. Applied to every connection the storage opens; it matters most to
+/// the minters', which is silent for as long as its alias lives and takes
+/// the alias's snapshot with it when it goes.
+///
+/// - `idle`: how long without a byte either way before the first probe;
+///   zero turns the probing off.
+/// - `interval`: how long after an unanswered probe the next one goes
+///   out; zero leaves the kernel's default.
+/// - `retries`: how many probes in a row may go unanswered before the
+///   kernel gives the connection up; zero leaves the kernel's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Keepalive {
+    pub idle: Duration,
+    pub interval: Duration,
+    pub retries: u32,
+}
+
+impl Keepalive {
+    /// Put these settings on `config`, for every connection opened from
+    /// it: tokio-postgres applies them to the connections it opens, and
+    /// [`replication::ReplicationConnection::open`] to the one it opens.
+    pub fn apply(self, config: &mut Config) {
+        if self.idle.is_zero() {
+            config.keepalives(false);
+            return;
+        }
+        config.keepalives(true).keepalives_idle(self.idle);
+        if !self.interval.is_zero() {
+            config.keepalives_interval(self.interval);
+        }
+        if self.retries > 0 {
+            config.keepalives_retries(self.retries);
+        }
+    }
+}
+
 /// One minted alias: an exported snapshot and the consistent point it
 /// was built at, alive as long as the replication connection that created
 /// its temporary slot.
@@ -287,7 +325,17 @@ impl PgStorage {
         catalog: Arc<Catalog>,
         runtime: Handle,
     ) -> Result<Self, StorageError> {
-        let config: Config = dsn.parse()?;
+        Self::connect_configured(dsn.parse()?, catalog, runtime).await
+    }
+
+    /// Connect as [`PgStorage::connect_on`] does, from a `config` already
+    /// parsed and, say, given a [`Keepalive`]: every connection the storage
+    /// opens, the reads' and the minters', is opened from it.
+    pub async fn connect_configured(
+        config: Config,
+        catalog: Arc<Catalog>,
+        runtime: Handle,
+    ) -> Result<Self, StorageError> {
         let client = open(&config, &runtime).await?;
         let pool = Arc::new(Pool {
             config,
@@ -532,19 +580,14 @@ impl Pool {
         }
     }
 
-    /// How a read's connection is opened: `config`, with TCP keepalive
-    /// probes that find a dead peer within half a minute of idling (the
-    /// driver's default is two hours), and the read timeout as both the
-    /// time the connection may take to open and the session's
-    /// `statement_timeout`, after whatever options the connection string
-    /// already carries.
+    /// How a read's connection is opened: `config` (which carries the
+    /// [`Keepalive`] the storage was given, if any, so the kernel probes
+    /// the connection while it sits idle in the pool), and the read
+    /// timeout as both the time the connection may take to open and the
+    /// session's `statement_timeout`, after whatever options the
+    /// connection string already carries.
     fn read_config(&self) -> Config {
         let mut config = self.config.clone();
-        config
-            .keepalives(true)
-            .keepalives_idle(Duration::from_secs(15))
-            .keepalives_interval(Duration::from_secs(5))
-            .keepalives_retries(3);
         if let Some(limit) = self.timeout() {
             config.connect_timeout(limit);
             let ours = format!("-c statement_timeout={}", limit.as_millis());
@@ -751,6 +794,47 @@ fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A keepalive goes onto the connection settings whole; an idle time
+    /// of zero turns the probing off, and a zero interval or count leaves
+    /// the kernel's default in place.
+    #[test]
+    fn keepalive_settings_reach_the_connection_config() {
+        let mut config = Config::new();
+        Keepalive {
+            idle: Duration::from_secs(30),
+            interval: Duration::from_secs(10),
+            retries: 3,
+        }
+        .apply(&mut config);
+        assert!(config.get_keepalives());
+        assert_eq!(config.get_keepalives_idle(), Duration::from_secs(30));
+        assert_eq!(
+            config.get_keepalives_interval(),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(config.get_keepalives_retries(), Some(3));
+
+        let mut config = Config::new();
+        Keepalive {
+            idle: Duration::from_secs(5),
+            interval: Duration::ZERO,
+            retries: 0,
+        }
+        .apply(&mut config);
+        assert_eq!(config.get_keepalives_idle(), Duration::from_secs(5));
+        assert_eq!(config.get_keepalives_interval(), None);
+        assert_eq!(config.get_keepalives_retries(), None);
+
+        let mut config = Config::new();
+        Keepalive {
+            idle: Duration::ZERO,
+            interval: Duration::from_secs(10),
+            retries: 3,
+        }
+        .apply(&mut config);
+        assert!(!config.get_keepalives());
+    }
 
     /// Data and syntax errors are permanent; the class-42 codes a schema
     /// change or a grant can cure, and everything else, are not.

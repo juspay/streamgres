@@ -41,6 +41,10 @@ pgoutput = "0.0.7"
 postgres-protocol = "0.6"
 fallible-iterator = "0.2"
 bytes = "1"
+# TCP keepalive on that connection (`keep_alive` there): nothing can be sent
+# on it without discarding its snapshot, so the kernel probes it instead.
+# The crate tokio-postgres uses for the same on the connections it opens.
+socket2 = { version = "0.6", features = ["all"] }
 
 # The client side (`src/client`): message encoding, the
 # HTTP calls to the application server, and the WebSocket handshake.

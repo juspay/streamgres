@@ -101,6 +101,7 @@ listed with their defaults so the manifest can carry them explicitly.
 | `XYNE_SYNC_SLOT` | `xyne_sync` | the permanent replication slot; the publication is `<slot>_pub` |
 | `XYNE_SYNC_FORWARD_COOKIES` | `true` | the connection's cookies go to the backend's endpoints |
 | `XYNE_SYNC_READ_TIMEOUT_MS` | `10000` | how long one storage read may take before PostgreSQL is told to cancel it and the query that needed it is refused by name (`reason="read_timeout"`); `0` sets no limit |
+| `XYNE_SYNC_PG_KEEPALIVE_IDLE_MS`, `XYNE_SYNC_PG_KEEPALIVE_INTERVAL_MS`, `XYNE_SYNC_PG_KEEPALIVE_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on every connection to the database: after the idle time without a byte either way the kernel probes the peer, again at the interval while unanswered, and gives the connection up after that many unanswered in a row. Keep the idle time under whatever a NAT or load balancer between drops silent flows at (section 4); `0` turns the probing off |
 | `XYNE_SYNC_BACKEND_TIMEOUT_MS` | `30000` | how long one call to the backend (a transform, a push) may take; a call that timed out is not made again; `0` sets no limit |
 | `XYNE_SYNC_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is minted |
 | `XYNE_SYNC_JOIN_LIMIT` | `100000` | the most rows the planner lets one side of a join read |
@@ -159,6 +160,19 @@ listed with their defaults so the manifest can carry them explicitly.
   pg_log_standby_snapshot()` on the primary (PostgreSQL 16) forces one.
   Set `hot_standby_feedback = on` on the standby so the primary's vacuum
   does not cancel the snapshots.
+- **The connection behind each read snapshot is silent for its whole
+  life.** Nothing may be sent on it, since any command discards the
+  snapshot, so TCP keepalive is all that keeps it through a NAT or a load
+  balancer (`XYNE_SYNC_PG_KEEPALIVE_*`, section 3), from both ends: the
+  session asks PostgreSQL to probe it with the same values. Its session is
+  idle in a transaction the whole time, and it turns
+  `idle_in_transaction_session_timeout` off for itself at connect (a
+  setting any role may make for its own session), since that timeout
+  would end the session at its interval, the snapshot with it, and reads
+  would fail with `snapshot "…" does not exist` until the next one is
+  minted. Nothing else on the database side may end an idle session
+  short of a restart, a failover, or a recovery conflict on a standby
+  without `hot_standby_feedback`.
 - Tables without a primary key are left out, as are columns of types the
   wire cannot carry (`bytea`); the startup log lists both.
 - **Connections to PostgreSQL are not encrypted.** If the database

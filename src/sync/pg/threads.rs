@@ -19,7 +19,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::spawn_local;
 
-use super::{Feed, PgStorage, Transport, load_catalog};
+use super::{Feed, Keepalive, PgStorage, Transport, load_catalog};
 use crate::ivm::MultiTableIVM;
 use crate::log::{log_error, log_info, log_warn};
 use crate::model::{Catalog, MultiTableReadQuery, TableName};
@@ -38,6 +38,8 @@ use crate::sync::{Command, Event, Runtime, Service, Sources, Transaction};
 /// - `read_timeout`: how long one storage read may take before it is
 ///   given up and refused; zero for no limit.
 /// - `read_threads`: how many threads the reads pool runs on.
+/// - `keepalive`: how the kernel probes a silent connection to the
+///   database so that nothing between drops it ([`Keepalive`]).
 /// - `watched`: tables whose writes are copied to the consumer as they
 ///   are decoded, besides being routed like every other write.
 #[derive(Debug, Clone)]
@@ -49,6 +51,7 @@ pub struct Settings {
     pub read_connections: usize,
     pub read_timeout: Duration,
     pub read_threads: usize,
+    pub keepalive: Keepalive,
     pub watched: Vec<TableName>,
 }
 
@@ -168,7 +171,12 @@ pub async fn start(
     consumers: usize,
     stats: Arc<Stats>,
 ) -> Result<(Started, ServiceTask), String> {
-    let pg = PgStorage::connect_on(&settings.dsn, catalog.clone(), reads)
+    let mut config: tokio_postgres::Config = settings
+        .dsn
+        .parse()
+        .map_err(|error| format!("connecting the storage: {error}"))?;
+    settings.keepalive.apply(&mut config);
+    let pg = PgStorage::connect_configured(config, catalog.clone(), reads)
         .await
         .map_err(|error| format!("connecting the storage: {error}"))?
         .with_rotation(settings.snapshot_rotation)

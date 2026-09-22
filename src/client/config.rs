@@ -11,7 +11,7 @@ use std::time::Duration;
 use super::plan::{Policy, Side};
 use crate::log::{Format, Level};
 use crate::model::TableName;
-use crate::sync::pg::Settings;
+use crate::sync::pg::{Keepalive, Settings};
 
 /// Everything the server reads from the environment.
 #[derive(Debug, Clone)]
@@ -46,6 +46,20 @@ pub struct Config {
     /// `XYNE_SYNC_READ_THREADS`: how many threads run the storage reads,
     /// their connections and their row decoding (2).
     pub read_threads: usize,
+    /// `XYNE_SYNC_PG_KEEPALIVE_IDLE_MS`: how long a connection to the
+    /// database may go without a byte either way before the kernel probes
+    /// the peer, so that nothing between (a NAT, a load balancer) drops it
+    /// as idle. The connection behind each read snapshot is silent for its
+    /// whole life, and the snapshot dies with it (30000; 0 turns the
+    /// probing off).
+    pub pg_keepalive_idle: Duration,
+    /// `XYNE_SYNC_PG_KEEPALIVE_INTERVAL_MS`: how long after an unanswered
+    /// probe the next one goes out (10000; 0 leaves the kernel's default).
+    pub pg_keepalive_interval: Duration,
+    /// `XYNE_SYNC_PG_KEEPALIVE_RETRIES`: how many probes in a row may go
+    /// unanswered before the kernel gives the connection up (3; 0 leaves
+    /// the kernel's default).
+    pub pg_keepalive_retries: u32,
     /// `XYNE_SYNC_GROUP_THREADS`: how many threads keep the client groups'
     /// views and build their pokes, each owning a share of the groups (1).
     pub group_threads: usize,
@@ -259,6 +273,14 @@ impl Config {
                     })?,
                 None => 2,
             },
+            pg_keepalive_idle: millis("XYNE_SYNC_PG_KEEPALIVE_IDLE_MS", 30_000)?,
+            pg_keepalive_interval: millis("XYNE_SYNC_PG_KEEPALIVE_INTERVAL_MS", 10_000)?,
+            pg_keepalive_retries: match first(&["XYNE_SYNC_PG_KEEPALIVE_RETRIES"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("XYNE_SYNC_PG_KEEPALIVE_RETRIES must be a number, got `{text}`")
+                })?,
+                None => 3,
+            },
             group_threads: match first(&["XYNE_SYNC_GROUP_THREADS"]) {
                 Some(text) => text
                     .parse::<usize>()
@@ -355,7 +377,76 @@ impl Config {
             read_connections: self.read_connections,
             read_timeout: self.read_timeout,
             read_threads: self.read_threads,
+            keepalive: Keepalive {
+                idle: self.pg_keepalive_idle,
+                interval: self.pg_keepalive_interval,
+                retries: self.pg_keepalive_retries,
+            },
             watched: vec![TableName::from(self.clients_table().as_str())],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The configuration `vars` describe, over the three variables that
+    /// have no default.
+    fn config(vars: &[(&str, &str)]) -> Result<Config, String> {
+        Config::from_lookup(|name| match name {
+            "XYNE_SYNC_PG_DSN" => Some("postgresql://u:p@db/app".to_owned()),
+            "XYNE_SYNC_QUERY_URL" => Some("http://app/query".to_owned()),
+            "XYNE_SYNC_MUTATE_URL" => Some("http://app/push".to_owned()),
+            _ => vars
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned()),
+        })
+    }
+
+    /// Left alone, the database connections are probed after 30 s of
+    /// silence, every 10 s while unanswered, three times.
+    #[test]
+    fn the_keepalive_has_its_defaults() {
+        let keepalive = config(&[]).unwrap().engine_settings().keepalive;
+        assert_eq!(
+            keepalive,
+            Keepalive {
+                idle: Duration::from_secs(30),
+                interval: Duration::from_secs(10),
+                retries: 3,
+            }
+        );
+    }
+
+    /// The three variables set the probing and reach the engine's settings.
+    #[test]
+    fn the_keepalive_is_read_from_the_environment() {
+        let keepalive = config(&[
+            ("XYNE_SYNC_PG_KEEPALIVE_IDLE_MS", "5000"),
+            ("XYNE_SYNC_PG_KEEPALIVE_INTERVAL_MS", "2000"),
+            ("XYNE_SYNC_PG_KEEPALIVE_RETRIES", "5"),
+        ])
+        .unwrap()
+        .engine_settings()
+        .keepalive;
+        assert_eq!(
+            keepalive,
+            Keepalive {
+                idle: Duration::from_secs(5),
+                interval: Duration::from_secs(2),
+                retries: 5,
+            }
+        );
+    }
+
+    /// A value that is not a number is refused by the variable's name.
+    #[test]
+    fn a_malformed_keepalive_is_refused_by_name() {
+        let error = config(&[("XYNE_SYNC_PG_KEEPALIVE_RETRIES", "three")]).unwrap_err();
+        assert!(error.contains("XYNE_SYNC_PG_KEEPALIVE_RETRIES"), "{error}");
+        let error = config(&[("XYNE_SYNC_PG_KEEPALIVE_IDLE_MS", "soon")]).unwrap_err();
+        assert!(error.contains("XYNE_SYNC_PG_KEEPALIVE_IDLE_MS"), "{error}");
     }
 }
