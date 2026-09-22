@@ -31,12 +31,12 @@ use crate::sync::{Command, Event, Runtime, Service, Sources, Transaction};
 /// - `dsn`: the database, with the user and password in the URL.
 /// - `slot`: the permanent replication slot of the change feed.
 /// - `schemas`: the schemas whose tables the catalog carries.
-/// - `heartbeat`: how often the feed emits a heartbeat so the engine's
-///   position moves while nothing is written.
 /// - `snapshot_rotation`: how often a fresh exported snapshot is minted
 ///   for reads.
 /// - `read_connections`: how many storage reads may hold a connection at
 ///   once.
+/// - `read_timeout`: how long one storage read may take before it is
+///   given up and refused; zero for no limit.
 /// - `read_threads`: how many threads the reads pool runs on.
 /// - `watched`: tables whose writes are copied to the consumer as they
 ///   are decoded, besides being routed like every other write.
@@ -45,12 +45,18 @@ pub struct Settings {
     pub dsn: String,
     pub slot: String,
     pub schemas: Vec<String>,
-    pub heartbeat: Duration,
     pub snapshot_rotation: Duration,
     pub read_connections: usize,
+    pub read_timeout: Duration,
     pub read_threads: usize,
     pub watched: Vec<TableName>,
 }
+
+/// How often the feed thread tells the engine where the feed is without a
+/// transaction to carry the news: the most a snapshot minted while
+/// nothing is being written waits before reads move onto it, and a server
+/// on a quiet database before it says it is ready.
+const POSITION_EVERY: Duration = Duration::from_millis(200);
 
 /// The running engine side: commands in, one event stream per consumer
 /// (the consumer of a client being the one at its id modulo their count),
@@ -116,7 +122,7 @@ pub fn spawn_feed(
                             failures = 0;
                             let outcome = transport
                                 .stream(
-                                    settings.heartbeat,
+                                    POSITION_EVERY,
                                     Feed::new(catalog.clone()),
                                     &settings.watched,
                                     out.clone(),
@@ -166,7 +172,8 @@ pub async fn start(
         .await
         .map_err(|error| format!("connecting the storage: {error}"))?
         .with_rotation(settings.snapshot_rotation)
-        .with_read_connections(settings.read_connections);
+        .with_read_connections(settings.read_connections)
+        .with_read_timeout(settings.read_timeout);
     let pg = Arc::new(pg);
     let cached = Sources::cached_from_env();
     let storage = Rc::new(Sources::new(pg.clone(), catalog.clone(), cached.clone()));

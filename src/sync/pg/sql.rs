@@ -95,15 +95,16 @@ pub fn cast_of(declared: &ValueType) -> &'static str {
 }
 
 /// The SQL reading one column in the form the engine keeps it: a time
-/// column as epoch milliseconds, a JSON, array or map column as JSON text,
-/// every other cast to its declared type's Postgres form.
+/// column as epoch milliseconds, a JSON column as the text of its `jsonb`
+/// (the cast is nothing for a `jsonb` column, and gives a `json` column's
+/// stored text the one spelling `jsonb` has), an array or map column as
+/// JSON text, every other cast to its declared type's Postgres form.
 pub fn select_expr(column: &str, declared: &ValueType) -> String {
     let quoted = quote_ident(column);
     match declared {
         ValueType::Timestamp => epoch_millis(&quoted),
-        ValueType::Json | ValueType::List(_) | ValueType::Map(_, _) => {
-            format!("to_json({quoted})::text")
-        }
+        ValueType::Json => format!("{quoted}::jsonb::text"),
+        ValueType::List(_) | ValueType::Map(_, _) => format!("to_json({quoted})::text"),
         other => format!("{quoted}::{}", cast_of(other)),
     }
 }
@@ -116,16 +117,26 @@ fn epoch_millis(expr: &str) -> String {
 
 /// A column as the SQL its conditions compare it by: the bare column, so
 /// an index on it answers the comparison; a time column's literal is
-/// converted instead ([`literal_as`]).
-fn column_expr(column: &str, _table: &DbTable) -> String {
-    quote_ident(column)
+/// converted instead ([`literal_as`]). A JSON column is compared as
+/// `jsonb`, which a `json` column has to be turned into (it has no
+/// equality of its own) and a `jsonb` column already is: the cast of a
+/// `jsonb` column is the bare column, index and all.
+fn column_expr(column: &str, table: &DbTable) -> String {
+    match table.column(column).map(|declared| &declared.r#type) {
+        Some(ValueType::Json) => format!("{}::jsonb", quote_ident(column)),
+        _ => quote_ident(column),
+    }
 }
 
 /// A literal compared against a column of `declared` type: the engine
 /// keeps a time as milliseconds since the epoch, so against a time
 /// column the number becomes the timestamp it names, and the column
-/// itself stays bare for the index.
+/// itself stays bare for the index; against a JSON column the text the
+/// engine holds is the `jsonb` it names.
 fn literal_as(value: &Value, declared: Option<&ValueType>) -> String {
+    if let (Value::String(text), Some(ValueType::Json)) = (value, declared) {
+        return format!("{}::jsonb", quote_literal(text));
+    }
     let millis = match (value, declared) {
         (Value::Int(millis), Some(ValueType::Timestamp)) => *millis,
         (Value::Float(millis), Some(ValueType::Timestamp)) if millis.is_finite() => *millis as i64,
@@ -415,5 +426,57 @@ mod tests {
             sql.ends_with("ORDER BY \"points\" DESC NULLS FIRST LIMIT 5"),
             "{sql}"
         );
+    }
+
+    /// A JSON column is compared as `jsonb` with the literal cast to it,
+    /// in a condition, in a list and in a count, so neither a `json`
+    /// column (which has no equality) nor a text literal (which is not
+    /// JSON) makes Postgres refuse the statement.
+    #[test]
+    fn a_json_column_is_compared_as_jsonb() {
+        let values = DbTable::new(
+            "form_entity_values",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::String),
+                DbColumn::new("fieldId", ValueType::String),
+                DbColumn::new("actualFieldValue", ValueType::Json),
+            ],
+        );
+        let query = SingleTableReadQuery::new(
+            "form_entity_values",
+            Where::AND(vec![
+                Where::condition("fieldId", ComparisonOperator::EQ, "f1"),
+                Where::OR(vec![
+                    Where::condition("actualFieldValue", ComparisonOperator::EQ, "\"high\""),
+                    Where::condition(
+                        "actualFieldValue",
+                        ComparisonOperator::IN,
+                        Value::List(vec![Value::from("5"), Value::from("true")]),
+                    ),
+                ]),
+            ]),
+            OrderBy::new("id", crate::model::Order::ASC),
+            u32::MAX,
+        );
+        let sql = select_sql(&query, &values);
+        assert!(
+            sql.contains("\"actualFieldValue\"::jsonb = '\"high\"'::jsonb"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("\"actualFieldValue\"::jsonb IN ('5'::jsonb, 'true'::jsonb)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("\"fieldId\" = 'f1'"),
+            "a text column stays bare: {sql}"
+        );
+        assert!(
+            sql.starts_with("SELECT \"id\"::text, \"actualFieldValue\"::jsonb::text,"),
+            "the cell is read as the text of its jsonb: {sql}"
+        );
+        let count = count_sql(&query, &values, 100);
+        assert!(count.contains("'\"high\"'::jsonb"), "{count}");
     }
 }

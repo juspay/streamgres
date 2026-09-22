@@ -10,10 +10,10 @@
 //! from the plan cache or by counting on the reads pool) and mutations are
 //! forwarded to the application server, all from here, on the server's
 //! threads; the group thread only ever sees planned trees. Nothing is
-//! planned before the engine's first heartbeat: a connection that arrives
-//! earlier waits for it (the writer keeps answering the client's pings
-//! meanwhile), and `/health` says the same thing to whoever starts the
-//! process.
+//! planned before the change feed has passed the first read snapshot: a
+//! connection that arrives earlier waits for it (the writer keeps
+//! answering the client's pings meanwhile), and `/health` says the same
+//! thing to whoever starts the process.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -102,7 +102,8 @@ struct ConnectParams {
 }
 
 /// The routes: the connect endpoint under the base path, a health check
-/// (`503` until the first heartbeat, `200` once queries are served), and
+/// (`503` until the change feed has passed the first read snapshot, `200`
+/// once queries are served), and
 /// the server's measurements (`/stats`; `?reset=1` also zeroes the
 /// histograms after reading them, so a load run measures itself alone).
 pub fn router(state: Arc<AppState>) -> Router {
@@ -232,7 +233,7 @@ fn readiness(ready: bool) -> (StatusCode, &'static str) {
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "waiting for the change feed's first heartbeat",
+            "waiting for the change feed to pass the first read snapshot",
         )
     }
 }
@@ -410,17 +411,28 @@ async fn handle(
         lmids,
         reply: reply_tx,
     };
-    let accepted = match requests.send(request).await {
-        Ok(()) => matches!(reply_rx.await, Ok(ConnectReply::Accepted)),
-        Err(_) => false,
+    let refusal = match requests.send(request).await {
+        Ok(()) => match reply_rx.await {
+            Ok(ConnectReply::Accepted) => None,
+            Ok(ConnectReply::Reset { reason }) => Some(reason),
+            Err(_) => Some("the group thread is gone".to_owned()),
+        },
+        Err(_) => Some("the group thread is gone".to_owned()),
     };
-    if !accepted {
-        log_info!("connection {wsid}: client group {group_id} must start over");
+    if let Some(reason) = refusal {
+        log_event!(
+            Level::Info,
+            "client told to start over",
+            wsid = wsid,
+            group = group_id,
+            cookie = conn.params.base_cookie.as_deref().unwrap_or(""),
+            reason = reason
+        );
         send(
             &out,
             protocol::error(
                 "InvalidConnectionRequestBaseCookie",
-                "the server holds no sync state for this client group; start a fresh sync",
+                &format!("{reason}; start a fresh sync"),
             ),
         );
         let _ = out.send(Outbound::Close);
@@ -1104,9 +1116,9 @@ impl LmidReader {
 mod tests {
     use super::*;
 
-    /// The health check refuses until the first heartbeat and answers
-    /// `ok` after it, so a process manager waits for the feed, not the
-    /// socket.
+    /// The health check refuses until the feed is past the first snapshot
+    /// and answers `ok` after it, so a process manager waits for the feed,
+    /// not the socket.
     #[test]
     fn health_follows_readiness() {
         assert_eq!(readiness(false).0, StatusCode::SERVICE_UNAVAILABLE);

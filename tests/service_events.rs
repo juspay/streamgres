@@ -638,3 +638,61 @@ fn a_heavy_read_is_told_to_the_subscriptions_owner() {
         );
     });
 }
+
+/// A feed that reopens its slot is sent again the transactions the server
+/// had not seen confirmed. The driver applies each transaction once: one
+/// that committed at or below where the engine already is goes by
+/// without a second event, a position mark is a step with nothing in it,
+/// and the transactions after the repeat are applied as ever.
+#[test]
+fn a_transaction_the_feed_repeats_is_applied_once() {
+    block_on(async {
+        let storage = Rc::new(MemoryStorage::new());
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let (feed, transactions) = mpsc::channel(16);
+        let (service, commands) = Service::new(MultiTableIVM::new(), storage, events_tx);
+        spawn_local(service.with_feed(transactions).run());
+        commands
+            .send(Command::Register {
+                sink: 0,
+                query: open_tickets(),
+                token: 1,
+            })
+            .await
+            .expect("send");
+        drain(&mut events).await;
+
+        let committed = |id: i64, at: u64| {
+            let mut transaction = Transaction::new(vec![insert(id, "OPEN")], Lsn(at));
+            transaction.committed_at_micros = 1;
+            transaction
+        };
+        assert!(Transaction::mark(Lsn(5)).is_mark());
+        assert!(!committed(1, 10).is_mark());
+        assert!(committed(1, 10).repeats(Lsn(10)));
+        assert!(!committed(1, 10).repeats(Lsn(9)));
+        assert!(!Transaction::mark(Lsn(5)).repeats(Lsn(10)));
+
+        feed.send(committed(1, 10)).await.expect("feed");
+        feed.send(committed(2, 20)).await.expect("feed");
+        feed.send(Transaction::mark(Lsn(25))).await.expect("feed");
+        feed.send(committed(2, 20)).await.expect("feed");
+        feed.send(committed(1, 10)).await.expect("feed");
+        feed.send(committed(3, 30)).await.expect("feed");
+        let seen = drain(&mut events).await;
+        assert_eq!(
+            shapes(&seen),
+            vec!["committed", "committed", "committed", "committed"],
+            "two transactions, the mark, and the one after the repeats"
+        );
+        assert_eq!(ids(&seen), vec![1, 2, 3], "each row added once");
+        let positions: Vec<Lsn> = seen
+            .iter()
+            .filter_map(|event| match event {
+                Event::Committed { position, .. } => Some(*position),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(positions, vec![Lsn(10), Lsn(20), Lsn(25), Lsn(30)]);
+    });
+}

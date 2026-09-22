@@ -9,14 +9,47 @@
 //! `START_REPLICATION`, standby feedback; it decodes the transaction
 //! boundaries) and the row messages are decoded by the `pgoutput` crate;
 //! this module only maps decoded tuples onto the catalog's tables and
-//! types. Progress marks come from **heartbeats**: each poll commits a
-//! tiny `pg_logical_emit_message` and waits until the feed returns it.
-//! Decoding emits whole transactions in commit order, so once the
-//! heartbeat's commit is back every transaction committed before it has
-//! been delivered, and the heartbeat's own position is the mark.
+//! types.
+//!
+//! # Where the feed is
+//!
+//! The feed writes nothing to the database, so it follows a primary, a
+//! logical replica and a physical standby alike. Its position comes from
+//! what the server sends anyway. A **commit** carries the end of its
+//! record, and decoding emits whole transactions in commit order, so
+//! every transaction committed before it has been delivered. A
+//! **keepalive** carries the location the server has decoded up to: the
+//! server sends one whenever it has gone through log that held nothing
+//! for this slot (another database's writes, a vacuum, a checkpoint, the
+//! record a snapshot's slot is built from) and is about to wait for more,
+//! as long as that location is past what the feed has confirmed; every
+//! transaction that committed at or below it was sent before it on the
+//! same connection. Both are confirmed back to the slot, so the server
+//! keeps no log for a feed that is only idle. While the log stands still
+//! the position does too, and nothing is owed: a snapshot cannot be
+//! ahead of a log that has not moved.
+//!
+//! # A feed that has gone silent
+//!
+//! A connection can die without either end being told (a network that
+//! drops its state, a machine that slept): nothing arrives, nothing
+//! fails, and a server that went on serving would be serving what it
+//! last knew. Silence alone does not say so: an idle database is silent,
+//! and so is a server working through a long stretch of log that holds
+//! nothing for this slot. What does say so is the slot: while this
+//! connection lives, PostgreSQL shows the slot as held by its walsender,
+//! and when the walsender has given up on a peer it no longer hears
+//! (`wal_sender_timeout`), the slot is free. So once nothing has been
+//! heard for [`SILENCE`] the server is asked, on a fresh ordinary
+//! connection, whether the slot is still held (a read), and asked again
+//! every half of that while the silence lasts. A slot nobody holds means
+//! this connection is dead: it is given up and the caller reopens the
+//! slot, which resumes after the last position the server had confirmed.
+//! A server that cannot be asked proves nothing, and the feed waits.
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -28,9 +61,12 @@ use pgoutput::events::event::{Event, EventType};
 use pgoutput::options::{BinaryValueTraitOff, StreamingValueTraitOff};
 use pgwire_replication::{ReplicationClient, ReplicationConfig, ReplicationEvent, TlsConfig};
 use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
 use tokio_postgres::Client;
 use tokio_postgres::config::Host;
+use tokio_postgres::types::PgLsn;
 
+use crate::log::log_warn;
 use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, DeleteQuery, InsertQuery, Lsn,
     RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
@@ -46,11 +82,23 @@ type Decoded = Event<BinaryValueTraitOff, StreamingValueTraitOff>;
 /// column, in the relation's column order.
 type Columns = TupleData<BinaryValueTraitOff>;
 
-/// The prefix of the feed's heartbeat messages.
-const HEARTBEAT_PREFIX: &str = "xyne_sync";
+/// The type of a `json` column as a relation message names it. Its cells
+/// arrive as the text that was stored, where a `jsonb` column's arrive as
+/// the one text `jsonb` writes.
+const JSON_OID: i32 = 114;
 
-/// How long a poll waits for its heartbeat to come back before failing.
-const HEARTBEAT_WAIT: Duration = Duration::from_secs(10);
+/// How long a poll waits for the feed to reach the server's position
+/// before failing.
+const POLL_WAIT: Duration = Duration::from_secs(10);
+
+/// How long the feed may hear nothing before the server is asked whether
+/// the slot is still held, and asked again every half of this while the
+/// silence lasts.
+const SILENCE: Duration = Duration::from_secs(10);
+
+/// How long the server is given to say whether the slot is held; no
+/// answer proves nothing.
+const ASK_WAIT: Duration = Duration::from_secs(5);
 
 /// One poll's yield: the writes delivered since the last poll, in commit
 /// order, each at its position; and the position the feed is known to
@@ -62,23 +110,31 @@ pub struct Batch {
 }
 
 /// One decoded transaction: the end of its commit record (the position of
-/// its writes), its writes on catalog tables, and the heartbeat token it
-/// carried, if it was a heartbeat.
+/// its writes), its writes on catalog tables (none when it touched no
+/// table the catalog declares), when it committed and how long decoding
+/// it took.
 #[derive(Debug, PartialEq)]
 pub struct Transaction {
     pub at: Lsn,
     pub writes: Vec<WriteQuery>,
-    pub heartbeat: Option<String>,
     pub committed_at_micros: i64,
     pub decode: Duration,
 }
 
 /// One published table as the feed described it: the catalog table it
 /// maps to (`None` for a table the catalog does not declare) and its
-/// column names in message order.
+/// columns in message order.
 struct Relation {
     table: Option<TableName>,
-    columns: Vec<ColumnName>,
+    columns: Vec<Described>,
+}
+
+/// One column of a published table as the feed described it: its name,
+/// and whether it is a `json` column, whose cells are rewritten into the
+/// standard form as they are decoded.
+struct Described {
+    name: ColumnName,
+    plain_json: bool,
 }
 
 /// The mapping of decoded messages onto catalog writes: the relations
@@ -87,7 +143,6 @@ pub struct Decoder {
     catalog: Arc<Catalog>,
     relations: HashMap<i32, Relation>,
     pending: Vec<WriteQuery>,
-    heartbeat: Option<String>,
     decode: Duration,
 }
 
@@ -98,7 +153,6 @@ impl Decoder {
             catalog,
             relations: HashMap::new(),
             pending: Vec::new(),
-            heartbeat: None,
             decode: Duration::ZERO,
         }
     }
@@ -116,11 +170,13 @@ impl Decoder {
     }
 
     /// Absorb one event.
-    fn absorb_event(&mut self, event: ReplicationEvent) -> Result<Option<Transaction>, StorageError> {
+    fn absorb_event(
+        &mut self,
+        event: ReplicationEvent,
+    ) -> Result<Option<Transaction>, StorageError> {
         match event {
             ReplicationEvent::Begin { .. } => {
                 self.pending.clear();
-                self.heartbeat = None;
                 Ok(None)
             }
             ReplicationEvent::Commit {
@@ -130,19 +186,9 @@ impl Decoder {
             } => Ok(Some(Transaction {
                 at: position(end_lsn),
                 writes: std::mem::take(&mut self.pending),
-                heartbeat: self.heartbeat.take(),
                 committed_at_micros: commit_time_micros,
                 decode: Duration::ZERO,
             })),
-            ReplicationEvent::Message {
-                transactional: true,
-                prefix,
-                content,
-                ..
-            } if prefix == HEARTBEAT_PREFIX => {
-                self.heartbeat = Some(String::from_utf8_lossy(&content).into_owned());
-                Ok(None)
-            }
             ReplicationEvent::XLogData { data, .. } => {
                 self.decode(&data)?;
                 Ok(None)
@@ -178,7 +224,10 @@ impl Decoder {
                     columns: relation
                         .columns
                         .iter()
-                        .map(|column| ColumnName::from(column.name.as_str()))
+                        .map(|column| Described {
+                            name: ColumnName::from(column.name.as_str()),
+                            plain_json: column.oid == JSON_OID,
+                        })
                         .collect(),
                 },
             );
@@ -271,7 +320,7 @@ impl Decoder {
 
     /// The catalog table and column order of relation `oid`, if the feed
     /// announced it and the catalog declares it.
-    fn declared(&self, oid: i32) -> Option<(&DbTable, &[ColumnName])> {
+    fn declared(&self, oid: i32) -> Option<(&DbTable, &[Described])> {
         let relation = self.relations.get(&oid)?;
         let table = self.catalog.table(relation.table.as_ref()?.as_str())?;
         Some((table, &relation.columns))
@@ -279,23 +328,61 @@ impl Decoder {
 }
 
 /// The change feed over one replication slot: the transport half (the
-/// replication connection, and the ordinary connection the heartbeats go
-/// through) and the decoding half (the catalog-driven decoder and the
-/// delivered position), together for a single-threaded driver, or split
-/// ([`PgStream::split`]) so both run on a thread of their own
+/// replication connection) and the decoding half (the catalog-driven
+/// decoder and the delivered position), together with an ordinary
+/// connection for a single-threaded driver that polls, or split
+/// ([`PgStream::split`]) so both halves run on a thread of their own
 /// ([`Transport::stream`]) and hand decoded transactions to the engine
 /// over a channel.
 pub struct PgStream {
     transport: Transport,
     feed: Feed,
+    client: Client,
 }
 
-/// The connections of a change feed. Nothing in it is tied to a thread:
-/// it forwards raw replication events and beats the heart.
+/// The replication connection of a change feed on `slot`, and how to
+/// reach the same server on an ordinary connection to ask about the slot.
+/// Nothing in it is tied to a thread: it receives raw replication events
+/// and confirms positions back to the slot.
 pub struct Transport {
-    client: Client,
     feed: ReplicationClient,
-    heart: Heart,
+    config: tokio_postgres::Config,
+    slot: String,
+}
+
+/// A feed's silence, watched: when it was last heard, and when the server
+/// was last asked about the slot.
+struct Watch {
+    heard: Instant,
+    asked: Instant,
+}
+
+impl Watch {
+    /// A feed heard just now.
+    fn new() -> Self {
+        let now = Instant::now();
+        Watch {
+            heard: now,
+            asked: now,
+        }
+    }
+
+    /// The feed was heard.
+    fn heard(&mut self) {
+        self.heard = Instant::now();
+    }
+
+    /// Whether it is time to ask the server about the slot as of `now`:
+    /// nothing heard for [`SILENCE`], and not asked within half of it.
+    /// Asking is noted, so the next is due half a silence later.
+    fn due(&mut self, now: Instant) -> bool {
+        let due = now.duration_since(self.heard) >= SILENCE
+            && now.duration_since(self.asked) >= SILENCE / 2;
+        if due {
+            self.asked = now;
+        }
+        due
+    }
 }
 
 /// The decoding half of a change feed: raw events in, catalog writes and
@@ -305,40 +392,13 @@ pub struct Feed {
     progress: Lsn,
 }
 
-struct Heart {
-    prefix: String,
-    count: u64,
-}
-
-impl Heart {
-    fn new(slot: &str) -> Self {
-        let started = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos())
-            .unwrap_or_default();
-        Heart {
-            prefix: format!("{slot}@{started}:"),
-            count: 0,
-        }
-    }
-
-    async fn beat(&mut self, client: &Client) -> Result<String, StorageError> {
-        let token = format!("{}{}", self.prefix, self.count);
-        self.count += 1;
-        client
-            .execute(
-                "SELECT pg_logical_emit_message(true, $1::text, $2::text)",
-                &[&HEARTBEAT_PREFIX, &token],
-            )
-            .await?;
-        Ok(token)
-    }
-}
-
 impl Transport {
-    /// Open the connections to `dsn` for `slot`, creating the publication
-    /// (`<slot>_pub`, every table) and the slot when they do not exist
-    /// yet.
+    /// Open the replication connection to `dsn` on `slot`, first making
+    /// sure what it streams from exists: the publication (`<slot>_pub`,
+    /// every table) and the slot are created only when they are missing,
+    /// so a deployment that creates them itself is never written to. A
+    /// standby cannot create a publication; when it has none the error
+    /// says what to run on the primary.
     pub async fn open(dsn: &str, slot: &str) -> Result<Self, StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
@@ -351,6 +411,15 @@ impl Transport {
             .await?
             .is_some();
         if !published {
+            let standby: bool = client
+                .query_one("SELECT pg_is_in_recovery()", &[])
+                .await?
+                .get(0);
+            if standby {
+                return Err(StorageError(format!(
+                    "publication `{publication}` does not exist and this server is a standby, which cannot create it; on the primary run: CREATE PUBLICATION \"{publication}\" FOR ALL TABLES"
+                )));
+            }
             client
                 .batch_execute(&format!(
                     "CREATE PUBLICATION \"{publication}\" FOR ALL TABLES"
@@ -376,38 +445,86 @@ impl Transport {
             .await
             .map_err(|error| StorageError(format!("replication connection: {error}")))?;
         Ok(Transport {
-            client,
             feed,
-            heart: Heart::new(slot),
+            config,
+            slot: slot.to_owned(),
         })
     }
 
-    /// Tell the slot that every commit up to `at` is applied.
+    /// Whether a walsender still holds the slot, asked on a fresh
+    /// connection (one kept from before could be as dead as the feed).
+    /// While this replication connection lives the answer is yes; no
+    /// answer within [`ASK_WAIT`], or a server that cannot be reached,
+    /// counts as yes too, since it proves nothing.
+    async fn slot_is_held(&self) -> bool {
+        let asked = tokio::time::timeout(ASK_WAIT, async {
+            let client = super::open(&self.config, &tokio::runtime::Handle::current()).await?;
+            let row = client
+                .query_opt(
+                    "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                    &[&self.slot],
+                )
+                .await?;
+            Ok::<bool, StorageError>(row.is_some_and(|row| row.get(0)))
+        })
+        .await;
+        match asked {
+            Ok(Ok(held)) => held,
+            Ok(Err(error)) => {
+                log_warn!("asking whether slot {} is held failed: {error}", self.slot);
+                true
+            }
+            Err(_) => {
+                log_warn!(
+                    "the server did not say whether slot {} is held within {ASK_WAIT:?}",
+                    self.slot
+                );
+                true
+            }
+        }
+    }
+
+    /// Tell the slot that everything up to `at` has been received.
     fn acknowledge(&mut self, at: Lsn) {
         self.feed.update_applied_lsn(pgwire_replication::Lsn(at.0));
     }
 
     /// Run until `out` has no receiver or the connection ends: decode
-    /// every event as it arrives through `feed`, acknowledge each commit
-    /// to the slot, send each transaction on (its writes, its position,
-    /// the feed's progress and the writes on the `watched` tables, once
-    /// per commit; a heartbeat is a transaction with no writes), and beat
-    /// the heart every `interval` so the position keeps moving while
-    /// nothing is written. A dropped connection ends the run quietly (the
-    /// caller reopens the slot); a decoding failure ends it with the error.
+    /// every event as it arrives through `feed`, confirm the position it
+    /// brought to the slot, and send each transaction on (its writes, its
+    /// position, the feed's progress and the writes on the `watched`
+    /// tables, once per commit). Once every `every` the engine is told
+    /// the feed's position without a transaction to carry it
+    /// ([`Committed::mark`]): that is how it learns of a keepalive, and
+    /// what lets a snapshot minted while nothing was being written become
+    /// current. A dropped connection ends the run quietly (the caller
+    /// reopens the slot), and so does one that has gone silent while the
+    /// server no longer holds the slot for it (see the module docs); a
+    /// decoding failure ends it with the error.
     pub async fn stream(
         mut self,
-        interval: Duration,
+        every: Duration,
         mut feed: Feed,
         watched: &[TableName],
         out: mpsc::Sender<Committed>,
     ) -> Result<(), StorageError> {
-        let mut ticker = tokio::time::interval(interval);
+        let mut ticker = tokio::time::interval(every);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut watch = Watch::new();
         loop {
             let event = tokio::select! {
                 _ = ticker.tick() => {
-                    if let Err(error) = self.heart.beat(&self.client).await {
-                        eprintln!("change feed heartbeat failed: {error}");
+                    let position = feed.progress();
+                    if position > Lsn(0) && out.send(Committed::mark(position)).await.is_err() {
+                        return Ok(());
+                    }
+                    if watch.due(Instant::now()) && !self.slot_is_held().await {
+                        log_warn!(
+                            "the change feed has been silent for {:.0} s at {position} and no walsender holds slot {}; giving the connection up",
+                            watch.heard.elapsed().as_secs_f64(),
+                            self.slot
+                        );
+                        return Ok(());
                     }
                     continue;
                 }
@@ -421,10 +538,13 @@ impl Transport {
                     return Ok(());
                 }
             };
-            let Some(transaction) = feed.absorb(event)? else {
+            heard();
+            watch.heard();
+            let transaction = feed.absorb(event)?;
+            self.acknowledge(feed.progress());
+            let Some(transaction) = transaction else {
                 continue;
             };
-            self.acknowledge(transaction.at);
             let watched_writes: Vec<WriteQuery> = transaction
                 .writes
                 .iter()
@@ -447,6 +567,16 @@ impl Transport {
     }
 }
 
+/// Note that PostgreSQL was heard from on the replication connection just
+/// now, for the process that publishes how long the feed has been silent.
+fn heard() {
+    if let Some(stats) = crate::stats::Stats::global() {
+        stats
+            .feed_last_message_ms
+            .store(crate::stats::now_ms(), Ordering::Relaxed);
+    }
+}
+
 impl Feed {
     /// A decoder for `catalog`, at position zero until the first event.
     pub fn new(catalog: Arc<Catalog>) -> Self {
@@ -457,7 +587,10 @@ impl Feed {
     }
 
     /// Absorb one raw event: a keepalive or a commit moves the position,
-    /// and a commit also yields the transaction it closes.
+    /// and a commit also yields the transaction it closes. A keepalive
+    /// that arrives inside a transaction names a location below that
+    /// transaction's commit record, so the position never runs ahead of a
+    /// commit still to come.
     pub fn absorb(&mut self, event: ReplicationEvent) -> Result<Option<Transaction>, StorageError> {
         if let ReplicationEvent::KeepAlive { wal_end, .. } = &event {
             self.progress = self.progress.max(position(*wal_end));
@@ -478,9 +611,13 @@ impl Feed {
 impl PgStream {
     /// Open the feed of `slot` at `dsn`, decoding with `catalog`.
     pub async fn open(dsn: &str, slot: &str, catalog: Arc<Catalog>) -> Result<Self, StorageError> {
+        let transport = Transport::open(dsn, slot).await?;
+        let config: tokio_postgres::Config = dsn.parse()?;
+        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
         Ok(PgStream {
-            transport: Transport::open(dsn, slot).await?,
+            transport,
             feed: Feed::new(catalog),
+            client,
         })
     }
 
@@ -526,103 +663,85 @@ impl PgStream {
         Ok(())
     }
 
-    /// Emit a heartbeat and collect every write the feed delivers up to
-    /// it, with the position the feed reached; fails if the heartbeat does
-    /// not come back within [`HEARTBEAT_WAIT`].
+    /// Collect every write the feed delivers up to where the server's log
+    /// is right now, with the position the feed reached: every
+    /// transaction whose commit had been acknowledged before the call is
+    /// in the batch. The server is asked where its log ends (the flushed
+    /// end on a primary, the replayed end on a standby; a read, nothing is
+    /// written) and the feed is consumed until a commit or a keepalive
+    /// says it has been delivered that far; fails if that takes longer
+    /// than [`POLL_WAIT`].
     pub async fn poll(&mut self) -> Result<Batch, StorageError> {
-        let token = self.transport.heart.beat(&self.transport.client).await?;
-        let deadline = Instant::now() + HEARTBEAT_WAIT;
+        let target = server_position(&self.client).await?;
+        let deadline = Instant::now() + POLL_WAIT;
         let mut writes = Vec::new();
-        loop {
+        while self.feed.progress() < target {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let event = tokio::time::timeout(remaining, self.transport.feed.recv())
                 .await
                 .map_err(|_| {
                     StorageError(format!(
-                        "the feed did not return heartbeat {token} within {HEARTBEAT_WAIT:?}"
+                        "the feed did not reach {target} within {POLL_WAIT:?}; it is at {}",
+                        self.feed.progress()
                     ))
                 })?;
             let event = event
                 .map_err(|error| StorageError(format!("replication stream: {error}")))?
                 .ok_or_else(|| StorageError("the replication stream ended".to_owned()))?;
-            let Some(transaction) = self.absorb(event)? else {
-                continue;
-            };
-            let done = transaction.heartbeat.as_deref() == Some(token.as_str());
-            let at = transaction.at;
-            writes.extend(transaction.writes.into_iter().map(|write| (write, at)));
-            if done {
-                return Ok(Batch {
-                    writes,
-                    progress: self.feed.progress(),
-                });
+            let transaction = self.feed.absorb(event)?;
+            self.transport.acknowledge(self.feed.progress());
+            if let Some(transaction) = transaction {
+                let at = transaction.at;
+                writes.extend(transaction.writes.into_iter().map(|write| (write, at)));
             }
         }
-    }
-
-    fn absorb(&mut self, event: ReplicationEvent) -> Result<Option<Transaction>, StorageError> {
-        let transaction = self.feed.absorb(event)?;
-        if let Some(transaction) = &transaction {
-            self.transport.acknowledge(transaction.at);
-        }
-        Ok(transaction)
+        Ok(Batch {
+            writes,
+            progress: self.feed.progress(),
+        })
     }
 
     /// Run on one thread until `commands` has no receiver or the
-    /// connection ends: each transaction goes out as one
-    /// [`Command::Transaction`], and a heartbeat every `interval` keeps
-    /// the position moving while nothing is written.
-    pub async fn run<Q>(mut self, interval: Duration, commands: mpsc::Sender<Command<Q>>) {
-        let mut ticker = tokio::time::interval(interval);
-        loop {
-            let Transport {
-                client,
-                feed,
-                heart,
-            } = &mut self.transport;
-            let event = tokio::select! {
-                _ = ticker.tick() => {
-                    if let Err(error) = heart.beat(client).await {
-                        eprintln!("change feed heartbeat failed: {error}");
-                    }
-                    continue;
-                }
-                event = feed.recv() => event,
-            };
-            let event = match event {
-                Ok(Some(event)) => event,
-                Ok(None) => return,
-                Err(error) => {
-                    eprintln!("change feed ended: {error}");
+    /// connection ends: [`Transport::stream`], each transaction and each
+    /// position mark going out as one [`Command::Transaction`].
+    pub async fn run<Q>(self, every: Duration, commands: mpsc::Sender<Command<Q>>) {
+        let (transport, feed) = self.split();
+        let (out, mut transactions) = mpsc::channel(64);
+        let forward = async move {
+            while let Some(transaction) = transactions.recv().await {
+                if commands
+                    .send(Command::Transaction(transaction))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
-            };
-            let transaction = match self.absorb(event) {
-                Ok(Some(transaction)) => transaction,
-                Ok(None) => continue,
-                Err(error) => {
-                    eprintln!("change feed decoding failed: {error}");
-                    return;
-                }
-            };
-            let committed = Committed {
-                writes: transaction.writes,
-                at: transaction.at,
-                progress: self.feed.progress(),
-                watched: Vec::new(),
-                received: Instant::now(),
-                committed_at_micros: transaction.committed_at_micros,
-                decode: transaction.decode,
-            };
-            if commands
-                .send(Command::Transaction(committed))
-                .await
-                .is_err()
-            {
-                return;
             }
+        };
+        tokio::select! {
+            outcome = transport.stream(every, feed, &[], out) => {
+                if let Err(error) = outcome {
+                    eprintln!("change feed decoding failed: {error}");
+                }
+            }
+            _ = forward => {}
         }
     }
+}
+
+/// Where the server's log ends right now, on the scale the feed's
+/// positions are on: the flushed end on a primary (a transaction is
+/// acknowledged once its commit record is flushed, and the feed is sent
+/// flushed log only), the replayed end on a standby.
+async fn server_position(client: &Client) -> Result<Lsn, StorageError> {
+    let row = client
+        .query_one(
+            "SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_flush_lsn() END",
+            &[],
+        )
+        .await?;
+    let end: PgLsn = row.get(0);
+    Ok(Lsn(u64::from(end)))
 }
 
 fn publication_of(slot: &str) -> String {
@@ -674,22 +793,26 @@ fn key_of(row: &DataFrameRow, table: &DbTable) -> DataFrameKey {
 }
 
 /// A decoded tuple as a row image of `table`: each value converted by the
-/// column's declared type, columns the catalog does not declare skipped,
-/// declared columns the relation lacks `NULL`, so every image carries
-/// every column.
+/// column's declared type (a `json` column's stored text rewritten into
+/// the standard form first), columns the catalog does not declare
+/// skipped, declared columns the relation lacks `NULL`, so every image
+/// carries every column.
 fn image(
     table: &DbTable,
-    columns: &[ColumnName],
+    columns: &[Described],
     tuple: &Columns,
 ) -> Result<DataFrameRow, StorageError> {
     let mut data = HashMap::new();
     let mut unchanged: Vec<ColumnName> = Vec::new();
-    for (name, column) in columns.iter().zip(tuple) {
-        let Some(declared) = table.column(name.as_str()) else {
+    for (described, column) in columns.iter().zip(tuple) {
+        let Some(declared) = table.column(described.name.as_str()) else {
             continue;
         };
         let value = match column {
             TupleDataColumn::PGNull => Value::Null,
+            TupleDataColumn::Value(text) if described.plain_json => {
+                Value::String(super::text::json_as_jsonb(text))
+            }
             TupleDataColumn::Value(text) => convert(text, &declared.r#type)?,
             TupleDataColumn::PGUnchangedToastedValue => {
                 unchanged.push(declared.name.clone());
@@ -716,13 +839,15 @@ fn image(
     Ok(DataFrameRow::from(data))
 }
 
-/// Convert one text value by its declared type.
+/// Convert one text value by its declared type; a `jsonb` cell is kept in
+/// the standard form, as a read keeps it.
 fn convert(raw: &str, declared: &ValueType) -> Result<Value, StorageError> {
     let unreadable = || StorageError(format!("`{raw}` is not a {declared:?}"));
     Ok(match declared {
         ValueType::Int => Value::Int(raw.parse().map_err(|_| unreadable())?),
         ValueType::Float => Value::Float(raw.parse().map_err(|_| unreadable())?),
-        ValueType::String | ValueType::Json | ValueType::Map(_, _) => Value::String(raw.to_owned()),
+        ValueType::Json => Value::String(super::text::standard_json(raw).into_owned()),
+        ValueType::String | ValueType::Map(_, _) => Value::String(raw.to_owned()),
         ValueType::List(inner) => super::text::array_literal(raw, inner),
         ValueType::Timestamp => Value::Int(super::text::epoch_millis(raw).ok_or_else(unreadable)?),
         ValueType::Bool => Value::Bool(match raw {
@@ -797,14 +922,163 @@ mod tests {
         }
     }
 
-    /// A heartbeat message carrying `token`.
-    fn heartbeat(token: &str) -> ReplicationEvent {
+    /// A logical message some other writer emitted inside a transaction.
+    fn message(content: &str) -> ReplicationEvent {
         ReplicationEvent::Message {
             transactional: true,
             lsn: pgwire_replication::Lsn(0),
-            prefix: HEARTBEAT_PREFIX.to_owned(),
-            content: Bytes::copy_from_slice(token.as_bytes()),
+            prefix: "someone_else".to_owned(),
+            content: Bytes::copy_from_slice(content.as_bytes()),
         }
+    }
+
+    /// A keepalive saying the server has gone through its log up to `end`.
+    fn keepalive(end: &str) -> ReplicationEvent {
+        ReplicationEvent::KeepAlive {
+            wal_end: pgwire_replication::Lsn(Lsn::parse(end).unwrap().0),
+            reply_requested: false,
+            server_time_micros: 0,
+        }
+    }
+
+    /// A relation message for `public.<name>` with `columns` of the given
+    /// type OIDs, the first being the key.
+    fn relation(oid: i32, name: &str, columns: &[(&str, i32)]) -> ReplicationEvent {
+        let mut data = vec![b'R'];
+        data.extend_from_slice(&oid.to_be_bytes());
+        data.extend_from_slice(b"public\0");
+        data.extend_from_slice(name.as_bytes());
+        data.push(0);
+        data.push(b'd');
+        data.extend_from_slice(&(columns.len() as i16).to_be_bytes());
+        for (index, (column, type_oid)) in columns.iter().enumerate() {
+            data.push(if index == 0 { 1 } else { 0 });
+            data.extend_from_slice(column.as_bytes());
+            data.push(0);
+            data.extend_from_slice(&type_oid.to_be_bytes());
+            data.extend_from_slice(&(-1i32).to_be_bytes());
+        }
+        raw(data)
+    }
+
+    /// An insert into relation `oid` of one row of text `values`.
+    fn insert(oid: i32, values: &[&str]) -> ReplicationEvent {
+        let mut data = vec![b'I'];
+        data.extend_from_slice(&oid.to_be_bytes());
+        data.push(b'N');
+        data.extend_from_slice(&(values.len() as i16).to_be_bytes());
+        for value in values {
+            data.push(b't');
+            data.extend_from_slice(&(value.len() as i32).to_be_bytes());
+            data.extend_from_slice(value.as_bytes());
+        }
+        raw(data)
+    }
+
+    /// A row message of `data`.
+    fn raw(data: Vec<u8>) -> ReplicationEvent {
+        ReplicationEvent::XLogData {
+            wal_start: pgwire_replication::Lsn(0),
+            wal_end: pgwire_replication::Lsn(0),
+            server_time_micros: 0,
+            data: Bytes::from(data),
+        }
+    }
+
+    /// The server is asked about the slot only once the feed has been
+    /// silent for [`SILENCE`], then every half of it while the silence
+    /// lasts, and hearing the feed starts the wait over.
+    #[test]
+    fn a_silent_feed_is_asked_about_at_intervals() {
+        let mut watch = Watch::new();
+        let start = watch.heard;
+        assert!(!watch.due(start + SILENCE / 2), "heard recently enough");
+        assert!(watch.due(start + SILENCE), "silent for the whole of it");
+        assert!(
+            !watch.due(start + SILENCE + SILENCE / 4),
+            "asked a moment ago"
+        );
+        assert!(watch.due(start + SILENCE + SILENCE / 2), "and asked again");
+        watch.heard();
+        assert!(
+            !watch.due(Instant::now() + SILENCE / 2),
+            "heard: the wait starts over"
+        );
+    }
+
+    /// The feed's position is the furthest a commit or a keepalive has
+    /// said, and never goes back: a keepalive moves it while nothing is
+    /// written, one that arrives inside a transaction names a location
+    /// below that transaction's commit, and an old one changes nothing.
+    #[test]
+    fn a_keepalive_moves_the_position_and_never_back() {
+        let mut feed = Feed::new(catalog());
+        assert_eq!(feed.progress(), Lsn(0));
+        assert!(feed.absorb(keepalive("0/100")).unwrap().is_none());
+        assert_eq!(feed.progress(), Lsn::parse("0/100").unwrap());
+        assert!(feed.absorb(begin()).unwrap().is_none());
+        assert!(feed.absorb(keepalive("0/180")).unwrap().is_none());
+        let committed = feed
+            .absorb(commit("0/200"))
+            .unwrap()
+            .expect("a transaction");
+        assert_eq!(committed.at, Lsn::parse("0/200").unwrap());
+        assert!(committed.writes.is_empty());
+        assert_eq!(feed.progress(), Lsn::parse("0/200").unwrap());
+        assert!(feed.absorb(keepalive("0/180")).unwrap().is_none());
+        assert_eq!(feed.progress(), Lsn::parse("0/200").unwrap());
+        assert!(feed.absorb(keepalive("0/2A8")).unwrap().is_none());
+        assert_eq!(feed.progress(), Lsn::parse("0/2A8").unwrap());
+    }
+
+    /// A JSON cell is decoded into the standard form whichever kind of
+    /// column holds it: a `jsonb` cell loses a padded fraction, a `json`
+    /// cell is rewritten as its `jsonb` would read; both are then the text
+    /// a read of the same row returns and a literal is written as.
+    #[test]
+    fn json_cells_are_decoded_into_the_standard_form() {
+        let catalog = Arc::new(Catalog::new(vec![DbTable::new(
+            "docs",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("binary", ValueType::Json),
+                DbColumn::new("plain", ValueType::Json),
+            ],
+        )]));
+        let mut decoder = Decoder::new(catalog);
+        let events = vec![
+            begin(),
+            relation(
+                7,
+                "docs",
+                &[("id", 20), ("binary", 3802), ("plain", JSON_OID)],
+            ),
+            insert(
+                7,
+                &[
+                    "1",
+                    "{\"a\": 1.50, \"bb\": \"1.0\"}",
+                    "{ \"bb\":\"1.0\",\"a\":1.50, \"a\":15e-1 }",
+                ],
+            ),
+            insert(7, &["2", "2.0", "2.0"]),
+            commit("0/10"),
+        ];
+        let transactions: Vec<Transaction> = events
+            .into_iter()
+            .filter_map(|event| decoder.absorb(event).unwrap())
+            .collect();
+        let rows: Vec<&DataFrameRow> = transactions[0]
+            .writes
+            .iter()
+            .map(|write| write.new_row_image().unwrap())
+            .collect();
+        let standard = Value::String("{\"a\": 1.5, \"bb\": \"1.0\"}".into());
+        assert_eq!(rows[0].data["binary"], standard);
+        assert_eq!(rows[0].data["plain"], standard);
+        assert_eq!(rows[1].data["binary"], Value::String("2".into()));
+        assert_eq!(rows[1].data["plain"], Value::String("2".into()));
     }
 
     /// An `UPDATE` whose `name` PostgreSQL sent as unchanged (a large
@@ -843,8 +1117,9 @@ mod tests {
     /// A recorded `pgoutput` session (PostgreSQL 15, `proto_version 1`,
     /// text values): two inserts with quoting, nulls and every scalar
     /// type; an update; a primary-key change, a delete and an insert on
-    /// an undeclared table; and a heartbeat. Each transaction lands at
-    /// the end of its commit record.
+    /// an undeclared table; and a transaction that carried only a logical
+    /// message, which is a transaction with no writes. Each transaction
+    /// lands at the end of its commit record.
     #[test]
     fn decodes_a_recorded_session() {
         let mut decoder = Decoder::new(catalog());
@@ -870,7 +1145,7 @@ mod tests {
             xlog("490000434e4e0001740000000139"),
             commit("0/3EFF6F8"),
             begin(),
-            heartbeat("7"),
+            message("7"),
             commit("0/3EFF768"),
         ];
         let transactions: Vec<Transaction> = events
@@ -920,10 +1195,8 @@ mod tests {
             matches!(&last[2], WriteQuery::DELETE(d) if d.pkey_value.pkey_value["id"] == Value::Int(1))
         );
         assert_eq!(transactions[2].at, Lsn::parse("0/3EFF6F8").unwrap());
-        assert_eq!(transactions[2].heartbeat, None);
 
         assert!(transactions[3].writes.is_empty());
-        assert_eq!(transactions[3].heartbeat.as_deref(), Some("7"));
         assert_eq!(transactions[3].at, Lsn::parse("0/3EFF768").unwrap());
     }
 }

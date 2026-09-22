@@ -274,6 +274,7 @@ pub struct Stats {
     pub refused_unsupported: AtomicU64,
     pub refused_plan_limit: AtomicU64,
     pub refused_read_limit: AtomicU64,
+    pub refused_read_timeout: AtomicU64,
     pub refused_other: AtomicU64,
     pub pages_short: AtomicU64,
     pub plans_page_driven: AtomicU64,
@@ -286,6 +287,14 @@ pub struct Stats {
     /// Connections refused because the client's schema names what the
     /// server cannot serve (`SchemaVersionNotSupported`).
     pub connections_refused_schema: AtomicU64,
+    /// Connections by what they were owed since their cookie: nothing
+    /// (the cookie was the group's version), the group's whole state (no
+    /// cookie, the group under way), the logged pokes after an older
+    /// cookie; or told to start over.
+    pub connects_current: AtomicU64,
+    pub connects_from_state: AtomicU64,
+    pub connects_from_log: AtomicU64,
+    pub connects_reset: AtomicU64,
     /// Storage reads that came back with at least half, and at least four
     /// fifths, of the row limit: the queries to look at before they are
     /// refused.
@@ -353,12 +362,15 @@ const REFUSED_NAMES: usize = 256;
 /// translation does not express: `LIKE`, `NOT EXISTS`, a compound join
 /// key), `plan_limit` (the planner found no side of a join small enough
 /// to read), `read_limit` (a read came back larger than the row limit),
-/// `other` (a count that failed, an AST that does not parse).
+/// `read_timeout` (a read or a count did not finish within the read
+/// timeout), `other` (a count that failed, an AST that does not parse).
 pub fn refusal_kind(reason: &str) -> &'static str {
     if reason.contains("would read more than") {
         "plan_limit"
     } else if reason.contains("returned more than") {
         "read_limit"
+    } else if reason.contains("took longer than") {
+        "read_timeout"
     } else if reason.contains("not supported")
         || reason.contains("unknown ")
         || reason.contains("nests deeper")
@@ -415,6 +427,7 @@ impl Stats {
             refused_unsupported: AtomicU64::new(0),
             refused_plan_limit: AtomicU64::new(0),
             refused_read_limit: AtomicU64::new(0),
+            refused_read_timeout: AtomicU64::new(0),
             refused_other: AtomicU64::new(0),
             pages_short: AtomicU64::new(0),
             plans_page_driven: AtomicU64::new(0),
@@ -425,6 +438,10 @@ impl Stats {
             connections_closed_by_error: AtomicU64::new(0),
             connections_closed_by_server: AtomicU64::new(0),
             connections_refused_schema: AtomicU64::new(0),
+            connects_current: AtomicU64::new(0),
+            connects_from_state: AtomicU64::new(0),
+            connects_from_log: AtomicU64::new(0),
+            connects_reset: AtomicU64::new(0),
             reads_over_half: AtomicU64::new(0),
             reads_over_80: AtomicU64::new(0),
             read_row_limit: AtomicU64::new(0),
@@ -617,6 +634,7 @@ impl Stats {
             ("refused_unsupported", load(&self.refused_unsupported)),
             ("refused_plan_limit", load(&self.refused_plan_limit)),
             ("refused_read_limit", load(&self.refused_read_limit)),
+            ("refused_read_timeout", load(&self.refused_read_timeout)),
             ("refused_other", load(&self.refused_other)),
             ("plans_page_driven", load(&self.plans_page_driven)),
             ("pages_short", load(&self.pages_short)),
@@ -639,6 +657,10 @@ impl Stats {
                 "connections_refused_schema",
                 load(&self.connections_refused_schema),
             ),
+            ("connects_current", load(&self.connects_current)),
+            ("connects_from_state", load(&self.connects_from_state)),
+            ("connects_from_log", load(&self.connects_from_log)),
+            ("connects_reset", load(&self.connects_reset)),
             ("reads_over_half", load(&self.reads_over_half)),
             ("reads_over_80", load(&self.reads_over_80)),
             ("log_dropped", crate::log::dropped()),
@@ -780,6 +802,7 @@ impl Stats {
             "unsupported" => &self.refused_unsupported,
             "plan_limit" => &self.refused_plan_limit,
             "read_limit" => &self.refused_read_limit,
+            "read_timeout" => &self.refused_read_timeout,
             _ => &self.refused_other,
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -1268,6 +1291,7 @@ impl Stats {
             refused: load(&self.refused_unsupported)
                 + load(&self.refused_plan_limit)
                 + load(&self.refused_read_limit)
+                + load(&self.refused_read_timeout)
                 + load(&self.refused_other),
             page_rows_rejected: self
                 .engine
@@ -1390,6 +1414,7 @@ fn counter_name(name: &str) -> (String, Vec<(&'static str, String)>) {
         "refused_unsupported" => ("queries_refused", &[("reason", "unsupported")]),
         "refused_plan_limit" => ("queries_refused", &[("reason", "plan_limit")]),
         "refused_read_limit" => ("queries_refused", &[("reason", "read_limit")]),
+        "refused_read_timeout" => ("queries_refused", &[("reason", "read_timeout")]),
         "refused_other" => ("queries_refused", &[("reason", "other")]),
         "pages_short" => ("queries_short", &[("reason", "page_capped")]),
         "plans_page_driven" => ("plans", &[("kind", "page_drives")]),
@@ -1409,6 +1434,10 @@ fn counter_name(name: &str) -> (String, Vec<(&'static str, String)>) {
             "connections",
             &[("event", "refused"), ("reason", "client_schema")],
         ),
+        "connects_current" => ("connects", &[("owed", "nothing")]),
+        "connects_from_state" => ("connects", &[("owed", "state")]),
+        "connects_from_log" => ("connects", &[("owed", "log")]),
+        "connects_reset" => ("connects", &[("owed", "start_over")]),
         "reads_over_half" => ("reads_near_limit", &[("over", "50")]),
         "reads_over_80" => ("reads_near_limit", &[("over", "80")]),
         "transactions" => ("feed_transactions", &[]),
@@ -1437,9 +1466,11 @@ fn measure_help(name: &str) -> &'static str {
         "transform_hits" | "transform_misses" | "transform_errors" => {
             "query transforms by outcome: answered from the cache, asked of the application server, failed"
         }
-        "refused_unsupported" | "refused_plan_limit" | "refused_read_limit" | "refused_other" => {
-            "queries refused, by class of reason"
-        }
+        "refused_unsupported"
+        | "refused_plan_limit"
+        | "refused_read_limit"
+        | "refused_read_timeout"
+        | "refused_other" => "queries refused, by class of reason",
         "pages_short" => "pages served short of their limit",
         "plans_page_driven" => "plans in which a page drives its own join",
         "pushes_ok" | "pushes_failed" => "pushes forwarded to the application server, by outcome",
@@ -1448,6 +1479,9 @@ fn measure_help(name: &str) -> &'static str {
         | "connections_closed_by_error"
         | "connections_closed_by_server"
         | "connections_refused_schema" => "client connections by event and reason",
+        "connects_current" | "connects_from_state" | "connects_from_log" | "connects_reset" => {
+            "connections by what they were owed since their cookie: nothing, the group's state, its logged pokes, or told to start over"
+        }
         "reads_over_half" | "reads_over_80" => {
             "storage reads that returned at least this percentage of the row limit"
         }
@@ -1463,7 +1497,9 @@ fn measure_help(name: &str) -> &'static str {
         "transform_cache_entries" => "query transforms remembered",
         "warm_shapes" => "query shapes kept for a warm start",
         "feed_lsn" => "the feed's position in PostgreSQL's log",
-        "feed_heartbeat_age_ms" => "since the feed last heard from PostgreSQL",
+        "feed_heartbeat_age_ms" => {
+            "since the feed last heard from PostgreSQL: a transaction, or a keepalive saying how far its log has been gone through"
+        }
         "process_rss_bytes" => "the process's resident memory",
         "read_row_limit" => "the row limit of one storage read, as configured",
         "read_rows_max" => "the largest storage read of the last minute or two",
@@ -1676,16 +1712,24 @@ mod tests {
             "unsupported"
         );
         assert_eq!(
-            stats.note_refusal("odd", "counting the rows of tickets failed: timeout"),
+            stats.note_refusal(
+                "odd",
+                "counting the rows of tickets failed: connection reset"
+            ),
             "other"
+        );
+        assert_eq!(
+            stats.note_refusal("slow", "a read on `messages` took longer than 10000 ms"),
+            "read_timeout"
         );
         let refused = stats.refused_queries();
         assert_eq!(refused[0].0, "kbRoot");
         assert_eq!(refused[0].1.count, 2);
         assert_eq!(refused[0].1.kind, "read_limit");
-        assert_eq!(refused.len(), 4);
+        assert_eq!(refused.len(), 5);
         let text = stats.prometheus();
         assert!(text.contains("xyne_sync_queries_refused_total{reason=\"read_limit\"} 2"));
+        assert!(text.contains("xyne_sync_queries_refused_total{reason=\"read_timeout\"} 1"));
         assert!(text.contains("xyne_sync_queries_refused_total{reason=\"plan_limit\"} 1"));
         assert!(text.contains("xyne_sync_queries_refused_total{reason=\"unsupported\"} 1"));
         let json = stats.json();

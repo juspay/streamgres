@@ -88,6 +88,31 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    /// The feed's position without a transaction to carry it: everything
+    /// committed at or below `position` has been delivered, and nothing
+    /// was written. It is one step like any other, which is what moves
+    /// the engine, and the snapshots waiting on it, while nobody writes.
+    pub fn mark(position: Lsn) -> Self {
+        Self::new(Vec::new(), position)
+    }
+
+    /// Whether the feed is delivering this transaction a second time: it
+    /// committed at or below `position`, which the engine has applied
+    /// everything up to. A slot reopened after a lost connection resumes
+    /// from the last position the server saw confirmed, so the
+    /// transactions received after that confirmation come again; commit
+    /// records end at distinct locations, so the comparison is exact.
+    pub fn repeats(&self, position: Lsn) -> bool {
+        !self.is_mark() && self.at <= position
+    }
+
+    /// Whether this is a position mark rather than a transaction
+    /// PostgreSQL committed (which carries the time it committed, even
+    /// when none of its writes were on a table of the catalog).
+    pub fn is_mark(&self) -> bool {
+        self.writes.is_empty() && self.committed_at_micros == 0
+    }
+
     /// A transaction of `writes` committed at `at`, the feed's progress
     /// mark being that same location, with nothing watched, received now.
     pub fn new(writes: Vec<WriteQuery>, at: Lsn) -> Self {
@@ -294,6 +319,9 @@ where
                         break;
                     }
                     for transaction in transactions.drain(..) {
+                        if transaction.repeats(self.runtime.position()) {
+                            continue;
+                        }
                         self.commit(transaction);
                     }
                 }
@@ -390,8 +418,11 @@ where
 
     /// Apply one committed transaction as one step: every write routed,
     /// the progress mark taken, the storage told, the deltas delivered
-    /// together, and the consumer told where the engine now is.
+    /// together, and the consumer told where the engine now is. A position
+    /// mark is the same step with nothing to route; it is not counted or
+    /// timed as a transaction.
     fn commit(&mut self, transaction: Transaction) {
+        let mark = transaction.is_mark();
         let Transaction {
             writes,
             at,
@@ -417,6 +448,11 @@ where
         let floor = self.runtime.floor();
         let routed = Instant::now();
         if let Some(stats) = &self.stats {
+            stats.feed_lsn.store(at.0, Ordering::Relaxed);
+            stats.publish_engine(self.runtime.engine_stats(), self.runtime.stats());
+            stats.publish_footprint(self.runtime.engine_footprint());
+        }
+        if let Some(stats) = self.stats.as_ref().filter(|_| !mark) {
             stats
                 .feed_to_engine
                 .record(started.duration_since(received));
@@ -443,7 +479,6 @@ where
                     );
                 }
             }
-            stats.feed_lsn.store(at.0, Ordering::Relaxed);
             log_event!(
                 Level::Debug,
                 "transaction routed",
@@ -456,15 +491,10 @@ where
                     routed.duration_since(started).as_secs_f64() * 1000.0
                 )
             );
-            stats
-                .feed_last_message_ms
-                .store(crate::stats::now_ms(), Ordering::Relaxed);
             stats.transactions.fetch_add(1, Ordering::Relaxed);
             stats
                 .writes
                 .fetch_add(writes.len() as u64, Ordering::Relaxed);
-            stats.publish_engine(self.runtime.engine_stats(), self.runtime.stats());
-            stats.publish_footprint(self.runtime.engine_footprint());
         }
         self.dispatch(
             step,

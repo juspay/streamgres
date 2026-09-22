@@ -3,10 +3,16 @@
 // behind it: a PostgreSQL with `wal_level = logical`, the server, and this script as a
 // Zero client speaking the sync protocol with a query AST of its own. It creates one
 // table, subscribes, and checks that the rows hydrate, that an insert, an update out of
-// the filter and a delete made straight in PostgreSQL arrive as pokes, that a client
-// whose schema the server cannot serve is refused, that a read of more than half the
-// row limit is reported by query name, and, when SMOKE_COLLECTOR is given, that the
-// collector has received the server's metrics over OTLP. Exits 0 on PASS.
+// the filter and a delete made straight in PostgreSQL arrive as pokes, that a JSON
+// column is filtered by value however the stored value was spelled (a number with a
+// padded fraction, a `json` object with its own spacing and key order), that the feed
+// keeps being heard while nobody writes, that a client which comes back after writes is sent
+// what it missed from its cookie, that a tab joining a live client group without a
+// cookie is sent the group's state while the first tab goes on hearing, that a tab
+// behind its group is sent the pokes it missed, that a client whose schema the server
+// cannot serve is refused, that a read of more than half the row limit is reported by
+// query name, and, when SMOKE_COLLECTOR is given, that the collector has received the
+// server's metrics over OTLP. Exits 0 on PASS.
 //
 //   node scripts/smoke.mjs            (Node 22 or later: the built-in WebSocket)
 //
@@ -31,9 +37,11 @@ const fail = (why) => { console.error('FAIL:', why); process.exit(1); };
 const sql = (text) => execFileSync('psql', [PG, '-v', 'ON_ERROR_STOP=1', '-Atc', text]).toString().trim();
 
 if (process.argv.includes('--prepare')) {
-  sql(`DROP TABLE IF EXISTS smoke_items;
-       CREATE TABLE smoke_items (id text PRIMARY KEY, status text NOT NULL, points integer NOT NULL, meta jsonb, "createdAt" timestamptz NOT NULL DEFAULT now());
-       INSERT INTO smoke_items (id, status, points, meta) SELECT 'seed-' || n, 'OPEN', n, jsonb_build_object('n', n) FROM generate_series(1, ${SEEDED}) n;
+  sql(`CREATE SCHEMA IF NOT EXISTS xyne_0;
+       CREATE TABLE IF NOT EXISTS xyne_0.clients ("clientGroupID" text, "clientID" text, "lastMutationID" bigint, "userID" text, PRIMARY KEY ("clientGroupID", "clientID"));
+       DROP TABLE IF EXISTS smoke_items;
+       CREATE TABLE smoke_items (id text PRIMARY KEY, status text NOT NULL, points integer NOT NULL, meta jsonb, tag jsonb, score jsonb, loose json, bucket text, "createdAt" timestamptz NOT NULL DEFAULT now());
+       INSERT INTO smoke_items (id, status, points, meta, tag, score, loose, bucket) SELECT 'seed-' || n, 'OPEN', n, jsonb_build_object('n', n), to_jsonb('t' || (n % 5)), (CASE WHEN n % 5 = 0 THEN '1.50' ELSE '2' END)::jsonb, (CASE WHEN n % 5 = 0 THEN '{ "k":1.50,   "a":[1e1], "k": 1.50 }' ELSE '{"k":2}' END)::json, 'b' || (n % 10) FROM generate_series(1, ${SEEDED}) n;
        INSERT INTO smoke_items (id, status, points) VALUES ('closed-1', 'DONE', 0);`);
   log(`prepared smoke_items with ${SEEDED} open rows and one closed`);
   process.exit(0);
@@ -41,24 +49,26 @@ if (process.argv.includes('--prepare')) {
 
 const open = { table: 'smoke_items', where: { type: 'simple', op: '=', left: { type: 'column', name: 'status' }, right: { type: 'literal', value: 'OPEN' } }, orderBy: [['id', 'asc']] };
 
-/// One connection with its own view of the rows it was sent.
-function connect(name, { clientSchema, patch }) {
-  const state = { name, rows: new Map(), got: new Set(), pokes: 0, errors: [], closed: false, waiters: [] };
+/// One connection with its own view of the rows it was sent; `group` and `baseCookie`
+/// make it a tab of an existing client group, or a client coming back.
+function connect(name, { clientSchema, patch = [], group, baseCookie = '', rows }) {
+  const state = { name, rows: rows ?? new Map(), got: new Set(), pokes: 0, puts: 0, cookie: null, bases: [], errors: [], closed: false, waiters: [] };
   const init = ['initConnection', { desiredQueriesPatch: patch, ...(clientSchema ? { clientSchema } : {}) }];
   const sec = encodeURIComponent(Buffer.from(JSON.stringify({ initConnectionMessage: init })).toString('base64'));
-  const url = `${GATEWAY}/sync/v51/connect?clientID=c-${name}&clientGroupID=g-${name}-${randomUUID().slice(0, 8)}&userID=smoke&baseCookie=&ts=1&lmid=0&wsid=${name}`;
+  state.group = group ?? `g-${name}-${randomUUID().slice(0, 8)}`;
+  const url = `${GATEWAY}/sync/v51/connect?clientID=c-${name}&clientGroupID=${state.group}&userID=smoke&baseCookie=${encodeURIComponent(baseCookie)}&ts=1&lmid=0&wsid=${name}`;
   const ws = new WebSocket(url, [sec]);
   state.ws = ws;
   const wake = () => { state.waiters = state.waiters.filter((w) => !w()); };
   ws.addEventListener('message', (event) => {
     const [tag, body] = JSON.parse(event.data);
-    if (tag === 'pokePart') {
+    if (tag === 'pokeStart') { state.bases.push(body.baseCookie); } else if (tag === 'pokePart') {
       for (const op of body.rowsPatch ?? []) {
-        if (op.op === 'put') state.rows.set(op.value.id, op.value);
+        if (op.op === 'put') { state.rows.set(op.value.id, op.value); state.puts += 1; }
         if (op.op === 'del') state.rows.delete(op.id.id);
       }
       for (const op of body.gotQueriesPatch ?? []) { if (op.op === 'put') state.got.add(op.hash); }
-    } else if (tag === 'pokeEnd') { state.pokes += 1; } else if (tag === 'error') { state.errors.push(body); }
+    } else if (tag === 'pokeEnd') { state.pokes += 1; state.cookie = body.cookie; } else if (tag === 'error') { state.errors.push(body); }
     wake();
   });
   ws.addEventListener('close', () => { state.closed = true; wake(); });
@@ -90,6 +100,68 @@ sql(`DELETE FROM smoke_items WHERE id = 'live-1'`);
 await a.until('the deleted row', (s) => !s.rows.has('live-1'));
 log('an insert, an update out of the filter, an update in place and a delete all arrived by poke');
 
+const tagged = { table: 'smoke_items', where: { type: 'simple', op: '=', left: { type: 'column', name: 'tag' }, right: { type: 'literal', value: 't3' } }, orderBy: [['id', 'asc']] };
+const j = connect('J', { patch: [{ op: 'put', hash: 'tagged', ast: tagged, ttl: 300000 }] });
+await j.until('the JSON filter', (s) => s.got.has('tagged') || s.errors.length > 0);
+if (j.errors.length) fail('a filter on a JSON column was refused: ' + JSON.stringify(j.errors[0]));
+if (j.rows.size !== SEEDED / 5 || [...j.rows.values()].some((r) => r.tag !== 't3')) fail(`tag = "t3" delivered ${j.rows.size} rows, expected ${SEEDED / 5}`);
+sql(`UPDATE smoke_items SET tag = '"t3"' WHERE id = 'seed-5'`);
+await j.until('a row entering the JSON filter', (s) => s.rows.has('seed-5'));
+sql(`UPDATE smoke_items SET tag = '"t0"' WHERE id = 'seed-5'`);
+await j.until('a row leaving the JSON filter', (s) => !s.rows.has('seed-5'));
+j.ws.close();
+log(`a JSON column filtered by value: ${SEEDED / 5} rows, and rows enter and leave the filter live`);
+
+const column = (name, value) => ({ table: 'smoke_items', where: { type: 'simple', op: '=', left: { type: 'column', name }, right: { type: 'literal', value } }, orderBy: [['id', 'asc']] });
+const n = connect('N', { patch: [{ op: 'put', hash: 'scored', ast: column('score', 1.5), ttl: 300000 }, { op: 'put', hash: 'loose', ast: column('loose', { a: [10], k: 1.5 }), ttl: 300000 }] });
+await n.until('the JSON number and object filters', (s) => (s.got.has('scored') && s.got.has('loose')) || s.errors.length > 0);
+if (n.errors.length) fail('a filter on a JSON number or object was refused: ' + JSON.stringify(n.errors[0]));
+if (n.rows.size !== SEEDED / 5 || [...n.rows.values()].some((r) => r.score !== 1.5 || r.loose?.k !== 1.5 || r.loose?.a?.[0] !== 10)) fail(`score = 1.5 (stored as 1.50) and loose = {a:[10],k:1.5} (stored with its own spelling) delivered ${n.rows.size} rows, expected ${SEEDED / 5}`);
+sql(`UPDATE smoke_items SET score = '1.500', loose = '{"a":[10.0],"k":15e-1}' WHERE id = 'seed-6'`);
+await n.until('a row entering the JSON number filter', (s) => s.rows.get('seed-6')?.score === 1.5);
+sql(`UPDATE smoke_items SET score = '2', loose = '{"k":2}' WHERE id = 'seed-6'`);
+await n.until('a row leaving the JSON number filter', (s) => !s.rows.has('seed-6'));
+n.ws.close();
+log(`a number stored as 1.50 is found by 1.5, a json object by its value whatever its spelling: ${SEEDED / 5} rows, live changes included`);
+
+const r1 = connect('R1', { patch: [{ op: 'put', hash: 'open', ast: open, ttl: 300000 }] });
+await r1.until('hydration', (s) => s.got.has('open'));
+const leftAt = r1.cookie;
+r1.ws.close();
+await r1.until('the close', (s) => s.closed);
+sql(`INSERT INTO smoke_items (id, status, points) VALUES ('away-1', 'OPEN', 1), ('away-2', 'OPEN', 2);
+     UPDATE smoke_items SET points = 71 WHERE id = 'seed-7'; UPDATE smoke_items SET points = 72 WHERE id = 'seed-7';
+     DELETE FROM smoke_items WHERE id = 'away-2'; UPDATE smoke_items SET status = 'DONE' WHERE id = 'seed-9';`);
+await new Promise((resolve) => setTimeout(resolve, 1500));
+const r2 = connect('R2', { group: r1.group, baseCookie: leftAt, rows: r1.rows, patch: [{ op: 'put', hash: 'open', ast: open, ttl: 300000 }] });
+await r2.until('what it missed', (s) => s.errors.length > 0 || (s.rows.has('away-1') && s.rows.get('seed-7')?.points === 72 && !s.rows.has('seed-9')));
+if (r2.errors.length) fail('a client back with its cookie was told to start over: ' + JSON.stringify(r2.errors[0]));
+if (r2.bases[0] !== leftAt) fail(`the catch-up should start from ${leftAt}, it started from ${r2.bases[0]}`);
+if (r2.puts > 5 || r2.rows.has('away-2')) fail(`the catch-up should carry the net of what changed, it carried ${r2.puts} puts`);
+log(`a client back after six writes was sent their net from its cookie ${leftAt}: ${r2.puts} puts, no fresh sync`);
+
+const t2 = connect('T2', { group: r1.group, patch: [{ op: 'put', hash: 'open', ast: open, ttl: 300000 }] });
+await t2.until('the group\'s state', (s) => s.errors.length > 0 || s.got.has('open'));
+if (t2.errors.length) fail('a tab without a cookie was refused by a live group: ' + JSON.stringify(t2.errors[0]));
+if (t2.bases[0] !== null || t2.rows.size !== r2.rows.size) fail(`the late tab should hold the group's ${r2.rows.size} rows from nothing, it holds ${t2.rows.size} from ${t2.bases[0]}`);
+sql(`INSERT INTO smoke_items (id, status, points) VALUES ('both-1', 'OPEN', 1)`);
+await Promise.all([r2.until('the write, at the first tab', (s) => s.rows.has('both-1')), t2.until('the write, at the late tab', (s) => s.rows.has('both-1'))]);
+log(`a tab joined the live group without a cookie: sent its ${t2.rows.size - 1} rows, and the first tab went on hearing`);
+
+const behindAt = t2.cookie;
+t2.ws.close();
+await t2.until('the close', (s) => s.closed);
+sql(`INSERT INTO smoke_items (id, status, points) VALUES ('behind-1', 'OPEN', 1)`);
+await r2.until('the first missed write', (s) => s.rows.has('behind-1'));
+sql(`DELETE FROM smoke_items WHERE id = 'both-1'`);
+await r2.until('the second missed write', (s) => !s.rows.has('both-1'));
+const t3 = connect('T3', { group: r1.group, baseCookie: behindAt, rows: t2.rows });
+await t3.until('the pokes it missed', (s) => s.errors.length > 0 || (s.rows.has('behind-1') && !s.rows.has('both-1')));
+if (t3.errors.length) fail('a tab behind its group was told to start over: ' + JSON.stringify(t3.errors[0]));
+if (t3.bases[0] !== behindAt || t3.cookie !== r2.cookie || t3.puts > 2) fail(`the tab should be replayed from ${behindAt} to ${r2.cookie}; it went from ${t3.bases[0]} to ${t3.cookie} with ${t3.puts} puts`);
+log(`a tab behind its group was sent the ${t3.pokes} pokes it missed, from ${behindAt} to ${t3.cookie}`);
+r2.ws.close(); t3.ws.close();
+
 const fits = { tables: { smoke_items: { columns: { id: { type: 'string' }, points: { type: 'number' }, meta: { type: 'json' } }, primaryKey: ['id'] } } };
 const b = connect('B', { clientSchema: fits, patch: [{ op: 'put', hash: 'open', ast: open, ttl: 300000 }] });
 await b.until('hydration', (s) => s.got.has('open') || s.errors.length > 0);
@@ -105,8 +177,12 @@ const limit = stats.gauges.read_row_limit;
 const heavy = stats.heavy_queries?.[0];
 if (limit !== 600) fail(`the server should run with XYNE_SYNC_READ_ROW_LIMIT=600, it reports ${limit}`);
 if (!heavy || heavy.table !== 'smoke_items' || heavy.rows < SEEDED - 1 || heavy.percent_of_limit < 60) fail('the heavy read was not reported: ' + JSON.stringify(stats.heavy_queries));
+await new Promise((resolve) => setTimeout(resolve, 3000));
 const metrics = await (await fetch(`${HTTP}/metrics`)).text();
-for (const needle of ['xyne_sync_read_row_limit 600', 'xyne_sync_reads_near_limit_total{over="50"}', 'xyne_sync_query_read_rows_max{', 'xyne_sync_connections_total{event="refused",reason="client_schema"} 1', 'xyne_sync_end_to_end_seconds_bucket']) {
+const silent = Number(/^xyne_sync_feed_heartbeat_age_seconds (\S+)/m.exec(metrics)?.[1] ?? NaN);
+if (!(silent < 2.5)) fail(`the feed was last heard ${silent} s ago with nobody writing; PostgreSQL's keepalives should keep it under the snapshot rotation`);
+log(`with nobody writing for three seconds the feed was last heard ${silent} s ago, and nothing was written to be heard`);
+for (const needle of ['xyne_sync_connects_total{owed="state"} 1', 'xyne_sync_connects_total{owed="log"} 1', 'xyne_sync_connects_total{owed="start_over"} 0', 'xyne_sync_read_row_limit 600', 'xyne_sync_reads_near_limit_total{over="50"}', 'xyne_sync_query_read_rows_max{', 'xyne_sync_connections_total{event="refused",reason="client_schema"} 1', 'xyne_sync_end_to_end_seconds_bucket']) {
   if (!metrics.includes(needle)) fail(`/metrics lacks ${needle}`);
 }
 log(`the read of ${heavy.rows} rows (${heavy.percent_of_limit}% of the limit of ${limit}) is reported under its query, and /metrics carries it`);

@@ -34,15 +34,40 @@
 //! committed transaction (so a mutation's rows and its `lastMutationID`
 //! travel together), per landed read, and per query change, advancing the
 //! group's version; the version is the cookie the client hands back when
-//! it reconnects, and a cookie this server does not hold (it keeps no
-//! history) resets the client to a fresh sync.
+//! it reconnects.
+//!
+//! # A client that comes back, or comes late
+//!
+//! What a client is owed is everything after its cookie, and a group
+//! answers that in one of four ways ([`Groups::connect`]):
+//!
+//! - **The cookie is the group's version.** Nothing is owed. This is the
+//!   usual reconnect, because a group with no connection open stands
+//!   still: its deltas are still accounted against its row ledger as they
+//!   arrive, but they wait as one coalesced list of row operations and no
+//!   poke is built, so the version stays where the last client left it and
+//!   the first poke after it returns carries all it missed.
+//! - **No cookie, and the group is under way** (a tab opened before the
+//!   store it shares held a cookie). The newcomer is sent the group's
+//!   whole state from the ledger, as one poke from nothing to the group's
+//!   version; the other connections of the group are not disturbed.
+//! - **An older cookie the group's log still reaches** (a tab that was
+//!   away while another kept the group moving). The group keeps its most
+//!   recent pokes, as the frames it already built, up to
+//!   `XYNE_SYNC_GROUP_LOG_BYTES`: every poke sent is kept and the oldest
+//!   dropped until the rest fit, whether or not anyone was really
+//!   listening (a socket that died unnoticed is sent to, and logged for,
+//!   until the server learns of it). The returning connection is sent the
+//!   ones after its cookie, as they were.
+//! - **Anything else** (a cookie older than the log, or from a server
+//!   that is gone): the client is told to start over, and syncs afresh.
 //!
 //! The application's mutation ids arrive as writes to its clients table,
 //! which the engine side carries inside the transaction's own
 //! [`Event::Committed`], so a mutation's rows and its id go out in the
 //! same poke and no later transaction's id rides out early.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -334,6 +359,67 @@ struct Group {
     queued_got: Vec<Json>,
     queued_lmids: HashMap<String, i64>,
     queued_rows: Vec<RowOp>,
+    /// How long `queued_rows` was when it was last coalesced: a group
+    /// with no connection coalesces its waiting operations again only once
+    /// they have doubled, so holding them costs each delta once.
+    queued_floor: usize,
+    log: PokeLog,
+}
+
+/// A group's most recent pokes as the frames that were sent, oldest
+/// first and without a gap up to the group's version, within a budget of
+/// bytes: every poke sent is pushed, and the oldest are dropped until the
+/// rest fit. It is what a connection that returns behind the group is
+/// sent: a tab that reconnects before it has taken up what another tab
+/// stored, or a client whose socket died unnoticed while the server went
+/// on sending to it. A poke larger than the whole budget (a first
+/// hydration) empties the log, since nothing older can be continued from
+/// without it.
+#[derive(Default)]
+struct PokeLog {
+    pokes: VecDeque<(u64, Arc<[Bytes]>, usize)>,
+    bytes: usize,
+}
+
+/// What a logged frame is counted as on top of its own bytes, for the
+/// allocations that hold it, so a log of many small pokes stays near its
+/// budget in memory too.
+const FRAME_OVERHEAD: usize = 64;
+
+impl PokeLog {
+    /// Remember the poke that took the group to `version`.
+    fn push(&mut self, version: u64, frames: &Arc<[Bytes]>, budget: usize) {
+        let size: usize = frames
+            .iter()
+            .map(|frame| frame.len() + FRAME_OVERHEAD)
+            .sum();
+        if size > budget {
+            self.pokes.clear();
+            self.bytes = 0;
+            return;
+        }
+        self.pokes.push_back((version, frames.clone(), size));
+        self.bytes += size;
+        while self.bytes > budget {
+            match self.pokes.pop_front() {
+                Some((_, _, dropped)) => self.bytes -= dropped,
+                None => break,
+            }
+        }
+    }
+
+    /// The pokes after `version`, in order, when the log reaches back
+    /// that far.
+    fn after(&self, version: u64) -> Option<Vec<Arc<[Bytes]>>> {
+        let (oldest, _, _) = self.pokes.front()?;
+        (*oldest <= version + 1).then(|| {
+            self.pokes
+                .iter()
+                .filter(|(logged, _, _)| *logged > version)
+                .map(|(_, frames, _)| frames.clone())
+                .collect()
+        })
+    }
 }
 
 impl Group {
@@ -353,6 +439,8 @@ impl Group {
             queued_got: Vec::new(),
             queued_lmids: HashMap::new(),
             queued_rows: Vec::new(),
+            queued_floor: 0,
+            log: PokeLog::default(),
         }
     }
 
@@ -447,7 +535,7 @@ pub async fn run(
         next_generation: 0,
     };
     log_info!(
-        "client groups {}/{} up; waiting for the first heartbeat before serving queries",
+        "client groups {}/{} up; waiting for the change feed to pass the first snapshot before serving queries",
         shard + 1,
         shards.max(1)
     );
@@ -663,8 +751,12 @@ impl Groups {
         self.dirty.insert(group_id.to_owned());
     }
 
-    /// Attach a connection to its group, creating or resetting the group
-    /// as its cookie requires.
+    /// Attach a connection to its group and send it what it is owed since
+    /// its cookie (the module's "A client that comes back, or comes
+    /// late"): nothing when the cookie is the group's version, the group's
+    /// whole state when it has none and the group is under way, the logged
+    /// pokes after an older cookie. A client that cannot be caught up is
+    /// told to start over; no other connection of the group is touched.
     fn connect(
         &mut self,
         group_id: &str,
@@ -673,31 +765,39 @@ impl Groups {
         base_cookie: Option<String>,
         lmids: Vec<(String, i64)>,
     ) -> ConnectReply {
-        let known: Option<Option<String>> = self
-            .groups
-            .get(group_id)
-            .map(|group| (group.version > 0).then(|| protocol::cookie(group.version)));
-        match (&known, &base_cookie) {
-            (None, Some(_)) => {
+        let offered = match base_cookie.as_deref().map(protocol::version_of) {
+            None => 0,
+            Some(Some(version)) => version,
+            Some(None) => {
+                self.stats.connects_reset.fetch_add(1, Ordering::Relaxed);
                 return ConnectReply::Reset {
-                    reason: "the server holds no state for this client group".to_owned(),
+                    reason: "the cookie is not one this server wrote".to_owned(),
                 };
             }
-            (Some(current), offered) if current != offered => {
-                if offered.is_none() {
-                    self.drop_group(group_id);
-                } else {
-                    return ConnectReply::Reset {
-                        reason: format!(
-                            "the server is at {}, the client at {}",
-                            current.as_deref().unwrap_or("the start"),
-                            offered.as_deref().unwrap_or("the start")
-                        ),
-                    };
-                }
+        };
+        let owed = match self.groups.get(group_id) {
+            None if base_cookie.is_some() => {
+                Err("the server holds no state for this client group".to_owned())
             }
-            _ => {}
-        }
+            None => Ok(Owed::Nothing),
+            Some(group) if offered == group.version => Ok(Owed::Nothing),
+            Some(_) if base_cookie.is_none() => Ok(Owed::Everything),
+            Some(group) => match group.log.after(offered) {
+                Some(pokes) if offered < group.version => Ok(Owed::Pokes(pokes)),
+                _ => Err(format!(
+                    "the server is at {}, the client at {}, and the pokes between are not kept",
+                    protocol::cookie(group.version),
+                    protocol::cookie(offered)
+                )),
+            },
+        };
+        let owed = match owed {
+            Ok(owed) => owed,
+            Err(reason) => {
+                self.stats.connects_reset.fetch_add(1, Ordering::Relaxed);
+                return ConnectReply::Reset { reason };
+            }
+        };
         if !self.groups.contains_key(group_id) {
             self.groups.insert(group_id.to_owned(), Group::new());
             self.stats.client_groups.fetch_add(1, Ordering::Relaxed);
@@ -720,6 +820,88 @@ impl Groups {
             "connection {wsid} joined client group {group_id} as client {}",
             socket.client
         );
+        let sent = Instant::now();
+        match owed {
+            Owed::Nothing => {
+                self.stats.connects_current.fetch_add(1, Ordering::Relaxed);
+            }
+            Owed::Pokes(pokes) => {
+                self.stats.connects_from_log.fetch_add(1, Ordering::Relaxed);
+                log_event!(
+                    Level::Info,
+                    "connection caught up from the group's log",
+                    wsid = wsid,
+                    group = group_id,
+                    from = protocol::cookie(offered),
+                    to = protocol::cookie(group.version),
+                    pokes = pokes.len()
+                );
+                for frames in pokes {
+                    let _ = socket.sink.send(Outbound::Poke {
+                        frames,
+                        since: None,
+                        sent,
+                    });
+                }
+            }
+            Owed::Everything => {
+                self.stats
+                    .connects_from_state
+                    .fetch_add(1, Ordering::Relaxed);
+                let got: Vec<Json> = group
+                    .queries
+                    .iter()
+                    .filter(|(_, state)| state.got)
+                    .map(|(hash, _)| json!({"op": "put", "hash": hash}))
+                    .collect();
+                let images: Vec<(&TableName, DataFrameRow)> = group
+                    .rows
+                    .iter()
+                    .flat_map(|(table, of_table)| {
+                        of_table.values().map(move |held| {
+                            (
+                                table,
+                                DataFrameRow {
+                                    data: held.image.clone(),
+                                },
+                            )
+                        })
+                    })
+                    .collect();
+                let patches: Vec<Patch<'_>> = images
+                    .iter()
+                    .map(|(table, row)| Patch::Put(table, row))
+                    .collect();
+                let poke_id = self.next_poke.to_string();
+                self.next_poke += 1;
+                let (frames, puts, _) = build_poke(
+                    &self.catalog,
+                    &self.stats,
+                    self.config.rows_per_part.max(1),
+                    &poke_id,
+                    None,
+                    &protocol::cookie(group.version),
+                    head_of(&HashMap::new(), &got, &group.lmids),
+                    &patches,
+                    &mut HashMap::new(),
+                );
+                log_event!(
+                    Level::Info,
+                    "connection caught up from the group's state",
+                    wsid = wsid,
+                    group = group_id,
+                    to = protocol::cookie(group.version),
+                    rows = puts,
+                    queries = got.len()
+                );
+                self.stats.pokes.fetch_add(1, Ordering::Relaxed);
+                let _ = socket.sink.send(Outbound::Poke {
+                    frames,
+                    since: None,
+                    sent,
+                });
+            }
+        }
         if group.sockets.insert(wsid, socket).is_none() {
             self.stats.clients.fetch_add(1, Ordering::Relaxed);
         }
@@ -1199,10 +1381,14 @@ impl Groups {
         self.stats.groups_flush.record(started.elapsed());
     }
 
-    /// Assemble and send one group's poke, if there is anything in it;
-    /// `fragments` are the row entries already serialized in this flush,
-    /// by image, and `since` when the oldest transaction of the flush was
-    /// decoded.
+    /// Account what has arrived for one group and, when a connection is
+    /// there to hear it, assemble and send its poke; `fragments` are the
+    /// row entries already serialized in this flush, by image, and `since`
+    /// when the oldest transaction of the flush was decoded. A group with
+    /// no connection keeps its ledger current and its row operations
+    /// waiting, coalesced, and stands still: no frames, no new version,
+    /// so the client that returns with the group's cookie is owed exactly
+    /// what waits here.
     fn poke(
         &mut self,
         group_id: &str,
@@ -1234,93 +1420,167 @@ impl Groups {
                 rows.push(op);
             }
         }
-        let got = std::mem::take(&mut group.queued_got);
-        let desired = std::mem::take(&mut group.queued_desired);
-        let mut lmids = std::mem::take(&mut group.queued_lmids);
         for (client, lmid) in lmid_changes {
             let known = group.lmids.entry(client.clone()).or_insert(0);
             if lmid >= *known {
                 *known = lmid;
-                lmids.insert(client, lmid);
+                group.queued_lmids.insert(client, lmid);
             }
         }
-        if rows.is_empty() && got.is_empty() && desired.is_empty() && lmids.is_empty() {
+        if group.sockets.is_empty() {
+            if rows.len() > group.queued_floor * 2 + 64 {
+                rows = coalesce(rows);
+                group.queued_floor = rows.len();
+            }
+            group.queued_rows = rows;
             return;
         }
+        group.queued_floor = 0;
+        if rows.is_empty()
+            && group.queued_got.is_empty()
+            && group.queued_desired.is_empty()
+            && group.queued_lmids.is_empty()
+        {
+            return;
+        }
+        let got = std::mem::take(&mut group.queued_got);
+        let desired = std::mem::take(&mut group.queued_desired);
+        let lmids = std::mem::take(&mut group.queued_lmids);
         let rows = coalesce(rows);
+        let patches: Vec<Patch<'_>> = rows
+            .iter()
+            .map(|op| match op {
+                RowOp::Put(table, _, row) => Patch::Put(table, row),
+                RowOp::Del(table, key) => Patch::Del(table, key),
+            })
+            .collect();
         let poke_id = self.next_poke.to_string();
         self.next_poke += 1;
         let base = (group.version > 0).then(|| protocol::cookie(group.version));
         group.version += 1;
         let cookie = protocol::cookie(group.version);
-        let per_part = self.config.rows_per_part.max(1);
-        let mut frames: Vec<Bytes> = Vec::with_capacity(rows.len().div_ceil(per_part) + 3);
-        frames.push(Bytes::from(protocol::poke_start(&poke_id, base.as_deref())));
-        let got_count = got.len();
-        let mut head: Vec<u8> = Vec::new();
-        if !desired.is_empty() {
-            head.extend_from_slice(b",\"desiredQueriesPatches\":");
-            let _ = serde_json::to_writer(&mut head, &desired);
-        }
-        if !got.is_empty() {
-            head.extend_from_slice(b",\"gotQueriesPatch\":");
-            let _ = serde_json::to_writer(&mut head, &got);
-        }
-        if !lmids.is_empty() {
-            head.extend_from_slice(b",\"lastMutationIDChanges\":");
-            let _ = serde_json::to_writer(&mut head, &lmids);
-        }
-        let mut head = Some(head);
-        if rows.is_empty() {
-            frames.push(part_frame(&poke_id, head.take(), &[]));
-        }
-        let mut puts = 0usize;
-        let mut dels = 0usize;
-        for chunk in rows.chunks(per_part) {
-            let mut entries: Vec<Bytes> = Vec::with_capacity(chunk.len());
-            for op in chunk {
-                match op {
-                    RowOp::Put(table, _, row) => {
-                        let Some(declared) = self.catalog.table(table.as_str()) else {
-                            continue;
-                        };
-                        puts += 1;
-                        let (shared, serialized) =
-                            (&self.stats.rows_shared, &self.stats.rows_serialized);
-                        let fragment = match fragments.entry(Arc::as_ptr(&row.data) as usize) {
-                            std::collections::hash_map::Entry::Occupied(entry) => {
-                                shared.fetch_add(1, Ordering::Relaxed);
-                                entry.into_mut()
-                            }
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                serialized.fetch_add(1, Ordering::Relaxed);
-                                let mut bytes = Vec::with_capacity(256);
-                                wire::write_put(&mut bytes, declared, row);
-                                entry.insert(Bytes::from(bytes))
-                            }
-                        };
-                        entries.push(fragment.clone());
-                    }
-                    RowOp::Del(table, key) => {
-                        dels += 1;
-                        let mut bytes = Vec::with_capacity(64);
-                        wire::write_del(&mut bytes, table.as_str(), key);
-                        entries.push(Bytes::from(bytes));
-                    }
-                }
-            }
-            frames.push(part_frame(&poke_id, head.take(), &entries));
-        }
-        frames.push(Bytes::from(protocol::poke_end(&poke_id, &cookie)));
+        let (frames, puts, dels) = build_poke(
+            &self.catalog,
+            &self.stats,
+            self.config.rows_per_part.max(1),
+            &poke_id,
+            base.as_deref(),
+            &cookie,
+            head_of(&desired, &got, &lmids),
+            &patches,
+            fragments,
+        );
         log_debug!(
-            "group {group_id}: poke {poke_id} {} -> {cookie}: {puts} puts, {dels} dels, {got_count} got, {} lmids",
+            "group {group_id}: poke {poke_id} {} -> {cookie}: {puts} puts, {dels} dels, {} got, {} lmids",
             base.as_deref().unwrap_or("null"),
+            got.len(),
             lmids.len()
         );
         self.stats.pokes.fetch_add(1, Ordering::Relaxed);
-        let frames: Arc<[Bytes]> = frames.into();
+        group
+            .log
+            .push(group.version, &frames, self.config.group_log_bytes);
         group.broadcast(&frames, since);
     }
+}
+
+/// What a connecting client is owed since its cookie.
+enum Owed {
+    Nothing,
+    /// The group's whole state, as one poke from nothing.
+    Everything,
+    /// The logged pokes after its cookie, as they were sent.
+    Pokes(Vec<Arc<[Bytes]>>),
+}
+
+/// One row operation of a poke, borrowed from wherever it is kept: a
+/// flush's operations, or the ledger's images.
+enum Patch<'a> {
+    Put(&'a TableName, &'a DataFrameRow),
+    Del(&'a TableName, &'a DataFrameKey),
+}
+
+/// The query-state and mutation-id fields of a poke's first part, as JSON
+/// fields ready to follow the poke id.
+fn head_of(
+    desired: &HashMap<String, Vec<Json>>,
+    got: &[Json],
+    lmids: &HashMap<String, i64>,
+) -> Vec<u8> {
+    let mut head: Vec<u8> = Vec::new();
+    if !desired.is_empty() {
+        head.extend_from_slice(b",\"desiredQueriesPatches\":");
+        let _ = serde_json::to_writer(&mut head, desired);
+    }
+    if !got.is_empty() {
+        head.extend_from_slice(b",\"gotQueriesPatch\":");
+        let _ = serde_json::to_writer(&mut head, got);
+    }
+    if !lmids.is_empty() {
+        head.extend_from_slice(b",\"lastMutationIDChanges\":");
+        let _ = serde_json::to_writer(&mut head, lmids);
+    }
+    head
+}
+
+/// One poke as its frames, from `base` to `cookie`: the start, the parts
+/// (`head` in the first, `per_part` row operations each, every put taken
+/// from `fragments` when the image was already serialized in this flush),
+/// the end. Also how many puts and dels it carries.
+#[allow(clippy::too_many_arguments)]
+fn build_poke(
+    catalog: &Catalog,
+    stats: &Stats,
+    per_part: usize,
+    poke_id: &str,
+    base: Option<&str>,
+    cookie: &str,
+    head: Vec<u8>,
+    rows: &[Patch<'_>],
+    fragments: &mut HashMap<usize, Bytes>,
+) -> (Arc<[Bytes]>, usize, usize) {
+    let mut frames: Vec<Bytes> = Vec::with_capacity(rows.len().div_ceil(per_part) + 3);
+    frames.push(Bytes::from(protocol::poke_start(poke_id, base)));
+    let mut head = Some(head);
+    if rows.is_empty() {
+        frames.push(part_frame(poke_id, head.take(), &[]));
+    }
+    let (mut puts, mut dels) = (0usize, 0usize);
+    for chunk in rows.chunks(per_part) {
+        let mut entries: Vec<Bytes> = Vec::with_capacity(chunk.len());
+        for op in chunk {
+            match op {
+                Patch::Put(table, row) => {
+                    let Some(declared) = catalog.table(table.as_str()) else {
+                        continue;
+                    };
+                    puts += 1;
+                    let fragment = match fragments.entry(Arc::as_ptr(&row.data) as usize) {
+                        std::collections::hash_map::Entry::Occupied(entry) => {
+                            stats.rows_shared.fetch_add(1, Ordering::Relaxed);
+                            entry.into_mut()
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            stats.rows_serialized.fetch_add(1, Ordering::Relaxed);
+                            let mut bytes = Vec::with_capacity(256);
+                            wire::write_put(&mut bytes, declared, row);
+                            entry.insert(Bytes::from(bytes))
+                        }
+                    };
+                    entries.push(fragment.clone());
+                }
+                Patch::Del(table, key) => {
+                    dels += 1;
+                    let mut bytes = Vec::with_capacity(64);
+                    wire::write_del(&mut bytes, table.as_str(), key);
+                    entries.push(Bytes::from(bytes));
+                }
+            }
+        }
+        frames.push(part_frame(poke_id, head.take(), &entries));
+    }
+    frames.push(Bytes::from(protocol::poke_end(poke_id, cookie)));
+    (frames.into(), puts, dels)
 }
 
 /// One `pokePart` frame: the poke id, the query-state and mutation-id
@@ -1446,5 +1706,511 @@ mod tests {
                 .is_some_and(|of_table| of_table.contains_key(&key)),
             "the shared row stays for the first holder"
         );
+    }
+
+    /// A group thread on its own: the engine side is this test, which
+    /// reads the commands the thread sends and hands it events.
+    struct Bench {
+        core: Groups,
+        commands: mpsc::UnboundedReceiver<Command<MultiTableReadQuery>>,
+    }
+
+    /// One fake connection: what its socket was sent.
+    #[derive(Debug)]
+    struct Tab {
+        wsid: String,
+        frames: mpsc::UnboundedReceiver<Outbound>,
+    }
+
+    /// One poke as a test reads it: the cookie it starts from and ends at,
+    /// the rows put (by id, with the name sent) and deleted, the queries
+    /// reported complete.
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        base: Option<String>,
+        cookie: String,
+        puts: Vec<(i64, String)>,
+        dels: Vec<i64>,
+        got: Vec<String>,
+    }
+
+    impl Bench {
+        /// A thread over one table `notes(id, name)`, the log's budget as
+        /// given.
+        fn new(log_bytes: &str) -> Self {
+            let vars: HashMap<&str, &str> = HashMap::from([
+                ("XYNE_SYNC_PG_DSN", "postgresql://none/none"),
+                ("XYNE_SYNC_QUERY_URL", "http://none/query"),
+                ("XYNE_SYNC_MUTATE_URL", "http://none/push"),
+                ("XYNE_SYNC_GROUP_LOG_BYTES", log_bytes),
+            ]);
+            let config = Config::from_lookup(|name| vars.get(name).map(|v| (*v).to_owned()))
+                .expect("a configuration");
+            let catalog = Catalog::new([crate::model::DbTable::new(
+                "notes",
+                ["id"],
+                vec![
+                    crate::model::DbColumn::new("id", crate::model::ValueType::Int),
+                    crate::model::DbColumn::new("name", crate::model::ValueType::String),
+                ],
+            )]);
+            let (outbox, commands) = mpsc::unbounded_channel();
+            let (requests, _requests_rx) = mpsc::channel(16);
+            let core = Groups {
+                clients_table: TableName::from(config.clients_table().as_str()),
+                config: Arc::new(config),
+                catalog: Arc::new(catalog),
+                shard: 0,
+                stats: Stats::shared(),
+                oldest: None,
+                commands: outbox,
+                requests,
+                ready: true,
+                readiness: watch::channel(true).0,
+                backlog: Vec::new(),
+                groups: HashMap::new(),
+                by_sub: HashMap::new(),
+                awaiting: HashMap::new(),
+                pending: HashMap::new(),
+                lmid_changes: HashMap::new(),
+                dirty: HashSet::new(),
+                next_poke: 1,
+                next_generation: 0,
+            };
+            Bench { core, commands }
+        }
+
+        /// Connect `wsid` to group `g` with `cookie`; the tab when accepted,
+        /// the reason when told to start over.
+        fn connect(&mut self, wsid: &str, cookie: Option<&str>) -> Result<Tab, String> {
+            let (sink, frames) = mpsc::unbounded_channel();
+            let socket = Socket {
+                client: format!("client-{wsid}"),
+                sink,
+            };
+            match self.core.connect(
+                "g",
+                wsid.to_owned(),
+                socket,
+                cookie.map(str::to_owned),
+                Vec::new(),
+            ) {
+                ConnectReply::Accepted => Ok(Tab {
+                    wsid: wsid.to_owned(),
+                    frames,
+                }),
+                ConnectReply::Reset { reason } => Err(reason),
+            }
+        }
+
+        /// The tab desires the query `hash`; the engine side registers it
+        /// as `sub`, delivers `rows` and reports it complete.
+        fn hydrate(&mut self, tab: &Tab, hash: &str, sub: u64, rows: &[(i64, &str)]) {
+            let query = MultiTableReadQuery::single(crate::model::SingleTableReadQuery::new(
+                "notes",
+                crate::model::Where::AND(Vec::new()),
+                crate::model::OrderBy::new("id", crate::model::Order::ASC),
+                u32::MAX,
+            ));
+            self.core.desired(
+                "g",
+                &format!("client-{}", tab.wsid),
+                vec![DesiredOp::Put {
+                    hash: hash.to_owned(),
+                    name: hash.to_owned(),
+                    ttl: None,
+                    planned: Some(Ok(Box::new(Translated {
+                        query,
+                        hidden: HashSet::new(),
+                    }))),
+                }],
+            );
+            let token = loop {
+                match self.commands.try_recv().expect("a registration is sent") {
+                    Command::Register { token, .. } => break token,
+                    _ => continue,
+                }
+            };
+            self.core.event(Event::Registered {
+                token,
+                sub: SubId(sub),
+                updates: rows.iter().map(|(id, name)| put(sub, *id, name)).collect(),
+                reads: 1,
+            });
+            self.core.event(Event::Hydrated(vec![SubId(sub)]));
+            self.core.flush();
+        }
+
+        /// Deltas arrive from the engine side and the thread flushes.
+        fn deliver(&mut self, updates: Vec<Delta>) {
+            self.core.event(Event::Landed { updates });
+            self.core.flush();
+        }
+
+        /// The group's version, as its cookie.
+        fn cookie(&self) -> String {
+            protocol::cookie(self.core.groups["g"].version)
+        }
+    }
+
+    impl Tab {
+        /// Every poke the tab's socket was sent since the last look.
+        fn pokes(&mut self) -> Vec<Seen> {
+            let mut out = Vec::new();
+            while let Ok(outbound) = self.frames.try_recv() {
+                let Outbound::Poke { frames, .. } = outbound else {
+                    continue;
+                };
+                let mut seen = Seen {
+                    base: None,
+                    cookie: String::new(),
+                    puts: Vec::new(),
+                    dels: Vec::new(),
+                    got: Vec::new(),
+                };
+                for frame in frames.iter() {
+                    let parsed: Json = serde_json::from_slice(frame).expect("a JSON frame");
+                    let (tag, body) = (parsed[0].as_str().unwrap_or(""), &parsed[1]);
+                    match tag {
+                        "pokeStart" => {
+                            seen.base = body["baseCookie"].as_str().map(str::to_owned);
+                        }
+                        "pokeEnd" => seen.cookie = body["cookie"].as_str().unwrap_or("").to_owned(),
+                        _ => {
+                            for op in body["rowsPatch"].as_array().into_iter().flatten() {
+                                if op["op"] == "put" {
+                                    seen.puts.push((
+                                        op["value"]["id"].as_i64().unwrap_or(-1),
+                                        op["value"]["name"].as_str().unwrap_or("").to_owned(),
+                                    ));
+                                } else {
+                                    seen.dels.push(op["id"]["id"].as_i64().unwrap_or(-1));
+                                }
+                            }
+                            for op in body["gotQueriesPatch"].as_array().into_iter().flatten() {
+                                seen.got.push(op["hash"].as_str().unwrap_or("").to_owned());
+                            }
+                        }
+                    }
+                }
+                seen.puts.sort();
+                seen.dels.sort_unstable();
+                out.push(seen);
+            }
+            out
+        }
+    }
+
+    /// Subscription `sub` shows the note `id` named `name`.
+    fn put(sub: u64, id: i64, name: &str) -> Delta {
+        let (key, image) = row(id, name);
+        Delta {
+            table: TableName::from("notes"),
+            op: DataFrameOperation::Add(key, image),
+            audiences: vec![crate::ivm::Audience {
+                part: QueryPart::main(),
+                subs: crate::ivm::Subs::One(SubId(sub)),
+            }],
+        }
+    }
+
+    /// Subscription `sub` no longer shows the note `id`.
+    fn gone(sub: u64, id: i64) -> Delta {
+        let (key, image) = row(id, "");
+        Delta {
+            table: TableName::from("notes"),
+            op: DataFrameOperation::Delete(key, image),
+            audiences: vec![crate::ivm::Audience {
+                part: QueryPart::main(),
+                subs: crate::ivm::Subs::One(SubId(sub)),
+            }],
+        }
+    }
+
+    /// Run `body` where the thread's timers can be spawned.
+    fn on_local<T>(body: impl FnOnce() -> T) -> T {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let local = tokio::task::LocalSet::new();
+        local.block_on(&runtime, async { body() })
+    }
+
+    /// A group with no connection stands still: what changes while its
+    /// client is away is accounted and waits, no poke is built and the
+    /// version does not move, so the client that returns with its cookie
+    /// is accepted and its next poke carries exactly the net of what it
+    /// missed, once.
+    #[test]
+    fn a_client_that_returns_is_sent_what_it_missed() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut tab = bench.connect("a1", None).expect("accepted");
+            bench.hydrate(&tab, "h1", 1, &[(1, "one"), (2, "two")]);
+            let first = tab.pokes();
+            let last = first.last().expect("a poke");
+            assert_eq!(last.cookie, bench.cookie());
+            assert_eq!(last.got, vec!["h1"]);
+            let left_at = bench.cookie();
+            bench.core.disconnect("g", "a1");
+
+            bench.deliver(vec![put(1, 3, "three"), gone(1, 1)]);
+            bench.deliver(vec![put(1, 3, "three, renamed")]);
+            bench.deliver(vec![put(1, 4, "four"), gone(1, 4)]);
+            assert_eq!(
+                bench.cookie(),
+                left_at,
+                "the group did not move while nobody listened"
+            );
+            assert!(bench.core.groups["g"].log.pokes.len() <= first.len());
+
+            let mut back = bench
+                .connect("a2", Some(&left_at))
+                .expect("the cookie still fits");
+            bench.core.flush();
+            let pokes = back.pokes();
+            assert_eq!(pokes.len(), 1, "{pokes:?}");
+            assert_eq!(pokes[0].base.as_deref(), Some(left_at.as_str()));
+            assert_eq!(pokes[0].puts, vec![(3, "three, renamed".to_owned())]);
+            assert_eq!(pokes[0].dels, vec![1, 4]);
+            assert_eq!(pokes[0].cookie, bench.cookie());
+            let stats = &bench.core.stats;
+            assert_eq!(stats.connects_reset.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    /// A tab that joins a group under way without a cookie is sent the
+    /// group's whole state as one poke from nothing, and the tab already
+    /// there keeps its subscriptions and goes on hearing: nothing is
+    /// unregistered, and the next change reaches both from the same
+    /// cookie.
+    #[test]
+    fn a_tab_without_a_cookie_joins_a_group_under_way() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut first = bench.connect("a", None).expect("accepted");
+            bench.hydrate(&first, "h1", 1, &[(1, "one"), (2, "two")]);
+            bench.deliver(vec![put(1, 3, "three"), gone(1, 2)]);
+            first.pokes();
+            let at = bench.cookie();
+
+            let mut second = bench.connect("b", None).expect("accepted, not reset");
+            let caught_up = second.pokes();
+            assert_eq!(caught_up.len(), 1, "{caught_up:?}");
+            assert_eq!(caught_up[0].base, None);
+            assert_eq!(caught_up[0].cookie, at);
+            assert_eq!(
+                caught_up[0].puts,
+                vec![(1, "one".to_owned()), (3, "three".to_owned())]
+            );
+            assert_eq!(caught_up[0].got, vec!["h1"]);
+            assert!(
+                first.pokes().is_empty(),
+                "the first tab hears nothing of it"
+            );
+            assert!(bench.core.groups["g"].subs.contains(&SubId(1)));
+            while let Ok(command) = bench.commands.try_recv() {
+                assert!(
+                    !matches!(command, Command::Unregister(_) | Command::UnregisterAll(_)),
+                    "the group's subscriptions were let go"
+                );
+            }
+
+            bench.deliver(vec![put(1, 5, "five")]);
+            let (to_first, to_second) = (first.pokes(), second.pokes());
+            assert_eq!(to_first, to_second);
+            let change = to_first.last().expect("a poke");
+            assert_eq!(change.base.as_deref(), Some(at.as_str()));
+            assert_eq!(change.puts, vec![(5, "five".to_owned())]);
+        });
+    }
+
+    /// A tab that was away while another kept the group moving returns
+    /// with an older cookie and is sent the pokes after it, as they were;
+    /// with nothing logged, or a cookie the log no longer reaches, it is
+    /// told to start over, as is a cookie this server never wrote or one
+    /// for a group it does not hold.
+    #[test]
+    fn a_tab_behind_the_group_is_sent_the_logged_pokes() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut stays = bench.connect("a", None).expect("accepted");
+            bench.hydrate(&stays, "h1", 1, &[(1, "one")]);
+            let leaves = bench.connect("b", Some(&bench.cookie())).expect("accepted");
+            let left_at = bench.cookie();
+            bench.core.disconnect("g", &leaves.wsid);
+            stays.pokes();
+
+            bench.deliver(vec![put(1, 2, "two")]);
+            bench.deliver(vec![gone(1, 1)]);
+            let heard = stays.pokes();
+            assert_eq!(heard.len(), 2);
+
+            let mut back = bench
+                .connect("b2", Some(&left_at))
+                .expect("caught up from the log");
+            assert_eq!(back.pokes(), heard, "the same pokes, in order");
+            bench.deliver(vec![put(1, 3, "three")]);
+            assert_eq!(back.pokes(), stays.pokes());
+            assert_eq!(
+                bench.core.stats.connects_from_log.load(Ordering::Relaxed),
+                1
+            );
+
+            assert!(
+                bench.connect("c", Some("zz")).is_err(),
+                "not a cookie of ours"
+            );
+            let ahead = protocol::cookie(bench.core.groups["g"].version + 5);
+            assert!(
+                bench.connect("d", Some(&ahead)).is_err(),
+                "ahead of the group"
+            );
+
+            let mut unlogged = Bench::new("0");
+            let mut tab = unlogged.connect("a", None).expect("accepted");
+            unlogged.hydrate(&tab, "h1", 1, &[(1, "one")]);
+            let old = unlogged.cookie();
+            unlogged.deliver(vec![put(1, 2, "two")]);
+            tab.pokes();
+            let reason = unlogged
+                .connect("b", Some(&old))
+                .expect_err("nothing is kept");
+            assert!(reason.contains("not kept"), "{reason}");
+            let mut empty = Bench::new("262144");
+            assert!(empty.connect("x", Some("01")).is_err(), "no such group");
+        });
+    }
+
+    /// A socket that died unnoticed is still sent to, and what it is sent
+    /// is logged like any poke: the client that returns with the cookie it
+    /// last received, while its dead socket is still attached, is sent
+    /// every poke after it, in order, many more than a handful, and hears
+    /// what follows; the dead socket's later departure changes nothing.
+    #[test]
+    fn a_client_whose_socket_died_unnoticed_is_caught_up() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut dead = bench.connect("a", None).expect("accepted");
+            bench.hydrate(&dead, "h1", 1, &[(1, "one")]);
+            let last_received = bench.cookie();
+            dead.pokes();
+            for id in 2..=201 {
+                bench.deliver(vec![put(1, id, "written while nobody heard")]);
+            }
+            let unheard = dead.pokes();
+            assert_eq!(unheard.len(), 200);
+
+            let mut back = bench
+                .connect("a-again", Some(&last_received))
+                .expect("caught up");
+            let replayed = back.pokes();
+            assert_eq!(
+                replayed, unheard,
+                "every poke after its cookie, as it was sent"
+            );
+            assert_eq!(replayed[0].base.as_deref(), Some(last_received.as_str()));
+            assert_eq!(
+                replayed.last().map(|poke| poke.cookie.clone()),
+                Some(bench.cookie())
+            );
+
+            bench.core.disconnect("g", "a");
+            bench.deliver(vec![put(1, 500, "after")]);
+            let after = back.pokes();
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].puts, vec![(500, "after".to_owned())]);
+        });
+    }
+
+    /// The two ways of keeping what a client missed meet without a gap or
+    /// an overlap. A socket dies unnoticed at cookie `c`: the pokes sent to
+    /// it meanwhile are in the log. The server then learns of it and the
+    /// group stands still: what changes from there on waits as one
+    /// operation per row. The client that returns much later with `c` is
+    /// sent the logged pokes as they were, which bring it to where the
+    /// group stopped, and then one poke from there with the net of the
+    /// rest; had it received some of the logged pokes before dying, its
+    /// cookie says so and it is sent only the ones after it.
+    #[test]
+    fn a_long_absence_is_the_logged_pokes_and_then_the_waiting_rows() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut dead = bench.connect("a", None).expect("accepted");
+            bench.hydrate(&dead, "h1", 1, &[(1, "one")]);
+            let last_received = bench.cookie();
+            dead.pokes();
+            for id in 2..=6 {
+                bench.deliver(vec![put(1, id, "sent to the dead socket")]);
+            }
+            let unheard = dead.pokes();
+            let partly = unheard[1].cookie.clone();
+            bench.core.disconnect("g", "a");
+            let stopped_at = bench.cookie();
+
+            bench.deliver(vec![put(1, 7, "seven")]);
+            bench.deliver(vec![put(1, 7, "seven, renamed"), gone(1, 2)]);
+            bench.deliver(vec![put(1, 8, "eight"), gone(1, 8)]);
+            assert_eq!(bench.cookie(), stopped_at);
+
+            let mut back = bench
+                .connect("a2", Some(&last_received))
+                .expect("caught up");
+            bench.core.flush();
+            let pokes = back.pokes();
+            assert_eq!(pokes.len(), unheard.len() + 1, "{pokes:?}");
+            assert_eq!(pokes[..unheard.len()], unheard[..]);
+            let rest = pokes.last().expect("the waiting rows");
+            assert_eq!(rest.base.as_deref(), Some(stopped_at.as_str()));
+            assert_eq!(rest.puts, vec![(7, "seven, renamed".to_owned())]);
+            assert_eq!(rest.dels, vec![2, 8]);
+            assert_eq!(rest.cookie, bench.cookie());
+
+            let mut other = Bench::new("262144");
+            let mut tab = other.connect("a", None).expect("accepted");
+            other.hydrate(&tab, "h1", 1, &[(1, "one")]);
+            tab.pokes();
+            for id in 2..=6 {
+                other.deliver(vec![put(1, id, "sent to the dead socket")]);
+            }
+            let sent = tab.pokes();
+            assert_eq!(sent[1].cookie, partly);
+            other.core.disconnect("g", "a");
+            let mut half = other.connect("a2", Some(&partly)).expect("caught up");
+            assert_eq!(
+                half.pokes(),
+                sent[2..],
+                "only the pokes after the one it last received"
+            );
+        });
+    }
+
+    /// The log keeps the newest pokes within its budget without a gap:
+    /// every poke is pushed and the oldest are dropped until the rest fit,
+    /// however many that is, and a poke larger than the budget empties it,
+    /// since nothing older can be continued from without it.
+    #[test]
+    fn the_poke_log_is_bounded_and_gapless() {
+        let frames = |bytes: usize| -> Arc<[Bytes]> {
+            vec![Bytes::from(vec![b'x'; bytes - FRAME_OVERHEAD])].into()
+        };
+        let mut log = PokeLog::default();
+        for version in 1..=5 {
+            log.push(version, &frames(400), 1_000);
+        }
+        assert_eq!(log.pokes.len(), 2);
+        assert_eq!(log.bytes, 800);
+        assert!(log.after(2).is_none(), "version 3 is gone");
+        assert_eq!(log.after(3).map(|pokes| pokes.len()), Some(2));
+        assert_eq!(log.after(4).map(|pokes| pokes.len()), Some(1));
+        log.push(6, &frames(5_000), 1_000);
+        assert!(log.pokes.is_empty() && log.bytes == 0);
+        assert!(log.after(5).is_none());
+        for version in 7..=1_006 {
+            log.push(version, &frames(100), 256 * 1024);
+        }
+        assert_eq!(log.pokes.len(), 1_000, "only the bytes bound it");
+        assert_eq!(log.after(6).map(|pokes| pokes.len()), Some(1_000));
     }
 }

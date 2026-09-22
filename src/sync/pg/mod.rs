@@ -29,6 +29,20 @@
 //! `Send + Sync`, so the same handle answers the engine's reads, the
 //! planner's counts from a connection task and a plain query.
 //!
+//! # A read that does not come back
+//!
+//! A read is given [`PgStorage::with_read_timeout`] to finish, counted
+//! from the moment it holds a connection permit (the wait for a permit is
+//! the server's own queue, not PostgreSQL's time). Two clocks run: the
+//! connections the pool opens carry the limit as their session's
+//! `statement_timeout`, so PostgreSQL stops working on a statement it has
+//! been running that long, and the pool stops waiting after the same
+//! time, which covers what PostgreSQL cannot cancel (a connection that
+//! will not open, a network that went silent). Either way the read is
+//! **refused**, naming the table: reading it again would load a database
+//! that is already slow, so the query that needed it is told, by name,
+//! and asked for again later by the client. The connection is dropped.
+//!
 //! [`stream::PgStream`] delivers the change feed from a permanent logical
 //! slot over a replication connection and positions every write at the
 //! end of its commit record, the same scale the aliases' consistent
@@ -48,6 +62,7 @@ use std::time::Duration;
 
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow};
 
 use super::storage::{Storage, StorageError};
@@ -141,6 +156,9 @@ impl From<tokio_postgres::Error> for StorageError {
     /// a schema change can cure; a text value with a NUL byte the driver
     /// cannot encode) is refused rather than parked and retried forever,
     /// with a reason that quotes no data; the message itself is logged.
+    /// A snapshot that is no longer there (the connection that exported
+    /// it ended) is a data error by its code and is not one: the next
+    /// alias cures it, so that read is parked like any transient failure.
     fn from(error: tokio_postgres::Error) -> Self {
         let mut text = error.to_string();
         let mut source = std::error::Error::source(&error);
@@ -150,7 +168,7 @@ impl From<tokio_postgres::Error> for StorageError {
             source = inner.source();
         }
         match error.as_db_error() {
-            Some(db) if permanent(db.code().code()) => {
+            Some(db) if permanent(db.code().code()) && !snapshot_gone(db.message()) => {
                 log_warn!("a read the database will not run as written: {text}");
                 StorageError::refused(format!(
                     "the database will not run this query as written (SQLSTATE {})",
@@ -172,6 +190,19 @@ impl From<tokio_postgres::Error> for StorageError {
 fn permanent(code: &str) -> bool {
     const CURABLE: [&str; 6] = ["42501", "42P01", "42703", "42883", "42704", "42P02"];
     code.len() >= 2 && matches!(&code[..2], "22" | "42") && !CURABLE.contains(&code)
+}
+
+/// Whether a server message says the exported snapshot a read asked for
+/// no longer exists.
+fn snapshot_gone(message: &str) -> bool {
+    message.starts_with("invalid snapshot identifier")
+}
+
+/// The refusal of `what` (a read on a table, a count, a statement) that
+/// did not finish within `limit`.
+fn timed_out(what: &str, limit: Duration) -> StorageError {
+    log_warn!("{what} took longer than {} ms; refused", limit.as_millis());
+    StorageError::refused(format!("{what} took longer than {} ms", limit.as_millis()))
 }
 
 /// The aliases: the current one, and the newer ones minted since, oldest
@@ -205,6 +236,8 @@ impl Aliases {
 /// - `aliases`: the current alias and the ones waiting to become it; a
 ///   read clones the current handle and keeps it until it is done.
 /// - `rotation`: how often a fresh alias is minted, in milliseconds.
+/// - `timeout`: how long a read may take, in milliseconds; zero for no
+///   limit.
 /// - `alive`: cleared when the storage drops, which ends the minting task.
 /// - `runtime`: where the reads, the connections and the minter run.
 struct Pool {
@@ -216,6 +249,7 @@ struct Pool {
     row_limit: AtomicUsize,
     aliases: Mutex<Aliases>,
     rotation: AtomicU64,
+    timeout: AtomicU64,
     alive: AtomicBool,
     runtime: Handle,
 }
@@ -263,6 +297,7 @@ impl PgStorage {
             row_limit: AtomicUsize::new(read_row_limit()),
             aliases: Mutex::new(Aliases::default()),
             rotation: AtomicU64::new(250),
+            timeout: AtomicU64::new(0),
             alive: AtomicBool::new(true),
             runtime,
         });
@@ -295,6 +330,7 @@ impl PgStorage {
             row_limit: AtomicUsize::new(self.pool.row_limit.load(Ordering::Relaxed)),
             aliases: Mutex::new(std::mem::take(&mut *self.pool.lock_aliases())),
             rotation: AtomicU64::new(self.pool.rotation.load(Ordering::Relaxed)),
+            timeout: AtomicU64::new(self.pool.timeout.load(Ordering::Relaxed)),
             alive: AtomicBool::new(true),
             runtime: self.pool.runtime.clone(),
         });
@@ -302,6 +338,16 @@ impl PgStorage {
         let delay = self.delay;
         drop(self);
         PgStorage { pool, delay }
+    }
+
+    /// Give a read `timeout` to finish before it is refused (zero: as
+    /// long as it takes). The connections opened so far carry no limit of
+    /// their own, so they are let go and the next reads open theirs.
+    pub fn with_read_timeout(self, timeout: Duration) -> Self {
+        let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        self.pool.timeout.store(millis, Ordering::Relaxed);
+        self.pool.lock_idle().clear();
+        self
     }
 
     /// Mint a fresh alias every `every`.
@@ -329,16 +375,7 @@ impl PgStorage {
         let pool = self.pool.clone();
         let sql = sql.to_owned();
         run_on(&self.pool.runtime, async move {
-            let _permit = pool.permit().await?;
-            let client = pool.acquire().await?;
-            let outcome = client.simple_query(&sql).await;
-            match outcome {
-                Ok(messages) => {
-                    pool.release(client);
-                    Ok(rows_of(messages))
-                }
-                Err(error) => Err(error.into()),
-            }
+            pool.run("a statement", &sql).await
         })
         .await
     }
@@ -367,7 +404,8 @@ impl Storage for PgStorage {
             if query.limit == u32::MAX {
                 sql.push_str(&format!(" LIMIT {}", row_limit + 1));
             }
-            let rows = pool.read(&alias, &sql, delay).await?;
+            let what = format!("a read on `{}`", query.table);
+            let rows = pool.read(&alias, &what, &sql, delay).await?;
             if rows.len() > row_limit {
                 log_warn!(
                     "read on `{}` returned more than {} rows; refused",
@@ -406,7 +444,8 @@ impl Storage for PgStorage {
             let table = pool.table(&query)?;
             let alias = pool.current_alias()?;
             let sql = sql::count_sql(&query, table, cap);
-            let rows = pool.read(&alias, &sql, None).await?;
+            let what = format!("counting the rows of `{}`", query.table);
+            let rows = pool.read(&alias, &what, &sql, None).await?;
             let text = rows
                 .first()
                 .and_then(|row| row.get(0))
@@ -470,12 +509,82 @@ impl Pool {
             .map_err(|_| StorageError("the read pool is closed".to_owned()))
     }
 
-    /// An idle connection, or a new one.
+    /// An idle connection that is still open, or a new one. A connection
+    /// that ended while it sat idle (the server restarted, the network
+    /// lost it and the keepalive probes found out) is let go here rather
+    /// than handed to a read that would wait on it.
     async fn acquire(&self) -> Result<Client, StorageError> {
-        let idle = self.lock_idle().pop();
-        match idle {
-            Some(client) => Ok(client),
-            None => open(&self.config, &self.runtime).await,
+        loop {
+            let idle = self.lock_idle().pop();
+            match idle {
+                Some(client) if client.is_closed() => continue,
+                Some(client) => return Ok(client),
+                None => return open(&self.read_config(), &self.runtime).await,
+            }
+        }
+    }
+
+    /// How long a read may take, when a limit is set.
+    fn timeout(&self) -> Option<Duration> {
+        match self.timeout.load(Ordering::Relaxed) {
+            0 => None,
+            millis => Some(Duration::from_millis(millis)),
+        }
+    }
+
+    /// How a read's connection is opened: `config`, with TCP keepalive
+    /// probes that find a dead peer within half a minute of idling (the
+    /// driver's default is two hours), and the read timeout as both the
+    /// time the connection may take to open and the session's
+    /// `statement_timeout`, after whatever options the connection string
+    /// already carries.
+    fn read_config(&self) -> Config {
+        let mut config = self.config.clone();
+        config
+            .keepalives(true)
+            .keepalives_idle(Duration::from_secs(15))
+            .keepalives_interval(Duration::from_secs(5))
+            .keepalives_retries(3);
+        if let Some(limit) = self.timeout() {
+            config.connect_timeout(limit);
+            let ours = format!("-c statement_timeout={}", limit.as_millis());
+            let options = match config.get_options() {
+                Some(theirs) => format!("{theirs} {ours}"),
+                None => ours,
+            };
+            config.options(&options);
+        }
+        config
+    }
+
+    /// Run one simple-query batch on a pooled connection, within the read
+    /// timeout, and return the rows of its last statement that had any.
+    /// `what` names the work in the refusal of a batch that did not
+    /// finish in time: PostgreSQL cancelled it, or the wait ended first.
+    async fn run(&self, what: &str, batch: &str) -> Result<Vec<SimpleQueryRow>, StorageError> {
+        let _permit = self.permit().await?;
+        let limit = self.timeout();
+        let work = async {
+            let client = self.acquire().await?;
+            match client.simple_query(batch).await {
+                Ok(messages) => {
+                    self.release(client);
+                    Ok(rows_of(messages))
+                }
+                Err(error) => match limit {
+                    Some(limit) if error.code() == Some(&SqlState::QUERY_CANCELED) => {
+                        Err(timed_out(what, limit))
+                    }
+                    _ => Err(error.into()),
+                },
+            }
+        };
+        match limit {
+            None => work.await,
+            Some(limit) => match tokio::time::timeout(limit, work).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(timed_out(what, limit)),
+            },
         }
     }
 
@@ -488,16 +597,15 @@ impl Pool {
     /// Run one positioned statement as a single simple-query batch: the
     /// read-only transaction opened, the alias's exported snapshot
     /// imported as its first statement, `sql` run against it, and the
-    /// transaction committed, all in one round trip; the rows of `sql`
-    /// come back as text.
+    /// transaction committed, all in one round trip ([`Pool::run`]); the
+    /// rows of `sql` come back as text.
     async fn read(
         &self,
         alias: &Alias,
+        what: &str,
         sql: &str,
         delay: Option<Duration>,
     ) -> Result<Vec<SimpleQueryRow>, StorageError> {
-        let _permit = self.permit().await?;
-        let client = self.acquire().await?;
         let mut batch = format!(
             "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '{}';",
             alias.snapshot.replace('\'', "''")
@@ -508,13 +616,7 @@ impl Pool {
         batch.push(' ');
         batch.push_str(sql);
         batch.push_str("; COMMIT");
-        match client.simple_query(&batch).await {
-            Ok(messages) => {
-                self.release(client);
-                Ok(rows_of(messages))
-            }
-            Err(error) => Err(error.into()),
-        }
+        self.run(what, &batch).await
     }
 }
 
@@ -616,8 +718,10 @@ fn decode_row(
 
 /// One column of a result row in its text form, decoded by the cast its
 /// declared type was read with ([`sql::select_expr`]): a time column
-/// arrives as its epoch milliseconds, a JSON, list or map column as JSON
-/// text, the rest in Postgres's text form for the cast type.
+/// arrives as its epoch milliseconds, a JSON column as the text of its
+/// `jsonb` (kept in the standard form, [`text::standard_json`]), a list
+/// or map column as JSON text, the rest in Postgres's text form for the
+/// cast type.
 fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> {
     let unreadable = || StorageError(format!("`{text}` is not a {declared:?}"));
     Ok(match declared {
@@ -625,9 +729,8 @@ fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> 
             Value::Int(text.parse().map_err(|_| unreadable())?)
         }
         ValueType::Float => Value::Float(text.parse().map_err(|_| unreadable())?),
-        ValueType::String | ValueType::Json | ValueType::Map(_, _) => {
-            Value::String(text.to_owned())
-        }
+        ValueType::Json => Value::String(text::standard_json(text).into_owned()),
+        ValueType::String | ValueType::Map(_, _) => Value::String(text.to_owned()),
         ValueType::List(inner) => text::json_list(text, inner),
         ValueType::Bool => Value::Bool(match text {
             "t" | "true" => true,
@@ -661,6 +764,21 @@ mod tests {
         assert!(!permanent("53300"), "too many connections is transient");
         assert!(!permanent("08006"));
         assert!(!permanent(""));
+    }
+
+    /// A snapshot that is gone is cured by the next alias, whatever class
+    /// its code is in; a read past its time is a refusal naming the work.
+    #[test]
+    fn a_gone_snapshot_is_transient_and_a_timeout_is_a_refusal() {
+        assert!(snapshot_gone(
+            "invalid snapshot identifier: \"00000004-0000001B-1\""
+        ));
+        assert!(!snapshot_gone("invalid input syntax for type json"));
+        let refusal = timed_out("a read on `messages`", Duration::from_secs(10));
+        assert_eq!(
+            refusal.refusal(),
+            Some("a read on `messages` took longer than 10000 ms")
+        );
     }
 
     /// A minted alias becomes current only once the feed passes its
@@ -722,6 +840,11 @@ mod tests {
             decode_text("2026-09-11 10:00:00.5", &ValueType::Datetime).unwrap(),
             Value::Datetime(_)
         ));
+        assert_eq!(
+            decode_text("{\"a\": 1.50}", &ValueType::Json).unwrap(),
+            Value::String("{\"a\": 1.5}".into()),
+            "a JSON cell is kept in the standard form"
+        );
         assert!(decode_text("x", &ValueType::Int).is_err());
     }
 }

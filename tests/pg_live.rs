@@ -667,3 +667,258 @@ fn a_read_past_the_row_budget_is_refused() {
         cleanup(&dsn, &client, &names).await;
     });
 }
+
+/// A JSON column is filtered by value on the database as the engine
+/// filters it in memory: a `jsonb` and a `json` column are both read and
+/// counted by a string, a number, a boolean and an object, however the
+/// stored value was spelled (a padded fraction, an exponent, spacing, the
+/// order of keys, a key repeated), and every cell, whether a read brought
+/// it or the change feed did, is the one text a literal of the same value
+/// is given, so the two compare equal in the engine as they do in
+/// Postgres. This is the support desk's `actualFieldValue = value`, which
+/// Postgres used to refuse.
+#[test]
+fn a_json_column_is_filtered_by_value() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let table = "live_json_values";
+        let slot = "xyne_sync_live_json";
+        let client = admin(&dsn).await;
+        PgStream::drop_slot(&dsn, slot).await.expect("drop slot");
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table};
+                 CREATE TABLE {table} (id int8 PRIMARY KEY, fixed jsonb, loose json);
+                 INSERT INTO {table} VALUES
+                   (1, '\"high\"', '\"high\"'), (2, '5', '5'), (3, 'true', 'true'),
+                   (4, '{{\"b\": [1, 2], \"a\": \"x\"}}', '{{\"b\":[1,2],   \"a\":\"x\"}}'), (5, NULL, NULL),
+                   (6, '1.50', '1.50'),
+                   (7, '{{\"n\": 2.0, \"list\": [0.10, 1e2]}}', '{{ \"list\":[0.10,1e2], \"n\":7, \"n\": 2.0 }}');"
+            ))
+            .await
+            .expect("prepare");
+        let catalog = Arc::new(Catalog::new(vec![DbTable::new(
+            table,
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("fixed", ValueType::Json),
+                DbColumn::new("loose", ValueType::Json),
+            ],
+        )]));
+        let mut stream = PgStream::open(&dsn, slot, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+
+        let by = |column: &'static str, literal: serde_json::Value| {
+            SingleTableReadQuery::new(
+                table,
+                Where::condition(
+                    column,
+                    ComparisonOperator::EQ,
+                    xyne_sync::sync::pg::text::jsonb_text(&literal).as_str(),
+                ),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            )
+        };
+        let ids = |snapshot: &xyne_sync::model::Snapshot| -> Vec<i64> {
+            snapshot
+                .rows
+                .iter()
+                .filter_map(
+                    |(key, _)| match key.pkey_value.get(&ColumnName::from("id")) {
+                        Some(Value::Int(id)) => Some(*id),
+                        _ => None,
+                    },
+                )
+                .collect()
+        };
+        for column in ["fixed", "loose"] {
+            for (literal, expected) in [
+                (serde_json::json!("high"), 1),
+                (serde_json::json!(5), 2),
+                (serde_json::json!(true), 3),
+                (serde_json::json!({"a": "x", "b": [1, 2]}), 4),
+                (serde_json::json!(1.5), 6),
+                (serde_json::json!({"list": [0.1, 100], "n": 2}), 7),
+            ] {
+                let query = by(column, literal.clone());
+                let read = storage.select(&query).await.expect("the read is served");
+                assert_eq!(ids(&read), vec![expected], "{column} = {literal}");
+                assert_eq!(storage.count(&query, 10).await.expect("count"), 1);
+                assert_eq!(
+                    read.rows[0].1.data.get(&ColumnName::from(column)),
+                    Some(&Value::from(
+                        xyne_sync::sync::pg::text::jsonb_text(&literal).as_str()
+                    )),
+                    "the {column} cell a read brings back is the text the literal was given"
+                );
+            }
+            let none = by(column, serde_json::json!("low"));
+            assert_eq!(
+                ids(&storage.select(&none).await.expect("served")),
+                Vec::<i64>::new()
+            );
+        }
+        let object = storage
+            .select(&by("fixed", serde_json::json!({"b": [1, 2], "a": "x"})))
+            .await
+            .expect("served");
+        let cell = object.rows[0]
+            .1
+            .data
+            .get(&ColumnName::from("fixed"))
+            .cloned();
+        assert_eq!(
+            cell,
+            Some(Value::from("{\"a\": \"x\", \"b\": [1, 2]}")),
+            "the cell a read brings back is the text the literal was given"
+        );
+        let whole = SingleTableReadQuery::new(
+            table,
+            Where::AND(vec![]),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        );
+        let read = storage.select(&whole).await.expect("the table is read");
+        client
+            .batch_execute(&format!("UPDATE {table} SET fixed = fixed"))
+            .await
+            .expect("every row is written again");
+        let fed = stream.poll().await.expect("poll");
+        assert_eq!(fed.writes.len(), read.rows.len());
+        for (write, _) in &fed.writes {
+            let image = write.new_row_image().expect("an update has an image");
+            let (_, as_read) = read
+                .rows
+                .iter()
+                .find(|(key, _)| key == write.pkey_value())
+                .expect("the row was read");
+            for column in ["fixed", "loose"] {
+                let column = ColumnName::from(column);
+                assert_eq!(
+                    image.data.get(&column),
+                    as_read.data.get(&column),
+                    "the feed and a read bring {column} as the same text"
+                );
+            }
+        }
+        let _ = client
+            .batch_execute(&format!("DROP TABLE IF EXISTS {table};"))
+            .await;
+        let _ = PgStream::drop_slot(&dsn, slot).await;
+    });
+}
+
+/// A read is given the read timeout and no more: one that PostgreSQL is
+/// still working on when the time is up is cancelled there and refused
+/// here, naming the table, well before it would have finished; the
+/// connection settings that carry the limit leave an ordinary read
+/// alone, and a count is held to the same time.
+#[test]
+fn a_read_past_its_time_is_refused() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let names = Names::new("timeout");
+        let client = prepare(&dsn, &names).await;
+        let catalog = Arc::new(names.catalog());
+        let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+            .await
+            .expect("open stream");
+        let slow = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect")
+            .with_read_timeout(Duration::from_millis(400))
+            .with_read_delay(Duration::from_secs(5));
+        let quick = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect")
+            .with_read_timeout(Duration::from_millis(400));
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&slow, &quick]).await;
+        let whole = SingleTableReadQuery::new(
+            names.tickets.as_str(),
+            Where::AND(vec![]),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        );
+        let started = Instant::now();
+        let refused = slow.select(&whole).await.expect_err("a read past its time");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the read was given up after the timeout, not after it finished: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            refused.refusal(),
+            Some(format!("a read on `{}` took longer than 400 ms", names.tickets).as_str()),
+            "{refused}"
+        );
+        let served = quick
+            .select(&whole)
+            .await
+            .expect("an ordinary read is served");
+        assert!(!served.rows.is_empty());
+        assert!(quick.count(&whole, 10).await.expect("an ordinary count") > 0);
+        let again = slow.select(&whole).await.expect_err("and again");
+        assert!(again.refusal().is_some(), "{again}");
+        cleanup(&dsn, &client, &names).await;
+    });
+}
+
+/// The feed writes nothing and still moves: with no transaction of ours,
+/// the server's keepalives carry its position past the first snapshot,
+/// the service is told the position without a transaction to carry it,
+/// the snapshot comes into use and the service says where it and the
+/// storage are, which is what a server waits for before it serves.
+#[test]
+fn an_idle_feed_brings_the_first_snapshot_into_use() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let names = Names::new("idle");
+        let client = prepare(&dsn, &names).await;
+        let catalog = Arc::new(names.catalog());
+        let stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+            .await
+            .expect("open stream");
+        let pg = Arc::new(
+            PgStorage::connect(&dsn, catalog.clone())
+                .await
+                .expect("connect")
+                .with_rotation(Duration::from_millis(100)),
+        );
+        let storage = Rc::new(Sources::new(pg.clone(), catalog.clone(), Vec::new()));
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let (service, commands) = Service::new(MultiTableIVM::new(), storage, events_tx);
+        let running = spawn_local(service.run());
+        let feeding = spawn_local(stream.run(Duration::from_millis(50), commands.clone()));
+        let covered = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = events.recv().await {
+                if let Event::Committed {
+                    position, floor, ..
+                } = event
+                    && floor > Lsn(0)
+                    && position >= floor
+                {
+                    return Some((position, floor));
+                }
+            }
+            None
+        })
+        .await
+        .expect("the service is ready within ten seconds of an idle feed");
+        let (position, floor) = covered.expect("the service is still running");
+        assert!(position >= floor && floor > Lsn(0));
+        assert_eq!(pg.alias_position(), Some(floor));
+        feeding.abort();
+        drop(commands);
+        let _ = running.await;
+        cleanup(&dsn, &client, &names).await;
+    });
+}

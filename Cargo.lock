@@ -2025,6 +2025,7 @@ dependencies = [
  "fallible-iterator",
  "futures-util",
  "libc",
+ "memchr",
  "percent-encoding",
  "pgoutput",
  "pgwire-replication",

@@ -3,9 +3,14 @@
 //! query endpoint turns query names into ASTs, a `POST` of a client's push
 //! body to the mutate endpoint runs its mutations; both carry the
 //! connection's cookies and origin, its auth token when it has one, and
-//! the `schema` and `appID` parameters the server library reads.
+//! the `schema` and `appID` parameters the server library reads. Every
+//! call is given the configured time to answer
+//! (`XYNE_SYNC_BACKEND_TIMEOUT_MS`); one that ran out of it is reported as
+//! failed and not made again, since a slow server is not helped by the
+//! same question asked three times.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::time::Duration;
 
 use serde_json::{Value as Json, json};
@@ -61,11 +66,30 @@ pub enum PushOutcome {
     },
 }
 
+/// A call that got no answer: what went wrong, and whether it was the
+/// time that ran out (such a call is not made again).
+#[derive(Debug)]
+struct Unanswered {
+    message: String,
+    timed_out: bool,
+}
+
+impl fmt::Display for Unanswered {
+    /// The message.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 impl Backend {
-    /// A client for the endpoints `config` names.
+    /// A client for the endpoints `config` names, each call given
+    /// `config.backend_timeout` to answer (zero: as long as it takes).
     pub fn new(config: &Config) -> Result<Backend, String> {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+        let mut http = reqwest::Client::builder();
+        if !config.backend_timeout.is_zero() {
+            http = http.timeout(config.backend_timeout);
+        }
+        let http = http
             .build()
             .map_err(|error| format!("http client: {error}"))?;
         Ok(Backend {
@@ -79,7 +103,8 @@ impl Backend {
     }
 
     /// Turn query names into ASTs: `requests` are `{id, name, args}`
-    /// objects. A 5xx or a network failure is retried a few times.
+    /// objects. A 5xx or a network failure is retried a few times; a call
+    /// that timed out is not.
     pub async fn transform(&self, identity: &Identity, requests: Vec<Json>) -> TransformOutcome {
         let url = identity.query_url.as_deref().unwrap_or(&self.query_url);
         let body = json!(["transform", requests]);
@@ -155,14 +180,14 @@ impl Backend {
                         ),
                     };
                 }
-                Err(message) => {
-                    if attempt < 3 {
+                Err(unanswered) => {
+                    if attempt < 3 && !unanswered.timed_out {
                         tokio::time::sleep(Duration::from_millis(200 * attempt)).await;
                         continue;
                     }
                     return TransformOutcome::Failed {
                         status: None,
-                        message,
+                        message: unanswered.message,
                     };
                 }
             }
@@ -182,26 +207,28 @@ impl Backend {
                 preview: Some(preview(&json.to_string())),
                 message: format!("the mutate endpoint answered {status}"),
             },
-            Err(message) => PushOutcome::Failed {
+            Err(unanswered) => PushOutcome::Failed {
                 status: None,
                 preview: None,
-                message,
+                message: unanswered.message,
             },
         }
     }
 
     /// One `POST` with the identity's headers and the reserved
     /// parameters; the status and the body (as JSON when it parses, as a
-    /// string otherwise).
+    /// string otherwise), or why there was no answer.
     async fn post(
         &self,
         url: &str,
         extra: &HashMap<String, String>,
         identity: &Identity,
         body: &Json,
-    ) -> Result<(u16, Json), String> {
-        let mut url = reqwest::Url::parse(url)
-            .map_err(|error| format!("bad endpoint URL `{url}`: {error}"))?;
+    ) -> Result<(u16, Json), Unanswered> {
+        let mut url = reqwest::Url::parse(url).map_err(|error| Unanswered {
+            message: format!("bad endpoint URL `{url}`: {error}"),
+            timed_out: false,
+        })?;
         url.query_pairs_mut()
             .append_pair("schema", &self.upstream_schema)
             .append_pair("appID", &self.app_id);
@@ -226,12 +253,12 @@ impl Backend {
             .body(body.to_string())
             .send()
             .await
-            .map_err(|error| format!("{url}: {error}"))?;
+            .map_err(|error| unanswered(&url, "", &error))?;
         let status = response.status().as_u16();
         let text = response
             .text()
             .await
-            .map_err(|error| format!("{url}: reading the response: {error}"))?;
+            .map_err(|error| unanswered(&url, "reading the response: ", &error))?;
         if !(200..300).contains(&status) {
             log_warn!("{url} answered {status}: {}", preview(&text));
         }
@@ -240,6 +267,17 @@ impl Backend {
             serde_json::from_str(&text).unwrap_or(Json::String(text)),
         ))
     }
+}
+
+/// Why `url` gave no answer, a timeout named as one.
+fn unanswered(url: &reqwest::Url, doing: &str, error: &reqwest::Error) -> Unanswered {
+    let timed_out = error.is_timeout();
+    let message = if timed_out {
+        format!("{url}: {doing}no answer within the backend timeout")
+    } else {
+        format!("{url}: {doing}{error}")
+    };
+    Unanswered { message, timed_out }
 }
 
 /// The first 512 characters of a body, for a log line or an error.

@@ -337,17 +337,21 @@ fn simple(op: &str, left: &Operand, right: &Operand, table: &DbTable) -> Result<
 }
 
 /// A JSON literal as the value a column of type `declared` compares
-/// against.
+/// against. A JSON column's cells are the text `jsonb` writes, so a literal
+/// against one, whatever its kind, is that text: the string `x` is `"x"`,
+/// a number its digits, an object its canonical form.
 fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> {
     Ok(match (literal, declared) {
         (Json::Null, _) => Value::Null,
+        (Json::String(text), ValueType::Json) if text.contains('\0') => {
+            return Err("a text value contains a NUL byte".to_owned());
+        }
+        (_, ValueType::Json) => Value::String(crate::sync::pg::text::jsonb_text(literal)),
         (Json::Bool(flag), _) => Value::Bool(*flag),
         (Json::Number(number), ValueType::Float) => {
             Value::Float(number.as_f64().unwrap_or(f64::NAN))
         }
-        (Json::Number(number), ValueType::String | ValueType::Json) => {
-            Value::String(number.to_string())
-        }
+        (Json::Number(number), ValueType::String) => Value::String(number.to_string()),
         (Json::Number(number), _) => match number.as_i64() {
             Some(int) => Value::Int(int),
             None => Value::Float(number.as_f64().unwrap_or(f64::NAN)),
@@ -376,7 +380,6 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
                 .map(|item| literal_value(item, declared))
                 .collect::<Result<_, _>>()?,
         ),
-        (Json::Object(_), ValueType::Json) => Value::String(literal.to_string()),
         (Json::Object(_), _) => return Err("an object literal in a comparison".to_owned()),
     })
 }
@@ -611,6 +614,35 @@ mod tests {
             translate(&not_exists, &catalog())
                 .unwrap_err()
                 .contains("NOT EXISTS")
+        );
+    }
+
+    /// A literal compared with a JSON column is the text `jsonb` writes
+    /// for it, whatever its kind, because that is what the column's cells
+    /// hold: the support desk filters `actualFieldValue = "high"`, and the
+    /// cell of a matching row is `"high"` with its quotes.
+    #[test]
+    fn a_literal_against_a_json_column_is_jsonb_text() {
+        let json = ValueType::Json;
+        let value = |literal: Json| literal_value(&literal, &json).expect("a value");
+        assert_eq!(value(serde_json::json!("high")), Value::from("\"high\""));
+        assert_eq!(value(serde_json::json!(5)), Value::from("5"));
+        assert_eq!(value(serde_json::json!(true)), Value::from("true"));
+        assert_eq!(
+            value(serde_json::json!({"b": [1, 2], "a": "x"})),
+            Value::from("{\"a\": \"x\", \"b\": [1, 2]}")
+        );
+        assert_eq!(value(Json::Null), Value::Null);
+        assert!(literal_value(&serde_json::json!("a\u{0}b"), &json).is_err());
+        assert_eq!(
+            literal_value(&serde_json::json!("high"), &ValueType::String).expect("a value"),
+            Value::from("high"),
+            "a text column still compares with the bare text"
+        );
+        assert_eq!(
+            literal_value(&serde_json::json!(["a", 1]), &json).expect("a value"),
+            Value::from("[\"a\", 1]"),
+            "an array against a JSON column is one JSON value, not a list of them"
         );
     }
 }

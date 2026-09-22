@@ -29,15 +29,20 @@ pub struct Config {
     pub schemas: Vec<String>,
     /// `XYNE_SYNC_SLOT`: the permanent replication slot (`xyne_sync`).
     pub slot: String,
-    /// `XYNE_SYNC_HEARTBEAT_MS`: how often the feed emits a heartbeat so
-    /// the engine's position moves while nothing is written (1000).
-    pub heartbeat: Duration,
     /// `XYNE_SYNC_SNAPSHOT_ROTATION_MS`: how often a fresh exported
     /// snapshot (a temporary replication slot) is minted for reads (1000).
     pub snapshot_rotation: Duration,
     /// `XYNE_SYNC_READ_CONNECTIONS`: how many storage reads may hold a
     /// Postgres connection at once; the rest queue (16).
     pub read_connections: usize,
+    /// `XYNE_SYNC_READ_TIMEOUT_MS`: how long one storage read (a query's
+    /// rows, a planner's count, a client group's mutation ids) may take,
+    /// the connection it may have to open included and the wait for a free
+    /// connection not. PostgreSQL is told to cancel the statement at that
+    /// point and the server stops waiting for it; the query that needed
+    /// the read is refused, by name, rather than read again (10000; 0 sets
+    /// no limit).
+    pub read_timeout: Duration,
     /// `XYNE_SYNC_READ_THREADS`: how many threads run the storage reads,
     /// their connections and their row decoding (2).
     pub read_threads: usize,
@@ -50,6 +55,11 @@ pub struct Config {
     /// `XYNE_SYNC_MUTATE_URL` (or `ZERO_MUTATE_URL`): the application
     /// server's mutation endpoint.
     pub mutate_url: String,
+    /// `XYNE_SYNC_BACKEND_TIMEOUT_MS`: how long one call to the
+    /// application server (a transform of query names, a push of
+    /// mutations) may take before it is given up; a call that timed out is
+    /// not tried again (30000; 0 sets no limit).
+    pub backend_timeout: Duration,
     /// `XYNE_SYNC_FORWARD_COOKIES` (or `ZERO_QUERY_FORWARD_COOKIES`):
     /// whether the connection's cookies go along to those endpoints
     /// (true).
@@ -73,6 +83,13 @@ pub struct Config {
     /// `XYNE_SYNC_GROUP_TTL_MS`: how long a client group's subscriptions
     /// stay registered after its last connection closes (60000).
     pub group_ttl: Duration,
+    /// `XYNE_SYNC_GROUP_LOG_BYTES`: how many bytes of its most recent
+    /// pokes a client group keeps, the oldest dropped as new ones are
+    /// sent, so a client that reconnects behind the group (its socket
+    /// died unnoticed while the server went on sending, or another tab
+    /// kept the group moving) is sent what it missed instead of being
+    /// told to start over (262144; 0 keeps none).
+    pub group_log_bytes: usize,
     /// `XYNE_SYNC_MAX_MESSAGE_BYTES`: the largest inbound WebSocket message
     /// accepted (16 MiB).
     pub max_message_bytes: usize,
@@ -129,10 +146,16 @@ impl Config {
     /// Read the configuration; an error names the missing or malformed
     /// variable.
     pub fn from_env() -> Result<Config, String> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// The configuration `lookup` describes (the environment's, or a
+    /// test's): an unset or empty variable takes its default.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, String> {
         let first = |names: &[&str]| {
             names
                 .iter()
-                .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+                .find_map(|name| lookup(name).filter(|value| !value.is_empty()))
         };
         let millis = |name: &str, default: u64| -> Result<Duration, String> {
             match first(&[name]) {
@@ -218,7 +241,6 @@ impl Config {
             dsn,
             schemas,
             slot: first(&["XYNE_SYNC_SLOT"]).unwrap_or_else(|| "xyne_sync".to_owned()),
-            heartbeat: millis("XYNE_SYNC_HEARTBEAT_MS", 1_000)?,
             snapshot_rotation: millis("XYNE_SYNC_SNAPSHOT_ROTATION_MS", 1_000)?,
             read_connections: match first(&["XYNE_SYNC_READ_CONNECTIONS"]) {
                 Some(text) => text.parse().map_err(|_| {
@@ -226,6 +248,7 @@ impl Config {
                 })?,
                 None => 16,
             },
+            read_timeout: millis("XYNE_SYNC_READ_TIMEOUT_MS", 10_000)?,
             read_threads: match first(&["XYNE_SYNC_READ_THREADS"]) {
                 Some(text) => text
                     .parse::<usize>()
@@ -248,6 +271,7 @@ impl Config {
             },
             query_url,
             mutate_url,
+            backend_timeout: millis("XYNE_SYNC_BACKEND_TIMEOUT_MS", 30_000)?,
             forward_cookies,
             app_id,
             shard,
@@ -255,6 +279,12 @@ impl Config {
             client_timeout: millis("XYNE_SYNC_CLIENT_TIMEOUT_MS", 45_000)?,
             pong_interval: millis("XYNE_SYNC_PONG_INTERVAL_MS", 3_000)?,
             group_ttl: millis("XYNE_SYNC_GROUP_TTL_MS", 60_000)?,
+            group_log_bytes: match first(&["XYNE_SYNC_GROUP_LOG_BYTES"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("XYNE_SYNC_GROUP_LOG_BYTES must be a number of bytes, got `{text}`")
+                })?,
+                None => 256 * 1024,
+            },
             max_message_bytes: match first(&["XYNE_SYNC_MAX_MESSAGE_BYTES"]) {
                 Some(text) => text.parse().map_err(|_| {
                     format!("XYNE_SYNC_MAX_MESSAGE_BYTES must be a number, got `{text}`")
@@ -321,9 +351,9 @@ impl Config {
             dsn: self.dsn.clone(),
             slot: self.slot.clone(),
             schemas: self.schemas.clone(),
-            heartbeat: self.heartbeat,
             snapshot_rotation: self.snapshot_rotation,
             read_connections: self.read_connections,
+            read_timeout: self.read_timeout,
             read_threads: self.read_threads,
             watched: vec![TableName::from(self.clients_table().as_str())],
         }

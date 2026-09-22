@@ -383,6 +383,10 @@ mod tests {
         assert_eq!(parsed["ts"], "2026-09-19T12:00:00.123Z");
     }
 
+    /// A line below the level is neither formatted (`boom` would panic)
+    /// nor queued; a line at the level is queued. The count is the
+    /// process's, so lines other tests log meanwhile may be in it: the
+    /// last check is that it grew, not by how much.
     #[test]
     fn a_level_that_is_off_formats_nothing() {
         set_level(Level::Warn);
@@ -395,6 +399,6 @@ mod tests {
         set_level(Level::Info);
         log_event!(Level::Info, "seen", n = 1);
         flush();
-        assert_eq!(queued(), before + 1);
+        assert!(queued() > before);
     }
 }

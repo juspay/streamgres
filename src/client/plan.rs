@@ -482,8 +482,10 @@ impl PlanCache {
 
 /// Plan `translated` under `policy`: the cache's decision when it has
 /// one, otherwise the counts on `storage` (concurrently) and the
-/// planner's decision, remembered in the cache. A count that fails
-/// refuses the query, saying so.
+/// planner's decision, remembered in the cache. A count that fails (the
+/// database was unreachable, the count ran past the read timeout) refuses
+/// the query, saying so, and is not remembered: it says nothing about the
+/// query, and the next asking counts again.
 pub async fn plan<S: Storage + ?Sized>(
     translated: Translated,
     policy: Policy,
@@ -510,16 +512,19 @@ pub async fn plan<S: Storage + ?Sized>(
         match answer {
             Ok(count) => planner.answer(*index, count),
             Err(error) => {
-                failed = Some(format!(
-                    "counting the rows of {} failed: {error}",
-                    planner.table_of(*index)
-                ));
+                failed = Some(match error.refusal() {
+                    Some(reason) => reason.to_owned(),
+                    None => format!(
+                        "counting the rows of {} failed: {error}",
+                        planner.table_of(*index)
+                    ),
+                });
                 break;
             }
         }
     }
     let outcome = match failed {
-        Some(reason) => Err(reason),
+        Some(reason) => return Err(reason),
         None => planner.decide(),
     };
     cache.put(query, outcome.clone());
@@ -695,7 +700,11 @@ mod tests {
                 ]),
                 limit,
             ),
-            vec![Join::inner(conversations, "conversationId", "conversationId")],
+            vec![Join::inner(
+                conversations,
+                "conversationId",
+                "conversationId",
+            )],
         )
     }
 
@@ -729,12 +738,19 @@ mod tests {
     fn a_node_driven_from_above_drives_below() {
         for preferred in [Side::Parent, Side::Child] {
             let (_, outcome) = drive(
-                Planner::new(message_under_the_access_rule(u32::MAX), policy(100, preferred)),
+                Planner::new(
+                    message_under_the_access_rule(u32::MAX),
+                    policy(100, preferred),
+                ),
                 &[("messages", 5), ("conversations", 90), ("channels", 3)],
             );
             let planned = outcome.expect("planned");
             assert_eq!(planned.joins[0].driver, Driver::Main, "{preferred:?}");
-            assert_eq!(planned.joins[0].sub.joins[0].driver, Driver::Main, "{preferred:?}");
+            assert_eq!(
+                planned.joins[0].sub.joins[0].driver,
+                Driver::Main,
+                "{preferred:?}"
+            );
         }
     }
 
@@ -744,7 +760,10 @@ mod tests {
     #[test]
     fn a_big_root_is_driven_from_the_small_end_of_the_chain() {
         let (_, outcome) = drive(
-            Planner::new(message_under_the_access_rule(u32::MAX), policy(100, Side::Parent)),
+            Planner::new(
+                message_under_the_access_rule(u32::MAX),
+                policy(100, Side::Parent),
+            ),
             &[("messages", 101), ("conversations", 101), ("channels", 3)],
         );
         let planned = outcome.expect("planned");

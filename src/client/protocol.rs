@@ -238,6 +238,18 @@ pub fn cookie(version: u64) -> String {
     format!("{}{digits}", to_base36(digits.len() as u64 - 1))
 }
 
+/// The version a cookie of [`cookie`]'s form names; `None` for anything
+/// else (a cookie another server wrote).
+pub fn version_of(cookie: &str) -> Option<u64> {
+    let mut chars = cookie.chars();
+    let length = chars.next()?.to_digit(36)? as usize + 1;
+    let digits = chars.as_str();
+    if digits.len() != length || digits.chars().any(|digit| digit.is_ascii_uppercase()) {
+        return None;
+    }
+    u64::from_str_radix(digits, 36).ok()
+}
+
 /// A number in base 36, lowercase.
 fn to_base36(mut value: u64) -> String {
     const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
@@ -377,6 +389,12 @@ mod tests {
         assert_eq!(cookie(36), "110");
         assert!(cookie(35) < cookie(36));
         assert!(cookie(1295) < cookie(1296));
+        for version in [0, 1, 35, 36, 1295, 1296, 987_654_321] {
+            assert_eq!(version_of(&cookie(version)), Some(version));
+        }
+        for foreign in ["", "0", "1z", "00z", "0Z", "abc:01", "9"] {
+            assert_eq!(version_of(foreign), None, "{foreign}");
+        }
     }
 
     /// The handshake header round-trips the first message and the token.

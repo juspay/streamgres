@@ -16,8 +16,10 @@
 //!
 //! - **Feed thread.** The replication connection, decoding the `pgoutput`
 //!   events into rows and handing the engine one transaction per commit,
-//!   and a heartbeat so the engine's position moves while nothing is
-//!   written. Started by the sync side.
+//!   and the feed's position a few times a second so the engine keeps up
+//!   with it while nothing is written (it is read off PostgreSQL's
+//!   keepalives; nothing is written to the database). Started by the sync
+//!   side.
 //! - **Engine thread.** The service: the runtime and the engine, and
 //!   nothing else; the storage reads it asks for run on the reads pool.
 //! - **Group threads.** `XYNE_SYNC_GROUP_THREADS` of them, each keeping
@@ -90,10 +92,10 @@ pub fn serve(config: Config) -> Result<(), String> {
         .thread_name("xyne-sync-reads")
         .build()
         .map_err(|error| format!("tokio: {error}"))?;
-    let feed = threads::spawn_feed(settings.clone(), catalog.clone())?;
-    let shards = config.group_threads.max(1);
     let stats = crate::stats::Stats::shared();
     crate::stats::Stats::install(&stats);
+    let feed = threads::spawn_feed(settings.clone(), catalog.clone())?;
+    let shards = config.group_threads.max(1);
     stats.read_row_limit.store(
         crate::sync::pg::read_row_limit() as u64,
         std::sync::atomic::Ordering::Relaxed,

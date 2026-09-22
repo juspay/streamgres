@@ -11,6 +11,11 @@ license = "Apache-2.0"
 # `model::ids`). Keys that are user data keep the default hasher.
 rustc-hash = "2"
 
+# Vectorised byte search: a JSON cell is looked through for a number with a
+# padded fraction at the speed of a copy (see `sync::pg::text`), which is
+# what nearly every cell has none of.
+memchr = "2"
+
 # Only `NaiveDate` / `NaiveDateTime` are used (see `Value` in src/model/value.rs).
 # Default features pull in a timezone database and wasm bindings we do not need.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
