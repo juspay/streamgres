@@ -24,17 +24,19 @@
 //! leaves all stay where the translation put them, and an inner edge at
 //! any depth is planned the same way as one at the root.
 //!
-//! **A main with a page.** A sub that fits by its own count drives it:
-//! its values restrict the page inside the page's own filter, so the
-//! window is exact and reads only rows the sub admits (a channel's
-//! conversations driving the page of its attachments). Any other sub is
-//! driven *by* the page: the page reads its window, the sub is narrowed
-//! to the window's values, and the engine keeps the page to the rows the
-//! sub admits, reaching past the ones it rejects (see the `window`
-//! module). That is the plan for `WHERE id = ? … LIMIT 1` under an access
-//! rule that walks `conversations`: four small reads from the row
-//! outwards, where driving from the rule's side reads every conversation
-//! of every channel the user may see. A node bounded only because a
+//! **A main with a page** is counted like any other node, on its own
+//! filter with its cursor, its `EXISTS` leaves taken as true and its
+//! `LIMIT` ignored, so a new cursor is a new plan and a page turn costs
+//! one capped count on the root. Against a sub that fits too, the smaller
+//! of the two drives, with no allowance for the preferred side: a page of
+//! one canvas drives the rule's twenty-five thousand participants from the
+//! row outwards, and a page over forty thousand channel stats is driven
+//! by the few hundred channels it can show. A page whose count is over
+//! the limit is still bounded by its window: a sub that fits drives it,
+//! restricting the page inside its own filter, and any other sub is
+//! driven *by* the page, the page reading its window and the engine
+//! keeping it to the rows the sub admits, reaching past the ones it
+//! rejects (see the `window` module). A node bounded only because a
 //! bounded node drives it is not small in any measured sense (the
 //! fan-out is unknown), so it never drives a page.
 //!
@@ -64,8 +66,8 @@ pub enum Side {
     Parent,
 }
 
-/// The planner's settings: the most rows a whole node may hold (zero
-/// turns planning off), and the side to prefer.
+/// The planner's settings: the most rows a whole node may hold (the same
+/// number a storage read may return), and the side to prefer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
     pub limit: u64,
@@ -114,13 +116,13 @@ impl Planner {
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
         flatten(&query, Vec::new(), None, &mut nodes, &mut edges);
-        let counted = if policy.limit == 0 || !query.has_joins() {
+        let counted = if !query.has_joins() {
             Vec::new()
         } else {
             nodes
                 .iter()
                 .enumerate()
-                .filter(|(_, node)| !node.driven && node.query.limit == u32::MAX)
+                .filter(|(_, node)| !node.driven)
                 .map(|(index, _)| index)
                 .collect()
         };
@@ -133,9 +135,10 @@ impl Planner {
         }
     }
 
-    /// The counts the planner wants, all at once: for each node that
-    /// would be read whole, its index, the query to count (the node's own
-    /// filter with its `EXISTS` leaves taken as true) and the cap.
+    /// The counts the planner wants, all at once: for each node no outer
+    /// edge drives, its index, the query to count (the node's own filter,
+    /// cursor included, with its `EXISTS` leaves taken as true and no
+    /// `LIMIT`) and the cap.
     pub fn counts(&self) -> Vec<(usize, SingleTableReadQuery, u64)> {
         self.counted
             .iter()
@@ -165,7 +168,15 @@ impl Planner {
         }
     }
 
-    /// Decide every inner edge's driver from the counts in, or refuse.
+    /// Decide every inner edge's driver from the counts in, or refuse. A
+    /// node something already drives from above drives the edges below
+    /// it. Otherwise the side that is bounded drives the one that is not;
+    /// with both bounded, the smaller count drives (strictly when the
+    /// parent is a page, with the preferred side's allowance when not), a
+    /// side bounded by a count drives one bounded only by its window, and
+    /// two sides bounded only by their windows are driven from the parent;
+    /// with neither bounded the edge stays undecided and the query is
+    /// refused.
     pub fn decide(mut self) -> Result<MultiTableReadQuery, String> {
         if self.counted.is_empty() {
             return Ok(self.query);
@@ -210,25 +221,24 @@ impl Planner {
                     let up = &self.edges[up];
                     up.decided && up.driver == Driver::Main
                 });
-                let chosen = if paged[parent] {
-                    Some(if counts[child].is_some() || paged[child] {
-                        Driver::Sub
-                    } else {
-                        Driver::Main
-                    })
-                } else if driven_from_above && bounded[parent] {
+                let chosen = if driven_from_above && bounded[parent] {
                     Some(Driver::Main)
                 } else {
                     match (bounded[parent], bounded[child]) {
                         (true, false) => Some(Driver::Main),
                         (false, true) => Some(Driver::Sub),
                         (true, true) => Some(match (counts[parent], counts[child]) {
+                            (Some(main), Some(sub)) if paged[parent] => {
+                                if main < sub {
+                                    Driver::Main
+                                } else {
+                                    Driver::Sub
+                                }
+                            }
                             (Some(main), Some(sub)) => smaller(main, sub, self.policy.preferred),
-                            (Some(_), None) if !paged[child] => Driver::Main,
-                            _ => match self.policy.preferred {
-                                Side::Parent => Driver::Main,
-                                Side::Child => Driver::Sub,
-                            },
+                            (Some(_), None) => Driver::Main,
+                            (None, Some(_)) => Driver::Sub,
+                            (None, None) => Driver::Main,
                         }),
                         (false, false) => None,
                     }
@@ -598,21 +608,13 @@ mod tests {
         Policy { limit, preferred }
     }
 
-    /// A query without joins, or a limit of zero, is registered as it is
-    /// with nothing counted.
+    /// A query without joins is registered as it is with nothing counted.
     #[test]
-    fn nothing_to_plan_without_joins_or_a_limit() {
+    fn nothing_to_plan_without_joins() {
         let plain = MultiTableReadQuery::single(node("tickets", Where::AND(Vec::new()), u32::MAX));
         let (asked, outcome) = drive(Planner::new(plain.clone(), policy(10, Side::Child)), &[]);
         assert!(asked.is_empty());
         assert_eq!(outcome.expect("kept"), plain);
-
-        let (asked, outcome) = drive(
-            Planner::new(messages_in_channel(u32::MAX).query, policy(0, Side::Child)),
-            &[],
-        );
-        assert!(asked.is_empty(), "a limit of zero turns planning off");
-        assert!(outcome.is_ok());
     }
 
     /// Both sides are counted in one batch; under the limit, the tree
@@ -666,17 +668,24 @@ mod tests {
         assert!(reason.contains("messages holds more than 100"), "{reason}");
     }
 
-    /// A root with a page is never counted; a child too big to restrict
-    /// it is driven by the page (the engine keeps the page to the rows the
-    /// child admits).
+    /// A root with a page is counted like any node, on its filter without
+    /// the page; a child too big to restrict it is driven by the page
+    /// (the engine keeps the page to the rows the child admits), whether
+    /// the page's own count fits or not.
     #[test]
     fn a_paged_root_drives_a_big_child() {
-        let (asked, outcome) = drive(
-            Planner::new(messages_in_channel(50).query, policy(100, Side::Child)),
-            &[("conversations", 101)],
-        );
-        assert_eq!(asked, vec!["conversations"]);
-        assert_eq!(outcome.expect("planned").joins[0].driver, Driver::Main);
+        for messages in [40, 101] {
+            let (asked, outcome) = drive(
+                Planner::new(messages_in_channel(50).query, policy(100, Side::Child)),
+                &[("messages", messages), ("conversations", 101)],
+            );
+            assert_eq!(asked, vec!["messages", "conversations"]);
+            assert_eq!(
+                outcome.expect("planned").joins[0].driver,
+                Driver::Main,
+                "{messages} messages"
+            );
+        }
     }
 
     /// `messages WHERE <own> LIMIT limit` under `EXISTS conversations
@@ -718,9 +727,9 @@ mod tests {
     fn a_page_is_not_driven_through_an_unmeasured_fan_out() {
         let (asked, outcome) = drive(
             Planner::new(message_under_the_access_rule(1), policy(100, Side::Parent)),
-            &[("conversations", 101), ("channels", 20)],
+            &[("messages", 1), ("conversations", 101), ("channels", 20)],
         );
-        assert_eq!(asked, vec!["conversations", "channels"]);
+        assert_eq!(asked, vec!["messages", "conversations", "channels"]);
         let planned = outcome.expect("planned");
         assert_eq!(planned.joins[0].driver, Driver::Main, "the page drives");
         assert_eq!(
@@ -771,17 +780,150 @@ mod tests {
         assert_eq!(planned.joins[0].sub.joins[0].driver, Driver::Sub);
     }
 
-    /// A paged root with a small child keeps the child driving.
+    /// A paged root whose count is over the limit is driven by a child
+    /// that fits, whichever side is preferred: the child restricts the
+    /// page inside its own filter.
     #[test]
     fn a_paged_root_is_driven_by_a_small_child() {
-        let (_, outcome) = drive(
-            Planner::new(messages_in_channel(50).query, policy(100, Side::Parent)),
-            &[("conversations", 5)],
+        for preferred in [Side::Parent, Side::Child] {
+            let (_, outcome) = drive(
+                Planner::new(messages_in_channel(50).query, policy(100, preferred)),
+                &[("messages", 101), ("conversations", 5)],
+            );
+            assert_eq!(
+                outcome.expect("planned").joins[0].driver,
+                Driver::Sub,
+                "the page is over the limit, so the child drives ({preferred:?})"
+            );
+        }
+    }
+
+    /// With both a page and its child counted within the limit, the
+    /// smaller drives, strictly: a page gets no preferred-side allowance,
+    /// so a page of three rows drives a child of five even when the child
+    /// is preferred, and a page of fifty is driven by that child.
+    #[test]
+    fn a_page_and_a_fitting_child_compare_strictly() {
+        for (messages, conversations, expected) in [
+            (3, 5, Driver::Main),
+            (50, 5, Driver::Sub),
+            (5, 5, Driver::Sub),
+        ] {
+            for preferred in [Side::Parent, Side::Child] {
+                let (_, outcome) = drive(
+                    Planner::new(messages_in_channel(50).query, policy(100, preferred)),
+                    &[("messages", messages), ("conversations", conversations)],
+                );
+                assert_eq!(
+                    outcome.expect("planned").joins[0].driver,
+                    expected,
+                    "a page of {messages} against {conversations}, preferring {preferred:?}"
+                );
+            }
+        }
+    }
+
+    /// `canvases WHERE id = ? LIMIT 1` under the canvas rule as the rig
+    /// holds it: the participants (an `EXISTS` inside an `OR`, so their
+    /// count is the whole table, 25 100) reach user groups and channels
+    /// (44 066) and the channels their memberships; a second `EXISTS` on
+    /// users. With the page counted at one row, every inner edge is
+    /// driven from the page outwards: nothing large is ever read whole.
+    #[test]
+    fn a_one_row_page_drives_the_canvas_rule_from_the_row_outwards() {
+        let memberships = MultiTableReadQuery::single(node(
+            "channel_participants",
+            Where::condition("userId", ComparisonOperator::EQ, "me"),
+            u32::MAX,
+        ));
+        let channels = MultiTableReadQuery::new(
+            node("channels", Where::exists("id", 0), u32::MAX),
+            vec![Join::inner(memberships, "id", "channelId")],
+        );
+        let groups = MultiTableReadQuery::single(node(
+            "user_groups",
+            Where::condition("userId", ComparisonOperator::EQ, "me"),
+            u32::MAX,
+        ));
+        let participants = MultiTableReadQuery::new(
+            node(
+                "canvas_participants",
+                Where::OR(vec![
+                    Where::condition("userId", ComparisonOperator::EQ, "me"),
+                    Where::exists("groupId", 0),
+                    Where::exists("channelId", 1),
+                ]),
+                u32::MAX,
+            ),
+            vec![
+                Join::inner(groups, "groupId", "id"),
+                Join::inner(channels, "channelId", "id"),
+            ],
+        );
+        let users = MultiTableReadQuery::single(node("users", Where::AND(Vec::new()), u32::MAX));
+        let query = MultiTableReadQuery::new(
+            node(
+                "canvases",
+                Where::AND(vec![
+                    Where::condition("id", ComparisonOperator::EQ, "cv1"),
+                    Where::OR(vec![
+                        Where::condition("createdBy", ComparisonOperator::EQ, "me"),
+                        Where::exists("id", 0),
+                        Where::condition("visibility", ComparisonOperator::EQ, "PUBLIC"),
+                    ]),
+                    Where::exists("createdBy", 1),
+                ]),
+                1,
+            ),
+            vec![
+                Join::inner(participants, "id", "canvasId"),
+                Join::inner(users, "createdBy", "id"),
+            ],
+        );
+        let (asked, outcome) = drive(
+            Planner::new(query, policy(20_000, Side::Parent)),
+            &[
+                ("canvases", 1),
+                ("canvas_participants", 20_001),
+                ("user_groups", 42),
+                ("channels", 20_001),
+                ("channel_participants", 52),
+                ("users", 2_000),
+            ],
         );
         assert_eq!(
-            outcome.expect("planned").joins[0].driver,
-            Driver::Sub,
-            "the preferred parent has a page, so the child drives"
+            asked,
+            vec![
+                "canvases",
+                "canvas_participants",
+                "user_groups",
+                "channels",
+                "channel_participants",
+                "users"
+            ]
+        );
+        let planned = outcome.expect("served");
+        assert_eq!(
+            planned.joins[0].driver,
+            Driver::Main,
+            "the page drives the participants"
+        );
+        assert_eq!(planned.joins[1].driver, Driver::Main, "and the users");
+        let participants = &planned.joins[0].sub;
+        assert_eq!(
+            participants.joins[0].driver,
+            Driver::Main,
+            "the participants drive the groups"
+        );
+        assert_eq!(
+            participants.joins[1].driver,
+            Driver::Main,
+            "and the channels"
+        );
+        assert_eq!(
+            participants.joins[1].sub.joins[0].driver,
+            Driver::Main,
+            "and the channels their memberships"
         );
     }
 
@@ -804,12 +946,12 @@ mod tests {
     fn a_driving_page_is_reported() {
         let (_, outcome) = drive(
             Planner::new(messages_in_channel(50).query, policy(100, Side::Child)),
-            &[("conversations", 101)],
+            &[("messages", 101), ("conversations", 101)],
         );
         assert!(page_drives(&outcome.expect("planned")));
         let (_, outcome) = drive(
             Planner::new(messages_in_channel(50).query, policy(100, Side::Child)),
-            &[("conversations", 5)],
+            &[("messages", 101), ("conversations", 5)],
         );
         assert!(!page_drives(&outcome.expect("planned")));
     }
@@ -872,8 +1014,8 @@ mod tests {
         assert!(reason.contains("tickets holds more than 100"), "{reason}");
     }
 
-    /// A paged root with LEFT joins holds its window and is never
-    /// counted; nothing is asked.
+    /// A paged root with LEFT joins is counted but holds its window: over
+    /// the limit it is still served.
     #[test]
     fn a_paged_left_root_is_bounded_by_its_window() {
         let users = MultiTableReadQuery::single(node("users", Where::AND(Vec::new()), u32::MAX));
@@ -881,8 +1023,11 @@ mod tests {
             node("tickets", Where::AND(Vec::new()), 50),
             vec![Join::left(users, "assigned_to", "id")],
         );
-        let (asked, outcome) = drive(Planner::new(query, policy(100, Side::Child)), &[]);
-        assert!(asked.is_empty());
+        let (asked, outcome) = drive(
+            Planner::new(query, policy(100, Side::Child)),
+            &[("tickets", 101)],
+        );
+        assert_eq!(asked, vec!["tickets"]);
         assert!(outcome.is_ok());
     }
 
