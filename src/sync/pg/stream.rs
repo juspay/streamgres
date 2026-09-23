@@ -68,7 +68,7 @@ use tokio_postgres::types::PgLsn;
 
 use super::ddl::{self, DdlSource};
 use crate::ivm::SchemaChange;
-use crate::log::{log_debug, log_info, log_warn};
+use crate::log::{log_info, log_warn};
 use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, DeleteQuery, InsertQuery, Lsn,
     RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
@@ -259,19 +259,6 @@ impl Decoder {
             .map_err(|_| StorageError(format!("the DDL message at {at} is not UTF-8")))?;
         let message = ddl::DdlMessage::parse(text)
             .map_err(|reason| StorageError(format!("the DDL message at {at}: {reason}")))?;
-        log_debug!(
-            "DDL message at {at}: {} {} ({} published tables before, {} after)",
-            message.kind,
-            message.tag(),
-            message
-                .previous
-                .as_ref()
-                .map_or(0, |schema| schema.tables.len()),
-            message
-                .schema
-                .as_ref()
-                .map_or(0, |schema| schema.tables.len())
-        );
         if !message.is_update() {
             return Ok(());
         }
@@ -283,10 +270,6 @@ impl Decoder {
                 ))
             })?;
         if classified.changes.is_empty() {
-            log_debug!(
-                "DDL message at {at} ({}) changes nothing the catalog carries",
-                message.tag()
-            );
             return Ok(());
         }
         for change in &classified.changes {

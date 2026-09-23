@@ -8,12 +8,9 @@
 //! appended to the ordering when absent so pages are deterministic, and
 //! every literal is coerced to its column's catalog type. Subqueries Zero
 //! marks as permission checks are registered but their parts are not
-//! shipped to the client, the way zero-cache withholds them. Two `EXISTS`
-//! tests beside each other under a node's `AND`, on the same to-one
-//! relationship, are one test of both conditions ([`merge_exists`]).
+//! shipped to the client, the way zero-cache withholds them.
 
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use serde::Deserialize;
 use serde_json::Value as Json;
@@ -108,10 +105,6 @@ pub struct Correlation {
     pub child_field: Vec<String>,
 }
 
-/// One to-one relationship an `EXISTS` tests, as [`merge_exists`] groups
-/// them: the parent column, the child column and the child table.
-type Relationship<'a> = (&'a str, &'a str, &'a str);
-
 /// A translated query: the tree to register, and the parts whose rows
 /// stay on the server (permission subqueries).
 #[derive(Debug, Clone)]
@@ -149,12 +142,8 @@ fn node(
     if concealed {
         hidden.insert(part);
     }
-    let merged = ast
-        .filter
-        .as_deref()
-        .map(|condition| merge_exists(condition, catalog));
     let mut inner: Vec<&CorrelatedSubquery> = Vec::new();
-    let filter = match &merged {
+    let filter = match &ast.filter {
         Some(condition) => translate_condition(condition, table, &mut inner)?,
         None => Where::AND(Vec::new()),
     };
@@ -207,168 +196,6 @@ fn node(
         joins.push(edge(sub, child_path, concealed, true, catalog, hidden)?);
     }
     Ok(MultiTableReadQuery::new(main_table, joins))
-}
-
-/// `condition` with the `EXISTS` tests that are direct children of its
-/// `AND` merged wherever two or more test the same to-one relationship:
-/// the same parent column, the same child table and the same child
-/// column, that column being the child table's single-column primary
-/// key. Each parent row reaches exactly one child row there, so "a
-/// channel that is a DM exists" and "a channel I may see exists" are one
-/// test, "a channel that is a DM and I may see exists", whose count is
-/// what the two share rather than either alone, and whose rows the
-/// engine reads once. A test inside an `OR`, one on a one-to-many
-/// relationship, or two with different correlations are left as they
-/// are; so is a condition that is not an `AND`. Merged before
-/// translation, so the leaf numbering, the part paths and the hidden
-/// parts all follow from the merged tree.
-fn merge_exists<'a>(condition: &'a Condition, catalog: &Catalog) -> Cow<'a, Condition> {
-    let Condition::And { conditions } = condition else {
-        return Cow::Borrowed(condition);
-    };
-    let mut groups: Vec<(Relationship<'a>, Vec<usize>)> = Vec::new();
-    for (index, child) in conditions.iter().enumerate() {
-        let Some(sub) = exists_of(child).filter(|sub| to_one(sub, catalog)) else {
-            continue;
-        };
-        let key = (
-            sub.correlation.parent_field[0].as_str(),
-            sub.correlation.child_field[0].as_str(),
-            sub.subquery.table.as_str(),
-        );
-        match groups.iter_mut().find(|(held, _)| *held == key) {
-            Some((_, members)) => members.push(index),
-            None => groups.push((key, vec![index])),
-        }
-    }
-    if groups.iter().all(|(_, members)| members.len() < 2) {
-        return Cow::Borrowed(condition);
-    }
-    let mut merged: HashMap<usize, Condition> = HashMap::new();
-    let mut dropped: HashSet<usize> = HashSet::new();
-    for (_, members) in groups.iter().filter(|(_, members)| members.len() >= 2) {
-        let subs: Vec<&CorrelatedSubquery> = members
-            .iter()
-            .filter_map(|&index| exists_of(&conditions[index]))
-            .collect();
-        merged.insert(
-            members[0],
-            Condition::CorrelatedSubquery {
-                related: merge(&subs),
-                op: "EXISTS".to_owned(),
-            },
-        );
-        dropped.extend(members[1..].iter().copied());
-    }
-    Cow::Owned(Condition::And {
-        conditions: conditions
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !dropped.contains(index))
-            .map(|(index, child)| merged.remove(&index).unwrap_or_else(|| child.clone()))
-            .collect(),
-    })
-}
-
-/// The subquery of an `EXISTS` condition.
-fn exists_of(condition: &Condition) -> Option<&CorrelatedSubquery> {
-    match condition {
-        Condition::CorrelatedSubquery { related, op } if op == "EXISTS" => Some(related),
-        _ => None,
-    }
-}
-
-/// Whether `sub` joins its parent to at most one row: one column pair,
-/// the child's column its table's single-column primary key, and the
-/// subquery a plain test (no page, order or cursor, as an `EXISTS` never
-/// has).
-fn to_one(sub: &CorrelatedSubquery, catalog: &Catalog) -> bool {
-    let (correlation, subquery) = (&sub.correlation, &sub.subquery);
-    correlation.parent_field.len() == 1
-        && correlation.child_field.len() == 1
-        && subquery.limit.is_none()
-        && subquery.order_by.is_empty()
-        && subquery.start.is_none()
-        && catalog.table(&subquery.table).is_some_and(|table| {
-            table.pkey.len() == 1 && table.pkey[0].as_str() == correlation.child_field[0]
-        })
-}
-
-/// One `EXISTS` for `members`, tests of the same to-one relationship:
-/// the conjunction of their filters, their nested edges in order, hidden
-/// only when every one of them is, and of the system they all share. A
-/// member that was a permission check while the merged test is not keeps
-/// its own nested subqueries marked as permission checks, so what it
-/// withheld from the client stays withheld; the merged rows themselves
-/// are shipped, as the member that was not a permission check shipped a
-/// superset of them.
-fn merge(members: &[&CorrelatedSubquery]) -> CorrelatedSubquery {
-    let first = members[0];
-    let system = members
-        .iter()
-        .map(|member| member.system.as_deref())
-        .reduce(|shared, next| if shared == next { shared } else { None })
-        .flatten()
-        .map(str::to_owned);
-    let mut filters = Vec::with_capacity(members.len());
-    let mut related = Vec::new();
-    for member in members {
-        let mut subquery = (*member.subquery).clone();
-        if system.is_none() && member.system.as_deref() == Some("permissions") {
-            conceal(&mut subquery);
-        }
-        if let Some(filter) = subquery.filter.take() {
-            filters.push(*filter);
-        }
-        related.append(&mut subquery.related);
-    }
-    let filter = match filters.len() {
-        0 => None,
-        1 => filters.pop(),
-        _ => Some(Condition::And {
-            conditions: filters,
-        }),
-    };
-    CorrelatedSubquery {
-        correlation: first.correlation.clone(),
-        subquery: Box::new(Ast {
-            table: first.subquery.table.clone(),
-            filter: filter.map(Box::new),
-            related,
-            limit: None,
-            order_by: Vec::new(),
-            start: None,
-        }),
-        hidden: members
-            .iter()
-            .all(|member| member.hidden == Some(true))
-            .then_some(true),
-        system,
-    }
-}
-
-/// Mark every subquery directly under `ast` as a permission check (the
-/// translation conceals everything under one).
-fn conceal(ast: &mut Ast) {
-    for sub in &mut ast.related {
-        sub.system = Some("permissions".to_owned());
-    }
-    if let Some(filter) = ast.filter.as_deref_mut() {
-        conceal_condition(filter);
-    }
-}
-
-/// [`conceal`] for the subqueries inside a condition.
-fn conceal_condition(condition: &mut Condition) {
-    match condition {
-        Condition::Simple { .. } => {}
-        Condition::And { conditions } | Condition::Or { conditions } => {
-            conditions.iter_mut().for_each(conceal_condition);
-        }
-        Condition::CorrelatedSubquery { related, .. } => {
-            related.system = Some("permissions".to_owned());
-        }
-    }
 }
 
 /// One join edge and the subtree under it: a LEFT edge for `related`, an
@@ -669,150 +496,7 @@ mod tests {
                     DbColumn::new("userId", ValueType::String),
                 ],
             ),
-            DbTable::new(
-                "channels",
-                ["id"],
-                vec![
-                    DbColumn::new("id", ValueType::String),
-                    DbColumn::new("scopeType", ValueType::String),
-                    DbColumn::new("visibility", ValueType::String),
-                ],
-            ),
-            DbTable::new(
-                "channel_stats",
-                ["channelId"],
-                vec![
-                    DbColumn::new("channelId", ValueType::String),
-                    DbColumn::new("lastActivityAt", ValueType::Int),
-                ],
-            ),
         ])
-    }
-
-    /// The DM list's root as the application server returns it: the
-    /// app's test that the channel is a DM, and the permission rule's
-    /// test that it is public or the reader is in it, both `EXISTS` on
-    /// `channels` through `channelId = id`, with `acl` wrapping the rule
-    /// as given (a plain sibling, or inside an `OR`).
-    fn dm_list(acl: &str) -> Ast {
-        serde_json::from_str(&format!(r#"{{
-            "table": "channel_stats",
-            "where": {{"type": "and", "conditions": [
-                {{"type": "correlatedSubquery", "op": "EXISTS", "related": {{
-                    "correlation": {{"parentField": ["channelId"], "childField": ["id"]}},
-                    "subquery": {{"table": "channels", "where": {{"type": "or", "conditions": [
-                        {{"type": "simple", "op": "=", "left": {{"type": "column", "name": "scopeType"}}, "right": {{"type": "literal", "value": "DM"}}}},
-                        {{"type": "simple", "op": "=", "left": {{"type": "column", "name": "scopeType"}}, "right": {{"type": "literal", "value": "GROUP_DM"}}}}
-                    ]}}}}
-                }}}},
-                {acl}
-            ]}},
-            "orderBy": [["lastActivityAt", "desc"]],
-            "limit": 10
-        }}"#)).expect("an AST")
-    }
-
-    /// The permission rule's `EXISTS` on channels.
-    const ACL: &str = r#"{"type": "correlatedSubquery", "op": "EXISTS", "related": {
-        "correlation": {"parentField": ["channelId"], "childField": ["id"]},
-        "system": "permissions",
-        "subquery": {"table": "channels", "where": {"type": "or", "conditions": [
-            {"type": "simple", "op": "=", "left": {"type": "column", "name": "visibility"}, "right": {"type": "literal", "value": "PUBLIC"}},
-            {"type": "correlatedSubquery", "op": "EXISTS", "related": {
-                "correlation": {"parentField": ["id"], "childField": ["channelId"]},
-                "subquery": {"table": "channel_participants", "where": {"type": "simple", "op": "=", "left": {"type": "column", "name": "userId"}, "right": {"type": "literal", "value": "me"}}}
-            }}
-        ]}}
-    }}"#;
-
-    /// Two `EXISTS` on `channels` through `channelId = id`, the channel's
-    /// primary key, under the root's `AND` become one: one inner edge
-    /// whose filter is the `AND` of both tests and whose subtree carries
-    /// the rule's nested edge; the merged channels are shipped (the app's
-    /// test needs them), the rule's memberships stay hidden.
-    #[test]
-    fn sibling_exists_on_a_to_one_relationship_merge() {
-        let translated = translate(&dm_list(ACL), &catalog()).unwrap();
-        let root = &translated.query;
-        assert_eq!(root.joins.len(), 1, "one edge for both tests: {root:?}");
-        let channels = &root.joins[0];
-        assert!(channels.is_inner);
-        assert_eq!(channels.sub.main_table.table.as_str(), "channels");
-        let Where::AND(both) = &channels.sub.main_table.filter else {
-            panic!(
-                "the AND of both tests: {:?}",
-                channels.sub.main_table.filter
-            );
-        };
-        assert_eq!(both.len(), 2, "{both:?}");
-        assert!(
-            matches!(&both[0], Where::OR(_)),
-            "the app's scope test: {:?}",
-            both[0]
-        );
-        assert!(
-            matches!(&both[1], Where::OR(_)),
-            "the rule's visibility test: {:?}",
-            both[1]
-        );
-        assert_eq!(channels.sub.joins.len(), 1, "the rule's memberships edge");
-        assert_eq!(
-            channels.sub.joins[0].sub.main_table.table.as_str(),
-            "channel_participants"
-        );
-        assert!(
-            !translated.hidden.contains(&QueryPart::join(0)),
-            "the merged channels are shipped"
-        );
-        assert!(
-            translated.hidden.contains(&QueryPart::new(&[0, 0])),
-            "the rule's memberships stay hidden"
-        );
-        let rendered = format!("{:?}", root.main_table.filter);
-        assert_eq!(
-            rendered.matches("EXISTS").count(),
-            1,
-            "one leaf: {rendered}"
-        );
-    }
-
-    /// The same rule inside an `OR` at the root is not a sibling test and
-    /// is left alone: two edges, the rule's hidden whole.
-    #[test]
-    fn an_exists_inside_an_or_is_not_merged() {
-        let inside_or = format!(
-            r#"{{"type": "or", "conditions": [
-                {{"type": "simple", "op": "=", "left": {{"type": "column", "name": "lastActivityAt"}}, "right": {{"type": "literal", "value": 0}}}},
-                {ACL}
-            ]}}"#
-        );
-        let translated = translate(&dm_list(&inside_or), &catalog()).unwrap();
-        assert_eq!(translated.query.joins.len(), 2, "{:?}", translated.query);
-        assert!(translated.hidden.contains(&QueryPart::join(1)));
-        assert!(!translated.hidden.contains(&QueryPart::join(0)));
-    }
-
-    /// Two tests on a one-to-many relationship (participants through the
-    /// channel's id, not the participants' key) each reach many rows, so
-    /// they are not one test and are not merged.
-    #[test]
-    fn exists_on_a_one_to_many_relationship_are_not_merged() {
-        let participant = |user: &str| {
-            format!(
-                r#"{{"type": "correlatedSubquery", "op": "EXISTS", "related": {{
-                "correlation": {{"parentField": ["id"], "childField": ["channelId"]}},
-                "subquery": {{"table": "channel_participants", "where": {{"type": "simple", "op": "=", "left": {{"type": "column", "name": "userId"}}, "right": {{"type": "literal", "value": "{user}"}}}}}}
-            }}}}"#
-            )
-        };
-        let ast: Ast = serde_json::from_str(&format!(
-            r#"{{"table": "channels", "where": {{"type": "and", "conditions": [{}, {}]}}}}"#,
-            participant("me"),
-            participant("you")
-        ))
-        .unwrap();
-        let translated = translate(&ast, &catalog()).unwrap();
-        assert_eq!(translated.query.joins.len(), 2, "{:?}", translated.query);
     }
 
     /// A message thread with a visibility rule, a related conversation,

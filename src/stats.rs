@@ -1501,9 +1501,7 @@ fn measure_help(name: &str) -> &'static str {
             "since the feed last heard from PostgreSQL: a transaction, or a keepalive saying how far its log has been gone through"
         }
         "process_rss_bytes" => "the process's resident memory",
-        "read_row_limit" => {
-            "the most rows one storage read may return and the planner reads whole, as configured"
-        }
+        "read_row_limit" => "the row limit of one storage read, as configured",
         "read_rows_max" => "the largest storage read of the last minute or two",
         "writes_impacting_total" => "writes that changed at least one subscription",
         "narrowed_reads_total" => "storage reads the engine asked for",

@@ -20,7 +20,7 @@
 // SMOKE_GATEWAY (ws://localhost:4848/sync), SMOKE_HTTP (http://localhost:4848),
 // SMOKE_COLLECTOR (the collector's Prometheus endpoint, http://localhost:9464/metrics;
 // unset skips that check). The server is expected to run with
-// XYNE_SYNC_ROW_LIMIT=600, so the 400 seeded rows make a heavy read. The table must
+// XYNE_SYNC_READ_ROW_LIMIT=600, so the 400 seeded rows make a heavy read. The table must
 // exist before the server starts (it reads the catalog once): run with `--prepare` first.
 
 import { execFileSync } from 'node:child_process';
@@ -175,7 +175,7 @@ log('a fitting client schema was served and one naming an unknown column was ref
 const stats = await (await fetch(`${HTTP}/stats`)).json();
 const limit = stats.gauges.read_row_limit;
 const heavy = stats.heavy_queries?.[0];
-if (limit !== 600) fail(`the server should run with XYNE_SYNC_ROW_LIMIT=600, it reports ${limit}`);
+if (limit !== 600) fail(`the server should run with XYNE_SYNC_READ_ROW_LIMIT=600, it reports ${limit}`);
 if (!heavy || heavy.table !== 'smoke_items' || heavy.rows < SEEDED - 1 || heavy.percent_of_limit < 60) fail('the heavy read was not reported: ' + JSON.stringify(stats.heavy_queries));
 await new Promise((resolve) => setTimeout(resolve, 3000));
 const metrics = await (await fetch(`${HTTP}/metrics`)).text();
