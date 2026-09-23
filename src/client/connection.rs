@@ -45,8 +45,8 @@ use super::schema;
 use super::transform::TransformCache;
 use super::warm::WarmStart;
 use crate::log::{Level, log_debug, log_event, log_info, log_warn};
-use crate::model::Catalog;
 use crate::stats::Stats;
+use crate::sync::CatalogHandle;
 use crate::sync::pg::PgStorage;
 use crate::sync::pg::sql::{quote_ident, quote_literal};
 
@@ -56,7 +56,8 @@ use crate::sync::pg::sql::{quote_ident, quote_literal};
 ///   speaks to the thread its client group hashes to.
 /// - `storage`: the engine side's storage handle, for the planner's
 ///   counts and the connect-time mutation ids.
-/// - `catalog`: the tables, for translating ASTs.
+/// - `catalog`: the tables, for translating ASTs; the engine side keeps
+///   it current with the schema.
 /// - `plans`: the join plans remembered across connections.
 /// - `stats`: the server's measurements, served at `/stats`.
 /// - `ready`: whether the engine's position has covered the storage's
@@ -66,7 +67,7 @@ pub struct AppState {
     pub requests: Vec<mpsc::Sender<Request>>,
     pub backend: Arc<Backend>,
     pub storage: Arc<PgStorage>,
-    pub catalog: Arc<Catalog>,
+    pub catalog: Arc<CatalogHandle>,
     pub plans: Arc<PlanCache>,
     pub lmids: Arc<LmidReader>,
     pub stats: Arc<Stats>,
@@ -505,7 +506,7 @@ fn admits(
     out: &mpsc::UnboundedSender<Outbound>,
     declared: &protocol::ClientSchema,
 ) -> bool {
-    let found = schema::mismatches(&state.catalog, declared);
+    let found = schema::mismatches(&state.catalog.load(), declared);
     if found.is_empty() {
         return true;
     }
@@ -1032,7 +1033,7 @@ impl Conn {
 async fn plan_ast(state: &AppState, name: &str, ast: Json) -> Result<Translated, String> {
     let parsed: Ast = Ast::deserialize(&ast).map_err(|error| format!("malformed AST: {error}"))?;
     let started = Instant::now();
-    let translated = ast::translate(&parsed, &state.catalog)?;
+    let translated = ast::translate(&parsed, &state.catalog.load())?;
     state.warm.record(name, &ast);
     let planned = plan::plan(
         translated,

@@ -49,6 +49,7 @@
 //! points are on.
 
 pub mod catalog;
+pub mod ddl;
 pub mod replication;
 pub mod sql;
 pub mod stream;
@@ -61,7 +62,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow};
 
@@ -244,19 +245,61 @@ fn timed_out(what: &str, limit: Duration) -> StorageError {
 }
 
 /// The aliases: the current one, and the newer ones minted since, oldest
-/// first, waiting for the stream to pass their consistent points.
-#[derive(Default)]
+/// first, waiting for the stream to pass their consistent points; and the
+/// catalog reads on the current one describe their tables by. The alias
+/// and the catalog change together under one lock: a schema change
+/// committed at some position hands in the catalog from then on
+/// (`upcoming`), and the alias that first reaches that position brings it
+/// into force, so a read never pairs a snapshot with a catalog from the
+/// other side of a migration.
 struct Aliases {
     current: Option<Arc<Alias>>,
     waiting: VecDeque<Arc<Alias>>,
+    catalog: Arc<Catalog>,
+    /// Catalogs handed in for positions the current alias has not reached,
+    /// each with the position it applies from, in order.
+    upcoming: VecDeque<(Lsn, Arc<Catalog>)>,
 }
 
 impl Aliases {
+    /// No alias yet, reads to describe their tables by `catalog`.
+    fn new(catalog: Arc<Catalog>) -> Self {
+        Aliases {
+            current: None,
+            waiting: VecDeque::new(),
+            catalog,
+            upcoming: VecDeque::new(),
+        }
+    }
+
+    /// Everything, moved out; what stays behind holds no alias.
+    fn take(&mut self) -> Self {
+        Aliases {
+            current: self.current.take(),
+            waiting: std::mem::take(&mut self.waiting),
+            catalog: self.catalog.clone(),
+            upcoming: std::mem::take(&mut self.upcoming),
+        }
+    }
+
     /// Make the newest waiting alias at or below `feed` current, dropping
-    /// the older ones it supersedes.
+    /// the older ones it supersedes, and bring into force every catalog
+    /// handed in for a position the current alias has reached.
     fn advance(&mut self, feed: Lsn) {
         while self.waiting.front().is_some_and(|alias| alias.lsn <= feed) {
             self.current = self.waiting.pop_front();
+        }
+        let Some(current) = &self.current else {
+            return;
+        };
+        while self
+            .upcoming
+            .front()
+            .is_some_and(|(at, _)| *at <= current.lsn)
+        {
+            if let Some((_, catalog)) = self.upcoming.pop_front() {
+                self.catalog = catalog;
+            }
         }
     }
 }
@@ -269,24 +312,28 @@ impl Aliases {
 ///   transaction.
 /// - `permits`: how many reads may be in flight at once; the rest queue
 ///   here rather than at the server's connection limit.
-/// - `catalog`: the tables' declared columns, which the `SELECT` casts to
-///   and the rows decode by.
-/// - `aliases`: the current alias and the ones waiting to become it; a
-///   read clones the current handle and keeps it until it is done.
+/// - `aliases`: the current alias and the ones waiting to become it, and
+///   the catalog (the tables' declared columns, which the `SELECT` casts
+///   to and the rows decode by) in force on the current one; a read
+///   clones both and keeps them until it is done.
 /// - `rotation`: how often a fresh alias is minted, in milliseconds.
+/// - `wake`: rung to mint at once rather than at the next tick.
+/// - `first`: the consistent point of the first alias minted, which is
+///   where the feed starts.
 /// - `timeout`: how long a read may take, in milliseconds; zero for no
 ///   limit.
 /// - `alive`: cleared when the storage drops, which ends the minting task.
 /// - `runtime`: where the reads, the connections and the minter run.
 struct Pool {
     config: Config,
-    catalog: Arc<Catalog>,
     idle: Mutex<Vec<Client>>,
     permits: Arc<Semaphore>,
     /// The most rows one read may return before it is refused.
     row_limit: AtomicUsize,
     aliases: Mutex<Aliases>,
     rotation: AtomicU64,
+    wake: Notify,
+    first: AtomicU64,
     timeout: AtomicU64,
     alive: AtomicBool,
     runtime: Handle,
@@ -339,17 +386,19 @@ impl PgStorage {
         let client = open(&config, &runtime).await?;
         let pool = Arc::new(Pool {
             config,
-            catalog,
             idle: Mutex::new(vec![client]),
             permits: Arc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
             row_limit: AtomicUsize::new(read_row_limit()),
-            aliases: Mutex::new(Aliases::default()),
+            aliases: Mutex::new(Aliases::new(catalog)),
             rotation: AtomicU64::new(250),
+            wake: Notify::new(),
+            first: AtomicU64::new(0),
             timeout: AtomicU64::new(0),
             alive: AtomicBool::new(true),
             runtime,
         });
         let first = Arc::new(mint(&pool.config).await?);
+        pool.first.store(first.lsn.0, Ordering::Relaxed);
         pool.lock_aliases().waiting.push_back(first);
         rotate(pool.clone());
         Ok(PgStorage { pool, delay: None })
@@ -372,12 +421,13 @@ impl PgStorage {
     pub fn with_read_connections(self, limit: usize) -> Self {
         let pool = Arc::new(Pool {
             config: self.pool.config.clone(),
-            catalog: self.pool.catalog.clone(),
             idle: Mutex::new(std::mem::take(&mut *self.pool.lock_idle())),
             permits: Arc::new(Semaphore::new(limit.max(1))),
             row_limit: AtomicUsize::new(self.pool.row_limit.load(Ordering::Relaxed)),
-            aliases: Mutex::new(std::mem::take(&mut *self.pool.lock_aliases())),
+            aliases: Mutex::new(self.pool.lock_aliases().take()),
             rotation: AtomicU64::new(self.pool.rotation.load(Ordering::Relaxed)),
+            wake: Notify::new(),
+            first: AtomicU64::new(self.pool.first.load(Ordering::Relaxed)),
             timeout: AtomicU64::new(self.pool.timeout.load(Ordering::Relaxed)),
             alive: AtomicBool::new(true),
             runtime: self.pool.runtime.clone(),
@@ -404,6 +454,18 @@ impl PgStorage {
             .rotation
             .store(every.as_millis().max(1) as u64, Ordering::Relaxed);
         self
+    }
+
+    /// The consistent point of the first alias minted: everything the
+    /// storage will ever read is at or past it, so it is where the feed
+    /// starts.
+    pub fn first_position(&self) -> Lsn {
+        Lsn(self.pool.first.load(Ordering::Relaxed))
+    }
+
+    /// Mint an alias now, without waiting for the rotation's next tick.
+    pub fn mint_now(&self) {
+        self.pool.wake.notify_one();
     }
 
     /// The current alias's consistent point, for inspection; `None` until
@@ -445,8 +507,8 @@ impl Storage for PgStorage {
         let pool = self.pool.clone();
         let delay = self.delay;
         run_on(&self.pool.runtime, async move {
-            let table = pool.table(&query)?;
-            let alias = pool.current_alias()?;
+            let (alias, catalog) = pool.current_alias()?;
+            let table = table_of(&catalog, &query)?;
             let row_limit = pool.row_limit.load(Ordering::Relaxed);
             let mut sql = sql::select_sql(&query, table);
             if query.limit == u32::MAX {
@@ -489,8 +551,8 @@ impl Storage for PgStorage {
         let pool = self.pool.clone();
         let query = query.clone();
         run_on(&self.pool.runtime, async move {
-            let table = pool.table(&query)?;
-            let alias = pool.current_alias()?;
+            let (alias, catalog) = pool.current_alias()?;
+            let table = table_of(&catalog, &query)?;
             let sql = sql::count_sql(&query, table, cap);
             let what = format!("counting the rows of `{}`", query.table);
             let rows = pool.read(&alias, &what, &sql, None).await?;
@@ -509,6 +571,17 @@ impl Storage for PgStorage {
     /// Flip to the newest minted alias the stream has passed.
     fn advance(&self, feed: Lsn) {
         self.pool.lock_aliases().advance(feed);
+    }
+
+    /// Reads on the alias that first reaches `at`, and every later one,
+    /// describe their tables by `catalog`.
+    fn follow(&self, at: Lsn, catalog: Arc<Catalog>) {
+        self.pool.lock_aliases().upcoming.push_back((at, catalog));
+    }
+
+    /// [`PgStorage::mint_now`].
+    fn mint_now(&self) {
+        self.pool.wake.notify_one();
     }
 
     /// The current alias's consistent point; zero while there is none.
@@ -533,19 +606,15 @@ impl Pool {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// The catalog table of `query`.
-    fn table(&self, query: &SingleTableReadQuery) -> Result<&DbTable, StorageError> {
-        self.catalog
-            .table(query.table.as_str())
-            .ok_or_else(|| StorageError(format!("table `{}` is not in the catalog", query.table)))
-    }
-
-    /// The current alias, or an error while the stream has not passed
-    /// the first one yet (the runtime parks the read and asks again).
-    fn current_alias(&self) -> Result<Arc<Alias>, StorageError> {
-        self.lock_aliases().current.clone().ok_or_else(|| {
+    /// The current alias with the catalog in force on it, or an error
+    /// while the stream has not passed the first one yet (the runtime
+    /// parks the read and asks again).
+    fn current_alias(&self) -> Result<(Arc<Alias>, Arc<Catalog>), StorageError> {
+        let aliases = self.lock_aliases();
+        let alias = aliases.current.clone().ok_or_else(|| {
             StorageError("no snapshot at or below the stream's position yet".to_owned())
-        })
+        })?;
+        Ok((alias, aliases.catalog.clone()))
     }
 
     /// A permit to hold a connection.
@@ -689,19 +758,33 @@ fn rows_of(messages: Vec<SimpleQueryMessage>) -> Vec<SimpleQueryRow> {
     rows
 }
 
+/// The table of `query` in `catalog`.
+fn table_of<'a>(
+    catalog: &'a Catalog,
+    query: &SingleTableReadQuery,
+) -> Result<&'a DbTable, StorageError> {
+    catalog
+        .table(query.table.as_str())
+        .ok_or_else(|| StorageError(format!("table `{}` is not in the catalog", query.table)))
+}
+
 /// Keep minting aliases every rotation interval until the storage drops,
-/// pausing while enough are already waiting for the stream; a failed mint
+/// pausing while enough are already waiting for the stream, and at once
+/// when rung ([`PgStorage::mint_now`], whatever is waiting); a failed mint
 /// is reported and tried again at the next tick.
 fn rotate(pool: Arc<Pool>) {
     let runtime = pool.runtime.clone();
     runtime.spawn(async move {
         while pool.alive.load(Ordering::Relaxed) {
             let every = Duration::from_millis(pool.rotation.load(Ordering::Relaxed));
-            tokio::time::sleep(every).await;
+            let rung = tokio::select! {
+                _ = tokio::time::sleep(every) => false,
+                _ = pool.wake.notified() => true,
+            };
             if !pool.alive.load(Ordering::Relaxed) {
                 break;
             }
-            if pool.lock_aliases().waiting.len() >= WAITING_ALIASES {
+            if !rung && pool.lock_aliases().waiting.len() >= WAITING_ALIASES {
                 continue;
             }
             match mint(&pool.config).await {
@@ -794,6 +877,7 @@ fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::DbColumn;
 
     /// A keepalive goes onto the connection settings whole; an idle time
     /// of zero turns the probing off, and a zero interval or count leaves
@@ -877,7 +961,7 @@ mod tests {
                 _minter: ReplicationConnection::detached(),
             })
         };
-        let mut aliases = Aliases::default();
+        let mut aliases = Aliases::new(Arc::new(Catalog::default()));
         aliases.waiting.push_back(alias(10));
         aliases.waiting.push_back(alias(20));
         aliases.waiting.push_back(alias(30));
@@ -891,6 +975,38 @@ mod tests {
         aliases.advance(Lsn(30));
         assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(30)));
         assert!(aliases.waiting.is_empty());
+    }
+
+    /// A catalog handed in for a position comes into force with the first
+    /// alias at or past that position, never with an earlier one, and the
+    /// alias and the catalog flip in the same step.
+    #[test]
+    fn catalogs_come_into_force_with_the_alias_that_reaches_them() {
+        let alias = |lsn: u64| {
+            Arc::new(Alias {
+                snapshot: format!("snap-{lsn}"),
+                lsn: Lsn(lsn),
+                _minter: ReplicationConnection::detached(),
+            })
+        };
+        let table =
+            |name: &str| DbTable::new(name, ["id"], vec![DbColumn::new("id", ValueType::Int)]);
+        let before = Arc::new(Catalog::new(vec![table("a")]));
+        let after = Arc::new(Catalog::new(vec![table("a"), table("b")]));
+        let mut aliases = Aliases::new(before.clone());
+        aliases.upcoming.push_back((Lsn(15), after.clone()));
+        aliases.waiting.push_back(alias(10));
+        aliases.waiting.push_back(alias(20));
+        aliases.advance(Lsn(12));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(10)));
+        assert!(
+            Arc::ptr_eq(&aliases.catalog, &before),
+            "10 is before the change at 15"
+        );
+        aliases.advance(Lsn(20));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(20)));
+        assert!(Arc::ptr_eq(&aliases.catalog, &after));
+        assert!(aliases.upcoming.is_empty());
     }
 
     /// The text forms the casts produce decode to the engine's values.

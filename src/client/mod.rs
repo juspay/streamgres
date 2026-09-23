@@ -70,6 +70,7 @@ use tokio::sync::mpsc;
 pub use config::Config;
 
 use crate::log::{self, log_error, log_info, log_warn};
+use crate::sync::CatalogHandle;
 use crate::sync::pg::threads;
 
 /// Run the server with `config` until ctrl-c; returns the reason it could
@@ -84,8 +85,13 @@ pub fn serve(config: Config) -> Result<(), String> {
         .thread_name("xyne-sync-server")
         .build()
         .map_err(|error| format!("tokio: {error}"))?;
-    let catalog =
-        Arc::new(server.block_on(threads::load_catalog_at(&settings.dsn, &settings.schemas))?);
+    let catalog = Arc::new(CatalogHandle::new(
+        server.block_on(threads::load_catalog_at(&settings.dsn, &settings.schemas))?,
+    ));
+    server.block_on(threads::require_ddl_trigger(
+        &settings.dsn,
+        &settings.ddl_trigger,
+    ))?;
     let reads = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(settings.read_threads)
         .enable_all()
@@ -94,7 +100,6 @@ pub fn serve(config: Config) -> Result<(), String> {
         .map_err(|error| format!("tokio: {error}"))?;
     let stats = crate::stats::Stats::shared();
     crate::stats::Stats::install(&stats);
-    let feed = threads::spawn_feed(settings.clone(), catalog.clone())?;
     let shards = config.group_threads.max(1);
     stats.read_row_limit.store(
         crate::sync::pg::read_row_limit() as u64,
@@ -117,7 +122,6 @@ pub fn serve(config: Config) -> Result<(), String> {
                 match threads::start(
                     &settings,
                     engine_catalog,
-                    feed,
                     reads_handle,
                     shards,
                     engine_stats,
@@ -245,7 +249,7 @@ pub fn serve(config: Config) -> Result<(), String> {
                 let count = shapes.len();
                 let replayed = warm::WarmStart::replay(
                     shapes,
-                    &state.catalog,
+                    &state.catalog.load(),
                     state.config.policy(),
                     &state.plans,
                     &*state.storage,

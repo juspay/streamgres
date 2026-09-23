@@ -186,6 +186,8 @@ impl SingleTableIVM {
         key: &DataFrameKey,
         row: &DataFrameRow,
     ) -> Vec<SingleTableUpdate> {
+        let conformed = self.conform(table, row);
+        let row = conformed.as_ref().unwrap_or(row);
         let frame = self.frames.entry(table.clone()).or_default();
         let (id, shared) = frame.entry(key, || row.clone());
         debug_assert!(

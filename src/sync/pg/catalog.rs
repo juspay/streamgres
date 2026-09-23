@@ -120,8 +120,10 @@ pub fn value_type(data_type: &str, udt_name: &str) -> Option<ValueType> {
     }
 }
 
-/// The engine's type for a scalar Postgres type name.
-fn scalar_type(name: &str) -> Option<ValueType> {
+/// The engine's type for a scalar Postgres type name (`information_schema`'s
+/// `data_type` or `pg_type`'s name alike); `None` for one the wire cannot
+/// carry.
+pub fn scalar_type(name: &str) -> Option<ValueType> {
     let name = name.to_ascii_lowercase();
     let name = name.split('(').next().unwrap_or("").trim();
     Some(match name {

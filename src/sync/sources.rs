@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use super::pg::PgStorage;
 use super::storage::{MemoryStorage, Storage, StorageError};
+use crate::ivm::SchemaChange;
 use crate::model::{
     Catalog, Lsn, Order, OrderBy, SingleTableReadQuery, Snapshot, TableName, Where, WriteQuery,
 };
@@ -154,5 +155,24 @@ impl Storage for Sources {
         if self.is_cached(write.table()) {
             self.memory.absorb(write, at);
         }
+    }
+
+    /// A column added to a cached table reaches the mirror.
+    fn alter(&self, change: &SchemaChange) {
+        if let SchemaChange::ColumnAdded { table, .. } = change
+            && self.is_cached(table)
+        {
+            self.memory.alter(change);
+        }
+    }
+
+    /// Postgres reads by the catalog.
+    fn follow(&self, at: Lsn, catalog: Arc<Catalog>) {
+        self.pg.follow(at, catalog);
+    }
+
+    /// Postgres mints.
+    fn mint_now(&self) {
+        self.pg.mint_now();
     }
 }

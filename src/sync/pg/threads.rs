@@ -6,6 +6,14 @@
 //! talks to this side over the service's channels, commands in and events
 //! out, and never touches a database connection.
 //!
+//! The order at start is what makes the first snapshot and the feed
+//! agree: the slot is made to exist, then the storage mints its first
+//! snapshot, then the feed opens with the slot moved up to that
+//! snapshot's point, so it streams exactly what the snapshot does not
+//! hold. Schema changes reach the feed as the messages of the reference server's
+//! DDL event trigger ([`super::ddl`]); the server refuses to serve
+//! without that trigger ([`require_ddl_trigger`]).
+//!
 //! A consumer that must read some rows for itself (an application's
 //! mutation-id table, say) names those tables in [`Settings::watched`].
 //! Their writes travel inside the transaction that carried them and reach
@@ -19,12 +27,13 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::spawn_local;
 
+use super::ddl::{self, DdlSource};
 use super::{Feed, Keepalive, PgStorage, Transport, load_catalog};
 use crate::ivm::MultiTableIVM;
 use crate::log::{log_error, log_info, log_warn};
-use crate::model::{Catalog, MultiTableReadQuery, TableName};
+use crate::model::{Catalog, Lsn, MultiTableReadQuery, TableName};
 use crate::stats::Stats;
-use crate::sync::{Command, Event, Runtime, Service, Sources, Transaction};
+use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Transaction};
 
 /// How the engine side reaches its database.
 ///
@@ -42,6 +51,9 @@ use crate::sync::{Command, Event, Runtime, Service, Sources, Transaction};
 ///   database so that nothing between drops it ([`Keepalive`]).
 /// - `watched`: tables whose writes are copied to the consumer as they
 ///   are decoded, besides being routed like every other write.
+/// - `ddl_trigger`: the event trigger on `ddl_command_end` through which
+///   schema changes are heard; the server will not serve without it.
+/// - `ddl_prefix`: the prefix of that trigger's logical messages.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub dsn: String,
@@ -53,6 +65,8 @@ pub struct Settings {
     pub read_threads: usize,
     pub keepalive: Keepalive,
     pub watched: Vec<TableName>,
+    pub ddl_trigger: String,
+    pub ddl_prefix: String,
 }
 
 /// How often the feed thread tells the engine where the feed is without a
@@ -100,13 +114,44 @@ pub async fn load_catalog_at(dsn: &str, schemas: &[String]) -> Result<Catalog, S
     Ok(catalog)
 }
 
-/// Start the feed thread: it decodes every replication event with
-/// `catalog` and sends one transaction per commit into the returned
-/// channel, reopens the slot with a backoff when the connection drops,
-/// and ends the process when the receiver is gone or decoding fails.
+/// Refuse to serve without the event trigger `name` on `ddl_command_end`
+/// at `dsn`: it is how the server hears of schema changes, and a server
+/// that would not hear of them could go on serving rows in a shape the
+/// clients no longer expect.
+pub async fn require_ddl_trigger(dsn: &str, name: &str) -> Result<(), String> {
+    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .map_err(|error| format!("connecting to the database: {error}"))?;
+    let handle = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let present = ddl::trigger_present(&client, name)
+        .await
+        .map_err(|error| format!("looking for the DDL event trigger `{name}`: {error}"))?;
+    drop(client);
+    let _ = handle.await;
+    if present {
+        log_info!("schema changes are heard through the event trigger {name}");
+        Ok(())
+    } else {
+        Err(format!(
+            "the event trigger `{name}` (XYNE_SYNC_DDL_TRIGGER) is not on this database or is disabled; the server hears of schema changes through it and will not serve without it"
+        ))
+    }
+}
+
+/// Start the feed thread: it decodes every replication event, starting
+/// from `catalog` and following the schema changes the DDL trigger
+/// announces, sends one transaction per commit into the returned channel,
+/// reopens the slot with a backoff when the connection drops (the catalog
+/// as the feed has grown it survives the connection), and ends the
+/// process when the receiver is gone or decoding fails. The first time
+/// the slot opens it is moved up to `start`, the first read snapshot's
+/// point, when it is behind it.
 pub fn spawn_feed(
     settings: Settings,
     catalog: Arc<Catalog>,
+    start: Lsn,
 ) -> Result<mpsc::Receiver<Transaction>, String> {
     let (out, transactions) = mpsc::channel(1024);
     std::thread::Builder::new()
@@ -117,19 +162,27 @@ pub fn spawn_feed(
                 .build()
                 .expect("feed runtime");
             runtime.block_on(async move {
+                let ddl = DdlSource {
+                    prefix: settings.ddl_prefix.clone(),
+                    schemas: settings.schemas.clone(),
+                };
+                let mut feed = Feed::with_ddl(catalog, ddl);
+                let mut start = Some(start);
                 let mut failures = 0u32;
                 loop {
-                    match Transport::open(&settings.dsn, &settings.slot).await {
+                    let opened = match start {
+                        Some(from) => {
+                            Transport::open_from(&settings.dsn, &settings.slot, from).await
+                        }
+                        None => Transport::open(&settings.dsn, &settings.slot).await,
+                    };
+                    match opened {
                         Ok(transport) => {
                             log_info!("change feed open on slot {}", settings.slot);
+                            start = None;
                             failures = 0;
                             let outcome = transport
-                                .stream(
-                                    POSITION_EVERY,
-                                    Feed::new(catalog.clone()),
-                                    &settings.watched,
-                                    out.clone(),
-                                )
+                                .stream(POSITION_EVERY, &mut feed, &settings.watched, out.clone())
                                 .await;
                             if out.is_closed() {
                                 return;
@@ -158,33 +211,37 @@ pub fn spawn_feed(
     Ok(transactions)
 }
 
-/// Bring the engine side up on the current thread's local set: the
-/// storage over `settings` (its reads running on `reads`) and the
-/// service, taking the feed thread's transactions from `feed`, delivering
-/// its events to `consumers` streams and its timings to `stats`. Must run
-/// inside a `LocalSet`.
+/// Bring the engine side up on the current thread's local set: the slot
+/// made to exist, the storage over `settings` (its reads running on
+/// `reads`) with its first snapshot minted, the feed thread started at
+/// that snapshot's point, and the service, keeping `catalog` current,
+/// delivering its events to `consumers` streams and its timings to
+/// `stats`. Must run inside a `LocalSet`.
 pub async fn start(
     settings: &Settings,
-    catalog: Arc<Catalog>,
-    feed: mpsc::Receiver<Transaction>,
+    catalog: Arc<CatalogHandle>,
     reads: tokio::runtime::Handle,
     consumers: usize,
     stats: Arc<Stats>,
 ) -> Result<(Started, ServiceTask), String> {
+    Transport::prepare(&settings.dsn, &settings.slot)
+        .await
+        .map_err(|error| format!("preparing the change feed: {error}"))?;
     let mut config: tokio_postgres::Config = settings
         .dsn
         .parse()
         .map_err(|error| format!("connecting the storage: {error}"))?;
     settings.keepalive.apply(&mut config);
-    let pg = PgStorage::connect_configured(config, catalog.clone(), reads)
+    let pg = PgStorage::connect_configured(config, catalog.load(), reads)
         .await
         .map_err(|error| format!("connecting the storage: {error}"))?
         .with_rotation(settings.snapshot_rotation)
         .with_read_connections(settings.read_connections)
         .with_read_timeout(settings.read_timeout);
     let pg = Arc::new(pg);
+    let feed = spawn_feed(settings.clone(), catalog.load(), pg.first_position())?;
     let cached = Sources::cached_from_env();
-    let storage = Rc::new(Sources::new(pg.clone(), catalog.clone(), cached.clone()));
+    let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
     if !cached.is_empty() {
         let rows = storage
             .warm()
@@ -200,6 +257,7 @@ pub async fn start(
     let service = spawn_local(
         service
             .with_feed(feed)
+            .with_catalog(catalog)
             .with_sinks(sinks)
             .with_stats(stats)
             .run(),

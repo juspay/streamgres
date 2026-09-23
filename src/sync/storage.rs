@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::ivm::{evaluate, order_rows};
-use crate::model::Snapshot;
+use crate::ivm::{SchemaChange, conform, evaluate, order_rows};
+use crate::model::{Catalog, Snapshot};
 use crate::model::{DataFrameKey, DataFrameRow, Lsn, SingleTableReadQuery, TableName, WriteQuery};
 
 /// A failed storage read; the runtime parks the read and hands it out
@@ -106,6 +106,26 @@ pub trait Storage {
     fn absorb(&self, write: &WriteQuery, at: Lsn) {
         let _ = (write, at);
     }
+
+    /// A migration grew the schema: a source mirroring tables in memory
+    /// gives its rows the column. No-op by default.
+    fn alter(&self, change: &SchemaChange) {
+        let _ = change;
+    }
+
+    /// From the snapshot at or past `at` on, read with `catalog`: what a
+    /// schema change committed at `at` asks of a source whose reads
+    /// describe the tables in SQL. A source answering from memory has no
+    /// use for it. No-op by default.
+    fn follow(&self, at: Lsn, catalog: Arc<Catalog>) {
+        let _ = (at, catalog);
+    }
+
+    /// Mint a read snapshot now rather than at the next rotation, for a
+    /// source that mints ahead: what a schema change asks for, so that a
+    /// snapshot holding it is current as soon as the feed reaches it.
+    /// No-op by default.
+    fn mint_now(&self) {}
 }
 
 /// In-process storage: plain tables of rows, kept in insertion order so
@@ -219,5 +239,28 @@ impl Storage for MemoryStorage {
     fn absorb(&self, write: &WriteQuery, at: Lsn) {
         self.apply(write);
         self.advance(at);
+    }
+
+    /// A column added: every row of the table is laid out again with it.
+    fn alter(&self, change: &SchemaChange) {
+        let SchemaChange::ColumnAdded {
+            table,
+            column,
+            value,
+            schema,
+        } = change
+        else {
+            return;
+        };
+        let mut tables = self.tables.borrow_mut();
+        let Some(rows) = tables.get_mut(table) else {
+            return;
+        };
+        let added = [(column.name.clone(), value.clone())];
+        for (_, row) in rows.iter_mut() {
+            if let Some(image) = conform(row, schema, &added) {
+                *row = image;
+            }
+        }
     }
 }

@@ -11,11 +11,96 @@
 //! emits names the subscriptions it applies to ([`super::Delta`]), and
 //! whose they are is the transport's business.
 
+use std::fmt;
 use std::sync::Arc;
 
 use super::Delta;
 use crate::model::frame::SharedRow;
-use crate::model::{DataFrameKey, DataFrameRow, SingleTableReadQuery, SubId, WriteQuery};
+use crate::model::{
+    ColumnName, DataFrameKey, DataFrameRow, DbColumn, DbTable, RowData, RowSchema,
+    SingleTableReadQuery, SubId, TableName, Value, WriteQuery,
+};
+
+/// A migration the engine absorbs while it runs (the seam's vocabulary
+/// for it, whichever source noticed the change).
+///
+/// - `TableAdded`: a table the catalog now has; the engine holds no row of
+///   it yet.
+/// - `ColumnAdded`: `column` joined `table`; `value` is what every row
+///   the database already had holds for it (its default, or `NULL`), and
+///   `schema` the table's row layout with the column in it, so rewritten
+///   rows share one layout with the rows that arrive from now on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SchemaChange {
+    TableAdded {
+        table: DbTable,
+    },
+    ColumnAdded {
+        table: TableName,
+        column: DbColumn,
+        value: Value,
+        schema: Arc<RowSchema>,
+    },
+}
+
+impl fmt::Display for SchemaChange {
+    /// One line for the log: what was added where, and what the rows hold.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SchemaChange::TableAdded { table } => write!(
+                f,
+                "table `{}` added ({} columns, key {:?})",
+                table.name,
+                table.columns.len(),
+                table.pkey
+            ),
+            SchemaChange::ColumnAdded {
+                table,
+                column,
+                value,
+                ..
+            } => write!(
+                f,
+                "column `{}` ({:?}) added to `{table}`, existing rows {value:?}",
+                column.name, column.r#type
+            ),
+        }
+    }
+}
+
+/// `image` laid out on `schema` with the `added` columns it lacks given
+/// their values, or `None` when it already carries them all: the fast
+/// path is one pointer comparison (a row decoded on the table's current
+/// layout shares the layout's allocation), the slow one a lookup per
+/// added column, and a rebuild only for a row from before the change.
+pub fn conform(
+    image: &DataFrameRow,
+    schema: &Arc<RowSchema>,
+    added: &[(ColumnName, Value)],
+) -> Option<DataFrameRow> {
+    if Arc::ptr_eq(image.data.schema(), schema)
+        || added
+            .iter()
+            .all(|(column, _)| image.data.contains_key(column))
+    {
+        return None;
+    }
+    let values = schema
+        .names()
+        .iter()
+        .map(|name| match image.data.get(name) {
+            Some(value) => value.clone(),
+            None => added
+                .iter()
+                .find(|(column, _)| column == name)
+                .map_or(Value::Null, |(_, value)| value.clone()),
+        })
+        .collect();
+    Some(DataFrameRow::from(RowData::with_schema(
+        schema.clone(),
+        values,
+    )))
+}
 
 /// The engine's handle for one storage read it asked for; unique for the
 /// life of the engine.
@@ -117,6 +202,16 @@ pub trait Engine {
     /// Take the reads recorded since the last call, in the order they were
     /// asked for.
     fn requests(&mut self) -> Vec<Fetch>;
+
+    /// A migration grew the schema: a table the engine may see rows of
+    /// from now on (nothing to do for it, its frame is made on first use),
+    /// or a column added to a table, which every row the engine holds of
+    /// that table gets with the value the database gave the existing rows,
+    /// and every row that enters later without it gets on entry. No delta
+    /// comes of it: what the clients hold is theirs on their own schema.
+    fn alter(&mut self, change: &SchemaChange) {
+        let _ = change;
+    }
 
     /// Whether every row of `sub`'s initial result has arrived: no read it
     /// waits on is still out and, for a tree, every part is live. False

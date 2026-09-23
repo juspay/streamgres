@@ -66,7 +66,9 @@ use tokio_postgres::Client;
 use tokio_postgres::config::Host;
 use tokio_postgres::types::PgLsn;
 
-use crate::log::log_warn;
+use super::ddl::{self, DdlSource};
+use crate::ivm::SchemaChange;
+use crate::log::{log_info, log_warn};
 use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, DeleteQuery, InsertQuery, Lsn,
     RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
@@ -111,12 +113,15 @@ pub struct Batch {
 
 /// One decoded transaction: the end of its commit record (the position of
 /// its writes), its writes on catalog tables (none when it touched no
-/// table the catalog declares), when it committed and how long decoding
-/// it took.
-#[derive(Debug, PartialEq)]
+/// table the catalog declares), the schema changes it carried with the
+/// catalog they make (`None` when it carried none), when it committed and
+/// how long decoding it took.
+#[derive(Debug)]
 pub struct Transaction {
     pub at: Lsn,
     pub writes: Vec<WriteQuery>,
+    pub schema: Vec<SchemaChange>,
+    pub catalog: Option<Arc<Catalog>>,
     pub committed_at_micros: i64,
     pub decode: Duration,
 }
@@ -137,24 +142,50 @@ struct Described {
     plain_json: bool,
 }
 
-/// The mapping of decoded messages onto catalog writes: the relations
-/// announced so far and the transaction being collected.
+/// The mapping of decoded messages onto catalog writes: the catalog as
+/// the feed has it (it grows as the trigger's messages arrive, so a row
+/// after a change is decoded on the shape it was written in), the
+/// relations announced so far and the transaction being collected.
 pub struct Decoder {
     catalog: Arc<Catalog>,
     relations: HashMap<i32, Relation>,
     pending: Vec<WriteQuery>,
+    /// Where schema changes are heard, when they are heard at all.
+    ddl: Option<DdlSource>,
+    /// The schema changes absorbed since a transaction was last yielded,
+    /// for the next one to carry. They outlive a lost connection on
+    /// purpose: a transaction cut off before its commit is streamed again
+    /// from its start, its messages then mean nothing against a catalog
+    /// that already has them, and the engine must still be told.
+    changes: Vec<SchemaChange>,
     decode: Duration,
 }
 
 impl Decoder {
-    /// A decoder over `catalog`.
+    /// A decoder over `catalog` that hears of no schema change.
     pub fn new(catalog: Arc<Catalog>) -> Self {
         Decoder {
             catalog,
             relations: HashMap::new(),
             pending: Vec::new(),
+            ddl: None,
+            changes: Vec::new(),
             decode: Duration::ZERO,
         }
+    }
+
+    /// A decoder over `catalog` that follows the schema changes `ddl`
+    /// announces.
+    pub fn with_ddl(catalog: Arc<Catalog>, ddl: DdlSource) -> Self {
+        Decoder {
+            ddl: Some(ddl),
+            ..Self::new(catalog)
+        }
+    }
+
+    /// The catalog as the feed has it.
+    pub fn catalog(&self) -> &Arc<Catalog> {
+        &self.catalog
     }
 
     /// Absorb one event; a `Commit` yields the finished transaction, which
@@ -183,20 +214,70 @@ impl Decoder {
                 end_lsn,
                 commit_time_micros,
                 ..
-            } => Ok(Some(Transaction {
-                at: position(end_lsn),
-                writes: std::mem::take(&mut self.pending),
-                committed_at_micros: commit_time_micros,
-                decode: Duration::ZERO,
-            })),
+            } => {
+                let schema = std::mem::take(&mut self.changes);
+                Ok(Some(Transaction {
+                    at: position(end_lsn),
+                    writes: std::mem::take(&mut self.pending),
+                    catalog: (!schema.is_empty()).then(|| self.catalog.clone()),
+                    schema,
+                    committed_at_micros: commit_time_micros,
+                    decode: Duration::ZERO,
+                }))
+            }
             ReplicationEvent::XLogData { data, .. } => {
                 self.decode(&data)?;
                 Ok(None)
             }
-            ReplicationEvent::Message { .. }
-            | ReplicationEvent::KeepAlive { .. }
-            | ReplicationEvent::StoppedAt { .. } => Ok(None),
+            ReplicationEvent::Message {
+                prefix,
+                content,
+                lsn,
+                ..
+            } => {
+                if self.ddl.as_ref().is_some_and(|ddl| ddl.prefix == prefix) {
+                    self.migrate(position(lsn), &content)?;
+                }
+                Ok(None)
+            }
+            ReplicationEvent::KeepAlive { .. } | ReplicationEvent::StoppedAt { .. } => Ok(None),
         }
+    }
+
+    /// Absorb one message of the trigger, written at `at`: the catalog
+    /// becomes what the message makes of it, every row decoded from here
+    /// on is laid out on that, and the changes wait for the commit that
+    /// carries them. A message that changes nothing the catalog carries
+    /// leaves everything as it was. A change the server cannot follow, or
+    /// a message it cannot read, is the error that stops the feed, and
+    /// with it the server; restarted, it loads the catalog as it is then.
+    fn migrate(&mut self, at: Lsn, content: &Bytes) -> Result<(), StorageError> {
+        let Some(source) = &self.ddl else {
+            return Ok(());
+        };
+        let text = std::str::from_utf8(content)
+            .map_err(|_| StorageError(format!("the DDL message at {at} is not UTF-8")))?;
+        let message = ddl::DdlMessage::parse(text)
+            .map_err(|reason| StorageError(format!("the DDL message at {at}: {reason}")))?;
+        if !message.is_update() {
+            return Ok(());
+        }
+        let classified =
+            ddl::classify(&self.catalog, &source.schemas, &message).map_err(|reason| {
+                StorageError(format!(
+                    "schema change at {at} ({}) the server cannot follow: {reason}; the server stops here and, restarted, serves the schema as it is now",
+                    message.tag()
+                ))
+            })?;
+        if classified.changes.is_empty() {
+            return Ok(());
+        }
+        for change in &classified.changes {
+            log_info!("schema change at {at} ({}): {change}", message.tag());
+        }
+        self.catalog = Arc::new(classified.catalog);
+        self.changes.extend(classified.changes);
+        Ok(())
     }
 
     /// Map one `pgoutput` row message onto the pending transaction.
@@ -393,54 +474,41 @@ pub struct Feed {
 }
 
 impl Transport {
-    /// Open the replication connection to `dsn` on `slot`, first making
-    /// sure what it streams from exists: the publication (`<slot>_pub`,
-    /// every table) and the slot are created only when they are missing,
-    /// so a deployment that creates them itself is never written to. A
-    /// standby cannot create a publication; when it has none the error
-    /// says what to run on the primary.
+    /// Open the replication connection to `dsn` on `slot`, after
+    /// [`Transport::prepare`].
     pub async fn open(dsn: &str, slot: &str) -> Result<Self, StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+        ensure_slot(&config, slot).await?;
+        Self::connect(config, slot).await
+    }
+
+    /// [`Transport::open`], the slot first moved up to `start` when it is
+    /// behind it: the point the first read snapshot was taken at, so that
+    /// nothing the snapshot already holds is streamed, and, after a stop
+    /// on a schema change, the change is not met again. A slot at or past
+    /// `start` is left where it is.
+    pub async fn open_from(dsn: &str, slot: &str, start: Lsn) -> Result<Self, StorageError> {
+        let config: tokio_postgres::Config = dsn.parse()?;
+        let client = ensure_slot(&config, slot).await?;
+        advance_slot(&client, slot, start).await?;
+        Self::connect(config, slot).await
+    }
+
+    /// Make sure what the feed of `slot` streams from exists at `dsn`:
+    /// the publication (`<slot>_pub`, every table) and the slot, each
+    /// created only when it is missing, so a deployment that creates them
+    /// itself is never written to. A standby cannot create a publication;
+    /// when it has none the error says what to run on the primary. Done
+    /// before the first read snapshot is minted, so that the slot holds
+    /// the log from before that snapshot's point.
+    pub async fn prepare(dsn: &str, slot: &str) -> Result<(), StorageError> {
+        let config: tokio_postgres::Config = dsn.parse()?;
+        ensure_slot(&config, slot).await.map(drop)
+    }
+
+    /// The replication connection on `slot`.
+    async fn connect(config: tokio_postgres::Config, slot: &str) -> Result<Self, StorageError> {
         let publication = publication_of(slot);
-        let published = client
-            .query_opt(
-                "SELECT 1 FROM pg_publication WHERE pubname = $1",
-                &[&publication],
-            )
-            .await?
-            .is_some();
-        if !published {
-            let standby: bool = client
-                .query_one("SELECT pg_is_in_recovery()", &[])
-                .await?
-                .get(0);
-            if standby {
-                return Err(StorageError(format!(
-                    "publication `{publication}` does not exist and this server is a standby, which cannot create it; on the primary run: CREATE PUBLICATION \"{publication}\" FOR ALL TABLES"
-                )));
-            }
-            client
-                .batch_execute(&format!(
-                    "CREATE PUBLICATION \"{publication}\" FOR ALL TABLES"
-                ))
-                .await?;
-        }
-        let exists = client
-            .query_opt(
-                "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
-                &[&slot],
-            )
-            .await?
-            .is_some();
-        if !exists {
-            client
-                .execute(
-                    "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
-                    &[&slot],
-                )
-                .await?;
-        }
         let feed = ReplicationClient::connect(replication_config(&config, slot, &publication))
             .await
             .map_err(|error| StorageError(format!("replication connection: {error}")))?;
@@ -504,7 +572,7 @@ impl Transport {
     pub async fn stream(
         mut self,
         every: Duration,
-        mut feed: Feed,
+        feed: &mut Feed,
         watched: &[TableName],
         out: mpsc::Sender<Committed>,
     ) -> Result<(), StorageError> {
@@ -556,11 +624,112 @@ impl Transport {
                 at: transaction.at,
                 progress: feed.progress(),
                 watched: watched_writes,
+                schema: transaction.schema,
+                catalog: transaction.catalog,
                 received: Instant::now(),
                 committed_at_micros: transaction.committed_at_micros,
                 decode: transaction.decode,
             };
             if out.send(committed).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// The publication and the slot of `slot` at `config`, created when
+/// missing (see [`Transport::prepare`]); the ordinary connection used.
+async fn ensure_slot(config: &tokio_postgres::Config, slot: &str) -> Result<Client, StorageError> {
+    let client = super::open(config, &tokio::runtime::Handle::current()).await?;
+    let publication = publication_of(slot);
+    let published = client
+        .query_opt(
+            "SELECT 1 FROM pg_publication WHERE pubname = $1",
+            &[&publication],
+        )
+        .await?
+        .is_some();
+    if !published {
+        let standby: bool = client
+            .query_one("SELECT pg_is_in_recovery()", &[])
+            .await?
+            .get(0);
+        if standby {
+            return Err(StorageError(format!(
+                "publication `{publication}` does not exist and this server is a standby, which cannot create it; on the primary run: CREATE PUBLICATION \"{publication}\" FOR ALL TABLES"
+            )));
+        }
+        client
+            .batch_execute(&format!(
+                "CREATE PUBLICATION \"{publication}\" FOR ALL TABLES"
+            ))
+            .await?;
+    }
+    let exists = client
+        .query_opt(
+            "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await?
+        .is_some();
+    if !exists {
+        client
+            .execute(
+                "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+                &[&slot],
+            )
+            .await?;
+    }
+    Ok(client)
+}
+
+/// Move `slot` up to `to` when its confirmed position is behind it,
+/// first ending a walsender still holding it (one left by an earlier
+/// process; the server itself holds the slot on no other connection
+/// while it opens the feed). A slot at or past `to` is left alone.
+async fn advance_slot(client: &Client, slot: &str, to: Lsn) -> Result<(), StorageError> {
+    let mut attempts = 0;
+    loop {
+        let row = client
+            .query_opt(
+                "SELECT confirmed_flush_lsn, active_pid FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await?
+            .ok_or_else(|| StorageError(format!("slot `{slot}` does not exist")))?;
+        let confirmed: Option<PgLsn> = row.get(0);
+        let holder: Option<i32> = row.get(1);
+        let confirmed = confirmed.map(|lsn| Lsn(u64::from(lsn)));
+        if confirmed.is_some_and(|confirmed| confirmed >= to) {
+            return Ok(());
+        }
+        match holder {
+            Some(pid) if attempts < 40 => {
+                attempts += 1;
+                log_warn!(
+                    "slot {slot} is held by backend {pid}; ending it to move the slot to {to}"
+                );
+                client
+                    .execute("SELECT pg_terminate_backend($1)", &[&pid])
+                    .await?;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Some(pid) => {
+                return Err(StorageError(format!(
+                    "slot `{slot}` stays held by backend {pid}; it cannot be moved to {to}"
+                )));
+            }
+            None => {
+                client
+                    .execute(
+                        "SELECT pg_replication_slot_advance($1, $2)",
+                        &[&slot, &PgLsn::from(to.0)],
+                    )
+                    .await?;
+                log_info!(
+                    "slot {slot} moved from {} to {to}, the first read snapshot's point",
+                    confirmed.map_or_else(|| "nowhere".to_owned(), |lsn| lsn.to_string())
+                );
                 return Ok(());
             }
         }
@@ -578,12 +747,28 @@ fn heard() {
 }
 
 impl Feed {
-    /// A decoder for `catalog`, at position zero until the first event.
+    /// A decoder for `catalog`, at position zero until the first event,
+    /// hearing of no schema change.
     pub fn new(catalog: Arc<Catalog>) -> Self {
         Feed {
             decoder: Decoder::new(catalog),
             progress: Lsn(0),
         }
+    }
+
+    /// A decoder for `catalog` that follows the schema changes `ddl`
+    /// announces; a feed kept across the connections of one slot, so the
+    /// catalog it grows is never lost with a connection.
+    pub fn with_ddl(catalog: Arc<Catalog>, ddl: DdlSource) -> Self {
+        Feed {
+            decoder: Decoder::with_ddl(catalog, ddl),
+            progress: Lsn(0),
+        }
+    }
+
+    /// The catalog as the feed has it.
+    pub fn catalog(&self) -> &Arc<Catalog> {
+        self.decoder.catalog()
     }
 
     /// Absorb one raw event: a keepalive or a commit moves the position,
@@ -617,6 +802,24 @@ impl PgStream {
         Ok(PgStream {
             transport,
             feed: Feed::new(catalog),
+            client,
+        })
+    }
+
+    /// [`PgStream::open`], the feed following the schema changes `ddl`
+    /// announces.
+    pub async fn open_with(
+        dsn: &str,
+        slot: &str,
+        catalog: Arc<Catalog>,
+        ddl: DdlSource,
+    ) -> Result<Self, StorageError> {
+        let transport = Transport::open(dsn, slot).await?;
+        let config: tokio_postgres::Config = dsn.parse()?;
+        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+        Ok(PgStream {
+            transport,
+            feed: Feed::with_ddl(catalog, ddl),
             client,
         })
     }
@@ -670,7 +873,11 @@ impl PgStream {
     /// end on a primary, the replayed end on a standby; a read, nothing is
     /// written) and the feed is consumed until a commit or a keepalive
     /// says it has been delivered that far; fails if that takes longer
-    /// than [`POLL_WAIT`].
+    /// than [`POLL_WAIT`]. A batch carries writes only: a poller is a
+    /// tool for tests and the bench over a feed that hears of no schema
+    /// change ([`PgStream::open`]); the schema changes a feed opened with
+    /// [`PgStream::open_with`] hears travel with its transactions
+    /// ([`Transport::stream`]), not with a batch.
     pub async fn poll(&mut self) -> Result<Batch, StorageError> {
         let target = server_position(&self.client).await?;
         let deadline = Instant::now() + POLL_WAIT;
@@ -705,7 +912,7 @@ impl PgStream {
     /// connection ends: [`Transport::stream`], each transaction and each
     /// position mark going out as one [`Command::Transaction`].
     pub async fn run<Q>(self, every: Duration, commands: mpsc::Sender<Command<Q>>) {
-        let (transport, feed) = self.split();
+        let (transport, mut feed) = self.split();
         let (out, mut transactions) = mpsc::channel(64);
         let forward = async move {
             while let Some(transaction) = transactions.recv().await {
@@ -719,7 +926,7 @@ impl PgStream {
             }
         };
         tokio::select! {
-            outcome = transport.stream(every, feed, &[], out) => {
+            outcome = transport.stream(every, &mut feed, &[], out) => {
                 if let Err(error) = outcome {
                     eprintln!("change feed decoding failed: {error}");
                 }
@@ -930,6 +1137,162 @@ mod tests {
             prefix: "someone_else".to_owned(),
             content: Bytes::copy_from_slice(content.as_bytes()),
         }
+    }
+
+    /// A `ddlUpdate` as the reference server's end trigger writes it for `ALTER
+    /// TABLE`, on the prefix the feed under test listens on, with the
+    /// published tables `previous` before and `after` after the command.
+    fn ddl(previous: &str, after: &str) -> ReplicationEvent {
+        ReplicationEvent::Message {
+            transactional: true,
+            lsn: pgwire_replication::Lsn(0x10),
+            prefix: "xyne/0/ddl".to_owned(),
+            content: Bytes::from(format!(
+                r#"{{"type":"ddlUpdate","version":1,"event":{{"tag":"ALTER TABLE"}},"context":{{"query":"alter table"}},"previousSchema":{{"tables":[{previous}],"indexes":[]}},"schema":{{"tables":[{after}],"indexes":[]}}}}"#
+            )),
+        }
+    }
+
+    /// One published table `public.<name>` of a message, keyed by `id`,
+    /// with `columns` as (name, `pg_type` name, default expression).
+    fn published(name: &str, columns: &[(&str, &str, Option<&str>)]) -> String {
+        let columns: Vec<String> = columns
+            .iter()
+            .enumerate()
+            .map(|(index, (column, data_type, dflt))| {
+                let dflt = dflt.map_or_else(|| "null".to_owned(), |text| format!("\"{text}\""));
+                format!(
+                    r#""{column}":{{"pos":{},"dataType":"{data_type}","pgTypeClass":"b","notNull":false,"dflt":{dflt}}}"#,
+                    index + 1
+                )
+            })
+            .collect();
+        format!(
+            r#"{{"oid":7,"schema":"public","name":"{name}","replicaIdentity":"d","columns":{{{}}},"primaryKey":["id"],"publications":{{}}}}"#,
+            columns.join(",")
+        )
+    }
+
+    /// The `docs(id, title)` catalog the schema-change scenarios start
+    /// from, and the feed's source of changes.
+    fn docs() -> (Arc<Catalog>, DdlSource) {
+        let catalog = Arc::new(Catalog::new(vec![DbTable::new(
+            "docs",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("title", ValueType::String),
+            ],
+        )]));
+        let source = DdlSource {
+            prefix: "xyne/0/ddl".to_owned(),
+            schemas: vec!["public".to_owned()],
+        };
+        (catalog, source)
+    }
+
+    /// A column added grows the feed's catalog the moment its message is
+    /// absorbed: a row of the same transaction decoded before the message
+    /// is on the old layout, one after it carries the column on the
+    /// layout the change names, the transaction carries the change and
+    /// the catalog it makes, and a later transaction, carrying no change,
+    /// is decoded on the grown catalog.
+    #[test]
+    fn a_column_added_is_decoded_from_the_message_on() {
+        let (catalog, source) = docs();
+        let mut decoder = Decoder::with_ddl(catalog, source);
+        let before = published("docs", &[("id", "int8", None), ("title", "text", None)]);
+        let after = published(
+            "docs",
+            &[
+                ("id", "int8", None),
+                ("title", "text", None),
+                ("owner", "text", Some("'nobody'::text")),
+            ],
+        );
+        let events = vec![
+            begin(),
+            relation(7, "docs", &[("id", 20), ("title", 25)]),
+            insert(7, &["1", "first"]),
+            ddl(&before, &after),
+            relation(7, "docs", &[("id", 20), ("title", 25), ("owner", 25)]),
+            insert(7, &["2", "second", "meera"]),
+            commit("0/10"),
+            begin(),
+            insert(7, &["3", "third", "arjun"]),
+            commit("0/20"),
+        ];
+        let transactions: Vec<Transaction> = events
+            .into_iter()
+            .filter_map(|event| decoder.absorb(event).unwrap())
+            .collect();
+        assert_eq!(transactions.len(), 2, "{transactions:?}");
+
+        let first = &transactions[0];
+        assert_eq!(first.schema.len(), 1, "{:?}", first.schema);
+        let SchemaChange::ColumnAdded {
+            column,
+            value,
+            schema,
+            ..
+        } = &first.schema[0]
+        else {
+            panic!("{:?}", first.schema);
+        };
+        assert_eq!(column.name.as_str(), "owner");
+        assert_eq!(*value, Value::from("nobody"));
+        let grown = first
+            .catalog
+            .as_ref()
+            .expect("the catalog the change makes");
+        let widened = grown.table("docs").expect("docs");
+        assert!(widened.column("owner").is_some());
+        assert!(
+            Arc::ptr_eq(schema, widened.row_schema()),
+            "the change names the layout the new catalog's rows share"
+        );
+        let images: Vec<&DataFrameRow> = first
+            .writes
+            .iter()
+            .filter_map(|write| write.new_row_image())
+            .collect();
+        assert_eq!(images.len(), 2);
+        assert!(
+            !images[0].data.contains_key("owner"),
+            "decoded before the message, on the old layout: {:?}",
+            images[0]
+        );
+        assert_eq!(images[1].data.get("owner"), Some(&Value::from("meera")));
+        assert!(
+            Arc::ptr_eq(images[1].data.schema(), schema),
+            "decoded after the message, on the layout the change names"
+        );
+
+        let second = &transactions[1];
+        assert!(second.schema.is_empty() && second.catalog.is_none());
+        let late = second.writes[0].new_row_image().expect("an insert");
+        assert_eq!(late.data.get("owner"), Some(&Value::from("arjun")));
+        assert!(Arc::ptr_eq(decoder.catalog(), grown));
+    }
+
+    /// A message on another prefix is somebody else's; one on the feed's
+    /// prefix that removes a column the catalog carries is the error that
+    /// stops the feed, naming the change.
+    #[test]
+    fn a_change_the_server_cannot_follow_stops_the_feed() {
+        let (catalog, source) = docs();
+        let mut decoder = Decoder::with_ddl(catalog, source);
+        assert!(decoder.absorb(begin()).unwrap().is_none());
+        assert!(
+            decoder.absorb(message("not even json")).unwrap().is_none(),
+            "another prefix is not read"
+        );
+        let before = published("docs", &[("id", "int8", None), ("title", "text", None)]);
+        let after = published("docs", &[("id", "int8", None)]);
+        let error = decoder.absorb(ddl(&before, &after)).unwrap_err();
+        assert!(error.0.contains("cannot follow"), "{error}");
+        assert!(error.0.contains("`title`"), "{error}");
+        assert!(error.0.contains("removed or renamed"), "{error}");
     }
 
     /// A keepalive saying the server has gone through its log up to `end`.

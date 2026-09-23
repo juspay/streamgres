@@ -124,7 +124,7 @@ mod update;
 mod window;
 
 pub use crate::model::SubId;
-pub use engine::{Engine, Fetch, FetchId, FetchKind, Footprint};
+pub use engine::{Engine, Fetch, FetchId, FetchKind, Footprint, SchemaChange, conform};
 pub use multi::{MultiTableIVM, MultiTableUpdate};
 pub use predicate::{eval_condition, evaluate, evaluate_with};
 pub use stats::IvmStats;
@@ -132,11 +132,12 @@ pub use update::{Audience, Delta, QueryPart, Subs, Target};
 pub use window::{order_cmp, order_rows};
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use crate::model::frame::{RowId, SharedRow, TableFrame};
 use crate::model::{
-    DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, SingleTableReadQuery, TableName,
-    WriteQuery,
+    ColumnName, DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, RowSchema,
+    SingleTableReadQuery, TableName, Value, WriteQuery,
 };
 use index::TableIndex;
 use update::{Raw, fold};
@@ -197,11 +198,17 @@ pub struct SingleTableUpdate {
 ///   that freeing them (a hash map and its strings per row) happens off
 ///   the engine's thread; a release of a large subscription is otherwise
 ///   spent in the allocator.
+/// - `layouts`: for each table a migration widened while the engine ran,
+///   its row layout now and the columns added with their values, so a
+///   row that enters without them is completed ([`Engine::alter`]).
+///   Empty until a column is added, which is what keeps the check off the
+///   write path until then.
 /// - `stats`: operation counters; not part of the sync state.
 pub struct SingleTableIVM {
     select_queries: IdMap<SubId, SingleTableReadQuery>,
     by_query: HashMap<SingleTableReadQuery, BTreeSet<SubId>>,
     frames: HashMap<TableName, TableFrame>,
+    layouts: HashMap<TableName, Layout>,
     held: IdMap<SubId, IdSet<RowId>>,
     windows: IdMap<SubId, Window>,
     tables: HashMap<TableName, TableIndex>,
@@ -213,6 +220,13 @@ pub struct SingleTableIVM {
     next_fetch: u64,
     graveyard: Vec<SharedRow>,
     stats: IvmStats,
+}
+
+/// A table's row layout after a migration added columns to it, and those
+/// columns with the value every earlier row was given.
+struct Layout {
+    schema: Arc<RowSchema>,
+    added: Vec<(ColumnName, Value)>,
 }
 
 /// One confirmed impact of a write on a subscription, with the two facts
@@ -242,6 +256,7 @@ impl SingleTableIVM {
             select_queries: IdMap::default(),
             by_query: HashMap::new(),
             frames: HashMap::new(),
+            layouts: HashMap::new(),
             held: IdMap::default(),
             windows: IdMap::default(),
             tables: HashMap::new(),
@@ -313,6 +328,8 @@ impl SingleTableIVM {
             .map(|row| row.data.clone());
         let completed = complete_image(write_query.new_row_image(), old_data.as_ref());
         let row_image = completed.as_ref().or(write_query.new_row_image());
+        let conformed = row_image.and_then(|image| self.conform(&table, image));
+        let row_image = conformed.as_ref().or(row_image);
         let impacts = self.analyze(&table, &key, row_image);
 
         let mut ops: Vec<SingleTableUpdate> = Vec::new();
@@ -385,6 +402,50 @@ impl SingleTableIVM {
 
         let impacted: Vec<SubId> = impacts.iter().map(|impact| impact.sub).collect();
         self.gate_updates(&impacted, ops)
+    }
+
+    /// `image` completed with the columns a migration added to `table`
+    /// that it lacks ([`engine::conform`]); `None` when it has them all,
+    /// which is every row once the tables' layouts have never changed.
+    pub(super) fn conform(&self, table: &TableName, image: &DataFrameRow) -> Option<DataFrameRow> {
+        if self.layouts.is_empty() {
+            return None;
+        }
+        let layout = self.layouts.get(table)?;
+        engine::conform(image, &layout.schema, &layout.added)
+    }
+
+    /// A column joined `table`: every held row of the table that lacks it
+    /// is laid out again on `schema` with `value` in it, and rows entering
+    /// from now on are completed the same way. No delta comes of it.
+    /// Adding a column already added changes nothing.
+    pub fn add_column(
+        &mut self,
+        table: &TableName,
+        column: ColumnName,
+        value: Value,
+        schema: Arc<RowSchema>,
+    ) {
+        let layout = self.layouts.entry(table.clone()).or_insert_with(|| Layout {
+            schema: schema.clone(),
+            added: Vec::new(),
+        });
+        layout.schema = schema;
+        if !layout.added.iter().any(|(added, _)| *added == column) {
+            layout.added.push((column, value));
+        }
+        let Some(frame) = self.frames.get_mut(table) else {
+            return;
+        };
+        let rewritten: Vec<(RowId, DataFrameRow)> = frame
+            .rows()
+            .filter_map(|(id, row)| {
+                engine::conform(&row.data, &layout.schema, &layout.added).map(|image| (id, image))
+            })
+            .collect();
+        for (id, image) in rewritten {
+            frame.replace_image(id, image);
+        }
     }
 
     /// Tag `sub` onto the frame row `key` of `table` (which must be
@@ -636,6 +697,20 @@ impl Engine for SingleTableIVM {
     /// [`SingleTableIVM::take_requests`].
     fn requests(&mut self) -> Vec<Fetch> {
         self.take_requests()
+    }
+
+    /// [`SingleTableIVM::add_column`] for a column added; nothing for a
+    /// table added.
+    fn alter(&mut self, change: &SchemaChange) {
+        if let SchemaChange::ColumnAdded {
+            table,
+            column,
+            value,
+            schema,
+        } = change
+        {
+            self.add_column(table, column.name.clone(), value.clone(), schema.clone());
+        }
     }
 
     /// Registered, with no read out.

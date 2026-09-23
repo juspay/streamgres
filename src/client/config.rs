@@ -29,6 +29,14 @@ pub struct Config {
     pub schemas: Vec<String>,
     /// `XYNE_SYNC_SLOT`: the permanent replication slot (`xyne_sync`).
     pub slot: String,
+    /// `XYNE_SYNC_DDL_TRIGGER`: the event trigger on `ddl_command_end`
+    /// through which the server hears of schema changes, zero-cache's
+    /// (`<app>_ddl_end_<shard>`, so `zero_ddl_end_0`); the server refuses
+    /// to start without it.
+    pub ddl_trigger: String,
+    /// `XYNE_SYNC_DDL_PREFIX`: the prefix of that trigger's logical
+    /// messages (`<app>/<shard>/ddl`, so `zero/0/ddl`).
+    pub ddl_prefix: String,
     /// `XYNE_SYNC_SNAPSHOT_ROTATION_MS`: how often a fresh exported
     /// snapshot (a temporary replication slot) is minted for reads (1000).
     pub snapshot_rotation: Duration,
@@ -194,6 +202,10 @@ impl Config {
                 .map_err(|_| format!("XYNE_SYNC_SHARD must be a number, got `{text}`"))?,
             None => 0,
         };
+        let ddl_trigger = first(&["XYNE_SYNC_DDL_TRIGGER"])
+            .unwrap_or_else(|| format!("{app_id}_ddl_end_{shard}"));
+        let ddl_prefix =
+            first(&["XYNE_SYNC_DDL_PREFIX"]).unwrap_or_else(|| format!("{app_id}/{shard}/ddl"));
         let schemas = match first(&["XYNE_SYNC_SCHEMAS"]) {
             Some(text) => text
                 .split(',')
@@ -255,6 +267,8 @@ impl Config {
             dsn,
             schemas,
             slot: first(&["XYNE_SYNC_SLOT"]).unwrap_or_else(|| "xyne_sync".to_owned()),
+            ddl_trigger,
+            ddl_prefix,
             snapshot_rotation: millis("XYNE_SYNC_SNAPSHOT_ROTATION_MS", 1_000)?,
             read_connections: match first(&["XYNE_SYNC_READ_CONNECTIONS"]) {
                 Some(text) => text.parse().map_err(|_| {
@@ -383,6 +397,8 @@ impl Config {
                 retries: self.pg_keepalive_retries,
             },
             watched: vec![TableName::from(self.clients_table().as_str())],
+            ddl_trigger: self.ddl_trigger.clone(),
+            ddl_prefix: self.ddl_prefix.clone(),
         }
     }
 }
@@ -403,6 +419,30 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| (*value).to_owned()),
         })
+    }
+
+    /// The DDL trigger and its message prefix follow zero-cache's naming
+    /// from the app id and the shard unless named outright.
+    #[test]
+    fn the_ddl_trigger_follows_the_app_and_shard() {
+        let config = config(&[]).unwrap();
+        assert_eq!(config.ddl_trigger, "zero_ddl_end_0");
+        assert_eq!(config.ddl_prefix, "zero/0/ddl");
+        let config = config_with(&[("XYNE_SYNC_APP_ID", "zero02"), ("XYNE_SYNC_SHARD", "3")]);
+        assert_eq!(config.ddl_trigger, "zero02_ddl_end_3");
+        assert_eq!(config.ddl_prefix, "zero02/3/ddl");
+        let config = config_with(&[
+            ("XYNE_SYNC_DDL_TRIGGER", "my_trigger"),
+            ("XYNE_SYNC_DDL_PREFIX", "mine/ddl"),
+        ]);
+        assert_eq!(config.ddl_trigger, "my_trigger");
+        assert_eq!(config.ddl_prefix, "mine/ddl");
+        assert_eq!(config.engine_settings().ddl_trigger, "my_trigger");
+    }
+
+    /// [`config`], expected to parse.
+    fn config_with(vars: &[(&str, &str)]) -> Config {
+        config(vars).unwrap()
     }
 
     /// Left alone, the database connections are probed after 30 s of

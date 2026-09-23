@@ -182,7 +182,7 @@ use super::engine::Footprint;
 use super::predicate::evaluate_with;
 use super::stats::IvmStats;
 use super::update::{Audience, Raw, Subs, fold};
-use super::{Delta, Engine, Fetch, QueryPart, SingleTableIVM, SingleTableUpdate};
+use super::{Delta, Engine, Fetch, QueryPart, SchemaChange, SingleTableIVM, SingleTableUpdate};
 use crate::model::frame::SharedRow;
 use crate::model::{
     ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow,
@@ -2503,6 +2503,11 @@ impl Engine for MultiTableIVM {
     }
 
     /// [`MultiTableIVM::take_requests`].
+    /// The inner engine's, which holds every row.
+    fn alter(&mut self, change: &SchemaChange) {
+        self.single.alter(change);
+    }
+
     fn requests(&mut self) -> Vec<Fetch> {
         self.take_requests()
     }

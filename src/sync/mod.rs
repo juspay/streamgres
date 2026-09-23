@@ -14,6 +14,7 @@
 //! The sources differ only in how they arrive at a read's location; the
 //! runtime, the engine's rules, and both drivers are shared.
 
+pub mod catalog;
 mod local;
 pub mod pg;
 mod runtime;
@@ -23,6 +24,7 @@ mod storage;
 
 pub use crate::model::SubId;
 pub use crate::model::{Lsn, Snapshot};
+pub use catalog::CatalogHandle;
 pub use local::Local;
 pub use runtime::{Runtime, Step, SyncStats};
 pub use service::{Command, Event, Service, Transaction};

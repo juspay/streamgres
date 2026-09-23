@@ -90,7 +90,7 @@ use crate::model::{
     SubId, TableName, Value, WriteQuery,
 };
 use crate::stats::Stats;
-use crate::sync::{Command, Event};
+use crate::sync::{CatalogHandle, Command, Event};
 
 /// What goes out on one connection: a text frame, one poke (its frames
 /// written together, one flush; `since` is when the feed decoded the
@@ -470,7 +470,7 @@ impl Group {
 ///   the start of the clock every poke of the next flush carries.
 pub struct Groups {
     config: Arc<Config>,
-    catalog: Arc<Catalog>,
+    catalog: Arc<CatalogHandle>,
     shard: usize,
     stats: Arc<Stats>,
     oldest: Option<Instant>,
@@ -501,7 +501,7 @@ pub struct Groups {
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: Arc<Config>,
-    catalog: Arc<Catalog>,
+    catalog: Arc<CatalogHandle>,
     shard: usize,
     shards: usize,
     commands: mpsc::Sender<Command<MultiTableReadQuery>>,
@@ -875,7 +875,7 @@ impl Groups {
                 let poke_id = self.next_poke.to_string();
                 self.next_poke += 1;
                 let (frames, puts, _) = build_poke(
-                    &self.catalog,
+                    &self.catalog.load(),
                     &self.stats,
                     self.config.rows_per_part.max(1),
                     &poke_id,
@@ -1460,7 +1460,7 @@ impl Groups {
         group.version += 1;
         let cookie = protocol::cookie(group.version);
         let (frames, puts, dels) = build_poke(
-            &self.catalog,
+            &self.catalog.load(),
             &self.stats,
             self.config.rows_per_part.max(1),
             &poke_id,
@@ -1759,7 +1759,7 @@ mod tests {
             let core = Groups {
                 clients_table: TableName::from(config.clients_table().as_str()),
                 config: Arc::new(config),
-                catalog: Arc::new(catalog),
+                catalog: Arc::new(CatalogHandle::new(catalog)),
                 shard: 0,
                 stats: Stats::shared(),
                 oldest: None,

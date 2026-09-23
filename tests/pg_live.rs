@@ -1,7 +1,8 @@
 //! Live Postgres scenarios: the runtime over `PgStorage` and the
 //! `test_decoding` change feed, with writes committed deliberately behind
-//! an open snapshot; and the asynchronous service end to end with one
-//! table mirrored in memory. They run only when `XYNE_SYNC_PG_DSN` names a
+//! an open snapshot; the asynchronous service end to end with one table
+//! mirrored in memory; and schema changes followed through the reference server's
+//! DDL trigger stack. They run only when `XYNE_SYNC_PG_DSN` names a
 //! database with `wal_level = logical` (and free replication slots), and
 //! report themselves skipped otherwise; each scenario uses its own tables
 //! and slot, so they can run in parallel.
@@ -16,9 +17,10 @@ use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, NoTls};
 use xyne_sync::ivm::{Delta, Fetch, MultiTableIVM, QueryPart};
 use xyne_sync::model::*;
+use xyne_sync::sync::pg::ddl::{DdlSource, trigger_stack_sql};
 use xyne_sync::sync::pg::{PgStorage, PgStream};
 use xyne_sync::sync::{
-    Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
+    CatalogHandle, Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
 };
 
 /// The database under test, if any.
@@ -40,10 +42,12 @@ fn block_on<F: std::future::Future>(body: F) -> F::Output {
     LocalSet::new().block_on(&runtime, body)
 }
 
-/// One scenario's names: its tables and its slot.
+/// One scenario's names: its tables (`extra` is one a scenario creates
+/// while it runs), and its slot.
 struct Names {
     tickets: String,
     users: String,
+    extra: String,
     slot: String,
 }
 
@@ -53,6 +57,7 @@ impl Names {
         Names {
             tickets: format!("live_{tag}_tickets"),
             users: format!("live_{tag}_users"),
+            extra: format!("live_{tag}_extra"),
             slot: format!("xyne_sync_live_{tag}"),
         }
     }
@@ -122,13 +127,14 @@ async fn prepare(dsn: &str, names: &Names) -> Client {
         .expect("drop slot");
     client
         .batch_execute(&format!(
-            "DROP TABLE IF EXISTS {t}; DROP TABLE IF EXISTS {u};
+            "DROP TABLE IF EXISTS {t}; DROP TABLE IF EXISTS {u}; DROP TABLE IF EXISTS {e};
              CREATE TABLE {t} (id int8 PRIMARY KEY, status text, assigned_to int8, points int8);
              CREATE TABLE {u} (id int8 PRIMARY KEY, name text);
              INSERT INTO {u} VALUES (7, 'meera'), (8, 'arjun');
              INSERT INTO {t} VALUES (1, 'OPEN', 7, 1), (2, 'OPEN', 7, 2), (3, 'OPEN', 8, 3);",
             t = names.tickets,
-            u = names.users
+            u = names.users,
+            e = names.extra
         ))
         .await
         .expect("prepare");
@@ -139,8 +145,8 @@ async fn prepare(dsn: &str, names: &Names) -> Client {
 async fn cleanup(dsn: &str, client: &Client, names: &Names) {
     let _ = client
         .batch_execute(&format!(
-            "DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {};",
-            names.tickets, names.users
+            "DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {};",
+            names.tickets, names.users, names.extra
         ))
         .await;
     let _ = PgStream::drop_slot(dsn, &names.slot).await;
@@ -416,6 +422,8 @@ fn service_streams_end_to_end() {
                     at: batch.progress,
                     progress: batch.progress,
                     watched: Vec::new(),
+                    schema: Vec::new(),
+                    catalog: None,
                     received: Instant::now(),
                     committed_at_micros: 0,
                     decode: std::time::Duration::ZERO,
@@ -919,6 +927,270 @@ fn an_idle_feed_brings_the_first_snapshot_into_use() {
         feeding.abort();
         drop(commands);
         let _ = running.await;
+        cleanup(&dsn, &client, &names).await;
+    });
+}
+
+/// Events until one satisfies `done`, that one included; fails after ten
+/// seconds.
+async fn events_until(
+    events: &mut mpsc::UnboundedReceiver<Event>,
+    done: impl Fn(&Event) -> bool,
+) -> Vec<Event> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let event = tokio::time::timeout(remaining, events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the awaited event did not come; seen {seen:?}"))
+            .expect("the service is alive");
+        let finished = done(&event);
+        seen.push(event);
+        if finished {
+            return seen;
+        }
+    }
+}
+
+/// Poll `ready` every 50 ms until it holds; fails after ten seconds.
+async fn wait_until(what: &str, ready: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(Instant::now() < deadline, "{what} did not happen in time");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The rows `table` gained in `events`, by id: their `owner` cell.
+fn owners_added(events: &[Event], table: &str) -> BTreeMap<i64, Option<Value>> {
+    let mut out = BTreeMap::new();
+    for event in events {
+        let updates: &[Delta] = match event {
+            Event::Registered { updates, .. }
+            | Event::Landed { updates }
+            | Event::Committed { updates, .. } => updates,
+            _ => &[],
+        };
+        for update in updates {
+            if update.table.as_str() != table {
+                continue;
+            }
+            if let DataFrameOperation::Add(key, row) = &update.op
+                && let Some(Value::Int(id)) = key.pkey_value.get(&ColumnName::from("id"))
+            {
+                out.insert(*id, row.data.get("owner").cloned());
+            }
+        }
+    }
+    out
+}
+
+/// Schema changes arrive through the reference server's DDL trigger stack and are
+/// followed live, the feed and the service wired as the server wires
+/// them: a column added with a constant default reaches the rows the
+/// engine holds and the rows written after it, a row of the migration's
+/// own transaction included; a table created becomes queryable, and the
+/// catalog the clients' side reads switches, once a snapshot has the
+/// change; and a change the server cannot follow ends the feed with the
+/// reason.
+#[test]
+fn schema_changes_follow_the_trigger() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let names = Names::new("ddl");
+        let client = prepare(&dsn, &names).await;
+        let catalog = Arc::new(names.catalog());
+        let handle = Arc::new(CatalogHandle::from_arc(catalog.clone()));
+        let source = DdlSource {
+            prefix: "xslive/0/ddl".to_owned(),
+            schemas: vec!["public".to_owned()],
+        };
+        let stream = PgStream::open_with(&dsn, &names.slot, catalog.clone(), source)
+            .await
+            .expect("open stream");
+        let publication = format!("{}_pub", names.slot);
+        client
+            .batch_execute(&trigger_stack_sql("xslive", 0, &[publication.as_str()]))
+            .await
+            .expect("install the reference server's trigger stack");
+        let pg = Arc::new(
+            PgStorage::connect(&dsn, catalog.clone())
+                .await
+                .expect("connect"),
+        );
+        let sources = Rc::new(Sources::new(
+            pg,
+            catalog.clone(),
+            [TableName::from(names.users.as_str())],
+        ));
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let (service, commands) = Service::new(MultiTableIVM::new(), sources.clone(), events_tx);
+        spawn_local(service.with_catalog(handle.clone()).run());
+        let (transport, mut feed) = stream.split();
+        let (out, mut transactions) = mpsc::channel(64);
+        let forward = commands.clone();
+        spawn_local(async move {
+            while let Some(transaction) = transactions.recv().await {
+                if forward
+                    .send(Command::Transaction(transaction))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        let streaming = spawn_local(async move {
+            transport
+                .stream(Duration::from_millis(50), &mut feed, &[], out)
+                .await
+        });
+        wait_until("the first snapshot became current", || {
+            sources.floor() > Lsn(0)
+        })
+        .await;
+
+        commands
+            .send(Command::Register {
+                sink: 0,
+                query: names.spec(),
+                token: 1,
+            })
+            .await
+            .expect("send");
+        let opened = events_until(&mut events, |event| matches!(event, Event::Hydrated(_))).await;
+        assert_eq!(
+            owners_added(&opened, &names.tickets),
+            BTreeMap::from([(1, None), (2, None), (3, None)]),
+            "three open tickets, no owner column yet"
+        );
+
+        client
+            .batch_execute(&format!(
+                "BEGIN;
+                 ALTER TABLE {t} ADD COLUMN owner text DEFAULT 'nobody';
+                 INSERT INTO {t} (id, status, assigned_to, points, owner) VALUES (20, 'OPEN', 7, 20, 'meera');
+                 COMMIT;",
+                t = names.tickets
+            ))
+            .await
+            .expect("the first migration");
+        let migrated = events_until(&mut events, |event| {
+            !owners_added(std::slice::from_ref(event), &names.tickets).is_empty()
+        })
+        .await;
+        assert_eq!(
+            owners_added(&migrated, &names.tickets),
+            BTreeMap::from([(20, Some(Value::from("meera")))]),
+            "the migration's own row arrives with its owner, and nothing else is delivered for the change"
+        );
+        wait_until("the clients' catalog gained the column", || {
+            handle
+                .load()
+                .table(&names.tickets)
+                .is_some_and(|table| table.column("owner").is_some())
+        })
+        .await;
+
+        commands
+            .send(Command::Register {
+                sink: 0,
+                query: names.spec(),
+                token: 2,
+            })
+            .await
+            .expect("send");
+        let twin = events_until(&mut events, |event| matches!(event, Event::Hydrated(_))).await;
+        assert!(
+            twin.iter()
+                .any(|event| matches!(event, Event::Registered { token: 2, .. })),
+            "{twin:?}"
+        );
+        assert_eq!(
+            owners_added(&twin, &names.tickets),
+            BTreeMap::from([
+                (1, Some(Value::from("nobody"))),
+                (2, Some(Value::from("nobody"))),
+                (3, Some(Value::from("nobody"))),
+                (20, Some(Value::from("meera"))),
+            ]),
+            "the rows held from before the migration carry the default; the new row its own value"
+        );
+
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {e} (id int8 PRIMARY KEY, label text);
+                 INSERT INTO {e} VALUES (1, 'one');",
+                e = names.extra
+            ))
+            .await
+            .expect("the second migration");
+        wait_until("the clients' catalog gained the table", || {
+            handle.load().table(&names.extra).is_some()
+        })
+        .await;
+        commands
+            .send(Command::Register {
+                sink: 0,
+                query: MultiTableReadQuery::single(SingleTableReadQuery::new(
+                    names.extra.as_str(),
+                    Where::AND(vec![]),
+                    OrderBy::new("id", Order::ASC),
+                    u32::MAX,
+                )),
+                token: 3,
+            })
+            .await
+            .expect("send");
+        let extra = events_until(&mut events, |event| matches!(event, Event::Hydrated(_))).await;
+        let extra_ids: Vec<i64> = extra
+            .iter()
+            .flat_map(|event| match event {
+                Event::Registered { updates, .. } | Event::Landed { updates } => updates.as_slice(),
+                _ => &[],
+            })
+            .filter_map(|delta| match &delta.op {
+                DataFrameOperation::Add(key, _) if delta.table.as_str() == names.extra => {
+                    match key.pkey_value.get(&ColumnName::from("id")) {
+                        Some(Value::Int(id)) => Some(*id),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            extra_ids,
+            vec![1],
+            "the new table is read on a snapshot that has it"
+        );
+        assert!(
+            !extra
+                .iter()
+                .any(|event| matches!(event, Event::Refused { .. })),
+            "{extra:?}"
+        );
+
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE {t} DROP COLUMN points",
+                t = names.tickets
+            ))
+            .await
+            .expect("the third migration");
+        let outcome = streaming.await.expect("the feed task");
+        let error = outcome.expect_err("a dropped column stops the feed");
+        assert!(error.0.contains("cannot follow"), "{error}");
+        assert!(error.0.contains("`points`"), "{error}");
+
+        let _ = client
+            .batch_execute(
+                "DROP EVENT TRIGGER IF EXISTS xslive_ddl_start_0;
+                 DROP EVENT TRIGGER IF EXISTS xslive_ddl_end_0;
+                 DROP SCHEMA IF EXISTS xslive_0 CASCADE;",
+            )
+            .await;
         cleanup(&dsn, &client, &names).await;
     });
 }

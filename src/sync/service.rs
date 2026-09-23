@@ -24,13 +24,13 @@
 //! under the service never learns of clients or sinks: it names
 //! subscriptions, and this is where a subscription finds its way home.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::log::{Level, log_event, log_warn};
+use crate::log::{Level, log_event, log_info, log_warn};
 
 /// PostgreSQL's epoch (2000-01-01) in microseconds since the Unix epoch.
 const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
@@ -38,12 +38,13 @@ const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
 use tokio::sync::mpsc;
 use tokio::task::spawn_local;
 
+use super::catalog::CatalogHandle;
 use super::runtime::{Runtime, Step};
 use super::storage::{Storage, StorageError};
-use crate::ivm::{Audience, Delta, Engine, Fetch, FetchId, Subs};
+use crate::ivm::{Audience, Delta, Engine, Fetch, FetchId, SchemaChange, Subs};
 use crate::model::frame::SharedRow;
 use crate::model::{
-    DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
+    Catalog, DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
 };
 use crate::stats::Stats;
 
@@ -71,17 +72,21 @@ pub enum Command<Q> {
 /// One committed transaction as the feed delivers it: every write of it,
 /// the location of its commit record, the position the feed has delivered
 /// everything up to once it is applied, the writes among them on the
-/// tables the consumer watches for itself, and the instant the feed
-/// decoded it (where the server's own clock on it starts). A transaction
-/// is one step of the engine, so nothing can be interleaved inside it: a
-/// read that lands while it is being routed is seen only once the whole
-/// transaction has been, and a consumer never meets half of one.
+/// tables the consumer watches for itself, the schema changes it carried
+/// with the catalog they make (`None` when it carried none), and the
+/// instant the feed decoded it (where the server's own clock on it
+/// starts). A transaction is one step of the engine, so nothing can be
+/// interleaved inside it: a read that lands while it is being routed is
+/// seen only once the whole transaction has been, and a consumer never
+/// meets half of one.
 #[derive(Debug)]
 pub struct Transaction {
     pub writes: Vec<WriteQuery>,
     pub at: Lsn,
     pub progress: Lsn,
     pub watched: Vec<WriteQuery>,
+    pub schema: Vec<SchemaChange>,
+    pub catalog: Option<Arc<Catalog>>,
     pub received: Instant,
     pub committed_at_micros: i64,
     pub decode: Duration,
@@ -121,10 +126,20 @@ impl Transaction {
             at,
             progress: at,
             watched: Vec::new(),
+            schema: Vec::new(),
+            catalog: None,
             received: Instant::now(),
             committed_at_micros: 0,
             decode: Duration::ZERO,
         }
+    }
+
+    /// The transaction with the schema `changes` it carried and the
+    /// `catalog` they make.
+    pub fn with_schema(mut self, changes: Vec<SchemaChange>, catalog: Arc<Catalog>) -> Self {
+        self.schema = changes;
+        self.catalog = Some(catalog);
+        self
     }
 }
 
@@ -236,6 +251,13 @@ pub struct Service<E: Engine, S: Storage> {
     lag_warned: Option<Instant>,
     results: mpsc::UnboundedReceiver<(FetchId, Result<Snapshot, StorageError>)>,
     report: mpsc::UnboundedSender<(FetchId, Result<Snapshot, StorageError>)>,
+    /// The catalog the clients' side reads, when the service is to keep
+    /// it current ([`Service::with_catalog`]).
+    catalog: Option<Arc<CatalogHandle>>,
+    /// Catalogs of schema changes applied to the engine, each with the
+    /// position it took effect at, waiting for the storage floor to reach
+    /// that position before the clients' side sees them.
+    pending: VecDeque<(Lsn, Arc<Catalog>)>,
 }
 
 impl<E, S> Service<E, S>
@@ -268,8 +290,20 @@ where
             lag_warned: None,
             results,
             report,
+            catalog: None,
+            pending: VecDeque::new(),
         };
         (service, commands_tx)
+    }
+
+    /// Keep `catalog`, the one the clients' side plans and translates by,
+    /// current with the schema changes the feed delivers: each is
+    /// published there once the storage's snapshot has the change, so
+    /// that a query on a new table is never planned against a snapshot
+    /// that lacks it.
+    pub fn with_catalog(mut self, catalog: Arc<CatalogHandle>) -> Self {
+        self.catalog = Some(catalog);
+        self
     }
 
     /// Take the committed transactions from `feed` as well.
@@ -416,7 +450,8 @@ where
         }
     }
 
-    /// Apply one committed transaction as one step: every write routed,
+    /// Apply one committed transaction as one step: its schema changes
+    /// absorbed first ([`Service::migrate`]), then every write routed,
     /// the progress mark taken, the storage told, the deltas delivered
     /// together, and the consumer told where the engine now is. A position
     /// mark is the same step with nothing to route; it is not counted or
@@ -428,12 +463,17 @@ where
             at,
             progress,
             watched,
+            schema,
+            catalog,
             received,
             committed_at_micros,
             decode,
         } = transaction;
         let started = Instant::now();
         let mut step = Step::default();
+        if let Some(catalog) = catalog {
+            self.migrate(at, &schema, catalog);
+        }
         for write in &writes {
             self.storage.absorb(write, at);
             let routed = self.runtime.write(write, at);
@@ -446,6 +486,7 @@ where
         self.moved();
         let position = self.runtime.position();
         let floor = self.runtime.floor();
+        self.adopt(floor);
         let routed = Instant::now();
         if let Some(stats) = &self.stats {
             stats.feed_lsn.store(at.0, Ordering::Relaxed);
@@ -507,6 +548,48 @@ where
             },
         );
         self.reap();
+    }
+
+    /// A transaction committed at `at` carried schema `changes`, making
+    /// `catalog`: the engine's held rows and the memory tables are brought
+    /// onto the new layouts before the transaction's writes are routed (a
+    /// write of the same transaction may already be in the new shape),
+    /// the storage is told to read by `catalog` from `at` on and to mint a
+    /// snapshot now rather than at its next tick, and the catalog waits
+    /// for the storage floor to reach `at` before the clients' side sees
+    /// it ([`Service::adopt`]).
+    fn migrate(&mut self, at: Lsn, changes: &[SchemaChange], catalog: Arc<Catalog>) {
+        let started = Instant::now();
+        for change in changes {
+            self.storage.alter(change);
+            self.runtime.alter(change);
+        }
+        self.storage.follow(at, catalog.clone());
+        self.storage.mint_now();
+        self.pending.push_back((at, catalog));
+        log_info!(
+            "schema changed at {at}: {} change(s) absorbed in {:?}; the clients' side sees it with the next snapshot",
+            changes.len(),
+            started.elapsed()
+        );
+    }
+
+    /// Publish to the clients' side every waiting catalog whose position
+    /// the storage `floor` has reached: from here on every read it plans
+    /// and every query it translates meets a snapshot that has the change.
+    fn adopt(&mut self, floor: Lsn) {
+        while self.pending.front().is_some_and(|(at, _)| *at <= floor) {
+            let Some((at, catalog)) = self.pending.pop_front() else {
+                break;
+            };
+            if let Some(handle) = &self.catalog {
+                handle.swap(catalog.clone());
+            }
+            log_info!(
+                "the schema of {at} is in force at floor {floor}: {} tables",
+                catalog.tables().count()
+            );
+        }
     }
 
     /// Hand the rows the engine dropped, and the batches it landed, to

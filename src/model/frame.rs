@@ -282,6 +282,11 @@ impl TableFrame {
         self.rows.get(&id)
     }
 
+    /// Every row the frame holds, with its id, in no particular order.
+    pub fn rows(&self) -> impl Iterator<Item = (RowId, &SharedRow)> {
+        self.rows.iter().map(|(id, row)| (*id, row))
+    }
+
     /// The shared row under `id`, mutably, for its subscriber tags; an
     /// image changes through [`TableFrame::replace_image`], which keeps
     /// the value indexes in step.

@@ -28,7 +28,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-use crate::ivm::{Delta, Engine, Fetch, FetchId, evaluate, order_rows};
+use crate::ivm::{Delta, Engine, Fetch, FetchId, SchemaChange, evaluate, order_rows};
 use crate::model::frame::SharedRow;
 use crate::model::{
     DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
@@ -222,6 +222,13 @@ impl<E: Engine> Runtime<E> {
         self.wake(&mut step);
         self.trim();
         step
+    }
+
+    /// A migration grew the schema ([`Engine::alter`]): the engine's held
+    /// rows are brought onto the new layout before the writes that follow
+    /// it are routed. Nothing is delivered for it.
+    pub fn alter(&mut self, change: &SchemaChange) {
+        self.engine.alter(change);
     }
 
     /// The feed has delivered everything up to `lsn` without a write to
