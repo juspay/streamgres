@@ -118,11 +118,13 @@ pub struct Config {
     /// `XYNE_SYNC_ROWS_PER_PART`: how many row operations one poke part
     /// carries at most (500).
     pub rows_per_part: usize,
-    /// `XYNE_SYNC_JOIN_LIMIT`: the most rows a join may read whole into
-    /// memory on either side (100000). A side over it is driven from the
-    /// other side when that one fits, and the query is refused when
-    /// neither does; `0` turns the check off.
-    pub join_limit: u64,
+    /// `XYNE_SYNC_ROW_LIMIT`: the most rows the server reads into memory
+    /// at once (100000), one number for the planner and the storage: the
+    /// planner reads whole no side of a join past it, driving that side
+    /// from the other when the other fits and refusing the query when
+    /// neither does, and a storage read returning more is refused.
+    /// `XYNE_SYNC_JOIN_LIMIT`, the planner's older name, is still read.
+    pub row_limit: u64,
     /// `XYNE_SYNC_JOIN_PREFERRED_SIDE`: which side of an INNER join drives
     /// it when both fit, `parent` (the default: the parent is the query's
     /// own key-filtered rows and the child is usually an access rule over
@@ -216,10 +218,14 @@ impl Config {
         };
         let forward_cookies = first(&["XYNE_SYNC_FORWARD_COOKIES", "ZERO_QUERY_FORWARD_COOKIES"])
             .is_none_or(|value| value != "false" && value != "0");
-        let join_limit = match first(&["XYNE_SYNC_JOIN_LIMIT"]) {
-            Some(text) => text.parse::<u64>().map_err(|_| {
-                format!("XYNE_SYNC_JOIN_LIMIT must be a number of rows, got `{text}`")
-            })?,
+        let row_limit = match first(&["XYNE_SYNC_ROW_LIMIT", "XYNE_SYNC_JOIN_LIMIT"]) {
+            Some(text) => text
+                .parse::<u64>()
+                .ok()
+                .filter(|limit| *limit > 0)
+                .ok_or_else(|| {
+                    format!("XYNE_SYNC_ROW_LIMIT must be a positive number of rows, got `{text}`")
+                })?,
             None => 100_000,
         };
         let join_preferred_side = match first(&["XYNE_SYNC_JOIN_PREFERRED_SIDE"]).as_deref() {
@@ -333,7 +339,7 @@ impl Config {
                 })?,
                 None => 500,
             },
-            join_limit,
+            row_limit,
             join_preferred_side,
             plan_ttl: millis("XYNE_SYNC_PLAN_TTL_MS", 600_000)?,
             plan_cache: match first(&["XYNE_SYNC_PLAN_CACHE"]) {
@@ -361,7 +367,7 @@ impl Config {
     /// The join planner's settings.
     pub fn policy(&self) -> Policy {
         Policy {
-            limit: self.join_limit,
+            limit: self.row_limit,
             preferred: self.join_preferred_side,
         }
     }
