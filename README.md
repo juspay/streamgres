@@ -55,7 +55,7 @@ every later delta continues from.
 | `ORDER BY` / `LIMIT` windows: compound order, the page of `L` to the client over a buffer of `2L`, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
 | In-place condition edits: a literal `IN` swapped inside its disjuncts, or a set-valued `IN` (`Value::Set`) gaining/losing one member in O(1) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
 | Join tree: one vector of edges, each with its **driver** (`Main` or `Sub`) and `is_inner`, so LEFT, RIGHT and the two inner forms (driven from the sub, driven from the main) at any depth; existence tests placed anywhere in a node's filter (`EXISTS` inside `OR`, bound to the set when the sub drives, a per-row gate on the match count when the main does); set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns; a value index on every join column so a crossing costs the matches, not the part; a driven child's `ORDER BY` / `LIMIT` is a window **per parent row** (`related` with a limit) | ✅ done | `src/ivm/multi.rs` |
-| Join planning: every node that would be read whole is counted, in one concurrent batch capped at the limit; the inner edges are settled from the root down (the side that fits; the smaller side when both do; a node already driven from above drives the edges below it; a main with a page is restricted by a sub that fits and drives any other, the engine keeping the page to the rows the sub admits), the root never moves, and a query with a side nothing can bound is refused with the reason; decisions are cached by tree (`XYNE_SYNC_JOIN_LIMIT`, `XYNE_SYNC_JOIN_PREFERRED_SIDE`, `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE`), and run on the connection's own task | ✅ done | `src/client/plan.rs` |
+| Join planning: every node that would be read whole is counted, in one concurrent batch capped at the limit; the inner edges are settled from the root down (the side that fits; the smaller side when both do; a node already driven from above drives the edges below it; a page is counted too and the smaller side drives it strictly, a page over the limit being restricted by a sub that fits and driving any other, the engine keeping the page to the rows the sub admits; two `EXISTS` beside each other on one to-one relationship are one), the root never moves, and a query with a side nothing can bound is refused with the reason; decisions are cached by tree (`XYNE_SYNC_ROW_LIMIT`, `XYNE_SYNC_JOIN_PREFERRED_SIDE`, `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE`), and run on the connection's own task | ✅ done | `src/client/plan.rs` |
 | Client-free output: the engine knows subscriptions, never clients. One step's operations are folded per row (`Delta { table, op, audiences }`), each audience one part of one tree with **all its subscribers as the tree's shared list** (`Subs::Many(Arc<[SubId]>)`), so an operation costs the engine the same for one subscriber and for ten thousand; the service routes each delta to the group threads owning its subscriptions, and the group thread's row ledger decides what each client is sent (a row once per client group, whatever brought it); images and keys are shared handles (`Arc`), so nothing on the path copies a row | ✅ done | `src/ivm/update.rs`, `src/model/frame.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
 | Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; the runtime holds the one position and brings every read up to it before landing; no read ever blocks the stream; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
@@ -460,9 +460,11 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   which side of each inner edge drives it, on the connection's own task. A
   node nothing drives is read whole; the planner counts every such node in
   one concurrent batch on the reads pool, no further than
-  `XYNE_SYNC_JOIN_LIMIT` + 1 (100 000 by default, so a big table is never
-  scanned whole), a node with a page being bounded by its window and a
-  driven node by its driver. The inner edges are then settled from the root
+  `XYNE_SYNC_ROW_LIMIT` + 1 (100 000 by default, the same number a storage
+  read may return, so a big table is never scanned whole and a side the
+  planner calls small is one a read returns), a node with a page counted on
+  its filter without the page and bounded by its window when its count is
+  over, a driven node by its driver. The inner edges are then settled from the root
   down: an edge with one bounded side is driven from it; one whose sides
   both fit by their own counts is driven from the smaller, with
   `XYNE_SYNC_JOIN_PREFERRED_SIDE` (`parent` by default) winning unless the
@@ -542,7 +544,7 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   A read is one simple-query batch (`BEGIN … READ ONLY; SET TRANSACTION
   SNAPSHOT; SELECT; COMMIT`), so its rows are back after one round trip, and
   a read narrowed to one join value renders that value instead of the whole
-  set it belongs to. A read may return at most `XYNE_SYNC_READ_ROW_LIMIT`
+  set it belongs to. A read may return at most `XYNE_SYNC_ROW_LIMIT`
   (100 000) rows; past that it is refused, the subscriptions depending on it
   are unregistered and their clients get a `transformError` naming the
   table, because a query without a `LIMIT` over a large table would
@@ -619,7 +621,7 @@ XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5499/xyne_bench cargo run --rel
 cp .env.example .env              # set XYNE_SYNC_PG_DSN and the two endpoint URLs
 cargo run --release --bin server
 node scripts/e2e-protocol.mjs   # two dev users, real mutations, fan-out, reconnects; PASS when the chain holds
-node scripts/smoke.mjs --prepare && node scripts/smoke.mjs   # no application needed: a PostgreSQL, the server (XYNE_SYNC_READ_ROW_LIMIT=600),
+node scripts/smoke.mjs --prepare && node scripts/smoke.mjs   # no application needed: a PostgreSQL, the server (XYNE_SYNC_ROW_LIMIT=600),
                                      # a scripted Zero client; sync, a JSON filter, a client back after writes, late and lagging tabs,
                                      # schema refusal, heavy reads, and with SMOKE_COLLECTOR the OTLP push. CI runs it on the image
 node scripts/load-smoke.mjs --connections 300 --writes 100 --duration 20 --away 100   # the same setup under load: delivery latency, the

@@ -80,7 +80,7 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_engine_step_seconds{step=register,land,unregister}` | the engine's own compute per step |
 | `xyne_sync_read_seconds` | a storage read from issue to its rows back on the engine thread (queue + PostgreSQL + decode) |
 | `xyne_sync_read_rows` | rows per storage read (histogram over counts) |
-| `xyne_sync_read_row_limit` | the row limit of one storage read, as configured (`XYNE_SYNC_READ_ROW_LIMIT`) |
+| `xyne_sync_read_row_limit` | the most rows one storage read may return, and the planner reads whole, as configured (`XYNE_SYNC_ROW_LIMIT`) |
 | `xyne_sync_read_rows_max` | the largest storage read of the last minute or two (a window closed every minute, the one before kept), so the ratio to the limit is one division |
 | `xyne_sync_reads_near_limit_total{over=50,80}` | storage reads that returned at least half, and at least four fifths, of the row limit; exact, where the histogram's bounds are coarse |
 | `xyne_sync_query_read_rows_max{name,table}`, `xyne_sync_query_heavy_reads_total{name}` | per query name, for queries whose subscriptions waited on a read of at least half the limit: the largest such read with its table, and how many; at most 256 names, also `/stats.heavy_queries` |
