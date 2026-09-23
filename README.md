@@ -348,6 +348,30 @@ floor.
   feeds a `Service`'s command channel, and tells it the feed's position on
   an interval so the engine, and the snapshots waiting on it, keep moving
   while the tables are quiet.
+- **Schema changes** reach the feed as the logical messages of the reference server's
+  DDL event trigger (`ddl.rs`; `<app>_ddl_end_<shard>`, prefix
+  `<app>/<shard>/ddl`), written in the migration's own transaction with the
+  published schema before and after it, so they arrive at the change's
+  commit on any topology; the server refuses to start without the trigger.
+  The decoder grows its catalog the moment the message is absorbed (a row
+  of the same transaction after it is decoded in the new shape) and the
+  transaction carries the changes and the catalog they make. The service
+  applies them before the transaction's writes: a column added is written
+  into every held row of the table in memory with the value the migration
+  gave existing rows (`NULL` or the constant default), no delta is sent,
+  and a row entering later without it (an older snapshot's, a pre-change
+  write) is completed on entry by one pointer comparison; a table added
+  needs nothing held. Then the pool is told to read by the new catalog from
+  that position on and to mint a snapshot at once; the catalog rides with
+  the alias under one lock, so a read never pairs a snapshot with a catalog
+  from the other side of a migration, and the clients' side (`CatalogHandle`,
+  an `ArcSwap`) sees the new shape only once the current snapshot has it.
+  Any other change to a served table (a column dropped or renamed, a type
+  or key changed, a table dropped, a column added with an expression
+  default) stops the feed with one line naming it, and the server with it;
+  restarted, it loads the schema as it is. At every start the slot is moved
+  up to the first read snapshot's point, so nothing the snapshot holds is
+  streamed and a migration stopped on is not met again.
 - Requirements: `wal_level = logical`; `max_replication_slots` and
   `max_wal_senders` headroom for the feed's slot plus the live aliases (up to
   three per storage instance at a rotation boundary); a role that may create
@@ -356,9 +380,11 @@ floor.
   the current alias meanwhile.
 - Live scenarios (`tests/pg_live.rs`) hold a snapshot open while writes commit
   behind it, one of them from a transaction already open when the snapshot
-  was taken, and run the async service end to end with one table mirrored in
-  memory; they need `XYNE_SYNC_PG_DSN` pointing at such a database and
-  otherwise report themselves skipped.
+  was taken, run the async service end to end with one table mirrored in
+  memory, and follow schema changes through the reference server's own trigger stack
+  (installed by the test; `ADD COLUMN … DEFAULT`, `CREATE TABLE`, and a
+  `DROP COLUMN` that stops the feed); they need `XYNE_SYNC_PG_DSN` pointing
+  at such a database and otherwise report themselves skipped.
 
 ### 6. The client side (`src/client/`)
 
@@ -729,9 +755,12 @@ silently narrowed:
   deliberate step: shard by table.
 - **DNF has no size cap** yet (exponential for adversarial filters; a cap with
   tree-evaluation fallback is deferred until a workload needs it).
-- **Schema changes are not followed**: the feed skips tables the catalog does
-  not declare and maps columns by name; a changed table needs a restart with
-  the new catalog.
+- **Schema changes are followed only two ways**: a table created (with a
+  key) and a column added with no default or a constant one, heard through
+  the reference server's DDL trigger (section 5). Every other change to a served
+  table stops the server, which restarts on the new schema; a column added
+  with an expression default (`now()`, `gen_random_uuid()`) counts as such,
+  since the values it gave existing rows are in the database only.
 
 ---
 

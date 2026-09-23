@@ -99,6 +99,8 @@ listed with their defaults so the manifest can carry them explicitly.
 | `XYNE_SYNC_SCHEMAS` | `public,<app>_<shard>` | schemas whose tables are served |
 | `XYNE_SYNC_SHARD` | `0` | |
 | `XYNE_SYNC_SLOT` | `xyne_sync` | the permanent replication slot; the publication is `<slot>_pub` |
+| `XYNE_SYNC_DDL_TRIGGER` | `<app>_ddl_end_<shard>` (`xyne_ddl_end_0` for app `xyne`) | the reference server's event trigger on `ddl_command_end`, through which schema changes are heard (section 4); the server refuses to start without it |
+| `XYNE_SYNC_DDL_PREFIX` | `<app>/<shard>/ddl` (`xyne/0/ddl` for app `xyne`) | the prefix of that trigger's logical messages |
 | `XYNE_SYNC_FORWARD_COOKIES` | `true` | the connection's cookies go to the backend's endpoints |
 | `XYNE_SYNC_READ_TIMEOUT_MS` | `10000` | how long one storage read may take before PostgreSQL is told to cancel it and the query that needed it is refused by name (`reason="read_timeout"`); `0` sets no limit |
 | `XYNE_SYNC_PG_KEEPALIVE_IDLE_MS`, `XYNE_SYNC_PG_KEEPALIVE_INTERVAL_MS`, `XYNE_SYNC_PG_KEEPALIVE_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on every connection to the database: after the idle time without a byte either way the kernel probes the peer, again at the interval while unanswered, and gives the connection up after that many unanswered in a row. Keep the idle time under whatever a NAT or load balancer between drops silent flows at (section 4); `0` turns the probing off |
@@ -175,6 +177,34 @@ listed with their defaults so the manifest can carry them explicitly.
   without `hot_standby_feedback`.
 - Tables without a primary key are left out, as are columns of types the
   wire cannot carry (`bytea`); the startup log lists both.
+- **Schema changes are heard through the reference server's DDL event trigger**, the
+  one the reference server installs on the upstream database for its app and shard
+  (`<app>_ddl_end_<shard>`, `xyne_ddl_end_0` for app `xyne`, shard 0; `XYNE_SYNC_DDL_TRIGGER`
+  and `XYNE_SYNC_DDL_PREFIX` name it and its messages' prefix). It writes
+  the published schema before and after every migration into the WAL, in
+  the migration's own transaction, so the server learns of the change at
+  its commit and on any topology (the message replays on a standby like
+  any WAL). **The server refuses to start without the trigger** (the log
+  says so). On a database the reference server has never run against, install the
+  stack it would have installed: `cargo run --example ddl_triggers --
+  <app> <shard> <publication>... | psql "$DSN"` on the primary.
+  - **A table created** (with a primary key) and **a column added with no
+    default or a constant one** (`DEFAULT 'x'`, `DEFAULT 0`, `DEFAULT true`,
+    `DEFAULT '{}'::jsonb`) are followed while the server runs: the rows the
+    engine holds get the column in memory, the read snapshot that has the
+    change is minted at once, and the new shape is served from that
+    snapshot on. No client is sent anything for the change; a client whose
+    schema names the new column is admitted once the catalog has it.
+  - **Anything else** on a served table (a column dropped or renamed, a
+    type changed, a key changed, a table dropped or renamed, a column added
+    with an expression default such as `now()` or `gen_random_uuid()`)
+    stops the server with one error line naming the change; restarted, it
+    loads the schema as it is then and every client starts over. Plan such
+    migrations as a restart.
+  - At every start the slot is moved up to the first read snapshot's point
+    (`pg_replication_slot_advance`, on a standby too), so nothing the
+    snapshot already holds is streamed and a migration the server stopped
+    on is not met again.
 - **Connections to PostgreSQL are not encrypted.** If the database
   enforces TLS, reach it through a local proxy (the Cloud SQL proxy, a
   sidecar) until TLS is added here.
@@ -259,5 +289,7 @@ server and the sandbox's proxy forward `/sync` to. So:
 - A client whose schema names a table or column the database does not have
   yet is refused with `SchemaVersionNotSupported` and reloads, as with
   the reference server: migrate the database before shipping the frontend that needs
-  it.
+  it. A table created or a column added with a constant default is picked
+  up while the server runs; every other migration of a served table
+  restarts it (section 4).
 - One replica, state in memory, no TLS to PostgreSQL (sections 2 and 4).
