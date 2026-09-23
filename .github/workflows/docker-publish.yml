@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - feat/build
+      - feat/schema_upgrade
     tags:
       - "v*"
   workflow_dispatch:
