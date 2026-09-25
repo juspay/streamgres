@@ -117,11 +117,15 @@ pub struct FetchId(pub u64);
 ///   driving edge started referencing.
 /// - `Refill`: a window drained to its limit, read again from its
 ///   frontier.
+/// - `Lookup`: a page asked for the rows of one join value it dropped
+///   earlier, because a write on the driven side concerns them; the rows
+///   land like a write's and the frontier is left where it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchKind {
     Snapshot,
     Narrowed,
     Refill,
+    Lookup,
 }
 
 /// One storage read an engine wants run on its behalf.

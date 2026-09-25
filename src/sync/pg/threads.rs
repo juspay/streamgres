@@ -253,7 +253,8 @@ pub async fn start(
         .map(|_| mpsc::unbounded_channel())
         .unzip();
     let first = sinks[0].clone();
-    let (service, commands) = Service::new(MultiTableIVM::new(), storage, first);
+    let engine = MultiTableIVM::new().with_row_limit(super::read_row_limit());
+    let (service, commands) = Service::new(engine, storage, first);
     let service = spawn_local(
         service
             .with_feed(feed)

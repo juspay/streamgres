@@ -129,7 +129,11 @@ pub use multi::{MultiTableIVM, MultiTableUpdate};
 pub use predicate::{eval_condition, evaluate, evaluate_with};
 pub use stats::IvmStats;
 pub use update::{Audience, Delta, QueryPart, Subs, Target};
-pub use window::{order_cmp, order_rows};
+pub use window::{PAGE_FIRST_BATCH, PAGE_ROUNDS, PageSpec, order_cmp, order_rows};
+
+/// The most rows one batch of a page reads when no other limit is set:
+/// the same number the server's `XYNE_SYNC_ROW_LIMIT` defaults to.
+pub const DEFAULT_ROW_LIMIT: usize = 100_000;
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -203,6 +207,8 @@ pub struct SingleTableUpdate {
 ///   row that enters without them is completed ([`Engine::alter`]).
 ///   Empty until a column is added, which is what keeps the check off the
 ///   write path until then.
+/// - `row_limit`: the most rows one read of a page's batch asks for (the
+///   storage refuses reads past it, so no batch is sized past it).
 /// - `stats`: operation counters; not part of the sync state.
 pub struct SingleTableIVM {
     select_queries: IdMap<SubId, SingleTableReadQuery>,
@@ -219,6 +225,7 @@ pub struct SingleTableIVM {
     next_sub: u64,
     next_fetch: u64,
     graveyard: Vec<SharedRow>,
+    row_limit: usize,
     stats: IvmStats,
 }
 
@@ -267,8 +274,22 @@ impl SingleTableIVM {
             next_sub: 0,
             next_fetch: 0,
             graveyard: Vec::new(),
+            row_limit: DEFAULT_ROW_LIMIT,
             stats: IvmStats::default(),
         }
+    }
+
+    /// The engine with `limit` as the most rows one batch of a page
+    /// reads: the storage's row limit, so that no read is sized past what
+    /// it would refuse.
+    pub fn with_row_limit(mut self, limit: usize) -> Self {
+        self.row_limit = limit.max(1);
+        self
+    }
+
+    /// The most rows one batch of a page reads.
+    pub fn row_limit(&self) -> usize {
+        self.row_limit
     }
 
     /// Take the storage reads recorded since the last call, oldest first.

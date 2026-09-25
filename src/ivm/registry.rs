@@ -5,7 +5,7 @@
 //! uses for its set-valued `IN` leaves.
 
 use super::index::TableIndex;
-use super::window::Window;
+use super::window::{PageSpec, Window};
 use super::{FetchKind, SingleTableIVM, SingleTableUpdate, window};
 use crate::model::frame::RowId;
 use crate::model::{Condition, DataFrameOperation, SingleTableReadQuery, SubId, TableName, Value};
@@ -33,6 +33,54 @@ impl SingleTableIVM {
         &mut self,
         select_query: SingleTableReadQuery,
     ) -> (SubId, Vec<DataFrameOperation>) {
+        self.register_with(select_query, None)
+    }
+
+    /// Register a page under a gate (see the `window` module): as
+    /// [`SingleTableIVM::register_query`], its window a page read as
+    /// `spec` says and its first read sized by the spec. A page read in
+    /// batches drops the rows its gate rejects, so it takes no twin's rows
+    /// (a twin may have dropped rows this page has to decide for itself)
+    /// and reads for itself; a page read whole shares like any query.
+    pub fn register_page(
+        &mut self,
+        select_query: SingleTableReadQuery,
+        spec: PageSpec,
+    ) -> (SubId, Vec<DataFrameOperation>) {
+        self.register_with(select_query, Some(spec))
+    }
+
+    /// Register a subscription that reads nothing at registration: its
+    /// filter routes from this moment on, and its rows come from the
+    /// narrowed reads asked for later ([`SingleTableIVM::fetch`]) and
+    /// the writes that route to it. The join layer registers the driven
+    /// part of an edge whose driver is a page read in batches this way:
+    /// the part's filter carries no `IN` restriction, so reading it whole
+    /// would read the table. Never a twin donor (it holds only what its
+    /// driver referenced), and never served from one.
+    pub fn register_driven(&mut self, select_query: SingleTableReadQuery) -> SubId {
+        let sub = SubId(self.next_sub);
+        self.next_sub += 1;
+        self.stats.queries_registered += 1;
+        let dnf = select_query.filter.to_dnf();
+        if !dnf.is_empty() {
+            self.tables
+                .entry(select_query.table.clone())
+                .or_default()
+                .register(sub, dnf, &mut self.stats);
+        }
+        self.select_queries.insert(sub, select_query);
+        sub
+    }
+
+    /// [`SingleTableIVM::register_query`] and
+    /// [`SingleTableIVM::register_page`] in one: `page` says whether the
+    /// window is a page and how it is read.
+    fn register_with(
+        &mut self,
+        select_query: SingleTableReadQuery,
+        page: Option<PageSpec>,
+    ) -> (SubId, Vec<DataFrameOperation>) {
         let sub = SubId(self.next_sub);
         self.next_sub += 1;
         self.stats.queries_registered += 1;
@@ -44,12 +92,21 @@ impl SingleTableIVM {
                 .or_default()
                 .register(sub, dnf, &mut self.stats);
         }
-        let twin = self.identical_subscription(&select_query, sub);
-        let storage_query = Self::storage_query(&select_query);
-        self.by_query
-            .entry(select_query.clone())
-            .or_default()
-            .insert(sub);
+        let shares = page.is_none_or(|spec| spec.whole);
+        let twin = shares
+            .then(|| self.identical_subscription(&select_query, sub))
+            .flatten();
+        if shares {
+            self.by_query
+                .entry(select_query.clone())
+                .or_default()
+                .insert(sub);
+        }
+        if let Some(spec) = page
+            && let Some(window) = Window::for_page(&select_query, spec, self.row_limit)
+        {
+            self.windows.insert(sub, window);
+        }
         self.select_queries.insert(sub, select_query);
 
         let mut ops = Vec::new();
@@ -71,6 +128,7 @@ impl SingleTableIVM {
             }
             None => {
                 self.rebuild_window(sub);
+                let storage_query = self.storage_query(sub);
                 self.issue(sub, storage_query, FetchKind::Snapshot);
             }
         }
@@ -165,12 +223,14 @@ impl SingleTableIVM {
         self.stats.snapshots_shared += count;
     }
 
-    /// The storage-facing form of a subscription's query: identical except
-    /// that a windowed (finite-limit) query is issued with its limit
-    /// doubled, to fill the window's buffer.
-    fn storage_query(query: &SingleTableReadQuery) -> SingleTableReadQuery {
+    /// The storage-facing form of a registered subscription's query:
+    /// identical except for its limit, which is what its window's first
+    /// read takes (twice the limit for an ordinary window, a page's first
+    /// batch, everything for a page read whole).
+    fn storage_query(&self, sub: SubId) -> SingleTableReadQuery {
+        let query = &self.select_queries[&sub];
         SingleTableReadQuery {
-            limit: window::storage_limit(query),
+            limit: window::storage_limit(query, self.windows.get(&sub)),
             ..query.clone()
         }
     }

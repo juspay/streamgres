@@ -55,6 +55,12 @@ fn open() -> Where {
     Where::condition("open", ComparisonOperator::EQ, Value::Int(1))
 }
 
+/// `spec` with its root page read whole.
+fn whole(mut spec: MultiTableReadQuery) -> MultiTableReadQuery {
+    spec.page = PageRead::Whole;
+    spec
+}
+
 /// The subscriptions under test, by name.
 fn specs() -> Vec<(&'static str, MultiTableReadQuery)> {
     let users = || MultiTableReadQuery::single(all("users"));
@@ -120,6 +126,24 @@ fn specs() -> Vec<(&'static str, MultiTableReadQuery)> {
             ),
         ),
         (
+            "a page under a gate, read whole",
+            whole(MultiTableReadQuery::new(
+                node("tickets", open(), &[], 3),
+                vec![Join::inner_from_main(users(), "assignee", "id")],
+            )),
+        ),
+        (
+            "a page under a chain, read whole",
+            whole(MultiTableReadQuery::new(
+                node("tickets", open(), &[("project", Order::DESC)], 3),
+                vec![Join::inner_from_main(
+                    users_with_profiles(from_main),
+                    "assignee",
+                    "id",
+                )],
+            )),
+        ),
+        (
             "a page under a gate inside OR",
             MultiTableReadQuery::new(
                 node(
@@ -160,6 +184,25 @@ fn specs() -> Vec<(&'static str, MultiTableReadQuery)> {
             "a page per parent under a gate",
             MultiTableReadQuery::new(
                 node("teams", Where::AND(Vec::new()), &[], u32::MAX),
+                vec![Join::left(
+                    MultiTableReadQuery::new(
+                        node("tickets", open(), &[("project", Order::DESC)], 2),
+                        vec![Join::inner_from_main(users(), "assignee", "id")],
+                    ),
+                    "id",
+                    "team",
+                )],
+            ),
+        ),
+        (
+            "a page per parent under a gate below a paged root",
+            MultiTableReadQuery::new(
+                node(
+                    "teams",
+                    Where::AND(Vec::new()),
+                    &[("active", Order::DESC)],
+                    2,
+                ),
                 vec![Join::left(
                     MultiTableReadQuery::new(
                         node("tickets", open(), &[("project", Order::DESC)], 2),
@@ -382,7 +425,9 @@ fn random_write(
 
 /// Run `steps` random writes from `seed`, some before the subscriptions
 /// register and the rest after, checking every subscription against the
-/// reference after each.
+/// reference after each. `GATED_TRACE=<step>` prints, for the seed
+/// `GATED_SEED` names (1 by default), every write from that step on with
+/// what it produced and the trees' state.
 fn run(seed: u64, steps: usize) {
     let _ = (
         table("tickets", &["open", "assignee", "project", "team"]),
@@ -411,7 +456,8 @@ fn run(seed: u64, steps: usize) {
             assert_eq!(
                 shown,
                 expected(spec, &storage),
-                "`{name}`, seed {seed}, after {step} writes"
+                "`{name}`, seed {seed}, after {step} writes: {:#?}",
+                ivm.engine().describe(*sub)
             );
             assert!(
                 ivm.engine().hydrated(*sub),
@@ -420,7 +466,33 @@ fn run(seed: u64, steps: usize) {
         }
         let write = random_write(&mut random, &mut present);
         storage.apply(&write);
-        ivm.incremental_update(&write);
+        let traced_seed: u64 = std::env::var("GATED_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let trace = std::env::var("GATED_TRACE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|from| seed == traced_seed && step >= from);
+        if trace {
+            eprintln!("--- write {step}: {write:?}");
+        }
+        let out = ivm.incremental_update(&write);
+        if trace {
+            for delta in &out {
+                eprintln!("    {delta:?}");
+            }
+            let stats = ivm.engine().stats();
+            eprintln!(
+                "    stats: reads {} lookups {} rounds {} rejected {}",
+                stats.storage_reads, stats.page_lookups, stats.page_rounds, stats.window_rejections
+            );
+            for (name, _, sub) in &registered {
+                for line in ivm.engine().describe(*sub) {
+                    eprintln!("    `{name}` {line}");
+                }
+            }
+        }
         let problems = ivm.engine().audit();
         assert!(
             problems.is_empty(),
@@ -478,18 +550,43 @@ fn run_late(seed: u64, steps: usize) {
         asked(step.selects, &storage, lsn, &mut out);
         registered.push((name, spec, sub));
     }
+    let trace_from: Option<usize> = std::env::var("GATED_TRACE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|_| std::env::var("GATED_SEED").is_ok());
     for step in 0..steps {
+        let trace = trace_from.is_some_and(|from| step >= from);
         let land = !out.is_empty() && (random.below(3) != 0 || step + 1 == steps);
         if land {
             let (fetch, snapshot) = out.remove(random.below(out.len() as u64) as usize);
+            if trace {
+                eprintln!(
+                    "--- step {step}: land {:?} {:?} for {:?}: {} rows {:?}",
+                    fetch.id,
+                    fetch.kind,
+                    fetch.sub,
+                    snapshot.rows.len(),
+                    fetch.query.filter
+                );
+            }
             let landed = runtime.fetched(fetch.id, snapshot);
             asked(landed.selects, &storage, lsn, &mut out);
         } else {
             let write = random_write(&mut random, &mut present);
             storage.apply(&write);
             lsn += 1;
+            if trace {
+                eprintln!("--- step {step}: write {write:?}");
+            }
             let routed = runtime.write(&write, Lsn(lsn));
             asked(routed.selects, &storage, lsn, &mut out);
+        }
+        if trace {
+            for (name, _, sub) in &registered {
+                for line in runtime.engine().describe(*sub) {
+                    eprintln!("    `{name}` {line}");
+                }
+            }
         }
         let problems = runtime.engine().audit();
         assert!(
@@ -513,8 +610,25 @@ fn run_late(seed: u64, steps: usize) {
     let mut rounds = 0;
     while !out.is_empty() {
         let (fetch, snapshot) = out.remove(0);
+        if trace_from.is_some() {
+            eprintln!(
+                "--- drain {rounds}: land {:?} {:?} for {:?}: {} rows {:?}",
+                fetch.id,
+                fetch.kind,
+                fetch.sub,
+                snapshot.rows.len(),
+                fetch.query.filter
+            );
+        }
         let landed = runtime.fetched(fetch.id, snapshot);
         asked(landed.selects, &storage, lsn, &mut out);
+        if trace_from.is_some() {
+            for (name, _, sub) in &registered {
+                for line in runtime.engine().describe(*sub) {
+                    eprintln!("    `{name}` {line}");
+                }
+            }
+        }
         rounds += 1;
         assert!(rounds < 10_000, "seed {seed}: the reads never settle");
     }

@@ -211,8 +211,17 @@ fn write(ivm: &mut Ivm, storage: &MemoryStorage, w: WriteQuery) -> Vec<Delta> {
 
 /// A fresh engine, a shared storage handle, and an empty name directory.
 fn engine() -> (Ivm, Rc<MemoryStorage>, Names) {
+    engine_with_row_limit(xyne_sync::ivm::DEFAULT_ROW_LIMIT)
+}
+
+/// [`engine`] with `row_limit` as the most rows one batch of a page
+/// reads.
+fn engine_with_row_limit(row_limit: usize) -> (Ivm, Rc<MemoryStorage>, Names) {
     let storage = Rc::new(MemoryStorage::new());
-    let ivm = Local::new(MultiTableIVM::new(), storage.clone());
+    let ivm = Local::new(
+        MultiTableIVM::new().with_row_limit(row_limit),
+        storage.clone(),
+    );
     (ivm, storage, Names::default())
 }
 
@@ -2188,45 +2197,294 @@ fn a_page_per_parent_under_a_gate_reaches_past_rejected_rows() {
     assert!(ivm.engine().hydrated(names.id("q")));
 }
 
-/// A page whose gate turns nearly every row away reaches past them in
-/// refills that grow, asks for the rows' subs in one read per round, and
-/// stops after 64 rejected rows (eight per row of the page, at least 64):
-/// the page is served short and its subscription is handed out to be
-/// reported.
-#[test]
-fn a_page_whose_gate_rejects_hundreds_of_rows_is_capped_and_reported() {
-    let (mut ivm, storage, names) = engine();
+/// Seven hundred OPEN tickets whose assignee does not exist, then one
+/// whose assignee does: what a page of two tickets with a user has to
+/// reach past.
+fn seed_seven_hundred_rejected(storage: &MemoryStorage) {
     for id in 1..=700 {
         storage.apply(&ticket(id, "OPEN", 10_000 + id));
     }
     storage.apply(&ticket(701, "OPEN", 7));
     storage.apply(&user(7, "g"));
+}
+
+/// A page whose gate turns nearly every row away reaches past them in
+/// batches that double — the first hundred rows, then two hundred, then
+/// four hundred — asking for each batch's subs in one read, and drops the
+/// rows it rejects; it stops when storage runs dry, short but not capped.
+#[test]
+fn a_page_reaches_past_hundreds_of_rejected_rows_in_doubling_batches() {
+    let (mut ivm, storage, names) = engine();
+    seed_seven_hundred_rejected(&storage);
     let snapshot = names.register(&mut ivm, "q", first_two_tickets_with_a_user());
-    assert!(
-        names.tags(&snapshot).is_empty(),
-        "ticket 701 lies behind 700 rejected rows: the page stops before it"
+    assert_eq!(
+        names.tags(&snapshot),
+        ["q/join0/add:Int(7)", "q/main/add:Int(701)"],
+        "ticket 701 lies behind 700 rejected rows: the page reaches it"
     );
     assert!(ivm.engine().hydrated(names.id("q")));
-    let capped = ivm.engine_mut().take_capped();
-    assert_eq!(capped, [names.id("q")], "reported once");
-    assert!(ivm.engine_mut().take_capped().is_empty());
+    assert!(
+        ivm.engine_mut().take_capped().is_empty(),
+        "the page is short because storage ran dry, not because it gave up"
+    );
     let stats = ivm.engine().stats();
+    assert_eq!(
+        stats.window_rejections, 700,
+        "every rejected row was dropped, none read twice: the order ends in the key, so each refill starts strictly past the frontier"
+    );
+    assert_eq!(stats.window_capped, 0);
+    assert_eq!(
+        stats.page_rounds, 3,
+        "batches of 200, 400 and 800 after the first hundred"
+    );
+    assert_eq!(stats.window_refills, 3);
+    assert_eq!(
+        stats.storage_reads, 8,
+        "the first batch, three more, and one read of the users per batch"
+    );
+    assert_eq!(
+        frame_len(&ivm, &names, "q", QueryPart::main()),
+        1,
+        "the rejected rows are gone, not held"
+    );
+}
+
+/// Read whole, the same page holds every ticket from its one read, takes
+/// its batches from memory (no further storage read of the tickets),
+/// keeps the rows it rejects apart, and, when the user of one of them
+/// appears, decides that row again without a lookup.
+#[test]
+fn a_page_read_whole_reaches_from_memory_and_keeps_its_rejected_rows() {
+    let (mut ivm, storage, names) = engine();
+    seed_seven_hundred_rejected(&storage);
+    let mut whole = first_two_tickets_with_a_user();
+    whole.page = PageRead::Whole;
+    let snapshot = names.register(&mut ivm, "q", whole);
+    assert_eq!(
+        names.tags(&snapshot),
+        ["q/join0/add:Int(7)", "q/main/add:Int(701)"]
+    );
+    let stats = ivm.engine().stats().clone();
+    assert_eq!(
+        stats.window_refills, 0,
+        "no storage read of the tickets past the first"
+    );
+    assert_eq!(
+        stats.page_rounds, 4,
+        "batches of 100, 200, 400 and the last row, from memory"
+    );
+    assert_eq!(
+        stats.storage_reads, 5,
+        "one read of the tickets, one of the users per batch"
+    );
+    assert_eq!(stats.window_rejections, 700);
+
+    let ops = write(&mut ivm, &storage, user(10_001, "a"));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/add:Int(10001)", "q/main/add:Int(1)"],
+        "ticket 1's user appeared: the row kept apart takes the first place"
+    );
+    assert_eq!(shown_ids(&ivm, &names, "q", QueryPart::main()), [1, 701]);
+    let after = ivm.engine().stats();
+    assert_eq!(
+        after.page_lookups, 0,
+        "the row was in memory: nothing to look up"
+    );
+    assert_eq!(
+        after.storage_reads,
+        stats.storage_reads + 1,
+        "one read of the user's rows for the row decided again: {after:#?}"
+    );
+}
+
+/// A row a page dropped comes back through a lookup when a write on the
+/// driven side concerns a value no held page row carries: the page is
+/// asked for its rows with that value, once, whether or not it has any.
+#[test]
+fn a_dropped_row_comes_back_through_a_lookup_when_its_gate_opens() {
+    let (mut ivm, storage, names) = engine();
+    for id in 1..=8 {
+        storage.apply(&ticket(id, "OPEN", id));
+    }
+    for id in [3, 6, 7] {
+        storage.apply(&user(id, "u"));
+    }
+    names.register(&mut ivm, "q", first_two_tickets_with_a_user());
+    assert_eq!(shown_ids(&ivm, &names, "q", QueryPart::main()), [3, 6]);
+    let before = ivm.engine().stats().clone();
+
+    let ops = write(&mut ivm, &storage, user(99, "nobody's"));
+    assert!(ops.is_empty());
+    let asked = ivm.engine().stats().clone();
+    assert_eq!(
+        asked.page_lookups, 1,
+        "no held ticket names user 99: the page is asked"
+    );
+    assert_eq!(
+        asked.storage_reads,
+        before.storage_reads + 1,
+        "the lookup finds nothing and nothing else is read"
+    );
+    assert_eq!(shown_ids(&ivm, &names, "q", QueryPart::main()), [3, 6]);
+
+    let ops = write(&mut ivm, &storage, user(1, "a"));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/add:Int(1)",
+            "q/join0/del:Int(6)",
+            "q/main/add:Int(1)",
+            "q/main/del:Int(6)"
+        ],
+        "ticket 1 was dropped; its user's arrival looks it up and it takes the first place"
+    );
+    let after = ivm.engine().stats();
+    assert_eq!(after.page_lookups, 2);
+    assert_eq!(
+        after.storage_reads,
+        asked.storage_reads + 2,
+        "the lookup of ticket 1, and the read of its user"
+    );
+    assert!(ivm.engine().hydrated(names.id("q")));
+}
+
+/// The per-parent windows under a paged root: the root is an ordinary
+/// page (nothing gates it), each of its rows has a window of one member
+/// with a profile, and a member the window dropped comes back when its
+/// profile arrives — the shape of the DM list's latest visible
+/// conversation per channel.
+#[test]
+fn per_parent_windows_under_a_gate_work_below_a_paged_root() {
+    let (mut ivm, storage, names) = engine();
+    for id in 1..=4 {
+        storage.apply(&member(id, 5));
+    }
+    storage.apply(&member(9, 6));
+    storage.apply(&profile(100, 2));
+    storage.apply(&team_ticket(10, 5));
+    storage.apply(&team_ticket(11, 6));
+    storage.apply(&team_ticket(12, 7));
+    let mut members = query(&members_table(), Where::AND(vec![]));
+    members.order_by = vec![OrderBy::new("id", Order::DESC)];
+    members.limit = 1;
+    let mut root = open_tickets();
+    root.limit = 2;
+    let spec = left_joined(
+        root,
+        vec![Join::left(
+            MultiTableReadQuery::new(
+                members,
+                vec![Join::inner_from_main(
+                    MultiTableReadQuery::single(query(&profiles_table(), Where::AND(vec![]))),
+                    "id",
+                    "user_id",
+                )],
+            ),
+            "team_id",
+            "team",
+        )],
+    );
+    let snapshot = names.register(&mut ivm, "q", spec);
+    assert_eq!(
+        names.tags(&snapshot),
+        [
+            "q/join0/add:Int(2)",
+            "q/main/add:Int(10)",
+            "q/main/add:Int(11)",
+            "q/part[0, 0]/add:Int(100)"
+        ],
+        "the page holds tickets 10 and 11; team 5's window reaches member 2, team 6's is empty"
+    );
+    assert!(ivm.engine().hydrated(names.id("q")));
+
+    let ops = write(&mut ivm, &storage, profile(101, 4));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/add:Int(4)",
+            "q/join0/del:Int(2)",
+            "q/part[0, 0]/add:Int(101)",
+            "q/part[0, 0]/del:Int(100)"
+        ],
+        "member 4 was dropped; its profile's arrival looks it up and it takes team 5's window"
+    );
+
+    let ops = write(&mut ivm, &storage, profile(102, 9));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/add:Int(9)", "q/part[0, 0]/add:Int(102)"],
+        "team 6's only member gets a profile and fills its window"
+    );
+
+    let ops = write(&mut ivm, &storage, delete("tickets", 10));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/del:Int(4)",
+            "q/main/add:Int(12)",
+            "q/main/del:Int(10)",
+            "q/part[0, 0]/del:Int(101)"
+        ],
+        "the root page refills with ticket 12 (team 7 has no members); team 5's window goes with its ticket"
+    );
+    assert!(ivm.engine().hydrated(names.id("q")));
+}
+
+/// A page still short after ten rounds is capped and reported: it holds
+/// what it found and reaches no further until one of its admitted rows
+/// leaves, which starts the rounds over from where it stopped.
+#[test]
+fn a_page_short_after_ten_rounds_is_capped_until_an_admitted_row_leaves() {
+    let (mut ivm, storage, names) = engine_with_row_limit(50);
+    storage.apply(&ticket(1, "OPEN", 1));
+    storage.apply(&user(1, "a"));
+    for id in 2..=800 {
+        storage.apply(&ticket(id, "OPEN", 10_000 + id));
+    }
+    storage.apply(&ticket(801, "OPEN", 7));
+    storage.apply(&user(7, "g"));
+    let snapshot = names.register(&mut ivm, "q", first_two_tickets_with_a_user());
+    assert_eq!(
+        names.tags(&snapshot),
+        ["q/join0/add:Int(1)", "q/main/add:Int(1)"],
+        "batches of fifty: ten rounds after the first reach row 550, short of ticket 801"
+    );
+    assert!(ivm.engine().hydrated(names.id("q")));
+    assert_eq!(ivm.engine_mut().take_capped(), [names.id("q")], "reported");
+    assert!(ivm.engine_mut().take_capped().is_empty(), "once");
+    let stats = ivm.engine().stats().clone();
     assert_eq!(stats.window_capped, 1);
-    assert!(
-        (64..=200).contains(&stats.window_rejections),
-        "the refills stop at 64 rejected rows and the rows already buffered are walked: {}",
-        stats.window_rejections
+    assert_eq!(stats.page_rounds, 10);
+    assert_eq!(stats.window_rejections, 549);
+
+    let ops = write(&mut ivm, &storage, user(20_000, "unrelated"));
+    assert!(ops.is_empty());
+    assert_eq!(
+        ivm.engine().stats().page_rounds,
+        10,
+        "a capped page does not reach again for a write that changes nothing it holds"
     );
-    assert!(
-        stats.window_refills <= 8,
-        "the refills double with the rows rejected: {}",
-        stats.window_refills
+
+    let ops = write(&mut ivm, &storage, delete("tickets", 1));
+    assert_eq!(
+        names.tags(&ops),
+        [
+            "q/join0/add:Int(7)",
+            "q/join0/del:Int(1)",
+            "q/main/add:Int(801)",
+            "q/main/del:Int(1)"
+        ],
+        "the shown ticket left: the page reaches on from row 550 and finds ticket 801"
     );
+    let after = ivm.engine().stats();
     assert!(
-        stats.storage_reads <= 80,
-        "one read of the users per round of two rows, and the refills: {}",
-        stats.storage_reads
+        (15..=17).contains(&after.page_rounds),
+        "five or six more batches of fifty to row 801: {}",
+        after.page_rounds
     );
+    assert_eq!(after.window_capped, 1, "not capped again: storage ran dry");
+    assert!(ivm.engine().hydrated(names.id("q")));
 }
 
 /// The join values a landing references are asked for in one narrowed

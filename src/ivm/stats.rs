@@ -51,12 +51,19 @@ use std::fmt;
 ///   round trip the runtime runs.
 ///
 /// Window maintenance:
-/// - `window_evictions`: rows evicted past a window's doubled buffer.
-/// - `window_refills`: refill reads asked for by drained windows.
-/// - `window_rejections`: rows a join gate rejected inside a page, each
-///   making the page reach one row further.
-/// - `window_capped`: windows that stopped growing past their rejected
-///   rows (a page whose gate turns away thousands of rows).
+/// - `window_evictions`: rows evicted past a window's doubled buffer (a
+///   page's admitted rows demoted past it counted too).
+/// - `window_refills`: refill reads asked for by drained windows and by
+///   pages reaching further.
+/// - `window_rejections`: rows a join gate rejected inside a page: dropped
+///   by a page read in batches, kept apart by one read whole.
+/// - `window_capped`: pages that stopped reaching further after
+///   [`super::PAGE_ROUNDS`] rounds without filling.
+/// - `page_rounds`: rounds pages took past their first batch, each a
+///   batch twice the size of the last (a read, or a promotion from the
+///   rows a page read whole holds).
+/// - `page_lookups`: reads pages asked for of one join value they had
+///   dropped, because a write on the driven side concerned it.
 ///
 /// Emitted operations:
 /// - `ops_add`: `Add` operations emitted (row entered a result set, or
@@ -83,6 +90,8 @@ pub struct IvmStats {
     pub window_refills: u64,
     pub window_rejections: u64,
     pub window_capped: u64,
+    pub page_rounds: u64,
+    pub page_lookups: u64,
     pub ops_add: u64,
     pub ops_delete: u64,
 }
@@ -111,6 +120,8 @@ impl IvmStats {
             window_refills: self.window_refills - earlier.window_refills,
             window_rejections: self.window_rejections - earlier.window_rejections,
             window_capped: self.window_capped - earlier.window_capped,
+            page_rounds: self.page_rounds - earlier.page_rounds,
+            page_lookups: self.page_lookups - earlier.page_lookups,
             ops_add: self.ops_add - earlier.ops_add,
             ops_delete: self.ops_delete - earlier.ops_delete,
         }
@@ -188,6 +199,11 @@ impl fmt::Display for IvmStats {
             f,
             "page rows rejected / capped  {} / {}",
             self.window_rejections, self.window_capped
+        )?;
+        writeln!(
+            f,
+            "page rounds / lookups ...... {} / {}",
+            self.page_rounds, self.page_lookups
         )?;
         write!(
             f,

@@ -27,10 +27,43 @@ impl SingleTableIVM {
     /// of that set (the caller inserted them just before), so the rows are
     /// the same, and the read renders a handful of literals instead of the
     /// whole set. Unknown subscriptions are a no-op.
-    pub fn fetch(&mut self, sub: SubId, column: &str, values: &[Value]) {
-        let Some(query) = self.select_queries.get(&sub) else {
+    pub fn fetch(&mut self, sub: SubId, column: &str, values: &[Value]) -> Option<FetchId> {
+        self.read_narrowed(sub, column, values, FetchKind::Narrowed)
+    }
+
+    /// Ask a page for the rows of `values` on `column` it dropped earlier
+    /// (a write on the driven side concerns them): the same narrowed read
+    /// as [`SingleTableIVM::fetch`], landed as a [`FetchKind::Lookup`] —
+    /// only the rows better than the frontier are held, as candidates,
+    /// and the frontier stays where it is.
+    pub fn lookup(&mut self, sub: SubId, column: &str, values: &[Value]) {
+        self.stats.page_lookups += 1;
+        self.read_narrowed(sub, column, values, FetchKind::Lookup);
+    }
+
+    /// Ask for `query` as a [`FetchKind::Lookup`] on behalf of `sub`: the
+    /// join layer's read across the windows of a node with one per parent
+    /// row, whose rows it sorts into the windows itself when they land
+    /// ([`SingleTableIVM::land_lookup`]).
+    pub fn lookup_query(&mut self, sub: SubId, query: SingleTableReadQuery) {
+        if !self.select_queries.contains_key(&sub) {
             return;
-        };
+        }
+        self.stats.page_lookups += 1;
+        self.issue(sub, query, FetchKind::Lookup);
+        self.sync_boundary(sub);
+    }
+
+    /// Record the narrowed read of `sub` to `column IN values`, of `kind`;
+    /// its id, when one was recorded.
+    fn read_narrowed(
+        &mut self,
+        sub: SubId,
+        column: &str,
+        values: &[Value],
+        kind: FetchKind,
+    ) -> Option<FetchId> {
+        let query = self.select_queries.get(&sub)?;
         let narrowed = Where::Condition(Condition::new(
             column,
             ComparisonOperator::IN,
@@ -41,20 +74,26 @@ impl SingleTableIVM {
                 narrow_set_leaves(&query.filter, column, &narrowed),
                 narrowed,
             ]),
-            limit: window::storage_limit(query),
+            limit: window::storage_limit(query, self.windows.get(&sub)),
             ..query.clone()
         };
-        self.issue(sub, narrowed, FetchKind::Narrowed);
+        let id = self.issue(sub, narrowed, kind);
         self.sync_boundary(sub);
+        id
     }
 
     /// Record one storage read for `sub`, counted as pending by `sub` and
-    /// every subscription of its query, all of which it will land into; a
-    /// read for no rows at all (`LIMIT 0`) is not worth a round trip and
-    /// is dropped.
-    pub(super) fn issue(&mut self, sub: SubId, query: SingleTableReadQuery, kind: FetchKind) {
+    /// every subscription of its query, all of which it will land into,
+    /// and return its id; a read for no rows at all (`LIMIT 0`) is not
+    /// worth a round trip and is dropped.
+    pub(super) fn issue(
+        &mut self,
+        sub: SubId,
+        query: SingleTableReadQuery,
+        kind: FetchKind,
+    ) -> Option<FetchId> {
         if query.limit == 0 {
-            return;
+            return None;
         }
         let id = FetchId(self.next_fetch);
         self.next_fetch += 1;
@@ -70,14 +109,18 @@ impl SingleTableIVM {
             kind,
             query: std::sync::Arc::new(query),
         });
+        Some(id)
     }
 
     /// `sub` and every other subscription with its query, in id order;
-    /// `sub` alone if it is not registered.
+    /// `sub` alone if it is not registered or shares with no one (a
+    /// driven part reading nothing at registration is keyed with no
+    /// twins, whatever its filter).
     fn query_group(&self, sub: SubId) -> Vec<SubId> {
         self.select_queries
             .get(&sub)
             .and_then(|query| self.by_query.get(query))
+            .filter(|group| group.contains(&sub))
             .map(|group| group.iter().copied().collect())
             .unwrap_or_else(|| vec![sub])
     }
@@ -135,20 +178,10 @@ impl SingleTableIVM {
         rows: &[(DataFrameKey, DataFrameRow)],
         worst_read: Option<&DataFrameRow>,
     ) -> Vec<SingleTableUpdate> {
-        let Some(query) = self.select_queries.get(&sub).cloned() else {
+        if !self.select_queries.contains_key(&sub) {
             return Vec::new();
-        };
-        let table = query.table.clone();
-        let mut updates = Vec::new();
-        for (key, row) in rows {
-            updates.extend(self.land_row(sub, &table, &query.filter, key, row));
         }
-        if let Some(window) = self.windows.get_mut(&sub) {
-            window.note_fetch(worst_read);
-            if fetch.kind == FetchKind::Refill {
-                window.note_refill(updates.len());
-            }
-        }
+        let mut updates = self.land_rows(sub, fetch.kind, rows, worst_read);
         let outstanding = match self.pending.get_mut(&sub) {
             Some(count) => {
                 *count = count.saturating_sub(1);
@@ -173,11 +206,90 @@ impl SingleTableIVM {
         self.gate_updates(&[sub], updates)
     }
 
+    /// Land the rows of a read of `kind` into `sub`: each adopted and
+    /// tagged ([`SingleTableIVM::land_row`]) — a lookup's rows only when
+    /// the window admits them — then tracked in the window, as candidates
+    /// of a page unless a page read whole is taking its snapshot, and the
+    /// window told what the read covered (a lookup covers nothing new).
+    /// Returns the `Add`s.
+    fn land_rows(
+        &mut self,
+        sub: SubId,
+        kind: FetchKind,
+        rows: &[(DataFrameKey, DataFrameRow)],
+        worst_read: Option<&DataFrameRow>,
+    ) -> Vec<SingleTableUpdate> {
+        let Some(query) = self.select_queries.get(&sub).cloned() else {
+            return Vec::new();
+        };
+        let table = query.table.clone();
+        let lookup = kind == FetchKind::Lookup;
+        let mut updates = Vec::new();
+        let mut landed: Vec<(Vec<Value>, DataFrameKey)> = Vec::new();
+        for (key, row) in rows {
+            let beyond = lookup
+                && self
+                    .windows
+                    .get(&sub)
+                    .is_some_and(|window| !window.admits(&window.order_value(row)));
+            if beyond {
+                continue;
+            }
+            let Some((update, image)) = self.land_row(sub, &table, &query.filter, key, row) else {
+                continue;
+            };
+            if let Some(window) = self.windows.get(&sub) {
+                landed.push((window.order_value(&image), key.clone()));
+            }
+            updates.push(update);
+        }
+        if let Some(window) = self.windows.get_mut(&sub) {
+            let candidates = kind != FetchKind::Snapshot || !window.is_whole();
+            let keys: Vec<DataFrameKey> = landed.iter().map(|(_, key)| key.clone()).collect();
+            window.insert_many(landed);
+            if candidates {
+                for key in &keys {
+                    window.enroll(key);
+                }
+            }
+            if !lookup {
+                window.note_fetch(worst_read);
+            }
+            if kind == FetchKind::Refill {
+                window.note_refill(updates.len());
+            }
+        }
+        updates
+    }
+
+    /// Land the rows a lookup returned for `sub`, a window of a node with
+    /// one per parent row, which the join layer sorted out of the node's
+    /// one read ([`SingleTableIVM::lookup_query`]): as a lookup's rows land
+    /// ([`SingleTableIVM::land_rows`]), overflow evicted and the boundary
+    /// republished; no read of `sub`'s own is accounted for. Returns the
+    /// subscription's operations.
+    pub fn land_lookup(
+        &mut self,
+        sub: SubId,
+        rows: &[(DataFrameKey, DataFrameRow)],
+    ) -> Vec<SingleTableUpdate> {
+        if !self.select_queries.contains_key(&sub) {
+            return Vec::new();
+        }
+        let mut updates = self.land_rows(sub, FetchKind::Lookup, rows, None);
+        let evictions = self.evict_overflow(sub);
+        updates.extend(self.tagged(sub, evictions));
+        self.sync_boundary(sub);
+        self.gate_updates(&[sub], updates)
+    }
+
     /// Adopt one landed row for `sub`, whose filter is `filter`: the frame
     /// row is materialized with the read's image if absent (the frame's
     /// image is current, and so is the read's, so an existing row keeps
     /// what it has), and `sub` is tagged onto it and sent the `Add` unless
     /// it already held it or the image does not satisfy its filter.
+    /// Returns the `Add` and the image tagged; the caller tracks it in the
+    /// window.
     fn land_row(
         &mut self,
         sub: SubId,
@@ -185,7 +297,7 @@ impl SingleTableIVM {
         filter: &Where,
         key: &DataFrameKey,
         row: &DataFrameRow,
-    ) -> Vec<SingleTableUpdate> {
+    ) -> Option<(SingleTableUpdate, DataFrameRow)> {
         let conformed = self.conform(table, row);
         let row = conformed.as_ref().unwrap_or(row);
         let frame = self.frames.entry(table.clone()).or_default();
@@ -195,33 +307,45 @@ impl SingleTableIVM {
             "a read brought up to the engine's position agrees with the frame"
         );
         if shared.held_by(sub) {
-            return Vec::new();
+            return None;
         }
         let image = shared.data.clone();
         if !evaluate(filter, &image.data, &mut 0) {
             frame.drop_if_unheld(id);
-            return Vec::new();
+            return None;
         }
-        let mut updates = Vec::new();
-        if let Some(update) = self.tag_row(sub, table, key, &image) {
-            updates.push(update);
-            self.track_landed(sub, key, &image);
-        }
-        updates
+        let update = self.tag_row(sub, table, key, &image)?;
+        Some((update, image))
     }
 
-    /// Record a landed row in `sub`'s window, if it has one.
-    fn track_landed(&mut self, sub: SubId, key: &DataFrameKey, image: &DataFrameRow) {
-        if let Some(window) = self.windows.get_mut(&sub) {
-            let value = window.order_value(image);
-            window.insert(value, key.clone());
-        }
+    /// The image of a row `sub` holds, `None` when it does not hold it.
+    pub(super) fn row_image(&self, sub: SubId, key: &DataFrameKey) -> Option<DataFrameRow> {
+        let query = self.select_queries.get(&sub)?;
+        let frame = self.frames.get(&query.table)?;
+        let row = frame.get(key)?;
+        row.held_by(sub).then(|| row.data.clone())
     }
 
-    /// Untag one row from `sub` (dropping it when nobody holds it).
-    /// Returns the `Delete` — carrying the image `sub` held — to forward,
-    /// or `None` if the subscription did not hold it.
+    /// Untag one row from `sub` (dropping it when nobody holds it) and
+    /// take it out of the window. Returns the `Delete` — carrying the
+    /// image `sub` held — to forward, or `None` if the subscription did
+    /// not hold it.
     pub fn remove_row(&mut self, sub: SubId, key: &DataFrameKey) -> Option<DataFrameOperation> {
+        let op = self.untag_row(sub, key)?;
+        if let Some(window) = self.windows.get_mut(&sub) {
+            window.remove(key);
+        }
+        Some(op)
+    }
+
+    /// Untag one row from `sub` (dropping it when nobody holds it),
+    /// leaving the window to the caller. Returns the `Delete` carrying the
+    /// image `sub` held, or `None` if the subscription did not hold it.
+    pub(super) fn untag_row(
+        &mut self,
+        sub: SubId,
+        key: &DataFrameKey,
+    ) -> Option<DataFrameOperation> {
         let table = self.select_queries.get(&sub)?.table.clone();
         let frame = self.frames.get_mut(&table)?;
         let id = frame.id_of(key)?;
@@ -234,9 +358,6 @@ impl SingleTableIVM {
             ids.remove(&id);
         }
         frame.drop_if_unheld(id);
-        if let Some(window) = self.windows.get_mut(&sub) {
-            window.remove(key);
-        }
         Some(DataFrameOperation::Delete(key.clone(), removed))
     }
 
@@ -271,8 +392,23 @@ impl SingleTableIVM {
         else {
             return Vec::new();
         };
+        self.prune_rows_unless(sub, column, values, &filter)
+    }
+
+    /// Untag every row `sub` holds whose `column` equals one of `values`
+    /// and that `keeps` does not admit: the prune after a join edge lost
+    /// those values when the restriction is not in the registered filter
+    /// (`keeps` is then the part's own filter with the edge's leaf taken
+    /// as false). Otherwise as [`SingleTableIVM::prune_rows`].
+    pub fn prune_rows_unless(
+        &mut self,
+        sub: SubId,
+        column: &str,
+        values: &[Value],
+        keeps: &Where,
+    ) -> Vec<DataFrameOperation> {
         let ops = self.remove_rows_where(sub, column, values, |row| {
-            !evaluate(&filter, &row.data, &mut 0)
+            !evaluate(keeps, &row.data, &mut 0)
         });
         if !ops.is_empty() {
             if self.windows.get(&sub).is_some_and(Window::needs_refill) {
@@ -309,7 +445,7 @@ impl SingleTableIVM {
 
     /// The rows `sub` holds whose `column` equals `value`, as the layer
     /// above sees the subscription: for a windowed one only the rows of
-    /// its span, since the buffer below it was never shown to anyone.
+    /// its prefix, since the buffer below it was never shown to anyone.
     pub fn visible_rows_matching(
         &self,
         sub: SubId,
@@ -317,10 +453,10 @@ impl SingleTableIVM {
         value: &Value,
     ) -> Vec<(DataFrameKey, DataFrameRow)> {
         let rows = self.rows_matching(sub, column, value);
-        match self.windows.get(&sub).map(Window::shown_prefix) {
-            Some(span) => rows
+        match self.windows.get(&sub) {
+            Some(window) => rows
                 .into_iter()
-                .filter(|(key, _)| span.contains(key))
+                .filter(|(key, _)| window.in_span(key))
                 .collect(),
             None => rows,
         }
@@ -399,14 +535,14 @@ impl SingleTableIVM {
     pub fn rows_for(&self, sub: SubId) -> Option<HashMap<DataFrameKey, DataFrameRow>> {
         let query = self.select_queries.get(&sub)?;
         let frame = self.frames.get(&query.table);
-        let shown = self.windows.get(&sub).map(Window::shown_prefix);
+        let window = self.windows.get(&sub);
         Some(
             self.held
                 .get(&sub)
                 .into_iter()
                 .flatten()
                 .filter_map(|id| frame.and_then(|frame| frame.row(*id)))
-                .filter(|row| shown.as_ref().is_none_or(|shown| shown.contains(&row.key)))
+                .filter(|row| window.is_none_or(|window| window.in_span(&row.key)))
                 .map(|row| (row.key.clone(), row.data.clone()))
                 .collect(),
         )

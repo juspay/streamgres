@@ -178,16 +178,37 @@ impl Join {
     }
 }
 
+/// How a node with a `LIMIT` that drives an inner edge — a page whose
+/// rows the edge admits or rejects — is read. The planner decides from
+/// the node's count; for every other node the value has no effect.
+///
+/// - `Whole`: every row the node's filter matches is read in one go and
+///   held; the `LIMIT` is applied in memory. The rows the edge rejects
+///   stay held, so the driven side keeps its `IN` restriction exactly.
+/// - `Batched`: the window is read in batches that double from one round
+///   to the next; the rows the edge rejects are dropped, and the driven
+///   side routes on its own filter, looking the driver up when a write
+///   concerns a dropped row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PageRead {
+    Whole,
+    #[default]
+    Batched,
+}
+
 /// A multi-table subscription: a tree whose every node is a single-table
 /// query and every edge a [`Join`]. The root is the query the client
 /// subscribed to; its `order_by` / `limit` apply to the root's rows. A
 /// node's parts are numbered by the position of their edge in `joins`.
-/// Structurally identical trees compare equal, the basis of sharing; two
-/// trees that differ only in an edge's `driver` are two trees.
+/// `page` says how the node is read when it is a page that drives an
+/// inner edge ([`PageRead`]). Structurally identical trees compare equal,
+/// the basis of sharing; two trees that differ only in an edge's `driver`
+/// or a node's `page` are two trees.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MultiTableReadQuery {
     pub main_table: SingleTableReadQuery,
     pub joins: Vec<Join>,
+    pub page: PageRead,
 }
 
 impl MultiTableReadQuery {
@@ -196,12 +217,26 @@ impl MultiTableReadQuery {
         MultiTableReadQuery {
             main_table,
             joins: Vec::new(),
+            page: PageRead::default(),
         }
     }
 
     /// A tree of `main_table` with `joins` under it.
     pub fn new(main_table: SingleTableReadQuery, joins: Vec<Join>) -> Self {
-        MultiTableReadQuery { main_table, joins }
+        MultiTableReadQuery {
+            main_table,
+            joins,
+            page: PageRead::default(),
+        }
+    }
+
+    /// The node at `path` (the join positions from the root), mutably.
+    pub fn node_at_mut(&mut self, path: &[usize]) -> Option<&mut MultiTableReadQuery> {
+        let mut node = self;
+        for &step in path {
+            node = &mut node.joins.get_mut(step)?.sub;
+        }
+        Some(node)
     }
 
     /// Whether the tree has any edge.

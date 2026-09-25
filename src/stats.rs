@@ -977,6 +977,8 @@ impl Stats {
                 "window_refills": engine.ivm.window_refills,
                 "window_rejections": engine.ivm.window_rejections,
                 "window_capped": engine.ivm.window_capped,
+                "page_rounds": engine.ivm.page_rounds,
+                "page_lookups": engine.ivm.page_lookups,
                 "snapshots_shared": engine.ivm.snapshots_shared,
                 "reads_issued": engine.sync.reads_issued,
                 "reads_landed": engine.sync.reads_landed,
@@ -1134,6 +1136,8 @@ impl Stats {
             ("window_refills_total", engine.ivm.window_refills),
             ("page_rows_rejected_total", engine.ivm.window_rejections),
             ("pages_capped_total", engine.ivm.window_capped),
+            ("page_rounds_total", engine.ivm.page_rounds),
+            ("page_lookups_total", engine.ivm.page_lookups),
             ("registrations_total", engine.ivm.queries_registered),
             ("client_updates_add_total", engine.ivm.ops_add),
             ("client_updates_delete_total", engine.ivm.ops_delete),
@@ -1513,7 +1517,9 @@ fn measure_help(name: &str) -> &'static str {
         "reads_shared_total" => "registrations answered from rows already held",
         "window_refills_total" => "pages that read again to stay full",
         "page_rows_rejected_total" => "page rows their join rejected",
-        "pages_capped_total" => "pages that stopped reading past rejected rows",
+        "pages_capped_total" => "pages that stopped reaching further after ten rounds",
+        "page_rounds_total" => "rounds pages took to reach further, each batch twice the last",
+        "page_lookups_total" => "reads pages asked for of a join value they had dropped",
         "registrations_total" => "queries registered with the engine",
         "client_updates_add_total" | "client_updates_delete_total" => {
             "row operations the engine emitted"
