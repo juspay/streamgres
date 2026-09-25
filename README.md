@@ -55,7 +55,7 @@ every later delta continues from.
 | `ORDER BY` / `LIMIT` windows: compound order, the page of `L` to the client over a buffer of `2L`, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
 | In-place condition edits: a literal `IN` swapped inside its disjuncts, or a set-valued `IN` (`Value::Set`) gaining/losing one member in O(1) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
 | Join tree: one vector of edges, each with its **driver** (`Main` or `Sub`) and `is_inner`, so LEFT, RIGHT and the two inner forms (driven from the sub, driven from the main) at any depth; existence tests placed anywhere in a node's filter (`EXISTS` inside `OR`, bound to the set when the sub drives, a per-row gate on the match count when the main does); set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns; a value index on every join column so a crossing costs the matches, not the part; a driven child's `ORDER BY` / `LIMIT` is a window **per parent row** (`related` with a limit) | ✅ done | `src/ivm/multi.rs` |
-| Join planning: every node that would be read whole is counted, in one concurrent batch capped at the limit; the inner edges are settled from the root down (the side that fits; the smaller side when both do; a node already driven from above drives the edges below it; a page is counted too and the smaller side drives it strictly, a page over the limit being restricted by a sub that fits and driving any other, the engine keeping the page to the rows the sub admits; two `EXISTS` beside each other on one to-one relationship are one), the root never moves, and a query with a side nothing can bound is refused with the reason; decisions are cached by tree (`XYNE_SYNC_ROW_LIMIT`, `XYNE_SYNC_JOIN_PREFERRED_SIDE`, `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE`), and run on the connection's own task | ✅ done | `src/client/plan.rs` |
+| Join planning: the nodes that may be compared are counted, in one concurrent batch capped at the limit; the tree is decided from the root down, one node at a time — the smallest of a node and its inner subs drives (the smallest count that fits; else a page, the node's own first; else a sub narrowed by its own sub), the rest are driven by the node, and a node driven from above drives everything below it with nothing counted there; two `EXISTS` beside each other on one to-one relationship are one; a page that drives is read whole within `XYNE_SYNC_WHOLE_PAGE_LIMIT` and in doubling batches past it; the root never moves, and a node no side can drive refuses the query with the reason; decisions are cached by tree (`XYNE_SYNC_ROW_LIMIT`, `XYNE_SYNC_JOIN_PREFERRED_SIDE` for ties, `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE`), and run on the connection's own task | ✅ done | `src/client/plan.rs` |
 | Client-free output: the engine knows subscriptions, never clients. One step's operations are folded per row (`Delta { table, op, audiences }`), each audience one part of one tree with **all its subscribers as the tree's shared list** (`Subs::Many(Arc<[SubId]>)`), so an operation costs the engine the same for one subscriber and for ten thousand; the service routes each delta to the group threads owning its subscriptions, and the group thread's row ledger decides what each client is sent (a row once per client group, whatever brought it); images and keys are shared handles (`Arc`), so nothing on the path copies a row | ✅ done | `src/ivm/update.rs`, `src/model/frame.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
 | Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; the runtime holds the one position and brings every read up to it before landing; no read ever blocks the stream; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
@@ -458,30 +458,35 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   shipped, as the reference server withholds them.
 - **Planning.** Before a translated query registers, `client/plan.rs` decides
   which side of each inner edge drives it, on the connection's own task. A
-  node nothing drives is read whole; the planner counts every such node in
-  one concurrent batch on the reads pool, no further than
-  `XYNE_SYNC_ROW_LIMIT` + 1 (100 000 by default, the same number a storage
-  read may return, so a big table is never scanned whole and a side the
-  planner calls small is one a read returns), a node with a page counted on
-  its filter without the page and bounded by its window when its count is
-  over, a driven node by its driver. The inner edges are then settled from the root
-  down: an edge with one bounded side is driven from it; one whose sides
-  both fit by their own counts is driven from the smaller, with
-  `XYNE_SYNC_JOIN_PREFERRED_SIDE` (`parent` by default) winning unless the
-  other side is at most half its size (a project's few boards drive the
-  workspace's stages); a node already driven from above drives the edges
-  below it, so an access rule is read link by link from the row outwards
-  (the message's conversation, its channel, the reader's participation);
-  a main with a page is restricted by a sub that fits by its own count
-  (the window stays exact) and drives any other sub, the engine keeping
-  the page to the rows the sub admits (`docs/gated-pages-2026-09-20.md`);
-  and an edge left with no bounded side refuses the query with a
-  `transformError` naming the sides. The root never moves:
-  the decision is the `driver` field of the edge, so part paths, hidden
-  parts and `EXISTS` leaves stay where the translation put them, and a
-  nested `EXISTS` is planned like one at the root. Decisions are cached by
-  tree for `XYNE_SYNC_PLAN_TTL_MS` (10 min), at most `XYNE_SYNC_PLAN_CACHE`
-  (10 000) of them, so the counts run once per distinct tree.
+  node nothing drives is read whole; the planner counts the nodes it may
+  have to compare in one concurrent batch on the reads pool, no further
+  than `XYNE_SYNC_ROW_LIMIT` + 1 (100 000 by default, the same number a
+  storage read may return, so a big table is never scanned whole and a
+  side the planner calls small is one a read returns), a node with a page
+  counted on its filter without the page. The tree is then decided from
+  the root down, one node at a time, by one rule: the smallest of a node
+  and its inner subs drives. Among sides whose count fits the smallest
+  count wins (`XYNE_SYNC_JOIN_PREFERRED_SIDE`, `parent` by default, decides
+  a tie, except that a page is always restricted by a sub that counts the
+  same: its window stays exact); with none fitting, a side with a page
+  drives, the node's own page first, the engine keeping it to the rows the
+  subs admit (`docs/gated-pages-2026-09-20.md`); with none of those, a sub
+  that is itself narrowed by one of its own subs drives, so an access rule
+  is read from its small end. When a sub drives, the node is narrowed by
+  it and drives its other subs; when the node drives, it drives them all;
+  a node something drives from above (a LEFT child, a RIGHT child's
+  parent, the driven side of an inner edge) drives everything below it
+  without a comparison, and nothing below it is counted (the message's
+  conversation, its channel, the reader's participation are read link by
+  link from the row outwards). A page that drives is read whole within
+  `XYNE_SYNC_WHOLE_PAGE_LIMIT` (5 000) and in doubling batches past it. A
+  node no side can drive refuses the query with a `transformError` naming
+  the tables. The root never moves: the decision is the `driver` field of
+  the edge, so part paths, hidden parts and `EXISTS` leaves stay where the
+  translation put them, and a nested `EXISTS` is planned like one at the
+  root. Decisions are cached by tree for `XYNE_SYNC_PLAN_TTL_MS` (10 min),
+  at most `XYNE_SYNC_PLAN_CACHE` (10 000) of them, so the counts run once
+  per distinct tree.
 - **Warm start.** With `XYNE_SYNC_PLAN_FILE` set, every query shape that
   translates (its name and the application server's AST for it) is kept
   in that file, written every minute and on shutdown; the next process
@@ -931,13 +936,19 @@ they are discussed rather than discovered:
    names are `Arc<str>`: a clone anywhere is a reference count. `Join` has a
    `driver` and `is_inner` in place of three vectors; an `EXISTS` leaf names
    the node's i-th inner edge, whichever side drives it.
-10. **A page may drive an inner edge**: the join layer tells the page's
-    window which of the rows it shows the gate rejects, and the window
-    reaches past them (and draws back when a gate opens), so the page is
-    the best rows the edge admits, as the client's `Take` over `Exists`. It gives
-    up after eight rejected rows per row of the page, and the query is
-    then reported by name. A held row acts on the edge above it (as a
-    match, or as a driver's reference) only while its own gate is open.
+10. **A page may drive an inner edge**: the page's rows are candidates
+    until the edge decides them, a batch at a time — the first
+    `max(10·L, 100)` rows, then twice as many per round, from memory for a
+    page the planner read whole (`XYNE_SYNC_WHOLE_PAGE_LIMIT`) and from
+    storage for one read in batches — the rows the edge rejects are
+    dropped (kept apart by a page read whole), and a client is sent the
+    first `L` admitted rows, so the page is the best rows the edge admits,
+    as the client's `Take` over `Exists`. The driven side of a page read in
+    batches routes on its own filter, and a write for the join value of a
+    dropped row looks the row up again. A page still short after ten
+    rounds is capped and the query reported by name. A held row acts on
+    the edge above it (as a match, or as a driver's reference) only while
+    its own gate is open.
 
 ---
 

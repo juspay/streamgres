@@ -88,7 +88,8 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_subscriptions`, `xyne_sync_trees` | what the engine holds |
 | `xyne_sync_queries_refused_total{reason=unsupported,plan_limit,read_limit,read_timeout,other}` | queries the server refused, by why: the translation cannot express it (`LIKE`, `NOT EXISTS`), the planner found no side of a join small enough to read, a read came back over the row limit, a read or a count ran past `XYNE_SYNC_READ_TIMEOUT_MS`, anything else |
 | `xyne_sync_plans_total{kind=page_drives}` | plans in which a node with a `LIMIT` drives an inner edge (the page is kept to the rows the edge admits) |
-| `xyne_sync_page_rows_rejected_total`, `xyne_sync_pages_capped_total` | rows a join gate rejected inside a page, each making the page reach one row further; pages that stopped reaching (eight rejected rows for every row of the page, between 64 and 512) |
+| `xyne_sync_page_rows_rejected_total`, `xyne_sync_pages_capped_total` | rows a join gate rejected inside a page (dropped by a page read in batches, kept apart by one read whole); pages that stopped reaching further after ten rounds without filling |
+| `xyne_sync_page_rounds_total`, `xyne_sync_page_lookups_total` | rounds pages took past their first batch, each a batch twice the last (a read from the frontier, or a promotion from the rows a page read whole holds); reads pages asked for of one join value they had dropped, because a write on the driven side concerned it |
 | `xyne_sync_queries_short_total{reason=page_capped}` | subscriptions served a page short of its limit because it was capped |
 | `xyne_sync_window_refills_total` | refill reads asked for by drained windows |
 

@@ -75,6 +75,7 @@ listed with their defaults so the manifest can carry them explicitly.
 | variable | value | default | why |
 |---|---|---|---|
 | `XYNE_SYNC_ROW_LIMIT` | `20000` | `100000` | the most rows the server reads into memory at once, for the planner and the storage alike: a join side past it is driven from the other side or the query refused by name, and a storage read past it is refused. One number, so the planner never reads whole what the storage would refuse (the older `XYNE_SYNC_JOIN_LIMIT` and `XYNE_SYNC_READ_ROW_LIMIT` are still read). 20 000 is what the test campaigns ran as production policy |
+| `XYNE_SYNC_WHOLE_PAGE_LIMIT` | `5000` | `5000` | the most rows a page that drives an inner join is read whole for (the limit applied in memory, the join's restriction exact); past it the page is read in batches that double per round, ten rounds at most, the rows the join rejects dropped |
 | `XYNE_SYNC_GROUP_THREADS` | `2` | `1` | threads that build and send pokes |
 | `XYNE_SYNC_READ_THREADS` | `4` | `2` | threads that run and decode storage reads |
 | `XYNE_SYNC_READ_CONNECTIONS` | `32` | `16` | PostgreSQL connections for storage reads |
@@ -106,7 +107,7 @@ listed with their defaults so the manifest can carry them explicitly.
 | `XYNE_SYNC_PG_KEEPALIVE_IDLE_MS`, `XYNE_SYNC_PG_KEEPALIVE_INTERVAL_MS`, `XYNE_SYNC_PG_KEEPALIVE_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on every connection to the database: after the idle time without a byte either way the kernel probes the peer, again at the interval while unanswered, and gives the connection up after that many unanswered in a row. Keep the idle time under whatever a NAT or load balancer between drops silent flows at (section 4); `0` turns the probing off |
 | `XYNE_SYNC_BACKEND_TIMEOUT_MS` | `30000` | how long one call to the backend (a transform, a push) may take; a call that timed out is not made again; `0` sets no limit |
 | `XYNE_SYNC_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is minted |
-| `XYNE_SYNC_JOIN_PREFERRED_SIDE` | `parent` | which side of an inner join drives when both fit |
+| `XYNE_SYNC_JOIN_PREFERRED_SIDE` | `parent` | which side of an inner join drives when both count the same (the smaller side drives otherwise) |
 | `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE` | `600000`, `10000` | join plans remembered |
 | `XYNE_SYNC_TRANSFORM_TTL_MS`, `XYNE_SYNC_TRANSFORM_CACHE` | `60000`, `20000` | the backend's query transforms remembered per identity; the reference server keeps its own for 5 s, which cost a hydration about 8 ms at the median on the test rig |
 | `XYNE_SYNC_WARM_START_MS` | `20000` | the most time spent planning the kept shapes at start |
