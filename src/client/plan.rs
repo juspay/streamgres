@@ -4,25 +4,33 @@
 //! A node nothing drives is read **whole**: every row it matches sits in
 //! memory. A driven node holds only the rows matching its driver's
 //! values, and a node with a page (`LIMIT`) holds its window. The planner
-//! counts each node that would be read whole, no further than the
-//! configured limit plus one and all in one batch, and then settles the
-//! inner edges by a fixed point: a node is *bounded* when its count is
-//! within the limit, when it has a page, or when it is the driven side of
-//! an edge whose driver is bounded. An inner edge whose sides both fit by
-//! their own counts is driven from the **smaller** one (the preferred
-//! side winning unless the other is at most half its size: a project's
-//! few boards drive the workspace's stages, not the reverse); an edge
-//! with one bounded side is driven from it; an edge left with none
-//! refuses the query. The edges are settled from the root down, and a
-//! node something already drives from above (a LEFT child, the sub of an
-//! edge settled for its main) drives the edges below it: its rows are the
-//! few its driver's values reach, whatever the table holds, so the access
-//! rule under a conversation's messages is read narrowed link by link
-//! (the message's conversation, that conversation's channel, the reader's
-//! participation in it) rather than from the rule's own side. The root never changes: the decision is a `driver`
-//! per edge ([`Join::driver`]), so part paths, hidden parts and `EXISTS`
-//! leaves all stay where the translation put them, and an inner edge at
-//! any depth is planned the same way as one at the root.
+//! counts the nodes it may have to compare, no further than the
+//! configured limit plus one and all in one batch, and then decides the
+//! tree from the root down, one node at a time, by one rule: **the
+//! smallest of a node and its inner subs drives**. A side is *measured*
+//! when its count is within the limit, and among measured sides the
+//! smallest count wins (the preferred side breaks a tie, except that a
+//! page never wins one: restricted by its sub, its window stays exact).
+//! With no measured side, a side with a page drives, the node's own page
+//! before any sub's, reading its window and keeping it to the rows its
+//! subs admit (see the `window` module). With none of those, a sub that
+//! is itself *narrowed* by one of its own subs drives: an access rule is
+//! read from its small end (the reader's participations narrow the
+//! channels, the channels the conversations, those the messages). When a
+//! sub drives, the node is narrowed by it and drives its other inner
+//! subs; when the node drives, it drives them all. A node something
+//! drives from above — a LEFT child, the parent of a RIGHT child, the
+//! driven side of an inner edge — is narrowed already and drives every
+//! inner sub below it without a comparison: its rows are the few its
+//! driver's values reach, whatever the table holds, so nothing below it
+//! is counted. A node with no side to drive it (over the limit, no page,
+//! no narrowed sub) refuses the query, naming the tables. The root never
+//! changes: the decision is a `driver` per edge ([`Join::driver`]), so
+//! part paths, hidden parts and `EXISTS` leaves all stay where the
+//! translation put them, and an inner edge at any depth is planned the
+//! same way as one at the root. Two `EXISTS` on one to-one relationship
+//! were made one node before any of this (`ast::merge_exists`), so they
+//! are counted and compared as one.
 //!
 //! **A main with a page** is counted like any other node, on its own
 //! filter with its cursor, its `EXISTS` leaves taken as true and its
@@ -40,6 +48,15 @@
 //! bounded node drives it is not small in any measured sense (the
 //! fan-out is unknown), so it never drives a page.
 //!
+//! **How a page that drives is read** is the planner's last word
+//! ([`MultiTableReadQuery::page`]): a page whose count is within the
+//! whole-page limit ([`Policy::whole`]) is read **whole** — every row of
+//! its filter in one read, the `LIMIT` applied in memory, the rows its
+//! edge rejects kept, so the edge's restriction stays exact — and any
+//! other page in **batches** that double from one round to the next, the
+//! rows its edge rejects dropped and the driven side routing on its own
+//! filter (see the `multi` module).
+//!
 //! The planner does no I/O: it hands out the counts it wants and takes
 //! the answers back, so the caller runs them wherever it can and the
 //! decision stays a pure function that tests drive with numbers. [`plan`]
@@ -55,11 +72,13 @@ use std::time::{Duration, Instant};
 use futures_util::future::join_all;
 
 use super::ast::Translated;
-use crate::model::{ComparisonOperator, Driver, MultiTableReadQuery, SingleTableReadQuery};
+use crate::model::{
+    ComparisonOperator, Driver, MultiTableReadQuery, PageRead, SingleTableReadQuery,
+};
 use crate::sync::Storage;
 
-/// Which side of an inner edge to prefer when both are small enough to
-/// read whole.
+/// Which side of an inner edge drives when a node and one of its subs
+/// are measured equal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Child,
@@ -67,11 +86,14 @@ pub enum Side {
 }
 
 /// The planner's settings: the most rows a whole node may hold (the same
-/// number a storage read may return), and the side to prefer.
+/// number a storage read may return), the side that breaks a tie, and
+/// the most rows a page that drives an inner edge is read whole for
+/// (past it the page is read in batches).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
     pub limit: u64,
     pub preferred: Side,
+    pub whole: u64,
 }
 
 /// One node of the tree being planned.
@@ -79,7 +101,8 @@ pub struct Policy {
 /// - `path`: the join positions from the root to the node.
 /// - `query`: the node's own query.
 /// - `driven`: whether an outer edge drives the node (a LEFT child, a
-///   RIGHT parent), which bounds it by its driver and spares it a count.
+///   RIGHT parent): narrowed by construction, it drives everything below
+///   it and is never counted or compared.
 /// - `count`: its whole count, once answered; `None` when not asked.
 struct PlanNode {
     path: Vec<usize>,
@@ -89,15 +112,33 @@ struct PlanNode {
 }
 
 /// One edge of the tree being planned: its ends as node indices, the
-/// position of its join under the parent, and, for an inner edge, the
-/// driver decided so far.
+/// position of its join under the parent, its driver as translated and
+/// whether it is inner.
 struct PlanEdge {
     parent: usize,
     child: usize,
     position: usize,
     driver: Driver,
     is_inner: bool,
-    decided: bool,
+}
+
+/// How small a side is, smallest first: measured within the limit (by
+/// its count), bounded by a page, narrowed by a sub of its own, or none
+/// of those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    Measured(u64),
+    Paged,
+    Narrowed,
+    Unbounded,
+}
+
+/// How a node is decided: compared with its inner subs, or narrowed from
+/// above already and driving them all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Compare,
+    Driven,
 }
 
 /// The planner for one translated query.
@@ -116,27 +157,74 @@ impl Planner {
         let mut nodes = Vec::new();
         let mut edges = Vec::new();
         flatten(&query, Vec::new(), None, &mut nodes, &mut edges);
-        let counted = if !query.has_joins() {
-            Vec::new()
-        } else {
-            nodes
-                .iter()
-                .enumerate()
-                .filter(|(_, node)| !node.driven)
-                .map(|(index, _)| index)
-                .collect()
-        };
-        Planner {
+        let mut planner = Planner {
             query,
             policy,
             nodes,
             edges,
-            counted,
+            counted: Vec::new(),
+        };
+        if planner.query.has_joins() {
+            let mut counted = Vec::new();
+            planner.count_below(0, Mode::Compare, &mut counted);
+            planner.counted = counted;
+        }
+        planner
+    }
+
+    /// The edges under the node `index`, in join order.
+    fn edges_of(&self, index: usize) -> impl Iterator<Item = (usize, &PlanEdge)> + '_ {
+        self.edges
+            .iter()
+            .enumerate()
+            .filter(move |(_, edge)| edge.parent == index)
+    }
+
+    /// The mode the node `index` is decided in, given the mode its parent
+    /// hands down: a node an outer edge drives is narrowed whatever the
+    /// parent says.
+    fn mode_of(&self, index: usize, handed: Mode) -> Mode {
+        if self.nodes[index].driven {
+            Mode::Driven
+        } else {
+            handed
         }
     }
 
-    /// The counts the planner wants, all at once: for each node no outer
-    /// edge drives, its index, the query to count (the node's own filter,
+    /// The mode the child of `edge` is decided in when `chosen` is the
+    /// edge whose sub drives the parent: the driving sub, and a RIGHT
+    /// child (read whole, driving its parent), are compared with their
+    /// own subs; every other child is driven.
+    fn mode_below(&self, edge: usize, chosen: Option<usize>) -> Mode {
+        let e = &self.edges[edge];
+        if Some(edge) == chosen || (!e.is_inner && e.driver == Driver::Sub) {
+            Mode::Compare
+        } else {
+            Mode::Driven
+        }
+    }
+
+    /// Collect into `out` the nodes to count under `index`, decided in
+    /// `mode`: a compared node and every node its comparison may reach
+    /// through inner edges; nothing under a driven node but the RIGHT
+    /// children that drive it.
+    fn count_below(&self, index: usize, mode: Mode, out: &mut Vec<usize>) {
+        let mode = self.mode_of(index, mode);
+        if mode == Mode::Compare {
+            out.push(index);
+        }
+        let children: Vec<usize> = self.edges_of(index).map(|(edge, _)| edge).collect();
+        for edge in children {
+            let below = match mode {
+                Mode::Compare if self.edges[edge].is_inner => Mode::Compare,
+                _ => self.mode_below(edge, None),
+            };
+            self.count_below(self.edges[edge].child, below, out);
+        }
+    }
+
+    /// The counts the planner wants, all at once: for each node it may
+    /// compare, its index, the query to count (the node's own filter,
     /// cursor included, with its `EXISTS` leaves taken as true and no
     /// `LIMIT`) and the cap.
     pub fn counts(&self) -> Vec<(usize, SingleTableReadQuery, u64)> {
@@ -168,120 +256,30 @@ impl Planner {
         }
     }
 
-    /// Decide every inner edge's driver from the counts in, or refuse. A
-    /// node something already drives from above drives the edges below
-    /// it. Otherwise the side that is bounded drives the one that is not;
-    /// with both bounded, the smaller count drives (strictly when the
-    /// parent is a page, with the preferred side's allowance when not), a
-    /// side bounded by a count drives one bounded only by its window, and
-    /// two sides bounded only by their windows are driven from the parent;
-    /// with neither bounded the edge stays undecided and the query is
-    /// refused.
+    /// Decide every inner edge's driver from the counts in, or refuse:
+    /// the tree from the root down, each node by the rule in the module
+    /// docs (the smallest of the node and its inner subs drives, the rest
+    /// are driven; a node narrowed from above drives them all). Every
+    /// page left driving an inner edge is then marked read whole when its
+    /// count is within the whole-page limit, in batches otherwise.
     pub fn decide(mut self) -> Result<MultiTableReadQuery, String> {
         if self.counted.is_empty() {
             return Ok(self.query);
         }
-        let limit = self.policy.limit;
-        let paged: Vec<bool> = self
-            .nodes
-            .iter()
-            .map(|node| node.query.limit != u32::MAX)
-            .collect();
-        let counts: Vec<Option<u64>> = self
-            .nodes
-            .iter()
-            .map(|node| node.count.filter(|count| *count <= limit))
-            .collect();
-        let mut bounded: Vec<bool> = (0..self.nodes.len())
-            .map(|index| paged[index] || counts[index].is_some())
-            .collect();
-        let mut above: Vec<Option<usize>> = vec![None; self.nodes.len()];
-        for (index, edge) in self.edges.iter().enumerate() {
-            above[edge.child] = Some(index);
-        }
-        let mut order: Vec<usize> = (0..self.edges.len()).collect();
-        order.sort_by_key(|&index| self.nodes[self.edges[index].parent].path.len());
-        loop {
-            let mut changed = false;
-            for &index in &order {
-                let edge = &self.edges[index];
-                if !edge.is_inner || edge.decided {
-                    let (from, to) = match edge.driver {
-                        Driver::Main => (edge.parent, edge.child),
-                        Driver::Sub => (edge.child, edge.parent),
-                    };
-                    if bounded[from] && !bounded[to] {
-                        bounded[to] = true;
-                        changed = true;
-                    }
-                    continue;
-                }
-                let (parent, child) = (edge.parent, edge.child);
-                let driven_from_above = above[parent].is_some_and(|up| {
-                    let up = &self.edges[up];
-                    up.decided && up.driver == Driver::Main
-                });
-                let chosen = if driven_from_above && bounded[parent] {
-                    Some(Driver::Main)
-                } else {
-                    match (bounded[parent], bounded[child]) {
-                        (true, false) => Some(Driver::Main),
-                        (false, true) => Some(Driver::Sub),
-                        (true, true) => Some(match (counts[parent], counts[child]) {
-                            (Some(main), Some(sub)) if paged[parent] => {
-                                if main < sub {
-                                    Driver::Main
-                                } else {
-                                    Driver::Sub
-                                }
-                            }
-                            (Some(main), Some(sub)) => smaller(main, sub, self.policy.preferred),
-                            (Some(_), None) => Driver::Main,
-                            (None, Some(_)) => Driver::Sub,
-                            (None, None) => Driver::Main,
-                        }),
-                        (false, false) => None,
-                    }
-                };
-                if let Some(driver) = chosen {
-                    let edge = &mut self.edges[index];
-                    edge.driver = driver;
-                    edge.decided = true;
-                    let to = match driver {
-                        Driver::Main => child,
-                        Driver::Sub => parent,
-                    };
-                    if !bounded[to] {
-                        bounded[to] = true;
-                    }
-                    changed = true;
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
-        let undecided: Vec<&PlanEdge> = self
-            .edges
-            .iter()
-            .filter(|edge| edge.is_inner && !edge.decided)
-            .collect();
-        let over: Vec<usize> = (0..self.nodes.len())
-            .filter(|&index| !bounded[index])
-            .collect();
-        if !undecided.is_empty() || !over.is_empty() {
+        let ranks = self.ranks();
+        let mut drivers: Vec<Option<Driver>> = vec![None; self.edges.len()];
+        let mut over: Vec<usize> = Vec::new();
+        self.decide_node(0, Mode::Compare, &ranks, &mut drivers, &mut over);
+        if !over.is_empty() {
             return Err(self.refusal(&over));
         }
         let decisions: Vec<(Vec<usize>, usize, Driver)> = self
             .edges
             .iter()
-            .filter(|edge| edge.is_inner)
-            .map(|edge| {
-                (
-                    self.nodes[edge.parent].path.clone(),
-                    edge.position,
-                    edge.driver,
-                )
+            .enumerate()
+            .filter_map(|(index, edge)| {
+                drivers[index]
+                    .map(|driver| (self.nodes[edge.parent].path.clone(), edge.position, driver))
             })
             .collect();
         for (path, position, driver) in decisions {
@@ -289,7 +287,142 @@ impl Planner {
                 join.driver = driver;
             }
         }
+        let whole = self.policy.whole;
+        let pages: Vec<(Vec<usize>, PageRead)> =
+            self.nodes
+                .iter()
+                .enumerate()
+                .filter(|(index, node)| {
+                    node.query.limit != u32::MAX
+                        && self.edges.iter().enumerate().any(|(edge, e)| {
+                            e.parent == *index && drivers[edge] == Some(Driver::Main)
+                        })
+                })
+                .map(|(_, node)| {
+                    let read = match node.count {
+                        Some(count) if count <= whole => PageRead::Whole,
+                        _ => PageRead::Batched,
+                    };
+                    (node.path.clone(), read)
+                })
+                .collect();
+        for (path, read) in pages {
+            if let Some(node) = self.query.node_at_mut(&path) {
+                node.page = read;
+            }
+        }
         Ok(self.query)
+    }
+
+    /// How small every node is, subs before their parents: measured when
+    /// its count is within the limit, bounded by its page when it has
+    /// one, narrowed when one of its inner subs, or a RIGHT child, is
+    /// itself bounded, unbounded otherwise.
+    fn ranks(&self) -> Vec<Rank> {
+        let limit = self.policy.limit;
+        let mut ranks = vec![Rank::Unbounded; self.nodes.len()];
+        for index in (0..self.nodes.len()).rev() {
+            let node = &self.nodes[index];
+            let narrowed = self.edges_of(index).any(|(_, edge)| {
+                (edge.is_inner || edge.driver == Driver::Sub)
+                    && ranks[edge.child] != Rank::Unbounded
+            });
+            ranks[index] = match node.count {
+                Some(count) if count <= limit => Rank::Measured(count),
+                _ if node.query.limit != u32::MAX => Rank::Paged,
+                _ if narrowed => Rank::Narrowed,
+                _ => Rank::Unbounded,
+            };
+        }
+        ranks
+    }
+
+    /// Decide the node `index` in `mode` and every node below it: the
+    /// driver of each inner edge under it into `drivers`, the nodes no
+    /// side can drive into `over`.
+    fn decide_node(
+        &self,
+        index: usize,
+        mode: Mode,
+        ranks: &[Rank],
+        drivers: &mut [Option<Driver>],
+        over: &mut Vec<usize>,
+    ) {
+        let mode = self.mode_of(index, mode);
+        let inner: Vec<usize> = self
+            .edges_of(index)
+            .filter(|(_, edge)| edge.is_inner)
+            .map(|(edge, _)| edge)
+            .collect();
+        let chosen = match mode {
+            Mode::Driven => None,
+            Mode::Compare => self.smallest(index, &inner, ranks, over),
+        };
+        for &edge in &inner {
+            drivers[edge] = Some(if Some(edge) == chosen {
+                Driver::Sub
+            } else {
+                Driver::Main
+            });
+        }
+        let children: Vec<usize> = self.edges_of(index).map(|(edge, _)| edge).collect();
+        for edge in children {
+            let below = self.mode_below(edge, chosen);
+            self.decide_node(self.edges[edge].child, below, ranks, drivers, over);
+        }
+    }
+
+    /// Among the node `index` and its inner subs (`inner`, as edges),
+    /// the side that drives: `None` for the node itself, `Some(edge)`
+    /// for a sub. The smallest rank wins; a tie between the node and a
+    /// sub goes to the sub when the node is a page (restricted, its
+    /// window stays exact) and to the preferred side otherwise, and a
+    /// tie between subs to the first. With no side bounded the node and
+    /// its unbounded subs are recorded in `over` and the node is left
+    /// driving.
+    fn smallest(
+        &self,
+        index: usize,
+        inner: &[usize],
+        ranks: &[Rank],
+        over: &mut Vec<usize>,
+    ) -> Option<usize> {
+        let own = match ranks[index] {
+            rank @ (Rank::Measured(_) | Rank::Paged) => Some(rank),
+            Rank::Narrowed | Rank::Unbounded => None,
+        };
+        let best = inner
+            .iter()
+            .copied()
+            .filter(|&edge| ranks[self.edges[edge].child] != Rank::Unbounded)
+            .min_by_key(|&edge| ranks[self.edges[edge].child]);
+        match (own, best) {
+            (None, None) => {
+                over.push(index);
+                over.extend(
+                    inner
+                        .iter()
+                        .map(|&edge| self.edges[edge].child)
+                        .filter(|&child| ranks[child] == Rank::Unbounded),
+                );
+                None
+            }
+            (Some(_), None) => None,
+            (None, Some(edge)) => Some(edge),
+            (Some(own), Some(edge)) => {
+                let sub = ranks[self.edges[edge].child];
+                let paged = self.nodes[index].query.limit != u32::MAX;
+                let sub_wins = match sub.cmp(&own) {
+                    std::cmp::Ordering::Less => true,
+                    std::cmp::Ordering::Greater => false,
+                    std::cmp::Ordering::Equal => match own {
+                        Rank::Measured(_) => paged || self.policy.preferred == Side::Child,
+                        _ => false,
+                    },
+                };
+                sub_wins.then_some(edge)
+            }
+        }
     }
 
     /// The reason for refusing: every node that came out over the limit.
@@ -318,18 +451,6 @@ pub fn page_drives(query: &MultiTableReadQuery) -> bool {
     query.joins.iter().any(|join| {
         (paged && join.is_inner && join.driver == Driver::Main) || page_drives(&join.sub)
     })
-}
-
-/// Which side of an inner edge drives it when both fit by their own
-/// counts: the smaller one, the preferred side winning unless the other
-/// is at most half its size.
-fn smaller(main: u64, sub: u64, preferred: Side) -> Driver {
-    match preferred {
-        Side::Parent if sub < main && sub.saturating_mul(2) <= main => Driver::Sub,
-        Side::Parent => Driver::Main,
-        Side::Child if main < sub && main.saturating_mul(2) <= sub => Driver::Main,
-        Side::Child => Driver::Sub,
-    }
 }
 
 /// Flatten `query`'s subtree at `path` into `nodes` and `edges`; `above`
@@ -368,7 +489,6 @@ fn flatten(
             position,
             driver: join.driver,
             is_inner: join.is_inner,
-            decided: !join.is_inner,
         });
     }
     index
@@ -603,9 +723,51 @@ mod tests {
         (asked, planner.decide())
     }
 
-    /// The policy with `limit`, preferring `preferred`.
+    /// The policy with `limit`, preferring `preferred`, reading no page
+    /// whole.
     fn policy(limit: u64, preferred: Side) -> Policy {
-        Policy { limit, preferred }
+        Policy {
+            limit,
+            preferred,
+            whole: 0,
+        }
+    }
+
+    /// A page that drives is read whole when its count is within the
+    /// whole-page limit and in batches otherwise; a page a sub drives, and
+    /// a node without a page, are left as translated.
+    #[test]
+    fn a_driving_page_is_read_whole_within_the_whole_page_limit() {
+        let whole = Policy {
+            limit: 100,
+            preferred: Side::Parent,
+            whole: 10,
+        };
+        for (messages, expected) in [(10, PageRead::Whole), (11, PageRead::Batched)] {
+            let (_, outcome) = drive(
+                Planner::new(messages_in_channel(50).query, whole),
+                &[("messages", messages), ("conversations", 101)],
+            );
+            let planned = outcome.expect("planned");
+            assert_eq!(planned.joins[0].driver, Driver::Main, "the page drives");
+            assert_eq!(planned.page, expected, "a page of {messages} rows");
+        }
+        let (_, outcome) = drive(
+            Planner::new(messages_in_channel(50).query, whole),
+            &[("messages", 5), ("conversations", 3)],
+        );
+        let planned = outcome.expect("planned");
+        assert_eq!(planned.joins[0].driver, Driver::Sub, "the sub drives");
+        assert_eq!(planned.page, PageRead::Batched, "left as translated");
+        let (_, outcome) = drive(
+            Planner::new(messages_in_channel(u32::MAX).query, whole),
+            &[("messages", 5), ("conversations", 101)],
+        );
+        assert_eq!(
+            outcome.expect("planned").page,
+            PageRead::Batched,
+            "no page, nothing to read whole"
+        );
     }
 
     /// A query without joins is registered as it is with nothing counted.
@@ -927,18 +1089,66 @@ mod tests {
         );
     }
 
-    /// Preferring the parent flips the edge when both sides fit and the
-    /// child is not much the smaller.
+    /// The preferred side gets no allowance: the smaller side drives
+    /// however slightly smaller it is, and the preferred side decides a
+    /// tie only.
     #[test]
-    fn a_preferred_parent_that_fits_drives() {
-        let (_, outcome) = drive(
-            Planner::new(
-                messages_in_channel(u32::MAX).query,
-                policy(100, Side::Parent),
+    fn the_preferred_side_breaks_a_tie_only() {
+        for (messages, conversations, preferred, expected) in [
+            (40, 30, Side::Parent, Driver::Sub),
+            (30, 30, Side::Parent, Driver::Main),
+            (30, 30, Side::Child, Driver::Sub),
+        ] {
+            let (_, outcome) = drive(
+                Planner::new(messages_in_channel(u32::MAX).query, policy(100, preferred)),
+                &[("messages", messages), ("conversations", conversations)],
+            );
+            assert_eq!(
+                outcome.expect("planned").joins[0].driver,
+                expected,
+                "{messages} messages, {conversations} conversations, preferring {preferred:?}"
+            );
+        }
+    }
+
+    /// A node and all its inner subs are compared at once: the smallest
+    /// of them drives, and every other sub is driven by the node, however
+    /// small it is by itself.
+    #[test]
+    fn the_smallest_of_a_node_and_its_subs_drives_and_the_rest_are_driven() {
+        let channels =
+            MultiTableReadQuery::single(node("channels", Where::AND(Vec::new()), u32::MAX));
+        let users = MultiTableReadQuery::single(node("users", Where::AND(Vec::new()), u32::MAX));
+        let query = MultiTableReadQuery::new(
+            node(
+                "messages",
+                Where::AND(vec![
+                    Where::exists("channelId", 0),
+                    Where::exists("senderId", 1),
+                ]),
+                u32::MAX,
             ),
-            &[("messages", 40), ("conversations", 30)],
+            vec![
+                Join::inner(channels, "channelId", "id"),
+                Join::inner(users, "senderId", "id"),
+            ],
         );
-        assert_eq!(outcome.expect("planned").joins[0].driver, Driver::Main);
+        for (channels, users, expected) in [
+            (10, 5, [Driver::Main, Driver::Sub]),
+            (10, 30, [Driver::Sub, Driver::Main]),
+            (50, 60, [Driver::Main, Driver::Main]),
+        ] {
+            let (_, outcome) = drive(
+                Planner::new(query.clone(), policy(100, Side::Parent)),
+                &[("messages", 40), ("channels", channels), ("users", users)],
+            );
+            let planned = outcome.expect("planned");
+            assert_eq!(
+                [planned.joins[0].driver, planned.joins[1].driver],
+                expected,
+                "40 messages, {channels} channels, {users} users"
+            );
+        }
     }
 
     /// A planned page that drives is reported as such, at any depth.
@@ -958,15 +1168,16 @@ mod tests {
 
     /// With both sides measured the smaller one drives, whichever is
     /// preferred: a project's few boards drive the workspace's stages, a
-    /// conversation's few messages drive the channels of the access rule.
+    /// conversation's few messages drive the channels of the access rule;
+    /// equal counts go to the preferred side.
     #[test]
     fn the_smaller_side_drives() {
         for (messages, conversations, preferred, expected) in [
             (90, 5, Side::Parent, Driver::Sub),
-            (90, 46, Side::Parent, Driver::Main),
+            (90, 46, Side::Parent, Driver::Sub),
             (5, 90, Side::Parent, Driver::Main),
             (5, 90, Side::Child, Driver::Main),
-            (46, 90, Side::Child, Driver::Sub),
+            (46, 90, Side::Child, Driver::Main),
             (90, 5, Side::Child, Driver::Sub),
             (0, 0, Side::Parent, Driver::Main),
             (0, 0, Side::Child, Driver::Sub),
@@ -1031,11 +1242,11 @@ mod tests {
         assert!(outcome.is_ok());
     }
 
-    /// Each inner edge is decided on its own: the big child's edge flips
-    /// to the parent, the small child's keeps the child, the LEFT edge and
-    /// the leaves stay put.
+    /// A node is decided with all its subs at once: the smallest sub
+    /// drives it, the big sub is driven by it, the LEFT edge and the
+    /// leaves stay put.
     #[test]
-    fn edges_are_decided_one_by_one_in_place() {
+    fn a_node_is_decided_with_all_its_subs_at_once() {
         let channels =
             MultiTableReadQuery::single(node("channels", Where::AND(Vec::new()), u32::MAX));
         let users = MultiTableReadQuery::single(node("users", Where::AND(Vec::new()), u32::MAX));
@@ -1074,8 +1285,9 @@ mod tests {
         );
     }
 
-    /// An inner edge below the root is planned like one at the root: the
-    /// nested big child's edge flips to its (driven, so bounded) parent.
+    /// Under a LEFT child nothing is compared or counted: the child is
+    /// driven by its parent, so it drives its own inner sub, whatever the
+    /// sub holds.
     #[test]
     fn a_nested_inner_edge_is_planned_too() {
         let members =
@@ -1094,8 +1306,8 @@ mod tests {
         );
         assert_eq!(
             asked,
-            vec!["tickets", "members"],
-            "the LEFT child is driven and not counted; its inner child is"
+            vec!["tickets"],
+            "the LEFT child is driven, so neither it nor anything below it is counted"
         );
         let planned = outcome.expect("planned");
         assert_eq!(planned.joins[0].sub.joins[0].driver, Driver::Main);

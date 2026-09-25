@@ -125,12 +125,17 @@ pub struct Config {
     /// neither does, and a storage read returning more is refused.
     /// `XYNE_SYNC_JOIN_LIMIT`, the planner's older name, is still read.
     pub row_limit: u64,
+    /// `XYNE_SYNC_WHOLE_PAGE_LIMIT`: the most rows a page that drives an
+    /// inner join is read whole for (5000): within it the page's rows are
+    /// all read in one go and the limit applied in memory, so the join's
+    /// restriction stays exact; past it the page is read in batches that
+    /// double per round, the rows the join rejects dropped.
+    pub whole_page_limit: u64,
     /// `XYNE_SYNC_JOIN_PREFERRED_SIDE`: which side of an INNER join drives
-    /// it when both fit, `parent` (the default: the parent is the query's
-    /// own key-filtered rows and the child is usually an access rule over
-    /// a whole table, so driving from the parent reads the child narrowed
-    /// to the parent's join values instead of whole) or `child` (the
-    /// subquery drives, Zero's `whereExists` as translated).
+    /// it when the two count the same (the smaller side drives otherwise,
+    /// and a page is always restricted by a sub that counts the same),
+    /// `parent` (the default) or `child` (the subquery, Zero's
+    /// `whereExists` as translated).
     pub join_preferred_side: Side,
     /// `XYNE_SYNC_PLAN_TTL_MS`: how long a join plan is remembered before
     /// the query is counted again (600000).
@@ -227,6 +232,12 @@ impl Config {
                     format!("XYNE_SYNC_ROW_LIMIT must be a positive number of rows, got `{text}`")
                 })?,
             None => 100_000,
+        };
+        let whole_page_limit = match first(&["XYNE_SYNC_WHOLE_PAGE_LIMIT"]) {
+            Some(text) => text.parse::<u64>().map_err(|_| {
+                format!("XYNE_SYNC_WHOLE_PAGE_LIMIT must be a number of rows, got `{text}`")
+            })?,
+            None => 5_000,
         };
         let join_preferred_side = match first(&["XYNE_SYNC_JOIN_PREFERRED_SIDE"]).as_deref() {
             None | Some("parent") => Side::Parent,
@@ -340,6 +351,7 @@ impl Config {
                 None => 500,
             },
             row_limit,
+            whole_page_limit,
             join_preferred_side,
             plan_ttl: millis("XYNE_SYNC_PLAN_TTL_MS", 600_000)?,
             plan_cache: match first(&["XYNE_SYNC_PLAN_CACHE"]) {
@@ -369,6 +381,7 @@ impl Config {
         Policy {
             limit: self.row_limit,
             preferred: self.join_preferred_side,
+            whole: self.whole_page_limit.min(self.row_limit),
         }
     }
 
