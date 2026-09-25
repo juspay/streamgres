@@ -69,8 +69,8 @@ use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow};
 use super::storage::{Storage, StorageError};
 use crate::log::{log_info, log_warn};
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameRow, DbTable, Lsn, RowData, SingleTableReadQuery, Snapshot,
-    Value, ValueType,
+    Catalog, DataFrameKey, DataFrameRow, DbTable, Lsn, MultiTableReadQuery, RowData,
+    SingleTableReadQuery, Snapshot, Value, ValueType,
 };
 use replication::ReplicationConnection;
 
@@ -548,16 +548,16 @@ impl Storage for PgStorage {
         .await
     }
 
-    /// `SELECT count(*)` over at most `cap` matching rows, on the same
-    /// snapshot a read would use.
-    async fn count(&self, query: &SingleTableReadQuery, cap: u64) -> Result<u64, StorageError> {
+    /// `SELECT count(*)` over at most `cap` matching rows, the tree's
+    /// inner edges as `EXISTS` subqueries, on the same snapshot a read
+    /// would use.
+    async fn count(&self, query: &MultiTableReadQuery, cap: u64) -> Result<u64, StorageError> {
         let pool = self.pool.clone();
         let query = query.clone();
         run_on(&self.pool.runtime, async move {
             let (alias, catalog) = pool.current_alias()?;
-            let table = table_of(&catalog, &query)?;
-            let sql = sql::count_sql(&query, table, cap);
-            let what = format!("counting the rows of `{}`", query.table);
+            let sql = sql::count_sql(&query, &catalog, cap).map_err(StorageError)?;
+            let what = format!("counting the rows of `{}`", query.main_table.table);
             let rows = pool.read(&alias, &what, &sql, None).await?;
             let text = rows
                 .first()

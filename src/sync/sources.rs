@@ -12,7 +12,8 @@ use super::pg::PgStorage;
 use super::storage::{MemoryStorage, Storage, StorageError};
 use crate::ivm::SchemaChange;
 use crate::model::{
-    Catalog, Lsn, Order, OrderBy, SingleTableReadQuery, Snapshot, TableName, Where, WriteQuery,
+    Catalog, Lsn, MultiTableReadQuery, Order, OrderBy, SingleTableReadQuery, Snapshot, TableName,
+    Where, WriteQuery,
 };
 
 /// The environment variable naming the tables to mirror in memory.
@@ -129,9 +130,14 @@ impl Storage for Sources {
         }
     }
 
-    /// The count from whichever source holds the table.
-    async fn count(&self, query: &SingleTableReadQuery, cap: u64) -> Result<u64, StorageError> {
-        if self.is_cached(&query.table) {
+    /// The count from the mirror when it holds every table of the tree,
+    /// from Postgres (which holds them all) otherwise.
+    async fn count(&self, query: &MultiTableReadQuery, cap: u64) -> Result<u64, StorageError> {
+        if query
+            .tables()
+            .into_iter()
+            .all(|table| self.is_cached(table))
+        {
             self.memory.count(query, cap).await
         } else {
             self.pg.count(query, cap).await

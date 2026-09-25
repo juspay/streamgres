@@ -107,7 +107,7 @@ listed with their defaults so the manifest can carry them explicitly.
 | `XYNE_SYNC_PG_KEEPALIVE_IDLE_MS`, `XYNE_SYNC_PG_KEEPALIVE_INTERVAL_MS`, `XYNE_SYNC_PG_KEEPALIVE_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on every connection to the database: after the idle time without a byte either way the kernel probes the peer, again at the interval while unanswered, and gives the connection up after that many unanswered in a row. Keep the idle time under whatever a NAT or load balancer between drops silent flows at (section 4); `0` turns the probing off |
 | `XYNE_SYNC_BACKEND_TIMEOUT_MS` | `30000` | how long one call to the backend (a transform, a push) may take; a call that timed out is not made again; `0` sets no limit |
 | `XYNE_SYNC_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is minted |
-| `XYNE_SYNC_JOIN_PREFERRED_SIDE` | `parent` | which side of an inner join drives when both count the same (the smaller side drives otherwise) |
+| `XYNE_SYNC_JOIN_PREFERRED_SIDE` | `parent` | which side of an inner join drives when reading the node whole and having its subs drive it would hold the same rows (the plan holding fewer wins otherwise; the subs drive when they cut the node down by more than they cost, the leaves of an access rule driving the page they narrow) |
 | `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE` | `600000`, `10000` | join plans remembered |
 | `XYNE_SYNC_TRANSFORM_TTL_MS`, `XYNE_SYNC_TRANSFORM_CACHE` | `60000`, `20000` | the backend's query transforms remembered per identity; the reference server keeps its own for 5 s, which cost a hydration about 8 ms at the median on the test rig |
 | `XYNE_SYNC_WARM_START_MS` | `20000` | the most time spent planning the kept shapes at start |

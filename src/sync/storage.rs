@@ -12,12 +12,14 @@
 //! once the stream has passed it.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::ivm::{SchemaChange, conform, evaluate, order_rows};
-use crate::model::{Catalog, Snapshot};
+use crate::ivm::{SchemaChange, conform, evaluate, evaluate_with, order_rows};
+use crate::model::{Catalog, ComparisonOperator, Condition, MultiTableReadQuery, Snapshot, Value};
 use crate::model::{DataFrameKey, DataFrameRow, Lsn, SingleTableReadQuery, TableName, WriteQuery};
 
 /// A failed storage read; the runtime parks the read and hands it out
@@ -78,19 +80,21 @@ pub trait Storage {
         self.select(&query).await
     }
 
-    /// How many rows of `query.table` satisfy `query.filter`, counted no
-    /// further than `cap`: the answer is exact below `cap`, and `cap`
-    /// itself means "at least that many". A planner asks this before it
-    /// registers a join, to learn which side is small enough to read
-    /// whole; a source that can stop counting early does, and the default
-    /// reads the rows and counts them.
-    async fn count(&self, query: &SingleTableReadQuery, cap: u64) -> Result<u64, StorageError> {
-        let unlimited = SingleTableReadQuery {
-            limit: u32::MAX,
-            ..query.clone()
-        };
-        let snapshot = self.select(&unlimited).await?;
-        Ok((snapshot.rows.len() as u64).min(cap))
+    /// How many rows of `query`'s main table satisfy its filter with every
+    /// `EXISTS` leaf answered by the inner edge it names — a row of the
+    /// sub carrying the row's join value and satisfying the sub's own
+    /// filter the same way, all the way down; an `EXISTS` naming no inner
+    /// edge is false, an inner edge no leaf names is required, and an
+    /// outer edge plays no part — counted no further than `cap`: the
+    /// answer is exact below `cap`, and `cap` itself means "at least that
+    /// many". A planner asks this before it registers a join, once on a
+    /// node alone (its `EXISTS` leaves already taken as true) and once
+    /// with its subtree, to learn how small the node is by itself and how
+    /// small its subs make it; a source that can stop counting early does,
+    /// and the default reads the rows of every node and counts them
+    /// ([`count_by_select`]).
+    async fn count(&self, query: &MultiTableReadQuery, cap: u64) -> Result<u64, StorageError> {
+        count_by_select(self, query, cap).await
     }
 
     /// The stream has been delivered (and applied by the engine) up to
@@ -126,6 +130,98 @@ pub trait Storage {
     /// snapshot holding it is current as soon as the feed reaches it.
     /// No-op by default.
     fn mint_now(&self) {}
+}
+
+/// [`Storage::count`] done by reading: the rows of `query`'s main table
+/// (its filter as it stands, no `LIMIT`), kept when the filter holds with
+/// each `EXISTS` leaf answered from the join values the sub it names
+/// produces, the sub read the same way. Every node of the tree is read
+/// whole, which suits a source that holds its rows in memory; a source
+/// that would read many rows answers [`Storage::count`] itself.
+pub async fn count_by_select<S: Storage + ?Sized>(
+    storage: &S,
+    query: &MultiTableReadQuery,
+    cap: u64,
+) -> Result<u64, StorageError> {
+    let rows = matching_rows(storage, query).await?;
+    Ok((rows.len() as u64).min(cap))
+}
+
+/// The rows a node contributes to a count, still being read.
+type Matching<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<(DataFrameKey, DataFrameRow)>, StorageError>> + 'a>>;
+
+/// The rows of `node`'s main table [`count_by_select`] counts, boxed so
+/// the tree is walked recursively: each inner sub's matching rows give
+/// the join values a row of the node may carry, and a row is kept when
+/// its filter holds with the `EXISTS` leaves answered from them and it
+/// carries a value of every inner edge no leaf names.
+fn matching_rows<'a, S: Storage + ?Sized>(
+    storage: &'a S,
+    node: &'a MultiTableReadQuery,
+) -> Matching<'a> {
+    Box::pin(async move {
+        let unlimited = SingleTableReadQuery {
+            limit: u32::MAX,
+            ..node.main_table.clone()
+        };
+        let snapshot = storage.select(&unlimited).await?;
+        let mut values: Vec<HashSet<Value>> = Vec::with_capacity(node.joins.len());
+        for join in &node.joins {
+            let mut carried = HashSet::new();
+            if join.is_inner {
+                for (_, row) in matching_rows(storage, &join.sub).await? {
+                    if let Some(value) = row.data.get(&join.sub_table_column)
+                        && !value.is_null()
+                    {
+                        carried.insert(value.clone());
+                    }
+                }
+            }
+            values.push(carried);
+        }
+        let inner: Vec<usize> = node.inner_positions().collect();
+        let named: Vec<usize> = node
+            .main_table
+            .filter
+            .leaf_conditions()
+            .into_iter()
+            .filter(|leaf| leaf.comparison_operator == ComparisonOperator::EXISTS)
+            .filter_map(|leaf| exists_position(&inner, &leaf.value))
+            .collect();
+        let rows = snapshot
+            .rows
+            .into_iter()
+            .filter(|(_, row)| {
+                let carries = |position: usize| {
+                    let join = &node.joins[position];
+                    row.data
+                        .get(&join.main_table_column)
+                        .is_some_and(|value| values[position].contains(value))
+                };
+                let exists =
+                    |leaf: &Condition| exists_position(&inner, &leaf.value).is_some_and(carries);
+                evaluate_with(&node.main_table.filter, &row.data, &mut 0, &exists)
+                    && inner
+                        .iter()
+                        .filter(|position| !named.contains(position))
+                        .all(|&position| carries(position))
+            })
+            .collect();
+        Ok(rows)
+    })
+}
+
+/// The position in `joins` of the inner edge an `EXISTS` leaf's operand
+/// names, given the positions of the inner edges in order; `None` when it
+/// names none.
+fn exists_position(inner: &[usize], operand: &Value) -> Option<usize> {
+    match operand {
+        Value::Int(index) => usize::try_from(*index)
+            .ok()
+            .and_then(|index| inner.get(index).copied()),
+        _ => None,
+    }
 }
 
 /// In-process storage: plain tables of rows, kept in insertion order so

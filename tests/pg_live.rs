@@ -613,13 +613,75 @@ fn a_count_stops_at_the_cap_on_the_snapshot() {
         catch_up(&mut runtime, &mut stream, &[&storage]).await;
 
         let open = names.spec().main_table;
-        assert_eq!(storage.count(&open, 2).await.expect("count"), 2);
-        assert_eq!(storage.count(&open, 10).await.expect("count"), 3);
-        let none = SingleTableReadQuery {
+        let alone = MultiTableReadQuery::single(open.clone());
+        assert_eq!(storage.count(&alone, 2).await.expect("count"), 2);
+        assert_eq!(storage.count(&alone, 10).await.expect("count"), 3);
+        let none = MultiTableReadQuery::single(SingleTableReadQuery {
             filter: Where::condition("status", ComparisonOperator::EQ, "GONE"),
             ..open.clone()
-        };
+        });
         assert_eq!(storage.count(&none, 10).await.expect("count"), 0);
+        let under = |filter: Where, name: &str| {
+            MultiTableReadQuery::new(
+                SingleTableReadQuery {
+                    filter,
+                    ..open.clone()
+                },
+                vec![Join::inner(
+                    MultiTableReadQuery::single(SingleTableReadQuery::new(
+                        names.users.as_str(),
+                        Where::condition("name", ComparisonOperator::EQ, name),
+                        OrderBy::new("id", Order::ASC),
+                        u32::MAX,
+                    )),
+                    "assigned_to",
+                    "id",
+                )],
+            )
+        };
+        let open_and = |name: &str| {
+            under(
+                Where::AND(vec![
+                    Where::condition("status", ComparisonOperator::EQ, "OPEN"),
+                    Where::exists("assigned_to", 0),
+                ]),
+                name,
+            )
+        };
+        assert_eq!(
+            storage.count(&open_and("meera"), 10).await.expect("count"),
+            2,
+            "the tree is counted through its EXISTS on the database"
+        );
+        assert_eq!(
+            storage.count(&open_and("arjun"), 10).await.expect("count"),
+            1
+        );
+        assert_eq!(
+            storage.count(&open_and("nobody"), 10).await.expect("count"),
+            0
+        );
+        let points_or = under(
+            Where::OR(vec![
+                Where::condition("points", ComparisonOperator::EQ, 3),
+                Where::exists("assigned_to", 0),
+            ]),
+            "meera",
+        );
+        assert_eq!(
+            storage.count(&points_or, 10).await.expect("count"),
+            3,
+            "an EXISTS under an OR counts where it stands"
+        );
+        let unnamed = under(
+            Where::condition("status", ComparisonOperator::EQ, "OPEN"),
+            "arjun",
+        );
+        assert_eq!(
+            storage.count(&unnamed, 10).await.expect("count"),
+            1,
+            "an inner edge no leaf names is conjoined"
+        );
         cleanup(&dsn, &client, &names).await;
     });
 }
@@ -759,7 +821,8 @@ fn a_json_column_is_filtered_by_value() {
                 let query = by(column, literal.clone());
                 let read = storage.select(&query).await.expect("the read is served");
                 assert_eq!(ids(&read), vec![expected], "{column} = {literal}");
-                assert_eq!(storage.count(&query, 10).await.expect("count"), 1);
+                let alone = MultiTableReadQuery::single(query.clone());
+                assert_eq!(storage.count(&alone, 10).await.expect("count"), 1);
                 assert_eq!(
                     read.rows[0].1.data.get(&ColumnName::from(column)),
                     Some(&Value::from(
@@ -873,7 +936,8 @@ fn a_read_past_its_time_is_refused() {
             .await
             .expect("an ordinary read is served");
         assert!(!served.rows.is_empty());
-        assert!(quick.count(&whole, 10).await.expect("an ordinary count") > 0);
+        let alone = MultiTableReadQuery::single(whole.clone());
+        assert!(quick.count(&alone, 10).await.expect("an ordinary count") > 0);
         let again = slow.select(&whole).await.expect_err("and again");
         assert!(again.refusal().is_some(), "{again}");
         cleanup(&dsn, &client, &names).await;

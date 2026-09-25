@@ -230,6 +230,15 @@ impl MultiTableReadQuery {
         }
     }
 
+    /// The node at `path` (the join positions from the root).
+    pub fn node_at(&self, path: &[usize]) -> Option<&MultiTableReadQuery> {
+        let mut node = self;
+        for &step in path {
+            node = &node.joins.get(step)?.sub;
+        }
+        Some(node)
+    }
+
     /// The node at `path` (the join positions from the root), mutably.
     pub fn node_at_mut(&mut self, path: &[usize]) -> Option<&mut MultiTableReadQuery> {
         let mut node = self;
@@ -252,6 +261,23 @@ impl MultiTableReadQuery {
             .enumerate()
             .filter(|(_, join)| join.is_inner)
             .map(|(position, _)| position)
+    }
+
+    /// The node's `index`-th inner edge: the one an `EXISTS` leaf with
+    /// that index names.
+    pub fn inner_join(&self, index: usize) -> Option<&Join> {
+        self.joins.iter().filter(|join| join.is_inner).nth(index)
+    }
+
+    /// Every table of the tree, the node's own first and then each sub's
+    /// in join order, depth first; a table used by two nodes is listed
+    /// twice.
+    pub fn tables(&self) -> Vec<&TableName> {
+        let mut out = vec![&self.main_table.table];
+        for join in &self.joins {
+            out.extend(join.sub.tables());
+        }
+        out
     }
 }
 
@@ -475,6 +501,18 @@ impl Where {
         self.leaf_conditions()
             .into_iter()
             .any(|leaf| leaf == condition)
+    }
+
+    /// Whether the tree requires `condition`: the leaf stands on a path
+    /// of `AND`s from the root, so no row satisfies the tree without it.
+    /// A leaf only found under an `OR` is not required (another branch
+    /// may hold instead).
+    pub fn requires(&self, condition: &Condition) -> bool {
+        match self {
+            Where::Condition(leaf) => leaf == condition,
+            Where::AND(children) => children.iter().any(|child| child.requires(condition)),
+            Where::OR(_) => false,
+        }
     }
 
     /// All leaf [`Condition`]s of the tree, in depth-first order — the raw

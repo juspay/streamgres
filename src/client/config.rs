@@ -132,10 +132,11 @@ pub struct Config {
     /// double per round, the rows the join rejects dropped.
     pub whole_page_limit: u64,
     /// `XYNE_SYNC_JOIN_PREFERRED_SIDE`: which side of an INNER join drives
-    /// it when the two count the same (the smaller side drives otherwise,
-    /// and a page is always restricted by a sub that counts the same),
-    /// `parent` (the default) or `child` (the subquery, Zero's
-    /// `whereExists` as translated).
+    /// it when reading the node whole and having its subs drive it would
+    /// hold the same rows (the plan holding fewer wins otherwise, and a
+    /// page is always driven by subs that hold the same), `parent` (the
+    /// default) or `child` (the subquery, Zero's `whereExists` as
+    /// translated).
     pub join_preferred_side: Side,
     /// `XYNE_SYNC_PLAN_TTL_MS`: how long a join plan is remembered before
     /// the query is counted again (600000).
