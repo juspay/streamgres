@@ -437,8 +437,13 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   the net of what it missed; a tab that joins a group under way without a
   cookie is sent the group's whole state from its row ledger, the other
   tabs undisturbed; a tab behind its group is replayed the pokes it missed
-  from the group's log (`XYNE_SYNC_GROUP_LOG_BYTES`); anything else
-  starts a fresh sync (`docs/client-resume-2026-09-21.md`).
+  from the group's log (`XYNE_SYNC_GROUP_LOG_BYTES`), each closing with
+  the group's mutation ids as they are now (read from the clients table
+  at every connect), so the first poke it processes already confirms
+  every mutation processed since — a stale replay would have it rebase a
+  pending mutation against rows since removed, fail, and reconnect into
+  the same replay; anything else starts a fresh sync
+  (`docs/client-resume-2026-09-21.md`).
 - **Bounded waits.** A storage read is given `XYNE_SYNC_READ_TIMEOUT_MS`
   (10 s): PostgreSQL cancels the statement, the pool stops waiting, and the
   query that needed it is refused by name rather than read again. A call
