@@ -351,8 +351,15 @@ pub fn delete_clients(deleted: &DeleteClients) -> String {
     )
 }
 
-/// `pushResponse`: the application server's per-mutation results.
-pub fn push_response(body: Json) -> String {
+/// `pushResponse`: only the receiving client's per-mutation results.
+/// Zero's mutation tracker rejects results belonging to another client,
+/// even when the push contains mutations recovered for that client.
+pub fn push_response(mut body: Json, client_id: &str) -> String {
+    if let Some(mutations) = body.get_mut("mutations").and_then(Json::as_array_mut) {
+        mutations.retain(|mutation| {
+            mutation.pointer("/id/clientID").and_then(Json::as_str) == Some(client_id)
+        });
+    }
     frame("pushResponse", body)
 }
 
@@ -380,6 +387,32 @@ pub fn poke_end(poke_id: &str, cookie: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_response_filters_results_by_receiving_client() {
+        let own_ok = json!({"id": {"clientID": "a", "id": 1}, "result": {}});
+        let own_error = json!({"id": {"clientID": "a", "id": 2}, "result": {"error": "app", "message": "denied"}});
+        let body = json!({"mutations": [
+            {"id": {"clientID": "b", "id": 1}, "result": {}},
+            own_ok,
+            {"id": {"clientID": "b", "id": 2}, "result": {"error": "app"}},
+            own_error
+        ]});
+        let frame: Json = serde_json::from_str(&push_response(body.clone(), "a")).unwrap();
+        assert_eq!(
+            frame,
+            json!(["pushResponse", {"mutations": [own_ok, own_error]}])
+        );
+        let frame: Json = serde_json::from_str(&push_response(body, "c")).unwrap();
+        assert_eq!(frame, json!(["pushResponse", {"mutations": []}]));
+    }
+
+    #[test]
+    fn push_response_preserves_push_errors() {
+        let body = json!({"error": "unsupportedPushVersion"});
+        let frame: Json = serde_json::from_str(&push_response(body.clone(), "a")).unwrap();
+        assert_eq!(frame, json!(["pushResponse", body]));
+    }
 
     /// Cookies order like numbers: length prefix, then base 36.
     #[test]

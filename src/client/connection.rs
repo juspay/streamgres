@@ -988,10 +988,16 @@ impl Conn {
                 if let Some(mutations) = json.get("mutations") {
                     send(
                         &self.out,
-                        protocol::push_response(json!({"mutations": mutations})),
+                        protocol::push_response(
+                            json!({"mutations": mutations}),
+                            &self.params.client_id,
+                        ),
                     );
                 } else if json.get("error").is_some() {
-                    send(&self.out, protocol::push_response(json));
+                    send(
+                        &self.out,
+                        protocol::push_response(json, &self.params.client_id),
+                    );
                 } else if json.get("kind").and_then(Json::as_str) == Some("PushFailed") {
                     send(
                         &self.out,
