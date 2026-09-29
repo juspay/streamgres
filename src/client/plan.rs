@@ -72,10 +72,22 @@
 //! The planner does no I/O: it hands out the counts it wants and takes
 //! the answers back, so the caller runs them wherever it can and the
 //! decision stays a pure function that tests drive with numbers. [`plan`]
-//! is that caller for the server: the cache first (keyed by the tree as
-//! translated, the same identity the engine's twin sharing uses), else
-//! the counts on the storage, concurrently, then the decision, remembered
-//! for a while so the next client of the same tree pays nothing.
+//! is that caller for the server, and it plans a query once per **name**
+//! rather than once per set of arguments: the plan (every edge's driver,
+//! every page's read) is remembered by the query's name for
+//! `XYNE_SYNC_PLAN_QUERY_TTL_MS` (a day) and laid onto every later tree
+//! of that name, whoever asks and with whatever arguments — ids, lists,
+//! page sizes, cursors — so the counts run a few dozen times a day, not
+//! once per user, channel or cursor. A plan is about the join tree, not
+//! the filters, so it lays onto any tree of the same join skeleton; a name
+//! whose arguments add or drop a join (an optional `whereExists`) is
+//! planned once per skeleton. So a plan is made on the numbers of the
+//! first arguments that ask, and a later argument the plan does not suit
+//! is bounded by the read limit like any read. Only a plan that was made
+//! is remembered by name; a refusal is remembered for its own tree only
+//! (keyed as translated, the identity the engine's twin sharing uses, for
+//! `XYNE_SYNC_PLAN_TTL_MS`), so one argument's refusal never spreads to
+//! every other.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -86,7 +98,7 @@ use futures_util::future::join_all;
 use super::ast::Translated;
 use crate::log::{Level, log_event};
 use crate::model::{
-    ColumnName, ComparisonOperator, Condition, Driver, MultiTableReadQuery, PageRead,
+    ColumnName, ComparisonOperator, Condition, Driver, Join, MultiTableReadQuery, PageRead,
     SingleTableReadQuery, Value,
 };
 use crate::sync::Storage;
@@ -645,12 +657,37 @@ fn join_at<'a>(
     query: &'a mut MultiTableReadQuery,
     path: &[usize],
     position: usize,
-) -> Option<&'a mut crate::model::Join> {
+) -> Option<&'a mut Join> {
     let mut node = query;
     for &step in path {
         node = &mut node.joins.get_mut(step)?.sub;
     }
     node.joins.get_mut(position)
+}
+
+/// Whether `a` and `b` have one join skeleton: at every position the same
+/// table, and under it the same joins — the same columns, inner or outer,
+/// in the same order, down to the leaves. Filters, cursors, limits and
+/// literals may differ; a plan made for one lays onto the other.
+fn same_skeleton(a: &MultiTableReadQuery, b: &MultiTableReadQuery) -> bool {
+    a.main_table.table == b.main_table.table
+        && a.joins.len() == b.joins.len()
+        && a.joins.iter().zip(&b.joins).all(|(x, y)| {
+            x.main_table_column == y.main_table_column
+                && x.sub_table_column == y.sub_table_column
+                && x.is_inner == y.is_inner
+                && same_skeleton(&x.sub, &y.sub)
+        })
+}
+
+/// Lay the plan of `planned` onto `query`, a tree of the same skeleton:
+/// every edge's driver and every node's page read.
+fn copy_plan(planned: &MultiTableReadQuery, query: &mut MultiTableReadQuery) {
+    query.page = planned.page;
+    for (from, to) in planned.joins.iter().zip(query.joins.iter_mut()) {
+        to.driver = from.driver;
+        copy_plan(&from.sub, &mut to.sub);
+    }
 }
 
 /// One remembered decision.
@@ -669,25 +706,86 @@ struct CacheState {
     tick: u64,
 }
 
-/// Remembered plans, keyed by the tree as translated: a hit skips the
-/// counts. An entry expires after `ttl` (a table that grew past the limit
-/// is re-counted eventually), and the least recently used entry leaves
-/// when `capacity` is reached (every literal in a filter is its own key).
+/// The plans made per query name, each tree planned with when it was
+/// made: one per join skeleton the name's arguments give it.
+type ByName = HashMap<String, Vec<(MultiTableReadQuery, Instant)>>;
+
+/// Remembered plans, two ways: by **query name**, the plans that were made,
+/// laid onto every later tree of the name with the same join skeleton for
+/// `name_ttl`; and by the tree as translated, every outcome, refusals
+/// included, for `ttl` (a table that grew past the limit is re-counted
+/// eventually). Each way holds at most `capacity` entries: the least
+/// recently used tree leaves, and the oldest query name.
 pub struct PlanCache {
     state: Mutex<CacheState>,
+    names: Mutex<ByName>,
     ttl: Duration,
+    name_ttl: Duration,
     capacity: usize,
 }
 
 impl PlanCache {
-    /// A cache keeping each decision for `ttl`, at most `capacity` of
-    /// them.
-    pub fn new(ttl: Duration, capacity: usize) -> Self {
+    /// A cache keeping each tree's outcome for `ttl` and each query name's
+    /// plans for `name_ttl` (zero keeps none), at most `capacity` of each.
+    pub fn new(ttl: Duration, capacity: usize, name_ttl: Duration) -> Self {
         PlanCache {
             state: Mutex::new(CacheState::default()),
+            names: Mutex::new(HashMap::new()),
             ttl,
+            name_ttl,
             capacity: capacity.max(1),
         }
+    }
+
+    /// `query` planned as the plan remembered for `name` says, when the
+    /// name has one younger than its TTL made for a tree of the same
+    /// join skeleton.
+    pub fn by_name(&self, name: &str, query: &MultiTableReadQuery) -> Option<MultiTableReadQuery> {
+        let mut names = self.lock_names();
+        let plans = names.get_mut(name)?;
+        plans.retain(|(_, at)| at.elapsed() <= self.name_ttl);
+        let planned = plans
+            .iter()
+            .find(|(planned, _)| same_skeleton(planned, query))
+            .map(|(planned, _)| planned);
+        let mut laid = query.clone();
+        copy_plan(planned?, &mut laid);
+        Some(laid)
+    }
+
+    /// Remember `planned`, the plan made for a query `name`, for every
+    /// later tree of the name with its join skeleton (in place of an
+    /// earlier plan of that skeleton); the oldest name leaves when the
+    /// cache is full.
+    pub fn remember(&self, name: &str, planned: &MultiTableReadQuery) {
+        if self.name_ttl.is_zero() {
+            return;
+        }
+        let mut names = self.lock_names();
+        if !names.contains_key(name) && names.len() >= self.capacity {
+            let oldest = names
+                .iter()
+                .min_by_key(|(_, plans)| plans.iter().map(|(_, at)| *at).max())
+                .map(|(name, _)| name.clone());
+            if let Some(oldest) = oldest {
+                names.remove(&oldest);
+            }
+        }
+        let plans = names.entry(name.to_owned()).or_default();
+        plans.retain(|(known, _)| !same_skeleton(known, planned));
+        plans.push((planned.clone(), Instant::now()));
+    }
+
+    /// How many query names have a plan remembered.
+    pub fn queries(&self) -> usize {
+        self.lock_names().len()
+    }
+
+    /// The plans by name, read through a poisoned lock.
+    fn lock_names(&self) -> std::sync::MutexGuard<'_, ByName> {
+        self.names
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The remembered decision for `query`, if it has one that has not
@@ -756,20 +854,26 @@ impl PlanCache {
     }
 }
 
-/// Plan `translated` under `policy`: the cache's decision when it has
-/// one, otherwise the counts on `storage` (concurrently) and the
-/// planner's decision, remembered in the cache. A count that fails (the
-/// database was unreachable, the count ran past the read timeout) refuses
-/// the query, saying so, and is not remembered: it says nothing about the
+/// Plan `translated`, the query `name`, under `policy`: the plan
+/// remembered for its name, laid onto it, when there is one for its join
+/// skeleton, else the outcome remembered for this very tree, else the
+/// counts on `storage` (concurrently) and the planner's decision —
+/// remembered by name when it is a plan, and by tree either way. A count that fails (the database
+/// was unreachable, the count ran past the read timeout) refuses the
+/// query, saying so, and is not remembered: it says nothing about the
 /// query, and the next asking counts again. The counts are logged at
 /// debug level, `table alone/narrowed` per node.
 pub async fn plan<S: Storage + ?Sized>(
+    name: &str,
     translated: Translated,
     policy: Policy,
     cache: &PlanCache,
     storage: &S,
 ) -> Result<Translated, String> {
     let Translated { query, hidden } = translated;
+    if let Some(query) = cache.by_name(name, &query) {
+        return Ok(Translated { query, hidden });
+    }
     if let Some(outcome) = cache.get(&query) {
         return outcome.map(|query| Translated { query, hidden });
     }
@@ -812,6 +916,9 @@ pub async fn plan<S: Storage + ?Sized>(
         Some(reason) => return Err(reason),
         None => planner.decide(),
     };
+    if let Ok(planned) = &outcome {
+        cache.remember(name, planned);
+    }
     cache.put(query, outcome.clone());
     outcome.map(|query| Translated { query, hidden })
 }
@@ -832,9 +939,14 @@ mod tests {
     /// `messages WHERE EXISTS(conversations WHERE channelId = 'c1')`, the
     /// EXISTS named in the filter, with the conversations part hidden.
     fn messages_in_channel(limit: u32) -> Translated {
+        messages_in("c1", limit)
+    }
+
+    /// [`messages_in_channel`] for the channel `channel`.
+    fn messages_in(channel: &str, limit: u32) -> Translated {
         let conversations = MultiTableReadQuery::single(node(
             "conversations",
-            Where::condition("channelId", ComparisonOperator::EQ, "c1"),
+            Where::condition("channelId", ComparisonOperator::EQ, channel),
             u32::MAX,
         ));
         let query = MultiTableReadQuery::new(
@@ -1747,7 +1859,7 @@ mod tests {
     /// used decision at capacity.
     #[test]
     fn the_cache_remembers_decisions() {
-        let cache = PlanCache::new(Duration::from_secs(60), 2);
+        let cache = PlanCache::new(Duration::from_secs(60), 2, Duration::from_secs(60));
         let first = messages_in_channel(u32::MAX).query;
         let second = messages_in_channel(50).query;
         let third = messages_in_channel(7).query;
@@ -1762,9 +1874,242 @@ mod tests {
         assert!(cache.get(&first).is_some(), "recently used, kept");
         assert!(cache.get(&second).is_none(), "least recently used, evicted");
 
-        let brief = PlanCache::new(Duration::from_millis(0), 10);
+        let brief = PlanCache::new(Duration::from_millis(0), 10, Duration::from_secs(60));
         brief.put(first.clone(), Ok(first.clone()));
         std::thread::sleep(Duration::from_millis(2));
         assert!(brief.get(&first).is_none(), "expired");
+    }
+
+    /// A store whose every count answers `rows`, keeping how many it
+    /// answered; it holds no rows to read.
+    struct Counting {
+        rows: u64,
+        counts: std::cell::Cell<usize>,
+    }
+
+    impl Storage for Counting {
+        /// Nothing.
+        async fn select(
+            &self,
+            _query: &SingleTableReadQuery,
+        ) -> Result<crate::model::Snapshot, crate::sync::StorageError> {
+            Ok(crate::model::Snapshot {
+                rows: Vec::new(),
+                at: crate::model::Lsn::default(),
+            })
+        }
+
+        /// `rows`, counted.
+        async fn count(
+            &self,
+            _query: &MultiTableReadQuery,
+            cap: u64,
+        ) -> Result<u64, crate::sync::StorageError> {
+            self.counts.set(self.counts.get() + 1);
+            Ok(self.rows.min(cap))
+        }
+
+        /// Nothing to follow.
+        fn advance(&self, _feed: crate::model::Lsn) {}
+
+        /// Always current.
+        fn floor(&self) -> crate::model::Lsn {
+            crate::model::Lsn::default()
+        }
+    }
+
+    /// Run `future` to completion on a runtime of its own.
+    fn run<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+            .block_on(future)
+    }
+
+    /// Two trees of one join skeleton — same tables and joins at every
+    /// position — whatever their filters, cursors, limits and literals;
+    /// a join more or less, or another table, is another skeleton.
+    #[test]
+    fn a_join_skeleton_is_the_tree_without_its_filters() {
+        let one = messages_in("c1", 50).query;
+        assert!(same_skeleton(&one, &messages_in("c2", 20).query));
+        assert!(same_skeleton(&one, &messages_in("c1", u32::MAX).query));
+        let mut cursor = messages_in("c1", 50).query;
+        cursor.main_table.filter = Where::AND(vec![
+            cursor.main_table.filter.clone(),
+            Where::condition("id", ComparisonOperator::GT, "m9"),
+        ]);
+        assert!(same_skeleton(&one, &cursor), "a cursor adds no join");
+        let alone = MultiTableReadQuery::single(one.main_table.clone());
+        assert!(!same_skeleton(&one, &alone), "a join less");
+        let mut elsewhere = messages_in("c1", 50).query;
+        elsewhere.joins[0].sub.main_table.table = "threads".into();
+        assert!(!same_skeleton(&one, &elsewhere), "another table");
+    }
+
+    /// A query is counted once per name: the plan made for one channel is
+    /// laid onto another channel with another page size without a count,
+    /// its own arguments kept; another query name is planned on its own.
+    #[test]
+    fn a_plan_is_counted_once_per_name_and_laid_onto_every_argument() {
+        run(async {
+            let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
+            let storage = Counting {
+                rows: 5,
+                counts: std::cell::Cell::new(0),
+            };
+            let policy = policy(100, Side::Child);
+            let first = plan(
+                "messagesIn",
+                messages_in("c1", 50),
+                policy,
+                &cache,
+                &storage,
+            )
+            .await
+            .expect("planned");
+            let asked = storage.counts.get();
+            assert!(asked > 0, "the first asking is counted");
+            assert_eq!(
+                first.query.joins[0].driver,
+                Driver::Main,
+                "five messages drive their five conversations"
+            );
+            assert_eq!(cache.queries(), 1);
+
+            let second = plan(
+                "messagesIn",
+                messages_in("c2", 20),
+                policy,
+                &cache,
+                &storage,
+            )
+            .await
+            .expect("planned");
+            assert_eq!(storage.counts.get(), asked, "no count for other arguments");
+            let mut expected = messages_in("c2", 20).query;
+            expected.joins[0].driver = Driver::Main;
+            assert_eq!(
+                second.query, expected,
+                "the name's plan, its own arguments kept"
+            );
+            assert_eq!(second.hidden, messages_in("c2", 20).hidden);
+
+            plan(
+                "messagesElsewhere",
+                messages_in("c3", 20),
+                policy,
+                &cache,
+                &storage,
+            )
+            .await
+            .expect("planned");
+            assert!(
+                storage.counts.get() > asked,
+                "another name is planned on its own"
+            );
+            assert_eq!(cache.queries(), 2);
+        });
+    }
+
+    /// A name whose arguments give it another join skeleton is planned
+    /// for that skeleton too, and both plans stay: neither is laid onto
+    /// the other's tree.
+    #[test]
+    fn a_name_is_planned_once_per_join_skeleton() {
+        run(async {
+            let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
+            let storage = Counting {
+                rows: 5,
+                counts: std::cell::Cell::new(0),
+            };
+            let policy = policy(100, Side::Child);
+            plan("q", messages_in("c1", 50), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            let asked = storage.counts.get();
+            let mut other = messages_in("c1", 50);
+            other.query.joins[0].sub.main_table.table = "threads".into();
+            plan("q", other.clone(), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            let both = storage.counts.get();
+            assert!(both > asked, "another skeleton is counted");
+            other.query.joins[0].sub.main_table.filter =
+                Where::condition("channelId", ComparisonOperator::EQ, "c9");
+            plan("q", other, policy, &cache, &storage)
+                .await
+                .expect("planned");
+            plan("q", messages_in("c7", 50), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            assert_eq!(storage.counts.get(), both, "each skeleton's plan kept");
+            assert_eq!(cache.queries(), 1);
+        });
+    }
+
+    /// A refusal is remembered for its own tree only: other arguments of
+    /// the name are counted again, not refused on the first one's numbers;
+    /// the refused tree itself is answered from the cache.
+    #[test]
+    fn a_refusal_is_not_laid_onto_other_arguments() {
+        run(async {
+            let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
+            let storage = Counting {
+                rows: 101,
+                counts: std::cell::Cell::new(0),
+            };
+            let policy = policy(100, Side::Child);
+            let refused = |channel: &'static str| messages_in(channel, u32::MAX);
+            assert!(
+                plan("q", refused("c1"), policy, &cache, &storage)
+                    .await
+                    .is_err()
+            );
+            let asked = storage.counts.get();
+            assert!(
+                plan("q", refused("c2"), policy, &cache, &storage)
+                    .await
+                    .is_err()
+            );
+            assert!(storage.counts.get() > asked, "counted again");
+            assert_eq!(cache.queries(), 0, "no plan to lay onto others");
+            let again = storage.counts.get();
+            assert!(
+                plan("q", refused("c2"), policy, &cache, &storage)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(storage.counts.get(), again, "the same tree: from the cache");
+        });
+    }
+
+    /// A name's plan lasts its TTL (none at zero), and when the cache is
+    /// full the name planned longest ago leaves.
+    #[test]
+    fn a_name_plan_expires_and_the_oldest_leaves() {
+        let translated = messages_in("c1", 50).query;
+        let mut planned = translated.clone();
+        planned.joins[0].driver = Driver::Main;
+
+        let none = PlanCache::new(Duration::from_secs(60), 10, Duration::ZERO);
+        none.remember("q", &planned);
+        assert_eq!(none.queries(), 0);
+        assert!(none.by_name("q", &translated).is_none());
+
+        let brief = PlanCache::new(Duration::from_secs(60), 10, Duration::from_millis(1));
+        brief.remember("q", &planned);
+        std::thread::sleep(Duration::from_millis(3));
+        assert!(brief.by_name("q", &translated).is_none(), "expired");
+
+        let small = PlanCache::new(Duration::from_secs(60), 1, Duration::from_secs(60));
+        small.remember("a", &planned);
+        std::thread::sleep(Duration::from_millis(1));
+        small.remember("b", &planned);
+        assert_eq!(small.queries(), 1);
+        assert!(small.by_name("a", &translated).is_none(), "the oldest left");
+        let laid = small.by_name("b", &translated).expect("kept");
+        assert_eq!(laid.joins[0].driver, Driver::Main);
     }
 }

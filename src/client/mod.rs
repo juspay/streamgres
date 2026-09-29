@@ -200,7 +200,11 @@ pub fn serve(config: Config) -> Result<(), String> {
         storage.clone(),
         &config.upstream_schema(),
     ));
-    let plans = Arc::new(plan::PlanCache::new(config.plan_ttl, config.plan_cache));
+    let plans = Arc::new(plan::PlanCache::new(
+        config.plan_ttl,
+        config.plan_cache,
+        config.plan_query_ttl,
+    ));
     let warm = Arc::new(warm::WarmStart::new(
         config.plan_file.clone(),
         config.plan_cache,

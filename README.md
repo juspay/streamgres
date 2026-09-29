@@ -55,7 +55,7 @@ every later delta continues from.
 | `ORDER BY` / `LIMIT` windows: compound order, the page of `L` to the client over a buffer of `2L`, storage frontier, boundary condition in the index, eviction, refill | ✅ done | `src/ivm/window.rs` |
 | In-place condition edits: a literal `IN` swapped inside its disjuncts, or a set-valued `IN` (`Value::Set`) gaining/losing one member in O(1) | ✅ done | `src/ivm/index.rs`, `src/ivm/registry.rs` |
 | Join tree: one vector of edges, each with its **driver** (`Main` or `Sub`) and `is_inner`, so LEFT, RIGHT and the two inner forms (driven from the sub, driven from the main) at any depth; existence tests placed anywhere in a node's filter (`EXISTS` inside `OR`, bound to the set when the sub drives, a per-row gate on the match count when the main does); set-valued edges shared by identical subscriptions, cascades, self-joins, intersection on shared driven columns; a value index on every join column so a crossing costs the matches, not the part; a driven child's `ORDER BY` / `LIMIT` is a window **per parent row** (`related` with a limit) | ✅ done | `src/ivm/multi.rs` |
-| Join planning: every node that may be decided is counted twice in one concurrent batch capped at the limit — alone (its `EXISTS` leaves taken as true) and narrowed (its `EXISTS` leaves as correlated `EXISTS` subqueries on its subs, all the way down); the tree is sized from the leaves up and decided from the root down by one rule — a node's subs drive it when they cut it down by more than they cost (its narrowed count plus what the drivers hold, against its alone count), every bounded sub under an `OR` or under a page driving, a required sub driving when it costs no more than what the node keeps; a node driven from above drives everything below it with nothing counted there; two `EXISTS` beside each other on one to-one relationship are one; a page that drives is read whole within `XYNE_SYNC_WHOLE_PAGE_LIMIT` and in doubling batches past it; the root never moves, and a node no plan bounds refuses the query with the reason; decisions are cached by tree (`XYNE_SYNC_ROW_LIMIT`, `XYNE_SYNC_JOIN_PREFERRED_SIDE` for ties, `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE`), and run on the connection's own task | ✅ done | `src/client/plan.rs` |
+| Join planning: every node that may be decided is counted twice in one concurrent batch capped at the limit — alone (its `EXISTS` leaves taken as true) and narrowed (its `EXISTS` leaves as correlated `EXISTS` subqueries on its subs, all the way down); the tree is sized from the leaves up and decided from the root down by one rule — a node's subs drive it when they cut it down by more than they cost (its narrowed count plus what the drivers hold, against its alone count), every bounded sub under an `OR` or under a page driving, a required sub driving when it costs no more than what the node keeps; a node driven from above drives everything below it with nothing counted there; two `EXISTS` beside each other on one to-one relationship are one; a page that drives is read whole within `XYNE_SYNC_WHOLE_PAGE_LIMIT` and in doubling batches past it; the root never moves, and a node no plan bounds refuses the query with the reason; a plan is made once per query name (and join skeleton) and laid onto every later tree of it, whatever the arguments, for `XYNE_SYNC_PLAN_QUERY_TTL_MS` (a day), a refusal remembered for its own tree only (`XYNE_SYNC_ROW_LIMIT`, `XYNE_SYNC_JOIN_PREFERRED_SIDE` for ties, `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE`), and run on the connection's own task | ✅ done | `src/client/plan.rs` |
 | Client-free output: the engine knows subscriptions, never clients. One step's operations are folded per row (`Delta { table, op, audiences }`), each audience one part of one tree with **all its subscribers as the tree's shared list** (`Subs::Many(Arc<[SubId]>)`), so an operation costs the engine the same for one subscriber and for ten thousand; the service routes each delta to the group threads owning its subscriptions, and the group thread's row ledger decides what each client is sent (a row once per client group, whatever brought it); images and keys are shared handles (`Arc`), so nothing on the path copies a row | ✅ done | `src/ivm/update.rs`, `src/model/frame.rs` |
 | SQL parser (single table, schema-aware, typed coercion, `i64` ids) | ✅ done | `src/parser/` |
 | Asynchronous storage seam: the engine records the reads it needs (registration, join fetch, window refill) instead of running them; the runtime holds the one position and brings every read up to it before landing; no read ever blocks the stream; synchronous and asynchronous drivers | ✅ done | `src/ivm/engine.rs`, `src/sync/` |
@@ -502,10 +502,20 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   the tables. The root never moves: the decision is the `driver` field of
   the edge, so part paths, hidden parts and `EXISTS` leaves stay where the
   translation put them, and a nested `EXISTS` is planned like one at the
-  root. Decisions are cached by tree for `XYNE_SYNC_PLAN_TTL_MS` (10 min),
-  at most `XYNE_SYNC_PLAN_CACHE` (10 000) of them, so the counts run once
-  per distinct tree; the counts are logged at debug level (`query
-  counted`, `table alone/narrowed` per node).
+  root. A plan is made once per query **name** and laid onto every later
+  tree of that name, whatever its arguments (ids, lists, page sizes,
+  cursors), for `XYNE_SYNC_PLAN_QUERY_TTL_MS` (a day; `0` plans every tree
+  on its own): a plan is about the join tree, not the filters, so it lays
+  onto any tree of the same join skeleton, and a name whose arguments add
+  or drop a join is planned once per skeleton. The counts run a few dozen
+  times a day rather than per user, channel or cursor — on the numbers of
+  the first arguments to ask, a later argument the plan does not suit
+  being bounded by the read limit like any read. The client's query hash is no
+  key for this: it hashes the name with the arguments. A refusal is
+  remembered for its own tree only, for `XYNE_SYNC_PLAN_TTL_MS` (10 min),
+  so one argument's refusal never spreads; each way keeps at most
+  `XYNE_SYNC_PLAN_CACHE` (10 000) entries. The counts are logged at debug
+  level (`query counted`, `table alone/narrowed` per node).
 - **Warm start.** With `XYNE_SYNC_PLAN_FILE` set, every query shape that
   translates (its name and the application server's AST for it) is kept
   in that file, written every minute and on shutdown; the next process

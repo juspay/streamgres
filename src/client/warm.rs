@@ -196,7 +196,9 @@ impl WarmStart {
                 let Ok(translated) = ast::translate(&ast, catalog) else {
                     return false;
                 };
-                plan::plan(translated, policy, cache, storage).await.is_ok()
+                plan::plan(&shape.name, translated, policy, cache, storage)
+                    .await
+                    .is_ok()
             })
             .buffer_unordered(at_once.max(1));
         while started.elapsed() < budget {
@@ -304,7 +306,10 @@ mod tests {
                 ast["where"]["right"]["value"].as_str().unwrap().to_owned()
             })
             .collect();
-        assert!(ids.contains(&"b".to_owned()) && ids.contains(&"c".to_owned()), "{ids:?}");
+        assert!(
+            ids.contains(&"b".to_owned()) && ids.contains(&"c".to_owned()),
+            "{ids:?}"
+        );
         assert!(!ids.contains(&"a".to_owned()));
         assert!(loaded[0].last >= loaded[1].last, "most recent first");
         assert_eq!(again.len(), 2, "the loaded shapes are the starting set");
@@ -330,7 +335,7 @@ mod tests {
                 DbColumn::new("conversationId", ValueType::String),
             ],
         )]);
-        let cache = PlanCache::new(Duration::from_secs(60), 100);
+        let cache = PlanCache::new(Duration::from_secs(60), 100, Duration::from_secs(60));
         let storage = MemoryStorage::new();
         let policy = Policy {
             limit: 1000,
@@ -373,12 +378,16 @@ mod tests {
                 skipped: 0
             }
         );
-        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.queries(), 1, "two threads of one query are one plan");
+        assert!(
+            (1..=2).contains(&cache.len()),
+            "the second thread is planned by the name once the first is"
+        );
         let none = WarmStart::replay(
             shapes,
             &catalog,
             policy,
-            &PlanCache::new(Duration::from_secs(60), 100),
+            &PlanCache::new(Duration::from_secs(60), 100, Duration::from_secs(60)),
             &storage,
             Duration::ZERO,
             4,

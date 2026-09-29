@@ -246,6 +246,7 @@ async fn stats(
 ) -> axum::Json<Json> {
     let mut body = state.stats.json();
     body["plans_cached"] = json!(state.plans.len());
+    body["plan_queries"] = json!(state.plans.queries());
     body["group_threads"] = json!(state.requests.len());
     if query
         .get("reset")
@@ -1042,6 +1043,7 @@ async fn plan_ast(state: &AppState, name: &str, ast: Json) -> Result<Translated,
     let translated = ast::translate(&parsed, &state.catalog.load())?;
     state.warm.record(name, &ast);
     let planned = plan::plan(
+        name,
         translated,
         state.config.policy(),
         &state.plans,
