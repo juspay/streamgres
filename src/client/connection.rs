@@ -983,8 +983,11 @@ impl Conn {
         self.requests.send(request).await.is_ok()
     }
 
-    /// A push: forwarded as is; the application server's answer comes
-    /// back as a `pushResponse`, or as the error that stood in its way.
+    /// A push: forwarded as is. Ordinary mutation results are not answered
+    /// here: successful mutations settle when their last mutation id arrives
+    /// in a poke, and application errors arrive durably in that poke's
+    /// `mutationsPatch`, as they do in zero-cache. Only an error that prevents
+    /// the push from being processed is answered directly.
     async fn push(&mut self, push: protocol::Push) {
         if push.client_group_id != self.params.group_id {
             log_warn!(
@@ -1025,38 +1028,19 @@ impl Conn {
         );
         match outcome {
             PushOutcome::Response(json) => {
-                if let Some(mutations) = json.get("mutations") {
-                    send(
-                        &self.out,
-                        protocol::push_response(
-                            json!({"mutations": mutations}),
-                            &self.params.client_id,
-                        ),
-                    );
-                } else if json.get("error").is_some() {
-                    send(
-                        &self.out,
-                        protocol::push_response(json, &self.params.client_id),
-                    );
-                } else if json.get("kind").and_then(Json::as_str) == Some("PushFailed") {
-                    send(
-                        &self.out,
-                        serde_json::to_string(&json!(["error", json])).unwrap_or_default(),
-                    );
+                if let Some(reply) = direct_push_reply(&json, &push.mutation_ids) {
+                    if json.get("mutations").and_then(Json::as_array).is_none()
+                        && json.get("kind").and_then(Json::as_str) != Some("PushFailed")
+                    {
+                        log_warn!(
+                            "connection {}: unexpected mutate response: {json}",
+                            self.params.wsid
+                        );
+                    }
+                    send(&self.out, reply);
                 } else {
-                    log_warn!(
-                        "connection {}: unexpected mutate response: {json}",
-                        self.params.wsid
-                    );
-                    send(
-                        &self.out,
-                        protocol::push_failed(
-                            &push.mutation_ids,
-                            None,
-                            None,
-                            "unexpected response from the mutate endpoint",
-                        ),
-                    );
+                    // A valid ordinary MutateResponse is deliberately silent.
+                    // Its result reaches the client through the WAL poke.
                 }
             }
             PushOutcome::Failed {
@@ -1071,6 +1055,32 @@ impl Conn {
             }
         }
     }
+}
+
+/// The only immediate answer to a push is a fatal one. A normal
+/// `MutateResponse`, including an application error or `alreadyProcessed`, is
+/// silent because its authoritative outcome is the database state delivered
+/// by a poke. The deprecated per-mutation out-of-order result remains fatal.
+fn direct_push_reply(response: &Json, mutation_ids: &[protocol::MutationId]) -> Option<String> {
+    if response.get("kind").and_then(Json::as_str) == Some("PushFailed") {
+        return Some(serde_json::to_string(&json!(["error", response])).unwrap_or_default());
+    }
+    if let Some(mutations) = response.get("mutations").and_then(Json::as_array) {
+        return mutations
+            .iter()
+            .find(|mutation| {
+                mutation.pointer("/result/error").and_then(Json::as_str) == Some("oooMutation")
+            })
+            .map(|failed| {
+                protocol::out_of_order_push(mutation_ids, failed.pointer("/result/details"))
+            });
+    }
+    Some(protocol::push_failed(
+        mutation_ids,
+        None,
+        None,
+        "unexpected response from the mutate endpoint",
+    ))
 }
 
 /// One AST into the tree the engine registers: translated against the
@@ -1272,5 +1282,38 @@ mod tests {
                 result: json!({"error": "app", "message": "no"}),
             }]
         );
+    }
+
+    /// Ordinary mutate responses have no direct WebSocket answer: success,
+    /// application failure and a retry's alreadyProcessed result all wait for
+    /// the authoritative poke. Whole-push and out-of-order failures remain
+    /// immediate errors.
+    #[test]
+    fn only_fatal_push_results_receive_a_direct_reply() {
+        let ids = vec![protocol::MutationId {
+            client_id: "client-a".to_owned(),
+            id: 7,
+        }];
+        for response in [
+            json!({"kind": "MutateResponse", "mutations": [{"id": {"clientID": "client-a", "id": 7}, "result": {}}]}),
+            json!({"kind": "MutateResponse", "mutations": [{"id": {"clientID": "client-a", "id": 7}, "result": {"error": "app", "message": "denied"}}]}),
+            json!({"kind": "MutateResponse", "mutations": [{"id": {"clientID": "client-a", "id": 7}, "result": {"error": "alreadyProcessed"}}]}),
+        ] {
+            assert!(direct_push_reply(&response, &ids).is_none(), "{response}");
+        }
+
+        for response in [
+            json!({"kind": "PushFailed", "origin": "server", "reason": "database", "mutationIDs": []}),
+            json!({"kind": "MutateResponse", "mutations": [{"id": {"clientID": "client-a", "id": 7}, "result": {"error": "oooMutation"}}]}),
+            json!({"error": "unsupportedPushVersion"}),
+            json!({"unexpected": true}),
+        ] {
+            let reply: Json = serde_json::from_str(
+                &direct_push_reply(&response, &ids).expect("fatal response has a reply"),
+            )
+            .unwrap();
+            assert_eq!(reply[0], "error", "{response}");
+            assert_eq!(reply[1]["kind"], "PushFailed", "{response}");
+        }
     }
 }

@@ -322,6 +322,25 @@ pub fn push_failed(
     frame("error", body)
 }
 
+/// `error` for the deprecated per-mutation spelling of an out-of-order
+/// mutation. Current zero-server returns this as a top-level `PushFailed`, but
+/// zero-cache still recognizes the old result and promotes it to the same
+/// fatal downstream error.
+pub fn out_of_order_push(mutation_ids: &[MutationId], details: Option<&Json>) -> String {
+    let ids: Vec<Json> = mutation_ids
+        .iter()
+        .map(|id| json!({"clientID": id.client_id, "id": id.id}))
+        .collect();
+    let mut body = json!({
+        "kind": "PushFailed", "origin": "server", "reason": "oooMutation",
+        "mutationIDs": ids, "message": "mutation was out of order",
+    });
+    if let Some(details) = details {
+        body["details"] = details.clone();
+    }
+    frame("error", body)
+}
+
 /// `error` for a query transform the application server could not do.
 pub fn transform_failed(query_ids: &[String], status: Option<u16>, message: &str) -> String {
     let body = match status {
@@ -426,18 +445,6 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// `pushResponse`: only the receiving client's per-mutation results.
-/// Zero's mutation tracker rejects results belonging to another client,
-/// even when the push contains mutations recovered for that client.
-pub fn push_response(mut body: Json, client_id: &str) -> String {
-    if let Some(mutations) = body.get_mut("mutations").and_then(Json::as_array_mut) {
-        mutations.retain(|mutation| {
-            mutation.pointer("/id/clientID").and_then(Json::as_str) == Some(client_id)
-        });
-    }
-    frame("pushResponse", body)
-}
-
 /// `pull`: the last mutation ids of a client group.
 pub fn pull_response(cookie: &str, request_id: &str, lmids: &HashMap<String, i64>) -> String {
     frame(
@@ -532,29 +539,19 @@ mod tests {
     }
 
     #[test]
-    fn push_response_filters_results_by_receiving_client() {
-        let own_ok = json!({"id": {"clientID": "a", "id": 1}, "result": {}});
-        let own_error = json!({"id": {"clientID": "a", "id": 2}, "result": {"error": "app", "message": "denied"}});
-        let body = json!({"mutations": [
-            {"id": {"clientID": "b", "id": 1}, "result": {}},
-            own_ok,
-            {"id": {"clientID": "b", "id": 2}, "result": {"error": "app"}},
-            own_error
-        ]});
-        let frame: Json = serde_json::from_str(&push_response(body.clone(), "a")).unwrap();
-        assert_eq!(
-            frame,
-            json!(["pushResponse", {"mutations": [own_ok, own_error]}])
-        );
-        let frame: Json = serde_json::from_str(&push_response(body, "c")).unwrap();
-        assert_eq!(frame, json!(["pushResponse", {"mutations": []}]));
-    }
-
-    #[test]
-    fn push_response_preserves_push_errors() {
-        let body = json!({"error": "unsupportedPushVersion"});
-        let frame: Json = serde_json::from_str(&push_response(body.clone(), "a")).unwrap();
-        assert_eq!(frame, json!(["pushResponse", body]));
+    fn deprecated_out_of_order_result_becomes_push_failed() {
+        let ids = vec![MutationId {
+            client_id: "a".to_owned(),
+            id: 3,
+        }];
+        let details = json!("expected mutation 2");
+        let frame: Json = serde_json::from_str(&out_of_order_push(&ids, Some(&details))).unwrap();
+        assert_eq!(frame[0], "error");
+        assert_eq!(frame[1]["kind"], "PushFailed");
+        assert_eq!(frame[1]["origin"], "server");
+        assert_eq!(frame[1]["reason"], "oooMutation");
+        assert_eq!(frame[1]["mutationIDs"], json!([{"clientID": "a", "id": 3}]));
+        assert_eq!(frame[1]["details"], details);
     }
 
     /// Cookies order like numbers: length prefix, then base 36.
