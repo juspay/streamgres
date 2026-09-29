@@ -79,6 +79,18 @@
 //! connect they are also read from the table itself, merged into what the
 //! group knows, and sent with the connection's first poke: the state
 //! poke, the replayed pokes, or a poke of their own at the next flush.
+//!
+//! The result of a mutation the application server refused (an
+//! application error; a mutation that succeeds leaves none) is recorded in
+//! its results table in the same transaction as the mutation's id, and
+//! reaches the group the same way: as a `mutationsPatch` entry in the same
+//! poke as the id, as zero-cache sends it. The client applies a poke whole
+//! and settles its mutations from the results before it counts the id,
+//! so the mutation is rejected with the application's error rather than
+//! taken for a success. Once the client acknowledges its results the
+//! application server deletes them, and the deletions go out the same way.
+//! At every connect the results still waiting are read with the ids and
+//! sent with them.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -161,6 +173,15 @@ pub enum DesiredOp {
     Clear,
 }
 
+/// A mutation result waiting in the application server's results table:
+/// the result of `client`'s mutation `id`, as the server wrote it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MutationResult {
+    pub client: String,
+    pub id: i64,
+    pub result: Json,
+}
+
 /// What a connection asks of this thread.
 #[derive(Debug)]
 pub enum Request {
@@ -170,6 +191,7 @@ pub enum Request {
         socket: Socket,
         base_cookie: Option<String>,
         lmids: Vec<(String, i64)>,
+        results: Vec<MutationResult>,
         reply: oneshot::Sender<ConnectReply>,
     },
     Disconnect {
@@ -371,6 +393,8 @@ struct Group {
     queued_desired: HashMap<String, Vec<Json>>,
     queued_got: Vec<Json>,
     queued_lmids: HashMap<String, i64>,
+    /// `mutationsPatch` entries for the next poke, in the order heard.
+    queued_results: Vec<Json>,
     queued_rows: Vec<RowOp>,
     /// How long `queued_rows` was when it was last coalesced: a group
     /// with no connection coalesces its waiting operations again only once
@@ -466,6 +490,7 @@ impl Group {
             queued_desired: HashMap::new(),
             queued_got: Vec::new(),
             queued_lmids: HashMap::new(),
+            queued_results: Vec::new(),
             queued_rows: Vec::new(),
             queued_floor: 0,
             log: PokeLog::default(),
@@ -516,9 +541,12 @@ pub struct Groups {
     awaiting: HashMap<u64, (String, String)>,
     pending: HashMap<String, Vec<Pending>>,
     lmid_changes: HashMap<String, HashMap<String, i64>>,
+    /// The `mutationsPatch` entries each group heard since the last flush.
+    result_changes: HashMap<String, Vec<Json>>,
     /// Groups with something to hear at the next flush.
     dirty: HashSet<String>,
     clients_table: TableName,
+    mutations_table: TableName,
     next_poke: u64,
     next_generation: u64,
 }
@@ -543,6 +571,7 @@ pub async fn run(
     spawn_local(forward(outbox_rx, commands));
     let mut core = Groups {
         clients_table: TableName::from(config.clients_table().as_str()),
+        mutations_table: TableName::from(config.mutations_table().as_str()),
         config,
         catalog,
         shard,
@@ -558,6 +587,7 @@ pub async fn run(
         awaiting: HashMap::new(),
         pending: HashMap::new(),
         lmid_changes: HashMap::new(),
+        result_changes: HashMap::new(),
         dirty: HashSet::new(),
         next_poke: 1,
         next_generation: 0,
@@ -616,9 +646,10 @@ impl Groups {
                 socket,
                 base_cookie,
                 lmids,
+                results,
                 reply,
             } => {
-                let outcome = self.connect(&group, wsid, socket, base_cookie, lmids);
+                let outcome = self.connect(&group, wsid, socket, base_cookie, lmids, results);
                 let _ = reply.send(outcome);
             }
             Request::Disconnect { group, wsid } => self.disconnect(&group, &wsid),
@@ -713,6 +744,8 @@ impl Groups {
                 for write in &watched {
                     if write.table() == &self.clients_table {
                         self.note_lmid(write);
+                    } else if write.table() == &self.mutations_table {
+                        self.note_result(write);
                     }
                 }
                 self.serve_when_covered(position, floor);
@@ -792,6 +825,7 @@ impl Groups {
         socket: Socket,
         base_cookie: Option<String>,
         lmids: Vec<(String, i64)>,
+        results: Vec<MutationResult>,
     ) -> ConnectReply {
         let offered = match base_cookie.as_deref().map(protocol::version_of) {
             None => 0,
@@ -843,7 +877,12 @@ impl Groups {
         for (client, lmid) in &group.lmids {
             group.queued_lmids.insert(client.clone(), *lmid);
         }
-        if !group.queued_lmids.is_empty() {
+        let waiting: Vec<Json> = results
+            .into_iter()
+            .map(|waiting| protocol::result_put(&waiting.client, waiting.id, waiting.result))
+            .collect();
+        group.queued_results.extend(waiting.iter().cloned());
+        if !group.queued_lmids.is_empty() || !group.queued_results.is_empty() {
             self.dirty.insert(group_id.to_owned());
         }
         group.generation = generation;
@@ -869,7 +908,7 @@ impl Groups {
                 );
                 for (poke_id, frames) in pokes {
                     let _ = socket.sink.send(Outbound::Poke {
-                        frames: with_lmids(&poke_id, &frames, &group.lmids),
+                        frames: with_current(&poke_id, &frames, &group.lmids, &waiting),
                         since: None,
                         sent,
                     });
@@ -912,7 +951,7 @@ impl Groups {
                     &poke_id,
                     None,
                     &protocol::cookie(group.version),
-                    head_of(&HashMap::new(), &got, &group.lmids),
+                    head_of(&HashMap::new(), &got, &group.lmids, &waiting),
                     &patches,
                     &mut HashMap::new(),
                 );
@@ -1392,6 +1431,20 @@ impl Groups {
             .insert(client, lmid);
     }
 
+    /// A write to the mutation-result table: the result recorded for, or
+    /// cleaned up from, a client's mutation, for the group's next poke.
+    fn note_result(&mut self, write: &WriteQuery) {
+        let Some((group, entry)) = result_entry(write) else {
+            log_warn!(
+                "a write to {} names no group, client and mutation, or a result that is not JSON; passed over",
+                self.mutations_table
+            );
+            return;
+        };
+        self.dirty.insert(group.clone());
+        self.result_changes.entry(group).or_default().push(entry);
+    }
+
     /// Turn everything accumulated into one poke per group that has
     /// anything to hear, every row serialized once for all of them.
     fn flush(&mut self) {
@@ -1427,9 +1480,13 @@ impl Groups {
         since: Option<Instant>,
     ) {
         let lmid_changes = self.lmid_changes.remove(group_id).unwrap_or_default();
+        let result_changes = self.result_changes.remove(group_id).unwrap_or_default();
         let Some(group) = self.groups.get_mut(group_id) else {
             return;
         };
+        self.stats
+            .mutation_results
+            .fetch_add(result_changes.len() as u64, Ordering::Relaxed);
         let updates = self.pending.remove(group_id).unwrap_or_default();
         let mut rows: Vec<RowOp> = std::mem::take(&mut group.queued_rows);
         for Pending { delta, holders } in updates {
@@ -1458,6 +1515,7 @@ impl Groups {
                 group.queued_lmids.insert(client, lmid);
             }
         }
+        group.queued_results.extend(result_changes);
         if group.sockets.is_empty() {
             if rows.len() > group.queued_floor * 2 + 64 {
                 rows = coalesce(rows);
@@ -1471,12 +1529,14 @@ impl Groups {
             && group.queued_got.is_empty()
             && group.queued_desired.is_empty()
             && group.queued_lmids.is_empty()
+            && group.queued_results.is_empty()
         {
             return;
         }
         let got = std::mem::take(&mut group.queued_got);
         let desired = std::mem::take(&mut group.queued_desired);
         let lmids = std::mem::take(&mut group.queued_lmids);
+        let results = std::mem::take(&mut group.queued_results);
         let rows = coalesce(rows);
         let patches: Vec<Patch<'_>> = rows
             .iter()
@@ -1497,15 +1557,16 @@ impl Groups {
             &poke_id,
             base.as_deref(),
             &cookie,
-            head_of(&desired, &got, &lmids),
+            head_of(&desired, &got, &lmids, &results),
             &patches,
             fragments,
         );
         log_debug!(
-            "group {group_id}: poke {poke_id} {} -> {cookie}: {puts} puts, {dels} dels, {} got, {} lmids",
+            "group {group_id}: poke {poke_id} {} -> {cookie}: {puts} puts, {dels} dels, {} got, {} lmids, {} results",
             base.as_deref().unwrap_or("null"),
             got.len(),
-            lmids.len()
+            lmids.len(),
+            results.len()
         );
         self.stats.pokes.fetch_add(1, Ordering::Relaxed);
         group.log.push(
@@ -1535,12 +1596,13 @@ enum Patch<'a> {
     Del(&'a TableName, &'a DataFrameKey),
 }
 
-/// The query-state and mutation-id fields of a poke's first part, as JSON
-/// fields ready to follow the poke id.
+/// The query-state, mutation-id and mutation-result fields of a poke's
+/// first part, as JSON fields ready to follow the poke id.
 fn head_of(
     desired: &HashMap<String, Vec<Json>>,
     got: &[Json],
     lmids: &HashMap<String, i64>,
+    results: &[Json],
 ) -> Vec<u8> {
     let mut head: Vec<u8> = Vec::new();
     if !desired.is_empty() {
@@ -1555,24 +1617,72 @@ fn head_of(
         head.extend_from_slice(b",\"lastMutationIDChanges\":");
         let _ = serde_json::to_writer(&mut head, lmids);
     }
+    if !results.is_empty() {
+        head.extend_from_slice(b",\"mutationsPatch\":");
+        let _ = serde_json::to_writer(&mut head, results);
+    }
     head
+}
+
+/// The group and the `mutationsPatch` entry of one write to the
+/// mutation-result table: a result recorded is a `put` of the result the
+/// application server wrote (its JSON text parsed), a row deleted (the
+/// client received it and the server cleaned it up) a `del` of the
+/// mutation, named by the deleted row's key. `None` for a write naming no
+/// group, client or mutation, or with a result that is not JSON.
+fn result_entry(write: &WriteQuery) -> Option<(String, Json)> {
+    let row: &RowData = match write {
+        WriteQuery::DELETE(delete) => &delete.pkey_value.pkey_value,
+        _ => &write.new_row_image()?.data,
+    };
+    let text = |column: &str| match row.get(column) {
+        Some(Value::String(text)) => Some(text.clone()),
+        _ => None,
+    };
+    let group = text("clientGroupID")?;
+    let client = text("clientID")?;
+    let id = match row.get("mutationID") {
+        Some(Value::Int(id)) => *id,
+        Some(Value::Float(id)) => *id as i64,
+        _ => return None,
+    };
+    let entry = match write {
+        WriteQuery::DELETE(_) => protocol::result_del(&client, id),
+        _ => {
+            let result: Json = serde_json::from_str(&text("result")?).ok()?;
+            protocol::result_put(&client, id, result)
+        }
+    };
+    Some((group, entry))
 }
 
 /// A logged poke `poke_id` as it is replayed: its frames as they were,
 /// with one more part before the end carrying `lmids`, the group's
-/// mutation ids as they are now. The client merges a poke's parts in
-/// order, so the last part's ids stand; they are never below the ones the
-/// poke told at its time, which is what the client requires. With no ids
-/// to tell, the frames are sent as they are.
-fn with_lmids(poke_id: &str, frames: &Arc<[Bytes]>, lmids: &HashMap<String, i64>) -> Arc<[Bytes]> {
-    let Some((end, parts)) = frames.split_last().filter(|_| !lmids.is_empty()) else {
+/// mutation ids as they are now, and `results`, the mutation results
+/// waiting as they are now. The client merges a poke's parts in order,
+/// so the last part's ids stand; they are never below the ones the poke
+/// told at its time, which is what the client requires. A waiting result
+/// goes with the ids so that a pending mutation the ids settle is
+/// rejected with its error rather than taken for a success; put again in
+/// a later poke it changes nothing. With nothing to tell, the frames are
+/// sent as they are.
+fn with_current(
+    poke_id: &str,
+    frames: &Arc<[Bytes]>,
+    lmids: &HashMap<String, i64>,
+    results: &[Json],
+) -> Arc<[Bytes]> {
+    let Some((end, parts)) = frames
+        .split_last()
+        .filter(|_| !lmids.is_empty() || !results.is_empty())
+    else {
         return frames.clone();
     };
     let mut replayed: Vec<Bytes> = Vec::with_capacity(frames.len() + 1);
     replayed.extend(parts.iter().cloned());
     replayed.push(part_frame(
         poke_id,
-        Some(head_of(&HashMap::new(), &[], lmids)),
+        Some(head_of(&HashMap::new(), &[], lmids, results)),
         &[],
     ));
     replayed.push(end.clone());
@@ -1790,6 +1900,7 @@ mod tests {
         dels: Vec<i64>,
         got: Vec<String>,
         lmids: Vec<(String, i64)>,
+        results: Vec<Json>,
     }
 
     impl Bench {
@@ -1816,6 +1927,7 @@ mod tests {
             let (requests, _requests_rx) = mpsc::channel(16);
             let core = Groups {
                 clients_table: TableName::from(config.clients_table().as_str()),
+                mutations_table: TableName::from(config.mutations_table().as_str()),
                 config: Arc::new(config),
                 catalog: Arc::new(CatalogHandle::new(catalog)),
                 shard: 0,
@@ -1831,6 +1943,7 @@ mod tests {
                 awaiting: HashMap::new(),
                 pending: HashMap::new(),
                 lmid_changes: HashMap::new(),
+                result_changes: HashMap::new(),
                 dirty: HashSet::new(),
                 next_poke: 1,
                 next_generation: 0,
@@ -1852,6 +1965,18 @@ mod tests {
             cookie: Option<&str>,
             lmids: Vec<(String, i64)>,
         ) -> Result<Tab, String> {
+            self.connect_full(wsid, cookie, lmids, Vec::new())
+        }
+
+        /// [`Bench::connect_with`] with `results` as what the results table
+        /// holds for the group at the moment of connecting.
+        fn connect_full(
+            &mut self,
+            wsid: &str,
+            cookie: Option<&str>,
+            lmids: Vec<(String, i64)>,
+            results: Vec<MutationResult>,
+        ) -> Result<Tab, String> {
             let (sink, frames) = mpsc::unbounded_channel();
             let socket = Socket {
                 client: format!("client-{wsid}"),
@@ -1863,6 +1988,7 @@ mod tests {
                 socket,
                 cookie.map(str::to_owned),
                 lmids,
+                results,
             ) {
                 ConnectReply::Accepted => Ok(Tab {
                     wsid: wsid.to_owned(),
@@ -1891,6 +2017,31 @@ mod tests {
                     table,
                     pkey_value: key,
                     record,
+                }));
+        }
+
+        /// The application recorded `result` (JSON text, as the feed carries
+        /// a JSON column) for mutation `id` of client `client` in group `g`.
+        fn result_recorded(&mut self, client: &str, id: i64, result: &str) {
+            let table = self.core.mutations_table.clone();
+            let (key, record) = result_row("g", client, id, Some(result));
+            self.core
+                .note_result(&WriteQuery::INSERT(crate::model::InsertQuery {
+                    table,
+                    pkey_value: key,
+                    record,
+                }));
+        }
+
+        /// The application cleaned up the result of mutation `id` of
+        /// client `client` in group `g`: a delete, carrying the row's key.
+        fn result_cleaned(&mut self, client: &str, id: i64) {
+            let table = self.core.mutations_table.clone();
+            let (key, _) = result_row("g", client, id, None);
+            self.core
+                .note_result(&WriteQuery::DELETE(crate::model::DeleteQuery {
+                    table,
+                    pkey_value: key,
                 }));
         }
 
@@ -1959,6 +2110,7 @@ mod tests {
                     dels: Vec::new(),
                     got: Vec::new(),
                     lmids: Vec::new(),
+                    results: Vec::new(),
                 };
                 let mut merged_lmids: HashMap<String, i64> = HashMap::new();
                 for frame in frames.iter() {
@@ -1977,6 +2129,13 @@ mod tests {
                             {
                                 merged_lmids.insert(client.clone(), lmid.as_i64().unwrap_or(-1));
                             }
+                            seen.results.extend(
+                                body["mutationsPatch"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .cloned(),
+                            );
                             for op in body["rowsPatch"].as_array().into_iter().flatten() {
                                 if op["op"] == "put" {
                                     seen.puts.push((
@@ -2001,6 +2160,29 @@ mod tests {
             }
             out
         }
+    }
+
+    /// A results-table row of group `group`: its key (group, client,
+    /// mutation) and its image, with `result` when there is one.
+    fn result_row(
+        group: &str,
+        client: &str,
+        id: i64,
+        result: Option<&str>,
+    ) -> (DataFrameKey, DataFrameRow) {
+        let mut columns = vec![
+            (ColumnName::from("clientGroupID"), Value::from(group)),
+            (ColumnName::from("clientID"), Value::from(client)),
+            (ColumnName::from("mutationID"), Value::Int(id)),
+        ];
+        let key = DataFrameKey::from(columns.iter().cloned().collect::<HashMap<_, _>>());
+        if let Some(result) = result {
+            columns.push((ColumnName::from("result"), Value::from(result)));
+        }
+        (
+            key,
+            DataFrameRow::from(columns.into_iter().collect::<HashMap<_, _>>()),
+        )
     }
 
     /// Subscription `sub` shows the note `id` named `name`.
@@ -2257,6 +2439,213 @@ mod tests {
                 state[0].puts,
                 vec![(2, "two".to_owned()), (3, "three".to_owned())]
             );
+        });
+    }
+
+    /// The result of a mutation the application refused goes out in the
+    /// same poke as the mutation's id, to every connection of the group
+    /// (the client settles its mutations from the results before it counts
+    /// the id, so the mutation is rejected with the application's error);
+    /// the cleanup that follows the client's acknowledgement goes out as a
+    /// `del` the same way.
+    #[test]
+    fn a_mutation_result_goes_out_with_its_id() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut a = bench.connect("a", None).expect("accepted");
+            bench.hydrate(&a, "h1", 1, &[(1, "one")]);
+            let mut b = bench.connect("b", Some(&bench.cookie())).expect("accepted");
+            a.pokes();
+            b.pokes();
+            let refused = r#"{"error":"app","message":"Conversation not found"}"#;
+
+            bench.mutation_recorded("client-a", 22);
+            bench.result_recorded("client-a", 22, refused);
+            bench.core.flush();
+            let heard = a.pokes();
+            assert_eq!(
+                heard.len(),
+                1,
+                "the id and the result in one poke: {heard:?}"
+            );
+            assert_eq!(heard[0].lmids, vec![("client-a".to_owned(), 22)]);
+            assert_eq!(
+                heard[0].results,
+                vec![protocol::result_put(
+                    "client-a",
+                    22,
+                    serde_json::from_str(refused).expect("JSON")
+                )]
+            );
+            assert_eq!(b.pokes(), heard, "every connection of the group hears it");
+            assert_eq!(bench.core.stats.mutation_results.load(Ordering::Relaxed), 1);
+
+            bench.result_cleaned("client-a", 22);
+            bench.core.flush();
+            let cleaned = a.pokes();
+            assert_eq!(cleaned.len(), 1);
+            assert_eq!(
+                cleaned[0].results,
+                vec![protocol::result_del("client-a", 22)]
+            );
+            assert!(cleaned[0].lmids.is_empty());
+        });
+    }
+
+    /// A result heard while nobody listens waits with the group, no poke
+    /// built and the version standing still, and goes out once a client is
+    /// back.
+    #[test]
+    fn a_result_waits_while_nobody_listens() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut tab = bench.connect("a", None).expect("accepted");
+            bench.hydrate(&tab, "h1", 1, &[(1, "one")]);
+            tab.pokes();
+            let left_at = bench.cookie();
+            bench.core.disconnect("g", "a");
+
+            bench.result_recorded("client-a", 5, r#"{"error":"app"}"#);
+            bench.core.flush();
+            assert_eq!(
+                bench.cookie(),
+                left_at,
+                "nothing built while nobody listens"
+            );
+
+            let mut back = bench.connect("a2", Some(&left_at)).expect("current");
+            bench.core.flush();
+            let pokes = back.pokes();
+            assert_eq!(pokes.len(), 1, "{pokes:?}");
+            assert_eq!(pokes[0].base.as_deref(), Some(left_at.as_str()));
+            assert_eq!(
+                pokes[0].results,
+                vec![protocol::result_put("client-a", 5, json!({"error": "app"}))]
+            );
+        });
+    }
+
+    /// The results waiting in the table at connect go out with the ids:
+    /// in every poke replayed to a client behind the log (so a pending
+    /// mutation the ids settle is rejected with its error, not taken for a
+    /// success), in the state poke of a tab joining without a cookie, and
+    /// to the group once, in a poke of their own; a result put again is
+    /// the same entry, which changes nothing on a client that has it.
+    #[test]
+    fn a_connecting_client_is_told_the_results_waiting_with_the_ids() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut stays = bench.connect("a", None).expect("accepted");
+            bench.hydrate(&stays, "h1", 1, &[(1, "one")]);
+            let leaves = bench.connect("b", Some(&bench.cookie())).expect("accepted");
+            let left_at = bench.cookie();
+            bench.core.disconnect("g", &leaves.wsid);
+            stays.pokes();
+            bench.deliver(vec![put(1, 2, "two")]);
+            bench.deliver(vec![put(1, 3, "three")]);
+            let heard = stays.pokes();
+            assert_eq!(heard.len(), 2);
+
+            let waiting = MutationResult {
+                client: "client-b".to_owned(),
+                id: 7,
+                result: json!({"error": "app", "message": "denied"}),
+            };
+            let entry = protocol::result_put("client-b", 7, waiting.result.clone());
+            let mut back = bench
+                .connect_full(
+                    "b2",
+                    Some(&left_at),
+                    vec![("client-b".to_owned(), 7)],
+                    vec![waiting.clone()],
+                )
+                .expect("caught up from the log");
+            let replayed = back.pokes();
+            assert_eq!(replayed.len(), heard.len());
+            for (poke, original) in replayed.iter().zip(&heard) {
+                assert_eq!(poke.lmids, vec![("client-b".to_owned(), 7)]);
+                assert_eq!(poke.results, vec![entry.clone()], "the result with the ids");
+                assert_eq!(
+                    (&poke.cookie, &poke.puts),
+                    (&original.cookie, &original.puts)
+                );
+            }
+
+            bench.core.flush();
+            let told = back.pokes();
+            assert_eq!(told.len(), 1, "{told:?}");
+            assert_eq!(told[0].results, vec![entry.clone()]);
+            assert_eq!(stays.pokes(), told, "the group hears it once");
+
+            let mut fresh = bench
+                .connect_full("c", None, Vec::new(), vec![waiting])
+                .expect("accepted");
+            let state = fresh.pokes();
+            assert_eq!(state.len(), 1);
+            assert_eq!(state[0].base, None);
+            assert_eq!(state[0].results, vec![entry]);
+        });
+    }
+
+    /// A result for a group this thread does not hold (another thread's,
+    /// or a group connected to another server) is let go at the flush:
+    /// nothing is kept for it, no poke is built and it is not counted.
+    #[test]
+    fn a_result_for_a_group_held_elsewhere_is_let_go() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut tab = bench.connect("a", None).expect("accepted");
+            bench.hydrate(&tab, "h1", 1, &[(1, "one")]);
+            tab.pokes();
+            let at = bench.cookie();
+            let table = bench.core.mutations_table.clone();
+            let (key, record) = result_row("elsewhere", "client-x", 3, Some(r#"{"error":"app"}"#));
+            bench
+                .core
+                .note_result(&WriteQuery::INSERT(crate::model::InsertQuery {
+                    table,
+                    pkey_value: key,
+                    record,
+                }));
+            bench.core.flush();
+            assert!(tab.pokes().is_empty());
+            assert_eq!(bench.cookie(), at);
+            assert!(bench.core.result_changes.is_empty());
+            assert!(bench.core.dirty.is_empty());
+            assert_eq!(bench.core.stats.mutation_results.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    /// A write to the results table that names no group, client or
+    /// mutation, or whose result is not JSON, is passed over: nothing is
+    /// queued and no poke is built.
+    #[test]
+    fn a_result_the_group_cannot_read_is_passed_over() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut tab = bench.connect("a", None).expect("accepted");
+            bench.hydrate(&tab, "h1", 1, &[(1, "one")]);
+            tab.pokes();
+            let at = bench.cookie();
+            bench.result_recorded("client-a", 9, "not JSON");
+            let table = bench.core.mutations_table.clone();
+            bench
+                .core
+                .note_result(&WriteQuery::INSERT(crate::model::InsertQuery {
+                    table,
+                    pkey_value: DataFrameKey::from(HashMap::from([(
+                        ColumnName::from("clientID"),
+                        Value::from("client-a"),
+                    )])),
+                    record: DataFrameRow::from(HashMap::from([(
+                        ColumnName::from("clientID"),
+                        Value::from("client-a"),
+                    )])),
+                }));
+            bench.core.flush();
+            assert!(tab.pokes().is_empty());
+            assert_eq!(bench.cookie(), at);
+            assert_eq!(bench.core.stats.mutation_results.load(Ordering::Relaxed), 0);
         });
     }
 

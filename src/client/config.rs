@@ -404,10 +404,17 @@ impl Config {
         format!("{}.clients", self.upstream_schema())
     }
 
+    /// The catalog name of the table the application server records the
+    /// result of a failed mutation in, until its client has received it,
+    /// `<upstream schema>.mutations`.
+    pub fn mutations_table(&self) -> String {
+        format!("{}.mutations", self.upstream_schema())
+    }
+
     /// What the engine side needs: the database to follow and read, and
-    /// the one table whose rows the client side reads itself (the
-    /// application's mutation ids, which travel with the rows of the
-    /// mutation that produced them).
+    /// the two tables whose rows the client side reads itself (the
+    /// application's mutation ids and the results of failed mutations,
+    /// which travel with the rows of the mutation that produced them).
     pub fn engine_settings(&self) -> Settings {
         Settings {
             dsn: self.dsn.clone(),
@@ -422,7 +429,10 @@ impl Config {
                 interval: self.pg_keepalive_interval,
                 retries: self.pg_keepalive_retries,
             },
-            watched: vec![TableName::from(self.clients_table().as_str())],
+            watched: vec![
+                TableName::from(self.clients_table().as_str()),
+                TableName::from(self.mutations_table().as_str()),
+            ],
             ddl_trigger: self.ddl_trigger.clone(),
             ddl_prefix: self.ddl_prefix.clone(),
         }

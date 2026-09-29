@@ -196,9 +196,10 @@ pub fn serve(config: Config) -> Result<(), String> {
     }
 
     let backend = Arc::new(backend::Backend::new(&config)?);
-    let lmids = Arc::new(connection::LmidReader::new(
+    let mutations = Arc::new(connection::MutationReader::new(
         storage.clone(),
         &config.upstream_schema(),
+        catalog.clone(),
     ));
     let plans = Arc::new(plan::PlanCache::new(
         config.plan_ttl,
@@ -223,7 +224,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         storage,
         catalog,
         plans,
-        lmids,
+        mutations,
         stats,
         ready,
         warm: warm.clone(),

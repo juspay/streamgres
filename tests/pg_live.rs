@@ -543,6 +543,98 @@ fn service_streams_end_to_end() {
     });
 }
 
+/// A mutation result travels the feed as the client side reads it: the
+/// application server's insert into its results table arrives with the
+/// group, client and mutation and the result as JSON text, and its
+/// cleanup (the `DELETE … <= upTo` it runs when a client acknowledges its
+/// results) as a delete carrying that key — what the group thread turns
+/// into `mutationsPatch` entries.
+#[test]
+fn mutation_results_travel_the_feed() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let names = Names::new("results");
+        let client = prepare(&dsn, &names).await;
+        let results = names.extra.clone();
+        client
+            .batch_execute(&format!(
+                r#"CREATE TABLE {results} (
+                     "clientGroupID" text NOT NULL,
+                     "clientID" text NOT NULL,
+                     "mutationID" bigint NOT NULL,
+                     "result" json NOT NULL,
+                     PRIMARY KEY ("clientGroupID", "clientID", "mutationID"))"#
+            ))
+            .await
+            .expect("create the results table");
+        let mut tables: Vec<DbTable> = names.catalog().tables().cloned().collect();
+        tables.push(DbTable::new(
+            results.as_str(),
+            ["clientGroupID", "clientID", "mutationID"],
+            vec![
+                DbColumn::new("clientGroupID", ValueType::String),
+                DbColumn::new("clientID", ValueType::String),
+                DbColumn::new("mutationID", ValueType::Int),
+                DbColumn::new("result", ValueType::Json),
+            ],
+        ));
+        let mut stream = PgStream::open(&dsn, &names.slot, Arc::new(Catalog::new(tables)))
+            .await
+            .expect("open stream");
+
+        client
+            .batch_execute(&format!(
+                r#"INSERT INTO {results} VALUES ('g1', 'c1', 7, '{{"error": "app", "message": "Conversation not found"}}');
+                   DELETE FROM {results} WHERE "clientGroupID" = 'g1' AND "clientID" = 'c1' AND "mutationID" <= 7;"#
+            ))
+            .await
+            .expect("record and clean up a result");
+
+        let table = TableName::from(results.as_str());
+        let mut seen: Vec<WriteQuery> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while seen.len() < 2 {
+            let batch = stream.poll().await.expect("poll");
+            seen.extend(
+                batch
+                    .writes
+                    .into_iter()
+                    .map(|(write, _)| write)
+                    .filter(|write| write.table() == &table),
+            );
+            assert!(
+                Instant::now() < deadline,
+                "the result's writes never arrived: {seen:?}"
+            );
+        }
+        let text = |row: &RowData, column: &str| match row.get(column) {
+            Some(Value::String(text)) => text.clone(),
+            other => panic!("{column}: {other:?}"),
+        };
+        let WriteQuery::INSERT(recorded) = &seen[0] else {
+            panic!("the result is inserted first: {seen:?}");
+        };
+        let image = &recorded.record.data;
+        assert_eq!(text(image, "clientGroupID"), "g1");
+        assert_eq!(text(image, "clientID"), "c1");
+        assert_eq!(image.get("mutationID"), Some(&Value::Int(7)));
+        let result: serde_json::Value =
+            serde_json::from_str(&text(image, "result")).expect("the result is JSON text");
+        assert_eq!(
+            result,
+            serde_json::json!({"error": "app", "message": "Conversation not found"})
+        );
+        let WriteQuery::DELETE(cleaned) = &seen[1] else {
+            panic!("then cleaned up: {seen:?}");
+        };
+        let key = &cleaned.pkey_value.pkey_value;
+        assert_eq!(text(key, "clientGroupID"), "g1");
+        assert_eq!(text(key, "clientID"), "c1");
+        assert_eq!(key.get("mutationID"), Some(&Value::Int(7)));
+        cleanup(&dsn, &client, &names).await;
+    });
+}
+
 /// The read bound: with two permits and each read holding its snapshot
 /// for 400 ms, six concurrent reads take three rounds rather than six
 /// connections, and every one of them succeeds.

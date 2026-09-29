@@ -18,7 +18,7 @@ that do the work, and how to read it.
 | **update**: feed | decoding a transaction | commit → arrival (replication lag) | transactions, writes | – |
 | **update**: IVM | the engine's step | waiting for the engine (inbox) | subscriptions impacted, narrowed reads | client updates |
 | **update**: client | flush, socket write | – | pokes | rows serialized |
-| **mutation** | – | the push's round trip; push → acknowledgement | pushes ok / failed | – |
+| **mutation** | – | the push's round trip; push → acknowledgement | pushes ok / failed, results, cleanups | – |
 | **memory** | | | connections, groups, clients, subscriptions, trees, caches | rows held per table, RSS |
 
 Every cell is a metric below; the rows of the table are the labels.
@@ -115,6 +115,8 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_push_seconds` | the application server's push round trip (IO) |
 | `xyne_sync_pushes_total{result=ok,failed}` | pushes forwarded and their outcome |
 | `xyne_sync_mutation_ack_seconds` | push → the `lastMutationIDChanges` poke that acknowledges it to the client (the commit's way back through PostgreSQL, the feed and the engine) |
+| `xyne_sync_mutation_results_total` | results of refused mutations recorded in, or cleaned up from, `<app>_<shard>.mutations`, taken by a client group held here for its next poke's `mutationsPatch` |
+| `xyne_sync_mutation_cleanups_total` | cleanup-results pushes the application server accepted, sent when a client acknowledged its results or clients were deleted (a refusal is a `WARN` log line) |
 
 ### Memory and process
 

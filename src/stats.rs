@@ -280,6 +280,14 @@ pub struct Stats {
     pub plans_page_driven: AtomicU64,
     pub pushes_ok: AtomicU64,
     pub pushes_failed: AtomicU64,
+    /// Mutation results heard from the application server's result table
+    /// (a result recorded or cleaned up) for a client group this server
+    /// holds, each for the group's next poke's `mutationsPatch`.
+    pub mutation_results: AtomicU64,
+    /// Cleanup pushes the application server accepted, sent when a client
+    /// acknowledged its results or clients were deleted; the server's
+    /// answer does not say whether any result was deleted.
+    pub mutation_cleanups: AtomicU64,
     pub connections_opened: AtomicU64,
     pub connections_closed_by_client: AtomicU64,
     pub connections_closed_by_error: AtomicU64,
@@ -433,6 +441,8 @@ impl Stats {
             plans_page_driven: AtomicU64::new(0),
             pushes_ok: AtomicU64::new(0),
             pushes_failed: AtomicU64::new(0),
+            mutation_results: AtomicU64::new(0),
+            mutation_cleanups: AtomicU64::new(0),
             connections_opened: AtomicU64::new(0),
             connections_closed_by_client: AtomicU64::new(0),
             connections_closed_by_error: AtomicU64::new(0),
@@ -640,6 +650,8 @@ impl Stats {
             ("pages_short", load(&self.pages_short)),
             ("pushes_ok", load(&self.pushes_ok)),
             ("pushes_failed", load(&self.pushes_failed)),
+            ("mutation_results", load(&self.mutation_results)),
+            ("mutation_cleanups", load(&self.mutation_cleanups)),
             ("connections_opened", load(&self.connections_opened)),
             (
                 "connections_closed_by_client",
@@ -1424,6 +1436,8 @@ fn counter_name(name: &str) -> (String, Vec<(&'static str, String)>) {
         "plans_page_driven" => ("plans", &[("kind", "page_drives")]),
         "pushes_ok" => ("pushes", &[("result", "ok")]),
         "pushes_failed" => ("pushes", &[("result", "failed")]),
+        "mutation_results" => ("mutation_results", &[]),
+        "mutation_cleanups" => ("mutation_cleanups", &[]),
         "connections_opened" => ("connections", &[("event", "opened")]),
         "connections_closed_by_client" => {
             ("connections", &[("event", "closed"), ("reason", "client")])
@@ -1478,6 +1492,12 @@ fn measure_help(name: &str) -> &'static str {
         "pages_short" => "pages served short of their limit",
         "plans_page_driven" => "plans in which a page drives its own join",
         "pushes_ok" | "pushes_failed" => "pushes forwarded to the application server, by outcome",
+        "mutation_results" => {
+            "mutation results (recorded or cleaned up) taken by a client group held here, for its next poke's mutationsPatch"
+        }
+        "mutation_cleanups" => {
+            "cleanup pushes of received mutation results the application server accepted"
+        }
         "connections_opened"
         | "connections_closed_by_client"
         | "connections_closed_by_error"

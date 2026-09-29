@@ -277,7 +277,11 @@ server and the sandbox's proxy forward `/sync` to. So:
   mechanism; the SDLC lane already runs this way).
 - The backend needs nothing new: its query and mutate URL settings
   name its endpoints from the server's side, and it keeps writing mutation
-  ids to `<app>_<shard>.clients` as it does for the reference server.
+  ids to `<app>_<shard>.clients`, and the results of refused mutations to
+  `<app>_<shard>.mutations`, as it does for the reference server. The publication must
+  carry both tables; the server cleans up results a client has received
+  through the mutate endpoint (the cleanup-results push), so the results
+  table no longer grows while this server serves the clients.
 
 ## 8. Known limits at this rollout
 

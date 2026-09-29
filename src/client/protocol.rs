@@ -24,8 +24,11 @@ pub enum Upstream {
     Push(Push),
     Pull(Pull),
     CloseConnection,
-    /// `updateAuth`, `inspect`, `ackMutationResponses`: acknowledged and
-    /// otherwise ignored.
+    /// The client has received the application server's results of its
+    /// mutations up to this one (from a poke's `mutationsPatch`) and they
+    /// may be cleaned up.
+    AckMutationResponses(MutationId),
+    /// `updateAuth`, `inspect`: acknowledged and otherwise ignored.
     Other(String),
 }
 
@@ -112,8 +115,9 @@ pub struct Push {
 }
 
 /// The identity of one mutation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct MutationId {
+    #[serde(rename = "clientID")]
     pub client_id: String,
     pub id: i64,
 }
@@ -159,6 +163,7 @@ pub fn parse_upstream(text: &str) -> Result<Upstream, String> {
             "push" => Upstream::Push(parse_push(body)?),
             "pull" => Upstream::Pull(deserialize(body)?),
             "closeConnection" => Upstream::CloseConnection,
+            "ackMutationResponses" => Upstream::AckMutationResponses(deserialize(body)?),
             other => Upstream::Other(other.to_owned()),
         })
     };
@@ -351,6 +356,76 @@ pub fn delete_clients(deleted: &DeleteClients) -> String {
     )
 }
 
+/// The name of the custom mutation that asks the application server to
+/// delete mutation results a client has received (Zero's
+/// `CLEANUP_RESULTS_MUTATION_NAME`); it bumps no mutation id.
+pub const CLEANUP_RESULTS: &str = "_zero_cleanupResults";
+
+/// A `mutationsPatch` entry recording the result of `client`'s mutation
+/// `id`, as zero-cache words it: the client settles the mutation's
+/// promise with it.
+pub fn result_put(client: &str, id: i64, result: Json) -> Json {
+    json!({"op": "put", "mutation": {"id": {"clientID": client, "id": id}, "result": result}})
+}
+
+/// A `mutationsPatch` entry removing the result of `client`'s mutation
+/// `id` once it has been cleaned up.
+pub fn result_del(client: &str, id: i64) -> Json {
+    json!({"op": "del", "id": {"clientID": client, "id": id}})
+}
+
+/// The push body asking the application server to delete the results of
+/// `upto.client_id`'s mutations up to `upto.id` in `group`, the one
+/// zero-cache sends when a client acknowledges them.
+pub fn cleanup_results(group: &str, upto: &MutationId) -> Json {
+    cleanup_push(
+        group,
+        &upto.client_id,
+        json!({
+            "type": "single", "clientGroupID": group,
+            "clientID": upto.client_id, "upToMutationID": upto.id,
+        }),
+        format!("cleanup-{group}-{}-{}", upto.client_id, upto.id),
+    )
+}
+
+/// The push body asking the application server to delete every result of
+/// `clients` in `group`, the one zero-cache sends when clients are
+/// deleted; `None` for no clients.
+pub fn cleanup_clients(group: &str, clients: &[String]) -> Option<Json> {
+    let first = clients.first()?;
+    let now = now_millis();
+    Some(cleanup_push(
+        group,
+        first,
+        json!({"type": "bulk", "clientGroupID": group, "clientIDs": clients}),
+        format!("cleanup-bulk-{group}-{now}"),
+    ))
+}
+
+/// One cleanup push: a single custom mutation of id 0 carrying `args`.
+fn cleanup_push(group: &str, client: &str, args: Json, request_id: String) -> Json {
+    let now = now_millis();
+    json!({
+        "clientGroupID": group,
+        "mutations": [{
+            "type": "custom", "id": 0, "clientID": client,
+            "name": CLEANUP_RESULTS, "args": [args], "timestamp": now,
+        }],
+        "pushVersion": 1,
+        "timestamp": now,
+        "requestID": request_id,
+    })
+}
+
+/// Milliseconds since the epoch, now.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// `pushResponse`: only the receiving client's per-mutation results.
 /// Zero's mutation tracker rejects results belonging to another client,
 /// even when the push contains mutations recovered for that client.
@@ -387,6 +462,74 @@ pub fn poke_end(poke_id: &str, cookie: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client's acknowledgement of its mutation results is read with the
+    /// mutation it reaches.
+    #[test]
+    fn an_acknowledgement_of_results_is_read() {
+        let ack =
+            parse_upstream(r#"["ackMutationResponses",{"clientID":"c1","id":7}]"#).expect("parsed");
+        let Upstream::AckMutationResponses(upto) = ack else {
+            panic!("{ack:?}");
+        };
+        assert_eq!(
+            upto,
+            MutationId {
+                client_id: "c1".to_owned(),
+                id: 7
+            }
+        );
+        assert!(parse_upstream(r#"["ackMutationResponses",{"id":7}]"#).is_err());
+    }
+
+    /// The results patch and the cleanup pushes are the ones zero-cache
+    /// sends: the entries the client's poke handler turns into its result
+    /// records, and the `_zero_cleanupResults` mutation (single for an
+    /// acknowledgement, bulk for deleted clients) the application server
+    /// deletes them on.
+    #[test]
+    fn results_and_their_cleanup_are_worded_as_zero_cache_words_them() {
+        let error = json!({"error": "app", "message": "Conversation not found"});
+        assert_eq!(
+            result_put("c1", 7, error.clone()),
+            json!({"op": "put", "mutation": {"id": {"clientID": "c1", "id": 7}, "result": error}})
+        );
+        assert_eq!(
+            result_del("c1", 7),
+            json!({"op": "del", "id": {"clientID": "c1", "id": 7}})
+        );
+        let single = cleanup_results(
+            "g1",
+            &MutationId {
+                client_id: "c1".to_owned(),
+                id: 7,
+            },
+        );
+        assert_eq!(single["clientGroupID"], "g1");
+        assert_eq!(single["pushVersion"], 1);
+        assert_eq!(single["requestID"], "cleanup-g1-c1-7");
+        assert_eq!(single["mutations"][0]["name"], "_zero_cleanupResults");
+        assert_eq!(single["mutations"][0]["type"], "custom");
+        assert_eq!(single["mutations"][0]["id"], 0);
+        assert_eq!(single["mutations"][0]["clientID"], "c1");
+        assert_eq!(
+            single["mutations"][0]["args"],
+            json!([{"type": "single", "clientGroupID": "g1", "clientID": "c1", "upToMutationID": 7}])
+        );
+        let clients = vec!["c1".to_owned(), "c2".to_owned()];
+        let bulk = cleanup_clients("g1", &clients).expect("clients");
+        assert_eq!(bulk["mutations"][0]["clientID"], "c1");
+        assert_eq!(
+            bulk["mutations"][0]["args"],
+            json!([{"type": "bulk", "clientGroupID": "g1", "clientIDs": ["c1", "c2"]}])
+        );
+        assert!(
+            bulk["requestID"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("cleanup-bulk-g1-"))
+        );
+        assert!(cleanup_clients("g1", &[]).is_none());
+    }
 
     #[test]
     fn push_response_filters_results_by_receiving_client() {

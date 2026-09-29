@@ -36,7 +36,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::ast::{self, Ast, Translated};
 use super::backend::{Backend, Identity, PushOutcome, TransformOutcome};
 use super::config::Config;
-use super::groups::{ConnectReply, DesiredOp, Outbound, Request, Socket};
+use super::groups::{ConnectReply, DesiredOp, MutationResult, Outbound, Request, Socket};
 use super::plan::{self, PlanCache};
 use super::protocol::{
     self, DeleteClients, InitConnection, PROTOCOL_VERSION, QueryPatchOp, Upstream,
@@ -69,7 +69,7 @@ pub struct AppState {
     pub storage: Arc<PgStorage>,
     pub catalog: Arc<CatalogHandle>,
     pub plans: Arc<PlanCache>,
-    pub lmids: Arc<LmidReader>,
+    pub mutations: Arc<MutationReader>,
     pub stats: Arc<Stats>,
     pub ready: watch::Receiver<bool>,
     pub warm: Arc<WarmStart>,
@@ -400,7 +400,7 @@ async fn handle(
         let _ = writer.await;
         return;
     }
-    let lmids = state.lmids.lmids(&group_id).await;
+    let (lmids, results) = state.mutations.read(&group_id).await;
     let (reply_tx, reply_rx) = oneshot::channel();
     let request = Request::Connect {
         group: group_id.clone(),
@@ -411,6 +411,7 @@ async fn handle(
         },
         base_cookie: conn.params.base_cookie.clone(),
         lmids,
+        results,
         reply: reply_tx,
     };
     let refusal = match requests.send(request).await {
@@ -682,6 +683,16 @@ impl Conn {
             Upstream::ChangeDesiredQueries(ops) => self.desired(ops).await,
             Upstream::DeleteClients(deleted) => {
                 self.delete_clients(&deleted).await;
+                if self.state.mutations.keeps_results()
+                    && let Some(cleanup) =
+                        protocol::cleanup_clients(&self.params.group_id, &deleted.client_ids)
+                {
+                    self.clean_up(cleanup);
+                }
+                true
+            }
+            Upstream::AckMutationResponses(upto) => {
+                self.clean_up(protocol::cleanup_results(&self.params.group_id, &upto));
                 true
             }
             Upstream::Push(push) => {
@@ -742,6 +753,34 @@ impl Conn {
             self.delete_clients(deleted).await;
         }
         self.desired(init.desired_queries_patch).await
+    }
+
+    /// Ask the application server to delete mutation results — `body`, a
+    /// cleanup push, as zero-cache sends one when a client acknowledges its
+    /// results or clients are deleted — on a task of its own: the answer
+    /// matters only to the counters and the log, and a slow endpoint must
+    /// not hold up this connection's messages, its pings among them.
+    fn clean_up(&self, body: Json) {
+        let backend = self.state.backend.clone();
+        let identity = self.identity.clone();
+        let stats = self.state.stats.clone();
+        let wsid = self.params.wsid.clone();
+        tokio::spawn(async move {
+            match backend.push(&identity, &body).await {
+                PushOutcome::Response(json)
+                    if json.get("error").is_none()
+                        && json.get("kind").and_then(Json::as_str) != Some("PushFailed") =>
+                {
+                    stats.mutation_cleanups.fetch_add(1, Ordering::Relaxed);
+                }
+                PushOutcome::Response(json) => log_warn!(
+                    "connection {wsid}: the mutate endpoint refused a cleanup of mutation results: {json}"
+                ),
+                PushOutcome::Failed { message, .. } => {
+                    log_warn!("connection {wsid}: cleaning up mutation results failed: {message}")
+                }
+            }
+        });
     }
 
     /// Clients the client says are gone: their queries go, and the client
@@ -1080,45 +1119,99 @@ fn planned_failure(planned: Option<Result<Translated, String>>) -> String {
     }
 }
 
-/// Reads a client group's last mutation ids at connect time, on the reads
+/// Reads, at connect time, what the application server has recorded for
+/// a client group's mutations: every client's last mutation id and, when
+/// the catalog describes the server's results table, the results still
+/// waiting there for the group's clients — in one statement on the reads
 /// pool, over the engine side's storage handle.
-pub struct LmidReader {
+pub struct MutationReader {
     storage: Arc<PgStorage>,
-    table: String,
+    catalog: Arc<CatalogHandle>,
+    schema: String,
+    results_table: String,
 }
 
-impl LmidReader {
-    /// A reader of `<schema>.clients` through `storage`.
-    pub fn new(storage: Arc<PgStorage>, schema: &str) -> Self {
-        LmidReader {
+impl MutationReader {
+    /// A reader of `<schema>.clients`, and of `<schema>.mutations` while
+    /// `catalog` describes it, through `storage`.
+    pub fn new(storage: Arc<PgStorage>, schema: &str, catalog: Arc<CatalogHandle>) -> Self {
+        MutationReader {
             storage,
-            table: format!("{}.{}", quote_ident(schema), quote_ident("clients")),
+            catalog,
+            schema: schema.to_owned(),
+            results_table: format!("{schema}.mutations"),
         }
     }
 
-    /// The last mutation id of every client of `group`; empty when the
-    /// table cannot be read (the group then starts from the feed's word).
-    pub async fn lmids(&self, group: &str) -> Vec<(String, i64)> {
-        let sql = format!(
-            "SELECT \"clientID\", \"lastMutationID\" FROM {} WHERE \"clientGroupID\" = {}",
-            self.table,
-            quote_literal(group)
-        );
+    /// Whether the application server keeps mutation results: the catalog
+    /// describes its results table.
+    pub fn keeps_results(&self) -> bool {
+        self.catalog.load().table(&self.results_table).is_some()
+    }
+
+    /// The last mutation id of every client of `group`, and the results
+    /// waiting for them; both empty when the tables cannot be read (the
+    /// group then starts from the feed's word).
+    pub async fn read(&self, group: &str) -> (Vec<(String, i64)>, Vec<MutationResult>) {
+        let sql = mutation_state_sql(&self.schema, group, self.keeps_results());
         match self.storage.simple_query(&sql).await {
-            Ok(rows) => rows
-                .iter()
-                .filter_map(|row| {
-                    let client = row.get(0)?.to_owned();
-                    let lmid = row.get(1)?.parse::<i64>().ok()?;
-                    Some((client, lmid))
-                })
-                .collect(),
+            Ok(rows) => mutation_state(
+                rows.iter()
+                    .map(|row| [row.get(0), row.get(1), row.get(2), row.get(3)]),
+            ),
             Err(error) => {
-                log_warn!("reading last mutation ids of {group}: {error}");
-                Vec::new()
+                log_warn!("reading the mutations of client group {group}: {error}");
+                (Vec::new(), Vec::new())
             }
         }
     }
+}
+
+/// The one statement reading `group`'s mutation ids and, with `results`,
+/// the results waiting for its clients: rows tagged `l` (client, last
+/// mutation id) and `r` (client, mutation id, result as text), each table
+/// read by its primary key, which leads with the group.
+fn mutation_state_sql(schema: &str, group: &str, results: bool) -> String {
+    let schema = quote_ident(schema);
+    let group = quote_literal(group);
+    let lmids = format!(
+        "SELECT 'l', \"clientID\", \"lastMutationID\"::text, NULL::text FROM {schema}.\"clients\" WHERE \"clientGroupID\" = {group}"
+    );
+    if !results {
+        return lmids;
+    }
+    format!(
+        "{lmids} UNION ALL SELECT 'r', \"clientID\", \"mutationID\"::text, \"result\"::text FROM {schema}.\"mutations\" WHERE \"clientGroupID\" = {group}"
+    )
+}
+
+/// The ids and results among [`mutation_state_sql`]'s rows, each given as
+/// its four columns; a row that does not parse is passed over.
+fn mutation_state<'a>(
+    rows: impl Iterator<Item = [Option<&'a str>; 4]>,
+) -> (Vec<(String, i64)>, Vec<MutationResult>) {
+    let mut lmids = Vec::new();
+    let mut results = Vec::new();
+    for [kind, client, number, result] in rows {
+        let (Some(client), Some(number)) = (client, number.and_then(|number| number.parse().ok()))
+        else {
+            continue;
+        };
+        match (kind, result) {
+            (Some("l"), _) => lmids.push((client.to_owned(), number)),
+            (Some("r"), Some(result)) => {
+                if let Ok(result) = serde_json::from_str(result) {
+                    results.push(MutationResult {
+                        client: client.to_owned(),
+                        id: number,
+                        result,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    (lmids, results)
 }
 
 #[cfg(test)]
@@ -1132,5 +1225,52 @@ mod tests {
     fn health_follows_readiness() {
         assert_eq!(readiness(false).0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(readiness(true), (StatusCode::OK, "ok"));
+    }
+
+    /// A group's mutation ids and waiting results are read in one
+    /// statement, each table by its primary key, the group quoted; with no
+    /// results table, the ids alone.
+    #[test]
+    fn a_groups_mutations_are_read_in_one_statement() {
+        assert_eq!(
+            mutation_state_sql("zero02_0", "g'1", true),
+            "SELECT 'l', \"clientID\", \"lastMutationID\"::text, NULL::text FROM \"zero02_0\".\"clients\" WHERE \"clientGroupID\" = 'g''1' \
+             UNION ALL SELECT 'r', \"clientID\", \"mutationID\"::text, \"result\"::text FROM \"zero02_0\".\"mutations\" WHERE \"clientGroupID\" = 'g''1'"
+        );
+        assert_eq!(
+            mutation_state_sql("zero_0", "g", false),
+            "SELECT 'l', \"clientID\", \"lastMutationID\"::text, NULL::text FROM \"zero_0\".\"clients\" WHERE \"clientGroupID\" = 'g'"
+        );
+    }
+
+    /// The statement's rows split into ids and results, the results' JSON
+    /// parsed; a row with no client, no number or a result that is not
+    /// JSON is passed over.
+    #[test]
+    fn a_groups_mutation_rows_are_read_into_ids_and_results() {
+        let rows = [
+            [Some("l"), Some("c1"), Some("21"), None],
+            [
+                Some("r"),
+                Some("c1"),
+                Some("22"),
+                Some(r#"{"error":"app","message":"no"}"#),
+            ],
+            [Some("l"), Some("c2"), Some("3"), None],
+            [Some("r"), Some("c2"), Some("4"), Some("not json")],
+            [Some("l"), None, Some("5"), None],
+            [Some("l"), Some("c3"), Some("five"), None],
+            [Some("x"), Some("c4"), Some("6"), None],
+        ];
+        let (lmids, results) = mutation_state(rows.into_iter());
+        assert_eq!(lmids, vec![("c1".to_owned(), 21), ("c2".to_owned(), 3)]);
+        assert_eq!(
+            results,
+            vec![MutationResult {
+                client: "c1".to_owned(),
+                id: 22,
+                result: json!({"error": "app", "message": "no"}),
+            }]
+        );
     }
 }

@@ -438,11 +438,12 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   cookie is sent the group's whole state from its row ledger, the other
   tabs undisturbed; a tab behind its group is replayed the pokes it missed
   from the group's log (`XYNE_SYNC_GROUP_LOG_BYTES`), each closing with
-  the group's mutation ids as they are now (read from the clients table
-  at every connect), so the first poke it processes already confirms
-  every mutation processed since — a stale replay would have it rebase a
-  pending mutation against rows since removed, fail, and reconnect into
-  the same replay; anything else starts a fresh sync
+  the group's mutation ids and waiting mutation results as they are now
+  (read from the clients and mutations tables at every connect), so the
+  first poke it processes already settles every mutation processed since
+  — a stale replay would have it rebase a pending mutation against rows
+  since removed, fail, and reconnect into the same replay; anything else
+  starts a fresh sync
   (`docs/client-resume-2026-09-21.md`).
 - **Bounded waits.** A storage read is given `XYNE_SYNC_READ_TIMEOUT_MS`
   (10 s): PostgreSQL cancels the statement, the pool stops waiting, and the
@@ -533,9 +534,10 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   subscription parts holding it, so a row is `del`ed only when its last
   holder lets go and a row several queries share ships once. A poke goes out
   per flush of the group thread: idle, that is per committed transaction (a
-  mutation's rows and its `lastMutationID`, read off the application's
-  `xyne_0.clients` table and carried inside the same transaction's commit
-  event, travel together); under load one poke covers every transaction that
+  mutation's rows, its `lastMutationID` read off the application's
+  `xyne_0.clients` table and, when the application refused it, its result
+  read off `xyne_0.mutations`, all carried inside the same transaction's
+  commit event, travel together); under load one poke covers every transaction that
   arrived since the last flush, which keeps the frame count per connection
   bounded as the write rate climbs. `gotQueriesPatch` follows a query once
   every part of its tree is live. Versions are the client's lexicographic cookies.
@@ -545,10 +547,23 @@ which `sync/pg/threads.rs` wires to PostgreSQL.
   the client does on its own.
 - **Mutations.** A `push` is forwarded verbatim to the mutate endpoint with
   `schema` and `appID` parameters and the connection's cookies; the answer
-  comes back as `pushResponse`, a refusal as the `PushFailed` error the client
-  understands. The application server records each mutation in
-  `<app>_<shard>.clients` inside the mutation's transaction; the feed delivers
-  that row with the rest, and the poke carries the id.
+  comes back as `pushResponse` (the receiving client's results only: the client's
+  mutation tracker rejects another client's), a refusal as the `PushFailed`
+  error the client understands. The application server records each
+  mutation in `<app>_<shard>.clients` inside the mutation's transaction and,
+  for one it refused with an application error, the result in
+  `<app>_<shard>.mutations` in the same transaction; the feed delivers both
+  rows with the rest, and one poke carries the id (`lastMutationIDChanges`)
+  and the result (`mutationsPatch`, to every connection of the group, as
+  the reference server sends it), so the client rejects the mutation with the
+  application's error before the id would settle it as a success. When a
+  client acknowledges its results (`ackMutationResponses`), and when
+  clients are deleted, the application server is sent the
+  cleanup-results push the reference server sends (up to that mutation, or in
+  bulk for the deleted clients), and the rows' deletion reaches the group
+  as `del`s the same way. The results still waiting are read with the ids
+  at every connect and told with them. The publication must carry both
+  tables (`FOR ALL TABLES`, or one over the `<app>_<shard>` schema).
 - **Types.** The catalog is read from `information_schema` at startup
   (`sync/pg/catalog.rs`), mapped the way the sync protocol maps Postgres for its clients:
   `timestamp`, `timestamptz` and `date` are milliseconds since the epoch
