@@ -656,6 +656,7 @@ cargo run --bin xyne_sync      # scripted demo: SQL in, routed operations + cost
 cargo test                    # model, parser, routing, window, join and read/write interleaving scenarios
 cargo test --test xyne_spaces_queries   # the xyne-spaces dashboard's 283 queries on the engine (gap table in its main.rs)
 cargo run --release --bin bench   # routing / registration / window / join benchmarks, and the xyne-spaces query shapes
+cargo test --release --test engine_cost -- --ignored --nocapture   # the engine's time on production-shaped trees: the desk list's windows, writes under them, a workspace's channels
 cargo run --release --bin server  # the sync server on :4848 (reads .env; see .env.example)
 
 # against a real Postgres (wal_level = logical, replication slots to spare, a role that may create a publication):

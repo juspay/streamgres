@@ -121,7 +121,8 @@
 //! always-false boundary (`IN ()`), so it stays permanently empty.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use super::{FetchKind, SingleTableIVM, SingleTableUpdate};
 use crate::model::{
@@ -189,8 +190,9 @@ pub(super) struct PageState {
 /// was last full and whether it is capped, and its held rows sorted by
 /// the gate's verdict — candidates (undecided), admitted (gate open),
 /// rejected (gate closed; kept only by a page read whole) — every other
-/// held row waiting in memory for a round to take it. `client` is the
-/// prefix a client is sent: the first `L` admitted rows.
+/// held row waiting in memory for a round to take it. The prefix a
+/// client is sent, the first `L` admitted rows, is read off the entries
+/// when asked for ([`Window::client_prefix`]).
 struct Page {
     whole: bool,
     batch: usize,
@@ -200,29 +202,41 @@ struct Page {
     candidates: HashSet<DataFrameKey>,
     admitted: HashSet<DataFrameKey>,
     rejected: HashSet<DataFrameKey>,
-    client: Vec<DataFrameKey>,
 }
 
+/// A held row's order value, one per `ORDER BY` column, shared between
+/// the sorted entries and the index by key.
+type OrderValue = Rc<[Value]>;
+
+/// How few new rows a landing may bring for them to be inserted one by
+/// one (a binary search and a shift each) rather than by sorting them and
+/// merging them into the entries in one pass.
+const MERGE_FROM: usize = 32;
+
 /// The ORDER BY / LIMIT state of one subscription: its held rows' order
-/// values (one per `ORDER BY` column), best → worst, the storage frontier
-/// the boundary and the refill threshold are anchored at, the keys last
-/// delivered to the layer above (the prefix at the last step), whether
-/// the last refill brought nothing new (`stalled`: no further refill is
-/// asked for until the held rows change), whether the order is unique
-/// (`unique`: it ends in the row key, so no row ties the frontier),
-/// whether the frontier row itself is still to be read (`inclusive`: an
-/// evicted row sits at the frontier, unheld; a read's worst row was
-/// decided already), and, for a page under a gate, the page's state.
+/// values (one per `ORDER BY` column), best → worst, the same values by
+/// key (`held`, so whether a row is held and where it sits cost a lookup
+/// and a binary search, never a walk), the storage frontier the boundary
+/// and the refill threshold are anchored at, the keys last delivered to
+/// the layer above (the prefix at the last step), whether the last
+/// refill brought nothing new (`stalled`: no further refill is asked for
+/// until the held rows change), whether the order is unique (`unique`:
+/// it ends in the row key, so no row ties the frontier), whether the
+/// frontier row itself is still to be read (`inclusive`: an evicted row
+/// sits at the frontier, unheld; a read's worst row was decided already),
+/// and, for a page under a gate, the page's state.
 pub(super) struct Window {
     order: Vec<OrderBy>,
     user_limit: usize,
-    entries: Vec<(Vec<Value>, DataFrameKey)>,
+    entries: Vec<(OrderValue, DataFrameKey)>,
+    held: HashMap<DataFrameKey, OrderValue>,
     frontier: Option<Vec<Value>>,
     inclusive: bool,
     shown: Vec<DataFrameKey>,
     stalled: bool,
     unique: bool,
     page: Option<Page>,
+    version: u64,
 }
 
 impl Window {
@@ -237,13 +251,27 @@ impl Window {
             order: query.order_by.clone(),
             user_limit: query.limit as usize,
             entries: Vec::new(),
+            held: HashMap::new(),
             frontier: None,
             inclusive: false,
             shown: Vec::new(),
             stalled: false,
             unique: false,
             page: None,
+            version: 0,
         })
+    }
+
+    /// A count of the changes to what the window holds and what its page
+    /// admits: the layer above compares it with the count it last synced
+    /// its view at, and an unchanged window costs it nothing.
+    pub(super) fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Note a change to the held rows or the page's verdicts.
+    fn touched(&mut self) {
+        self.version = self.version.wrapping_add(1);
     }
 
     /// Learn from the first key held whether the order is unique: it is
@@ -276,7 +304,6 @@ impl Window {
             candidates: HashSet::new(),
             admitted: HashSet::new(),
             rejected: HashSet::new(),
-            client: Vec::new(),
         });
         Some(window)
     }
@@ -346,41 +373,50 @@ impl Window {
     pub(super) fn insert(&mut self, value: Vec<Value>, key: DataFrameKey) {
         self.learn(&key);
         self.detach(&key);
-        let position = self
-            .entries
-            .iter()
-            .position(|(existing, _)| is_worse(existing, &value, &self.order))
-            .unwrap_or(self.entries.len());
-        self.entries.insert(position, (value, key));
+        self.place(Rc::from(value), key);
         self.stalled = false;
-        self.refresh_client();
     }
 
-    /// Insert many rows at once (a storage read landing): one sort and one
-    /// merge instead of one scan per row. Keys already held keep their
-    /// place and what the gate made of them.
+    /// Put a row that is not held at its value's position: after every
+    /// entry at or better than its value, found by binary search.
+    fn place(&mut self, value: OrderValue, key: DataFrameKey) {
+        let order = &self.order;
+        let position = self
+            .entries
+            .partition_point(|(existing, _)| !is_worse(existing, &value, order));
+        self.held.insert(key.clone(), value.clone());
+        self.entries.insert(position, (value, key));
+        self.touched();
+    }
+
+    /// Insert many rows at once (a storage read landing): a few are placed
+    /// one by one, more are sorted and merged into the entries in one
+    /// pass. Keys already held keep their place and what the gate made of
+    /// them.
     pub(super) fn insert_many(&mut self, rows: Vec<(Vec<Value>, DataFrameKey)>) {
         let Some((_, first)) = rows.first() else {
             return;
         };
         self.learn(first);
-        let held: HashSet<&DataFrameKey> = self.entries.iter().map(|(_, key)| key).collect();
-        let mut fresh: Vec<(Vec<Value>, DataFrameKey)> = rows
+        let mut fresh: Vec<(OrderValue, DataFrameKey)> = rows
             .into_iter()
-            .filter(|(_, key)| !held.contains(key))
+            .filter(|(_, key)| !self.held.contains_key(key))
+            .map(|(value, key)| (Rc::from(value), key))
             .collect();
         if fresh.is_empty() {
             return;
         }
-        fresh.sort_by(|(a, _), (b, _)| {
-            if is_worse(a, b, &self.order) {
-                Ordering::Greater
-            } else if is_worse(b, a, &self.order) {
-                Ordering::Less
-            } else {
-                Ordering::Equal
+        self.stalled = false;
+        if fresh.len() < MERGE_FROM {
+            for (value, key) in fresh {
+                self.place(value, key);
             }
-        });
+            return;
+        }
+        fresh.sort_by(|(a, _), (b, _)| order_values(a, b, &self.order));
+        for (value, key) in &fresh {
+            self.held.insert(key.clone(), value.clone());
+        }
         let existing = std::mem::take(&mut self.entries);
         let mut merged = Vec::with_capacity(existing.len() + fresh.len());
         let mut fresh = fresh.into_iter().peekable();
@@ -396,19 +432,37 @@ impl Window {
         }
         merged.extend(fresh);
         self.entries = merged;
-        self.stalled = false;
-        self.refresh_client();
+        self.touched();
+    }
+
+    /// Where `key` sits among the entries, `None` when it is not held: a
+    /// binary search to the entries tying its value, then the few of
+    /// those (ties are rare: the order usually ends in the row key).
+    fn position_of(&self, key: &DataFrameKey) -> Option<usize> {
+        let value = self.held.get(key)?;
+        let order = &self.order;
+        let from = self
+            .entries
+            .partition_point(|(existing, _)| is_worse(value, existing, order));
+        self.entries[from..]
+            .iter()
+            .take_while(|(existing, _)| !is_worse(existing, value, order))
+            .position(|(_, existing)| existing == key)
+            .map(|offset| from + offset)
+    }
+
+    /// Whether `key` is held.
+    fn holds(&self, key: &DataFrameKey) -> bool {
+        self.held.contains_key(key)
     }
 
     /// Take one key out of the entries, leaving its page state as it is
     /// (an in-place re-insertion is about to put it back).
     fn detach(&mut self, key: &DataFrameKey) {
-        if let Some(index) = self
-            .entries
-            .iter()
-            .position(|(_, existing)| existing == key)
-        {
+        if let Some(index) = self.position_of(key) {
             self.entries.remove(index);
+            self.held.remove(key);
+            self.touched();
         }
     }
 
@@ -419,9 +473,11 @@ impl Window {
     pub(super) fn adopt_page(&mut self, previous: Window) {
         self.shown = previous.shown;
         if let (Some(page), Some(before)) = (&mut self.page, previous.page) {
-            let held: HashSet<&DataFrameKey> = self.entries.iter().map(|(_, key)| key).collect();
+            let held = &self.held;
             let kept = |keys: HashSet<DataFrameKey>| -> HashSet<DataFrameKey> {
-                keys.into_iter().filter(|key| held.contains(key)).collect()
+                keys.into_iter()
+                    .filter(|key| held.contains_key(key))
+                    .collect()
             };
             page.candidates = kept(before.candidates);
             page.admitted = kept(before.admitted);
@@ -429,7 +485,7 @@ impl Window {
             page.rounds = before.rounds;
             page.capped = before.capped;
         }
-        self.refresh_client();
+        self.touched();
     }
 
     /// The keys of the prefix the layer above sees: for a page its
@@ -458,43 +514,32 @@ impl Window {
         match &self.page {
             Some(page) => page.candidates.contains(key) || page.admitted.contains(key),
             None => self
-                .entries
-                .iter()
-                .take(self.user_limit)
-                .any(|(_, held)| held == key),
+                .position_of(key)
+                .is_some_and(|position| position < self.user_limit),
         }
     }
 
     /// The keys a client is sent: for a page the first `L` admitted rows,
-    /// otherwise the prefix itself.
+    /// read off the entries now; otherwise the prefix itself.
     pub(super) fn client_prefix(&self) -> Vec<DataFrameKey> {
         match &self.page {
-            Some(page) => page.client.clone(),
+            Some(page) => self
+                .entries
+                .iter()
+                .map(|(_, key)| key)
+                .filter(|key| page.admitted.contains(key))
+                .take(self.user_limit)
+                .cloned()
+                .collect(),
             None => self.shown_prefix(),
         }
-    }
-
-    /// Recompute a page's client prefix from its admitted rows.
-    fn refresh_client(&mut self) {
-        let limit = self.user_limit;
-        let Some(page) = &mut self.page else {
-            return;
-        };
-        page.client = self
-            .entries
-            .iter()
-            .map(|(_, key)| key)
-            .filter(|key| page.admitted.contains(key))
-            .take(limit)
-            .cloned()
-            .collect();
     }
 
     /// Make a held row a candidate: a row that needs the gate's verdict (a
     /// row a read or a write brought, a rejected row a write concerns).
     /// Nothing for a row already admitted or not held.
     pub(super) fn enroll(&mut self, key: &DataFrameKey) {
-        let held = self.entries.iter().any(|(_, existing)| existing == key);
+        let held = self.holds(key);
         let Some(page) = &mut self.page else {
             return;
         };
@@ -503,26 +548,36 @@ impl Window {
         }
         page.rejected.remove(key);
         page.candidates.insert(key.clone());
+        self.touched();
     }
 
-    /// The candidates, best first.
+    /// The candidates, best first: a few are sorted by their positions,
+    /// many are picked out of the entries in one walk.
     pub(super) fn candidates(&self) -> Vec<DataFrameKey> {
-        match &self.page {
-            Some(page) => self
-                .entries
+        let Some(page) = &self.page else {
+            return Vec::new();
+        };
+        if page.candidates.len() * 8 < self.entries.len() {
+            let mut placed: Vec<(usize, &DataFrameKey)> = page
+                .candidates
                 .iter()
-                .map(|(_, key)| key)
-                .filter(|key| page.candidates.contains(key))
-                .cloned()
-                .collect(),
-            None => Vec::new(),
+                .filter_map(|key| self.position_of(key).map(|position| (position, key)))
+                .collect();
+            placed.sort_unstable_by_key(|(position, _)| *position);
+            return placed.into_iter().map(|(_, key)| key.clone()).collect();
         }
+        self.entries
+            .iter()
+            .map(|(_, key)| key)
+            .filter(|key| page.candidates.contains(key))
+            .cloned()
+            .collect()
     }
 
     /// The gate let `key` through: it counts toward the page from now on.
     /// Reports whether that changed anything.
     pub(super) fn admit(&mut self, key: &DataFrameKey) -> bool {
-        let held = self.entries.iter().any(|(_, existing)| existing == key);
+        let held = self.holds(key);
         let Some(page) = &mut self.page else {
             return false;
         };
@@ -531,7 +586,7 @@ impl Window {
         }
         page.candidates.remove(key);
         page.rejected.remove(key);
-        self.refresh_client();
+        self.touched();
         true
     }
 
@@ -548,7 +603,7 @@ impl Window {
         page.candidates.insert(key.clone());
         page.rounds = 0;
         page.capped = false;
-        self.refresh_client();
+        self.touched();
         true
     }
 
@@ -561,6 +616,7 @@ impl Window {
             if page.whole {
                 page.rejected.insert(key.clone());
             }
+            self.touched();
         }
     }
 
@@ -568,16 +624,13 @@ impl Window {
     /// frontier is untouched: a removal does not change what storage
     /// covers. An admitted row leaving starts a page's rounds over.
     pub(super) fn remove(&mut self, key: &DataFrameKey) -> bool {
-        match self
-            .entries
-            .iter()
-            .position(|(_, existing)| existing == key)
-        {
+        match self.position_of(key) {
             Some(index) => {
                 self.entries.remove(index);
+                self.held.remove(key);
                 self.forget(key);
                 self.stalled = false;
-                self.refresh_client();
+                self.touched();
                 true
             }
             None => false,
@@ -591,10 +644,11 @@ impl Window {
         }
         self.entries.retain(|(_, key)| !keys.contains(key));
         for key in keys {
+            self.held.remove(key);
             self.forget(key);
         }
         self.stalled = false;
-        self.refresh_client();
+        self.touched();
     }
 
     /// Take `key` out of every page set; an admitted row leaving starts
@@ -621,9 +675,10 @@ impl Window {
             return None;
         }
         let (value, key) = self.entries.pop()?;
+        self.held.remove(&key);
         self.forget(&key);
-        self.cover(value, true);
-        self.refresh_client();
+        self.cover(value.to_vec(), true);
+        self.touched();
         Some(key)
     }
 
@@ -653,7 +708,9 @@ impl Window {
         for key in &demoted {
             page.admitted.remove(key);
         }
-        self.refresh_client();
+        if !demoted.is_empty() {
+            self.touched();
+        }
         demoted
     }
 
@@ -758,17 +815,15 @@ impl Window {
             return Some((self.capacity().max(wanted as usize) as u32, None));
         }
         let strict = self.unique && !self.inclusive;
-        let held_beyond = self
-            .entries
-            .iter()
-            .filter(|(value, _)| {
-                if strict {
-                    is_worse(value, frontier, &self.order)
-                } else {
-                    !is_worse(frontier, value, &self.order)
-                }
-            })
-            .count();
+        let order = &self.order;
+        let within = if strict {
+            self.entries
+                .partition_point(|(value, _)| !is_worse(value, frontier, order))
+        } else {
+            self.entries
+                .partition_point(|(value, _)| is_worse(frontier, value, order))
+        };
+        let held_beyond = self.entries.len() - within;
         let limit = (wanted as usize + held_beyond) as u32;
         let threshold = lexicographic(&self.order, frontier, |direction, last| {
             match (direction, last && !strict) {
@@ -781,25 +836,33 @@ impl Window {
         Some((limit, Some(threshold)))
     }
 
-    /// How many settled rows lie strictly inside the frontier, where every
-    /// matching row of storage is known to be held; all of them when
-    /// storage is exhausted. A held row whose value worsened in place past
-    /// the frontier keeps its slot but is not among them: storage may hold
-    /// better rows that were never fetched.
-    fn covered(&self) -> usize {
+    /// Whether at least `wanted` settled rows lie strictly inside the
+    /// frontier, where every matching row of storage is known to be held
+    /// (every settled row does when storage is exhausted). The rows inside
+    /// the frontier are a prefix of the entries, found by binary search; a
+    /// page counts the admitted ones among them, stopping at `wanted`. A
+    /// held row whose value worsened in place past the frontier keeps its
+    /// slot but is not among them: storage may hold better rows that were
+    /// never fetched.
+    fn covers(&self, wanted: usize) -> bool {
         let Some(frontier) = &self.frontier else {
-            return self.settled();
+            return self.settled() >= wanted;
         };
-        self.entries
-            .iter()
-            .filter(|(value, key)| {
-                is_worse(frontier, value, &self.order)
-                    && self
-                        .page
-                        .as_ref()
-                        .is_none_or(|page| page.admitted.contains(key))
-            })
-            .count()
+        let order = &self.order;
+        let inside = self
+            .entries
+            .partition_point(|(value, _)| is_worse(frontier, value, order));
+        match &self.page {
+            None => inside >= wanted,
+            Some(page) => {
+                self.entries[..inside]
+                    .iter()
+                    .filter(|(_, key)| page.admitted.contains(key))
+                    .nth(wanted.saturating_sub(1))
+                    .is_some()
+                    || wanted == 0
+            }
+        }
     }
 
     /// The refill trigger: the settled rows have drained to the user's
@@ -817,9 +880,9 @@ impl Window {
             Some(page) => {
                 !page.capped
                     && page.candidates.is_empty()
-                    && (page.admitted.len() < self.user_limit || self.covered() < self.user_limit)
+                    && (page.admitted.len() < self.user_limit || !self.covers(self.user_limit))
             }
-            None => self.settled() <= self.user_limit || self.covered() < self.user_limit,
+            None => self.settled() <= self.user_limit || !self.covers(self.user_limit),
         }
     }
 
@@ -880,6 +943,7 @@ impl Window {
         }
         let promoted = waiting.len();
         page.candidates.extend(waiting);
+        self.touched();
         Round::Promoted(promoted)
     }
 
@@ -912,6 +976,9 @@ impl Window {
             page.candidates.insert(key.clone());
             promoted += 1;
         }
+        if promoted > 0 {
+            self.touched();
+        }
         promoted
     }
 
@@ -939,6 +1006,21 @@ impl Window {
             page.rounds = 0;
         }
         dropped
+    }
+
+    /// Whether a round of the page would do nothing: no candidate to
+    /// decide, no refill due, nothing past capacity, and no waiting row
+    /// for a page read whole to promote (the layer then skips the round).
+    pub(super) fn round_idle(&self) -> bool {
+        match &self.page {
+            None => true,
+            Some(page) => {
+                page.candidates.is_empty()
+                    && !page.whole
+                    && !self.needs_refill()
+                    && self.settled() <= self.capacity()
+            }
+        }
     }
 
     /// Whether the page is capped.
@@ -1004,6 +1086,19 @@ fn is_worse(existing: &[Value], candidate: &[Value], order: &[OrderBy]) -> bool 
         };
     }
     false
+}
+
+/// The order of two order values under `order`, as a total order: the
+/// first differing column decides, reversed for DESC; a full tie is
+/// `Equal`.
+fn order_values(a: &[Value], b: &[Value], order: &[OrderBy]) -> Ordering {
+    if is_worse(a, b, order) {
+        Ordering::Greater
+    } else if is_worse(b, a, order) {
+        Ordering::Less
+    } else {
+        Ordering::Equal
+    }
 }
 
 /// The lexicographic comparison against `frontier` as a predicate: one
@@ -1165,6 +1260,18 @@ impl SingleTableIVM {
             window.adopt_page(previous);
         }
         self.windows.insert(sub, window);
+    }
+
+    /// The change count of `sub`'s window ([`Window::version`]); `None`
+    /// for a subscription without one.
+    pub(super) fn window_version(&self, sub: SubId) -> Option<u64> {
+        self.windows.get(&sub).map(Window::version)
+    }
+
+    /// Whether a round of `sub`'s page would do nothing
+    /// ([`Window::round_idle`]).
+    pub(super) fn page_round_idle(&self, sub: SubId) -> bool {
+        self.windows.get(&sub).is_none_or(Window::round_idle)
     }
 
     /// Whether `sub`'s page has stopped reaching further.
@@ -1444,24 +1551,29 @@ impl SingleTableIVM {
                 .and_then(|frame| frame.get(key))
                 .map(|row| row.data.clone())
         };
+        let mut by_key: HashMap<&DataFrameKey, Vec<&DataFrameOperation>> = HashMap::new();
+        for op in &raw {
+            by_key.entry(op.key()).or_default().push(op);
+        }
         let entering = |key: &DataFrameKey| -> Option<DataFrameRow> {
-            raw.iter()
-                .rev()
-                .find_map(|op| match op {
-                    DataFrameOperation::Add(candidate, row) if candidate == key => {
-                        Some(row.clone())
-                    }
-                    _ => None,
+            by_key
+                .get(key)
+                .and_then(|ops| {
+                    ops.iter().rev().find_map(|op| match op {
+                        DataFrameOperation::Add(_, row) => Some(row.clone()),
+                        _ => None,
+                    })
                 })
                 .or_else(|| held(key))
         };
         let leaving = |key: &DataFrameKey| -> Option<DataFrameRow> {
-            raw.iter()
-                .find_map(|op| match op {
-                    DataFrameOperation::Delete(candidate, row) if candidate == key => {
-                        Some(row.clone())
-                    }
-                    _ => None,
+            by_key
+                .get(key)
+                .and_then(|ops| {
+                    ops.iter().find_map(|op| match op {
+                        DataFrameOperation::Delete(_, row) => Some(row.clone()),
+                        _ => None,
+                    })
                 })
                 .or_else(|| held(key))
         };
@@ -1478,8 +1590,8 @@ impl SingleTableIVM {
                 if let Some(image) = entering(key) {
                     out.push(DataFrameOperation::Add(key.clone(), image));
                 }
-            } else {
-                out.extend(raw.iter().filter(|op| op.key() == key).cloned());
+            } else if let Some(ops) = by_key.get(key) {
+                out.extend(ops.iter().map(|op| (*op).clone()));
             }
         }
         out
@@ -1512,9 +1624,14 @@ impl SingleTableIVM {
                     .map(|query| (*sub, query.table.clone(), Vec::new()))
             })
             .collect();
+        let slots: HashMap<SubId, usize> = raw
+            .iter()
+            .enumerate()
+            .map(|(slot, (sub, _, _))| (*sub, slot))
+            .collect();
         for update in updates {
-            match raw.iter_mut().find(|(sub, _, _)| *sub == update.query) {
-                Some((_, _, ops)) => ops.push(update.op),
+            match slots.get(&update.query) {
+                Some(&slot) => raw[slot].2.push(update.op),
                 None => out.push(update),
             }
         }

@@ -11,15 +11,18 @@ use std::fmt;
 use std::ops::Index;
 use std::sync::Arc;
 
+use super::ids::IdMap;
 use super::schema::ColumnName;
 use super::value::Value;
 
 /// The columns of a table's rows, in the order their values are stored,
-/// and the position of each name; built once per table and shared.
+/// and the position of each name (under a fast hash: a column name is a
+/// catalog string, looked up once per condition per row); built once per
+/// table and shared.
 #[derive(Debug)]
 pub struct RowSchema {
     names: Box<[ColumnName]>,
-    positions: HashMap<ColumnName, u16>,
+    positions: IdMap<ColumnName, u16>,
 }
 
 impl RowSchema {
@@ -27,7 +30,7 @@ impl RowSchema {
     /// its first position).
     pub fn new(names: impl IntoIterator<Item = ColumnName>) -> Arc<Self> {
         let names: Box<[ColumnName]> = names.into_iter().collect();
-        let mut positions = HashMap::with_capacity(names.len());
+        let mut positions = IdMap::with_capacity_and_hasher(names.len(), Default::default());
         for (index, name) in names.iter().enumerate() {
             positions.entry(name.clone()).or_insert(index as u16);
         }

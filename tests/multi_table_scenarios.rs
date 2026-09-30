@@ -2299,8 +2299,10 @@ fn a_page_read_whole_reaches_from_memory_and_keeps_its_rejected_rows() {
 }
 
 /// A row a page dropped comes back through a lookup when a write on the
-/// driven side concerns a value no held page row carries: the page is
-/// asked for its rows with that value, once, whether or not it has any.
+/// driven side concerns its value: the page is asked for its rows with
+/// that value, once. A write carrying a value the page never dropped is
+/// not looked up: no held row carries it, and a lookup could only bring
+/// back a dropped one (rows behind the frontier land nothing).
 #[test]
 fn a_dropped_row_comes_back_through_a_lookup_when_its_gate_opens() {
     let (mut ivm, storage, names) = engine();
@@ -2318,13 +2320,12 @@ fn a_dropped_row_comes_back_through_a_lookup_when_its_gate_opens() {
     assert!(ops.is_empty());
     let asked = ivm.engine().stats().clone();
     assert_eq!(
-        asked.page_lookups, 1,
-        "no held ticket names user 99: the page is asked"
+        asked.page_lookups, 0,
+        "no ticket the page dropped names user 99: nothing to look up"
     );
     assert_eq!(
-        asked.storage_reads,
-        before.storage_reads + 1,
-        "the lookup finds nothing and nothing else is read"
+        asked.storage_reads, before.storage_reads,
+        "nothing is read for a value the page never dropped"
     );
     assert_eq!(shown_ids(&ivm, &names, "q", QueryPart::main()), [3, 6]);
 
@@ -2340,7 +2341,7 @@ fn a_dropped_row_comes_back_through_a_lookup_when_its_gate_opens() {
         "ticket 1 was dropped; its user's arrival looks it up and it takes the first place"
     );
     let after = ivm.engine().stats();
-    assert_eq!(after.page_lookups, 2);
+    assert_eq!(after.page_lookups, 1);
     assert_eq!(
         after.storage_reads,
         asked.storage_reads + 2,

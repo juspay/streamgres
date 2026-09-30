@@ -91,7 +91,12 @@ impl Value {
     /// strict equality plus `Int` / `Float` numeric coercion, so
     /// `Int(5)` equals `Float(5.0)`.
     pub fn loose_eq(&self, other: &Value) -> bool {
-        self == other || self.compare(other) == Some(Ordering::Equal)
+        match (self, other) {
+            (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
+                self.compare(other) == Some(Ordering::Equal)
+            }
+            _ => self == other,
+        }
     }
 }
 
@@ -187,8 +192,8 @@ impl SharedSet {
     /// Whether `value` is a member (`NULL` never is).
     pub fn contains(&self, value: &Value) -> bool {
         value
-            .equality_key()
-            .is_some_and(|key| self.read().contains(&key))
+            .equality_key_ref()
+            .is_some_and(|key| self.read().contains(&*key))
     }
 
     /// Add `value`; reports whether it was new (`NULL` is never added).

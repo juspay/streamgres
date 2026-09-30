@@ -222,8 +222,8 @@ use super::{
 use crate::model::frame::SharedRow;
 use crate::model::{
     ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameOperation, DataFrameRow,
-    Driver, IdMap, Join, MultiTableReadQuery, PageRead, SharedSet, SingleTableReadQuery, SubId,
-    TableName, Value, Where, WriteQuery,
+    Driver, IdMap, IdSet, Join, MultiTableReadQuery, PageRead, SharedSet, SingleTableReadQuery,
+    SubId, TableName, Value, Where, WriteQuery,
 };
 
 /// One operation for one part of a tree, the join layer's own unit, folded
@@ -289,6 +289,13 @@ struct JoinKeyCounts {
 ///   a kept edge, so the driven part's `IN` keeps every value ever
 ///   referenced: a value of a row the page kept apart, or of a row pruned
 ///   below it, must still route the write that brings the row back.
+/// - `dropped`: for an edge a page read in batches drives, the join
+///   values (in `parent_column`) of the rows the page dropped as
+///   rejected — the only rows a recall of the page can bring back (a
+///   lookup lands nothing behind the page's frontier, and a row ahead of
+///   it is held or was dropped), so a write on the driven side with any
+///   other value is not looked up. Never emptied: a value dropped once
+///   costs a lookup that lands nothing at worst.
 struct Edge {
     driver: Driver,
     is_inner: bool,
@@ -302,6 +309,7 @@ struct Edge {
     loose: bool,
     kept: bool,
     counts: JoinKeyCounts,
+    dropped: HashSet<Value>,
 }
 
 impl Edge {
@@ -351,6 +359,15 @@ impl Edge {
             Driver::Main => &self.counts.matched,
         };
         counts.get(value).copied().unwrap_or(0)
+    }
+
+    /// [`Edge::child_count`] for `row`'s value in `column`, the value
+    /// borrowed from the row; a missing column joins like `NULL` (never).
+    fn child_count_of(&self, row: &DataFrameRow, column: &ColumnName) -> u64 {
+        match row.data.get(column.as_str()) {
+            Some(value) => self.child_count(value),
+            None => 0,
+        }
     }
 }
 
@@ -451,10 +468,15 @@ struct TreeId(u64);
 /// - `parts`: inner part id → (tree id, part), the reverse map every
 ///   routed operation goes through.
 /// - `dirty`: the trees with a page under a gate whose rows moved or
-///   whose reads landed in this step, settled before the step returns.
+///   whose reads landed in this step, settled before the step returns, in
+///   the order queued; `queued` is the same set, so queuing a tree again
+///   costs a lookup.
 /// - `views`: for each inner part that is a page, the page's first `L`
 ///   admitted rows as of the last sync, each with the image it was sent
-///   with and whether it is sent at all (under a shown parent row).
+///   with and whether it is sent at all (under a shown parent row);
+///   `synced` the window version each view was last synced at
+///   ([`SingleTableIVM::window_version`]), so a page whose window has not
+///   changed since is not walked again.
 /// - `in_flight`: the rows the inner engine holds whose `Add` this layer
 ///   has not reached yet within the step being forwarded.
 /// - `wanted`: the join values newly referenced in this step, per driven
@@ -479,7 +501,9 @@ pub struct MultiTableIVM {
     next_sub: u64,
     parts: IdMap<SubId, (TreeId, QueryPart)>,
     dirty: Vec<TreeId>,
+    queued: IdSet<TreeId>,
     views: IdMap<SubId, HashMap<DataFrameKey, ViewRow>>,
+    synced: IdMap<SubId, u64>,
     in_flight: HashSet<(SubId, DataFrameKey)>,
     wanted: Vec<(SubId, ColumnName, Vec<Value>)>,
     capped: Vec<SubId>,
@@ -560,30 +584,27 @@ fn gate_open(tree: &Tree, node: &Node, row: &DataFrameRow) -> bool {
     if node.gates.is_empty() {
         return true;
     }
-    let inner_edges: Vec<&Edge> = node
-        .children
-        .iter()
-        .map(|edge| &tree.edges[*edge])
-        .filter(|edge| edge.is_inner)
-        .collect();
     let exists = |leaf: &Condition| -> bool {
         let Value::Int(index) = leaf.value else {
             return false;
         };
-        let Some(edge) = usize::try_from(index)
-            .ok()
-            .and_then(|index| inner_edges.get(index))
-        else {
+        let Some(edge) = usize::try_from(index).ok().and_then(|index| {
+            node.children
+                .iter()
+                .map(|edge| &tree.edges[*edge])
+                .filter(|edge| edge.is_inner)
+                .nth(index)
+        }) else {
             return false;
         };
-        edge.child_count(&join_value(row, &edge.parent_column)) > 0
+        edge.child_count_of(row, &edge.parent_column) > 0
     };
     if !evaluate_with(&node.query.filter, &row.data, &mut 0, &exists) {
         return false;
     }
     node.gates.iter().all(|edge| {
         let edge = &tree.edges[*edge];
-        edge.gate.is_some() || edge.child_count(&join_value(row, &edge.parent_column)) > 0
+        edge.gate.is_some() || edge.child_count_of(row, &edge.parent_column) > 0
     })
 }
 
@@ -726,6 +747,7 @@ fn add_node(tree: &mut Tree, spec: &MultiTableReadQuery, part: QueryPart, parent
             loose: false,
             kept: false,
             counts: JoinKeyCounts::default(),
+            dropped: HashSet::new(),
         });
         node.children.push(edge);
         if join.driver == Driver::Main && join.is_inner {
@@ -971,7 +993,9 @@ impl MultiTableIVM {
             next_sub: 0,
             parts: IdMap::default(),
             dirty: Vec::new(),
+            queued: IdSet::default(),
             views: IdMap::default(),
+            synced: IdMap::default(),
             in_flight: HashSet::new(),
             wanted: Vec::new(),
             capped: Vec::new(),
@@ -1359,6 +1383,7 @@ impl MultiTableIVM {
             return;
         };
         let view = self.views.remove(&inner).unwrap_or_default();
+        self.synced.remove(&inner);
         let table = self.trees[&tree_id].nodes[part].query.table.clone();
         for (key, entry) in view {
             if entry.shown {
@@ -1666,6 +1691,7 @@ impl MultiTableIVM {
                 self.single.unregister_query(inner);
                 self.parts.remove(&inner);
                 self.views.remove(&inner);
+                self.synced.remove(&inner);
             }
         }
     }
@@ -2323,10 +2349,12 @@ impl MultiTableIVM {
     /// dropped the ones its gate closed on, so it looks the value up in
     /// storage ([`SingleTableIVM::lookup`]; the rows it holds already come
     /// back as nothing, rows behind its frontier are not held) — one read
-    /// for the node, its windows per parent row included. A part below
-    /// the page that holds no row for the value looks it up the same way
-    /// (its rows for the value were pruned when their driver left); one
-    /// that holds rows has its gate re-evaluated already.
+    /// for the node, its windows per parent row included — and only when
+    /// it dropped a row with that value ([`Edge::dropped`]): for any other
+    /// value the lookup would land nothing. A part below the page that
+    /// holds no row for the value looks it up the same way (its rows for
+    /// the value were pruned when their driver left); one that holds rows
+    /// has its gate re-evaluated already.
     fn recall(
         &mut self,
         tree_id: TreeId,
@@ -2364,7 +2392,11 @@ impl MultiTableIVM {
                     out.extend(forwarded);
                 }
             }
-            Some(PageRead::Batched) => self.lookup(tree_id, &driver, &column, value),
+            Some(PageRead::Batched) => {
+                if self.trees[&tree_id].edges[edge].dropped.contains(value) {
+                    self.lookup(tree_id, &driver, &column, value);
+                }
+            }
             None => {
                 for inner in driver_parts {
                     if held_by(self, inner).is_empty() {
@@ -2465,15 +2497,23 @@ impl MultiTableIVM {
             let mut left: Vec<(DataFrameKey, DataFrameRow)> = Vec::new();
             let mut entered: Vec<(DataFrameKey, DataFrameRow)> = Vec::new();
             for inner in inners {
+                let version = self.single.window_version(inner);
+                if version.is_some() && version == self.synced.get(&inner).copied() {
+                    continue;
+                }
                 let now = self.single.client_prefix(inner);
+                let kept: HashSet<&DataFrameKey> = now.iter().collect();
                 if let Some(view) = self.views.get_mut(&inner) {
                     view.retain(|key, entry| {
-                        let stays = now.contains(key);
+                        let stays = kept.contains(key);
                         if !stays && entry.shown {
                             left.push((key.clone(), entry.row.clone()));
                         }
                         stays
                     });
+                }
+                if let Some(version) = version {
+                    self.synced.insert(inner, version);
                 }
                 for key in now {
                     if self
@@ -2543,7 +2583,7 @@ impl MultiTableIVM {
             .trees
             .get(&tree_id)
             .is_some_and(|tree| !tree.pages.is_empty());
-        if paged && !self.dirty.contains(&tree_id) {
+        if paged && self.queued.insert(tree_id) {
             self.dirty.push(tree_id);
         }
     }
@@ -2556,12 +2596,11 @@ impl MultiTableIVM {
         self.cause = Cause::Page;
         self.landing = None;
         let mut passes = 0usize;
-        while let Some(tree_id) = self.dirty.pop() {
-            self.dirty.retain(|queued| *queued != tree_id);
+        while passes < SETTLE_ROUNDS
+            && let Some(tree_id) = self.dirty.pop()
+        {
+            self.queued.remove(&tree_id);
             passes += 1;
-            if passes > SETTLE_ROUNDS {
-                break;
-            }
             for _ in 0..SETTLE_ROUNDS {
                 self.sync_views(tree_id, out);
                 if !self.settle_tree(tree_id, out) {
@@ -2598,9 +2637,22 @@ impl MultiTableIVM {
         }
         let mut verdicts: Vec<(SubId, HashSet<DataFrameKey>)> = Vec::new();
         let mut open: Vec<(SubId, DataFrameKey)> = Vec::new();
+        let mut dropped: Vec<(usize, Value)> = Vec::new();
         for part in &tree.pages {
             let node = &tree.nodes[part];
+            let recalled: Vec<usize> = if node.page == Some(PageRead::Batched) {
+                node.children
+                    .iter()
+                    .copied()
+                    .filter(|edge| tree.edges[*edge].loose)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             for inner in node.inner_parts() {
+                if self.single.page_round_idle(inner) {
+                    continue;
+                }
                 let mut rejected = HashSet::new();
                 for key in self.single.page_candidates(inner) {
                     let Some(row) = self.single.row_image(inner, &key) else {
@@ -2609,10 +2661,18 @@ impl MultiTableIVM {
                     if gate_open(tree, node, &row) {
                         open.push((inner, key));
                     } else {
+                        for &edge in &recalled {
+                            dropped.push((edge, join_value(&row, &tree.edges[edge].parent_column)));
+                        }
                         rejected.insert(key);
                     }
                 }
                 verdicts.push((inner, rejected));
+            }
+        }
+        if let Some(tree) = self.trees.get_mut(&tree_id) {
+            for (edge, value) in dropped {
+                tree.edges[edge].dropped.insert(value);
             }
         }
         for (inner, key) in open {
