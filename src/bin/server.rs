@@ -7,6 +7,17 @@
 //! Configured by `XYNE_SYNC_*` environment variables (see `.env.example`);
 //! a `.env` file in the working directory is read first, without
 //! overriding variables already set.
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: MallocConf =
+    MallocConf(c"prof:true,prof_active:false,lg_prof_sample:19".as_ptr());
+
+#[repr(transparent)]
+struct MallocConf(*const std::ffi::c_char);
+
+unsafe impl Sync for MallocConf {}
 
 fn main() {
     load_dotenv(".env");

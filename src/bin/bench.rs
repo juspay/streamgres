@@ -1366,12 +1366,36 @@ fn left_join() {
 }
 
 /// Run the four scenarios in order.
+
+#[global_allocator]
+static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF: MallocConf =
+    MallocConf(c"prof:true,prof_active:false,lg_prof_sample:19".as_ptr());
+
+#[repr(transparent)]
+struct MallocConf(*const std::ffi::c_char);
+
+unsafe impl Sync for MallocConf {}
+
 fn main() {
     println!(
         "xyne_sync bench: release build, single thread, xorshift seed {SEED:#x}, tables {} / {}",
         tickets_table().name,
         users_table().name
     );
+    let profiler =
+        match xyne_sync::profile::Config::from_env().and_then(xyne_sync::profile::start) {
+            Ok(profiler) => profiler,
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        };
+    if profiler.is_some() {
+        println!("profiling: on, pushed to Pyroscope");
+    }
     let started = Instant::now();
     if wanted("routing") {
         routing_and_registration();
@@ -1409,6 +1433,7 @@ fn main() {
         "\ntotal wall time: {}s",
         one(started.elapsed().as_secs_f64())
     );
+    drop(profiler);
 }
 
 /// Whether `dsn` names a database the postgres scenario may take over: one

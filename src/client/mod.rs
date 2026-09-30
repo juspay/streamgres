@@ -78,6 +78,7 @@ use crate::sync::pg::threads;
 pub fn serve(config: Config) -> Result<(), String> {
     log::set_level(config.log);
     log::set_format(config.log_format);
+    let _profiler = crate::profile::start(crate::profile::Config::from_env()?)?;
     let config = Arc::new(config);
     let settings = config.engine_settings();
     let server = tokio::runtime::Builder::new_multi_thread()
