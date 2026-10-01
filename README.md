@@ -325,11 +325,14 @@ floor.
   rendered from the model with the catalog's types cast on the way out
   (`sql.rs`), every leaf wrapped in `IS TRUE` so `NULL` semantics match the
   engine's. One connection per read in flight, pooled.
-- `PgStream::open(dsn, slot, catalog)` streams a permanent `pgoutput` slot
+- `PgStream::open(dsn, slot, publication, catalog)` streams a `pgoutput` slot
   over a replication connection (`START_REPLICATION`, spoken by the
   `pgwire-replication` crate; the row messages decoded by the `pgoutput`
   crate, mapped onto the catalog's tables and types here). It creates the
-  slot and a publication `<slot>_pub` for all tables if they are missing.
+  slot and the publication (for all tables) if they are missing. The server
+  names a slot of its own per process, `xyne_sync_slot_<uuid>`, and never
+  drops it (the slots of ended processes are cleaned up outside the
+  server); the publication is `XYNE_SYNC_PUBLICATION`.
   Every change becomes a full-image insert/update or a key-only delete
   **positioned at the end of its transaction's commit record**, the scale the
   aliases' consistent points are on: a snapshot at consistent point `X` holds

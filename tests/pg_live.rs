@@ -49,6 +49,7 @@ struct Names {
     users: String,
     extra: String,
     slot: String,
+    publication: String,
 }
 
 impl Names {
@@ -59,6 +60,7 @@ impl Names {
             users: format!("live_{tag}_users"),
             extra: format!("live_{tag}_extra"),
             slot: format!("xyne_sync_live_{tag}"),
+            publication: format!("xyne_sync_live_{tag}_pub"),
         }
     }
 
@@ -122,7 +124,7 @@ async fn admin(dsn: &str) -> Client {
 /// no leftover slot.
 async fn prepare(dsn: &str, names: &Names) -> Client {
     let client = admin(dsn).await;
-    PgStream::drop_slot(dsn, &names.slot)
+    PgStream::drop_slot(dsn, &names.slot, &names.publication)
         .await
         .expect("drop slot");
     client
@@ -149,7 +151,7 @@ async fn cleanup(dsn: &str, client: &Client, names: &Names) {
             names.tickets, names.users, names.extra
         ))
         .await;
-    let _ = PgStream::drop_slot(dsn, &names.slot).await;
+    let _ = PgStream::drop_slot(dsn, &names.slot, &names.publication).await;
 }
 
 /// The ids `sql` returns.
@@ -271,7 +273,7 @@ fn registration_behind_open_snapshot() {
         let names = Names::new("wal");
         let client = prepare(&dsn, &names).await;
         let catalog = Arc::new(names.catalog());
-        let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+        let mut stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
             .await
             .expect("open stream");
         let slow = PgStorage::connect(&dsn, catalog.clone())
@@ -390,7 +392,7 @@ fn service_streams_end_to_end() {
         let names = Names::new("service");
         let client = prepare(&dsn, &names).await;
         let catalog = Arc::new(names.catalog());
-        let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+        let mut stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
             .await
             .expect("open stream");
         let pg = Arc::new(
@@ -578,9 +580,14 @@ fn mutation_results_travel_the_feed() {
                 DbColumn::new("result", ValueType::Json),
             ],
         ));
-        let mut stream = PgStream::open(&dsn, &names.slot, Arc::new(Catalog::new(tables)))
-            .await
-            .expect("open stream");
+        let mut stream = PgStream::open(
+            &dsn,
+            &names.slot,
+            &names.publication,
+            Arc::new(Catalog::new(tables)),
+        )
+        .await
+        .expect("open stream");
 
         client
             .batch_execute(&format!(
@@ -645,7 +652,7 @@ fn reads_queue_at_the_connection_bound() {
         let names = Names::new("pool");
         let client = prepare(&dsn, &names).await;
         let catalog = Arc::new(names.catalog());
-        let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+        let mut stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
             .await
             .expect("open stream");
         let storage = Rc::new(
@@ -695,7 +702,7 @@ fn a_count_stops_at_the_cap_on_the_snapshot() {
         let names = Names::new("count");
         let client = prepare(&dsn, &names).await;
         let catalog = Arc::new(names.catalog());
-        let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+        let mut stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
             .await
             .expect("open stream");
         let storage = PgStorage::connect(&dsn, catalog.clone())
@@ -798,7 +805,7 @@ fn a_read_past_the_row_budget_is_refused() {
             .await
             .expect("fill");
         let catalog = Arc::new(names.catalog());
-        let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+        let mut stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
             .await
             .expect("open stream");
         let storage = PgStorage::connect(&dsn, catalog.clone())
@@ -845,8 +852,11 @@ fn a_json_column_is_filtered_by_value() {
     block_on(async {
         let table = "live_json_values";
         let slot = "xyne_sync_live_json";
+        let publication = "xyne_sync_live_json_pub";
         let client = admin(&dsn).await;
-        PgStream::drop_slot(&dsn, slot).await.expect("drop slot");
+        PgStream::drop_slot(&dsn, slot, publication)
+            .await
+            .expect("drop slot");
         client
             .batch_execute(&format!(
                 "DROP TABLE IF EXISTS {table};
@@ -868,7 +878,7 @@ fn a_json_column_is_filtered_by_value() {
                 DbColumn::new("loose", ValueType::Json),
             ],
         )]));
-        let mut stream = PgStream::open(&dsn, slot, catalog.clone())
+        let mut stream = PgStream::open(&dsn, slot, publication, catalog.clone())
             .await
             .expect("open stream");
         let storage = PgStorage::connect(&dsn, catalog.clone())
@@ -975,7 +985,7 @@ fn a_json_column_is_filtered_by_value() {
         let _ = client
             .batch_execute(&format!("DROP TABLE IF EXISTS {table};"))
             .await;
-        let _ = PgStream::drop_slot(&dsn, slot).await;
+        let _ = PgStream::drop_slot(&dsn, slot, publication).await;
     });
 }
 
@@ -991,7 +1001,7 @@ fn a_read_past_its_time_is_refused() {
         let names = Names::new("timeout");
         let client = prepare(&dsn, &names).await;
         let catalog = Arc::new(names.catalog());
-        let mut stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+        let mut stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
             .await
             .expect("open stream");
         let slow = PgStorage::connect(&dsn, catalog.clone())
@@ -1048,7 +1058,7 @@ fn an_idle_feed_brings_the_first_snapshot_into_use() {
         let names = Names::new("idle");
         let client = prepare(&dsn, &names).await;
         let catalog = Arc::new(names.catalog());
-        let stream = PgStream::open(&dsn, &names.slot, catalog.clone())
+        let stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
             .await
             .expect("open stream");
         let pg = Arc::new(
@@ -1162,12 +1172,21 @@ fn schema_changes_follow_the_trigger() {
             prefix: "xslive/0/ddl".to_owned(),
             schemas: vec!["public".to_owned()],
         };
-        let stream = PgStream::open_with(&dsn, &names.slot, catalog.clone(), source)
-            .await
-            .expect("open stream");
-        let publication = format!("{}_pub", names.slot);
+        let stream = PgStream::open_with(
+            &dsn,
+            &names.slot,
+            &names.publication,
+            catalog.clone(),
+            source,
+        )
+        .await
+        .expect("open stream");
         client
-            .batch_execute(&trigger_stack_sql("xslive", 0, &[publication.as_str()]))
+            .batch_execute(&trigger_stack_sql(
+                "xslive",
+                0,
+                &[names.publication.as_str()],
+            ))
             .await
             .expect("install the reference server's trigger stack");
         let pg = Arc::new(

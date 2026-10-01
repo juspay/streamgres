@@ -11,7 +11,7 @@ use std::time::Duration;
 use super::plan::{Policy, Side};
 use crate::log::{Format, Level};
 use crate::model::TableName;
-use crate::sync::pg::{Keepalive, Settings};
+use crate::sync::pg::{Keepalive, Settings, threads};
 
 /// Everything the server reads from the environment.
 #[derive(Debug, Clone)]
@@ -27,8 +27,15 @@ pub struct Config {
     /// `XYNE_SYNC_SCHEMAS`: the schemas whose tables the catalog carries
     /// (`public` plus the app's `zero_<shard>` schema by default).
     pub schemas: Vec<String>,
-    /// `XYNE_SYNC_SLOT`: the permanent replication slot (`xyne_sync`).
+    /// The replication slot of the change feed, not configurable: each
+    /// process names its own, `xyne_sync_slot_<uuid>`, and never drops
+    /// it; cleaning up the slots of ended processes is left to the
+    /// deployment.
     pub slot: String,
+    /// `XYNE_SYNC_PUBLICATION`: the publication the change feed streams
+    /// (`xyne_sync_pub`); created for all tables at start when missing,
+    /// which a standby cannot do (create it on the primary).
+    pub publication: String,
     /// `XYNE_SYNC_DDL_TRIGGER`: the event trigger on `ddl_command_end`
     /// through which the server hears of schema changes, zero-cache's
     /// (`<app>_ddl_end_<shard>`, so `zero_ddl_end_0`); the server refuses
@@ -289,7 +296,9 @@ impl Config {
             base_path,
             dsn,
             schemas,
-            slot: first(&["XYNE_SYNC_SLOT"]).unwrap_or_else(|| "xyne_sync".to_owned()),
+            slot: threads::slot_name(),
+            publication: first(&["XYNE_SYNC_PUBLICATION"])
+                .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
             ddl_trigger,
             ddl_prefix,
             snapshot_rotation: millis("XYNE_SYNC_SNAPSHOT_ROTATION_MS", 1_000)?,
@@ -419,6 +428,7 @@ impl Config {
         Settings {
             dsn: self.dsn.clone(),
             slot: self.slot.clone(),
+            publication: self.publication.clone(),
             schemas: self.schemas.clone(),
             snapshot_rotation: self.snapshot_rotation,
             read_connections: self.read_connections,
@@ -459,6 +469,31 @@ mod tests {
 
     /// The DDL trigger and its message prefix follow zero-cache's naming
     /// from the app id and the shard unless named outright.
+    #[test]
+    fn each_config_names_a_slot_of_its_own() {
+        let first = config(&[("XYNE_SYNC_SLOT", "ignored")]).unwrap();
+        let second = config(&[]).unwrap();
+        for slot in [&first.slot, &second.slot] {
+            let id = slot.strip_prefix("xyne_sync_slot_").expect("the prefix");
+            assert_eq!(id.len(), 32);
+            assert!(
+                id.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+            );
+            assert!(slot.len() <= 63, "PostgreSQL caps slot names at 63 bytes");
+        }
+        assert_ne!(first.slot, second.slot);
+        assert_eq!(first.engine_settings().slot, first.slot);
+    }
+
+    #[test]
+    fn the_publication_is_read_not_derived() {
+        assert_eq!(config(&[]).unwrap().publication, "xyne_sync_pub");
+        let config = config_with(&[("XYNE_SYNC_PUBLICATION", "sdlc_feed")]);
+        assert_eq!(config.publication, "sdlc_feed");
+        assert_eq!(config.engine_settings().publication, "sdlc_feed");
+    }
+
     #[test]
     fn the_ddl_trigger_follows_the_app_and_shard() {
         let config = config(&[]).unwrap();

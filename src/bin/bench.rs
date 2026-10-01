@@ -124,6 +124,7 @@ const PG_WRITES: usize = 5_000;
 const PG_WRITES_PER_TXN: usize = 100;
 const PG_LOAD_WRITES: usize = 500;
 const PG_SLOT: &str = "xyne_sync_bench";
+const PG_PUBLICATION: &str = "xyne_sync_bench_pub";
 
 const XY_USERS: u64 = 1_000;
 const XY_CHANNELS: u64 = 500;
@@ -1809,8 +1810,10 @@ async fn pg_run(dsn: &str) -> PgRow {
     let mut rng = XorShift64::new(SEED ^ 6);
     let mut next_id = PG_TICKETS as i64;
     let (rng, next_id) = (&mut rng, &mut next_id);
-    PgStream::drop_slot(dsn, PG_SLOT).await.expect("drop slot");
-    let mut stream = PgStream::open(dsn, PG_SLOT, catalog.clone())
+    PgStream::drop_slot(dsn, PG_SLOT, PG_PUBLICATION)
+        .await
+        .expect("drop slot");
+    let mut stream = PgStream::open(dsn, PG_SLOT, PG_PUBLICATION, catalog.clone())
         .await
         .expect("open stream");
     let storage = PgStorage::connect(dsn, catalog.clone())
@@ -1908,7 +1911,9 @@ async fn pg_run(dsn: &str) -> PgRow {
     let load_settle = started.elapsed();
     let after = runtime.stats();
 
-    PgStream::drop_slot(dsn, PG_SLOT).await.expect("drop slot");
+    PgStream::drop_slot(dsn, PG_SLOT, PG_PUBLICATION)
+        .await
+        .expect("drop slot");
     PgRow {
         mode: "wal",
         registration,

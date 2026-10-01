@@ -10,7 +10,12 @@
 //! agree: the slot is made to exist, then the storage mints its first
 //! snapshot, then the feed opens with the slot moved up to that
 //! snapshot's point, so it streams exactly what the snapshot does not
-//! hold. Schema changes reach the feed as the messages of the reference server's
+//! hold. Each process streams from a slot of its own, named
+//! [`SLOT_PREFIX`] and a fresh UUID: a restart needs nothing of the
+//! slot before it (the slot is moved up to the first snapshot anyway).
+//! The server never drops a slot; the slots of processes that have ended
+//! are left for the deployment to clean up.
+//! Schema changes reach the feed as the messages of the reference server's
 //! DDL event trigger ([`super::ddl`]); the server refuses to serve
 //! without that trigger ([`require_ddl_trigger`]).
 //!
@@ -38,7 +43,9 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 /// How the engine side reaches its database.
 ///
 /// - `dsn`: the database, with the user and password in the URL.
-/// - `slot`: the permanent replication slot of the change feed.
+/// - `slot`: the replication slot of the change feed, this process's own
+///   ([`slot_name`]).
+/// - `publication`: the publication the feed streams.
 /// - `schemas`: the schemas whose tables the catalog carries.
 /// - `snapshot_rotation`: how often a fresh exported snapshot is minted
 ///   for reads.
@@ -58,6 +65,7 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 pub struct Settings {
     pub dsn: String,
     pub slot: String,
+    pub publication: String,
     pub schemas: Vec<String>,
     pub snapshot_rotation: Duration,
     pub read_connections: usize,
@@ -67,6 +75,15 @@ pub struct Settings {
     pub watched: Vec<TableName>,
     pub ddl_trigger: String,
     pub ddl_prefix: String,
+}
+
+/// What every slot a server names for itself starts with.
+pub const SLOT_PREFIX: &str = "xyne_sync_slot_";
+
+/// A slot name of this process's own: [`SLOT_PREFIX`] and a fresh UUID
+/// (lowercase hex, no dashes, as slot names allow).
+pub fn slot_name() -> String {
+    format!("{SLOT_PREFIX}{}", uuid::Uuid::new_v4().simple())
 }
 
 /// How often the feed thread tells the engine where the feed is without a
@@ -172,9 +189,18 @@ pub fn spawn_feed(
                 loop {
                     let opened = match start {
                         Some(from) => {
-                            Transport::open_from(&settings.dsn, &settings.slot, from).await
+                            Transport::open_from(
+                                &settings.dsn,
+                                &settings.slot,
+                                &settings.publication,
+                                from,
+                            )
+                            .await
                         }
-                        None => Transport::open(&settings.dsn, &settings.slot).await,
+                        None => {
+                            Transport::open(&settings.dsn, &settings.slot, &settings.publication)
+                                .await
+                        }
                     };
                     match opened {
                         Ok(transport) => {
@@ -198,6 +224,15 @@ pub fn spawn_feed(
                         Err(error) => {
                             failures += 1;
                             log_error!("opening the change feed (attempt {failures}): {error}");
+                            if let Ok(false) =
+                                Transport::slot_exists(&settings.dsn, &settings.slot).await
+                            {
+                                log_error!(
+                                    "slot {} is gone, and a slot made again would skip the changes since; stopping so a restart begins on a fresh slot and snapshot",
+                                    settings.slot
+                                );
+                                crate::log::exit(1);
+                            }
                         }
                     }
                     let backoff = Duration::from_secs(1 << failures.min(4));
@@ -224,7 +259,7 @@ pub async fn start(
     consumers: usize,
     stats: Arc<Stats>,
 ) -> Result<(Started, ServiceTask), String> {
-    Transport::prepare(&settings.dsn, &settings.slot)
+    Transport::prepare(&settings.dsn, &settings.slot, &settings.publication)
         .await
         .map_err(|error| format!("preparing the change feed: {error}"))?;
     let mut config: tokio_postgres::Config = settings

@@ -34,6 +34,7 @@ libc = "0.2"
 
 # The Postgres storage backend and change feed (`src/sync/pg`).
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+uuid = { version = "1", features = ["v4"] }
 # The change feed's transport (`src/sync/pg/stream.rs`): a replication
 # connection speaking START_REPLICATION with the `pgoutput` plugin, and the
 # row messages it carries, decoded. Apache-2.0 OR MIT and MIT respectively;

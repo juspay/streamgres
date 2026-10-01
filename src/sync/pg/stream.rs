@@ -474,12 +474,16 @@ pub struct Feed {
 }
 
 impl Transport {
-    /// Open the replication connection to `dsn` on `slot`, after
-    /// [`Transport::prepare`].
-    pub async fn open(dsn: &str, slot: &str) -> Result<Self, StorageError> {
+    /// Open the replication connection to `dsn` on `slot`, streaming
+    /// `publication`, after [`Transport::prepare`]. The slot is never
+    /// created here: one that has gone missing since it was prepared
+    /// would come back at the server's current position and skip every
+    /// change in between, so its absence is an error
+    /// ([`Transport::slot_exists`] tells it apart).
+    pub async fn open(dsn: &str, slot: &str, publication: &str) -> Result<Self, StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        ensure_slot(&config, slot).await?;
-        Self::connect(config, slot).await
+        require_slot(&config, slot).await?;
+        Self::connect(config, slot, publication).await
     }
 
     /// [`Transport::open`], the slot first moved up to `start` when it is
@@ -487,29 +491,50 @@ impl Transport {
     /// nothing the snapshot already holds is streamed, and, after a stop
     /// on a schema change, the change is not met again. A slot at or past
     /// `start` is left where it is.
-    pub async fn open_from(dsn: &str, slot: &str, start: Lsn) -> Result<Self, StorageError> {
+    pub async fn open_from(
+        dsn: &str,
+        slot: &str,
+        publication: &str,
+        start: Lsn,
+    ) -> Result<Self, StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = ensure_slot(&config, slot).await?;
+        let client = require_slot(&config, slot).await?;
         advance_slot(&client, slot, start).await?;
-        Self::connect(config, slot).await
+        Self::connect(config, slot, publication).await
     }
 
     /// Make sure what the feed of `slot` streams from exists at `dsn`:
-    /// the publication (`<slot>_pub`, every table) and the slot, each
-    /// created only when it is missing, so a deployment that creates them
-    /// itself is never written to. A standby cannot create a publication;
+    /// `publication` (every table) and the slot, each created only when
+    /// it is missing, so a deployment that creates the publication itself
+    /// is never written to for it. A standby cannot create a publication;
     /// when it has none the error says what to run on the primary. Done
     /// before the first read snapshot is minted, so that the slot holds
     /// the log from before that snapshot's point.
-    pub async fn prepare(dsn: &str, slot: &str) -> Result<(), StorageError> {
+    pub async fn prepare(dsn: &str, slot: &str, publication: &str) -> Result<(), StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        ensure_slot(&config, slot).await.map(drop)
+        ensure_slot(&config, slot, publication).await.map(drop)
     }
 
-    /// The replication connection on `slot`.
-    async fn connect(config: tokio_postgres::Config, slot: &str) -> Result<Self, StorageError> {
-        let publication = publication_of(slot);
-        let feed = ReplicationClient::connect(replication_config(&config, slot, &publication))
+    /// Whether `slot` exists at `dsn`.
+    pub async fn slot_exists(dsn: &str, slot: &str) -> Result<bool, StorageError> {
+        let config: tokio_postgres::Config = dsn.parse()?;
+        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+        Ok(client
+            .query_opt(
+                "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await?
+            .is_some())
+    }
+
+    /// The replication connection on `slot`, streaming `publication`.
+    async fn connect(
+        config: tokio_postgres::Config,
+        slot: &str,
+        publication: &str,
+    ) -> Result<Self, StorageError> {
+        let feed = ReplicationClient::connect(replication_config(&config, slot, publication))
             .await
             .map_err(|error| StorageError(format!("replication connection: {error}")))?;
         Ok(Transport {
@@ -637,11 +662,14 @@ impl Transport {
     }
 }
 
-/// The publication and the slot of `slot` at `config`, created when
-/// missing (see [`Transport::prepare`]); the ordinary connection used.
-async fn ensure_slot(config: &tokio_postgres::Config, slot: &str) -> Result<Client, StorageError> {
+/// `publication` and `slot` at `config`, created when missing (see
+/// [`Transport::prepare`]); the ordinary connection used.
+async fn ensure_slot(
+    config: &tokio_postgres::Config,
+    slot: &str,
+    publication: &str,
+) -> Result<Client, StorageError> {
     let client = super::open(config, &tokio::runtime::Handle::current()).await?;
-    let publication = publication_of(slot);
     let published = client
         .query_opt(
             "SELECT 1 FROM pg_publication WHERE pubname = $1",
@@ -681,6 +709,24 @@ async fn ensure_slot(config: &tokio_postgres::Config, slot: &str) -> Result<Clie
             .await?;
     }
     Ok(client)
+}
+
+/// An ordinary connection at `config`, once `slot` is known to exist
+/// there; an error naming it when it does not.
+async fn require_slot(config: &tokio_postgres::Config, slot: &str) -> Result<Client, StorageError> {
+    let client = super::open(config, &tokio::runtime::Handle::current()).await?;
+    let exists = client
+        .query_opt(
+            "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await?
+        .is_some();
+    if exists {
+        Ok(client)
+    } else {
+        Err(StorageError(format!("slot `{slot}` does not exist")))
+    }
 }
 
 /// Move `slot` up to `to` when its confirmed position is behind it,
@@ -794,9 +840,17 @@ impl Feed {
 }
 
 impl PgStream {
-    /// Open the feed of `slot` at `dsn`, decoding with `catalog`.
-    pub async fn open(dsn: &str, slot: &str, catalog: Arc<Catalog>) -> Result<Self, StorageError> {
-        let transport = Transport::open(dsn, slot).await?;
+    /// Open the feed of `slot` at `dsn`, streaming `publication` and
+    /// decoding with `catalog`; the slot and the publication are created
+    /// first when missing ([`Transport::prepare`]).
+    pub async fn open(
+        dsn: &str,
+        slot: &str,
+        publication: &str,
+        catalog: Arc<Catalog>,
+    ) -> Result<Self, StorageError> {
+        Transport::prepare(dsn, slot, publication).await?;
+        let transport = Transport::open(dsn, slot, publication).await?;
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
         Ok(PgStream {
@@ -811,10 +865,12 @@ impl PgStream {
     pub async fn open_with(
         dsn: &str,
         slot: &str,
+        publication: &str,
         catalog: Arc<Catalog>,
         ddl: DdlSource,
     ) -> Result<Self, StorageError> {
-        let transport = Transport::open(dsn, slot).await?;
+        Transport::prepare(dsn, slot, publication).await?;
+        let transport = Transport::open(dsn, slot, publication).await?;
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
         Ok(PgStream {
@@ -829,9 +885,9 @@ impl PgStream {
         (self.transport, self.feed)
     }
 
-    /// Drop `slot` and its publication, ending the walsender holding the
+    /// Drop `slot` and `publication`, ending the walsender holding the
     /// slot first (the drop is retried while it lets go).
-    pub async fn drop_slot(dsn: &str, slot: &str) -> Result<(), StorageError> {
+    pub async fn drop_slot(dsn: &str, slot: &str, publication: &str) -> Result<(), StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
         client
@@ -858,10 +914,7 @@ impl PgStream {
             }
         }
         client
-            .batch_execute(&format!(
-                "DROP PUBLICATION IF EXISTS \"{}\"",
-                publication_of(slot)
-            ))
+            .batch_execute(&format!("DROP PUBLICATION IF EXISTS \"{publication}\""))
             .await?;
         Ok(())
     }
@@ -949,10 +1002,6 @@ async fn server_position(client: &Client) -> Result<Lsn, StorageError> {
         .await?;
     let end: PgLsn = row.get(0);
     Ok(Lsn(u64::from(end)))
-}
-
-fn publication_of(slot: &str) -> String {
-    format!("{slot}_pub")
 }
 
 /// The feed's position for a location the transport reports.

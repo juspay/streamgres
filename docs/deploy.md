@@ -99,7 +99,7 @@ listed with their defaults so the manifest can carry them explicitly.
 | `XYNE_SYNC_BASE_PATH` | `/sync` | the path prefix clients connect under (section 6) |
 | `XYNE_SYNC_SCHEMAS` | `public,<app>_<shard>` | schemas whose tables are served |
 | `XYNE_SYNC_SHARD` | `0` | |
-| `XYNE_SYNC_SLOT` | `xyne_sync` | the permanent replication slot; the publication is `<slot>_pub` |
+| `XYNE_SYNC_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams; created `FOR ALL TABLES` at start when missing (section 4). The replication slot is not configurable: each process uses its own, `xyne_sync_slot_<uuid>` |
 | `XYNE_SYNC_DDL_TRIGGER` | `<app>_ddl_end_<shard>` (`xyne_ddl_end_0` for app `xyne`) | the reference server's event trigger on `ddl_command_end`, through which schema changes are heard (section 4); the server refuses to start without it |
 | `XYNE_SYNC_DDL_PREFIX` | `<app>/<shard>/ddl` (`xyne/0/ddl` for app `xyne`) | the prefix of that trigger's logical messages |
 | `XYNE_SYNC_FORWARD_COOKIES` | `true` | the connection's cookies go to the backend's endpoints |
@@ -125,7 +125,7 @@ listed with their defaults so the manifest can carry them explicitly.
 
 - `wal_level = logical`, and room for this server beside the reference server:
   `max_replication_slots` and `max_wal_senders` with eight to spare (one
-  permanent slot, and short-lived ones, `xyne_sync_snap_*`, behind the read
+  slot per running server, and short-lived ones, `xyne_sync_snap_*`, behind the read
   snapshots), about 40 connections (`XYNE_SYNC_READ_CONNECTIONS` plus the
   feed and a handful).
 - The role needs `REPLICATION` and `SELECT` on the served schemas.
@@ -135,26 +135,37 @@ listed with their defaults so the manifest can carry them explicitly.
   has been gone through). So `XYNE_SYNC_PG_DSN` may name the primary, a
   logical replica, or a physical standby (PostgreSQL 16 or later, which is
   when a standby learned logical decoding).
-- **The slot and the publication are created only when they are missing.**
-  At start the server looks for the publication `<slot>_pub` and the slot
-  `<slot>`; what exists is used as it is. To keep creation in your own
-  hands, run once, on the primary:
+- **The publication is created only when it is missing.** At start the
+  server looks for the publication `XYNE_SYNC_PUBLICATION` names
+  (`xyne_sync_pub` by default) and uses it as it is. To keep creation in
+  your own hands, run once, on the primary:
 
   ```sql
   CREATE PUBLICATION xyne_sync_pub FOR ALL TABLES;
-  ```
-
-  and on the server `XYNE_SYNC_PG_DSN` names (the standby itself, when it
-  is one):
-
-  ```sql
-  SELECT pg_create_logical_replication_slot('xyne_sync', 'pgoutput');
   ```
 
   `CREATE PUBLICATION ... FOR ALL TABLES` needs a superuser, and a standby
   cannot run it at all (it reaches the standby through replication); a
   server started against a standby without it stops and says which
   statement to run on the primary.
+- **Each server process has a slot of its own**, `xyne_sync_slot_<uuid>`,
+  created at start on the server `XYNE_SYNC_PG_DSN` names (the standby
+  itself, when it is one). A restart needs nothing from the slot before it,
+  because the slot is moved up to the first read snapshot anyway. **The
+  server never drops a slot**, so every restart leaves the previous
+  process's slot behind, inactive and holding the log. Drop the inactive
+  `xyne_sync_slot_*` slots from outside the server, for example with a
+  scheduled job:
+
+  ```sql
+  SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
+   WHERE slot_name LIKE 'xyne\_sync\_slot\_%' AND NOT active;
+  ```
+
+  A slot is briefly inactive while its process reconnects. A process
+  whose slot disappears while it runs stops rather than make the slot
+  again, which would skip the changes in between; its restart begins on a
+  fresh slot and snapshot.
 - On a physical standby a read snapshot (a temporary slot,
   `xyne_sync_snap_*`) waits for the primary's next running-transactions
   record, which a busy primary writes every 15 s; reads keep using the

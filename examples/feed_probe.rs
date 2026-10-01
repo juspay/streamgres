@@ -1,8 +1,9 @@
-//! Print what the change feed delivers from `<dsn>` on `<slot>`, schema
+//! Print what the change feed delivers from `<dsn>` on `<slot>`, streaming
+//! `<publication>` (both created when missing), schema
 //! changes included as the DDL trigger whose messages carry `<prefix>`
 //! announces them; the slot is first moved up to `<start>` when one is
 //! given. A lab tool: `cargo run --example feed_probe -- <dsn> <slot>
-//! <prefix> [start-lsn]`.
+//! <publication> <prefix> [start-lsn]`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,8 +18,8 @@ use xyne_sync::sync::{Lsn, Transaction};
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [dsn, slot, prefix, ..] = args.as_slice() else {
-        eprintln!("usage: feed_probe <dsn> <slot> <prefix> [start-lsn]");
+    let [dsn, slot, publication, prefix, ..] = args.as_slice() else {
+        eprintln!("usage: feed_probe <dsn> <slot> <publication> <prefix> [start-lsn]");
         std::process::exit(2);
     };
     let schemas = vec!["public".to_owned()];
@@ -28,11 +29,15 @@ async fn main() {
         schemas,
     };
     let mut feed = Feed::with_ddl(catalog, ddl);
-    let transport = match args.get(3) {
+    Transport::prepare(dsn, slot, publication)
+        .await
+        .expect("prepare the feed");
+    let transport = match args.get(4) {
         Some(start) => {
-            Transport::open_from(dsn, slot, Lsn::parse(start).expect("an LSN like 0/1A2B")).await
+            let start = Lsn::parse(start).expect("an LSN like 0/1A2B");
+            Transport::open_from(dsn, slot, publication, start).await
         }
-        None => Transport::open(dsn, slot).await,
+        None => Transport::open(dsn, slot, publication).await,
     }
     .expect("open the feed");
     let (out, mut transactions) = mpsc::channel::<Transaction>(64);
