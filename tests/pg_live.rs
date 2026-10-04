@@ -132,11 +132,13 @@ async fn prepare(dsn: &str, names: &Names) -> Client {
             "DROP TABLE IF EXISTS {t}; DROP TABLE IF EXISTS {u}; DROP TABLE IF EXISTS {e};
              CREATE TABLE {t} (id int8 PRIMARY KEY, status text, assigned_to int8, points int8);
              CREATE TABLE {u} (id int8 PRIMARY KEY, name text);
+             CREATE PUBLICATION \"{p}\" FOR ALL TABLES;
              INSERT INTO {u} VALUES (7, 'meera'), (8, 'arjun');
              INSERT INTO {t} VALUES (1, 'OPEN', 7, 1), (2, 'OPEN', 7, 2), (3, 'OPEN', 8, 3);",
             t = names.tickets,
             u = names.users,
-            e = names.extra
+            e = names.extra,
+            p = names.publication
         ))
         .await
         .expect("prepare");
@@ -861,11 +863,13 @@ fn a_json_column_is_filtered_by_value() {
             .batch_execute(&format!(
                 "DROP TABLE IF EXISTS {table};
                  CREATE TABLE {table} (id int8 PRIMARY KEY, fixed jsonb, loose json);
+                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;
                  INSERT INTO {table} VALUES
                    (1, '\"high\"', '\"high\"'), (2, '5', '5'), (3, 'true', 'true'),
                    (4, '{{\"b\": [1, 2], \"a\": \"x\"}}', '{{\"b\":[1,2],   \"a\":\"x\"}}'), (5, NULL, NULL),
                    (6, '1.50', '1.50'),
-                   (7, '{{\"n\": 2.0, \"list\": [0.10, 1e2]}}', '{{ \"list\":[0.10,1e2], \"n\":7, \"n\": 2.0 }}');"
+                   (7, '{{\"n\": 2.0, \"list\": [0.10, 1e2]}}', '{{ \"list\":[0.10,1e2], \"n\":7, \"n\": 2.0 }}');",
+                publication = publication
             ))
             .await
             .expect("prepare");

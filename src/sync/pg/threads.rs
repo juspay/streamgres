@@ -13,8 +13,9 @@
 //! hold. Each process streams from a slot of its own, named
 //! [`SLOT_PREFIX`] and a fresh UUID: a restart needs nothing of the
 //! slot before it (the slot is moved up to the first snapshot anyway).
-//! The server never drops a slot; the slots of processes that have ended
-//! are left for the deployment to clean up.
+//! At startup it can drop this server's inactive slots once they have
+//! exceeded an explicitly configured age; the PostgreSQL 17
+//! `inactive_since` timestamp makes that cleanup safe across restarts.
 //! Schema changes reach the feed as the messages of the reference server's
 //! DDL event trigger ([`super::ddl`]); the server refuses to serve
 //! without that trigger ([`require_ddl_trigger`]).
@@ -45,6 +46,8 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 /// - `dsn`: the database, with the user and password in the URL.
 /// - `slot`: the replication slot of the change feed, this process's own
 ///   ([`slot_name`]).
+/// - `slot_cleanup_age`: how long an inactive slot of an ended process is
+///   retained before startup removes it (zero disables cleanup).
 /// - `publication`: the publication the feed streams.
 /// - `schemas`: the schemas whose tables the catalog carries.
 /// - `snapshot_rotation`: how often a fresh exported snapshot is minted
@@ -65,6 +68,7 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 pub struct Settings {
     pub dsn: String,
     pub slot: String,
+    pub slot_cleanup_age: Duration,
     pub publication: String,
     pub schemas: Vec<String>,
     pub snapshot_rotation: Duration,
@@ -259,6 +263,9 @@ pub async fn start(
     consumers: usize,
     stats: Arc<Stats>,
 ) -> Result<(Started, ServiceTask), String> {
+    Transport::cleanup_inactive_slots(&settings.dsn, settings.slot_cleanup_age)
+        .await
+        .map_err(|error| format!("cleaning up inactive replication slots: {error}"))?;
     Transport::prepare(&settings.dsn, &settings.slot, &settings.publication)
         .await
         .map_err(|error| format!("preparing the change feed: {error}"))?;

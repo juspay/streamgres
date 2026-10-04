@@ -99,7 +99,7 @@ listed with their defaults so the manifest can carry them explicitly.
 | `XYNE_SYNC_BASE_PATH` | `/sync` | the path prefix clients connect under (section 6) |
 | `XYNE_SYNC_SCHEMAS` | `public,<app>_<shard>` | schemas whose tables are served |
 | `XYNE_SYNC_SHARD` | `0` | |
-| `XYNE_SYNC_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams; created `FOR ALL TABLES` at start when missing (section 4). The replication slot is not configurable: each process uses its own, `xyne_sync_slot_<uuid>` |
+| `XYNE_SYNC_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams; it must be created before xyne-sync starts. The replication slot is not configurable: each process uses its own, `xyne_sync_slot_<uuid>` |
 | `XYNE_SYNC_DDL_TRIGGER` | `<app>_ddl_end_<shard>` (`xyne_ddl_end_0` for app `xyne`) | the reference server's event trigger on `ddl_command_end`, through which schema changes are heard (section 4); the server refuses to start without it |
 | `XYNE_SYNC_DDL_PREFIX` | `<app>/<shard>/ddl` (`xyne/0/ddl` for app `xyne`) | the prefix of that trigger's logical messages |
 | `XYNE_SYNC_FORWARD_COOKIES` | `true` | the connection's cookies go to the backend's endpoints |
@@ -107,6 +107,7 @@ listed with their defaults so the manifest can carry them explicitly.
 | `XYNE_SYNC_PG_KEEPALIVE_IDLE_MS`, `XYNE_SYNC_PG_KEEPALIVE_INTERVAL_MS`, `XYNE_SYNC_PG_KEEPALIVE_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on every connection to the database: after the idle time without a byte either way the kernel probes the peer, again at the interval while unanswered, and gives the connection up after that many unanswered in a row. Keep the idle time under whatever a NAT or load balancer between drops silent flows at (section 4); `0` turns the probing off |
 | `XYNE_SYNC_BACKEND_TIMEOUT_MS` | `30000` | how long one call to the backend (a transform, a push) may take; a call that timed out is not made again; `0` sets no limit |
 | `XYNE_SYNC_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is minted |
+| `XYNE_SYNC_SLOT_CLEANUP_AGE_MS` | `0` (off) | at startup, remove an inactive `xyne_sync_slot_*` of an ended process only after this age; requires PostgreSQL 17+ for its `inactive_since` timestamp |
 | `XYNE_SYNC_JOIN_PREFERRED_SIDE` | `parent` | which side of an inner join drives when reading the node whole and having its subs drive it would hold the same rows (the plan holding fewer wins otherwise; the subs drive when they cut the node down by more than they cost, the leaves of an access rule driving the page they narrow) |
 | `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE` | `600000`, `10000` | join plans remembered |
 | `XYNE_SYNC_PLAN_QUERY_TTL_MS` | `86400000` | how long a plan made for a query is laid onto every later query of the same name (and join skeleton), whatever its arguments, before the name is counted again; `0` plans every tree on its own |
@@ -135,39 +136,31 @@ listed with their defaults so the manifest can carry them explicitly.
   has been gone through). So `XYNE_SYNC_PG_DSN` may name the primary, a
   logical replica, or a physical standby (PostgreSQL 16 or later, which is
   when a standby learned logical decoding).
-- **The publication is created only when it is missing.** At start the
-  server looks for the publication `XYNE_SYNC_PUBLICATION` names
-  (`xyne_sync_pub` by default) and uses it as it is. To keep creation in
-  your own hands, run once, on the primary:
+- **The publication must exist before startup.** The server checks for the
+  publication `XYNE_SYNC_PUBLICATION` names (`xyne_sync_pub` by default)
+  and exits if it is missing. Create it once, on the primary:
 
   ```sql
   CREATE PUBLICATION xyne_sync_pub FOR ALL TABLES;
   ```
 
-  `CREATE PUBLICATION ... FOR ALL TABLES` needs a superuser, and a standby
-  cannot run it at all (it reaches the standby through replication); a
-  server started against a standby without it stops and says which
-  statement to run on the primary.
+  `CREATE PUBLICATION ... FOR ALL TABLES` needs a superuser. Keeping it out
+  of startup avoids concurrent-pod DDL races and lets a server follow a
+  standby when the publication was created on its primary.
 - **Each server process has a slot of its own**, `xyne_sync_slot_<uuid>`,
   created at start on the server `XYNE_SYNC_PG_DSN` names (the standby
   itself, when it is one). A restart needs nothing from the slot before it,
-  because the slot is moved up to the first read snapshot anyway. **The
-  server never drops a slot**, so every restart leaves the previous
-  process's slot behind, inactive and holding the log. Drop the inactive
-  `xyne_sync_slot_*` slots from outside the server, for example with a
-  scheduled job:
-
-  ```sql
-  SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
-   WHERE slot_name LIKE 'xyne\_sync\_slot\_%' AND NOT active;
-  ```
-
-  A slot is briefly inactive while its process reconnects. A process
-  whose slot disappears while it runs stops rather than make the slot
-  again, which would skip the changes in between; its restart begins on a
-  fresh slot and snapshot.
-- On a physical standby a read snapshot (a temporary slot,
-  `xyne_sync_snap_*`) waits for the primary's next running-transactions
+  because the slot is moved up to the first read snapshot anyway. Set
+  `XYNE_SYNC_SLOT_CLEANUP_AGE_MS` to remove slots of ended processes at the
+  next startup. Cleanup selects only inactive `xyne_sync_slot_*` slots whose
+  PostgreSQL `inactive_since` is older than that age, then asks PostgreSQL to
+  drop each; an active slot that races the cleanup is retained. This requires
+  PostgreSQL 17+. Leave the setting at `0` on PostgreSQL 16 or older rather
+  than guessing an inactive age from slot creation time. A process whose slot
+  disappears while it runs stops rather than make the slot again, which would
+  skip the changes in between; its restart begins on a fresh slot and snapshot.
+- On a physical standby a read snapshot (a temporary slot named
+  `xyne_sync_snap_<base36-count>_<uuid>`) waits for the primary's next running-transactions
   record, which a busy primary writes every 15 s; reads keep using the
   snapshot they have until the next one is ready, so this costs memory for
   the writes kept in between and no correctness. `SELECT

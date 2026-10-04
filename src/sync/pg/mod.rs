@@ -155,6 +155,38 @@ pub struct Alias {
 /// Aliases minted by this process, for unique slot names.
 static MINTED: AtomicU64 = AtomicU64::new(0);
 
+/// The compact base-36 spelling of an unsigned counter. A `u64` needs at
+/// most 13 digits in this base.
+fn base36(mut number: u64) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut text = [b'0'; 13];
+    let mut at = text.len();
+    loop {
+        at -= 1;
+        text[at] = DIGITS[(number % 36) as usize];
+        number /= 36;
+        if number == 0 {
+            return std::str::from_utf8(&text[at..])
+                .expect("base-36 digits are ASCII")
+                .to_owned();
+        }
+    }
+}
+
+/// A snapshot slot name says which attempt this process is minting, followed
+/// by a fresh UUID. The count is base 36: even a whole `u64` needs at most 13
+/// bytes, so this always fits PostgreSQL's 63-byte slot-name limit alongside
+/// the descriptive prefix and 32-byte UUID. The UUID makes names from
+/// concurrent processes distinct.
+fn snapshot_slot_name() -> String {
+    let count = MINTED.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "xyne_sync_snap_{}_{}",
+        base36(count),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
 /// Mint one alias: open a replication connection and create a temporary
 /// logical slot exporting its snapshot. Slot creation waits for every
 /// transaction open at that moment to finish, so a long-running
@@ -162,11 +194,7 @@ static MINTED: AtomicU64 = AtomicU64::new(0);
 /// alias).
 pub async fn mint(config: &Config) -> Result<Alias, StorageError> {
     let mut minter = ReplicationConnection::open(config).await?;
-    let slot = format!(
-        "xyne_sync_snap_{}_{}",
-        std::process::id(),
-        MINTED.fetch_add(1, Ordering::Relaxed)
-    );
+    let slot = snapshot_slot_name();
     let rows = minter
         .simple_query(&format!(
             "CREATE_REPLICATION_SLOT \"{slot}\" TEMPORARY LOGICAL pgoutput EXPORT_SNAPSHOT"
@@ -880,6 +908,31 @@ fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base36_keeps_any_snapshot_count_within_thirteen_digits() {
+        assert_eq!(base36(0), "0");
+        assert_eq!(base36(35), "z");
+        assert_eq!(base36(36), "10");
+        assert_eq!(base36(u64::MAX).len(), 13);
+    }
+
+    #[test]
+    fn snapshot_slot_names_fit_and_are_globally_unique() {
+        let first = snapshot_slot_name();
+        let second = snapshot_slot_name();
+        assert!(first.len() <= 63, "PostgreSQL caps slot names at 63 bytes");
+        assert_ne!(first, second);
+        let fields: Vec<_> = first.split('_').collect();
+        assert_eq!(fields.len(), 5, "xyne, sync, snap, count and UUID");
+        assert_eq!(fields[..3], ["xyne", "sync", "snap"]);
+        assert!(u64::from_str_radix(fields[3], 36).is_ok());
+        assert!(
+            fields[3].len() <= 13,
+            "a u64 takes at most 13 base-36 digits"
+        );
+        assert_eq!(fields[4].len(), 32);
+    }
     use crate::model::DbColumn;
 
     /// A keepalive goes onto the connection settings whole; an idle time

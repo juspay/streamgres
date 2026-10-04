@@ -28,13 +28,15 @@ pub struct Config {
     /// (`public` plus the app's `zero_<shard>` schema by default).
     pub schemas: Vec<String>,
     /// The replication slot of the change feed, not configurable: each
-    /// process names its own, `xyne_sync_slot_<uuid>`, and never drops
-    /// it; cleaning up the slots of ended processes is left to the
-    /// deployment.
+    /// process names its own, `xyne_sync_slot_<uuid>`.
     pub slot: String,
+    /// `XYNE_SYNC_SLOT_CLEANUP_AGE_MS`: how long a xyne-sync feed slot
+    /// must have stayed inactive before startup drops it (zero disables
+    /// cleanup). PostgreSQL 17 or later is required when this is enabled,
+    /// because that is where `inactive_since` is available.
+    pub slot_cleanup_age: Duration,
     /// `XYNE_SYNC_PUBLICATION`: the publication the change feed streams
-    /// (`xyne_sync_pub`); created for all tables at start when missing,
-    /// which a standby cannot do (create it on the primary).
+    /// (`xyne_sync_pub`); it must exist before the server starts.
     pub publication: String,
     /// `XYNE_SYNC_DDL_TRIGGER`: the event trigger on `ddl_command_end`
     /// through which the server hears of schema changes, zero-cache's
@@ -297,6 +299,7 @@ impl Config {
             dsn,
             schemas,
             slot: threads::slot_name(),
+            slot_cleanup_age: millis("XYNE_SYNC_SLOT_CLEANUP_AGE_MS", 0)?,
             publication: first(&["XYNE_SYNC_PUBLICATION"])
                 .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
             ddl_trigger,
@@ -428,6 +431,7 @@ impl Config {
         Settings {
             dsn: self.dsn.clone(),
             slot: self.slot.clone(),
+            slot_cleanup_age: self.slot_cleanup_age,
             publication: self.publication.clone(),
             schemas: self.schemas.clone(),
             snapshot_rotation: self.snapshot_rotation,
@@ -492,6 +496,17 @@ mod tests {
         let config = config_with(&[("XYNE_SYNC_PUBLICATION", "sdlc_feed")]);
         assert_eq!(config.publication, "sdlc_feed");
         assert_eq!(config.engine_settings().publication, "sdlc_feed");
+    }
+
+    #[test]
+    fn inactive_slot_cleanup_is_off_unless_an_age_is_set() {
+        assert_eq!(config(&[]).unwrap().slot_cleanup_age, Duration::ZERO);
+        let config = config_with(&[("XYNE_SYNC_SLOT_CLEANUP_AGE_MS", "3600000")]);
+        assert_eq!(config.slot_cleanup_age, Duration::from_secs(3600));
+        assert_eq!(
+            config.engine_settings().slot_cleanup_age,
+            Duration::from_secs(3600)
+        );
     }
 
     #[test]

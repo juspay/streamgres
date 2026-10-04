@@ -192,7 +192,6 @@ fn sender() -> &'static Mutex<SyncSender<Item>> {
 /// The log thread: lines to stderr in batches, a flush after each.
 fn write_loop(receiver: Receiver<Item>) {
     let stderr = std::io::stderr();
-    let mut out = std::io::BufWriter::with_capacity(64 * 1024, stderr.lock());
     while let Ok(first) = receiver.recv() {
         let mut items = vec![first];
         while let Ok(more) = receiver.try_recv() {
@@ -201,6 +200,10 @@ fn write_loop(receiver: Receiver<Item>) {
                 break;
             }
         }
+        // Do not hold StderrLock while waiting for the next item. Startup
+        // failures are printed with `eprintln!`; retaining the lock here
+        // would make that error path wait forever after the first log line.
+        let mut out = std::io::BufWriter::with_capacity(64 * 1024, stderr.lock());
         let mut acks = Vec::new();
         for item in items {
             match item {

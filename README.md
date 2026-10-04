@@ -328,11 +328,11 @@ floor.
 - `PgStream::open(dsn, slot, publication, catalog)` streams a `pgoutput` slot
   over a replication connection (`START_REPLICATION`, spoken by the
   `pgwire-replication` crate; the row messages decoded by the `pgoutput`
-  crate, mapped onto the catalog's tables and types here). It creates the
-  slot and the publication (for all tables) if they are missing. The server
-  names a slot of its own per process, `xyne_sync_slot_<uuid>`, and never
-  drops it (the slots of ended processes are cleaned up outside the
-  server); the publication is `XYNE_SYNC_PUBLICATION`.
+  crate, mapped onto the catalog's tables and types here). It creates its
+  own slot per process, `xyne_sync_slot_<uuid>`, but requires the deployment
+  to create `XYNE_SYNC_PUBLICATION` first. At startup, an optional
+  `XYNE_SYNC_SLOT_CLEANUP_AGE_MS` removes only own inactive slots older than
+  that age (PostgreSQL 17+ supplies the required `inactive_since` timestamp).
   Every change becomes a full-image insert/update or a key-only delete
   **positioned at the end of its transaction's commit record**, the scale the
   aliases' consistent points are on: a snapshot at consistent point `X` holds

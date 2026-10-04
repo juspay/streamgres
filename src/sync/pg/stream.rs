@@ -64,6 +64,7 @@ use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 use tokio_postgres::Client;
 use tokio_postgres::config::Host;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::PgLsn;
 
 use super::ddl::{self, DdlSource};
@@ -503,16 +504,64 @@ impl Transport {
         Self::connect(config, slot, publication).await
     }
 
-    /// Make sure what the feed of `slot` streams from exists at `dsn`:
-    /// `publication` (every table) and the slot, each created only when
-    /// it is missing, so a deployment that creates the publication itself
-    /// is never written to for it. A standby cannot create a publication;
-    /// when it has none the error says what to run on the primary. Done
-    /// before the first read snapshot is minted, so that the slot holds
-    /// the log from before that snapshot's point.
+    /// Check that the deployment-provided `publication` exists and create
+    /// this process's fresh feed `slot`. Done before the first read snapshot
+    /// is minted, so that the slot holds the log from before that snapshot's
+    /// point. The server never creates publications: that DDL belongs to
+    /// deployment setup and must not race among pods at startup.
     pub async fn prepare(dsn: &str, slot: &str, publication: &str) -> Result<(), StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        ensure_slot(&config, slot, publication).await.map(drop)
+        prepare_slot(&config, slot, publication).await.map(drop)
+    }
+
+    /// Drop only our own permanent slots that PostgreSQL has reported
+    /// inactive for at least `age`. A zero age disables cleanup. PostgreSQL
+    /// added `inactive_since` in version 17; refusing to guess on older
+    /// versions is safer than deleting a slot during a live reconnect.
+    pub async fn cleanup_inactive_slots(dsn: &str, age: Duration) -> Result<(), StorageError> {
+        if age.is_zero() {
+            return Ok(());
+        }
+        let config: tokio_postgres::Config = dsn.parse()?;
+        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+        let version: i32 = client
+            .query_one("SELECT current_setting('server_version_num')::int", &[])
+            .await?
+            .get(0);
+        if version < 170_000 {
+            return Err(StorageError(format!(
+                "XYNE_SYNC_SLOT_CLEANUP_AGE_MS requires PostgreSQL 17 or later (server is {version}); PostgreSQL 16 has no inactive_since timestamp, so safe age-bounded cleanup is impossible"
+            )));
+        }
+        let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
+        let prefix = "xyne_sync_slot_";
+        let slots = client
+            .query(
+                "SELECT slot_name FROM pg_replication_slots \
+                 WHERE left(slot_name, length($1)) = $1 \
+                   AND NOT temporary AND NOT active \
+                 AND inactive_since <= clock_timestamp() - $2::bigint * interval '1 millisecond'",
+                &[&prefix, &age_ms],
+            )
+            .await?;
+        for row in slots {
+            let slot: String = row.get(0);
+            match client
+                .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
+                .await
+            {
+                Ok(_) => log_info!("dropped inactive replication slot {slot} after {age:?}"),
+                // A feed may have claimed the slot after the candidate query.
+                // PostgreSQL refuses to drop an active slot; leave it alone.
+                Err(error) if error.code() == Some(&SqlState::OBJECT_IN_USE) => {
+                    log_info!(
+                        "inactive replication slot {slot} became active during cleanup; keeping it"
+                    )
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
     }
 
     /// Whether `slot` exists at `dsn`.
@@ -662,9 +711,9 @@ impl Transport {
     }
 }
 
-/// `publication` and `slot` at `config`, created when missing (see
+/// Require `publication` and create this process's new `slot` (see
 /// [`Transport::prepare`]); the ordinary connection used.
-async fn ensure_slot(
+async fn prepare_slot(
     config: &tokio_postgres::Config,
     slot: &str,
     publication: &str,
@@ -678,20 +727,9 @@ async fn ensure_slot(
         .await?
         .is_some();
     if !published {
-        let standby: bool = client
-            .query_one("SELECT pg_is_in_recovery()", &[])
-            .await?
-            .get(0);
-        if standby {
-            return Err(StorageError(format!(
-                "publication `{publication}` does not exist and this server is a standby, which cannot create it; on the primary run: CREATE PUBLICATION \"{publication}\" FOR ALL TABLES"
-            )));
-        }
-        client
-            .batch_execute(&format!(
-                "CREATE PUBLICATION \"{publication}\" FOR ALL TABLES"
-            ))
-            .await?;
+        return Err(StorageError(format!(
+            "publication `{publication}` does not exist; create it before starting xyne-sync (for example, on the primary: CREATE PUBLICATION \"{publication}\" FOR ALL TABLES)"
+        )));
     }
     let exists = client
         .query_opt(
