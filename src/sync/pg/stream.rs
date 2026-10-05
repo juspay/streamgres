@@ -61,6 +61,7 @@ use pgoutput::events::event::{Event, EventType};
 use pgoutput::options::{BinaryValueTraitOff, StreamingValueTraitOff};
 use pgwire_replication::{ReplicationClient, ReplicationConfig, ReplicationEvent, TlsConfig};
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tokio_postgres::Client;
 use tokio_postgres::config::Host;
@@ -577,6 +578,37 @@ impl Transport {
             .is_some())
     }
 
+    /// Drop `slot`, ending the walsender holding it first (the drop is
+    /// retried while it lets go).
+    pub async fn drop_slot_only(dsn: &str, slot: &str) -> Result<(), StorageError> {
+        let config: tokio_postgres::Config = dsn.parse()?;
+        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+        client
+            .execute(
+                "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = $1 AND active_pid IS NOT NULL",
+                &[&slot],
+            )
+            .await?;
+        let mut attempts = 0;
+        loop {
+            let dropped = client
+                .execute(
+                    "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1",
+                    &[&slot],
+                )
+                .await;
+            match dropped {
+                Ok(_) => break,
+                Err(_) if attempts < 40 => {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     /// The replication connection on `slot`, streaming `publication`.
     async fn connect(
         config: tokio_postgres::Config,
@@ -644,17 +676,39 @@ impl Transport {
     /// server no longer holds the slot for it (see the module docs); a
     /// decoding failure ends it with the error.
     pub async fn stream(
+        self,
+        every: Duration,
+        feed: &mut Feed,
+        watched: &[TableName],
+        out: mpsc::Sender<Committed>,
+    ) -> Result<(), StorageError> {
+        let (_stop, stop_rx) = watch::channel(false);
+        self.stream_with_shutdown(every, feed, watched, out, stop_rx)
+            .await
+    }
+
+    /// Like [`Transport::stream`], but also returns when `shutdown` is set.
+    /// This lets graceful shutdown stop the replication connection before
+    /// the permanent slot is removed.
+    pub async fn stream_with_shutdown(
         mut self,
         every: Duration,
         feed: &mut Feed,
         watched: &[TableName],
         out: mpsc::Sender<Committed>,
+        mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), StorageError> {
         let mut ticker = tokio::time::interval(every);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut watch = Watch::new();
         loop {
             let event = tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_ok() && *shutdown.borrow() {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 _ = ticker.tick() => {
                     let position = feed.progress();
                     if position > Lsn(0) && out.send(Committed::mark(position)).await.is_err() {
@@ -923,34 +977,11 @@ impl PgStream {
         (self.transport, self.feed)
     }
 
-    /// Drop `slot` and `publication`, ending the walsender holding the
-    /// slot first (the drop is retried while it lets go).
+    /// Drop `slot` and `publication`.
     pub async fn drop_slot(dsn: &str, slot: &str, publication: &str) -> Result<(), StorageError> {
+        Transport::drop_slot_only(dsn, slot).await?;
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
-        client
-            .execute(
-                "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = $1 AND active_pid IS NOT NULL",
-                &[&slot],
-            )
-            .await?;
-        let mut attempts = 0;
-        loop {
-            let dropped = client
-                .execute(
-                    "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1",
-                    &[&slot],
-                )
-                .await;
-            match dropped {
-                Ok(_) => break,
-                Err(_) if attempts < 40 => {
-                    attempts += 1;
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
         client
             .batch_execute(&format!("DROP PUBLICATION IF EXISTS \"{publication}\""))
             .await?;

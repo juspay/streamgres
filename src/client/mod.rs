@@ -81,6 +81,7 @@ pub fn serve(config: Config) -> Result<(), String> {
     let _profiler = crate::profile::start(crate::profile::Config::from_env()?)?;
     let config = Arc::new(config);
     let settings = config.engine_settings();
+    let cleanup_settings = settings.clone();
     let server = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("xyne-sync-server")
@@ -148,6 +149,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         commands,
         events,
         storage,
+        feed,
     } = started_rx
         .recv()
         .map_err(|_| "the engine thread ended before it was up".to_owned())??;
@@ -287,6 +289,24 @@ pub fn serve(config: Config) -> Result<(), String> {
     crate::otel::spawn(crate::otel::Config::from_env(), state.stats.clone());
     log_info!("client side up");
     let served = server.block_on(connection::serve(state));
+    server.block_on(async {
+        threads::stop_feed(feed).await;
+        match crate::sync::pg::Transport::drop_slot_only(
+            &cleanup_settings.dsn,
+            &cleanup_settings.slot,
+        )
+        .await
+        {
+            Ok(()) => log_info!(
+                "dropped change-feed slot {} during shutdown",
+                cleanup_settings.slot
+            ),
+            Err(error) => log_warn!(
+                "could not drop change-feed slot {} during shutdown: {error}",
+                cleanup_settings.slot
+            ),
+        }
+    });
     drop(reads);
     served
 }

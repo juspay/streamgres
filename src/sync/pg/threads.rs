@@ -31,6 +31,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio::task::spawn_local;
 
 use super::ddl::{self, DdlSource};
@@ -104,6 +105,15 @@ pub struct Started {
     pub commands: mpsc::Sender<Command<MultiTableReadQuery>>,
     pub events: Vec<mpsc::UnboundedReceiver<Event>>,
     pub storage: Arc<PgStorage>,
+    pub feed: FeedHandle,
+}
+
+/// The feed's stop signal and its OS thread. Shutdown sets the signal, waits
+/// for the replication connection to close, and only then may remove the
+/// feed's slot.
+pub struct FeedHandle {
+    stop: watch::Sender<bool>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// The service's task, kept on the engine thread: it resolves only when
@@ -173,16 +183,17 @@ pub fn spawn_feed(
     settings: Settings,
     catalog: Arc<Catalog>,
     start: Lsn,
-) -> Result<mpsc::Receiver<Transaction>, String> {
+) -> Result<(mpsc::Receiver<Transaction>, FeedHandle), String> {
     let (out, transactions) = mpsc::channel(1024);
-    std::thread::Builder::new()
+    let (stop, mut stop_rx) = watch::channel(false);
+    let thread = std::thread::Builder::new()
         .name("xyne-sync-feed".to_owned())
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("feed runtime");
-            runtime.block_on(async move {
+            let stopped = runtime.block_on(async move {
                 let ddl = DdlSource {
                     prefix: settings.ddl_prefix.clone(),
                     schemas: settings.schemas.clone(),
@@ -192,19 +203,19 @@ pub fn spawn_feed(
                 let mut failures = 0u32;
                 loop {
                     let opened = match start {
-                        Some(from) => {
-                            Transport::open_from(
-                                &settings.dsn,
-                                &settings.slot,
-                                &settings.publication,
-                                from,
-                            )
-                            .await
-                        }
-                        None => {
-                            Transport::open(&settings.dsn, &settings.slot, &settings.publication)
-                                .await
-                        }
+                        Some(from) => Transport::open_from(
+                            &settings.dsn,
+                            &settings.slot,
+                            &settings.publication,
+                            from,
+                        )
+                        .await,
+                        None => Transport::open(
+                            &settings.dsn,
+                            &settings.slot,
+                            &settings.publication,
+                        )
+                        .await,
                     };
                     match opened {
                         Ok(transport) => {
@@ -212,10 +223,19 @@ pub fn spawn_feed(
                             start = None;
                             failures = 0;
                             let outcome = transport
-                                .stream(POSITION_EVERY, &mut feed, &settings.watched, out.clone())
+                                .stream_with_shutdown(
+                                    POSITION_EVERY,
+                                    &mut feed,
+                                    &settings.watched,
+                                    out.clone(),
+                                    stop_rx.clone(),
+                                )
                                 .await;
+                            if *stop_rx.borrow() {
+                                return true;
+                            }
                             if out.is_closed() {
-                                return;
+                                return false;
                             }
                             match outcome {
                                 Ok(()) => log_warn!("change feed dropped; reopening the slot"),
@@ -240,14 +260,40 @@ pub fn spawn_feed(
                         }
                     }
                     let backoff = Duration::from_secs(1 << failures.min(4));
-                    tokio::time::sleep(backoff).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff) => {}
+                        changed = stop_rx.changed() => {
+                            if changed.is_ok() && *stop_rx.borrow() {
+                                return true;
+                            }
+                        }
+                    }
                 }
             });
-            log_error!("change feed thread stopped: the engine is gone");
-            crate::log::exit(1);
+            if stopped {
+                log_info!("change feed thread stopped gracefully");
+            } else {
+                log_error!("change feed thread stopped: the engine is gone");
+                crate::log::exit(1);
+            }
         })
         .map_err(|error| format!("feed thread: {error}"))?;
-    Ok(transactions)
+    Ok((
+        transactions,
+        FeedHandle {
+            stop,
+            thread: Some(thread),
+        },
+    ))
+}
+
+/// Stop the feed thread and wait until its replication connection is closed.
+pub async fn stop_feed(mut feed: FeedHandle) {
+    feed.stop.send_replace(true);
+    let Some(thread) = feed.thread.take() else {
+        return;
+    };
+    let _ = tokio::task::spawn_blocking(move || thread.join()).await;
 }
 
 /// Bring the engine side up on the current thread's local set: the slot
@@ -281,7 +327,7 @@ pub async fn start(
         .with_read_connections(settings.read_connections)
         .with_read_timeout(settings.read_timeout);
     let pg = Arc::new(pg);
-    let feed = spawn_feed(settings.clone(), catalog.load(), pg.first_position())?;
+    let (feed, feed_handle) = spawn_feed(settings.clone(), catalog.load(), pg.first_position())?;
     let cached = Sources::cached_from_env();
     let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
     if !cached.is_empty() {
@@ -310,6 +356,7 @@ pub async fn start(
             commands,
             events,
             storage: pg,
+            feed: feed_handle,
         },
         service,
     ))
