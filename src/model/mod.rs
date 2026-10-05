@@ -38,5 +38,5 @@ pub use query::{
     WriteQuery,
 };
 pub use row::{RowData, RowSchema};
-pub use schema::{Catalog, ColumnName, DbColumn, DbTable, TableName};
+pub use schema::{Catalog, ColumnName, DbColumn, DbTable, PutPlan, TableName};
 pub use value::{SharedSet, Value, ValueType};

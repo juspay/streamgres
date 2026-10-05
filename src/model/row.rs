@@ -11,6 +11,9 @@ use std::fmt;
 use std::ops::Index;
 use std::sync::Arc;
 
+use bytes::Bytes;
+use once_cell::race::OnceBox;
+
 use super::ids::IdMap;
 use super::schema::ColumnName;
 use super::value::Value;
@@ -63,6 +66,7 @@ impl RowSchema {
 pub struct RowData {
     schema: Arc<RowSchema>,
     values: Box<[Value]>,
+    wire: OnceBox<Bytes>,
 }
 
 impl PartialEq for RowSchema {
@@ -83,6 +87,7 @@ impl RowData {
         RowData {
             schema,
             values: values.into_boxed_slice(),
+            wire: OnceBox::new(),
         }
     }
 
@@ -128,6 +133,27 @@ impl RowData {
         self.values.is_empty()
     }
 
+    /// The row's bytes as the transport sends it (its `rowsPatch` put),
+    /// empty until the first time the row is sent. The cell is written
+    /// once, by whichever thread sends the row first, and read by every
+    /// later send in place of serializing the row again
+    /// (`client::groups`). That is sound because nothing the bytes are
+    /// made of changes while the image lives: the values are never
+    /// written after the image is built (a changed row is a new image,
+    /// with a cell of its own; a decoded row holds scalars, text and
+    /// lists, never a [`Value::Set`], which can grow in place and only
+    /// ever belongs to a query's condition), the image belongs to one
+    /// table, and its layout fixes the types that table declares (a
+    /// migration that adds a column lays the table's rows out again as
+    /// new images; one that changes a type stops the server). Two threads
+    /// that both find the cell empty write the same bytes, so it does not
+    /// matter which of them fills it: the cell is a [`OnceBox`], one
+    /// atomic pointer that the first `set` fills and every later one is
+    /// refused, and a reader never waits.
+    pub fn wire(&self) -> &OnceBox<Bytes> {
+        &self.wire
+    }
+
     /// The row as an owned map, for the few places that build a new row
     /// from an old one.
     pub fn to_map(&self) -> HashMap<ColumnName, Value> {
@@ -147,6 +173,7 @@ impl From<HashMap<ColumnName, Value>> for RowData {
         RowData {
             schema,
             values: pairs.into_iter().map(|(_, value)| value).collect(),
+            wire: OnceBox::new(),
         }
     }
 }

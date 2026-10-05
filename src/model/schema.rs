@@ -173,6 +173,72 @@ pub struct DbTable {
     row_schema: Arc<RowSchema>,
     /// The layout of the table's keys: the key columns, in order.
     key_schema: Arc<RowSchema>,
+    /// What the transport writes around the values of a row on
+    /// `row_schema`, worked out once for the table.
+    put_plan: Arc<PutPlan>,
+}
+
+/// The part of a row's `rowsPatch` put that depends on its table and not
+/// on the row: `{"op":"put","tableName":…,"value":{` and, for each column
+/// of the table's row layout in its order, the column's name as a JSON
+/// key followed by `:` (and preceded by `,` after the first) with the
+/// type the column declares. A row on that layout is then written as the
+/// head, each column's key bytes and value, and `}}`, with no lookup or
+/// escaping per cell (`client::wire::write_put`). Built by
+/// [`DbTable::new`], so once per table when the catalog is read and once
+/// more when a migration adds the table or a column to it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PutPlan {
+    head: Box<[u8]>,
+    columns: Box<[(Box<[u8]>, ValueType)]>,
+}
+
+impl PutPlan {
+    /// The plan for rows of `table` laid out on `layout`, whose names
+    /// are all keys of `columns`.
+    fn new(table: &TableName, layout: &RowSchema, columns: &HashMap<ColumnName, DbColumn>) -> Self {
+        let mut head = b"{\"op\":\"put\",\"tableName\":".to_vec();
+        json_string(&mut head, table.as_str());
+        head.extend_from_slice(b",\"value\":{");
+        let columns = layout
+            .names()
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let mut key = Vec::with_capacity(name.as_str().len() + 4);
+                if index > 0 {
+                    key.push(b',');
+                }
+                json_string(&mut key, name.as_str());
+                key.push(b':');
+                let declared = columns
+                    .get(name)
+                    .map(|column| column.r#type.clone())
+                    .expect("a table's row layout is made of its columns");
+                (key.into_boxed_slice(), declared)
+            })
+            .collect();
+        PutPlan {
+            head: head.into_boxed_slice(),
+            columns,
+        }
+    }
+
+    /// `{"op":"put","tableName":…,"value":{`.
+    pub fn head(&self) -> &[u8] {
+        &self.head
+    }
+
+    /// Per column of the row layout, in its order: the JSON key bytes
+    /// written before the value, and the type the column declares.
+    pub fn columns(&self) -> &[(Box<[u8]>, ValueType)] {
+        &self.columns
+    }
+}
+
+/// Append `text` as a JSON string.
+fn json_string(out: &mut Vec<u8>, text: &str) {
+    serde_json::to_writer(&mut *out, text).expect("a string always serializes into a Vec");
 }
 
 /// The authoritative set of table schemas, by name.
@@ -273,13 +339,21 @@ impl DbTable {
         rest.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         let row_schema = RowSchema::new(pkey.iter().cloned().chain(rest));
         let key_schema = RowSchema::new(pkey.iter().cloned());
+        let put_plan = Arc::new(PutPlan::new(&name, &row_schema, &by_name));
         DbTable {
             name,
             pkey,
             columns: by_name,
             row_schema,
             key_schema,
+            put_plan,
         }
+    }
+
+    /// The bytes and types the transport writes around the values of a
+    /// row on [`DbTable::row_schema`].
+    pub fn put_plan(&self) -> &PutPlan {
+        &self.put_plan
     }
 
     /// The definition of column `name`, if the table declares it.

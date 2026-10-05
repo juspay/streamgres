@@ -17,10 +17,11 @@
 //! something to hear, once: idle, that is one poke per transaction; under
 //! load one poke carries every transaction that arrived meanwhile, which
 //! is what keeps the frame count per connection bounded as the write rate
-//! climbs. Within a flush every row image is serialized to its `rowsPatch`
-//! bytes once and shared by every group's frame that carries it; a group's
-//! frame is a prefix, those fragments, and a suffix, so a poke costs the
-//! bookkeeping and a copy, never a JSON tree per group.
+//! climbs. Every row image is serialized to its `rowsPatch` bytes once,
+//! the first time any group is sent it, and the bytes stay on the image
+//! for every group's frame that carries it, in this flush or a later one;
+//! a group's frame is a prefix, those fragments, and a suffix, so a poke
+//! costs the bookkeeping and a copy, never a JSON tree per group.
 //!
 //! # A client group's view
 //!
@@ -953,7 +954,6 @@ impl Groups {
                     &protocol::cookie(group.version),
                     head_of(&HashMap::new(), &got, &group.lmids, &waiting),
                     &patches,
-                    &mut HashMap::new(),
                 );
                 log_event!(
                     Level::Info,
@@ -1446,7 +1446,8 @@ impl Groups {
     }
 
     /// Turn everything accumulated into one poke per group that has
-    /// anything to hear, every row serialized once for all of them.
+    /// anything to hear, every row serialized once for all of them and
+    /// for every later flush (the bytes stay on the row's image).
     fn flush(&mut self) {
         let groups = &self.groups;
         self.pending.retain(|group, _| groups.contains_key(group));
@@ -1458,27 +1459,20 @@ impl Groups {
         let since = self.oldest.take();
         let mut touched: Vec<String> = self.dirty.drain().collect();
         touched.sort();
-        let mut fragments: HashMap<usize, Bytes> = HashMap::new();
         for group_id in touched {
-            self.poke(&group_id, &mut fragments, since);
+            self.poke(&group_id, since);
         }
         self.stats.groups_flush.record(started.elapsed());
     }
 
     /// Account what has arrived for one group and, when a connection is
-    /// there to hear it, assemble and send its poke; `fragments` are the
-    /// row entries already serialized in this flush, by image, and `since`
-    /// when the oldest transaction of the flush was decoded. A group with
-    /// no connection keeps its ledger current and its row operations
+    /// there to hear it, assemble and send its poke; `since` is when the
+    /// oldest transaction of the flush was decoded. A group with no
+    /// connection keeps its ledger current and its row operations
     /// waiting, coalesced, and stands still: no frames, no new version,
     /// so the client that returns with the group's cookie is owed exactly
     /// what waits here.
-    fn poke(
-        &mut self,
-        group_id: &str,
-        fragments: &mut HashMap<usize, Bytes>,
-        since: Option<Instant>,
-    ) {
+    fn poke(&mut self, group_id: &str, since: Option<Instant>) {
         let lmid_changes = self.lmid_changes.remove(group_id).unwrap_or_default();
         let result_changes = self.result_changes.remove(group_id).unwrap_or_default();
         let Some(group) = self.groups.get_mut(group_id) else {
@@ -1559,7 +1553,6 @@ impl Groups {
             &cookie,
             head_of(&desired, &got, &lmids, &results),
             &patches,
-            fragments,
         );
         log_debug!(
             "group {group_id}: poke {poke_id} {} -> {cookie}: {puts} puts, {dels} dels, {} got, {} lmids, {} results",
@@ -1691,8 +1684,8 @@ fn with_current(
 
 /// One poke as its frames, from `base` to `cookie`: the start, the parts
 /// (`head` in the first, `per_part` row operations each, every put taken
-/// from `fragments` when the image was already serialized in this flush),
-/// the end. Also how many puts and dels it carries.
+/// from the bytes kept on its image when the image was sent before), the
+/// end. Also how many puts and dels it carries.
 #[allow(clippy::too_many_arguments)]
 fn build_poke(
     catalog: &Catalog,
@@ -1703,7 +1696,6 @@ fn build_poke(
     cookie: &str,
     head: Vec<u8>,
     rows: &[Patch<'_>],
-    fragments: &mut HashMap<usize, Bytes>,
 ) -> (Arc<[Bytes]>, usize, usize) {
     let mut frames: Vec<Bytes> = Vec::with_capacity(rows.len().div_ceil(per_part) + 3);
     frames.push(Bytes::from(protocol::poke_start(poke_id, base)));
@@ -1717,23 +1709,11 @@ fn build_poke(
         for op in chunk {
             match op {
                 Patch::Put(table, row) => {
-                    let Some(declared) = catalog.table(table.as_str()) else {
+                    let Some(fragment) = put_fragment(catalog, stats, table, row) else {
                         continue;
                     };
                     puts += 1;
-                    let fragment = match fragments.entry(Arc::as_ptr(&row.data) as usize) {
-                        std::collections::hash_map::Entry::Occupied(entry) => {
-                            stats.rows_shared.fetch_add(1, Ordering::Relaxed);
-                            entry.into_mut()
-                        }
-                        std::collections::hash_map::Entry::Vacant(entry) => {
-                            stats.rows_serialized.fetch_add(1, Ordering::Relaxed);
-                            let mut bytes = Vec::with_capacity(256);
-                            wire::write_put(&mut bytes, declared, row);
-                            entry.insert(Bytes::from(bytes))
-                        }
-                    };
-                    entries.push(fragment.clone());
+                    entries.push(fragment);
                 }
                 Patch::Del(table, key) => {
                     dels += 1;
@@ -1747,6 +1727,32 @@ fn build_poke(
     }
     frames.push(Bytes::from(protocol::poke_end(poke_id, cookie)));
     (frames.into(), puts, dels)
+}
+
+/// The `rowsPatch` put of `row` in `table`: the bytes kept on the image
+/// when it was sent before, by any group thread, or else the row written
+/// now and kept there for every later send ([`RowData::wire`]). The cell
+/// is read with `get` and filled with `set`, so a thread never waits on
+/// another's serialization: two that both find it empty both write the
+/// row, the same bytes, and the second `set` is refused and dropped. `None` for a table the catalog does not hold, which only a
+/// row never sent can meet, since tables are not dropped while serving.
+fn put_fragment(
+    catalog: &Catalog,
+    stats: &Stats,
+    table: &TableName,
+    row: &DataFrameRow,
+) -> Option<Bytes> {
+    if let Some(bytes) = row.data.wire().get() {
+        stats.rows_shared.fetch_add(1, Ordering::Relaxed);
+        return Some(bytes.clone());
+    }
+    let declared = catalog.table(table.as_str())?;
+    stats.rows_serialized.fetch_add(1, Ordering::Relaxed);
+    let mut bytes = Vec::with_capacity(256);
+    wire::write_put(&mut bytes, declared, row);
+    let bytes = Bytes::from(bytes);
+    let _ = row.data.wire().set(Box::new(bytes.clone()));
+    Some(bytes)
 }
 
 /// One `pokePart` frame: the poke id, the query-state and mutation-id
@@ -2778,5 +2784,1362 @@ mod tests {
         }
         assert_eq!(log.pokes.len(), 1_000, "only the bytes bound it");
         assert_eq!(log.after(6).map(|pokes| pokes.len()), Some(1_000));
+    }
+
+    /// A table `t` and `n` rows on its layout, each with an `id` and a
+    /// `name` (and a JSON `meta`), as the feed decodes them.
+    fn images(n: i64, name: &str) -> (Catalog, TableName, Vec<DataFrameRow>) {
+        use crate::model::{DbColumn, DbTable, ValueType};
+        let table = DbTable::new(
+            "t",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("name", ValueType::String),
+                DbColumn::new("meta", ValueType::Json),
+            ],
+        );
+        let layout = table.row_schema().clone();
+        let rows = (0..n)
+            .map(|id| {
+                let values = layout
+                    .names()
+                    .iter()
+                    .map(|column| match column.as_str() {
+                        "id" => Value::Int(id),
+                        "name" => Value::from(format!("{name} \"{id}\"")),
+                        _ => Value::from(format!(r#"{{"n":{id}}}"#)),
+                    })
+                    .collect();
+                DataFrameRow::from(RowData::with_schema(layout.clone(), values))
+            })
+            .collect();
+        (Catalog::new(vec![table]), TableName::from("t"), rows)
+    }
+
+    /// The put of `row` as `wire::write_put` writes it, cache aside.
+    fn written(catalog: &Catalog, row: &DataFrameRow) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        wire::write_put(&mut bytes, catalog.table("t").unwrap(), row);
+        bytes
+    }
+
+    /// A row is serialized the first time it is sent and its bytes are
+    /// reused by every later poke that carries it, in another flush and
+    /// for another group, byte for byte the same frames.
+    #[test]
+    fn a_row_is_serialized_once_for_every_send() {
+        let (catalog, table, rows) = images(3, "a");
+        let stats = Stats::new();
+        let patches: Vec<Patch<'_>> = rows.iter().map(|row| Patch::Put(&table, row)).collect();
+        let poke = |id: &str| build_poke(&catalog, &stats, 2, id, None, "01", Vec::new(), &patches);
+        let (first, puts, _) = poke("1");
+        assert_eq!(puts, 3);
+        assert_eq!(stats.rows_serialized.load(Ordering::Relaxed), 3);
+        assert_eq!(stats.rows_shared.load(Ordering::Relaxed), 0);
+        for row in &rows {
+            assert_eq!(
+                row.data.wire().get().map(|bytes| bytes.to_vec()),
+                Some(written(&catalog, row)),
+                "the bytes kept on the image are the row's put"
+            );
+        }
+        let (second, puts, _) = poke("1");
+        assert_eq!(puts, 3);
+        assert_eq!(
+            stats.rows_serialized.load(Ordering::Relaxed),
+            3,
+            "nothing serialized again"
+        );
+        assert_eq!(stats.rows_shared.load(Ordering::Relaxed), 3);
+        assert_eq!(first, second, "the same frames from the kept bytes");
+    }
+
+    /// A changed row is a new image: it is written anew, and the bytes
+    /// kept on the image it replaced stay that image's.
+    #[test]
+    fn a_changed_row_is_written_anew() {
+        let (catalog, table, before) = images(1, "before");
+        let (_, _, after) = images(1, "after");
+        let after = DataFrameRow::from(RowData::with_schema(
+            catalog.table("t").unwrap().row_schema().clone(),
+            after[0].data.values().cloned().collect(),
+        ));
+        let stats = Stats::new();
+        let old = put_fragment(&catalog, &stats, &table, &before[0]).unwrap();
+        let new = put_fragment(&catalog, &stats, &table, &after).unwrap();
+        assert_eq!(stats.rows_serialized.load(Ordering::Relaxed), 2);
+        assert!(String::from_utf8_lossy(&old).contains("before"));
+        assert!(String::from_utf8_lossy(&new).contains("after"));
+        assert_eq!(new.to_vec(), written(&catalog, &after));
+        assert_eq!(
+            before[0].data.wire().get(),
+            Some(&old),
+            "the old image keeps its own bytes"
+        );
+    }
+
+    /// Group threads sending the same rows at once each get the row's
+    /// put, the same bytes as one thread alone, and every image ends up
+    /// holding exactly those bytes, however the threads raced to fill it.
+    #[test]
+    fn group_threads_racing_on_a_row_agree() {
+        const THREADS: usize = 8;
+        let (catalog, table, rows) = images(2_000, "raced");
+        let expected: Vec<Vec<u8>> = rows.iter().map(|row| written(&catalog, row)).collect();
+        let stats = Stats::new();
+        let start = std::sync::Barrier::new(THREADS);
+        let seen: Vec<Vec<Bytes>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        rows.iter()
+                            .map(|row| put_fragment(&catalog, &stats, &table, row).unwrap())
+                            .collect::<Vec<Bytes>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        for of_thread in &seen {
+            for (bytes, want) in of_thread.iter().zip(&expected) {
+                assert_eq!(&bytes[..], &want[..], "every thread sends the row's put");
+            }
+        }
+        for (row, want) in rows.iter().zip(&expected) {
+            assert_eq!(&row.data.wire().get().unwrap()[..], &want[..]);
+        }
+        let serialized = stats.rows_serialized.load(Ordering::Relaxed) as usize;
+        let shared = stats.rows_shared.load(Ordering::Relaxed) as usize;
+        assert_eq!(serialized + shared, THREADS * rows.len());
+        assert!(serialized >= rows.len(), "each row written at least once");
+    }
+
+    /// What a users-sized poke costs: rows looked up column by column
+    /// (the writer before the table plan), written from the plan, and
+    /// sent again from the bytes kept on them. Run with
+    /// `cargo test --release --lib users_poke_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn users_poke_cost() {
+        use crate::model::{DbColumn, DbTable, RowSchema, ValueType};
+        const ROWS: usize = 5_526;
+        let mut columns = vec![
+            DbColumn::new("id", ValueType::String),
+            DbColumn::new("email", ValueType::String),
+            DbColumn::new("name", ValueType::String),
+            DbColumn::new("avatarUrl", ValueType::String),
+            DbColumn::new("preferences", ValueType::Json),
+            DbColumn::new("createdAt", ValueType::Timestamp),
+            DbColumn::new("updatedAt", ValueType::Timestamp),
+            DbColumn::new("lastSeenAt", ValueType::Timestamp),
+            DbColumn::new("isActive", ValueType::Bool),
+            DbColumn::new("isBot", ValueType::Bool),
+            DbColumn::new("role", ValueType::String),
+            DbColumn::new("timezone", ValueType::String),
+            DbColumn::new("workspaceId", ValueType::String),
+        ];
+        for extra in 0..7 {
+            columns.push(DbColumn::new(format!("field{extra}"), ValueType::String));
+        }
+        let table = DbTable::new("users", ["id"], columns);
+        let layout = table.row_schema().clone();
+        let cell = |column: &str, row: usize| -> Value {
+            match column {
+                "id" => Value::from(format!("u{row:08}x7f3kq2")),
+                "email" => Value::from(format!("person.{row}@example.com")),
+                "name" => Value::from(format!("Person Number {row}")),
+                "avatarUrl" => Value::from(format!("https://cdn.example.com/a/{row}.png?s=64")),
+                "preferences" => {
+                    Value::from(r#"{"theme":"dark","notify":{"dm":true,"mentions":true}}"#)
+                }
+                "createdAt" | "updatedAt" | "lastSeenAt" => {
+                    Value::Int(1_759_000_000_000 + row as i64)
+                }
+                "isActive" => Value::Bool(true),
+                "isBot" => Value::Bool(false),
+                "role" => Value::from("member"),
+                "timezone" => Value::from("Asia/Kolkata"),
+                "workspaceId" => Value::from("6642623f-cca7-43ad-9a6b-5e49c33226b4"),
+                _ => Value::from(format!("value {row}")),
+            }
+        };
+        let rows_on = |schema: &Arc<RowSchema>| -> Vec<DataFrameRow> {
+            (0..ROWS)
+                .map(|row| {
+                    let values = schema
+                        .names()
+                        .iter()
+                        .map(|c| cell(c.as_str(), row))
+                        .collect();
+                    DataFrameRow::from(RowData::with_schema(schema.clone(), values))
+                })
+                .collect()
+        };
+        let looked_up = rows_on(&RowSchema::new(layout.names().iter().cloned()));
+        let planned = rows_on(&layout);
+        let time = |label: &str, run: &mut dyn FnMut()| {
+            let mut runs: Vec<f64> = (0..15)
+                .map(|_| {
+                    let started = Instant::now();
+                    run();
+                    started.elapsed().as_secs_f64() * 1_000.0
+                })
+                .collect();
+            runs.sort_by(f64::total_cmp);
+            println!(
+                "{label:44} median {:6.2} ms  min {:6.2} ms",
+                runs[7], runs[0]
+            );
+        };
+        let mut sink = 0usize;
+        time("write_put, column by column (before)", &mut || {
+            for row in &looked_up {
+                let mut out = Vec::with_capacity(256);
+                wire::write_put(&mut out, &table, row);
+                sink += out.len();
+            }
+        });
+        time("write_put from the table plan", &mut || {
+            for row in &planned {
+                let mut out = Vec::with_capacity(256);
+                wire::write_put(&mut out, &table, row);
+                sink += out.len();
+            }
+        });
+        let catalog = Catalog::new(vec![table.clone()]);
+        let name = TableName::from("users");
+        let stats = Stats::new();
+        let patches: Vec<Patch<'_>> = planned.iter().map(|row| Patch::Put(&name, row)).collect();
+        build_poke(&catalog, &stats, 500, "1", None, "01", Vec::new(), &patches);
+        time("build_poke, rows already sent (cache hits)", &mut || {
+            let (frames, _, _) =
+                build_poke(&catalog, &stats, 500, "1", None, "01", Vec::new(), &patches);
+            sink += frames.len();
+        });
+        let fresh: Vec<Vec<DataFrameRow>> = (0..15)
+            .map(|_| {
+                planned
+                    .iter()
+                    .map(|row| {
+                        let values = row.data.values().cloned().collect();
+                        DataFrameRow::from(RowData::with_schema(layout.clone(), values))
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut fresh = fresh.into_iter();
+        let mut sent: Vec<Vec<DataFrameRow>> = Vec::new();
+        time("build_poke, rows never sent (plan + fill)", &mut || {
+            let rows = fresh.next().unwrap();
+            let patches: Vec<Patch<'_>> = rows.iter().map(|row| Patch::Put(&name, row)).collect();
+            let (frames, _, _) =
+                build_poke(&catalog, &stats, 500, "1", None, "01", Vec::new(), &patches);
+            sink += frames.len();
+            drop(patches);
+            sent.push(rows);
+        });
+        println!("({sink} bytes and frames, so nothing is optimised away)");
+    }
+
+    /// What a population of clients connecting costs the group thread,
+    /// through the real thread (`Groups`): 400 client groups, one tab each,
+    /// each registering a startup set over row images the engine shares
+    /// between subscriptions, as it does:
+    /// - `getUsersV2`: the workspace's 5 526 users, the same images for
+    ///   every group;
+    /// - `userChannels`: 250 of 1 200 channels, overlapping between groups;
+    /// - `channelConversations` x 10: a page of 50 messages in each of ten
+    ///   of the group's channels, overlapping where groups share channels;
+    /// - 15 small per-user queries of 3 rows each, every group its own.
+    ///
+    /// Two arrivals: staggered (one group after another, every query
+    /// landing and flushing on its own, the steady state) and a storm
+    /// (25 groups' registrations landing in each flush, a deploy's
+    /// reconnects). Prints the time the thread spent and the rows
+    /// serialized and reused, and a checksum of every frame sent so two
+    /// builds can be compared byte for byte. Run with
+    /// `cargo test --release --lib connect_storm_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn connect_storm_cost() {
+        use crate::model::{
+            DbColumn, DbTable, Order, OrderBy, RowSchema, SingleTableReadQuery, ValueType, Where,
+        };
+        const GROUPS: usize = 400;
+        const USERS: usize = 5_526;
+        const CHANNELS: usize = 1_200;
+        const PER_PAGE: usize = 50;
+        /// Rows a query shows: each row's key and the engine's image.
+        type Shown = Vec<(DataFrameKey, DataFrameRow)>;
+
+        fn table(name: &str, columns: &[(&str, ValueType)]) -> DbTable {
+            DbTable::new(
+                name,
+                ["id"],
+                columns
+                    .iter()
+                    .map(|(column, kind)| DbColumn::new(*column, kind.clone()))
+                    .collect(),
+            )
+        }
+        let mut user_columns: Vec<(&str, ValueType)> = vec![
+            ("id", ValueType::String),
+            ("email", ValueType::String),
+            ("name", ValueType::String),
+            ("avatarUrl", ValueType::String),
+            ("preferences", ValueType::Json),
+            ("createdAt", ValueType::Timestamp),
+            ("updatedAt", ValueType::Timestamp),
+            ("lastSeenAt", ValueType::Timestamp),
+            ("isActive", ValueType::Bool),
+            ("isBot", ValueType::Bool),
+            ("role", ValueType::String),
+            ("timezone", ValueType::String),
+            ("workspaceId", ValueType::String),
+        ];
+        let extras: Vec<String> = (0..7).map(|n| format!("field{n}")).collect();
+        for extra in &extras {
+            user_columns.push((extra.as_str(), ValueType::String));
+        }
+        let users = table("users", &user_columns);
+        let channels = table(
+            "channels",
+            &[
+                ("id", ValueType::String),
+                ("workspaceId", ValueType::String),
+                ("name", ValueType::String),
+                ("description", ValueType::String),
+                ("visibility", ValueType::String),
+                ("type", ValueType::String),
+                ("createdAt", ValueType::Timestamp),
+                ("updatedAt", ValueType::Timestamp),
+                ("createdBy", ValueType::String),
+                ("isArchived", ValueType::Bool),
+                ("lastMessageAt", ValueType::Timestamp),
+                ("metadata", ValueType::Json),
+            ],
+        );
+        let messages = table(
+            "messages",
+            &[
+                ("id", ValueType::String),
+                ("channelId", ValueType::String),
+                ("conversationId", ValueType::String),
+                ("senderId", ValueType::String),
+                ("content", ValueType::String),
+                ("type", ValueType::String),
+                ("createdAt", ValueType::Timestamp),
+                ("updatedAt", ValueType::Timestamp),
+                ("editedAt", ValueType::Timestamp),
+                ("isDeleted", ValueType::Bool),
+                ("reactions", ValueType::Json),
+                ("attachments", ValueType::Json),
+                ("threadCount", ValueType::Int),
+            ],
+        );
+        let items = table(
+            "items",
+            &[
+                ("id", ValueType::String),
+                ("userId", ValueType::String),
+                ("kind", ValueType::String),
+                ("value", ValueType::String),
+                ("updatedAt", ValueType::Timestamp),
+            ],
+        );
+        fn image(
+            layout: &Arc<RowSchema>,
+            cell: impl Fn(&str) -> Value,
+        ) -> (DataFrameKey, DataFrameRow) {
+            let values: Vec<Value> = layout.names().iter().map(|c| cell(c.as_str())).collect();
+            let key =
+                DataFrameKey::from(HashMap::from([(ColumnName::from("id"), values[0].clone())]));
+            (
+                key,
+                DataFrameRow::from(RowData::with_schema(layout.clone(), values)),
+            )
+        }
+        let t0 = 1_759_000_000_000i64;
+        // The engine's images, built afresh for every run: a new pod's
+        // rows, nothing sent yet.
+        let build = || {
+            let user_rows: Shown = (0..USERS)
+                .map(|n| {
+                    image(users.row_schema(), |c| match c {
+                        "id" => Value::from(format!("u{n:08}x7f3kq2")),
+                        "email" => Value::from(format!("person.{n}@example.com")),
+                        "name" => Value::from(format!("Person Number {n}")),
+                        "avatarUrl" => {
+                            Value::from(format!("https://cdn.example.com/a/{n}.png?s=64"))
+                        }
+                        "preferences" => Value::from(r#"{"theme":"dark","notify":{"dm":true}}"#),
+                        "createdAt" | "updatedAt" | "lastSeenAt" => Value::Int(t0 + n as i64),
+                        "isActive" => Value::Bool(true),
+                        "isBot" => Value::Bool(false),
+                        "role" => Value::from("member"),
+                        "timezone" => Value::from("Asia/Kolkata"),
+                        "workspaceId" => Value::from("6642623f-cca7-43ad-9a6b-5e49c33226b4"),
+                        _ => Value::from(format!("value {n}")),
+                    })
+                })
+                .collect();
+            let channel_rows: Shown = (0..CHANNELS)
+                .map(|n| {
+                    image(channels.row_schema(), |c| match c {
+                        "id" => Value::from(format!("c{n:06}")),
+                        "workspaceId" => Value::from("6642623f-cca7-43ad-9a6b-5e49c33226b4"),
+                        "name" => Value::from(format!("team-channel-{n}")),
+                        "description" => Value::from(format!("Discussion for \"area {n}\"")),
+                        "visibility" => Value::from(if n % 4 == 0 { "private" } else { "public" }),
+                        "type" => Value::from("channel"),
+                        "createdAt" | "updatedAt" | "lastMessageAt" => Value::Int(t0 + n as i64),
+                        "createdBy" => Value::from(format!("u{:08}x7f3kq2", n % USERS)),
+                        "isArchived" => Value::Bool(false),
+                        _ => Value::from(r#"{"pinned":[],"topic":"general"}"#),
+                    })
+                })
+                .collect();
+            let message_rows: Shown = (0..CHANNELS * PER_PAGE)
+                .map(|n| {
+                    image(messages.row_schema(), |c| match c {
+                        "id" => Value::from(format!("m{n:08}")),
+                        "channelId" => Value::from(format!("c{:06}", n / PER_PAGE)),
+                        "conversationId" => Value::from(format!("v{:07}", n / 5)),
+                        "senderId" => Value::from(format!("u{:08}x7f3kq2", n % USERS)),
+                        "content" => Value::from(format!(
+                            "Message {n}: the deploy finished, see \"notes\" for the details\nthanks"
+                        )),
+                        "type" => Value::from("text"),
+                        "createdAt" | "updatedAt" => Value::Int(t0 + n as i64),
+                        "editedAt" => Value::Null,
+                        "isDeleted" => Value::Bool(false),
+                        "reactions" => Value::from(r#"{"+1":["u1","u2"]}"#),
+                        "attachments" => Value::from("[]"),
+                        _ => Value::Int((n % 7) as i64),
+                    })
+                })
+                .collect();
+            (user_rows, channel_rows, message_rows)
+        };
+
+        let vars: HashMap<&str, &str> = HashMap::from([
+            ("XYNE_SYNC_PG_DSN", "postgresql://none/none"),
+            ("XYNE_SYNC_QUERY_URL", "http://none/query"),
+            ("XYNE_SYNC_MUTATE_URL", "http://none/push"),
+        ]);
+        let config = Config::from_lookup(|name| vars.get(name).map(|v| (*v).to_owned()))
+            .expect("a configuration");
+        let catalog = Catalog::new([
+            users.clone(),
+            channels.clone(),
+            messages.clone(),
+            items.clone(),
+        ]);
+
+        // One group's startup set: (hash, table, the rows it shows).
+        let startup = |g: usize,
+                       user_rows: &[(DataFrameKey, DataFrameRow)],
+                       channel_rows: &[(DataFrameKey, DataFrameRow)],
+                       message_rows: &[(DataFrameKey, DataFrameRow)]|
+         -> Vec<(String, &'static str, Shown)> {
+            let mut set = vec![("getUsersV2".to_owned(), "users", user_rows.to_vec())];
+            let mine: Vec<usize> = (0..250).map(|i| (g * 37 + i * 5) % CHANNELS).collect();
+            set.push((
+                "userChannels".to_owned(),
+                "channels",
+                mine.iter().map(|c| channel_rows[*c].clone()).collect(),
+            ));
+            for c in &mine[..10] {
+                set.push((
+                    format!("channelConversations-{c}"),
+                    "messages",
+                    message_rows[c * PER_PAGE..(c + 1) * PER_PAGE].to_vec(),
+                ));
+            }
+            for q in 0..15 {
+                let rows = (0..3)
+                    .map(|r| {
+                        image(items.row_schema(), |c| match c {
+                            "id" => Value::from(format!("i-{g}-{q}-{r}")),
+                            "userId" => Value::from(format!("u{g:08}x7f3kq2")),
+                            "kind" => Value::from(format!("kind{q}")),
+                            "value" => Value::from(format!("setting {q} of user {g}")),
+                            _ => Value::Int(t0),
+                        })
+                    })
+                    .collect();
+                set.push((format!("userItems{q}"), "items", rows));
+            }
+            set
+        };
+
+        let run = |per_flush: usize| {
+            let (user_rows, channel_rows, message_rows) = build();
+            let stats = Stats::shared();
+            let (outbox, mut commands) = mpsc::unbounded_channel();
+            let (requests, _requests_rx) = mpsc::channel(16);
+            let mut core = Groups {
+                clients_table: TableName::from(config.clients_table().as_str()),
+                mutations_table: TableName::from(config.mutations_table().as_str()),
+                config: Arc::new(config.clone()),
+                catalog: Arc::new(CatalogHandle::new(catalog.clone())),
+                shard: 0,
+                stats: stats.clone(),
+                oldest: None,
+                commands: outbox,
+                requests,
+                ready: true,
+                readiness: watch::channel(true).0,
+                backlog: Vec::new(),
+                groups: HashMap::new(),
+                by_sub: HashMap::new(),
+                awaiting: HashMap::new(),
+                pending: HashMap::new(),
+                lmid_changes: HashMap::new(),
+                result_changes: HashMap::new(),
+                dirty: HashSet::new(),
+                next_poke: 1,
+                next_generation: 0,
+            };
+            let mut thread_time = Duration::ZERO;
+            let mut flush_time = Duration::ZERO;
+            let (mut bytes, mut checksum, mut pokes) = (0usize, 0u64, 0usize);
+            let mut drain = |tab: &mut mpsc::UnboundedReceiver<Outbound>| {
+                while let Ok(outbound) = tab.try_recv() {
+                    if let Outbound::Poke { frames, .. } = outbound {
+                        pokes += 1;
+                        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+                        for frame in frames.iter() {
+                            bytes += frame.len();
+                            for byte in frame.iter() {
+                                hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+                            }
+                        }
+                        checksum = checksum.wrapping_add(hash);
+                    }
+                }
+            };
+            let batch = per_flush.max(1);
+            for first in (0..GROUPS).step_by(batch) {
+                let members: Vec<usize> = (first..(first + batch).min(GROUPS)).collect();
+                let mut tabs = Vec::new();
+                let mut landing: Vec<(u64, SubId, &'static str, Shown)> = Vec::new();
+                for g in &members {
+                    let group = format!("group-{g}");
+                    let (sink, frames) = mpsc::unbounded_channel();
+                    let started = Instant::now();
+                    let reply = core.connect(
+                        &group,
+                        format!("ws-{g}"),
+                        Socket {
+                            client: format!("client-{g}"),
+                            sink,
+                        },
+                        None,
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                    thread_time += started.elapsed();
+                    assert!(matches!(reply, ConnectReply::Accepted));
+                    tabs.push(frames);
+                    for (q, (hash, table, rows)) in
+                        startup(*g, &user_rows, &channel_rows, &message_rows)
+                            .into_iter()
+                            .enumerate()
+                    {
+                        let query = MultiTableReadQuery::single(SingleTableReadQuery::new(
+                            table,
+                            Where::AND(Vec::new()),
+                            OrderBy::new("id", Order::ASC),
+                            u32::MAX,
+                        ));
+                        let started = Instant::now();
+                        core.desired(
+                            &group,
+                            &format!("client-{g}"),
+                            vec![DesiredOp::Put {
+                                hash: hash.clone(),
+                                name: hash,
+                                ttl: None,
+                                planned: Some(Ok(Box::new(Translated {
+                                    query,
+                                    hidden: HashSet::new(),
+                                }))),
+                            }],
+                        );
+                        thread_time += started.elapsed();
+                        let token = loop {
+                            match commands.try_recv().expect("a registration is sent") {
+                                Command::Register { token, .. } => break token,
+                                _ => continue,
+                            }
+                        };
+                        let sub = SubId((g * 100 + q) as u64);
+                        landing.push((token, sub, table, rows));
+                        if per_flush == 0 {
+                            let (token, sub, table, rows) = landing.pop().unwrap();
+                            let started = Instant::now();
+                            core.event(Event::Registered {
+                                token,
+                                sub,
+                                updates: deltas(table, sub, rows),
+                                reads: 1,
+                            });
+                            core.event(Event::Hydrated(vec![sub]));
+                            let flushing = Instant::now();
+                            core.flush();
+                            flush_time += flushing.elapsed();
+                            thread_time += started.elapsed();
+                            drain(tabs.last_mut().unwrap());
+                        }
+                    }
+                }
+                if per_flush > 0 {
+                    let started = Instant::now();
+                    let mut hydrated = Vec::new();
+                    for (token, sub, table, rows) in landing {
+                        core.event(Event::Registered {
+                            token,
+                            sub,
+                            updates: deltas(table, sub, rows),
+                            reads: 1,
+                        });
+                        hydrated.push(sub);
+                    }
+                    core.event(Event::Hydrated(hydrated));
+                    let flushing = Instant::now();
+                    core.flush();
+                    flush_time += flushing.elapsed();
+                    thread_time += started.elapsed();
+                    for tab in &mut tabs {
+                        drain(tab);
+                    }
+                }
+            }
+            (
+                thread_time,
+                flush_time,
+                stats.rows_serialized.load(Ordering::Relaxed),
+                stats.rows_shared.load(Ordering::Relaxed),
+                pokes,
+                bytes,
+                checksum,
+            )
+        };
+        fn deltas(table: &str, sub: SubId, rows: Shown) -> Vec<Delta> {
+            rows.into_iter()
+                .map(|(key, image)| Delta {
+                    table: TableName::from(table),
+                    op: DataFrameOperation::Add(key, image),
+                    audiences: vec![crate::ivm::Audience {
+                        part: QueryPart::main(),
+                        subs: crate::ivm::Subs::One(sub),
+                    }],
+                })
+                .collect()
+        }
+
+        on_local(|| {
+            for (label, per_flush) in [
+                ("staggered (a flush per query, one group at a time)", 0usize),
+                ("storm (25 groups' registrations in each flush)", 25),
+            ] {
+                let mut runs = Vec::new();
+                for _ in 0..3 {
+                    runs.push(run(per_flush));
+                }
+                runs.sort_by_key(|run| run.0);
+                let (thread, flush, serialized, shared, pokes, bytes, checksum) = runs[1];
+                println!(
+                    "STORM {label}: thread {:7.1} ms, of which flush {:7.1} ms | rows serialized {serialized:>9}, reused {shared:>9} | {pokes} pokes, {:.1} MB, checksum {checksum:016x}",
+                    thread.as_secs_f64() * 1e3,
+                    flush.as_secs_f64() * 1e3,
+                    bytes as f64 / 1e6
+                );
+            }
+        });
+    }
+
+    /// One hour of prod's traffic through the real group threads, at
+    /// the rates prod showed over its 36 h on xyne-sync (2026-10-03 16:28
+    /// to 10-05 04:48 UTC): 4 group threads; 700 client groups already
+    /// there, their rows already sent (a warm-up, not measured); then, in
+    /// the hour, 162 new groups each hydrating a startup set (5 876 groups
+    /// opened in the run), 5 500 pages hydrated by navigation (5 680
+    /// hydrations an hour), messages written into channels whose pages
+    /// groups hold, and a few user rows updated, sent to every group.
+    /// Connects that resume from a cookie are left out: they replay
+    /// frames already built and serialize nothing. Each event lands and
+    /// flushes on its own, as prod's 19 900 flushes an hour did. Prints
+    /// the threads' flush time, the rows serialized and reused, the time
+    /// a new group's startup set and a page spend in flushes, and a
+    /// checksum of every frame. Run with
+    /// `cargo test --release --lib prod_hour_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn prod_hour_cost() {
+        use crate::model::{
+            DbColumn, DbTable, Order, OrderBy, RowSchema, SingleTableReadQuery, ValueType, Where,
+        };
+        const SHARDS: usize = 4;
+        const STANDING: usize = 700;
+        const WARM_PAGES: usize = 2_000;
+        const NEW: usize = 162;
+        const PAGES: usize = 5_500;
+        const INSERTS: usize = 600;
+        const USER_UPDATES: usize = 5;
+        const USERS: usize = 5_526;
+        const CHANNELS: usize = 1_200;
+        const PER_PAGE: usize = 50;
+        /// Rows a query shows: each row's key and the engine's image.
+        type Shown = Vec<(DataFrameKey, DataFrameRow)>;
+
+        /// What one group thread is handed, in order.
+        enum Step {
+            /// A new group connects and hydrates its startup set, one
+            /// query after another: (sub, hash, table, rows).
+            Open(usize, Vec<(SubId, String, &'static str, Shown)>),
+            /// A group hydrates one more page.
+            Page(usize, SubId, String, Shown),
+            /// A write lands for some of this thread's groups.
+            Land(Vec<usize>, Vec<Delta>),
+        }
+
+        fn table(name: &str, columns: &[(&str, ValueType)]) -> DbTable {
+            DbTable::new(
+                name,
+                ["id"],
+                columns
+                    .iter()
+                    .map(|(column, kind)| DbColumn::new(*column, kind.clone()))
+                    .collect(),
+            )
+        }
+        let mut user_columns: Vec<(&str, ValueType)> = vec![
+            ("id", ValueType::String),
+            ("email", ValueType::String),
+            ("name", ValueType::String),
+            ("avatarUrl", ValueType::String),
+            ("preferences", ValueType::Json),
+            ("createdAt", ValueType::Timestamp),
+            ("updatedAt", ValueType::Timestamp),
+            ("lastSeenAt", ValueType::Timestamp),
+            ("isActive", ValueType::Bool),
+            ("isBot", ValueType::Bool),
+            ("role", ValueType::String),
+            ("timezone", ValueType::String),
+            ("workspaceId", ValueType::String),
+        ];
+        let extras: Vec<String> = (0..7).map(|n| format!("field{n}")).collect();
+        for extra in &extras {
+            user_columns.push((extra.as_str(), ValueType::String));
+        }
+        let users = table("users", &user_columns);
+        let channels = table(
+            "channels",
+            &[
+                ("id", ValueType::String),
+                ("workspaceId", ValueType::String),
+                ("name", ValueType::String),
+                ("description", ValueType::String),
+                ("visibility", ValueType::String),
+                ("type", ValueType::String),
+                ("createdAt", ValueType::Timestamp),
+                ("updatedAt", ValueType::Timestamp),
+                ("createdBy", ValueType::String),
+                ("isArchived", ValueType::Bool),
+                ("lastMessageAt", ValueType::Timestamp),
+                ("metadata", ValueType::Json),
+            ],
+        );
+        let messages = table(
+            "messages",
+            &[
+                ("id", ValueType::String),
+                ("channelId", ValueType::String),
+                ("conversationId", ValueType::String),
+                ("senderId", ValueType::String),
+                ("content", ValueType::String),
+                ("type", ValueType::String),
+                ("createdAt", ValueType::Timestamp),
+                ("updatedAt", ValueType::Timestamp),
+                ("editedAt", ValueType::Timestamp),
+                ("isDeleted", ValueType::Bool),
+                ("reactions", ValueType::Json),
+                ("attachments", ValueType::Json),
+                ("threadCount", ValueType::Int),
+            ],
+        );
+        let items = table(
+            "items",
+            &[
+                ("id", ValueType::String),
+                ("userId", ValueType::String),
+                ("kind", ValueType::String),
+                ("value", ValueType::String),
+                ("updatedAt", ValueType::Timestamp),
+            ],
+        );
+        fn image(
+            layout: &Arc<RowSchema>,
+            cell: impl Fn(&str) -> Value,
+        ) -> (DataFrameKey, DataFrameRow) {
+            let values: Vec<Value> = layout.names().iter().map(|c| cell(c.as_str())).collect();
+            let key =
+                DataFrameKey::from(HashMap::from([(ColumnName::from("id"), values[0].clone())]));
+            (
+                key,
+                DataFrameRow::from(RowData::with_schema(layout.clone(), values)),
+            )
+        }
+        let t0 = 1_759_000_000_000i64;
+        let user = |n: usize, seen: i64| {
+            image(users.row_schema(), |c| match c {
+                "id" => Value::from(format!("u{n:08}x7f3kq2")),
+                "email" => Value::from(format!("person.{n}@example.com")),
+                "name" => Value::from(format!("Person Number {n}")),
+                "avatarUrl" => Value::from(format!("https://cdn.example.com/a/{n}.png?s=64")),
+                "preferences" => Value::from(r#"{"theme":"dark","notify":{"dm":true}}"#),
+                "createdAt" | "updatedAt" => Value::Int(t0 + n as i64),
+                "lastSeenAt" => Value::Int(t0 + seen),
+                "isActive" => Value::Bool(true),
+                "isBot" => Value::Bool(false),
+                "role" => Value::from("member"),
+                "timezone" => Value::from("Asia/Kolkata"),
+                "workspaceId" => Value::from("6642623f-cca7-43ad-9a6b-5e49c33226b4"),
+                _ => Value::from(format!("value {n}")),
+            })
+        };
+        let message = |n: usize, channel: usize| {
+            image(messages.row_schema(), |c| match c {
+                "id" => Value::from(format!("m{n:08}")),
+                "channelId" => Value::from(format!("c{channel:06}")),
+                "conversationId" => Value::from(format!("v{:07}", n / 5)),
+                "senderId" => Value::from(format!("u{:08}x7f3kq2", n % USERS)),
+                "content" => Value::from(format!(
+                    "Message {n}: the deploy finished, see \"notes\" for the details\nthanks"
+                )),
+                "type" => Value::from("text"),
+                "createdAt" | "updatedAt" => Value::Int(t0 + n as i64),
+                "editedAt" => Value::Null,
+                "isDeleted" => Value::Bool(false),
+                "reactions" => Value::from(r#"{"+1":["u1","u2"]}"#),
+                "attachments" => Value::from("[]"),
+                _ => Value::Int((n % 7) as i64),
+            })
+        };
+        fn deltas(table: &str, sub: SubId, rows: &Shown) -> Vec<Delta> {
+            rows.iter()
+                .map(|(key, image)| Delta {
+                    table: TableName::from(table),
+                    op: DataFrameOperation::Add(key.clone(), image.clone()),
+                    audiences: vec![crate::ivm::Audience {
+                        part: QueryPart::main(),
+                        subs: crate::ivm::Subs::One(sub),
+                    }],
+                })
+                .collect()
+        }
+
+        // The engine side: every image, and every step of the hour, made
+        // up front with a fixed seed, so two builds replay the same hour.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Channel popularity: Zipf over the channels (a few busy ones).
+        let weight: Vec<f64> = (0..CHANNELS)
+            .map(|rank| 1.0 / ((rank + 1) as f64).powf(0.9))
+            .collect();
+        let mut user_rows: Shown = (0..USERS).map(|n| user(n, 0)).collect();
+        let channel_rows: Shown = (0..CHANNELS)
+            .map(|n| {
+                image(channels.row_schema(), |c| match c {
+                    "id" => Value::from(format!("c{n:06}")),
+                    "workspaceId" => Value::from("6642623f-cca7-43ad-9a6b-5e49c33226b4"),
+                    "name" => Value::from(format!("team-channel-{n}")),
+                    "description" => Value::from(format!("Discussion for \"area {n}\"")),
+                    "visibility" => Value::from(if n % 4 == 0 { "private" } else { "public" }),
+                    "type" => Value::from("channel"),
+                    "createdAt" | "updatedAt" | "lastMessageAt" => Value::Int(t0 + n as i64),
+                    "createdBy" => Value::from(format!("u{:08}x7f3kq2", n % USERS)),
+                    "isArchived" => Value::Bool(false),
+                    _ => Value::from(r#"{"pinned":[],"topic":"general"}"#),
+                })
+            })
+            .collect();
+        let mut written = 0usize;
+        let mut channel_messages: Vec<Shown> = (0..CHANNELS)
+            .map(|c| {
+                (0..PER_PAGE)
+                    .map(|_| {
+                        written += 1;
+                        message(written, c)
+                    })
+                    .collect()
+            })
+            .collect();
+        let mine =
+            |g: usize| -> Vec<usize> { (0..250).map(|i| (g * 37 + i * 5) % CHANNELS).collect() };
+        let latest = |messages: &Shown| -> Shown { messages[messages.len() - PER_PAGE..].to_vec() };
+
+        let mut warm: Vec<Vec<Step>> = (0..SHARDS).map(|_| Vec::new()).collect();
+        let mut hour: Vec<Vec<Step>> = (0..SHARDS).map(|_| Vec::new()).collect();
+        let mut next_sub = 1u64;
+        let mut opened: Vec<usize> = Vec::new();
+        let mut users_sub: HashMap<usize, SubId> = HashMap::new();
+        let mut page_subs: Vec<Vec<(usize, SubId)>> = vec![Vec::new(); CHANNELS];
+        let mut sub = || {
+            next_sub += 1;
+            SubId(next_sub)
+        };
+        // Pick one of the group's channels, the busy ones more often.
+        let pick = |g: usize, roll: u64| -> usize {
+            let channels = mine(g);
+            let total: f64 = channels.iter().map(|c| weight[*c]).sum();
+            let mut at = (roll % 1_000_000) as f64 / 1_000_000.0 * total;
+            for c in &channels {
+                at -= weight[*c];
+                if at <= 0.0 {
+                    return *c;
+                }
+            }
+            channels[channels.len() - 1]
+        };
+        let open = |g: usize,
+                    steps: &mut [Vec<Step>],
+                    user_rows: &Shown,
+                    channel_messages: &[Shown],
+                    opened: &mut Vec<usize>,
+                    users_sub: &mut HashMap<usize, SubId>,
+                    page_subs: &mut [Vec<(usize, SubId)>],
+                    sub: &mut dyn FnMut() -> SubId| {
+            let mut set = Vec::new();
+            let s = sub();
+            users_sub.insert(g, s);
+            set.push((s, "getUsersV2".to_owned(), "users", user_rows.clone()));
+            let channels = mine(g);
+            set.push((
+                sub(),
+                "userChannels".to_owned(),
+                "channels",
+                channels.iter().map(|c| channel_rows[*c].clone()).collect(),
+            ));
+            for c in &channels[..10] {
+                let s = sub();
+                page_subs[*c].push((g, s));
+                set.push((
+                    s,
+                    format!("channelConversations-{c}"),
+                    "messages",
+                    latest(&channel_messages[*c]),
+                ));
+            }
+            for q in 0..15 {
+                let rows = (0..3)
+                    .map(|r| {
+                        image(items.row_schema(), |c| match c {
+                            "id" => Value::from(format!("i-{g}-{q}-{r}")),
+                            "userId" => Value::from(format!("u{g:08}x7f3kq2")),
+                            "kind" => Value::from(format!("kind{q}")),
+                            "value" => Value::from(format!("setting {q} of user {g}")),
+                            _ => Value::Int(t0),
+                        })
+                    })
+                    .collect();
+                set.push((sub(), format!("userItems{q}"), "items", rows));
+            }
+            opened.push(g);
+            steps[g % SHARDS].push(Step::Open(g, set));
+        };
+        for g in 0..STANDING {
+            open(
+                g,
+                &mut warm,
+                &user_rows,
+                &channel_messages,
+                &mut opened,
+                &mut users_sub,
+                &mut page_subs,
+                &mut sub,
+            );
+        }
+        for _ in 0..WARM_PAGES {
+            let g = opened[(next() % opened.len() as u64) as usize];
+            // A page the group does not hold yet (one it holds registers
+            // nothing new).
+            let c = (0..20)
+                .map(|_| pick(g, next()))
+                .find(|c| !page_subs[*c].iter().any(|(holder, _)| *holder == g))
+                .or_else(|| {
+                    mine(g)
+                        .into_iter()
+                        .find(|c| !page_subs[*c].iter().any(|(holder, _)| *holder == g))
+                })
+                .expect("a channel whose page the group does not hold");
+            let s = sub();
+            page_subs[c].push((g, s));
+            warm[g % SHARDS].push(Step::Page(
+                g,
+                s,
+                format!("channelConversations-{c}"),
+                latest(&channel_messages[c]),
+            ));
+        }
+        // The hour, its steps interleaved in proportion.
+        let total = NEW + PAGES + INSERTS + USER_UPDATES;
+        let mut left = [NEW, PAGES, INSERTS, USER_UPDATES];
+        for _ in 0..total {
+            let mut roll = next() % left.iter().sum::<usize>() as u64;
+            let mut kind = 0;
+            while roll >= left[kind] as u64 {
+                roll -= left[kind] as u64;
+                kind += 1;
+            }
+            left[kind] -= 1;
+            match kind {
+                0 => {
+                    let g = STANDING + (NEW - left[0] - 1);
+                    open(
+                        g,
+                        &mut hour,
+                        &user_rows,
+                        &channel_messages,
+                        &mut opened,
+                        &mut users_sub,
+                        &mut page_subs,
+                        &mut sub,
+                    );
+                }
+                1 => {
+                    let g = opened[(next() % opened.len() as u64) as usize];
+                    let c = (0..20)
+                        .map(|_| pick(g, next()))
+                        .find(|c| !page_subs[*c].iter().any(|(holder, _)| *holder == g))
+                        .or_else(|| {
+                            mine(g)
+                                .into_iter()
+                                .find(|c| !page_subs[*c].iter().any(|(holder, _)| *holder == g))
+                        })
+                        .expect("a channel whose page the group does not hold");
+                    let s = sub();
+                    page_subs[c].push((g, s));
+                    hour[g % SHARDS].push(Step::Page(
+                        g,
+                        s,
+                        format!("channelConversations-{c}"),
+                        latest(&channel_messages[c]),
+                    ));
+                }
+                2 => {
+                    // A message in a channel chosen by popularity.
+                    let total: f64 = weight.iter().sum();
+                    let mut at = (next() % 1_000_000) as f64 / 1_000_000.0 * total;
+                    let mut c = CHANNELS - 1;
+                    for (index, w) in weight.iter().enumerate() {
+                        at -= w;
+                        if at <= 0.0 {
+                            c = index;
+                            break;
+                        }
+                    }
+                    written += 1;
+                    let (key, image) = message(written, c);
+                    channel_messages[c].push((key.clone(), image.clone()));
+                    let mut per_shard: Vec<(Vec<usize>, Vec<Delta>)> =
+                        (0..SHARDS).map(|_| (Vec::new(), Vec::new())).collect();
+                    for (g, s) in &page_subs[c] {
+                        let (groups, deltas) = &mut per_shard[g % SHARDS];
+                        groups.push(*g);
+                        deltas.push(Delta {
+                            table: TableName::from("messages"),
+                            op: DataFrameOperation::Add(key.clone(), image.clone()),
+                            audiences: vec![crate::ivm::Audience {
+                                part: QueryPart::main(),
+                                subs: crate::ivm::Subs::One(*s),
+                            }],
+                        });
+                    }
+                    for (shard, (groups, deltas)) in per_shard.into_iter().enumerate() {
+                        if !deltas.is_empty() {
+                            hour[shard].push(Step::Land(groups, deltas));
+                        }
+                    }
+                }
+                _ => {
+                    // A user's row changes; every group holds the users list.
+                    let n = (next() % USERS as u64) as usize;
+                    let (key, old) = user_rows[n].clone();
+                    let (_, new) = user(n, 1 + left[3] as i64);
+                    user_rows[n] = (key.clone(), new.clone());
+                    let mut per_shard: Vec<(Vec<usize>, Vec<Delta>)> =
+                        (0..SHARDS).map(|_| (Vec::new(), Vec::new())).collect();
+                    for g in &opened {
+                        let s = users_sub[g];
+                        let (groups, deltas) = &mut per_shard[g % SHARDS];
+                        groups.push(*g);
+                        for op in [
+                            DataFrameOperation::Delete(key.clone(), old.clone()),
+                            DataFrameOperation::Add(key.clone(), new.clone()),
+                        ] {
+                            deltas.push(Delta {
+                                table: TableName::from("users"),
+                                op,
+                                audiences: vec![crate::ivm::Audience {
+                                    part: QueryPart::main(),
+                                    subs: crate::ivm::Subs::One(s),
+                                }],
+                            });
+                        }
+                    }
+                    for (shard, (groups, deltas)) in per_shard.into_iter().enumerate() {
+                        if !deltas.is_empty() {
+                            hour[shard].push(Step::Land(groups, deltas));
+                        }
+                    }
+                }
+            }
+        }
+
+        let vars: HashMap<&str, &str> = HashMap::from([
+            ("XYNE_SYNC_PG_DSN", "postgresql://none/none"),
+            ("XYNE_SYNC_QUERY_URL", "http://none/query"),
+            ("XYNE_SYNC_MUTATE_URL", "http://none/push"),
+        ]);
+        let config = Config::from_lookup(|name| vars.get(name).map(|v| (*v).to_owned()))
+            .expect("a configuration");
+        let catalog = Catalog::new([
+            users.clone(),
+            channels.clone(),
+            messages.clone(),
+            items.clone(),
+        ]);
+
+        /// What one thread measured over the hour.
+        #[derive(Default)]
+        struct Measured {
+            flush: Duration,
+            serialized: u64,
+            reused: u64,
+            pokes: usize,
+            bytes: usize,
+            checksum: u64,
+            opens: Vec<f64>,
+            pages: Vec<f64>,
+        }
+        let replay = |shard: usize, warm: &[Step], hour: &[Step]| -> Measured {
+            on_local(|| {
+                let stats = Stats::shared();
+                let (outbox, mut commands) = mpsc::unbounded_channel();
+                let (requests, _requests_rx) = mpsc::channel(16);
+                let mut core = Groups {
+                    clients_table: TableName::from(config.clients_table().as_str()),
+                    mutations_table: TableName::from(config.mutations_table().as_str()),
+                    config: Arc::new(config.clone()),
+                    catalog: Arc::new(CatalogHandle::new(catalog.clone())),
+                    shard,
+                    stats: stats.clone(),
+                    oldest: None,
+                    commands: outbox,
+                    requests,
+                    ready: true,
+                    readiness: watch::channel(true).0,
+                    backlog: Vec::new(),
+                    groups: HashMap::new(),
+                    by_sub: HashMap::new(),
+                    awaiting: HashMap::new(),
+                    pending: HashMap::new(),
+                    lmid_changes: HashMap::new(),
+                    result_changes: HashMap::new(),
+                    dirty: HashSet::new(),
+                    next_poke: 1,
+                    next_generation: 0,
+                };
+                let mut tabs: HashMap<usize, mpsc::UnboundedReceiver<Outbound>> = HashMap::new();
+                let mut out = Measured::default();
+                let drain = |tab: &mut mpsc::UnboundedReceiver<Outbound>,
+                             out: &mut Measured,
+                             count: bool| {
+                    while let Ok(outbound) = tab.try_recv() {
+                        if let (Outbound::Poke { frames, .. }, true) = (outbound, count) {
+                            out.pokes += 1;
+                            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+                            for frame in frames.iter() {
+                                out.bytes += frame.len();
+                                for byte in frame.iter() {
+                                    hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3);
+                                }
+                            }
+                            out.checksum = out.checksum.wrapping_add(hash);
+                        }
+                    }
+                };
+                let mut register = |core: &mut Groups,
+                                    g: usize,
+                                    sub: SubId,
+                                    hash: &str,
+                                    table: &'static str,
+                                    rows: &Shown|
+                 -> Duration {
+                    let query = MultiTableReadQuery::single(SingleTableReadQuery::new(
+                        table,
+                        Where::AND(Vec::new()),
+                        OrderBy::new("id", Order::ASC),
+                        u32::MAX,
+                    ));
+                    core.desired(
+                        &format!("group-{g}"),
+                        &format!("client-{g}"),
+                        vec![DesiredOp::Put {
+                            hash: hash.to_owned(),
+                            name: hash.to_owned(),
+                            ttl: None,
+                            planned: Some(Ok(Box::new(Translated {
+                                query,
+                                hidden: HashSet::new(),
+                            }))),
+                        }],
+                    );
+                    let token = loop {
+                        match commands.try_recv().expect("a registration is sent") {
+                            Command::Register { token, .. } => break token,
+                            _ => continue,
+                        }
+                    };
+                    core.event(Event::Registered {
+                        token,
+                        sub,
+                        updates: deltas(table, sub, rows),
+                        reads: 1,
+                    });
+                    core.event(Event::Hydrated(vec![sub]));
+                    let started = Instant::now();
+                    core.flush();
+                    started.elapsed()
+                };
+                for (measured, steps) in [(false, warm), (true, hour)] {
+                    if measured {
+                        let serialized = stats.rows_serialized.load(Ordering::Relaxed);
+                        let reused = stats.rows_shared.load(Ordering::Relaxed);
+                        out.serialized = 0u64.wrapping_sub(serialized);
+                        out.reused = 0u64.wrapping_sub(reused);
+                    }
+                    for step in steps {
+                        match step {
+                            Step::Open(g, set) => {
+                                let (sink, frames) = mpsc::unbounded_channel();
+                                let reply = core.connect(
+                                    &format!("group-{g}"),
+                                    format!("ws-{g}"),
+                                    Socket {
+                                        client: format!("client-{g}"),
+                                        sink,
+                                    },
+                                    None,
+                                    Vec::new(),
+                                    Vec::new(),
+                                );
+                                assert!(matches!(reply, ConnectReply::Accepted));
+                                tabs.insert(*g, frames);
+                                let mut spent = Duration::ZERO;
+                                for (sub, hash, table, rows) in set {
+                                    spent += register(&mut core, *g, *sub, hash, table, rows);
+                                    drain(tabs.get_mut(g).unwrap(), &mut out, measured);
+                                }
+                                if measured {
+                                    out.flush += spent;
+                                    out.opens.push(spent.as_secs_f64() * 1e3);
+                                }
+                            }
+                            Step::Page(g, sub, hash, rows) => {
+                                let spent = register(&mut core, *g, *sub, hash, "messages", rows);
+                                drain(tabs.get_mut(g).unwrap(), &mut out, measured);
+                                if measured {
+                                    out.flush += spent;
+                                    out.pages.push(spent.as_secs_f64() * 1e3);
+                                }
+                            }
+                            Step::Land(groups, updates) => {
+                                core.event(Event::Landed {
+                                    updates: updates.clone(),
+                                });
+                                let started = Instant::now();
+                                core.flush();
+                                let spent = started.elapsed();
+                                for g in groups {
+                                    drain(tabs.get_mut(g).unwrap(), &mut out, measured);
+                                }
+                                if measured {
+                                    out.flush += spent;
+                                }
+                            }
+                        }
+                    }
+                }
+                out.serialized = out
+                    .serialized
+                    .wrapping_add(stats.rows_serialized.load(Ordering::Relaxed));
+                out.reused = out
+                    .reused
+                    .wrapping_add(stats.rows_shared.load(Ordering::Relaxed));
+                out
+            })
+        };
+        let measured: Vec<Measured> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..SHARDS)
+                .map(|shard| {
+                    let (warm, hour) = (&warm[shard], &hour[shard]);
+                    let replay = &replay;
+                    scope.spawn(move || replay(shard, warm, hour))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
+        });
+        let quantile = |values: &mut Vec<f64>, q: f64| -> f64 {
+            values.sort_by(f64::total_cmp);
+            values[((values.len() as f64 - 1.0) * q).round() as usize]
+        };
+        let mut opens: Vec<f64> = measured.iter().flat_map(|m| m.opens.clone()).collect();
+        let mut pages: Vec<f64> = measured.iter().flat_map(|m| m.pages.clone()).collect();
+        let flush: f64 = measured.iter().map(|m| m.flush.as_secs_f64() * 1e3).sum();
+        let busiest = measured
+            .iter()
+            .map(|m| m.flush.as_secs_f64() * 1e3)
+            .fold(0.0, f64::max);
+        let checksum = measured
+            .iter()
+            .fold(0u64, |sum, m| sum.wrapping_add(m.checksum));
+        println!(
+            "HOUR flush {flush:8.1} ms over {SHARDS} threads (busiest {busiest:7.1} ms) | rows serialized {:>9}, reused {:>9} | {} pokes, {:.0} MB | checksum {checksum:016x}",
+            measured.iter().map(|m| m.serialized).sum::<u64>(),
+            measured.iter().map(|m| m.reused).sum::<u64>(),
+            measured.iter().map(|m| m.pokes).sum::<usize>(),
+            measured.iter().map(|m| m.bytes).sum::<usize>() as f64 / 1e6,
+        );
+        println!(
+            "HOUR new group's startup set, flush time: p50 {:6.2} ms  p90 {:6.2} ms  p99 {:6.2} ms  ({} groups)",
+            quantile(&mut opens, 0.5),
+            quantile(&mut opens, 0.9),
+            quantile(&mut opens, 0.99),
+            opens.len()
+        );
+        println!(
+            "HOUR page hydration, flush time:      p50 {:6.3} ms  p90 {:6.3} ms  p99 {:6.3} ms  ({} pages)",
+            quantile(&mut pages, 0.5),
+            quantile(&mut pages, 0.9),
+            quantile(&mut pages, 0.99),
+            pages.len()
+        );
     }
 }

@@ -1478,8 +1478,8 @@ fn measure_help(name: &str) -> &'static str {
         "writes" => "row writes inside those transactions",
         "pokes" => "pokes written to client groups",
         "frames" => "WebSocket frames written",
-        "rows_serialized" => "row images turned into JSON",
-        "rows_shared" => "row images found already serialized in the same flush",
+        "rows_serialized" => "row images turned into JSON, each the first time it was sent",
+        "rows_shared" => "row images sent from the bytes kept on them since an earlier send",
         "rows_read" => "rows storage reads returned",
         "transform_hits" | "transform_misses" | "transform_errors" => {
             "query transforms by outcome: answered from the cache, asked of the application server, failed"

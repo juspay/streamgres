@@ -2956,6 +2956,7 @@ dependencies = [
  "libc",
  "log",
  "memchr",
+ "once_cell",
  "percent-encoding",
  "pgoutput",
  "pgwire-replication",

@@ -52,6 +52,12 @@ bytes = "1"
 # The crate tokio-postgres uses for the same on the connections it opens.
 socket2 = { version = "0.6", features = ["all"] }
 
+# The write-once cell holding a row image's wire bytes (`RowData::wire`):
+# `race::OnceBox` is one atomic pointer, so every row image and key stays
+# in the allocation size it had without it, and a reader never waits.
+# Already in the tree through `pyroscope` and `jemalloc_pprof`.
+once_cell = "1"
+
 # The client side (`src/client`): message encoding, the
 # HTTP calls to the application server, and the WebSocket handshake.
 serde = { version = "1", features = ["derive"] }
