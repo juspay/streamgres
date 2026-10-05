@@ -698,3 +698,74 @@ fn a_transaction_the_feed_repeats_is_applied_once() {
         assert_eq!(positions, vec![Lsn(10), Lsn(20), Lsn(25), Lsn(30)]);
     });
 }
+
+/// With several consumers, a commit wakes only those with something to
+/// hear once they are serving: the first commit reaches every consumer (it
+/// is the one they start serving on), a later one with deltas for one
+/// consumer reaches that one alone, and a watched write reaches them all.
+#[test]
+fn a_serving_consumer_is_not_woken_for_nothing() {
+    block_on(async {
+        let storage = Rc::new(MemoryStorage::new());
+        let (owner_tx, mut owner) = mpsc::unbounded_channel();
+        let (other_tx, mut other) = mpsc::unbounded_channel();
+        let (service, commands) =
+            Service::new(MultiTableIVM::new(), storage, owner_tx.clone());
+        let service = service.with_sinks(vec![owner_tx, other_tx]);
+        spawn_local(service.run());
+
+        let transaction = |id: i64, at: u64, watched: bool| {
+            let write = insert(id, "OPEN");
+            Transaction {
+                watched: if watched { vec![write.clone()] } else { Vec::new() },
+                writes: vec![write],
+                at: Lsn(at),
+                progress: Lsn(at),
+                schema: Vec::new(),
+                catalog: None,
+                received: std::time::Instant::now(),
+                committed_at_micros: 0,
+                decode: Duration::ZERO,
+            }
+        };
+
+        commands
+            .send(Command::Transaction(transaction(1, 10, false)))
+            .await
+            .expect("send");
+        let (first_owner, first_other) = (drain(&mut owner).await, drain(&mut other).await);
+        assert_eq!(shapes(&first_owner), vec!["committed"]);
+        assert_eq!(shapes(&first_other), vec!["committed"], "every consumer starts serving");
+
+        commands
+            .send(Command::Register {
+                sink: 0,
+                query: open_tickets(),
+                token: 1,
+            })
+            .await
+            .expect("send");
+        drain(&mut owner).await;
+        commands
+            .send(Command::Transaction(transaction(2, 20, false)))
+            .await
+            .expect("send");
+        let (owner_seen, other_seen) = (drain(&mut owner).await, drain(&mut other).await);
+        assert_eq!(shapes(&owner_seen), vec!["committed"]);
+        assert_eq!(ids(&owner_seen), vec![2]);
+        assert!(other_seen.is_empty(), "nothing for it: {:?}", shapes(&other_seen));
+
+        commands
+            .send(Command::Transaction(transaction(3, 30, true)))
+            .await
+            .expect("send");
+        let other_seen = drain(&mut other).await;
+        assert!(
+            matches!(other_seen.as_slice(), [Event::Committed { updates, watched, .. }]
+                if updates.is_empty() && watched.len() == 1),
+            "a watched write reaches every consumer: {:?}",
+            shapes(&other_seen)
+        );
+        assert_eq!(ids(&drain(&mut owner).await), vec![3]);
+    });
+}

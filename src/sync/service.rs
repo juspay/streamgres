@@ -162,7 +162,8 @@ impl Transaction {
 ///   writes on the watched tables, and two instants for the consumer's
 ///   clock, when the feed decoded the transaction and when the engine
 ///   finished with it. A consumer serves once the position covers the
-///   floor.
+///   floor. With several consumers, one already serving hears only the
+///   commits with deltas for it or watched writes.
 /// - `Hydrated`: subscriptions whose first rows have all arrived (every
 ///   part of their tree is live), each named once.
 /// - `Capped`: a page of the subscription stopped reaching past the rows
@@ -249,6 +250,13 @@ pub struct Service<E: Engine, S: Storage> {
     /// costs the engine its bookkeeping and not the allocator's work.
     reaper: std::sync::mpsc::Sender<Dead>,
     lag_warned: Option<Instant>,
+    /// Whether every sink has been sent a commit whose position covers the
+    /// storage floor, the one it starts serving on (every sink not yet
+    /// serving hears every commit, so they all get that one together).
+    /// From then on, with several sinks, a sink hears a commit only when
+    /// the commit has deltas for it or watched writes: each send wakes its
+    /// thread.
+    serving: bool,
     results: mpsc::UnboundedReceiver<(FetchId, Result<Snapshot, StorageError>)>,
     report: mpsc::UnboundedSender<(FetchId, Result<Snapshot, StorageError>)>,
     /// The catalog the clients' side reads, when the service is to keep
@@ -288,6 +296,7 @@ where
             swept: Instant::now(),
             reaper: spawn_reaper(),
             lag_warned: None,
+            serving: false,
             results,
             report,
             catalog: None,
@@ -701,7 +710,9 @@ where
 
     /// Deliver a step's deltas inside the event its `outcome` calls for
     /// (a registration's to its client's sink; a landing's to the sinks
-    /// with any; a commit's to every sink, empty or not), start each of
+    /// with any; a commit's to every sink, empty or not, except that with
+    /// several sinks one already serving is not woken for a commit with
+    /// nothing for it, no delta and no watched write), start each of
     /// its reads as a task, and name the subscriptions that became
     /// hydrated.
     fn dispatch(&mut self, step: Step, outcome: Outcome) {
@@ -737,7 +748,11 @@ where
                 received,
                 routed,
             } => {
+                let skip_empty = self.serving && self.sinks.len() > 1 && watched.is_empty();
                 for (sink, batch) in self.sinks.iter().zip(self.partition(updates)) {
+                    if skip_empty && batch.is_empty() {
+                        continue;
+                    }
                     let _ = sink.send(Event::Committed {
                         updates: batch,
                         position,
@@ -747,6 +762,7 @@ where
                         routed,
                     });
                 }
+                self.serving |= floor.0 != 0 && position >= floor;
             }
             Outcome::Nothing => {
                 debug_assert!(updates.is_empty(), "a parked read has no deltas");
