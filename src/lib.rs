@@ -68,5 +68,6 @@ pub mod model;
 pub mod otel;
 pub mod parser;
 pub mod profile;
+pub mod shutdown;
 pub mod stats;
 pub mod sync;

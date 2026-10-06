@@ -45,6 +45,7 @@ use super::schema;
 use super::transform::TransformCache;
 use super::warm::WarmStart;
 use crate::log::{Level, log_debug, log_event, log_info, log_warn};
+use crate::shutdown::Shutdown;
 use crate::stats::Stats;
 use crate::sync::CatalogHandle;
 use crate::sync::pg::PgStorage;
@@ -75,6 +76,7 @@ pub struct AppState {
     pub warm: Arc<WarmStart>,
     pub warmed: watch::Receiver<bool>,
     pub transforms: Arc<TransformCache>,
+    pub shutdown: Shutdown,
 }
 
 /// One desired-query change between the client's message and the group
@@ -143,13 +145,6 @@ const DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// do not reconnect in the same instant.
 const DRAIN_STAGGER_MS: u64 = 3_000;
 
-/// The one flag every writer watches: flipped by the first shutdown
-/// signal, never unflipped.
-fn shutdown() -> &'static watch::Sender<bool> {
-    static FLAG: std::sync::OnceLock<watch::Sender<bool>> = std::sync::OnceLock::new();
-    FLAG.get_or_init(|| watch::channel(false).0)
-}
-
 /// Resolves on ctrl-c or, on unix, `SIGTERM` (what `docker stop` sends).
 async fn signalled() {
     #[cfg(unix)]
@@ -198,19 +193,21 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
         state.config.base_path
     );
     let warm = state.warm.clone();
+    let shutdown = state.shutdown.clone();
+    let serving_shutdown = shutdown.clone();
     let serving = axum::serve(listener, router(state)).with_graceful_shutdown(async move {
-        signalled().await;
+        let signalled = tokio::select! {
+            _ = signalled() => true,
+            _ = serving_shutdown.wait() => false,
+        };
         log_info!("shutting down: closing the clients, {DRAIN_GRACE:?} at most");
         warm.save();
-        shutdown().send_replace(true);
+        if signalled {
+            serving_shutdown.request();
+        }
     });
     let grace = async {
-        let mut flag = shutdown().subscribe();
-        while !*flag.borrow() {
-            if flag.changed().await.is_err() {
-                return;
-            }
-        }
+        shutdown.wait().await;
         tokio::time::sleep(DRAIN_GRACE).await;
     };
     tokio::select! {
@@ -336,6 +333,7 @@ async fn handle(
         pong_interval,
         state.stats.clone(),
         params.wsid.clone(),
+        state.shutdown.clone(),
     ));
     let wsid = params.wsid.clone();
     let group_id = params.group_id.clone();
@@ -544,11 +542,12 @@ async fn write_loop(
     pong_interval: Duration,
     stats: Arc<Stats>,
     wsid: String,
+    shutdown: Shutdown,
 ) {
     let mut last_sent = Instant::now();
     let mut idle = tokio::time::interval(pong_interval.max(Duration::from_millis(100)));
     idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut shutting_down = shutdown().subscribe();
+    let mut shutting_down = shutdown.subscribe();
     loop {
         tokio::select! {
             changed = shutting_down.changed(), if !*shutting_down.borrow() => {

@@ -250,8 +250,10 @@ from. The ones to have on day one:
   `/health`, `/metrics`, `/stats`. Keep `/metrics` and `/stats` inside the
   cluster.
 - `SIGTERM` closes the connections over three seconds, so the clients do
-  not all reconnect in the same instant, and exits within five more. A
-  `terminationGracePeriodSeconds` of 15 is enough.
+  not all reconnect in the same instant. The listener drain is bounded to
+  five seconds; feed, worker and slot cleanup are separately bounded so the
+  timed shutdown phases have a 25-second budget. Set `terminationGracePeriodSeconds`
+  to 30 or more, leaving five seconds of kubelet headroom.
 - The proxy in front must pass WebSocket upgrades and the
   `Sec-WebSocket-Protocol` header (the client's first message travels in
   it, several kilobytes: allow 128 KB of request headers, as

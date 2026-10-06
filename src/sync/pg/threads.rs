@@ -39,6 +39,7 @@ use super::{Feed, Keepalive, PgStorage, Transport, load_catalog};
 use crate::ivm::MultiTableIVM;
 use crate::log::{log_error, log_info, log_warn};
 use crate::model::{Catalog, Lsn, MultiTableReadQuery, TableName};
+use crate::shutdown::Shutdown;
 use crate::stats::Stats;
 use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Transaction};
 
@@ -96,6 +97,10 @@ pub fn slot_name() -> String {
 /// nothing is being written waits before reads move onto it, and a server
 /// on a quiet database before it says it is ready.
 const POSITION_EVERY: Duration = Duration::from_millis(200);
+
+/// The feed has four seconds of the process's 25-second application shutdown
+/// budget; Kubernetes retains five seconds of a 30-second grace period.
+const FEED_STOP_GRACE: Duration = Duration::from_secs(4);
 
 /// The running engine side: commands in, one event stream per consumer
 /// (the consumer of a client being the one at its id modulo their count),
@@ -183,6 +188,7 @@ pub fn spawn_feed(
     settings: Settings,
     catalog: Arc<Catalog>,
     start: Lsn,
+    shutdown: Shutdown,
 ) -> Result<(mpsc::Receiver<Transaction>, FeedHandle), String> {
     let (out, transactions) = mpsc::channel(1024);
     let (stop, mut stop_rx) = watch::channel(false);
@@ -193,6 +199,7 @@ pub fn spawn_feed(
                 .enable_all()
                 .build()
                 .expect("feed runtime");
+            let running_shutdown = shutdown.clone();
             let stopped = runtime.block_on(async move {
                 let ddl = DdlSource {
                     prefix: settings.ddl_prefix.clone(),
@@ -241,7 +248,8 @@ pub fn spawn_feed(
                                 Ok(()) => log_warn!("change feed dropped; reopening the slot"),
                                 Err(error) => {
                                     log_error!("change feed failed: {error}");
-                                    crate::log::exit(1);
+                                    running_shutdown.fail(format!("change feed failed: {error}"));
+                                    return true;
                                 }
                             }
                         }
@@ -255,7 +263,11 @@ pub fn spawn_feed(
                                     "slot {} is gone, and a slot made again would skip the changes since; stopping so a restart begins on a fresh slot and snapshot",
                                     settings.slot
                                 );
-                                crate::log::exit(1);
+                                running_shutdown.fail(format!(
+                                    "change-feed slot {} disappeared",
+                                    settings.slot
+                                ));
+                                return true;
                             }
                         }
                     }
@@ -274,7 +286,9 @@ pub fn spawn_feed(
                 log_info!("change feed thread stopped gracefully");
             } else {
                 log_error!("change feed thread stopped: the engine is gone");
-                crate::log::exit(1);
+                if !shutdown.requested() {
+                    shutdown.fail("change feed thread stopped: the engine is gone");
+                }
             }
         })
         .map_err(|error| format!("feed thread: {error}"))?;
@@ -288,12 +302,28 @@ pub fn spawn_feed(
 }
 
 /// Stop the feed thread and wait until its replication connection is closed.
-pub async fn stop_feed(mut feed: FeedHandle) {
+pub async fn stop_feed(mut feed: FeedHandle) -> Result<(), String> {
     feed.stop.send_replace(true);
     let Some(thread) = feed.thread.take() else {
-        return;
+        return Ok(());
     };
-    let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("xyne-sync-feed-join".to_owned())
+        .spawn(move || {
+            let outcome = thread
+                .join()
+                .map_err(|_| "change feed thread panicked while stopping".to_owned());
+            let _ = done_tx.send(outcome);
+        })
+        .map_err(|error| format!("joining change feed thread: {error}"))?;
+    match tokio::time::timeout(FEED_STOP_GRACE, done_rx).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(_)) => Err("change feed join worker stopped unexpectedly".to_owned()),
+        Err(_) => Err(format!(
+            "change feed did not stop within {FEED_STOP_GRACE:?}"
+        )),
+    }
 }
 
 /// Bring the engine side up on the current thread's local set: the slot
@@ -308,6 +338,7 @@ pub async fn start(
     reads: tokio::runtime::Handle,
     consumers: usize,
     stats: Arc<Stats>,
+    shutdown: Shutdown,
 ) -> Result<(Started, ServiceTask), String> {
     Transport::cleanup_inactive_slots(&settings.dsn, settings.slot_cleanup_age)
         .await
@@ -327,7 +358,12 @@ pub async fn start(
         .with_read_connections(settings.read_connections)
         .with_read_timeout(settings.read_timeout);
     let pg = Arc::new(pg);
-    let (feed, feed_handle) = spawn_feed(settings.clone(), catalog.load(), pg.first_position())?;
+    let (feed, feed_handle) = spawn_feed(
+        settings.clone(),
+        catalog.load(),
+        pg.first_position(),
+        shutdown,
+    )?;
     let cached = Sources::cached_from_env();
     let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
     if !cached.is_empty() {

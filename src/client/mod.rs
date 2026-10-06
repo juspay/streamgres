@@ -65,13 +65,48 @@ pub mod wire;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::join_all;
 use tokio::sync::mpsc;
 
 pub use config::Config;
 
 use crate::log::{self, log_error, log_info, log_warn};
+use crate::shutdown::Shutdown;
 use crate::sync::CatalogHandle;
 use crate::sync::pg::threads;
+
+// The listener drain is five seconds and profiler shutdown is bounded to two.
+// These four seconds per worker phase and slot cleanup, plus two for reads,
+// keep the application budget at 25 seconds of a 30-second Pod grace period.
+const WORKER_STOP_GRACE: Duration = Duration::from_secs(4);
+const SLOT_DROP_GRACE: Duration = Duration::from_secs(4);
+const READS_STOP_GRACE: Duration = Duration::from_secs(2);
+
+/// Wait a bounded amount of time for a native worker thread. The join itself
+/// lives on a helper thread so a timed-out join cannot make Tokio wait for a
+/// blocking-pool task forever while the process is terminating.
+async fn join_worker(
+    name: impl Into<String>,
+    thread: std::thread::JoinHandle<()>,
+) -> Result<(), String> {
+    let name = name.into();
+    let join_name = name.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(format!("xyne-sync-{name}-join"))
+        .spawn(move || {
+            let outcome = thread
+                .join()
+                .map_err(|_| format!("{join_name} thread panicked while stopping"));
+            let _ = done_tx.send(outcome);
+        })
+        .map_err(|error| format!("joining {name} thread: {error}"))?;
+    match tokio::time::timeout(WORKER_STOP_GRACE, done_rx).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(_)) => Err(format!("{name} join worker stopped unexpectedly")),
+        Err(_) => Err(format!("{name} did not stop within {WORKER_STOP_GRACE:?}")),
+    }
+}
 
 /// Run the server with `config` until ctrl-c; returns the reason it could
 /// not start.
@@ -80,6 +115,7 @@ pub fn serve(config: Config) -> Result<(), String> {
     log::set_format(config.log_format);
     let _profiler = crate::profile::start(crate::profile::Config::from_env()?)?;
     let config = Arc::new(config);
+    let shutdown = Shutdown::new();
     let settings = config.engine_settings();
     let cleanup_settings = settings.clone();
     let server = tokio::runtime::Builder::new_multi_thread()
@@ -111,8 +147,9 @@ pub fn serve(config: Config) -> Result<(), String> {
     let engine_catalog = catalog.clone();
     let engine_stats = stats.clone();
     let reads_handle = reads.handle().clone();
+    let engine_shutdown = shutdown.clone();
     let (started_tx, started_rx) = std::sync::mpsc::channel::<Result<threads::Started, String>>();
-    std::thread::Builder::new()
+    let engine_thread = std::thread::Builder::new()
         .name("xyne-sync-engine".to_owned())
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -127,19 +164,32 @@ pub fn serve(config: Config) -> Result<(), String> {
                     reads_handle,
                     shards,
                     engine_stats,
+                    engine_shutdown.clone(),
                 )
                 .await
                 {
                     Ok((engine, service)) => {
                         let _ = started_tx.send(Ok(engine));
                         match service.await {
-                            Ok(_) => log_error!("the engine's service stopped"),
-                            Err(error) => log_error!("the engine's service panicked: {error}"),
+                            Ok(_) if engine_shutdown.requested() => {
+                                log_info!("engine service stopped during shutdown")
+                            }
+                            Ok(_) => {
+                                let reason = "the engine's service stopped";
+                                log_error!("{reason}");
+                                engine_shutdown.fail(reason);
+                            }
+                            Err(error) => {
+                                let reason = format!("the engine's service panicked: {error}");
+                                log_error!("{reason}");
+                                engine_shutdown.fail(reason);
+                            }
                         }
-                        crate::log::exit(1);
                     }
                     Err(error) => {
+                        let reason = format!("starting engine: {error}");
                         let _ = started_tx.send(Err(error));
+                        engine_shutdown.fail(reason);
                     }
                 }
             });
@@ -156,6 +206,7 @@ pub fn serve(config: Config) -> Result<(), String> {
 
     let (readiness, ready) = tokio::sync::watch::channel(false);
     let mut requests = Vec::with_capacity(shards);
+    let mut group_threads = Vec::with_capacity(shards);
     for (shard, events) in events.into_iter().enumerate() {
         let (requests_tx, requests_rx) = mpsc::channel::<groups::Request>(1024);
         requests.push(requests_tx.clone());
@@ -164,7 +215,8 @@ pub fn serve(config: Config) -> Result<(), String> {
         let commands = commands.clone();
         let stats = stats.clone();
         let readiness = readiness.clone();
-        std::thread::Builder::new()
+        let group_shutdown = shutdown.clone();
+        let thread = std::thread::Builder::new()
             .name(format!("xyne-sync-groups-{shard}"))
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -190,12 +242,23 @@ pub fn serve(config: Config) -> Result<(), String> {
                     )
                 }));
                 match outcome {
-                    Ok(()) => log_error!("group thread {shard} stopped"),
-                    Err(_) => log_error!("group thread {shard} panicked"),
+                    Ok(()) if group_shutdown.requested() => {
+                        log_info!("group thread {shard} stopped during shutdown")
+                    }
+                    Ok(()) => {
+                        let reason = format!("group thread {shard} stopped");
+                        log_error!("{reason}");
+                        group_shutdown.fail(reason);
+                    }
+                    Err(_) => {
+                        let reason = format!("group thread {shard} panicked");
+                        log_error!("{reason}");
+                        group_shutdown.fail(reason);
+                    }
                 }
-                crate::log::exit(1);
             })
             .map_err(|error| format!("group thread {shard}: {error}"))?;
+        group_threads.push(thread);
     }
 
     let backend = Arc::new(backend::Backend::new(&config)?);
@@ -233,6 +296,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         warm: warm.clone(),
         warmed,
         transforms,
+        shutdown: shutdown.clone(),
     });
     drop(readiness);
     if warm.enabled() {
@@ -290,23 +354,55 @@ pub fn serve(config: Config) -> Result<(), String> {
     log_info!("client side up");
     let served = server.block_on(connection::serve(state));
     server.block_on(async {
-        threads::stop_feed(feed).await;
-        match crate::sync::pg::Transport::drop_slot_only(
-            &cleanup_settings.dsn,
-            &cleanup_settings.slot,
+        if let Err(error) = threads::stop_feed(feed).await {
+            log_warn!("stopping change feed during shutdown: {error}");
+        }
+        if let Err(error) = join_worker("engine", engine_thread).await {
+            log_warn!("joining engine during shutdown: {error}");
+        }
+        let joined_groups = join_all(
+            group_threads
+                .into_iter()
+                .enumerate()
+                .map(|(shard, thread)| join_worker(format!("groups-{shard}"), thread)),
+        )
+        .await;
+        for result in joined_groups {
+            if let Err(error) = result {
+                log_warn!("joining group thread during shutdown: {error}");
+            }
+        }
+        match tokio::time::timeout(
+            SLOT_DROP_GRACE,
+            crate::sync::pg::Transport::drop_slot_only(
+                &cleanup_settings.dsn,
+                &cleanup_settings.slot,
+            ),
         )
         .await
         {
-            Ok(()) => log_info!(
+            Ok(Ok(())) => log_info!(
                 "dropped change-feed slot {} during shutdown",
                 cleanup_settings.slot
             ),
-            Err(error) => log_warn!(
-                "could not drop change-feed slot {} during shutdown: {error}",
-                cleanup_settings.slot
-            ),
+            Ok(Err(error)) => {
+                log_warn!(
+                    "could not drop change-feed slot {} during shutdown: {error}",
+                    cleanup_settings.slot
+                );
+            }
+            Err(_) => {
+                log_warn!(
+                    "dropping change-feed slot {} timed out",
+                    cleanup_settings.slot
+                );
+            }
         }
     });
-    drop(reads);
-    served
+    reads.shutdown_timeout(READS_STOP_GRACE);
+    served?;
+    match shutdown.failure() {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
