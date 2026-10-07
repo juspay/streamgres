@@ -264,8 +264,9 @@ pub struct Service<E: Engine, S: Storage> {
     catalog: Option<Arc<CatalogHandle>>,
     /// Catalogs of schema changes applied to the engine, each with the
     /// position it took effect at, waiting for the storage floor to reach
-    /// that position before the clients' side sees them.
-    pending: VecDeque<(Lsn, Arc<Catalog>)>,
+    /// that position before the clients' side sees them, and the tables
+    /// the change touched.
+    pending: VecDeque<(Lsn, Arc<Catalog>, Vec<TableName>)>,
 }
 
 impl<E, S> Service<E, S>
@@ -575,7 +576,17 @@ where
         }
         self.storage.follow(at, catalog.clone());
         self.storage.mint_now();
-        self.pending.push_back((at, catalog));
+        let mut touched: Vec<TableName> = Vec::new();
+        for change in changes {
+            let table = match change {
+                SchemaChange::TableAdded { table } => &table.name,
+                SchemaChange::ColumnAdded { table, .. } => table,
+            };
+            if !touched.contains(table) {
+                touched.push(table.clone());
+            }
+        }
+        self.pending.push_back((at, catalog, touched));
         log_info!(
             "schema changed at {at}: {} change(s) absorbed in {:?}; the clients' side sees it with the next snapshot",
             changes.len(),
@@ -587,8 +598,8 @@ where
     /// the storage `floor` has reached: from here on every read it plans
     /// and every query it translates meets a snapshot that has the change.
     fn adopt(&mut self, floor: Lsn) {
-        while self.pending.front().is_some_and(|(at, _)| *at <= floor) {
-            let Some((at, catalog)) = self.pending.pop_front() else {
+        while self.pending.front().is_some_and(|(at, _, _)| *at <= floor) {
+            let Some((at, catalog, touched)) = self.pending.pop_front() else {
                 break;
             };
             if let Some(handle) = &self.catalog {
@@ -598,6 +609,11 @@ where
                 "the schema of {at} is in force at floor {floor}: {} tables",
                 catalog.tables().count()
             );
+            for name in &touched {
+                if let Some(table) = catalog.table(name.as_str()) {
+                    log_info!("schema pushed at {at}: {table}");
+                }
+            }
         }
     }
 

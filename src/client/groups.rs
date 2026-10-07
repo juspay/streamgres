@@ -112,8 +112,8 @@ use super::wire;
 use crate::ivm::{Delta, QueryPart};
 use crate::log::{Level, log_debug, log_event, log_info, log_warn};
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, Lsn, MultiTableReadQuery, RowData,
-    SubId, TableName, Value, WriteQuery,
+    Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, Lsn,
+    MultiTableReadQuery, RowData, SubId, TableName, Value, WriteQuery,
 };
 use crate::stats::Stats;
 use crate::sync::{CatalogHandle, Command, Event};
@@ -138,7 +138,7 @@ pub enum Outbound {
 /// What a client group holds, by table and row key: looked up by
 /// reference, so a delta the group already has the image of costs two
 /// hash probes and no copy of its key.
-type Ledger = HashMap<TableName, HashMap<DataFrameKey, Held>>;
+type Ledger = IdMap<TableName, IdMap<DataFrameKey, Held>>;
 
 /// One delta waiting for a group's next poke, shared with every other
 /// group it concerns, and the subscriptions and parts of this group it
@@ -294,7 +294,7 @@ const REFUSAL_COOLDOWN: Duration = Duration::from_secs(60);
 /// sends nothing and a released holder deletes nothing another still
 /// shows.
 struct Held {
-    holders: HashSet<(SubId, QueryPart)>,
+    holders: IdSet<(SubId, QueryPart)>,
     image: Arc<RowData>,
 }
 
@@ -309,7 +309,7 @@ fn account(
     table: &TableName,
     key: &DataFrameKey,
     image: Option<&DataFrameRow>,
-    holders: HashSet<(SubId, QueryPart)>,
+    holders: IdSet<(SubId, QueryPart)>,
 ) -> Option<RowOp> {
     match image {
         Some(image) => {
@@ -317,7 +317,7 @@ fn account(
                 return None;
             }
             if !rows.contains_key(table) {
-                rows.insert(table.clone(), HashMap::new());
+                rows.insert(table.clone(), IdMap::default());
             }
             let of_table = rows.get_mut(table)?;
             match of_table.get_mut(key) {
@@ -386,9 +386,9 @@ struct Group {
     sockets: HashMap<String, Socket>,
     desired: HashMap<String, HashSet<String>>,
     queries: HashMap<String, QueryState>,
-    subs: HashSet<SubId>,
+    subs: IdSet<SubId>,
     /// The hidden parts of each subscription, for the per-row check.
-    hidden: HashMap<SubId, HashSet<QueryPart>>,
+    hidden: IdMap<SubId, HashSet<QueryPart>>,
     rows: Ledger,
     lmids: HashMap<String, i64>,
     queued_desired: HashMap<String, Vec<Json>>,
@@ -484,9 +484,9 @@ impl Group {
             sockets: HashMap::new(),
             desired: HashMap::new(),
             queries: HashMap::new(),
-            subs: HashSet::new(),
-            hidden: HashMap::new(),
-            rows: HashMap::new(),
+            subs: IdSet::default(),
+            hidden: IdMap::default(),
+            rows: IdMap::default(),
             lmids: HashMap::new(),
             queued_desired: HashMap::new(),
             queued_got: Vec::new(),
@@ -1488,7 +1488,7 @@ impl Groups {
                 DataFrameOperation::Add(key, row) => (key, Some(row)),
                 DataFrameOperation::Delete(key, _) => (key, None),
             };
-            let holders: HashSet<(SubId, QueryPart)> = holders
+            let holders: IdSet<(SubId, QueryPart)> = holders
                 .into_iter()
                 .filter(|(sub, _)| group.subs.contains(sub))
                 .filter(|(sub, part)| {
@@ -1782,7 +1782,8 @@ fn part_frame(poke_id: &str, head: Option<Vec<u8>>, entries: &[Bytes]) -> Bytes 
 
 /// Keep one operation per row, the last one, in first-seen order.
 fn coalesce(rows: Vec<RowOp>) -> Vec<RowOp> {
-    let mut index: HashMap<(TableName, DataFrameKey), usize> = HashMap::new();
+    let mut index: IdMap<(TableName, DataFrameKey), usize> =
+        IdMap::with_capacity_and_hasher(rows.len(), Default::default());
     let mut out: Vec<Option<RowOp>> = Vec::with_capacity(rows.len());
     for op in rows {
         let slot = match &op {
@@ -1805,8 +1806,8 @@ mod tests {
     use crate::model::ColumnName;
 
     /// A holder of a row: subscription `sub`, main part.
-    fn holder(sub: u64) -> HashSet<(SubId, QueryPart)> {
-        HashSet::from([(SubId(sub), QueryPart::main())])
+    fn holder(sub: u64) -> IdSet<(SubId, QueryPart)> {
+        IdSet::from_iter([(SubId(sub), QueryPart::main())])
     }
 
     /// A row keyed by `id` with one `name` column.
@@ -1826,7 +1827,7 @@ mod tests {
     #[test]
     fn a_row_stays_on_the_client_while_any_query_still_holds_it() {
         let table = TableName::from("t");
-        let mut rows = HashMap::new();
+        let mut rows = Ledger::default();
         let (key, image) = row(1, "a");
         let first = account(&mut rows, &table, &key, Some(&image), holder(1));
         assert!(
@@ -1856,7 +1857,7 @@ mod tests {
     #[test]
     fn a_changed_image_is_sent_whoever_holds_the_row() {
         let table = TableName::from("t");
-        let mut rows = HashMap::new();
+        let mut rows = Ledger::default();
         let (key, image) = row(1, "a");
         account(&mut rows, &table, &key, Some(&image), holder(1));
         let (_, changed) = row(1, "b");

@@ -284,6 +284,23 @@ impl DbColumn {
     }
 }
 
+impl std::fmt::Display for DbTable {
+    /// One line for the log: the table, its key, and every column with
+    /// its type in row-layout order (the key columns first, the rest by
+    /// name).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let key: Vec<&str> = self.pkey.iter().map(ColumnName::as_str).collect();
+        write!(f, "`{}` key ({}), {} columns:", self.name, key.join(", "), self.columns.len())?;
+        for name in self.row_schema.names() {
+            match self.columns.get(name) {
+                Some(column) => write!(f, " {name} {:?}", column.r#type)?,
+                None => write!(f, " {name}")?,
+            }
+        }
+        Ok(())
+    }
+}
+
 impl DbTable {
     /// The layout of this table's rows: the key columns first, the rest
     /// by name; every row decoded from the table shares it.
@@ -375,6 +392,25 @@ impl DbTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table's log line names its key and lists every column with its
+    /// type, the key first and the rest by name.
+    #[test]
+    fn a_table_displays_its_key_and_typed_columns_in_layout_order() {
+        let table = DbTable::new(
+            "tickets",
+            ["id"],
+            vec![
+                DbColumn::new("title", ValueType::String),
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("owner", ValueType::String),
+            ],
+        );
+        assert_eq!(
+            table.to_string(),
+            "`tickets` key (id), 3 columns: id Int owner String title String"
+        );
+    }
 
     /// [`DbTable::new`] stamps the table name onto every column and resolves
     /// columns and pkey membership by name.

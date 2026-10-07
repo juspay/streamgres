@@ -147,6 +147,11 @@ pub async fn load_catalog_at(dsn: &str, schemas: &[String]) -> Result<Catalog, S
         schemas.join(", "),
         catalog.tables().count()
     );
+    let mut tables: Vec<_> = catalog.tables().collect();
+    tables.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
+    for table in tables {
+        log_info!("schema: {table}");
+    }
     Ok(catalog)
 }
 
