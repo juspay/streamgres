@@ -254,6 +254,7 @@ impl SingleTableIVM {
             });
         }
         let readers = &self.readers;
+        let mut withdrawn = Vec::new();
         self.requests.retain_mut(|fetch| {
             if fetch.sub != sub {
                 return true;
@@ -263,9 +264,15 @@ impl SingleTableIVM {
                     fetch.sub = next;
                     true
                 }
-                None => false,
+                None => {
+                    withdrawn.push(fetch.clone());
+                    false
+                }
             }
         });
+        for fetch in &withdrawn {
+            self.forget_read(fetch);
+        }
         if let Some(twins) = self.by_query.get_mut(&query) {
             twins.remove(&sub);
             if twins.is_empty() {

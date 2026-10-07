@@ -991,12 +991,15 @@ impl Stats {
                 "window_capped": engine.ivm.window_capped,
                 "page_rounds": engine.ivm.page_rounds,
                 "page_lookups": engine.ivm.page_lookups,
+                "row_reads": engine.ivm.row_reads,
+                "frame_mismatches": engine.ivm.frame_mismatches,
                 "snapshots_shared": engine.ivm.snapshots_shared,
                 "reads_issued": engine.sync.reads_issued,
                 "reads_landed": engine.sync.reads_landed,
                 "reads_refused": engine.sync.reads_refused,
                 "rows_dropped": engine.sync.rows_dropped,
                 "rows_refreshed": engine.sync.rows_refreshed,
+                "rows_completed": engine.sync.rows_completed,
                 "rows_added": engine.sync.rows_added,
             },
         })
@@ -1150,6 +1153,9 @@ impl Stats {
             ("pages_capped_total", engine.ivm.window_capped),
             ("page_rounds_total", engine.ivm.page_rounds),
             ("page_lookups_total", engine.ivm.page_lookups),
+            ("row_reads_total", engine.ivm.row_reads),
+            ("frame_mismatches_total", engine.ivm.frame_mismatches),
+            ("rows_completed_total", engine.sync.rows_completed),
             ("registrations_total", engine.ivm.queries_registered),
             ("client_updates_add_total", engine.ivm.ops_add),
             ("client_updates_delete_total", engine.ivm.ops_delete),
@@ -1540,6 +1546,15 @@ fn measure_help(name: &str) -> &'static str {
         "pages_capped_total" => "pages that stopped reaching further after ten rounds",
         "page_rounds_total" => "rounds pages took to reach further, each batch twice the last",
         "page_lookups_total" => "reads pages asked for of a join value they had dropped",
+        "row_reads_total" => {
+            "rows read again by key because an update left a large unchanged value out and no whole copy was held"
+        }
+        "frame_mismatches_total" => {
+            "rows a landing read brought that disagree with the frame's image of them (drift; should stay 0)"
+        }
+        "rows_completed_total" => {
+            "update images missing a large unchanged value, completed from the row's earlier image while bringing a read up"
+        }
         "registrations_total" => "queries registered with the engine",
         "client_updates_add_total" | "client_updates_delete_total" => {
             "row operations the engine emitted"

@@ -1121,7 +1121,10 @@ fn key_of(row: &DataFrameRow, table: &DbTable) -> DataFrameKey {
 /// column's declared type (a `json` column's stored text rewritten into
 /// the standard form first), columns the catalog does not declare
 /// skipped, declared columns the relation lacks `NULL`, so every image
-/// carries every column.
+/// carries every column. The one exception is a column PostgreSQL sent
+/// as unchanged (a large value an update did not touch): it is left out,
+/// and the image is marked partial ([`RowData::partial`]) so that the
+/// engine never holds or sends it as the whole row.
 fn image(
     table: &DbTable,
     columns: &[Described],
@@ -1161,7 +1164,7 @@ fn image(
         }
         data.entry(name.clone()).or_insert(Value::Null);
     }
-    Ok(DataFrameRow::from(data))
+    Ok(DataFrameRow::from(RowData::partial(data)))
 }
 
 /// Convert one text value by its declared type; a `jsonb` cell is kept in
@@ -1564,8 +1567,8 @@ mod tests {
 
     /// An `UPDATE` whose `name` PostgreSQL sent as unchanged (a large
     /// value the update did not touch, kind `u`) decodes to an image
-    /// without that column rather than failing: the engine completes it
-    /// from the row it holds.
+    /// without that column rather than failing, marked partial: the
+    /// engine completes it from the row it holds, or reads the row again.
     #[test]
     fn an_unchanged_toast_column_is_left_out_of_the_image() {
         let mut decoder = Decoder::new(catalog());
@@ -1591,6 +1594,7 @@ mod tests {
             image.data.get("name").is_none(),
             "the unchanged column is absent, not NULL: {image:?}"
         );
+        assert!(image.data.is_partial());
         assert_eq!(image.data["points"], Value::Int(4));
         assert_eq!(image.data["tag"], Value::String("a b".into()));
     }

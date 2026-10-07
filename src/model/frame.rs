@@ -125,6 +125,18 @@ impl DataFrameRow {
                 .collect::<HashMap<_, _>>(),
         )
     }
+
+    /// An image the change feed left the other columns out of
+    /// ([`RowData::partial`]), from the `(column, value)` pairs it did
+    /// carry.
+    pub fn partial(pairs: impl IntoIterator<Item = (impl Into<ColumnName>, Value)>) -> Self {
+        DataFrameRow::from(RowData::partial(
+            pairs
+                .into_iter()
+                .map(|(column, value)| (column.into(), value))
+                .collect(),
+        ))
+    }
 }
 
 impl From<HashMap<ColumnName, Value>> for DataFrameRow {

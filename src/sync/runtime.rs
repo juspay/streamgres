@@ -14,9 +14,12 @@
 //! snapshot that touches a row of its result is applied to the result
 //! first — a delete, or a new image that fails the read's filter, drops
 //! the row; a new image that passes replaces it — and what remains is
-//! exactly what the engine's position implies. The engine then adopts the
-//! rows without comparing anything. Nothing waits: a read behind the
-//! stream is caught up, and a read ahead of it cannot exist.
+//! exactly what the engine's position implies. A new image the feed left
+//! columns out of (a large value an update did not touch) is completed
+//! from the row's image before it, so it replaces nothing the update did
+//! not change. The engine then adopts the rows without comparing
+//! anything. Nothing waits: a read behind the stream is caught up, and a
+//! read ahead of it cannot exist.
 //!
 //! The delivered writes are kept in a buffer bounded below by the
 //! **floor**: the lowest location a read can still be positioned at,
@@ -28,7 +31,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
-use crate::ivm::{Delta, Engine, Fetch, FetchId, SchemaChange, evaluate, order_rows};
+use crate::ivm::{
+    Delta, Engine, Fetch, FetchId, SchemaChange, complete_image, evaluate, order_rows,
+};
 use crate::model::frame::SharedRow;
 use crate::model::{
     DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
@@ -69,6 +74,9 @@ struct Delivered {
 ///   out of the read's filter.
 /// - `rows_refreshed`: result rows whose image was replaced before
 ///   landing by such a write.
+/// - `rows_completed`: such writes' images the feed left columns out of,
+///   completed from the row's image before them (the snapshot's or an
+///   earlier write's).
 /// - `writes_buffered`: writes remembered for reads to be brought up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncStats {
@@ -78,6 +86,7 @@ pub struct SyncStats {
     pub reads_refused: u64,
     pub rows_dropped: u64,
     pub rows_refreshed: u64,
+    pub rows_completed: u64,
     pub rows_added: u64,
     pub writes_buffered: u64,
 }
@@ -97,6 +106,7 @@ impl fmt::Display for SyncStats {
             "rows dropped / refreshed ... {} / {}",
             self.rows_dropped, self.rows_refreshed
         )?;
+        writeln!(f, "rows completed ............. {}", self.rows_completed)?;
         writeln!(f, "rows added late ............ {}", self.rows_added)?;
         write!(f, "writes buffered ............ {}", self.writes_buffered)
     }
@@ -376,6 +386,14 @@ impl<E: Engine> Runtime<E> {
     /// the landing sets stays honest; the worst row read comes back beside
     /// the rows for that frontier, since the rows alone, some of them
     /// dropped here, no longer say the read was full.
+    ///
+    /// Each write applies onto the row's image before it, in commit
+    /// order: the snapshot's while the result holds the row, the last
+    /// write's otherwise (a row dropped from the result, or never in it).
+    /// An image the feed left columns out of takes them from there, and is
+    /// filtered whole. A row no whole image reaches (in no snapshot, and
+    /// brought in by a write that left columns out) stays partial; the
+    /// engine does not adopt it, and reads it again.
     fn bring_up(
         &mut self,
         fetch: &Fetch,
@@ -398,47 +416,65 @@ impl<E: Engine> Runtime<E> {
             .collect();
         let mut rows: Vec<Option<(DataFrameKey, DataFrameRow)>> =
             rows.into_iter().map(Some).collect();
+        let beyond = |image: &DataFrameRow| {
+            worst_read.as_ref().is_some_and(|worst| {
+                order_rows(&query.order_by, image, worst) == std::cmp::Ordering::Greater
+            })
+        };
+        // The last image of each row a write touched that the result does
+        // not hold: what a later write leaving columns out is completed
+        // from.
+        let mut outside: HashMap<DataFrameKey, DataFrameRow> = HashMap::new();
         for delivered in &self.recent {
             if delivered.at <= at || delivered.write.table() != table {
                 continue;
             }
-            let Some(&position) = index.get(delivered.write.pkey_value()) else {
-                let Some(image) = delivered.write.new_row_image() else {
-                    continue;
-                };
-                if !evaluate(&query.filter, &image.data, &mut 0) {
-                    continue;
-                }
-                let beyond = worst_read.as_ref().is_some_and(|worst| {
-                    order_rows(&query.order_by, image, worst) == std::cmp::Ordering::Greater
-                });
-                if beyond {
-                    continue;
-                }
-                index.insert(delivered.write.pkey_value().clone(), rows.len());
-                rows.push(Some((delivered.write.pkey_value().clone(), image.clone())));
-                self.stats.rows_added += 1;
-                continue;
-            };
-            let beyond = |image: &DataFrameRow| {
-                worst_read.as_ref().is_some_and(|worst| {
-                    order_rows(&query.order_by, image, worst) == std::cmp::Ordering::Greater
-                })
-            };
-            match delivered.write.new_row_image() {
-                Some(image)
-                    if evaluate(&fetch.query.filter, &image.data, &mut 0) && !beyond(image) =>
-                {
-                    if let Some((_, row)) = rows[position].as_mut() {
-                        *row = image.clone();
-                        self.stats.rows_refreshed += 1;
-                    }
-                }
-                _ => {
+            let key = delivered.write.pkey_value();
+            let position = index.get(key).copied();
+            let Some(image) = delivered.write.new_row_image() else {
+                if let Some(position) = position {
                     if rows[position].take().is_some() {
                         self.stats.rows_dropped += 1;
                     }
-                    index.remove(delivered.write.pkey_value());
+                    index.remove(key);
+                }
+                outside.remove(key);
+                continue;
+            };
+            let before = match position {
+                Some(position) => rows[position].as_ref().map(|(_, row)| row),
+                None => outside.get(key),
+            };
+            let image = match complete_image(Some(image), before) {
+                Some(completed) => {
+                    self.stats.rows_completed += 1;
+                    completed
+                }
+                None => image.clone(),
+            };
+            let admitted = evaluate(&query.filter, &image.data, &mut 0) && !beyond(&image);
+            match position {
+                Some(position) if admitted => {
+                    if let Some((_, row)) = rows[position].as_mut() {
+                        *row = image;
+                        self.stats.rows_refreshed += 1;
+                    }
+                }
+                Some(position) => {
+                    if rows[position].take().is_some() {
+                        self.stats.rows_dropped += 1;
+                    }
+                    index.remove(key);
+                    outside.insert(key.clone(), image);
+                }
+                None if admitted => {
+                    outside.remove(key);
+                    index.insert(key.clone(), rows.len());
+                    rows.push(Some((key.clone(), image)));
+                    self.stats.rows_added += 1;
+                }
+                None => {
+                    outside.insert(key.clone(), image);
                 }
             }
         }

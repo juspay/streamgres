@@ -301,10 +301,12 @@ pub enum WriteQuery {
 /// ones. Predicates are evaluated against it, so a partial image would
 /// silently mis-evaluate conditions on omitted columns. The one exception:
 /// a column the change feed reports unchanged (a large value the update
-/// did not touch) may be absent, and the engine completes it from the
-/// image it holds when it holds the row. Supporting partial
-/// updates needs a read-before-write against storage (see the roadmap in
-/// the README).
+/// did not touch) may be absent, in an image marked partial
+/// ([`crate::model::RowData::partial`]). The engine completes it from the
+/// image it holds when it holds the row, a read being brought up
+/// completes it from the read's image, and a row with no whole image at
+/// hand is read again by primary key before anyone is sent it. General
+/// partial updates (any column left out) are not supported.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateQuery {
     pub table: TableName,
