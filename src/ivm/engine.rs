@@ -1,7 +1,8 @@
 //! The seam between an engine and the runtime that feeds it: the engine
 //! never reads storage itself. Where it needs rows it does not hold (a
 //! registration's initial result set, a join edge's newly referenced
-//! value, a drained window's refill) it records a [`Fetch`] request and
+//! value, a drained window's refill, a row a write brought in with
+//! columns the feed left out) it records a [`Fetch`] request and
 //! carries on; the runtime runs the read, brings its result up to the
 //! point the engine has reached, and lands the rest through
 //! [`Engine::land`]. Positions never enter the engine: what lands is
@@ -120,12 +121,18 @@ pub struct FetchId(pub u64);
 /// - `Lookup`: a page asked for the rows of one join value it dropped
 ///   earlier, because a write on the driven side concerns them; the rows
 ///   land like a write's and the frontier is left where it was.
+/// - `Row`: one row read again by primary key, because the only image at
+///   hand of a row its readers need is partial (the feed left columns out
+///   of a write's image and no complete copy is held); the row lands like
+///   the write's own `Add` would have, and the frontier is left where it
+///   was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchKind {
     Snapshot,
     Narrowed,
     Refill,
     Lookup,
+    Row,
 }
 
 /// One storage read an engine wants run on its behalf.
@@ -192,7 +199,10 @@ pub trait Engine {
     /// Land the rows a requested read returned, already brought up to the
     /// engine's position by the runtime: each row is adopted into the
     /// shared frame if the frame does not hold it and tagged for the
-    /// reading subscription.
+    /// reading subscription. A partial row (a write since the snapshot
+    /// brought it in with columns the feed left out) is never adopted: a
+    /// held row is tagged with the frame's image, and one nobody holds is
+    /// read again ([`FetchKind::Row`]), the subscription waiting on it.
     /// `worst_read` is the worst row the read returned when it came back
     /// full, before it was brought up to date (`None` when it came back
     /// short): what a window's frontier is set from.

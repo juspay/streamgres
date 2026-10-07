@@ -173,8 +173,10 @@ for one subscriber or ten thousand.
 - `LEFT` keeps every parent row. `INNER` shows a parent only while a child
   matches, and a child only under a shown parent. `RIGHT` keeps every child
   row.
-- Rows are identified by primary key. Tables with large TOASTed columns need
-  `REPLICA IDENTITY FULL`.
+- Rows are identified by primary key. A large (TOASTed) value an update did
+  not touch, which PostgreSQL sends as unchanged, is filled in from the row the
+  server already holds, or the row is read again by key; no `REPLICA IDENTITY
+  FULL` is needed.
 
 ### Limitations
 

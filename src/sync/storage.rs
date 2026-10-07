@@ -18,7 +18,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::ivm::{SchemaChange, conform, evaluate, evaluate_with, order_rows};
+use crate::ivm::{SchemaChange, complete_image, conform, evaluate, evaluate_with, order_rows};
 use crate::model::{Catalog, ComparisonOperator, Condition, MultiTableReadQuery, Snapshot, Value};
 use crate::model::{DataFrameKey, DataFrameRow, Lsn, SingleTableReadQuery, TableName, WriteQuery};
 
@@ -247,14 +247,20 @@ impl MemoryStorage {
 
     /// Mirror one write into the store: insert/update upsert the row by
     /// primary key (full-row-image semantics, like the engine), delete
-    /// removes it.
+    /// removes it. A partial image (columns the feed left out as
+    /// unchanged) keeps the stored values of the columns it lacks, as
+    /// PostgreSQL does.
     pub fn apply(&self, write: &WriteQuery) {
         let mut tables = self.tables.borrow_mut();
         let rows = tables.entry(write.table().clone()).or_default();
         let position = rows.iter().position(|(key, _)| key == write.pkey_value());
         match write.new_row_image() {
             Some(image) => {
-                let entry = (write.pkey_value().clone(), image.clone());
+                let stored = position
+                    .filter(|_| image.data.is_partial())
+                    .map(|index| &rows[index].1);
+                let image = complete_image(Some(image), stored).unwrap_or_else(|| image.clone());
+                let entry = (write.pkey_value().clone(), image);
                 match position {
                     Some(index) => rows[index] = entry,
                     None => rows.push(entry),

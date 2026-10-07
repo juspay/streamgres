@@ -90,10 +90,12 @@
 //!   limit keeps every matching row; a `LIMIT 0` subscription is
 //!   permanently empty (its registration reads nothing and later writes
 //!   never admit).
-//! - The engine **never reads storage itself**. Frames fill three ways:
+//! - The engine **never reads storage itself**. Frames fill four ways:
 //!   the initial result set of a registration, writes seen afterwards,
-//!   and the narrowed reads the join layer asks for when a join value
-//!   becomes referenced ([`SingleTableIVM::fetch`]). Each read is
+//!   the narrowed reads the join layer asks for when a join value
+//!   becomes referenced ([`SingleTableIVM::fetch`]), and a row read
+//!   again by primary key when the only image of it at hand is partial
+//!   (`FetchKind::Row`). A frame never holds a partial image. Each read is
 //!   recorded as a [`Fetch`] request (see the `engine` module) and landed
 //!   later by the runtime through [`Engine::land`]; between the two the
 //!   subscription's routing is live, its window publishes no admission
@@ -140,7 +142,7 @@ use std::sync::Arc;
 
 use crate::model::frame::{RowId, SharedRow, TableFrame};
 use crate::model::{
-    ColumnName, DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, RowSchema,
+    ColumnName, DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, RowData, RowSchema,
     SingleTableReadQuery, TableName, Value, WriteQuery,
 };
 use index::TableIndex;
@@ -193,6 +195,9 @@ pub struct SingleTableUpdate {
 ///   that asked and every subscription of its query, joined by twins
 ///   registered while it is out.
 /// - `requests`: the reads asked for since the runtime last took them.
+/// - `rows_out`: the rows being read again by primary key
+///   ([`FetchKind::Row`]), by table and key: one read per row, which a
+///   subscription needing the row meanwhile joins instead of asking again.
 /// - `write_epoch`: monotonic write number; disjunct counters are lazily
 ///   invalidated by comparing against it, so no per-write reset sweep is
 ///   needed.
@@ -221,6 +226,7 @@ pub struct SingleTableIVM {
     pending: IdMap<SubId, u32>,
     readers: IdMap<FetchId, Vec<SubId>>,
     requests: Vec<Fetch>,
+    rows_out: HashMap<(TableName, DataFrameKey), FetchId>,
     write_epoch: u64,
     next_sub: u64,
     next_fetch: u64,
@@ -270,6 +276,7 @@ impl SingleTableIVM {
             pending: IdMap::default(),
             readers: IdMap::default(),
             requests: Vec::new(),
+            rows_out: HashMap::new(),
             write_epoch: 0,
             next_sub: 0,
             next_fetch: 0,
@@ -338,6 +345,14 @@ impl SingleTableIVM {
     /// row's data is written once; each firing subscription tags itself,
     /// each no-longer-matching holder untags itself, and the row is
     /// dropped when its last tag goes.
+    ///
+    /// A partial image (the feed left a large unchanged value out) is
+    /// completed from the frame's image of the row. When nobody holds the
+    /// row there is nothing to complete it from: no subscription is sent
+    /// it and the frame does not take it; the row is read again by
+    /// primary key for the subscriptions it enters
+    /// ([`SingleTableIVM::read_row`]) and reaches them when that read
+    /// lands.
     pub fn incremental_update(&mut self, write_query: &WriteQuery) -> Vec<SingleTableUpdate> {
         self.stats.writes_processed += 1;
         let table = write_query.table().clone();
@@ -349,9 +364,15 @@ impl SingleTableIVM {
             .map(|row| row.data.clone());
         let completed = complete_image(write_query.new_row_image(), old_data.as_ref());
         let row_image = completed.as_ref().or(write_query.new_row_image());
+        let withheld = old_data.is_none() && row_image.is_some_and(|image| image.data.is_partial());
         let conformed = row_image.and_then(|image| self.conform(&table, image));
         let row_image = conformed.as_ref().or(row_image);
         let impacts = self.analyze(&table, &key, row_image);
+        if withheld {
+            let entering: Vec<SubId> = impacts.iter().map(|impact| impact.sub).collect();
+            self.read_row(&table, &key, &entering);
+            return Vec::new();
+        }
 
         let mut ops: Vec<SingleTableUpdate> = Vec::new();
         for impact in &impacts {
@@ -631,21 +652,45 @@ impl SingleTableIVM {
     }
 }
 
-/// The new image of a write completed from the image the frame holds:
-/// a column the feed left out (one PostgreSQL reported unchanged, a large
-/// value the update did not touch) takes its held value, so the row the
-/// subscribers see stays whole. `None` when nothing was missing or the
-/// row is not held, and the write's own image serves.
-fn complete_image(new: Option<&DataFrameRow>, old: Option<&DataFrameRow>) -> Option<DataFrameRow> {
+/// The new image of a write completed from an earlier image of the same
+/// row (the one the frame holds, or the one a read brought): a column the
+/// feed left out (one PostgreSQL reported unchanged, a large value the
+/// update did not touch) takes its earlier value, so the row the
+/// subscribers see stays whole. The result is laid out like `old` when
+/// `old` has every column `new` has (the table's own layout, for a row
+/// decoded from the feed or from storage), and is partial only when
+/// `old` was. `None` when nothing was missing or there is no earlier
+/// image, and the write's own image serves.
+pub fn complete_image(
+    new: Option<&DataFrameRow>,
+    old: Option<&DataFrameRow>,
+) -> Option<DataFrameRow> {
     let (new, old) = (new?, old?);
-    if old.data.keys().all(|column| new.data.contains_key(column)) {
+    if Arc::ptr_eq(new.data.schema(), old.data.schema())
+        || old.data.keys().all(|column| new.data.contains_key(column))
+    {
         return None;
+    }
+    if new.data.keys().all(|column| old.data.contains_key(column)) {
+        let values = old
+            .data
+            .iter()
+            .map(|(column, value)| new.data.get(column).unwrap_or(value).clone())
+            .collect();
+        return Some(DataFrameRow::from(RowData::with_schema(
+            old.data.schema().clone(),
+            values,
+        )));
     }
     let mut data = old.data.to_map();
     for (column, value) in new.data.iter() {
         data.insert(column.clone(), value.clone());
     }
-    Some(DataFrameRow::from(data))
+    Some(DataFrameRow::from(if old.data.is_partial() {
+        RowData::partial(data)
+    } else {
+        RowData::from(data)
+    }))
 }
 
 impl Engine for SingleTableIVM {
@@ -691,6 +736,7 @@ impl Engine for SingleTableIVM {
 
     /// Every reader of the refused fetch, unsubscribed.
     fn refuse(&mut self, fetch: &Fetch) -> Vec<SubId> {
+        self.forget_read(fetch);
         let gone = self.readers_of(fetch);
         for sub in &gone {
             self.unregister_query(*sub);

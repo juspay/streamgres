@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, NoTls};
-use xyne_sync::ivm::{Delta, Fetch, MultiTableIVM, QueryPart};
+use xyne_sync::ivm::{Delta, Engine, Fetch, MultiTableIVM, QueryPart};
 use xyne_sync::model::*;
 use xyne_sync::client::ddl_triggers::trigger_stack_sql;
 use xyne_sync::sync::pg::ddl::DdlSource;
@@ -1371,6 +1371,176 @@ fn schema_changes_follow_the_trigger() {
                  DROP SCHEMA IF EXISTS xslive_0 CASCADE;",
             )
             .await;
+        cleanup(&dsn, &client, &names).await;
+    });
+}
+
+/// A large value PostgreSQL stores out of line arrives as "unchanged" when
+/// an update leaves it alone. A reply that updates a conversation while
+/// the registration's read is held open behind it, and an update that
+/// moves a conversation into the channel, never reach the subscriber or
+/// the frame without `md`: the frame ends equal to what Postgres holds.
+#[test]
+fn unchanged_out_of_line_values_are_never_lost() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let names = Names::new("toast");
+        let table = names.extra.clone();
+        let client = prepare(&dsn, &names).await;
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {table} (id int8 PRIMARY KEY, channel text, replies int8, md text);
+                 ALTER TABLE {table} ALTER COLUMN md SET STORAGE EXTERNAL;
+                 INSERT INTO {table} VALUES
+                     (1, 'a', 0, repeat('x', 4000)), (2, 'b', 0, repeat('y', 4000));"
+            ))
+            .await
+            .expect("conversations");
+        let catalog = Arc::new(Catalog::new(vec![DbTable::new(
+            table.as_str(),
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("channel", ValueType::String),
+                DbColumn::new("replies", ValueType::Int),
+                DbColumn::new("md", ValueType::String),
+            ],
+        )]));
+        let mut stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let slow = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect")
+            .with_read_delay(Duration::from_millis(1500));
+        let fast = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&slow, &fast]).await;
+
+        let (sub, step) = runtime.register(MultiTableReadQuery::single(SingleTableReadQuery::new(
+            table.as_str(),
+            Where::condition("channel", ComparisonOperator::EQ, "a"),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        )));
+        assert_eq!(step.selects.len(), 1);
+        let main = step.selects[0].clone();
+        let query = main.query.clone();
+        let select = spawn_local(async move { slow.select(&query).await });
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        client
+            .batch_execute(&format!("UPDATE {table} SET replies = 1 WHERE id = 1;"))
+            .await
+            .expect("reply");
+
+        let behind = stream.poll().await.expect("poll");
+        assert_eq!(behind.writes.len(), 1);
+        let image = behind.writes[0].0.new_row_image().expect("an update");
+        assert!(
+            image.data.is_partial() && image.data.get("md").is_none(),
+            "PostgreSQL sent md as unchanged: {image:?}"
+        );
+        let mut updates = Vec::new();
+        let mut pending = Vec::new();
+        for (write, at) in behind.writes {
+            let step = runtime.write(&write, at);
+            moved(&mut runtime, &[&fast]);
+            assert!(step.updates.is_empty(), "no partial row sent");
+            pending.extend(step.selects);
+        }
+        runtime.progress(behind.progress);
+        moved(&mut runtime, &[&fast]);
+        assert_eq!(pending.len(), 1, "the row is read again");
+
+        let snapshot = select.await.expect("join").expect("select");
+        assert!(
+            snapshot.at < runtime.position(),
+            "the read is behind the reply"
+        );
+        let step = runtime.fetched(main.id, snapshot);
+        updates.extend(step.updates);
+        pending.extend(step.selects);
+        updates.extend(drain(&mut runtime, &fast, &mut stream, pending).await);
+
+        client
+            .batch_execute(&format!("UPDATE {table} SET channel = 'a' WHERE id = 2;"))
+            .await
+            .expect("move");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut pending = Vec::new();
+        loop {
+            let batch = stream.poll().await.expect("poll");
+            let arrived = !batch.writes.is_empty();
+            for (write, at) in batch.writes {
+                let step = runtime.write(&write, at);
+                moved(&mut runtime, &[&fast]);
+                updates.extend(step.updates);
+                pending.extend(step.selects);
+            }
+            let step = runtime.progress(batch.progress);
+            moved(&mut runtime, &[&fast]);
+            updates.extend(step.updates);
+            pending.extend(step.selects);
+            if arrived {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the move never arrived");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        updates.extend(drain(&mut runtime, &fast, &mut stream, pending).await);
+
+        for delta in &updates {
+            if let DataFrameOperation::Add(_, row) = &delta.op {
+                assert!(
+                    !row.data.is_partial()
+                        && matches!(row.data.get("md"), Some(Value::String(md)) if md.len() == 4000),
+                    "a row without md was sent: {row:?}"
+                );
+            }
+        }
+        let held: BTreeMap<i64, (Value, Value)> = runtime
+            .engine()
+            .rows_for(sub, QueryPart::main())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, row)| match key.pkey_value["id"] {
+                Value::Int(id) => (id, (row.data["replies"].clone(), row.data["md"].clone())),
+                _ => panic!("integer ids"),
+            })
+            .collect();
+        let stored: BTreeMap<i64, (Value, Value)> = client
+            .query(
+                &format!("SELECT id, replies, md FROM {table} WHERE channel = 'a'"),
+                &[],
+            )
+            .await
+            .expect("truth")
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<_, i64>(0),
+                    (
+                        Value::Int(row.get::<_, i64>(1)),
+                        Value::String(row.get::<_, String>(2)),
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(held, stored, "the frame holds what Postgres holds");
+        assert!(runtime.engine().hydrated(sub));
+        assert_eq!(runtime.engine().stats().frame_mismatches, 0);
+        assert_eq!(
+            runtime.engine().stats().row_reads,
+            2,
+            "the reply and the move"
+        );
+        assert!(
+            runtime.stats().rows_completed >= 1,
+            "the held-open read completed the reply"
+        );
         cleanup(&dsn, &client, &names).await;
     });
 }

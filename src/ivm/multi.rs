@@ -1496,12 +1496,14 @@ impl MultiTableIVM {
             }
             None => self.single.land_read(fetch, rows, worst_read),
         };
+        // A row read stands in for the write whose image was partial: its
+        // row arrives as that write's would have, recalls included.
         self.cause = match fetch.kind {
-            FetchKind::Lookup => Cause::Write,
+            FetchKind::Lookup | FetchKind::Row => Cause::Write,
             FetchKind::Narrowed if self.write_reads.remove(&fetch.id) => Cause::Write,
             _ => Cause::Page,
         };
-        self.landing = Some(fetch.sub);
+        self.landing = (fetch.kind != FetchKind::Row).then_some(fetch.sub);
         let mut out = self.forward(applied);
         self.landing = None;
         if fetch.kind == FetchKind::Lookup {
@@ -3450,6 +3452,7 @@ impl Engine for MultiTableIVM {
     /// Every subscription of every tree with a part reading the refused
     /// fetch, unsubscribed.
     fn refuse(&mut self, fetch: &Fetch) -> Vec<SubId> {
+        self.single.forget_read(fetch);
         let mut gone = Vec::new();
         for tree_id in self.trees_reading(fetch) {
             let subs = self

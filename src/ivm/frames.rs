@@ -7,6 +7,7 @@
 //! [`crate::model::frame::RowId`]) and are always changed together.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::predicate::evaluate;
 use super::window::Window;
@@ -80,6 +81,68 @@ impl SingleTableIVM {
         let id = self.issue(sub, narrowed, kind);
         self.sync_boundary(sub);
         id
+    }
+
+    /// Read the row `key` of `table` again by primary key
+    /// ([`FetchKind::Row`]) for `subs` and their twins, each of which
+    /// waits on it as on a read of its own: the only image of the row at
+    /// hand is partial and the frame holds no whole one. The read selects
+    /// the key alone, with no filter or limit of a subscription's (a row a
+    /// write just brought into a filter is not in it at an older
+    /// snapshot), and lands into each subscription through its own filter
+    /// and window. One read per row: a subscription that needs a row
+    /// already being read joins that read. No subscriptions, no read.
+    pub(super) fn read_row(&mut self, table: &TableName, key: &DataFrameKey, subs: &[SubId]) {
+        let mut readers: Vec<SubId> = Vec::new();
+        for sub in subs {
+            for reader in self.query_group(*sub) {
+                if !readers.contains(&reader) {
+                    readers.push(reader);
+                }
+            }
+        }
+        let Some(&first) = readers.first() else {
+            return;
+        };
+        match self.rows_out.get(&(table.clone(), key.clone())) {
+            Some(&id) => {
+                let waiting = self.readers.entry(id).or_default();
+                readers.retain(|reader| !waiting.contains(reader));
+                waiting.extend(readers.iter().copied());
+            }
+            None => {
+                let id = FetchId(self.next_fetch);
+                self.next_fetch += 1;
+                self.stats.storage_reads += 1;
+                self.stats.row_reads += 1;
+                self.readers.insert(id, readers.clone());
+                self.rows_out.insert((table.clone(), key.clone()), id);
+                self.requests.push(Fetch {
+                    id,
+                    sub: first,
+                    kind: FetchKind::Row,
+                    query: Arc::new(SingleTableReadQuery {
+                        table: table.clone(),
+                        filter: key_filter(key),
+                        order_by: Vec::new(),
+                        limit: u32::MAX,
+                    }),
+                });
+            }
+        }
+        for reader in readers {
+            *self.pending.entry(reader).or_default() += 1;
+            self.sync_boundary(reader);
+        }
+    }
+
+    /// `fetch` is landing or will never land (refused): if it is a row
+    /// read, it no longer stands for its row, and the next subscription
+    /// that needs the row asks again.
+    pub(super) fn forget_read(&mut self, fetch: &Fetch) {
+        if fetch.kind == FetchKind::Row {
+            self.rows_out.retain(|_, id| *id != fetch.id);
+        }
     }
 
     /// Record one storage read for `sub`, counted as pending by `sub` and
@@ -159,6 +222,7 @@ impl SingleTableIVM {
         rows: &[(DataFrameKey, DataFrameRow)],
         worst_read: Option<&DataFrameRow>,
     ) -> Vec<SingleTableUpdate> {
+        self.forget_read(fetch);
         let readers = self
             .readers
             .remove(&fetch.id)
@@ -207,11 +271,11 @@ impl SingleTableIVM {
     }
 
     /// Land the rows of a read of `kind` into `sub`: each adopted and
-    /// tagged ([`SingleTableIVM::land_row`]) — a lookup's rows only when
-    /// the window admits them — then tracked in the window, as candidates
-    /// of a page unless a page read whole is taking its snapshot, and the
-    /// window told what the read covered (a lookup covers nothing new).
-    /// Returns the `Add`s.
+    /// tagged ([`SingleTableIVM::land_row`]) — a lookup's or a row read's
+    /// rows only when the window admits them — then tracked in the window,
+    /// as candidates of a page unless a page read whole is taking its
+    /// snapshot, and the window told what the read covered (a lookup or a
+    /// row read covers nothing new). Returns the `Add`s.
     fn land_rows(
         &mut self,
         sub: SubId,
@@ -223,7 +287,7 @@ impl SingleTableIVM {
             return Vec::new();
         };
         let table = query.table.clone();
-        let lookup = kind == FetchKind::Lookup;
+        let lookup = matches!(kind, FetchKind::Lookup | FetchKind::Row);
         let mut updates = Vec::new();
         let mut landed: Vec<(Vec<Value>, DataFrameKey)> = Vec::new();
         for (key, row) in rows {
@@ -290,6 +354,14 @@ impl SingleTableIVM {
     /// it already held it or the image does not satisfy its filter.
     /// Returns the `Add` and the image tagged; the caller tracks it in the
     /// window.
+    ///
+    /// A partial row (a write since the read's snapshot brought it in
+    /// with columns the feed left out) is never adopted: a held row is
+    /// tagged with the frame's whole image, and one nobody holds that the
+    /// filter admits is read again for `sub`
+    /// ([`SingleTableIVM::read_row`]), which waits on it. A whole row that
+    /// disagrees with the frame's image is counted in `frame_mismatches`;
+    /// the frame's image is kept.
     fn land_row(
         &mut self,
         sub: SubId,
@@ -298,14 +370,34 @@ impl SingleTableIVM {
         key: &DataFrameKey,
         row: &DataFrameRow,
     ) -> Option<(SingleTableUpdate, DataFrameRow)> {
-        let conformed = self.conform(table, row);
+        let partial = row.data.is_partial();
+        if partial
+            && self
+                .frames
+                .get(table)
+                .is_none_or(|frame| frame.get(key).is_none())
+        {
+            if evaluate(filter, &row.data, &mut 0) {
+                self.read_row(table, key, &[sub]);
+            }
+            return None;
+        }
+        let conformed = if partial {
+            None
+        } else {
+            self.conform(table, row)
+        };
         let row = conformed.as_ref().unwrap_or(row);
         let frame = self.frames.entry(table.clone()).or_default();
         let (id, shared) = frame.entry(key, || row.clone());
-        debug_assert!(
-            shared.data == *row,
-            "a read brought up to the engine's position agrees with the frame"
-        );
+        if !partial && !Arc::ptr_eq(&shared.data.data, &row.data) && shared.data != *row {
+            self.stats.frame_mismatches += 1;
+            debug_assert!(
+                false,
+                "a read brought up to the engine's position agrees with the frame: {:?} vs {:?}",
+                shared.data, row
+            );
+        }
         if shared.held_by(sub) {
             return None;
         }
@@ -574,6 +666,26 @@ pub(super) fn worst_of_full(
         .map(|(_, row)| row)
         .max_by(|a, b| window::order_rows(&fetch.query.order_by, a, b))
         .cloned()
+}
+
+/// The filter selecting the one row `key` names: its primary-key
+/// columns, each equal to the key's value.
+fn key_filter(key: &DataFrameKey) -> Where {
+    let mut conditions: Vec<Where> = key
+        .pkey_value
+        .iter()
+        .map(|(column, value)| {
+            Where::Condition(Condition::new(
+                column.clone(),
+                ComparisonOperator::EQ,
+                value.clone(),
+            ))
+        })
+        .collect();
+    if conditions.len() == 1 {
+        return conditions.remove(0);
+    }
+    Where::AND(conditions)
 }
 
 /// `filter` with every set-valued `IN` leaf on `column` replaced by

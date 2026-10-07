@@ -38,6 +38,12 @@
 //!    a page of 50 ordered by `createdAt DESC, id ASC`); one subscription
 //!    per user for each, then message inserts, membership churn that moves
 //!    the existence sets, and in-place ticket updates.
+//! 7. **Partial images** — `conversations` rows with a 4_000-character
+//!    `md` (laid out as the decoder lays them out), one subscription per
+//!    even channel: updates carrying `md` against updates that leave it
+//!    out (PostgreSQL's "unchanged" for an out-of-line value), on rows a
+//!    subscription holds (completed from the frame) and on rows moving
+//!    into a subscription that nobody holds (read again by key).
 //! 5. **Postgres** (only when `XYNE_SYNC_PG_DSN` names a database with
 //!    `wal_level = logical` and `bench` in its name, since the scenario
 //!    replaces its `users` and `tickets` tables) — the same join over real tables: a
@@ -64,7 +70,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use xyne_sync::ivm::{Fetch, IvmStats, MultiTableIVM, SingleTableIVM, evaluate, order_rows};
+use xyne_sync::ivm::{
+    Fetch, IvmStats, MultiTableIVM, SingleTableIVM, complete_image, evaluate, order_rows,
+};
 use xyne_sync::model::ComparisonOperator::{EQ, GTE};
 use xyne_sync::model::*;
 use xyne_sync::sync::pg::{PgStorage, PgStream};
@@ -139,6 +147,12 @@ const XY_TICKETS: u64 = 10_000;
 const XY_MESSAGE_INSERTS: usize = 5_000;
 const XY_MEMBERSHIP_CHURN: usize = 1_000;
 const XY_TICKET_UPDATES: usize = 2_000;
+
+const TOAST_CHANNELS: i64 = 1_000;
+const TOAST_PER_CHANNEL: i64 = 20;
+const TOAST_MD_CHARS: usize = 4_000;
+const TOAST_WRITES: usize = 5_000;
+const PG_PARTIAL_WRITES: usize = 200;
 
 const JOIN_TWINS: usize = 1_000;
 const JOIN_DISTINCT: usize = 100;
@@ -468,18 +482,26 @@ struct BenchStorage {
 }
 
 impl BenchStorage {
-    /// Mirror one write: insert/update upsert by primary key, delete
-    /// removes (swap-remove, positions and indexes patched for the moved
-    /// row).
+    /// Mirror one write: insert/update upsert by primary key (a partial
+    /// image keeps the stored values of the columns it lacks, as
+    /// PostgreSQL does), delete removes (swap-remove, positions and
+    /// indexes patched for the moved row).
     fn apply(&self, write: &WriteQuery) {
         let mut tables = self.tables.borrow_mut();
         let table = tables.entry(write.table().clone()).or_default();
         let key = write.pkey_value();
         match (write.new_row_image(), table.positions.get(key).copied()) {
             (Some(image), Some(position)) => {
+                let stored = &table.rows[position].1;
+                let image = match image.data.is_partial() {
+                    true => {
+                        complete_image(Some(image), Some(stored)).unwrap_or_else(|| image.clone())
+                    }
+                    false => image.clone(),
+                };
                 let old = std::mem::replace(&mut table.rows[position].1, image.clone());
                 table.unfile(position, &old);
-                table.file(position, image);
+                table.file(position, &image);
             }
             (Some(image), None) => {
                 let position = table.rows.len();
@@ -1419,6 +1441,9 @@ fn main() {
     if wanted("xyne") {
         xyne_spaces();
     }
+    if wanted("toast") {
+        partial_images();
+    }
     if wanted("postgres") {
         match std::env::var("XYNE_SYNC_PG_DSN") {
             Ok(dsn) if bench_database(&dsn) => postgres(&dsn),
@@ -1449,7 +1474,7 @@ fn bench_database(dsn: &str) -> bool {
 
 /// Whether scenario `name` runs: every scenario unless
 /// `XYNE_SYNC_BENCH_ONLY` names some (comma-separated: `routing`,
-/// `twins`, `release`, `window`, `join`, `xyne`, `postgres`).
+/// `twins`, `release`, `window`, `join`, `xyne`, `toast`, `postgres`).
 fn wanted(name: &str) -> bool {
     std::env::var("XYNE_SYNC_BENCH_ONLY")
         .map(|only| only.split(',').any(|scenario| scenario.trim() == name))
@@ -1813,6 +1838,12 @@ async fn pg_run(dsn: &str) -> PgRow {
     PgStream::drop_slot(dsn, PG_SLOT, PG_PUBLICATION)
         .await
         .expect("drop slot");
+    admin
+        .batch_execute(&format!(
+            "CREATE PUBLICATION \"{PG_PUBLICATION}\" FOR ALL TABLES"
+        ))
+        .await
+        .expect("publication");
     let mut stream = PgStream::open(dsn, PG_SLOT, PG_PUBLICATION, catalog.clone())
         .await
         .expect("open stream");
@@ -1938,7 +1969,9 @@ fn postgres(dsn: &str) {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let rows = tokio::task::LocalSet::new().block_on(&tokio, async { vec![pg_run(dsn).await] });
+    let (rows, partial) = tokio::task::LocalSet::new().block_on(&tokio, async {
+        (vec![pg_run(dsn).await], pg_partial(dsn).await)
+    });
     println!(
         "\nregistration (first subscription of a spec: two reads; then {JOIN_TWINS} identical ones from the shared tree):"
     );
@@ -2022,6 +2055,21 @@ fn postgres(dsn: &str) {
                 ]
             })
             .collect::<Vec<_>>(),
+    );
+    println!(
+        "\na row an update brings into a subscription nobody else holds it for ({PG_PARTIAL_WRITES} updates each, committed one at a time; {TOAST_MD_CHARS}-character md stored out of line; time from routing the update to the client's Add, reads included):"
+    );
+    print_table(
+        &[
+            "update",
+            "writes",
+            "p50 us",
+            "p95 us",
+            "max us",
+            "reads/write",
+            "every add whole",
+        ],
+        &partial,
     );
 }
 
@@ -2568,4 +2616,336 @@ fn xyne_spaces() {
         ],
         &rows,
     );
+}
+
+/// `conversations(id, channel, replies, md)`: `md` the large column an
+/// update that leaves it alone sends as unchanged.
+fn conversations_table() -> DbTable {
+    DbTable::new(
+        "conversations",
+        ["id"],
+        vec![
+            DbColumn::new("id", ValueType::Int),
+            DbColumn::new("channel", ValueType::Int),
+            DbColumn::new("replies", ValueType::Int),
+            DbColumn::new("md", ValueType::String),
+        ],
+    )
+}
+
+/// A write of conversation `id` as the decoder delivers it: on the
+/// table's own layout with `md`, or, with `md` `None`, the partial image
+/// of an update that did not touch it.
+fn conversation_write(
+    table: &DbTable,
+    id: i64,
+    channel: i64,
+    replies: i64,
+    md: Option<&str>,
+) -> WriteQuery {
+    let key = DataFrameKey::with_schema(table.key_schema().clone(), vec![Value::Int(id)]);
+    let value = |name: &str| match name {
+        "id" => Value::Int(id),
+        "channel" => Value::Int(channel),
+        "replies" => Value::Int(replies),
+        _ => Value::Null,
+    };
+    let record = match md {
+        Some(md) => DataFrameRow::from(RowData::with_schema(
+            table.row_schema().clone(),
+            table
+                .row_schema()
+                .names()
+                .iter()
+                .map(|name| match name.as_str() {
+                    "md" => Value::String(md.to_owned()),
+                    name => value(name),
+                })
+                .collect(),
+        )),
+        None => DataFrameRow::from(RowData::partial(
+            ["id", "channel", "replies"]
+                .into_iter()
+                .map(|name| (ColumnName::from(name), value(name)))
+                .collect(),
+        )),
+    };
+    WriteQuery::UPDATE(UpdateQuery {
+        table: table.name.clone(),
+        pkey_value: key,
+        record,
+    })
+}
+
+/// Scenario 7: updates whose large column the feed left out.
+fn partial_images() {
+    let rows = TOAST_CHANNELS * TOAST_PER_CHANNEL;
+    println!(
+        "\n== 7. partial images ({rows} conversations with a {TOAST_MD_CHARS}-character md over {TOAST_CHANNELS} channels; `channel = c` registered for the {} even channels; {TOAST_WRITES} writes per workload) ==",
+        TOAST_CHANNELS / 2
+    );
+    let table = conversations_table();
+    let md = "m".repeat(TOAST_MD_CHARS);
+    let storage = Rc::new(BenchStorage::default());
+    for id in 0..rows {
+        storage.apply(&conversation_write(
+            &table,
+            id,
+            id / TOAST_PER_CHANNEL,
+            0,
+            Some(&md),
+        ));
+    }
+    let mut ivm: Single = Local::new(SingleTableIVM::new(), storage.clone());
+    let mut subs = Vec::new();
+    for channel in (0..TOAST_CHANNELS).step_by(2) {
+        let query = unbounded(&table, Where::condition("channel", EQ, channel));
+        subs.push(ivm.register_query(query).0);
+    }
+
+    let held = |n: usize| {
+        let channel = (n as i64 % (TOAST_CHANNELS / 2)) * 2;
+        channel * TOAST_PER_CHANNEL + (n as i64 / (TOAST_CHANNELS / 2)) % TOAST_PER_CHANNEL
+    };
+    let entering = |n: usize| {
+        let channel = (n as i64 % (TOAST_CHANNELS / 2)) * 2 + 1;
+        channel * TOAST_PER_CHANNEL + (n as i64 / (TOAST_CHANNELS / 2)) % TOAST_PER_CHANNEL
+    };
+    let workloads: [(&str, Vec<WriteQuery>); 4] = [
+        (
+            "md carried, row held",
+            (0..TOAST_WRITES)
+                .map(|n| {
+                    let id = held(n);
+                    conversation_write(&table, id, id / TOAST_PER_CHANNEL, 1, Some(&md))
+                })
+                .collect(),
+        ),
+        (
+            "md left out, row held",
+            (0..TOAST_WRITES)
+                .map(|n| {
+                    let id = held(n);
+                    conversation_write(&table, id, id / TOAST_PER_CHANNEL, 2, None)
+                })
+                .collect(),
+        ),
+        (
+            "md carried, row enters",
+            (0..TOAST_WRITES)
+                .map(|n| {
+                    let id = entering(n);
+                    conversation_write(&table, id, id / TOAST_PER_CHANNEL - 1, 1, Some(&md))
+                })
+                .collect(),
+        ),
+        (
+            "md left out, row enters",
+            (0..TOAST_WRITES)
+                .map(|n| {
+                    let id = entering(n + TOAST_WRITES);
+                    conversation_write(&table, id, id / TOAST_PER_CHANNEL - 1, 1, None)
+                })
+                .collect(),
+        ),
+    ];
+
+    let mut table_rows = Vec::new();
+    for (label, writes) in workloads {
+        let before = ivm.engine().stats().clone();
+        let before_sync = ivm.runtime().stats().clone();
+        let mut elapsed = Duration::ZERO;
+        let mut returned = 0u64;
+        let mut all_whole = true;
+        for write in &writes {
+            storage.apply(write);
+            let started = Instant::now();
+            let updates = ivm.incremental_update(write);
+            elapsed += started.elapsed();
+            returned += updates.len() as u64;
+            all_whole &= updates.iter().all(|delta| match &delta.op {
+                DataFrameOperation::Add(_, row) => {
+                    !row.data.is_partial() && row.data.get("md").is_some()
+                }
+                DataFrameOperation::Delete(..) => true,
+            });
+        }
+        let run = Run {
+            label: label.to_owned(),
+            writes: writes.len() as u64,
+            elapsed,
+            stats: ivm.engine().stats().diff(&before),
+            returned,
+        };
+        let completed = ivm.runtime().stats().rows_completed - before_sync.rows_completed;
+        table_rows.push(vec![
+            run.label.clone(),
+            run.writes.to_string(),
+            two(run.micros_per_write()),
+            whole(run.writes_per_second()),
+            two(run.per_write(run.stats.row_reads)),
+            two(run.per_write(run.stats.storage_reads)),
+            completed.to_string(),
+            run.returned.to_string(),
+            if all_whole { "yes" } else { "NO" }.to_owned(),
+        ]);
+    }
+    print_table(
+        &[
+            "workload",
+            "writes",
+            "us/write",
+            "writes/s",
+            "row reads/write",
+            "reads/write",
+            "completed in reads",
+            "ops returned",
+            "every add whole",
+        ],
+        &table_rows,
+    );
+    let without_md = subs
+        .iter()
+        .filter_map(|sub| ivm.engine().rows_for(*sub))
+        .flat_map(|rows| rows.into_values())
+        .filter(|row| row.data.is_partial() || row.data.get("md").is_none())
+        .count();
+    println!(
+        "frame: {} rows held without md, {} frame mismatches",
+        without_md,
+        ivm.engine().stats().frame_mismatches
+    );
+}
+
+/// Scenario 5b: a conversation an update moves into a subscription's
+/// channel while nobody holds it, its large `md` either carried (the
+/// update sets a new value) or left out as unchanged (stored out of line
+/// and not touched, so PostgreSQL sends no value): the time from routing
+/// the update to the client's `Add`, the row read again by key included.
+async fn pg_partial(dsn: &str) -> Vec<Vec<String>> {
+    let table = "bench_conversations";
+    let catalog = Arc::new(Catalog::new(vec![DbTable::new(
+        table,
+        ["id"],
+        vec![
+            DbColumn::new("id", ValueType::Int),
+            DbColumn::new("channel", ValueType::String),
+            DbColumn::new("replies", ValueType::Int),
+            DbColumn::new("md", ValueType::String),
+        ],
+    )]));
+    let (admin, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .expect("connect");
+    tokio::task::spawn_local(async move {
+        let _ = connection.await;
+    });
+    PgStream::drop_slot(dsn, PG_SLOT, PG_PUBLICATION)
+        .await
+        .expect("drop slot");
+    admin
+        .batch_execute(&format!(
+            "DROP TABLE IF EXISTS {table};
+             CREATE TABLE {table} (id int8 PRIMARY KEY, channel text, replies int8, md text);
+             ALTER TABLE {table} ALTER COLUMN md SET STORAGE EXTERNAL;
+             INSERT INTO {table} SELECT g, 'a', 0, repeat('m', {TOAST_MD_CHARS})
+                 FROM generate_series(0, {}) g;
+             CREATE PUBLICATION \"{PG_PUBLICATION}\" FOR ALL TABLES",
+            2 * PG_PARTIAL_WRITES - 1
+        ))
+        .await
+        .expect("load conversations");
+    let mut stream = PgStream::open(dsn, PG_SLOT, PG_PUBLICATION, catalog.clone())
+        .await
+        .expect("open stream");
+    let storage = PgStorage::connect(dsn, catalog.clone())
+        .await
+        .expect("connect");
+    let mut runtime = Runtime::new(MultiTableIVM::new());
+    let first = stream.poll().await.expect("poll");
+    runtime.progress(first.progress);
+    moved(&mut runtime, &storage);
+    let (_, step) = runtime.register(MultiTableReadQuery::single(SingleTableReadQuery::new(
+        table,
+        Where::condition("channel", EQ, "b"),
+        OrderBy::new("id", Order::ASC),
+        u32::MAX,
+    )));
+    pg_drain(&mut runtime, &storage, &mut stream, step.selects, 0).await;
+
+    let mut rows = Vec::new();
+    for (label, carried) in [("md carried", true), ("md left out", false)] {
+        let offset = if carried { 0 } else { PG_PARTIAL_WRITES };
+        let mut samples: Vec<Duration> = Vec::new();
+        let mut reads = 0u64;
+        let mut all_whole = true;
+        for n in 0..PG_PARTIAL_WRITES {
+            let id = (offset + n) as i64;
+            let sql = if carried {
+                format!(
+                    "UPDATE {table} SET channel = 'b', md = repeat('n', {TOAST_MD_CHARS}) WHERE id = {id}"
+                )
+            } else {
+                format!("UPDATE {table} SET channel = 'b' WHERE id = {id}")
+            };
+            admin.batch_execute(&sql).await.expect("update");
+            let batch = loop {
+                let batch = stream.poll().await.expect("poll");
+                if !batch.writes.is_empty() {
+                    break batch;
+                }
+                runtime.progress(batch.progress);
+                moved(&mut runtime, &storage);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            };
+            let started = Instant::now();
+            let mut updates = Vec::new();
+            let mut pending = Vec::new();
+            for (write, at) in batch.writes {
+                let step = runtime.write(&write, at);
+                moved(&mut runtime, &storage);
+                updates.extend(step.updates);
+                pending.extend(step.selects);
+            }
+            while !pending.is_empty() {
+                let mut next = Vec::new();
+                for fetch in pending.drain(..) {
+                    reads += 1;
+                    let snapshot = storage.select(&fetch.query).await.expect("select");
+                    let step = runtime.fetched(fetch.id, snapshot);
+                    updates.extend(step.updates);
+                    next.extend(step.selects);
+                }
+                pending = next;
+            }
+            samples.push(started.elapsed());
+            runtime.progress(batch.progress);
+            moved(&mut runtime, &storage);
+            all_whole &= updates.iter().any(|delta| match &delta.op {
+                DataFrameOperation::Add(key, row) => {
+                    key.pkey_value.get("id") == Some(&Value::Int(id))
+                        && matches!(row.data.get("md"), Some(Value::String(md)) if md.len() == TOAST_MD_CHARS)
+                }
+                DataFrameOperation::Delete(..) => false,
+            });
+        }
+        samples.sort();
+        let micros = |d: Duration| one(d.as_secs_f64() * 1e6);
+        rows.push(vec![
+            label.to_owned(),
+            samples.len().to_string(),
+            micros(samples[samples.len() / 2]),
+            micros(samples[samples.len() * 95 / 100]),
+            micros(samples[samples.len() - 1]),
+            two(reads as f64 / samples.len() as f64),
+            if all_whole { "yes" } else { "NO" }.to_owned(),
+        ]);
+    }
+    PgStream::drop_slot(dsn, PG_SLOT, PG_PUBLICATION)
+        .await
+        .expect("drop slot");
+    let _ = admin
+        .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
+        .await;
+    rows
 }

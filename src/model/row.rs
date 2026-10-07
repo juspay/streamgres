@@ -21,23 +21,34 @@ use super::value::Value;
 /// The columns of a table's rows, in the order their values are stored,
 /// and the position of each name (under a fast hash: a column name is a
 /// catalog string, looked up once per condition per row); built once per
-/// table and shared.
+/// table and shared. `partial` marks the schema of an image the change
+/// feed left columns out of (see [`RowData::partial`]).
 #[derive(Debug)]
 pub struct RowSchema {
     names: Box<[ColumnName]>,
     positions: IdMap<ColumnName, u16>,
+    partial: bool,
 }
 
 impl RowSchema {
     /// A schema over `names` in that order (a name that repeats keeps
     /// its first position).
     pub fn new(names: impl IntoIterator<Item = ColumnName>) -> Arc<Self> {
+        Self::build(names, false)
+    }
+
+    /// [`RowSchema::new`], marked partial or not.
+    fn build(names: impl IntoIterator<Item = ColumnName>, partial: bool) -> Arc<Self> {
         let names: Box<[ColumnName]> = names.into_iter().collect();
         let mut positions = IdMap::with_capacity_and_hasher(names.len(), Default::default());
         for (index, name) in names.iter().enumerate() {
             positions.entry(name.clone()).or_insert(index as u16);
         }
-        Arc::new(RowSchema { names, positions })
+        Arc::new(RowSchema {
+            names,
+            positions,
+            partial,
+        })
     }
 
     /// The position of `column`, if the schema has it.
@@ -87,6 +98,36 @@ impl RowData {
         RowData {
             schema,
             values: values.into_boxed_slice(),
+            wire: OnceBox::new(),
+        }
+    }
+
+    /// A row the change feed left columns out of: an update's new image
+    /// in which PostgreSQL sent a large value the update did not touch as
+    /// "unchanged" instead of the value. It holds every other column, over
+    /// a schema of its own as [`RowData::from`] lays it out, and is marked
+    /// so whoever holds it knows it is not the whole row
+    /// ([`RowData::is_partial`]).
+    pub fn partial(map: HashMap<ColumnName, Value>) -> Self {
+        Self::laid_out(map, true)
+    }
+
+    /// Whether the row lacks columns its table has, the feed having left
+    /// them out ([`RowData::partial`]); a row built on such a row's
+    /// schema is partial too.
+    pub fn is_partial(&self) -> bool {
+        self.schema.partial
+    }
+
+    /// `map` over a schema of its own, the columns in name order, marked
+    /// partial or not.
+    fn laid_out(map: HashMap<ColumnName, Value>, partial: bool) -> Self {
+        let mut pairs: Vec<(ColumnName, Value)> = map.into_iter().collect();
+        pairs.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        let schema = RowSchema::build(pairs.iter().map(|(column, _)| column.clone()), partial);
+        RowData {
+            schema,
+            values: pairs.into_iter().map(|(_, value)| value).collect(),
             wire: OnceBox::new(),
         }
     }
@@ -167,14 +208,7 @@ impl From<HashMap<ColumnName, Value>> for RowData {
     /// A row over a schema of its own, the columns in name order, so two
     /// rows built from equal maps compare equal and hash alike.
     fn from(map: HashMap<ColumnName, Value>) -> Self {
-        let mut pairs: Vec<(ColumnName, Value)> = map.into_iter().collect();
-        pairs.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
-        let schema = RowSchema::new(pairs.iter().map(|(column, _)| column.clone()));
-        RowData {
-            schema,
-            values: pairs.into_iter().map(|(_, value)| value).collect(),
-            wire: OnceBox::new(),
-        }
+        Self::laid_out(map, false)
     }
 }
 

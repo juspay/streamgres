@@ -908,3 +908,549 @@ fn twin_joining_a_landing_tree_receives_the_rest() {
         );
     }
 }
+
+// Partial images: an update whose large value PostgreSQL stored out of line
+// and sent as "unchanged" (the update did not touch it) arrives without
+// that column, marked partial. The engine must never hold or send such an
+// image as the row: it completes it from a whole image of the row (the
+// frame's, or the read's while the read is brought up) or reads the row
+// again by primary key.
+
+/// A conversation: `channel`, `author`, `replies` and `md`, the large
+/// column an update that leaves it alone sends as unchanged.
+fn conversation(id: i64, channel: &str, author: i64, replies: i64, md: &str) -> WriteQuery {
+    insert(
+        "conversations",
+        id,
+        &[
+            ("channel", channel.into()),
+            ("author", Value::Int(author)),
+            ("replies", Value::Int(replies)),
+            ("md", md.into()),
+        ],
+    )
+}
+
+/// An update of conversation `id` that leaves `md` alone, as the feed
+/// delivers it: every other column, `md` left out, the image partial.
+fn reply(id: i64, channel: &str, author: i64, replies: i64) -> WriteQuery {
+    WriteQuery::UPDATE(UpdateQuery {
+        table: TableName::from("conversations"),
+        pkey_value: DataFrameKey::new(pkey(id)),
+        record: DataFrameRow::partial([
+            ("id", Value::Int(id)),
+            ("channel", channel.into()),
+            ("author", Value::Int(author)),
+            ("replies", Value::Int(replies)),
+        ]),
+    })
+}
+
+/// A whole update of conversation `id`, `md` included.
+fn edit(id: i64, channel: &str, author: i64, replies: i64, md: &str) -> WriteQuery {
+    update(
+        "conversations",
+        id,
+        &[
+            ("channel", channel.into()),
+            ("author", Value::Int(author)),
+            ("replies", Value::Int(replies)),
+            ("md", md.into()),
+        ],
+    )
+}
+
+/// The conversations of one channel, unbounded.
+fn in_channel(channel: &str) -> SingleTableReadQuery {
+    SingleTableReadQuery::new(
+        "conversations",
+        Where::condition("channel", ComparisonOperator::EQ, channel),
+        OrderBy::new("id", Order::ASC),
+        u32::MAX,
+    )
+}
+
+/// The conversations of one channel whose replies exceed `replies`: a
+/// different query over the same rows.
+fn busy_in_channel(channel: &str, replies: i64) -> SingleTableReadQuery {
+    SingleTableReadQuery::new(
+        "conversations",
+        Where::AND(vec![
+            Where::condition("channel", ComparisonOperator::EQ, channel),
+            Where::condition("replies", ComparisonOperator::GT, Value::Int(replies)),
+        ]),
+        OrderBy::new("id", Order::ASC),
+        u32::MAX,
+    )
+}
+
+/// The `md` and `replies` of each row, by id; a row without `md` reads
+/// `None`.
+fn md_and_replies(
+    rows: Option<HashMap<DataFrameKey, DataFrameRow>>,
+) -> BTreeMap<i64, (Option<Value>, Value)> {
+    rows.unwrap_or_default()
+        .into_iter()
+        .map(|(key, row)| match key.pkey_value["id"] {
+            Value::Int(id) => (
+                id,
+                (row.data.get("md").cloned(), row.data["replies"].clone()),
+            ),
+            _ => panic!("integer ids"),
+        })
+        .collect()
+}
+
+/// No delta carries a partial image or one without `md` to a client.
+fn assert_whole(updates: &[xyne_sync::ivm::Delta]) {
+    for delta in updates {
+        if let DataFrameOperation::Add(_, row) = &delta.op {
+            assert!(
+                !row.data.is_partial() && row.data.get("md").is_some(),
+                "a partial row was sent: {row:?}"
+            );
+        }
+    }
+}
+
+/// The ids the deltas add, in order.
+fn added(updates: &[xyne_sync::ivm::Delta]) -> Vec<i64> {
+    updates
+        .iter()
+        .filter_map(|delta| match &delta.op {
+            DataFrameOperation::Add(key, _) => match key.pkey_value["id"] {
+                Value::Int(id) => Some(id),
+                _ => panic!("integer ids"),
+            },
+            DataFrameOperation::Delete(..) => None,
+        })
+        .collect()
+}
+
+/// A held row: the update's image is completed from the frame's, and the
+/// client is sent the whole row.
+#[test]
+fn a_held_row_keeps_a_column_an_update_left_out() {
+    let mut db = Db::at(0);
+    db.seed(&[conversation(1, "a", 7, 0, "long")]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let (sub, step) = runtime.register(in_channel("a"));
+    settle(&mut runtime, &db, step);
+
+    let step = stream(&mut runtime, &mut db, &reply(1, "a", 7, 1));
+    assert_whole(&step.updates);
+    assert_eq!(added(&step.updates), vec![1]);
+    assert!(step.selects.is_empty(), "nothing to read again");
+    assert_eq!(
+        md_and_replies(runtime.engine().rows_for(sub)),
+        BTreeMap::from([(1, (Some("long".into()), Value::Int(1)))])
+    );
+}
+
+/// Nobody holds the row and no read is out: the update reaches nobody,
+/// nothing is read again, and the next read gets the whole row.
+#[test]
+fn an_update_nobody_needs_leaves_nothing_behind() {
+    let mut db = Db::at(0);
+    db.seed(&[conversation(1, "a", 7, 0, "long")]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+
+    let step = stream(&mut runtime, &mut db, &reply(1, "a", 7, 1));
+    assert!(step.updates.is_empty() && step.selects.is_empty());
+    runtime.set_floor(db.head());
+
+    let (sub, step) = runtime.register(in_channel("a"));
+    let updates = settle(&mut runtime, &db, step);
+    assert_whole(&updates);
+    assert_eq!(
+        md_and_replies(runtime.engine().rows_for(sub)),
+        BTreeMap::from([(1, (Some("long".into()), Value::Int(1)))])
+    );
+    assert_eq!(runtime.engine().stats().row_reads, 0);
+}
+
+/// The update first, then a registration whose read runs on a snapshot
+/// from before it: bringing the read up completes the update's image from
+/// the snapshot's row instead of replacing it, so the frame takes the
+/// whole row; a twin registered afterwards is served it from the frame,
+/// and a different query reading the row agrees with the frame.
+#[test]
+fn a_read_behind_an_update_completes_the_row_from_its_snapshot() {
+    let mut db = Db::at(0);
+    db.seed(&[conversation(1, "a", 7, 0, "long")]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let stale_rows = db.storage.rows(&in_channel("a"));
+    let stale_at = db.head();
+
+    stream(&mut runtime, &mut db, &reply(1, "a", 7, 1));
+    let (sub, step) = runtime.register(in_channel("a"));
+    let read = only(&step);
+    let landed = runtime.fetched(
+        read.id,
+        Snapshot {
+            rows: stale_rows,
+            at: stale_at,
+        },
+    );
+    assert_whole(&landed.updates);
+    assert_eq!(added(&landed.updates), vec![1]);
+    assert!(landed.selects.is_empty(), "the snapshot's row completed it");
+    assert_eq!(runtime.stats().rows_completed, 1);
+    assert_eq!(runtime.stats().rows_refreshed, 1);
+    let whole = BTreeMap::from([(1, (Some("long".into()), Value::Int(1)))]);
+    assert_eq!(md_and_replies(runtime.engine().rows_for(sub)), whole);
+
+    let (twin, step) = runtime.register(in_channel("a"));
+    assert!(step.selects.is_empty(), "served from the frame");
+    assert_whole(&step.updates);
+    assert_eq!(md_and_replies(runtime.engine().rows_for(twin)), whole);
+
+    let (other, step) = runtime.register(busy_in_channel("a", 0));
+    let updates = settle(&mut runtime, &db, step);
+    assert_whole(&updates);
+    assert_eq!(md_and_replies(runtime.engine().rows_for(other)), whole);
+    assert_eq!(runtime.engine().stats().frame_mismatches, 0);
+    assert_eq!(runtime.engine().stats().row_reads, 0);
+}
+
+/// The registration's read is out when the update arrives: the update's
+/// image is not sent and the frame does not take it; the row is read
+/// again, and the subscription is hydrated only once both reads landed.
+/// The registration's own read, brought up, delivers the whole row.
+#[test]
+fn an_update_while_the_read_is_out_waits_for_the_whole_row() {
+    let mut db = Db::at(0);
+    db.seed(&[conversation(1, "a", 7, 0, "long")]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let (sub, step) = runtime.register(in_channel("a"));
+    let read = only(&step);
+    let snapshot = db.snapshot(&read);
+
+    let step = stream(&mut runtime, &mut db, &reply(1, "a", 7, 1));
+    assert!(
+        step.updates.is_empty(),
+        "no partial row sent: {:?}",
+        step.updates
+    );
+    let again = only(&step);
+    assert_eq!(again.query.table, "conversations");
+    assert!(
+        runtime
+            .engine()
+            .rows_for(sub)
+            .unwrap_or_default()
+            .is_empty(),
+        "the frame did not take the partial image"
+    );
+
+    let landed = runtime.fetched(read.id, snapshot);
+    assert_whole(&landed.updates);
+    assert_eq!(added(&landed.updates), vec![1]);
+    assert!(
+        !runtime.engine().hydrated(sub),
+        "still waiting on the row read"
+    );
+    let landed = runtime.fetched(again.id, db.snapshot(&again));
+    assert!(landed.updates.is_empty(), "already held, whole");
+    assert!(runtime.engine().hydrated(sub));
+    assert_eq!(runtime.outstanding(), 0);
+    let whole = BTreeMap::from([(1, (Some("long".into()), Value::Int(1)))]);
+    assert_eq!(md_and_replies(runtime.engine().rows_for(sub)), whole);
+
+    let (other, step) = runtime.register(busy_in_channel("a", 0));
+    settle(&mut runtime, &db, step);
+    assert_eq!(md_and_replies(runtime.engine().rows_for(other)), whole);
+    assert_eq!(runtime.engine().stats().frame_mismatches, 0);
+    assert_eq!(runtime.engine().stats().row_reads, 1);
+}
+
+/// An update that leaves `md` alone moves a row into a hydrated
+/// subscription nobody else holds it for: the row is read again, the
+/// subscription waits on that read, and the client receives the whole
+/// row when it lands. A second update to the row meanwhile joins the
+/// same read.
+#[test]
+fn a_row_an_update_brings_in_is_read_again() {
+    let mut db = Db::at(0);
+    db.seed(&[conversation(1, "a", 7, 0, "long")]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let (sub, step) = runtime.register(in_channel("b"));
+    settle(&mut runtime, &db, step);
+    assert!(runtime.engine().hydrated(sub));
+
+    let step = stream(&mut runtime, &mut db, &reply(1, "b", 7, 0));
+    assert!(step.updates.is_empty());
+    let again = only(&step);
+    assert!(!runtime.engine().hydrated(sub), "waits on the row read");
+    let step = stream(&mut runtime, &mut db, &reply(1, "b", 7, 1));
+    assert!(
+        step.updates.is_empty() && step.selects.is_empty(),
+        "joins the read already out"
+    );
+
+    let landed = runtime.fetched(again.id, db.snapshot(&again));
+    assert_whole(&landed.updates);
+    assert_eq!(added(&landed.updates), vec![1]);
+    assert!(runtime.engine().hydrated(sub));
+    assert_eq!(
+        md_and_replies(runtime.engine().rows_for(sub)),
+        BTreeMap::from([(1, (Some("long".into()), Value::Int(1)))])
+    );
+    assert_eq!(runtime.engine().stats().row_reads, 1);
+}
+
+/// A row read lags the stream like any read: it is brought up before it
+/// lands, so updates after its snapshot apply (completed from it), and
+/// a delete after it leaves nothing to land.
+#[test]
+fn a_row_read_is_brought_up_like_any_read() {
+    let mut db = Db::at(0);
+    db.seed(&[
+        conversation(1, "a", 7, 0, "long"),
+        conversation(2, "a", 7, 0, "other"),
+    ]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let (sub, step) = runtime.register(in_channel("b"));
+    settle(&mut runtime, &db, step);
+
+    let again = only(&stream(&mut runtime, &mut db, &reply(1, "b", 7, 0)));
+    let snapshot = db.snapshot(&again);
+    stream(&mut runtime, &mut db, &reply(1, "b", 7, 5));
+    let landed = runtime.fetched(again.id, snapshot);
+    assert_whole(&landed.updates);
+    assert_eq!(
+        md_and_replies(runtime.engine().rows_for(sub)),
+        BTreeMap::from([(1, (Some("long".into()), Value::Int(5)))])
+    );
+
+    let again = only(&stream(&mut runtime, &mut db, &reply(2, "b", 7, 0)));
+    let snapshot = db.snapshot(&again);
+    stream(&mut runtime, &mut db, &delete("conversations", 2));
+    let landed = runtime.fetched(again.id, snapshot);
+    assert!(landed.updates.is_empty());
+    assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([1]));
+    assert!(runtime.engine().hydrated(sub));
+    assert_eq!(runtime.outstanding(), 0);
+}
+
+/// A read on a snapshot from before an update that brought a row into
+/// its filter, the row in no snapshot and the update leaving `md` out:
+/// the read cannot land the row whole, so it reads it again, and the
+/// subscription is hydrated once that read lands.
+#[test]
+fn a_read_behind_an_update_that_brought_its_row_in_reads_it_again() {
+    let mut db = Db::at(0);
+    db.seed(&[conversation(1, "a", 7, 0, "long")]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let stale_rows = db.storage.rows(&in_channel("b"));
+    let stale_at = db.head();
+
+    stream(&mut runtime, &mut db, &reply(1, "b", 7, 1));
+    let (sub, step) = runtime.register(in_channel("b"));
+    let read = only(&step);
+    let landed = runtime.fetched(
+        read.id,
+        Snapshot {
+            rows: stale_rows,
+            at: stale_at,
+        },
+    );
+    assert!(landed.updates.is_empty(), "no partial row sent");
+    let again = only(&landed);
+    assert!(!runtime.engine().hydrated(sub));
+    let landed = runtime.fetched(again.id, db.snapshot(&again));
+    assert_whole(&landed.updates);
+    assert!(runtime.engine().hydrated(sub));
+    assert_eq!(
+        md_and_replies(runtime.engine().rows_for(sub)),
+        BTreeMap::from([(1, (Some("long".into()), Value::Int(1)))])
+    );
+}
+
+/// The same, but a whole update of the row came first, while the row was
+/// still outside the filter: the later update's image is completed from
+/// it, in commit order, and nothing is read again.
+#[test]
+fn a_chain_of_updates_completes_from_the_last_whole_image() {
+    let mut db = Db::at(0);
+    db.seed(&[conversation(1, "a", 7, 0, "long")]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let stale_rows = db.storage.rows(&in_channel("b"));
+    let stale_at = db.head();
+
+    stream(&mut runtime, &mut db, &edit(1, "a", 7, 0, "edited"));
+    stream(&mut runtime, &mut db, &reply(1, "b", 7, 1));
+    let (sub, step) = runtime.register(in_channel("b"));
+    let read = only(&step);
+    let landed = runtime.fetched(
+        read.id,
+        Snapshot {
+            rows: stale_rows,
+            at: stale_at,
+        },
+    );
+    assert_whole(&landed.updates);
+    assert!(landed.selects.is_empty());
+    assert_eq!(
+        md_and_replies(runtime.engine().rows_for(sub)),
+        BTreeMap::from([(1, (Some("edited".into()), Value::Int(1)))])
+    );
+    assert_eq!(runtime.engine().stats().row_reads, 0);
+}
+
+/// A twin registered while the row is read again for its query waits on
+/// that read too; an unregistered reader's share lands as nothing.
+#[test]
+fn twins_join_a_row_read_and_leavers_drop_out() {
+    let mut db = Db::at(0);
+    db.seed(&[conversation(1, "a", 7, 0, "long")]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let (first, step) = runtime.register(in_channel("b"));
+    settle(&mut runtime, &db, step);
+
+    let again = only(&stream(&mut runtime, &mut db, &reply(1, "b", 7, 1)));
+    let (twin, step) = runtime.register(in_channel("b"));
+    assert!(step.selects.is_empty() && step.updates.is_empty());
+    assert!(!runtime.engine().hydrated(twin), "waits on the row read");
+    runtime.unregister(first);
+
+    let landed = runtime.fetched(again.id, db.snapshot(&again));
+    assert_whole(&landed.updates);
+    assert_eq!(landed.updates.len(), 1);
+    assert_eq!(landed.updates[0].target_count(), 1, "the twin alone");
+    assert!(runtime.engine().hydrated(twin));
+    assert_eq!(ids(runtime.engine().rows_for(twin)), BTreeSet::from([1]));
+}
+
+/// A refused row read unsubscribes its readers like any refused read, and
+/// the next subscription needing the row asks again instead of waiting on
+/// it.
+#[test]
+fn a_refused_row_read_is_asked_again() {
+    let mut db = Db::at(0);
+    db.seed(&[conversation(1, "a", 7, 0, "long")]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let (first, step) = runtime.register(in_channel("b"));
+    settle(&mut runtime, &db, step);
+    let again = only(&stream(&mut runtime, &mut db, &reply(1, "b", 7, 1)));
+    assert_eq!(runtime.refused(again.id), vec![first]);
+
+    let (second, step) = runtime.register(in_channel("b"));
+    let read = only(&step);
+    let snapshot = db.snapshot(&read);
+    let step = stream(&mut runtime, &mut db, &reply(1, "b", 7, 2));
+    let asked = only(&step);
+    assert_ne!(asked.id, again.id, "a new row read");
+    let mut updates = runtime.fetched(read.id, snapshot).updates;
+    updates.extend(settle(
+        &mut runtime,
+        &db,
+        Step {
+            updates: Vec::new(),
+            selects: vec![asked],
+        },
+    ));
+    assert_whole(&updates);
+    assert!(runtime.engine().hydrated(second));
+    assert_eq!(
+        md_and_replies(runtime.engine().rows_for(second)),
+        BTreeMap::from([(1, (Some("long".into()), Value::Int(2)))])
+    );
+}
+
+/// Under a window: the row read again lands through the window like the
+/// update's own row would have, entering the page and pushing the worse
+/// row out.
+#[test]
+fn a_row_read_lands_through_the_window() {
+    let mut db = Db::at(0);
+    db.seed(&[
+        conversation(1, "a", 7, 0, "long"),
+        conversation(2, "b", 7, 0, "two"),
+    ]);
+    let mut runtime = Runtime::new(SingleTableIVM::new());
+    runtime.progress(db.head());
+    let first_of_b = SingleTableReadQuery::new(
+        "conversations",
+        Where::condition("channel", ComparisonOperator::EQ, "b"),
+        OrderBy::new("id", Order::ASC),
+        1,
+    );
+    let (sub, step) = runtime.register(first_of_b);
+    settle(&mut runtime, &db, step);
+    assert_eq!(ids(runtime.engine().rows_for(sub)), BTreeSet::from([2]));
+
+    let again = only(&stream(&mut runtime, &mut db, &reply(1, "b", 7, 1)));
+    let landed = runtime.fetched(again.id, db.snapshot(&again));
+    assert_whole(&landed.updates);
+    assert_eq!(added(&landed.updates), vec![1]);
+    assert_eq!(
+        md_and_replies(runtime.engine().rows_for(sub)),
+        BTreeMap::from([(1, (Some("long".into()), Value::Int(1)))])
+    );
+}
+
+/// Through the join layer: the row read again arrives at the main part
+/// as the update's row would have, and its join value fetches the driven
+/// rows.
+#[test]
+fn a_row_read_cascades_through_a_join() {
+    let mut db = Db::at(0);
+    db.seed(&[user(7, "meera"), conversation(1, "a", 7, 0, "long")]);
+    let mut runtime = Runtime::new(MultiTableIVM::new());
+    runtime.progress(db.head());
+    let spec = MultiTableReadQuery::new(
+        in_channel("b"),
+        vec![Join::left(
+            MultiTableReadQuery::single(query(&users_table(), Where::AND(vec![]))),
+            "author",
+            "id",
+        )],
+    );
+    let (sub, step) = runtime.register(spec);
+    settle(&mut runtime, &db, step);
+    assert!(runtime.engine().hydrated(sub));
+
+    let step = stream(&mut runtime, &mut db, &reply(1, "b", 7, 1));
+    assert!(step.updates.is_empty());
+    let again = only(&step);
+    assert!(!runtime.engine().hydrated(sub));
+    let landed = runtime.fetched(again.id, db.snapshot(&again));
+    let users = only(&landed);
+    assert_eq!(users.query.table, "users");
+    let mut updates = landed.updates;
+    updates.extend(settle(
+        &mut runtime,
+        &db,
+        Step {
+            updates: Vec::new(),
+            selects: vec![users],
+        },
+    ));
+    assert_whole(
+        &updates
+            .iter()
+            .filter(|delta| delta.table == "conversations")
+            .cloned()
+            .collect::<Vec<_>>(),
+    );
+    assert!(runtime.engine().hydrated(sub));
+    assert_eq!(
+        md_and_replies(runtime.engine().rows_for(sub, QueryPart::main())),
+        BTreeMap::from([(1, (Some("long".into()), Value::Int(1)))])
+    );
+    assert_eq!(
+        ids(runtime.engine().rows_for(sub, QueryPart::join(0))),
+        BTreeSet::from([7])
+    );
+}
