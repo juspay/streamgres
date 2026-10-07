@@ -75,8 +75,7 @@ struct Delivered {
 /// - `rows_refreshed`: result rows whose image was replaced before
 ///   landing by such a write.
 /// - `rows_completed`: such writes' images the feed left columns out of,
-///   completed from the row's image before them (the snapshot's or an
-///   earlier write's).
+///   completed from the result's image of the row.
 /// - `writes_buffered`: writes remembered for reads to be brought up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncStats {
@@ -387,13 +386,11 @@ impl<E: Engine> Runtime<E> {
     /// the rows for that frontier, since the rows alone, some of them
     /// dropped here, no longer say the read was full.
     ///
-    /// Each write applies onto the row's image before it, in commit
-    /// order: the snapshot's while the result holds the row, the last
-    /// write's otherwise (a row dropped from the result, or never in it).
-    /// An image the feed left columns out of takes them from there, and is
-    /// filtered whole. A row no whole image reaches (in no snapshot, and
-    /// brought in by a write that left columns out) stays partial; the
-    /// engine does not adopt it, and reads it again.
+    /// A new image the feed left columns out of is completed from the
+    /// result's image of the row, when the result holds it, and filtered
+    /// whole. A row the result does not hold that such a write brings into
+    /// the filter stays partial; the engine does not adopt it, and reads
+    /// it again.
     fn bring_up(
         &mut self,
         fetch: &Fetch,
@@ -421,10 +418,6 @@ impl<E: Engine> Runtime<E> {
                 order_rows(&query.order_by, image, worst) == std::cmp::Ordering::Greater
             })
         };
-        // The last image of each row a write touched that the result does
-        // not hold: what a later write leaving columns out is completed
-        // from.
-        let mut outside: HashMap<DataFrameKey, DataFrameRow> = HashMap::new();
         for delivered in &self.recent {
             if delivered.at <= at || delivered.write.table() != table {
                 continue;
@@ -438,25 +431,23 @@ impl<E: Engine> Runtime<E> {
                     }
                     index.remove(key);
                 }
-                outside.remove(key);
                 continue;
             };
-            let before = match position {
-                Some(position) => rows[position].as_ref().map(|(_, row)| row),
-                None => outside.get(key),
+            let completed = if image.data.is_partial() {
+                let before = position.and_then(|position| rows[position].as_ref());
+                complete_image(Some(image), before.map(|(_, row)| row))
+            } else {
+                None
             };
-            let image = match complete_image(Some(image), before) {
-                Some(completed) => {
-                    self.stats.rows_completed += 1;
-                    completed
-                }
-                None => image.clone(),
-            };
-            let admitted = evaluate(&query.filter, &image.data, &mut 0) && !beyond(&image);
+            if completed.is_some() {
+                self.stats.rows_completed += 1;
+            }
+            let image = completed.as_ref().unwrap_or(image);
+            let admitted = evaluate(&query.filter, &image.data, &mut 0) && !beyond(image);
             match position {
                 Some(position) if admitted => {
                     if let Some((_, row)) = rows[position].as_mut() {
-                        *row = image;
+                        *row = image.clone();
                         self.stats.rows_refreshed += 1;
                     }
                 }
@@ -465,17 +456,13 @@ impl<E: Engine> Runtime<E> {
                         self.stats.rows_dropped += 1;
                     }
                     index.remove(key);
-                    outside.insert(key.clone(), image);
                 }
                 None if admitted => {
-                    outside.remove(key);
                     index.insert(key.clone(), rows.len());
-                    rows.push(Some((key.clone(), image)));
+                    rows.push(Some((key.clone(), image.clone())));
                     self.stats.rows_added += 1;
                 }
-                None => {
-                    outside.insert(key.clone(), image);
-                }
+                None => {}
             }
         }
         (rows.into_iter().flatten().collect(), worst_read)

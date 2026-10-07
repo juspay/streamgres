@@ -1531,7 +1531,6 @@ fn unchanged_out_of_line_values_are_never_lost() {
         assert_eq!(stored.len(), 2);
         assert_eq!(held, stored, "the frame holds what Postgres holds");
         assert!(runtime.engine().hydrated(sub));
-        assert_eq!(runtime.engine().stats().frame_mismatches, 0);
         assert_eq!(
             runtime.engine().stats().row_reads,
             2,

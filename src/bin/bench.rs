@@ -2810,11 +2810,7 @@ fn partial_images() {
         .flat_map(|rows| rows.into_values())
         .filter(|row| row.data.is_partial() || row.data.get("md").is_none())
         .count();
-    println!(
-        "frame: {} rows held without md, {} frame mismatches",
-        without_md,
-        ivm.engine().stats().frame_mismatches
-    );
+    println!("frame: {without_md} rows held without md");
 }
 
 /// Scenario 5b: a conversation an update moves into a subscription's

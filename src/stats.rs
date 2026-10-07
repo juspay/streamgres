@@ -267,6 +267,7 @@ pub struct Stats {
     pub frames: AtomicU64,
     pub rows_serialized: AtomicU64,
     pub rows_shared: AtomicU64,
+    pub partial_rows_sent: AtomicU64,
     pub rows_read: AtomicU64,
     pub transform_hits: AtomicU64,
     pub transform_misses: AtomicU64,
@@ -428,6 +429,7 @@ impl Stats {
             frames: AtomicU64::new(0),
             rows_serialized: AtomicU64::new(0),
             rows_shared: AtomicU64::new(0),
+            partial_rows_sent: AtomicU64::new(0),
             rows_read: AtomicU64::new(0),
             transform_hits: AtomicU64::new(0),
             transform_misses: AtomicU64::new(0),
@@ -637,6 +639,8 @@ impl Stats {
             ("frames", load(&self.frames)),
             ("rows_serialized", load(&self.rows_serialized)),
             ("rows_shared", load(&self.rows_shared)),
+            ("partial_images", crate::sync::pg::stream::partial_images()),
+            ("partial_rows_sent", load(&self.partial_rows_sent)),
             ("rows_read", load(&self.rows_read)),
             ("transform_hits", load(&self.transform_hits)),
             ("transform_misses", load(&self.transform_misses)),
@@ -992,7 +996,6 @@ impl Stats {
                 "page_rounds": engine.ivm.page_rounds,
                 "page_lookups": engine.ivm.page_lookups,
                 "row_reads": engine.ivm.row_reads,
-                "frame_mismatches": engine.ivm.frame_mismatches,
                 "snapshots_shared": engine.ivm.snapshots_shared,
                 "reads_issued": engine.sync.reads_issued,
                 "reads_landed": engine.sync.reads_landed,
@@ -1154,7 +1157,6 @@ impl Stats {
             ("page_rounds_total", engine.ivm.page_rounds),
             ("page_lookups_total", engine.ivm.page_lookups),
             ("row_reads_total", engine.ivm.row_reads),
-            ("frame_mismatches_total", engine.ivm.frame_mismatches),
             ("rows_completed_total", engine.sync.rows_completed),
             ("registrations_total", engine.ivm.queries_registered),
             ("client_updates_add_total", engine.ivm.ops_add),
@@ -1485,6 +1487,12 @@ fn measure_help(name: &str) -> &'static str {
         "pokes" => "pokes written to client groups",
         "frames" => "WebSocket frames written",
         "rows_serialized" => "row images turned into JSON, each the first time it was sent",
+        "partial_images" => {
+            "update images decoded with a large value left out, PostgreSQL having sent it as unchanged"
+        }
+        "partial_rows_sent" => {
+            "row images missing such a value turned into JSON for a client; anything above 0 is a blank-column bug"
+        }
         "rows_shared" => "row images sent from the bytes kept on them since an earlier send",
         "rows_read" => "rows storage reads returned",
         "transform_hits" | "transform_misses" | "transform_errors" => {
@@ -1548,9 +1556,6 @@ fn measure_help(name: &str) -> &'static str {
         "page_lookups_total" => "reads pages asked for of a join value they had dropped",
         "row_reads_total" => {
             "rows read again by key because an update left a large unchanged value out and no whole copy was held"
-        }
-        "frame_mismatches_total" => {
-            "rows a landing read brought that disagree with the frame's image of them (drift; should stay 0)"
         }
         "rows_completed_total" => {
             "update images missing a large unchanged value, completed from the row's earlier image while bringing a read up"

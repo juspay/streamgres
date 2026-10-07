@@ -105,6 +105,8 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_feed_transactions_total`, `xyne_sync_feed_writes_total` | what came through the feed |
 | `xyne_sync_writes_impacting_total`, `xyne_sync_client_updates_total{op=add,delete}`, `xyne_sync_narrowed_reads_total` | routing counters |
 | `xyne_sync_pokes_total`, `xyne_sync_frames_total`, `xyne_sync_rows_serialized_total`, `xyne_sync_rows_shared_total` | the client side's output |
+| `xyne_sync_partial_images_total`, `xyne_sync_partial_rows_sent_total` | update images the feed decoded with a large value left out (PostgreSQL sent it as unchanged); such images that reached a client as a row, which should stay 0, since the engine completes them or reads the row again |
+| `xyne_sync_row_reads_total`, `xyne_sync_rows_completed_total` | rows read again by primary key because the only image at hand was partial; partial images completed from a read's row while it was brought up |
 | `xyne_sync_feed_lsn`, `xyne_sync_feed_heartbeat_age_seconds` | where the feed is, and how long since PostgreSQL was last heard on the replication connection (a transaction, or a keepalive saying how far its log has been gone through; nothing is written to the database to be heard). On a primary the read snapshots alone keep it under their rotation |
 | `xyne_sync_engine_inbox`, `xyne_sync_groups_inbox{shard}` | queue depths, sampled |
 

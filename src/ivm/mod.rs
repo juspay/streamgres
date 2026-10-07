@@ -364,11 +364,14 @@ impl SingleTableIVM {
             .map(|row| row.data.clone());
         let completed = complete_image(write_query.new_row_image(), old_data.as_ref());
         let row_image = completed.as_ref().or(write_query.new_row_image());
-        let withheld = old_data.is_none() && row_image.is_some_and(|image| image.data.is_partial());
+        let unconformed = row_image;
         let conformed = row_image.and_then(|image| self.conform(&table, image));
         let row_image = conformed.as_ref().or(row_image);
         let impacts = self.analyze(&table, &key, row_image);
-        if withheld {
+        if old_data.is_none()
+            && !impacts.is_empty()
+            && unconformed.is_some_and(|image| image.data.is_partial())
+        {
             let entering: Vec<SubId> = impacts.iter().map(|impact| impact.sub).collect();
             self.read_row(&table, &key, &entering);
             return Vec::new();

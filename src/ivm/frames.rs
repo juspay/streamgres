@@ -359,9 +359,7 @@ impl SingleTableIVM {
     /// with columns the feed left out) is never adopted: a held row is
     /// tagged with the frame's whole image, and one nobody holds that the
     /// filter admits is read again for `sub`
-    /// ([`SingleTableIVM::read_row`]), which waits on it. A whole row that
-    /// disagrees with the frame's image is counted in `frame_mismatches`;
-    /// the frame's image is kept.
+    /// ([`SingleTableIVM::read_row`]), which waits on it.
     fn land_row(
         &mut self,
         sub: SubId,
@@ -390,14 +388,10 @@ impl SingleTableIVM {
         let row = conformed.as_ref().unwrap_or(row);
         let frame = self.frames.entry(table.clone()).or_default();
         let (id, shared) = frame.entry(key, || row.clone());
-        if !partial && !Arc::ptr_eq(&shared.data.data, &row.data) && shared.data != *row {
-            self.stats.frame_mismatches += 1;
-            debug_assert!(
-                false,
-                "a read brought up to the engine's position agrees with the frame: {:?} vs {:?}",
-                shared.data, row
-            );
-        }
+        debug_assert!(
+            partial || shared.data == *row,
+            "a read brought up to the engine's position agrees with the frame"
+        );
         if shared.held_by(sub) {
             return None;
         }

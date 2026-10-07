@@ -1748,6 +1748,9 @@ fn put_fragment(
     }
     let declared = catalog.table(table.as_str())?;
     stats.rows_serialized.fetch_add(1, Ordering::Relaxed);
+    if row.data.is_partial() {
+        stats.partial_rows_sent.fetch_add(1, Ordering::Relaxed);
+    }
     let mut bytes = Vec::with_capacity(256);
     wire::write_put(&mut bytes, declared, row);
     let bytes = Bytes::from(bytes);
@@ -2854,6 +2857,27 @@ mod tests {
         );
         assert_eq!(stats.rows_shared.load(Ordering::Relaxed), 3);
         assert_eq!(first, second, "the same frames from the kept bytes");
+    }
+
+    /// A partial image (a column the feed left out as unchanged) reaching
+    /// a client is counted when it is first turned into JSON; whole images
+    /// are not. The engine never sends one, so the count is the alarm.
+    #[test]
+    fn a_partial_row_sent_is_counted() {
+        let (catalog, table, rows) = images(2, "a");
+        let partial = DataFrameRow::from(RowData::partial(
+            rows[0]
+                .data
+                .iter()
+                .filter(|(column, _)| column.as_str() == "id")
+                .map(|(column, value)| (column.clone(), value.clone()))
+                .collect(),
+        ));
+        let stats = Stats::new();
+        let patches = [Patch::Put(&table, &rows[1]), Patch::Put(&table, &partial)];
+        build_poke(&catalog, &stats, 2, "1", None, "01", Vec::new(), &patches);
+        assert_eq!(stats.rows_serialized.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.partial_rows_sent.load(Ordering::Relaxed), 1);
     }
 
     /// A changed row is a new image: it is written anew, and the bytes
