@@ -16,8 +16,8 @@
 //! At startup it can drop this server's inactive slots once they have
 //! exceeded an explicitly configured age; the PostgreSQL 17
 //! `inactive_since` timestamp makes that cleanup safe across restarts.
-//! Schema changes reach the feed as the messages of the reference server's
-//! DDL event trigger ([`super::ddl`]); the server refuses to serve
+//! Schema changes reach the feed as the messages of the schema-change
+//! event trigger ([`super::ddl`]); the server refuses to serve
 //! without that trigger ([`require_ddl_trigger`]).
 //!
 //! A consumer that must read some rows for itself (an application's

@@ -14,6 +14,7 @@ import {randomUUID} from 'node:crypto';
 const pg = process.env.RACE_PG;
 if (!pg) throw new Error('RACE_PG is required');
 const gateway = process.env.RACE_GATEWAY ?? 'ws://127.0.0.1:4848/sync';
+const shardSchema = `${process.env.XYNE_SYNC_APP_ID ?? 'xyne'}_${process.env.XYNE_SYNC_SHARD ?? '0'}`;
 const port = Number(process.env.RACE_MUTATE_PORT ?? 4781);
 const group = `race-group-${randomUUID()}`;
 const client = `race-client-${randomUUID()}`;
@@ -37,8 +38,8 @@ const mutate = Bun.serve({
     if (calls === 1) {
       const q = (value) => `'${value.replaceAll("'", "''")}'`;
       sql(`BEGIN;
-           INSERT INTO xyne_0.clients ("clientGroupID", "clientID", "lastMutationID") VALUES (${q(group)}, ${q(client)}, 1);
-           INSERT INTO xyne_0.mutations ("clientGroupID", "clientID", "mutationID", result) VALUES (${q(group)}, ${q(client)}, 1, '{"error":"app","message":"denied by race test"}'::json);
+           INSERT INTO ${shardSchema}.clients ("clientGroupID", "clientID", "lastMutationID") VALUES (${q(group)}, ${q(client)}, 1);
+           INSERT INTO ${shardSchema}.mutations ("clientGroupID", "clientID", "mutationID", result) VALUES (${q(group)}, ${q(client)}, 1, '{"error":"app","message":"denied by race test"}'::json);
            COMMIT;`);
       return Response.json({kind: 'MutateResponse', mutations: [{id: mutation, result: {error: 'app', message: 'denied by race test'}}]});
     }

@@ -1,9 +1,9 @@
-//! Print the DDL event-trigger stack the reference server installs, for a database
-//! the reference server has never run against (a lab, a test database), so that the
-//! server can hear of schema changes there:
+//! Print the schema-change event-trigger stack for a database that does
+//! not have it yet (a lab, a test database), so that the server can hear
+//! of schema changes there:
 //! `cargo run --example ddl_triggers -- <app> <shard> <publication>... | psql "$DSN"`.
 
-use xyne_sync::sync::pg::ddl::trigger_stack_sql;
+use xyne_sync::client::ddl_triggers::trigger_stack_sql;
 
 /// Print the stack for the app, shard and publications given.
 fn main() {

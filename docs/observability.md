@@ -243,7 +243,7 @@ increase(xyne_sync_connections_total{event="refused"}[5m]) > 0
 
 ### Locally (Apple M4 Max, the server over the wire, `scripts/load-sweep.sh`)
 
-The same sweep as the paper's table of 2026-09-18 (200 sync-protocol
+The same sweep as the paper's table of 2026-09-18 (200 protocol
 clients holding the chat screen's queries, rows committed straight into
 PostgreSQL), on the observability build with JSON logs on and the
 sampler at its default; raw results in

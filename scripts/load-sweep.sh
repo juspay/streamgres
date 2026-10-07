@@ -114,6 +114,7 @@ if [ -n "${LINUX_BIN:-}" ]; then
     docker rm -f xs-load >/dev/null 2>&1 || true
     docker run -d --name xs-load --network host --cpus "$cpus" -v "$LINUX_BIN:/server:ro" \
       -e XYNE_SYNC_ADDR=0.0.0.0:$PORT -e XYNE_SYNC_PUBLICATION=xyne_load_pub -e XYNE_SYNC_PG_DSN="$PG_DSN" \
+      -e XYNE_SYNC_BASE_PATH=/sync -e XYNE_SYNC_APP_ID="${APP_ID:-xyne}" \
       -e XYNE_SYNC_QUERY_URL="$QUERY_URL" -e XYNE_SYNC_MUTATE_URL="$MUTATE_URL" -e XYNE_SYNC_LOG=info \
       -e XYNE_SYNC_GROUP_TTL_MS="$GROUP_TTL_MS" -e XYNE_SYNC_GROUP_THREADS="$GROUP_THREADS" \
       debian:bookworm-slim /server >/dev/null

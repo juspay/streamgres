@@ -1257,7 +1257,7 @@ mod tests {
         }
     }
 
-    /// A `ddlUpdate` as the reference server's end trigger writes it for `ALTER
+    /// A `ddlUpdate` as the schema-change end trigger writes it for `ALTER
     /// TABLE`, on the prefix the feed under test listens on, with the
     /// published tables `previous` before and `after` after the command.
     fn ddl(previous: &str, after: &str) -> ReplicationEvent {

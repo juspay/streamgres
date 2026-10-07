@@ -58,7 +58,7 @@ impl std::fmt::Display for SubId {
 /// - `Main`: the enclosing node's rows pick the sub rows (the client's
 ///   `related`, a LEFT join, and an inner join evaluated from the parent).
 /// - `Sub`: the sub rows pick the enclosing node's rows (a RIGHT join, and
-///   an inner join evaluated from the child, the client's `whereExists` as
+///   an inner join evaluated from the child, `whereExists` as
 ///   translated).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Driver {
@@ -95,7 +95,7 @@ pub enum Driver {
 /// unnamed, it is conjoined. Below the root, the sub node of an edge the
 /// main drives may carry an `order_by` / `limit` of its own: it is a
 /// window **per enclosing row**, the best *n* sub rows for each value the
-/// enclosing rows reference (`related` with a limit in the client's terms). A
+/// enclosing rows reference (`related` with a limit, in the client's terms). A
 /// sub node that drives its edge is read whole, so its limit is an
 /// ordinary window on that node. A `NULL` (or missing) join value never
 /// matches, consistent with the engine's NULL semantics.
@@ -153,7 +153,7 @@ impl Join {
     }
 
     /// An INNER edge evaluated from the sub: the sub rows drive and are
-    /// shown only under a shown main row (the client's `whereExists`).
+    /// shown only under a shown main row (`whereExists`).
     pub fn inner(
         sub: MultiTableReadQuery,
         main_table_column: impl Into<ColumnName>,

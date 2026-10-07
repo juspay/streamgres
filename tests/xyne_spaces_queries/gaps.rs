@@ -266,7 +266,7 @@ fn o_compound_order_pages_by_the_tiebreak_and_a_related_limit_is_per_parent() {
     );
 }
 
-/// Gap J: the client's `json` columns land in the catalog as strings, so a
+/// Gap J: the schema's `json` columns land in the catalog as strings, so a
 /// query can compare a whole document but not look inside it.
 #[test]
 fn j_json_columns_are_opaque_strings() {

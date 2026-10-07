@@ -1,8 +1,9 @@
-//! The server's telemetry pushed to a collector, configured the way
-//! the reference server's is: by the standard `OTEL_*` environment variables, so a
-//! deployment that already feeds a collector from the reference server feeds it from
-//! this server with the same block of settings. Metrics go out over
-//! OTLP/HTTP as JSON (the reference server's own default protocol) every
+//! The server's telemetry pushed to a collector, configured the way the
+//! reference server's is: by the standard `OTEL_*` environment variables,
+//! so a deployment that already feeds a collector from the reference
+//! server feeds it from this server with the same block of settings.
+//! Metrics go out over OTLP/HTTP as JSON (the reference server's own
+//! default protocol) every
 //! `OTEL_METRIC_EXPORT_INTERVAL`; log records, when the logs exporter is
 //! on, go out in batches as the log thread writes them, beside the lines
 //! it writes to stderr (the reference server tees the same way). One thread,
@@ -10,8 +11,8 @@
 //! here runs on a thread that serves clients, a slow or absent collector
 //! costs a dropped batch and a counted failure, never a wait.
 //!
-//! What is read, as the reference server and the OpenTelemetry specification read
-//! it: a signal is on when `OTEL_EXPORTER_OTLP_ENDPOINT`, its own
+//! What is read, as the reference server and the OpenTelemetry
+//! specification read it: a signal is on when `OTEL_EXPORTER_OTLP_ENDPOINT`, its own
 //! `OTEL_EXPORTER_OTLP_{METRICS,LOGS}_ENDPOINT` or its own
 //! `OTEL_{METRICS,LOGS}_EXPORTER` is set, and that exporter is not `none`;
 //! `OTEL_SDK_DISABLED=true` turns everything off. The base endpoint gets
@@ -540,7 +541,7 @@ mod tests {
     /// and leaves logs off, every five seconds, to the collector's
     /// `/v1/metrics`; with nothing set nothing is sent.
     #[test]
-    fn the_settings_the_reference_server_runs_with_are_read_the_same() {
+    fn the_settings_the_ref_server_runs_with_are_read_the_same() {
         let sandbox = config(&[
             ("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4318"),
             ("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json"),

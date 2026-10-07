@@ -49,7 +49,7 @@ pub enum ValueType {
     List(Box<ValueType>),
     Map(Box<ValueType>, Box<ValueType>),
     /// A point in time carried as milliseconds since the Unix epoch, the
-    /// form Zero clients see for `timestamp`, `timestamptz` and `date`
+    /// form protocol clients see for `timestamp`, `timestamptz` and `date`
     /// columns; the cell is a [`Value::Int`].
     Timestamp,
     /// A JSON document carried as its text, the form the engine keeps for

@@ -18,7 +18,7 @@
 //! | [`ivm`] | The engine: query registration, write routing (`search_impacted_queries`), delta computation (`incremental_update`), operation counters — plus the multi-table join layer ([`ivm::MultiTableIVM`]) and the read requests ([`ivm::Fetch`]) it records instead of reading storage itself. |
 //! | [`sync`] | Running an engine against a source: positions, the asynchronous [`sync::Storage`] seam, the single-owner [`sync::Runtime`] that lands reads against the write stream, the two drivers ([`sync::Service`] answers on an [`sync::Event`] stream), and PostgreSQL ([`sync::pg`], whose [`sync::pg::threads`] wires feed, storage and driver into one engine side). |
 //! | [`parser`] | SQL text → query model: schema-aware parsing against a [`parser::Catalog`]. |
-//! | [`client`] | The client side: the WebSocket server a Zero client connects to, the sync protocol, the AST translation, and each client group's view. It drives the engine only through [`sync::Service`]'s two channels. |
+//! | [`client`] | The client side: the WebSocket server the sync client connects to, the sync protocol, the AST translation, and each client group's view. It drives the engine only through [`sync::Service`]'s two channels. |
 //! | [`log`] | The leveled log the binary and the client side write to. |
 //! | [`stats`] | The server's own measurements: per-stage latency histograms and counters, served at `/stats`. |
 //! | [`profile`] | Continuous CPU and heap profiling pushed to Pyroscope, when `XYNE_SYNC_PYROSCOPE_URL` asks for it. |
@@ -42,9 +42,9 @@
 //!    ([`sync::Runtime`]); PostgreSQL storage positioned by WAL location
 //!    or transaction id and a `test_decoding` change-feed poller
 //!    ([`sync::pg`]), with live tests and a bench scenario
-//! 6. ✅ `INNER` edges, the streaming `pgoutput` consumer, and Zero's sync
-//!    protocol over WebSockets ([`client`]) against an unmodified Zero
-//!    client, with the engine reached only through [`sync::Service`]
+//! 6. ✅ `INNER` edges, the streaming `pgoutput` consumer, and the sync
+//!    protocol (v51) over WebSockets ([`client`]) against an unmodified
+//!    client of the protocol, with the engine reached only through [`sync::Service`]
 //! 7. ✅ Windows below the root (a `related` node's `ORDER BY` / `LIMIT`
 //!    as a window per parent row) and the join planner (every edge with a
 //!    driver, the inner edge evaluated from either side; the driver chosen

@@ -8,7 +8,7 @@
 //                 admin would through the UI), and open the writer sockets.
 //   2. seed     – writers create `--seed` conversations in the channel through the
 //                 real `conversations.send` mutation, `--seed-batch` mutations per
-//                 push; like a Zero client, a writer has one push in flight at a
+//                 push; like a protocol client, a writer has one push in flight at a
 //                 time; then `--seed-replies` replies spread over the threads the
 //                 subscribers will open.
 //   3. hydrate  – open `--connections` subscriber sockets, each with the same query
@@ -48,7 +48,7 @@
 // taken from it in order and the token goes in the connection's handshake, so no
 // test login is needed) --thread-query NAME (the per-conversation query, conversationMessages)
 // --client-schema FILE (a JSON client schema to send in initConnection; the TypeScript
-// the reference server requires one for a new client group, this server does not) --post-handshake
+// reference server requires one for a new client group, this server does not) --post-handshake
 // (send initConnection as the first message instead of in the handshake header, the way
 // a client with a large schema does; on by default when --client-schema is given)
 // The `ws` package is found through E2E_WS, `ws`, or ../node_modules/ws.

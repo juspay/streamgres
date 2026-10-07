@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // A self-contained check of a running sync server, with nothing of the application
 // behind it: a PostgreSQL with `wal_level = logical`, the server, and this script as a
-// Zero client speaking the sync protocol with a query AST of its own. It creates one
+// client speaking the sync protocol with a query AST of its own. It creates one
 // table, subscribes, and checks that the rows hydrate, that an insert, an update out of
 // the filter and a delete made straight in PostgreSQL arrive as pokes, that a JSON
 // column is filtered by value however the stored value was spelled (a number with a
@@ -18,6 +18,7 @@
 //
 // Environment: SMOKE_PG (postgresql://postgres:postgres@localhost:5432/postgres),
 // SMOKE_GATEWAY (ws://localhost:4848/sync), SMOKE_HTTP (http://localhost:4848),
+// XYNE_SYNC_APP_ID (xyne) and XYNE_SYNC_SHARD (0), which name the `<app>_<shard>` schema,
 // SMOKE_COLLECTOR (the collector's Prometheus endpoint, http://localhost:9464/metrics;
 // unset skips that check). The server is expected to run with
 // XYNE_SYNC_ROW_LIMIT=600, so the 400 seeded rows make a heavy read. The table must
@@ -28,6 +29,7 @@ import { randomUUID } from 'node:crypto';
 
 const PG = process.env.SMOKE_PG ?? 'postgresql://postgres:postgres@localhost:5432/postgres';
 const GATEWAY = process.env.SMOKE_GATEWAY ?? 'ws://localhost:4848/sync';
+const SHARD_SCHEMA = `${process.env.XYNE_SYNC_APP_ID ?? 'xyne'}_${process.env.XYNE_SYNC_SHARD ?? '0'}`;
 const HTTP = process.env.SMOKE_HTTP ?? 'http://localhost:4848';
 const COLLECTOR = process.env.SMOKE_COLLECTOR;
 const SEEDED = 400;
@@ -37,8 +39,8 @@ const fail = (why) => { console.error('FAIL:', why); process.exit(1); };
 const sql = (text) => execFileSync('psql', [PG, '-v', 'ON_ERROR_STOP=1', '-Atc', text]).toString().trim();
 
 if (process.argv.includes('--prepare')) {
-  sql(`CREATE SCHEMA IF NOT EXISTS xyne_0;
-       CREATE TABLE IF NOT EXISTS xyne_0.clients ("clientGroupID" text, "clientID" text, "lastMutationID" bigint, "userID" text, PRIMARY KEY ("clientGroupID", "clientID"));
+  sql(`CREATE SCHEMA IF NOT EXISTS ${SHARD_SCHEMA};
+       CREATE TABLE IF NOT EXISTS ${SHARD_SCHEMA}.clients ("clientGroupID" text, "clientID" text, "lastMutationID" bigint, "userID" text, PRIMARY KEY ("clientGroupID", "clientID"));
        DROP TABLE IF EXISTS smoke_items;
        CREATE TABLE smoke_items (id text PRIMARY KEY, status text NOT NULL, points integer NOT NULL, meta jsonb, tag jsonb, score jsonb, loose json, bucket text, "createdAt" timestamptz NOT NULL DEFAULT now());
        INSERT INTO smoke_items (id, status, points, meta, tag, score, loose, bucket) SELECT 'seed-' || n, 'OPEN', n, jsonb_build_object('n', n), to_jsonb('t' || (n % 5)), (CASE WHEN n % 5 = 0 THEN '1.50' ELSE '2' END)::jsonb, (CASE WHEN n % 5 = 0 THEN '{ "k":1.50,   "a":[1e1], "k": 1.50 }' ELSE '{"k":2}' END)::json, 'b' || (n % 10) FROM generate_series(1, ${SEEDED}) n;

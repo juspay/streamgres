@@ -65,7 +65,7 @@
 //! **A page under a gate.** In the join layer a windowed part may drive an
 //! inner edge, and the rows that edge rejects (no sub row matches them)
 //! must not take a place in the page: the page is the best `L` rows *the
-//! gate lets through*, as the client's `Take` above its `Exists` computes it.
+//! gate lets through*, as `Take` above `Exists` computes it in the client.
 //! Such a part registers its window as a **page**
 //! ([`SingleTableIVM::register_page`]), and the window then tells held
 //! rows apart: a **candidate** is a held row the gate has not decided

@@ -1,306 +1,345 @@
-# Deploying xyne-sync
+# Deploying Xyne-Sync
 
-For whoever runs the first deployment: what to run, with how much, every
-setting with its default, what PostgreSQL has to allow, how traffic gets to
-it, and what to watch. The target is the first rollout: about 300 connected
-clients, 100 row updates a second, 20 newly opened queries a second.
+This guide covers running the sync server in production:
+- what it needs from PostgreSQL and from your application server
+- how to size it
+- every setting and its default
+- how to route traffic to it, and what to monitor
 
-## 1. The image
+For a local first run, see the README's Quick start.
 
-`.github/workflows/docker-publish.yml` builds `docker/server/Dockerfile` on
-every push to `main` and `feat/build` and on a `v*` tag, and pushes to the
-GitHub Container Registry:
+## 1. What you need
 
+- **PostgreSQL** with `wal_level = logical`. It can be a primary, a logical
+  replica, or a physical standby on PostgreSQL 16+. Section 3 has the details.
+- **An application server** with two HTTP endpoints. The *query* endpoint turns
+  a query name and its arguments into a query AST. The *mutate* endpoint
+  applies a client's mutations. Section 4 has the details.
+- **A host or container** with about 2 cores and 4 GiB of memory to start.
+  Section 2 has the sizing.
+
+## 2. Image and sizing
+
+### The image
+
+```bash
+docker build -f docker/server/Dockerfile -t xyne-sync .
 ```
-ghcr.io/juspay/xyne-sync:<branch>        e.g. ghcr.io/juspay/xyne-sync:main
-ghcr.io/juspay/xyne-sync:<short sha>
-```
 
-It is a Debian slim image of about 125 MB with one binary, `/app/server`,
-run as the unprivileged user `xyne-sync` (uid 10001). It listens on 4848,
-writes JSON log lines to stderr, and needs no file system beyond an
-optional state directory (section 3, `XYNE_SYNC_PLAN_FILE`).
+The image is a slim Debian image of about 125 MB:
+- It has one binary, `/app/server`, run as the unprivileged user `xyne-sync`
+  (uid 10001).
+- It listens on port 4848 and writes JSON log lines to stderr.
+- It needs no file system, except an optional writable directory for
+  `XYNE_SYNC_PLAN_FILE` (section 5).
 
-## 2. Resources
+`.github/workflows/docker-publish.yml` publishes the image to the GitHub
+Container Registry as `ghcr.io/<owner>/xyne-sync`. It runs on pushes to the
+branches listed in that file and on `v*` tags, tagging each image with the
+branch name and the short commit SHA.
 
-| | request | limit |
-|---|---|---|
-| CPU | 2 cores | 4 cores, or none |
-| memory | 4 GiB | 8 GiB |
-| replicas | 1 | 1 |
+### Sizing
 
-Where the numbers come from, on the production-shaped test database:
-
-- 300 connections, each holding 12 queries and opening a new one every
-  0.75 s (about 300 new queries a second, fifteen times this rollout's
-  rate), used 0.6 of a core on average and 1.3 to 1.6 GB of memory, with a
-  median hydration of about 15 ms.
-- 100 updates a second cost the engine well under a tenth of a core; the
-  fan-out to the clients that hold the rows is the larger part and stays
-  under a third of a core at this size.
-- The two cores are for the moments, not the average: a restart makes
-  every client hydrate everything again at once, and the engine is one
-  thread that must never wait for a core. A CPU limit that throttles shows
-  up directly as latency, so set it generously or not at all.
-- Memory is the rows clients hold, about 2 KB a row, shared between
-  clients that hold the same row. A client group's rows stay for
-  `XYNE_SYNC_GROUP_TTL_MS` after its last tab closes (an hour below), so
-  the footprint follows the clients seen in the last hour, not the ones
-  connected now. Alert at 6 GB.
-
-**One replica, `strategy: Recreate`.** The server's state is in memory and
-it owns one PostgreSQL replication slot; two instances cannot share the
-slot, and a second one on its own slot would need every tab of a client
-group routed to the same instance, which nothing does yet. A restart is
-safe and costs a full re-sync: clients reconnect, are told their cookie is
-unknown, drop their local store and hydrate from nothing. Deploy off-peak.
-
-## 3. Settings
-
-Everything is an environment variable. **Must set** has no default.
-**Set for this rollout** differs from the default on purpose. The rest are
-listed with their defaults so the manifest can carry them explicitly.
-
-### Must set
-
-| variable | value |
+| | starting point |
 |---|---|
-| `XYNE_SYNC_PG_DSN` | the application's PostgreSQL, reached directly (no PgBouncer: logical replication does not pass through it). The primary, as the reference server's upstream database is, or a replica of it, logical or physical: the server writes nothing to the database it follows (section 4) |
-| `XYNE_SYNC_QUERY_URL` | the backend's query endpoint, `http://<backend>:3001/api/sync/query`, as the reference server has it |
-| `XYNE_SYNC_MUTATE_URL` | the backend's push endpoint, `http://<backend>:3001/api/sync/push` |
-| `XYNE_SYNC_APP_ID` | the same app id the reference server runs with (default: see `src/client/config.rs`); with the shard it names the schema (`<app>_<shard>`) the backend records mutation ids in |
+| CPU | 2 cores requested; limit 4 or none |
+| memory | 4 GiB requested, 8 GiB limit |
+| replicas | 1 |
 
-### Set for this rollout
+- **CPU.** The engine runs on one thread that should never wait for a core.
+  Load comes in bursts: after a restart, every client re-downloads its data at
+  once. A CPU limit that throttles shows up directly as latency, so set it
+  generously or not at all. In tests, 300 connections each holding 12 queries
+  and opening a new one every 0.75 s used about 0.6 of a core on average.
+- **Memory.** It grows with the rows clients hold: about 2 KB per row. Clients
+  holding the same row share one copy. A client group's rows are kept for
+  `XYNE_SYNC_GROUP_TTL_MS` after its last connection closes, so memory tracks
+  the clients seen within that window, not just the ones connected now.
+- **One replica.** State lives in memory. Every tab of one client group has to
+  reach the same instance, which nothing routes for yet, so run a single
+  replica and replace it on deploys rather than rolling (in Kubernetes,
+  `strategy: Recreate`).
+- **Restarts are safe but cost a full re-sync.** Clients reconnect, are told
+  to start over, and download their data again. Deploy at quiet times.
 
-| variable | value | default | why |
+## 3. PostgreSQL
+
+### Requirements
+
+- **`wal_level = logical`.**
+- **Spare replication capacity.** Leave about eight free slots in
+  `max_replication_slots` and `max_wal_senders`. Each server uses one slot
+  for its change feed, `xyne_sync_slot_<uuid>`, plus short-lived ones,
+  `xyne_sync_snap_*`, behind its read snapshots.
+- **Spare connections.** Allow about 40 connections:
+  `XYNE_SYNC_READ_CONNECTIONS`, plus the feed, plus a few more.
+- **A role** with `REPLICATION` and `SELECT` on the served schemas.
+- **A direct connection, not PgBouncer.** Logical replication does not pass
+  through PgBouncer.
+
+**The server writes nothing to the database it follows.** It reads rows and
+the replication stream. Its position in the stream comes from each commit and
+from the keepalives PostgreSQL sends anyway. So `XYNE_SYNC_PG_DSN` can point
+at:
+- the primary,
+- a logical replica, or
+- a physical standby (PostgreSQL 16 or later, the first version that can do
+  logical decoding on a standby).
+
+### One-time setup
+
+1. **Create the publication** on the primary. The server checks for it at
+   startup and exits if it is missing:
+
+   ```sql
+   CREATE PUBLICATION xyne_sync_pub FOR ALL TABLES;  -- needs a superuser
+   ```
+
+   The name is set by `XYNE_SYNC_PUBLICATION`. The publication must include
+   your application's mutation-tracking tables (section 4).
+
+2. **Install the schema-change event trigger** on the primary. The server
+   refuses to start without it:
+
+   ```bash
+   cargo run --example ddl_triggers -- <app> <shard> <publication> | psql "$DATABASE_URL"
+   # for example: -- xyne 0 xyne_sync_pub
+   ```
+
+   This creates the event trigger `<app>_ddl_end_<shard>`. During every
+   migration, inside the migration's own transaction, it records the published
+   schema before and after into the WAL. The server therefore sees each schema
+   change at its commit, on any topology. Use the same app id and shard you set
+   in `XYNE_SYNC_APP_ID` and `XYNE_SYNC_SHARD`.
+
+### Replication slots
+
+- **Each server process creates its own slot** at startup, on the database
+  `XYNE_SYNC_PG_DSN` names. On `SIGTERM` it drops the slot. A restart needs
+  nothing from the previous slot.
+- **A slot left behind by a crash holds WAL.** Either:
+  - set `XYNE_SYNC_SLOT_CLEANUP_AGE_MS` so the next startup drops inactive
+    `xyne_sync_slot_*` slots older than that age (needs PostgreSQL 17+, which
+    records `inactive_since`), or
+  - drop them by hand: `SELECT pg_drop_replication_slot('<slot name>');`
+  - Either way, set `max_slot_wal_keep_size` as a safety net.
+- **A process whose slot disappears while it runs stops.** It does not
+  silently recreate the slot, which would skip the changes in between. The
+  restarted process begins on a fresh slot and snapshot.
+
+### Physical standbys
+
+- A new read snapshot on a standby waits for the primary's next
+  running-transactions record. A busy primary writes one every 15 s;
+  `SELECT pg_log_standby_snapshot()` on the primary forces one. Until it
+  arrives, reads keep using the current snapshot, so the only cost is memory,
+  not correctness.
+- Set `hot_standby_feedback = on` on the standby, so the primary's vacuum does
+  not cancel the snapshots.
+
+### Networking
+
+- **Read snapshots sit on silent connections.** Each read snapshot lives on a
+  connection that must stay idle inside a transaction for its whole life,
+  because any command would discard the snapshot.
+  - TCP keepalive (`XYNE_SYNC_PG_KEEPALIVE_*`) keeps these connections through
+    NATs and load balancers, so keep its idle time below whatever drops silent
+    connections on your network.
+  - The server turns off `idle_in_transaction_session_timeout` for its own
+    sessions.
+- **No TLS to PostgreSQL yet.** If your database requires TLS, connect through
+  a local proxy, such as the Cloud SQL proxy or a sidecar.
+
+### What is served
+
+- Tables without a primary key are skipped. So are columns of types the wire
+  format cannot carry (`bytea`). The startup log lists both.
+- Tables with large TOASTed columns need `REPLICA IDENTITY FULL`.
+
+### Schema changes
+
+Two kinds of change are followed while the server runs:
+- **a table created** with a primary key, and
+- **a column added** with no default or a constant default (`DEFAULT 'x'`,
+  `DEFAULT 0`, `DEFAULT true`, `DEFAULT '{}'::jsonb`).
+
+The rows already in memory get the new column, and the new shape is served
+from the next snapshot on. Clients are sent nothing for the change.
+
+**Any other change to a served table stops the server**, with one log line
+naming the change. That includes dropping or renaming a column or table,
+changing a type or key, and adding a column with an expression default such as
+`now()`. Once restarted, the server loads the schema as it then is, and every
+client starts over. Plan those migrations as a restart.
+
+A client whose schema names a table or column the database does not have yet
+is refused with `SchemaVersionNotSupported`. Migrate the database before
+shipping a frontend that needs the change.
+
+## 4. The application server
+
+The server sends the client's requests to your application server:
+
+- **Queries.** A client asks for queries by name and arguments. The server
+  posts them to `XYNE_SYNC_QUERY_URL`, forwarding the connection's cookies
+  unless `XYNE_SYNC_FORWARD_COOKIES=false`, and receives query ASTs back.
+- **Mutations.** A client's pushes are forwarded unchanged to
+  `XYNE_SYNC_MUTATE_URL`, with the cookies, plus `schema` and `appID`
+  parameters.
+- **Recording mutations.** In the same transaction as each mutation, your
+  application server records the client's last mutation id in
+  `<app>_<shard>.clients`. When it refuses a mutation with an application
+  error, it records the result in `<app>_<shard>.mutations`. The publication
+  must carry both tables: the server reads them from the change feed and
+  sends them to the client together with the mutation's rows.
+- **Cleanup.** When a client acknowledges its mutation results, the server
+  sends the mutate endpoint a cleanup push, so the results table does not grow
+  without bound.
+
+## 5. Configuration
+
+Everything is set by environment variables. A `.env` file in the working
+directory is read first, and variables already set take precedence.
+[`.env.example`](../.env.example) documents each one.
+
+### Required
+
+| variable | meaning |
+|---|---|
+| `XYNE_SYNC_PG_DSN` | the PostgreSQL to follow, reached directly (section 3) |
+| `XYNE_SYNC_QUERY_URL` | the application server's query endpoint |
+| `XYNE_SYNC_MUTATE_URL` | the application server's mutate endpoint |
+
+### Set explicitly
+
+These have built-in defaults. Set them anyway, so the deployment does not
+depend on what the defaults happen to be:
+
+| variable | example | meaning |
+|---|---|---|
+| `XYNE_SYNC_BASE_PATH` | `/sync` | URL path prefix clients connect under. A client's server URL ends in it |
+| `XYNE_SYNC_APP_ID` | `xyne` | app id. With the shard, it names the `<app>_<shard>` schema of the mutation tables, the event trigger and its message prefix |
+| `XYNE_SYNC_SHARD` | `0` | shard number |
+
+### Recommended for production
+
+| variable | suggested | default | why |
 |---|---|---|---|
-| `XYNE_SYNC_ROW_LIMIT` | `20000` | `100000` | the most rows the server reads into memory at once, for the planner and the storage alike: a join side past it is driven from the other side or the query refused by name, and a storage read past it is refused. One number, so the planner never reads whole what the storage would refuse (the older `XYNE_SYNC_JOIN_LIMIT` and `XYNE_SYNC_READ_ROW_LIMIT` are still read). 20 000 is what the test campaigns ran as production policy |
-| `XYNE_SYNC_WHOLE_PAGE_LIMIT` | `5000` | `5000` | the most rows a page that drives an inner join is read whole for (the limit applied in memory, the join's restriction exact); past it the page is read in batches that double per round, ten rounds at most, the rows the join rejects dropped |
-| `XYNE_SYNC_GROUP_THREADS` | `2` | `1` | threads that build and send pokes |
-| `XYNE_SYNC_READ_THREADS` | `4` | `2` | threads that run and decode storage reads |
-| `XYNE_SYNC_READ_CONNECTIONS` | `32` | `16` | PostgreSQL connections for storage reads |
-| `XYNE_SYNC_GROUP_TTL_MS` | `3600000` | `60000` | a client back within the hour resumes from its cookie instead of downloading everything again |
+| `XYNE_SYNC_GROUP_TTL_MS` | `3600000` | `60000` | how long a disconnected client group's state is kept. A client back within it resumes instead of re-downloading everything |
+| `XYNE_SYNC_GROUP_THREADS` | `2` | `1` | threads that build and send updates to clients |
+| `XYNE_SYNC_READ_THREADS` | `4` | `2` | threads that run and decode database reads |
+| `XYNE_SYNC_READ_CONNECTIONS` | `32` | `16` | database connections for reads |
+| `XYNE_SYNC_ROW_LIMIT` | sized to your data | `100000` | the most rows read into memory at once. A larger read is refused, and the query named in logs and metrics |
+| `XYNE_SYNC_PLAN_FILE` | `/var/lib/xyne-sync/plans.json` | unset | query shapes seen so far, planned again at startup, so the first clients after a restart are fast. Needs a writable volume |
 | `XYNE_SYNC_LOG_FORMAT` | `json` | `text` | already set in the image |
-| `XYNE_SYNC_PLAN_FILE` | `/var/lib/xyne-sync/plans.json` | unset | the query shapes seen, planned again at start so the first clients after a restart do not pay the planner's counts. Needs a writable volume at `/var/lib/xyne-sync`; leave unset without one |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | the collector the reference server pushes to, `http://<collector>:4318` | unset | section 5 |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/json` | `http/json` | |
-| `OTEL_METRICS_EXPORTER` | `otlp` | | |
-| `OTEL_LOGS_EXPORTER` | `none` (or `otlp` to have logs in the collector too) | | |
-| `OTEL_TRACES_EXPORTER` | `none` | | |
-| `OTEL_METRIC_EXPORT_INTERVAL` | `5000` | `60000` | |
-| `OTEL_SERVICE_NAME` | `xyne-sync` | `xyne-sync` | |
-| `OTEL_RESOURCE_ATTRIBUTES` | `deployment.environment=sandbox` | none | |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://<collector>:4318` | unset | push metrics (and optionally logs) over OTLP. See [observability](observability.md) |
 
-### Defaults, for the record
+### All other settings
 
 | variable | default | meaning |
 |---|---|---|
 | `XYNE_SYNC_ADDR` | `0.0.0.0:4848` | listen address |
-| `XYNE_SYNC_BASE_PATH` | `/sync` | the path prefix clients connect under (section 6) |
 | `XYNE_SYNC_SCHEMAS` | `public,<app>_<shard>` | schemas whose tables are served |
-| `XYNE_SYNC_SHARD` | `0` | |
-| `XYNE_SYNC_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams; it must be created before xyne-sync starts. The replication slot is not configurable: each process uses its own, `xyne_sync_slot_<uuid>` |
-| `XYNE_SYNC_DDL_TRIGGER` | `<app>_ddl_end_<shard>` (`xyne_ddl_end_0` for app `xyne`) | the reference server's event trigger on `ddl_command_end`, through which schema changes are heard (section 4); the server refuses to start without it |
-| `XYNE_SYNC_DDL_PREFIX` | `<app>/<shard>/ddl` (`xyne/0/ddl` for app `xyne`) | the prefix of that trigger's logical messages |
-| `XYNE_SYNC_FORWARD_COOKIES` | `true` | the connection's cookies go to the backend's endpoints |
-| `XYNE_SYNC_READ_TIMEOUT_MS` | `10000` | how long one storage read may take before PostgreSQL is told to cancel it and the query that needed it is refused by name (`reason="read_timeout"`); `0` sets no limit |
-| `XYNE_SYNC_PG_KEEPALIVE_IDLE_MS`, `XYNE_SYNC_PG_KEEPALIVE_INTERVAL_MS`, `XYNE_SYNC_PG_KEEPALIVE_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on every connection to the database: after the idle time without a byte either way the kernel probes the peer, again at the interval while unanswered, and gives the connection up after that many unanswered in a row. Keep the idle time under whatever a NAT or load balancer between drops silent flows at (section 4); `0` turns the probing off |
-| `XYNE_SYNC_BACKEND_TIMEOUT_MS` | `30000` | how long one call to the backend (a transform, a push) may take; a call that timed out is not made again; `0` sets no limit |
-| `XYNE_SYNC_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is minted |
-| `XYNE_SYNC_SLOT_CLEANUP_AGE_MS` | `0` (off) | at startup, remove an inactive `xyne_sync_slot_*` of an ended process only after this age; requires PostgreSQL 17+ for its `inactive_since` timestamp |
-| `XYNE_SYNC_JOIN_PREFERRED_SIDE` | `parent` | which side of an inner join drives when reading the node whole and having its subs drive it would hold the same rows (the plan holding fewer wins otherwise; the subs drive when they cut the node down by more than they cost, the leaves of an access rule driving the page they narrow) |
-| `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE` | `600000`, `10000` | join plans remembered |
-| `XYNE_SYNC_PLAN_QUERY_TTL_MS` | `86400000` | how long a plan made for a query is laid onto every later query of the same name (and join skeleton), whatever its arguments, before the name is counted again; `0` plans every tree on its own |
-| `XYNE_SYNC_TRANSFORM_TTL_MS`, `XYNE_SYNC_TRANSFORM_CACHE` | `60000`, `20000` | the backend's query transforms remembered per identity; the reference server keeps its own for 5 s, which cost a hydration about 8 ms at the median on the test rig |
-| `XYNE_SYNC_WARM_START_MS` | `20000` | the most time spent planning the kept shapes at start |
-| `XYNE_SYNC_PING_INTERVAL_MS`, `XYNE_SYNC_CLIENT_TIMEOUT_MS`, `XYNE_SYNC_PONG_INTERVAL_MS` | `30000`, `45000`, `3000` | liveness of a connection |
-| `XYNE_SYNC_GROUP_LOG_BYTES` | `262144` | bytes of its most recent pokes a client group keeps, so a tab that returns behind its group is sent what it missed instead of starting over; `0` keeps none |
-| `XYNE_SYNC_MAX_MESSAGE_BYTES` | `16777216` | the largest inbound message |
-| `XYNE_SYNC_ROWS_PER_PART` | `500` | row operations per poke part |
-| `XYNE_SYNC_LOG` | `info` | `error`, `warn`, `info`, `debug` |
-| `XYNE_SYNC_SLOW_QUERY_MS` | `1000` | a hydration or a push slower than this is logged at warn |
-| `XYNE_SYNC_METRICS_INTERVAL_MS` | `10000` | the sampler's period |
-| the other `OTEL_*` | | `docs/observability.md` section 5 |
+| `XYNE_SYNC_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams |
+| `XYNE_SYNC_DDL_TRIGGER` | `<app>_ddl_end_<shard>` | the schema-change event trigger the server requires |
+| `XYNE_SYNC_DDL_PREFIX` | `<app>/<shard>/ddl` | the prefix of that trigger's messages |
+| `XYNE_SYNC_FORWARD_COOKIES` | `true` | forward the connection's cookies to the application server |
+| `XYNE_SYNC_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is created |
+| `XYNE_SYNC_SLOT_CLEANUP_AGE_MS` | `0` (off) | at startup, drop inactive slots of ended processes older than this (PostgreSQL 17+) |
+| `XYNE_SYNC_READ_TIMEOUT_MS` | `10000` | longest a database read may take before it is cancelled and its query refused. `0` means no limit |
+| `XYNE_SYNC_BACKEND_TIMEOUT_MS` | `30000` | longest a call to the application server may take. `0` means no limit |
+| `XYNE_SYNC_PG_KEEPALIVE_IDLE_MS`, `_INTERVAL_MS`, `_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on database connections. `0` idle time turns it off |
+| `XYNE_SYNC_WHOLE_PAGE_LIMIT` | `5000` | a page that drives a join is read whole up to this many rows, in growing batches past it |
+| `XYNE_SYNC_JOIN_PREFERRED_SIDE` | `parent` | which side drives a join when both plans cost the same |
+| `XYNE_SYNC_PLAN_QUERY_TTL_MS` | `86400000` | how long one plan is reused for every query of the same name and join shape. `0` plans every query separately |
+| `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE` | `600000`, `10000` | how long refused plans are remembered, and how many plans are kept |
+| `XYNE_SYNC_TRANSFORM_TTL_MS`, `XYNE_SYNC_TRANSFORM_CACHE` | `60000`, `20000` | how long query ASTs from the application server are cached per user, and how many |
+| `XYNE_SYNC_WARM_START_MS` | `20000` | most time spent re-planning saved query shapes at startup |
+| `XYNE_SYNC_PING_INTERVAL_MS`, `XYNE_SYNC_CLIENT_TIMEOUT_MS`, `XYNE_SYNC_PONG_INTERVAL_MS` | `30000`, `45000`, `3000` | connection liveness |
+| `XYNE_SYNC_GROUP_LOG_BYTES` | `262144` | recent updates kept per client group, so a briefly disconnected tab catches up instead of starting over. `0` keeps none |
+| `XYNE_SYNC_MAX_MESSAGE_BYTES` | `16777216` | largest message accepted from a client |
+| `XYNE_SYNC_ROWS_PER_PART` | `500` | row changes per message part |
+| `XYNE_SYNC_LOG` | `info` | `error`, `warn`, `info` or `debug`. `debug` costs throughput |
+| `XYNE_SYNC_SLOW_QUERY_MS` | `1000` | queries and pushes slower than this are logged at `warn` |
+| `XYNE_SYNC_METRICS_INTERVAL_MS` | `10000` | how often process metrics are sampled |
+| other `OTEL_*` | | see [observability](observability.md), section 5 |
 
-## 4. PostgreSQL
+## 6. Ports, probes and shutdown
 
-- `wal_level = logical`, and room for this server beside the reference server:
-  `max_replication_slots` and `max_wal_senders` with eight to spare (one
-  slot per running server, and short-lived ones, `xyne_sync_snap_*`, behind the read
-  snapshots), about 40 connections (`XYNE_SYNC_READ_CONNECTIONS` plus the
-  feed and a handful).
-- The role needs `REPLICATION` and `SELECT` on the served schemas.
-- **The server writes nothing to the database it follows.** It reads rows,
-  and it reads the change feed, whose position comes from what PostgreSQL
-  sends anyway (each commit, and the keepalives that say how far the log
-  has been gone through). So `XYNE_SYNC_PG_DSN` may name the primary, a
-  logical replica, or a physical standby (PostgreSQL 16 or later, which is
-  when a standby learned logical decoding).
-- **The publication must exist before startup.** The server checks for the
-  publication `XYNE_SYNC_PUBLICATION` names (`xyne_sync_pub` by default)
-  and exits if it is missing. Create it once, on the primary:
+- **One port, 4848.** It serves:
+  - the WebSocket at `<base path>/sync/v51/connect`
+  - `/health`, `/metrics` and `/stats`
 
-  ```sql
-  CREATE PUBLICATION xyne_sync_pub FOR ALL TABLES;
-  ```
+  Keep `/metrics` and `/stats` private.
+- **Health.** `GET /health` (also `/healthz`, `/readyz`, and each of them
+  under the base path) returns `503` until the server is ready. That means
+  the change feed has passed the first read snapshot, and the warm start, if
+  configured, has run. After that it returns `200`. Use it for both readiness
+  and liveness, and allow 60 s for startup.
+- **Shutdown.** On `SIGTERM` the server closes client connections spread over
+  three seconds, so clients don't all reconnect at once. It then stops the
+  feed and drops its slot. All timed phases fit in 25 seconds, so give it a
+  grace period of 30 seconds or more (in Kubernetes,
+  `terminationGracePeriodSeconds`).
+- **The proxy in front:**
+  - must pass WebSocket upgrades;
+  - must pass the `Sec-WebSocket-Protocol` header, which carries the client's
+    first message and can be several kilobytes, so allow 128 KB of request
+    headers;
+  - should not close idle WebSockets in under 60 s.
 
-  `CREATE PUBLICATION ... FOR ALL TABLES` needs a superuser. Keeping it out
-  of startup avoids concurrent-pod DDL races and lets a server follow a
-  standby when the publication was created on its primary.
-- **Each server process has a slot of its own**, `xyne_sync_slot_<uuid>`,
-  created at start on the server `XYNE_SYNC_PG_DSN` names (the standby
-  itself, when it is one). A restart needs nothing from the slot before it,
-  because the slot is moved up to the first read snapshot anyway. Set
-  `XYNE_SYNC_SLOT_CLEANUP_AGE_MS` to remove slots of ended processes at the
-  next startup. Cleanup selects only inactive `xyne_sync_slot_*` slots whose
-  PostgreSQL `inactive_since` is older than that age, then asks PostgreSQL to
-  drop each; an active slot that races the cleanup is retained. This requires
-  PostgreSQL 17+. Leave the setting at `0` on PostgreSQL 16 or older rather
-  than guessing an inactive age from slot creation time. A process whose slot
-  disappears while it runs stops rather than make the slot again, which would
-  skip the changes in between; its restart begins on a fresh slot and snapshot.
-- On a physical standby a read snapshot (a temporary slot named
-  `xyne_sync_snap_<base36-count>_<uuid>`) waits for the primary's next running-transactions
-  record, which a busy primary writes every 15 s; reads keep using the
-  snapshot they have until the next one is ready, so this costs memory for
-  the writes kept in between and no correctness. `SELECT
-  pg_log_standby_snapshot()` on the primary (PostgreSQL 16) forces one.
-  Set `hot_standby_feedback = on` on the standby so the primary's vacuum
-  does not cancel the snapshots.
-- **The connection behind each read snapshot is silent for its whole
-  life.** Nothing may be sent on it, since any command discards the
-  snapshot, so TCP keepalive is all that keeps it through a NAT or a load
-  balancer (`XYNE_SYNC_PG_KEEPALIVE_*`, section 3), from both ends: the
-  session asks PostgreSQL to probe it with the same values. Its session is
-  idle in a transaction the whole time, and it turns
-  `idle_in_transaction_session_timeout` off for itself at connect (a
-  setting any role may make for its own session), since that timeout
-  would end the session at its interval, the snapshot with it, and reads
-  would fail with `snapshot "…" does not exist` until the next one is
-  minted. Nothing else on the database side may end an idle session
-  short of a restart, a failover, or a recovery conflict on a standby
-  without `hot_standby_feedback`.
-- Tables without a primary key are left out, as are columns of types the
-  wire cannot carry (`bytea`); the startup log lists both.
-- **Schema changes are heard through the reference server's DDL event trigger**, the
-  one the reference server installs on the upstream database for its app and shard
-  (`<app>_ddl_end_<shard>`, `xyne_ddl_end_0` for app `xyne`, shard 0; `XYNE_SYNC_DDL_TRIGGER`
-  and `XYNE_SYNC_DDL_PREFIX` name it and its messages' prefix). It writes
-  the published schema before and after every migration into the WAL, in
-  the migration's own transaction, so the server learns of the change at
-  its commit and on any topology (the message replays on a standby like
-  any WAL). **The server refuses to start without the trigger** (the log
-  says so). On a database the reference server has never run against, install the
-  stack it would have installed: `cargo run --example ddl_triggers --
-  <app> <shard> <publication>... | psql "$DSN"` on the primary.
-  - **A table created** (with a primary key) and **a column added with no
-    default or a constant one** (`DEFAULT 'x'`, `DEFAULT 0`, `DEFAULT true`,
-    `DEFAULT '{}'::jsonb`) are followed while the server runs: the rows the
-    engine holds get the column in memory, the read snapshot that has the
-    change is minted at once, and the new shape is served from that
-    snapshot on. No client is sent anything for the change; a client whose
-    schema names the new column is admitted once the catalog has it.
-  - **Anything else** on a served table (a column dropped or renamed, a
-    type changed, a key changed, a table dropped or renamed, a column added
-    with an expression default such as `now()` or `gen_random_uuid()`)
-    stops the server with one error line naming the change; restarted, it
-    loads the schema as it is then and every client starts over. Plan such
-    migrations as a restart.
-  - At every start the slot is moved up to the first read snapshot's point
-    (`pg_replication_slot_advance`, on a standby too), so nothing the
-    snapshot already holds is streamed and a migration the server stopped
-    on is not met again.
-- **Connections to PostgreSQL are not encrypted.** If the database
-  enforces TLS, reach it through a local proxy (the Cloud SQL proxy, a
-  sidecar) until TLS is added here.
-- **The slot holds WAL while the server is down.** Set
-  `max_slot_wal_keep_size` on the database, and when the server is retired
-  drop its slot: `SELECT pg_drop_replication_slot('xyne_sync');`.
+## 7. Routing traffic
 
-## 5. Metrics, logs, alerts
+Clients connect to `<scheme>://<host>/<base path>`.
 
-As the reference server: metrics are pushed over OTLP/HTTP to the collector named by
-`OTEL_EXPORTER_OTLP_ENDPOINT`, every `OTEL_METRIC_EXPORT_INTERVAL`, by a
-thread of its own; logs are JSON lines on stderr for the platform's log
-collection, and also OTLP log records when `OTEL_LOGS_EXPORTER=otlp`. The
-same metrics are at `GET /metrics` in Prometheus format for a scrape, and
-`GET /stats` is the JSON the load tools read, with the refused and the
-heavy queries by name. `docs/observability.md` is the catalogue: section 3
-the metrics, section 4 the log events, section 5 alert rules to start
-from. The ones to have on day one:
+- **One sync server per path.** Route the base path, for example `/sync`, to
+  the server's port 4848. Switching clients to or from another sync server is a
+  routing change. The servers don't share state, so a client that moves
+  starts a fresh sync on its own.
+- **Two servers side by side.** For example, to test a new deployment:
+  - give each server its own base path (`XYNE_SYNC_BASE_PATH`) and route
+    each path to its own server;
+  - build the client that uses the second path with a different local storage
+    key, so the two don't overwrite each other's local data in the browser.
+
+## 8. Monitoring
+
+Metrics are available two ways:
+- pushed over OTLP/HTTP to `OTEL_EXPORTER_OTLP_ENDPOINT`;
+- served at `GET /metrics` in Prometheus format.
+
+Logs are JSON lines on stderr. `GET /stats` returns the same figures as JSON,
+including refused and heavy queries by name.
+
+[`observability.md`](observability.md) lists every metric, every log event,
+and alert rules. Alerts to start with:
 
 | what | rule |
 |---|---|
-| a query is within a fifth of the row limit | `xyne_sync_read_rows_max / xyne_sync_read_row_limit >= 0.8`; `xyne_sync_query_read_rows_max{name,table}` and the `heavy read` log event name the query |
-| a query was refused | `increase(xyne_sync_queries_refused_total[5m]) > 0`; `/stats.refused_queries` and the `query refused` event name it |
-| the engine is running out of its one core | `rate(xyne_sync_engine_busy_seconds_total[5m]) > 0.7` |
-| writes reach clients late | p99 of `xyne_sync_end_to_end_seconds` above 0.5 s |
-| the feed is behind or silent | p99 of `xyne_sync_feed_lag_seconds` above 5 s; `xyne_sync_feed_heartbeat_age_seconds > 90`. The server handles a dead connection itself: after 10 s of silence it asks PostgreSQL whether a walsender still holds its slot, and reopens the slot when none does, which PostgreSQL decides after `wal_sender_timeout` (60 s by default; keep it set) without hearing from the peer (the `change feed ... giving the connection up` warning). The alert is for when that does not help. On a standby of a primary that writes nothing at all the age grows although nothing is wrong |
-| reads are timing out | `increase(xyne_sync_queries_refused_total{reason="read_timeout"}[5m]) > 0`: a storage read ran past `XYNE_SYNC_READ_TIMEOUT_MS`; the `query refused` event names the query and the table |
-| memory | `xyne_sync_process_rss_bytes > 6e9` |
-| clients built for another database | `increase(xyne_sync_connections_total{event="refused"}[5m]) > 0` |
+| a query is close to the row limit | `xyne_sync_read_rows_max / xyne_sync_read_row_limit >= 0.8`; `xyne_sync_query_read_rows_max{name,table}` names it |
+| a query was refused | `increase(xyne_sync_queries_refused_total[5m]) > 0` |
+| the engine thread is nearly saturated | `rate(xyne_sync_engine_busy_seconds_total[5m]) > 0.7` |
+| changes reach clients late | p99 of `xyne_sync_end_to_end_seconds` above 0.5 s |
+| the feed is behind or silent | p99 of `xyne_sync_feed_lag_seconds` above 5 s, or `xyne_sync_feed_heartbeat_age_seconds > 90` |
+| reads are timing out | `increase(xyne_sync_queries_refused_total{reason="read_timeout"}[5m]) > 0` |
+| memory | `xyne_sync_process_rss_bytes` above 75 % of the container's limit |
+| clients built for a different schema | `increase(xyne_sync_connections_total{event="refused"}[5m]) > 0` |
 
-## 6. Probes, ports, shutdown
+**Dead connections.** The server recovers a dead feed connection by itself.
+After 10 s of silence it asks PostgreSQL whether its slot is still held, and
+reopens it if not. PostgreSQL notices a dead peer after `wal_sender_timeout`
+(60 s by default; keep it set). The feed alert is for when that doesn't help.
+On a standby whose primary writes nothing at all, the heartbeat age grows even
+though nothing is wrong.
 
-- `GET /health` (also `/healthz`, `/readyz`, and each under the base
-  path): `503` until the change feed has passed the first read snapshot
-  (a fraction of a second) and the warm start,
-  `200` after. Use it for readiness and liveness; give startup 60 s.
-- One port, 4848: the WebSocket under `<base path>/sync/v51/connect`, and
-  `/health`, `/metrics`, `/stats`. Keep `/metrics` and `/stats` inside the
-  cluster.
-- `SIGTERM` closes the connections over three seconds, so the clients do
-  not all reconnect in the same instant. The listener drain is bounded to
-  five seconds; feed, worker and slot cleanup are separately bounded so the
-  timed shutdown phases have a 25-second budget. Set `terminationGracePeriodSeconds`
-  to 30 or more, leaving five seconds of kubelet headroom.
-- The proxy in front must pass WebSocket upgrades and the
-  `Sec-WebSocket-Protocol` header (the client's first message travels in
-  it, several kilobytes: allow 128 KB of request headers, as
-  `--max-http-header-size=131072` does for the reference server), and should not
-  close an idle WebSocket before 60 s.
+## 9. Known limits
 
-## 7. Getting traffic to it
-
-The dashboard does not read a sync-server address from its environment in a
-deployed build: it connects to `https://<the host it was served from>/sync`
-(the sync path its build was configured with). The dashboard's sync-server URL build variable is only what the dev
-server and the sandbox's proxy forward `/sync` to. So:
-
-- **Everyone at once (cut-over).** Nothing changes in the frontend. Point
-  whatever serves `/sync` today at `xyne-sync:4848` instead of
-  `ref-server:4848`: the ingress rule for the `/sync` path, or, where the
-  backend's WebSocket proxy sits in front, the backend's
-  sync upstream setting (`http://xyne-sync:4848`). Going back is the same edit
-  reversed. The two servers keep separate state, so a client that moves
-  between them starts a fresh sync, on its own.
-- **Beside the reference server (a test lane).** Build the dashboard with
-  its sync-server path build variable set to `/sync-rs` and its storage-key build variable set to `rs`, route the path
-  `/sync-rs` to `xyne-sync:4848`, and run the server with
-  `XYNE_SYNC_BASE_PATH=/sync-rs`. The storage key must differ from the main
-  bundle's, or the two Zero clients share one local store on the origin
-  and wipe each other (`docs/sdlc-fast-lane.md` in xyne-spaces has the
-  mechanism; the SDLC lane already runs this way).
-- The backend needs nothing new: its query and mutate URL settings
-  name its endpoints from the server's side, and it keeps writing mutation
-  ids to `<app>_<shard>.clients`, and the results of refused mutations to
-  `<app>_<shard>.mutations`, as it does for the reference server. The publication must
-  carry both tables; the server cleans up results a client has received
-  through the mutate endpoint (the cleanup-results push), so the results
-  table no longer grows while this server serves the clients.
-
-## 8. Known limits at this rollout
-
-- Four query shapes are refused, by name, in `/stats.refused_queries` and
-  the `query refused` log event: `LIKE`/`ILIKE` conditions
-  (`searchChannelParticipants`, `createdOatsRecordings`), `NOT EXISTS`
-  (`getSdlcRepoById`), and any read past the row limit
-  (`scopedCollectionsWithItems` on large workspaces). The client sees the
-  query as errored, the rest of the app is unaffected.
-- A client whose schema names a table or column the database does not have
-  yet is refused with `SchemaVersionNotSupported` and reloads, as with
-  the reference server: migrate the database before shipping the frontend that needs
-  it. A table created or a column added with a constant default is picked
-  up while the server runs; every other migration of a served table
-  restarts it (section 4).
-- One replica, state in memory, no TLS to PostgreSQL (sections 2 and 4).
+- **Unsupported queries are refused, not run.** This covers `LIKE`/`ILIKE`,
+  `NOT EXISTS`, compound join keys, and any read over `XYNE_SYNC_ROW_LIMIT`.
+  Each one is refused by name, in `/stats.refused_queries` and in the
+  `query refused` log event. The client sees that one query fail; the rest of
+  the app is unaffected.
+- **No history across restarts.** A client that reconnects after a restart
+  starts a fresh sync, which drops its unsent mutations.
+- **One replica**, with state in memory.
+- **No TLS to PostgreSQL** (section 3).

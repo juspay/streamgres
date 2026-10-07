@@ -178,9 +178,9 @@ jobs:
             otel/opentelemetry-collector-contrib:0.146.1
           until docker exec pg pg_isready -U postgres; do sleep 1; done
           node scripts/smoke.mjs --prepare
-          # The server hears of schema changes through the reference server's DDL
-          # trigger and refuses to start without it: install the stack
-          # the reference server would have, over the publication the server uses.
+          # The server hears of schema changes through the schema-change
+          # event trigger and refuses to start without it: install the
+          # stack for app `xyne`, shard 0, over the publication the server uses.
           docker exec pg psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
             -c 'CREATE PUBLICATION xyne_sync_pub FOR ALL TABLES'
           docker exec -i pg psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
@@ -190,6 +190,8 @@ jobs:
         run: |
           docker run -d --name server --network host \
             -e XYNE_SYNC_PG_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
+            -e XYNE_SYNC_BASE_PATH=/sync \
+            -e XYNE_SYNC_APP_ID=xyne \
             -e XYNE_SYNC_QUERY_URL=http://127.0.0.1:9/query \
             -e XYNE_SYNC_MUTATE_URL=http://127.0.0.1:9/push \
             -e XYNE_SYNC_ROW_LIMIT=600 \

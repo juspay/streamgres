@@ -196,7 +196,7 @@ pub fn json_as_jsonb(text: &str) -> String {
 /// Milliseconds since the Unix epoch of a Postgres `timestamp`,
 /// `timestamptz` or `date` in its text form (`2026-09-15 10:00:00.123`,
 /// with an optional `+05:30` style offset, or `2026-09-15`); a timestamp
-/// without a zone is read as UTC, the client's convention. `None` when the text
+/// without a zone is read as UTC, the protocol's convention. `None` when the text
 /// is not a time (`infinity` included).
 pub fn epoch_millis(text: &str) -> Option<i64> {
     let text = text.trim();

@@ -1,8 +1,8 @@
 //! Live Postgres scenarios: the runtime over `PgStorage` and the
 //! `test_decoding` change feed, with writes committed deliberately behind
 //! an open snapshot; the asynchronous service end to end with one table
-//! mirrored in memory; and schema changes followed through the reference server's
-//! DDL trigger stack. They run only when `XYNE_SYNC_PG_DSN` names a
+//! mirrored in memory; and schema changes followed through the
+//! schema-change trigger stack. They run only when `XYNE_SYNC_PG_DSN` names a
 //! database with `wal_level = logical` (and free replication slots), and
 //! report themselves skipped otherwise; each scenario uses its own tables
 //! and slot, so they can run in parallel.
@@ -17,7 +17,8 @@ use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, NoTls};
 use xyne_sync::ivm::{Delta, Fetch, MultiTableIVM, QueryPart};
 use xyne_sync::model::*;
-use xyne_sync::sync::pg::ddl::{DdlSource, trigger_stack_sql};
+use xyne_sync::client::ddl_triggers::trigger_stack_sql;
+use xyne_sync::sync::pg::ddl::DdlSource;
 use xyne_sync::sync::pg::{PgStorage, PgStream};
 use xyne_sync::sync::{
     CatalogHandle, Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
@@ -1156,7 +1157,7 @@ fn owners_added(events: &[Event], table: &str) -> BTreeMap<i64, Option<Value>> {
     out
 }
 
-/// Schema changes arrive through the reference server's DDL trigger stack and are
+/// Schema changes arrive through the schema-change trigger stack and are
 /// followed live, the feed and the service wired as the server wires
 /// them: a column added with a constant default reaches the rows the
 /// engine holds and the rows written after it, a row of the migration's
@@ -1192,7 +1193,7 @@ fn schema_changes_follow_the_trigger() {
                 &[names.publication.as_str()],
             ))
             .await
-            .expect("install the reference server's trigger stack");
+            .expect("install the schema-change trigger stack");
         let pg = Arc::new(
             PgStorage::connect(&dsn, catalog.clone())
                 .await

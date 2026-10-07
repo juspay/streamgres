@@ -1,5 +1,6 @@
-import re, json
-src = open('xyne-spaces-main/packages/shared/src/schema.ts').read()
+import re, json, sys
+# argv[1]: the shared package's schema.ts in a checkout of juspay/xyne-spaces.
+src = open(sys.argv[1]).read()
 Q = r"['\"]"
 def strs(s): return re.findall(r"['\"]([^'\"]+)['\"]", s)
 

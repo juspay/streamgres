@@ -167,7 +167,7 @@ pub fn scalar_type(name: &str) -> Option<ValueType> {
 mod tests {
     use super::*;
 
-    /// The mapping follows the client's: times are numbers, json and arrays are
+    /// The mapping follows the protocol's: times are numbers, json and arrays are
     /// json, enums are strings, bytea is left out.
     #[test]
     fn types_map_like_the_protocol() {
