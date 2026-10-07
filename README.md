@@ -211,8 +211,9 @@ XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5432/xyne_sync cargo test --tes
 
 `scripts/` holds the end-to-end checks:
 
-- `smoke.mjs` drives the server with a scripted client, with no application
-  server needed. CI runs it against the built image.
+- `smoke.mjs` drives the server with a scripted client and stands in for the
+  application server's query endpoint, so nothing else is needed. CI runs it
+  against the built image.
 - `load-protocol.mjs` and `load-smoke.mjs` are load generators.
 
 ### Using the engine as a library
