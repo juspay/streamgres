@@ -49,7 +49,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -1117,6 +1117,17 @@ fn key_of(row: &DataFrameRow, table: &DbTable) -> DataFrameKey {
     )
 }
 
+/// Row images decoded with a column PostgreSQL sent as unchanged, left
+/// out ([`image`]); counted on that branch alone, so a whole image costs
+/// nothing.
+static PARTIAL_IMAGES: AtomicU64 = AtomicU64::new(0);
+
+/// How many row images the feed has decoded with a column left out as
+/// unchanged ([`RowData::partial`]).
+pub fn partial_images() -> u64 {
+    PARTIAL_IMAGES.load(Ordering::Relaxed)
+}
+
 /// A decoded tuple as a row image of `table`: each value converted by the
 /// column's declared type (a `json` column's stored text rewritten into
 /// the standard form first), columns the catalog does not declare
@@ -1164,6 +1175,7 @@ fn image(
         }
         data.entry(name.clone()).or_insert(Value::Null);
     }
+    PARTIAL_IMAGES.fetch_add(1, Ordering::Relaxed);
     Ok(DataFrameRow::from(RowData::partial(data)))
 }
 
@@ -1582,10 +1594,12 @@ mod tests {
             ),
             commit("0/3EFF508"),
         ];
+        let before = partial_images();
         let transactions: Vec<Transaction> = events
             .into_iter()
             .filter_map(|event| decoder.absorb(event).unwrap())
             .collect();
+        assert!(partial_images() > before, "the partial image is counted");
         assert_eq!(transactions.len(), 1, "{transactions:?}");
         let write = &transactions[0].writes[0];
         assert!(matches!(write, WriteQuery::UPDATE(_)));

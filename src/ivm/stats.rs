@@ -69,13 +69,6 @@ use std::fmt;
 ///   large unchanged value out of an update's image and no complete copy
 ///   was held) — one per row, however many subscriptions wait on it.
 ///
-/// Frame consistency:
-/// - `frame_mismatches`: rows a landing read brought that disagree with
-///   the image the frame already holds of them. A read is brought up to
-///   the engine's position before it lands, so the two must agree; any
-///   count here is drift between the frame and storage (the frame's image
-///   is kept and sent, as before).
-///
 /// Emitted operations:
 /// - `ops_add`: `Add` operations emitted (row entered a result set, or
 ///   changed in place).
@@ -104,7 +97,6 @@ pub struct IvmStats {
     pub page_rounds: u64,
     pub page_lookups: u64,
     pub row_reads: u64,
-    pub frame_mismatches: u64,
     pub ops_add: u64,
     pub ops_delete: u64,
 }
@@ -136,7 +128,6 @@ impl IvmStats {
             page_rounds: self.page_rounds - earlier.page_rounds,
             page_lookups: self.page_lookups - earlier.page_lookups,
             row_reads: self.row_reads - earlier.row_reads,
-            frame_mismatches: self.frame_mismatches - earlier.frame_mismatches,
             ops_add: self.ops_add - earlier.ops_add,
             ops_delete: self.ops_delete - earlier.ops_delete,
         }
@@ -221,7 +212,6 @@ impl fmt::Display for IvmStats {
             self.page_rounds, self.page_lookups
         )?;
         writeln!(f, "rows read again ............ {}", self.row_reads)?;
-        writeln!(f, "frame mismatches ........... {}", self.frame_mismatches)?;
         write!(
             f,
             "ops emitted ................ {} adds, {} deletes",

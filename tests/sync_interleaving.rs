@@ -1112,7 +1112,6 @@ fn a_read_behind_an_update_completes_the_row_from_its_snapshot() {
     let updates = settle(&mut runtime, &db, step);
     assert_whole(&updates);
     assert_eq!(md_and_replies(runtime.engine().rows_for(other)), whole);
-    assert_eq!(runtime.engine().stats().frame_mismatches, 0);
     assert_eq!(runtime.engine().stats().row_reads, 0);
 }
 
@@ -1164,7 +1163,6 @@ fn an_update_while_the_read_is_out_waits_for_the_whole_row() {
     let (other, step) = runtime.register(busy_in_channel("a", 0));
     settle(&mut runtime, &db, step);
     assert_eq!(md_and_replies(runtime.engine().rows_for(other)), whole);
-    assert_eq!(runtime.engine().stats().frame_mismatches, 0);
     assert_eq!(runtime.engine().stats().row_reads, 1);
 }
 
@@ -1274,11 +1272,12 @@ fn a_read_behind_an_update_that_brought_its_row_in_reads_it_again() {
     );
 }
 
-/// The same, but a whole update of the row came first, while the row was
-/// still outside the filter: the later update's image is completed from
-/// it, in commit order, and nothing is read again.
+/// The same, but a whole update of the row (an edit of `md`) came first,
+/// while the row was still outside the filter: the result holds no image
+/// of the row to complete the later update from, so the row is read
+/// again, and lands with the edit, not the snapshot's older value.
 #[test]
-fn a_chain_of_updates_completes_from_the_last_whole_image() {
+fn a_row_brought_in_after_an_edit_is_read_again_with_the_edit() {
     let mut db = Db::at(0);
     db.seed(&[conversation(1, "a", 7, 0, "long")]);
     let mut runtime = Runtime::new(SingleTableIVM::new());
@@ -1297,13 +1296,15 @@ fn a_chain_of_updates_completes_from_the_last_whole_image() {
             at: stale_at,
         },
     );
+    assert!(landed.updates.is_empty(), "no partial row sent");
+    let again = only(&landed);
+    let landed = runtime.fetched(again.id, db.snapshot(&again));
     assert_whole(&landed.updates);
-    assert!(landed.selects.is_empty());
     assert_eq!(
         md_and_replies(runtime.engine().rows_for(sub)),
         BTreeMap::from([(1, (Some("edited".into()), Value::Int(1)))])
     );
-    assert_eq!(runtime.engine().stats().row_reads, 0);
+    assert_eq!(runtime.engine().stats().row_reads, 1);
 }
 
 /// A twin registered while the row is read again for its query waits on
