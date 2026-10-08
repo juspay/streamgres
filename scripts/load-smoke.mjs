@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // A self-contained load on a running sync server, with nothing of the application
 // behind it (the table of scripts/smoke.mjs, prepared with `smoke.mjs --prepare`, and a
-// server started with XYNE_SYNC_ROW_LIMIT of at least 600). Every connection is a
+// server started with XYNE_SYNC_ROW_LIMIT of at least 600 and XYNE_SYNC_QUERY_URL at
+// http://127.0.0.1:<SMOKE_APP_PORT>/query, the query endpoint this script serves, as
+// smoke.mjs does, since the server takes no AST from a client). Every connection is a
 // client group of its own holding one of ten 40-row buckets of the table; one psql
 // session then writes `--writes` updates a second for `--duration` seconds, each reaching
 // the tenth of the connections that hold its bucket (so the load generator, one process,
@@ -18,6 +20,7 @@
 
 import { spawn, execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
 
 const arg = (name, fallback) => { const i = process.argv.indexOf(`--${name}`); return i > 0 ? Number(process.argv[i + 1]) : fallback; };
 const label = (() => { const i = process.argv.indexOf('--label'); return i > 0 ? process.argv[i + 1] : ''; })();
@@ -26,7 +29,24 @@ const CONNECTIONS = arg('connections', 100), WRITES = arg('writes', 100), DURATI
 const PG = process.env.SMOKE_PG ?? 'postgresql://postgres:postgres@localhost:5432/postgres';
 const GATEWAY = process.env.SMOKE_GATEWAY ?? 'ws://localhost:4848/sync';
 const HTTP = process.env.SMOKE_HTTP ?? 'http://localhost:4848';
+const APP_PORT = Number(process.env.SMOKE_APP_PORT ?? 4849);
 const bucket = (n) => ({ table: 'smoke_items', where: { type: 'simple', op: '=', left: { type: 'column', name: 'bucket' }, right: { type: 'literal', value: `b${n % 10}` } }, orderBy: [['id', 'asc']] });
+
+/// The query endpoint the sync server asks for each query's AST: `bucket` takes the
+/// connection's index as its argument.
+const app = createServer((request, response) => {
+  let body = '';
+  request.on('data', (chunk) => { body += chunk; });
+  request.on('end', () => {
+    const path = new URL(request.url, 'http://localhost').pathname;
+    if (request.method !== 'POST' || path !== '/query') { response.writeHead(404).end(); return; }
+    const [tag, requests] = JSON.parse(body);
+    if (tag !== 'transform') { response.writeHead(400).end(); return; }
+    const answered = requests.map(({ id, name, args }) => (name === 'bucket' ? { id, name, ast: bucket(Number(args?.[0] ?? 0)) } : { error: 'app', id, name, message: `no query named ${name}` }));
+    response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ kind: 'QueryResponse', queries: answered }));
+  });
+});
+await new Promise((resolve, reject) => { app.once('error', reject); app.listen(APP_PORT, '127.0.0.1', resolve); });
 const fail = (why) => { console.error('FAIL:', why); process.exit(1); };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const pct = (sorted, p) => (sorted.length ? Math.round(sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] * 10) / 10 : null);
@@ -40,7 +60,7 @@ let highest = 0;
 function connect(index, resume) {
   const state = resume ?? { index, group: `g-load-${index}-${randomUUID().slice(0, 8)}`, cookie: '', hydrated: false, seen: 0 };
   state.errors = []; state.closed = false; state.firstBase = undefined; state.putsSinceConnect = 0;
-  const init = ['initConnection', { desiredQueriesPatch: [{ op: 'put', hash: 'open', ast: bucket(index), ttl: 300000 }] }];
+  const init = ['initConnection', { desiredQueriesPatch: [{ op: 'put', hash: 'open', name: 'bucket', args: [index], ttl: 300000 }] }];
   const sec = encodeURIComponent(Buffer.from(JSON.stringify({ initConnectionMessage: init })).toString('base64'));
   const url = `${GATEWAY}/sync/v51/connect?clientID=c-${state.group}&clientGroupID=${state.group}&userID=load&baseCookie=${encodeURIComponent(state.cookie)}&ts=1&lmid=0&wsid=w${index}-${Date.now() % 100000}`;
   const ws = new WebSocket(url, [sec]);

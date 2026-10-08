@@ -379,7 +379,6 @@ async fn handle(
             cookie,
             origin,
             token: handshake.auth_token.clone(),
-            ..Identity::default()
         },
         state: state.clone(),
         params,
@@ -736,18 +735,6 @@ impl Conn {
         {
             return false;
         }
-        if let Some(url) = init.user_query_url {
-            self.identity.query_url = Some(url);
-        }
-        if let Some(headers) = init.user_query_headers {
-            self.identity.query_headers = headers;
-        }
-        if let Some(url) = init.user_push_url {
-            self.identity.mutate_url = Some(url);
-        }
-        if let Some(headers) = init.user_push_headers {
-            self.identity.mutate_headers = headers;
-        }
         if let Some(deleted) = &init.deleted {
             self.delete_clients(deleted).await;
         }
@@ -807,12 +794,12 @@ impl Conn {
         ready.wait_for(|ready| *ready).await.is_ok()
     }
 
-    /// Desired-query changes: custom queries go to the application server
-    /// for their ASTs, every AST is translated and planned here, and
-    /// everything goes to the group thread in the order the client sent
-    /// it. A query that cannot be translated or planned is refused to the
-    /// client from here and passed on as such, so the group still knows
-    /// the hash.
+    /// Desired-query changes: every query goes to the application server
+    /// for its AST (the transform cache first), every AST is translated and
+    /// planned here, and everything goes to the group thread in the order
+    /// the client sent it. A query that cannot be translated or planned is
+    /// refused to the client from here and passed on as such, so the group
+    /// still knows the hash.
     async fn desired(&mut self, ops: Vec<QueryPatchOp>) -> bool {
         if !self.await_ready().await {
             return false;
@@ -828,31 +815,28 @@ impl Conn {
                     ttl,
                     name,
                     args,
-                    ast,
                 } => {
                     let name = name.unwrap_or_else(|| "query".to_owned());
-                    let mut ast = ast;
-                    if ast.is_none() {
-                        let args = Json::Array(args.unwrap_or_default());
-                        match self.state.transforms.lookup(&self.identity, &name, &args) {
-                            Some(cached) => {
-                                self.state
-                                    .stats
-                                    .transform_hits
-                                    .fetch_add(1, Ordering::Relaxed);
-                                ast = Some(cached);
-                            }
-                            None => {
-                                self.state
-                                    .stats
-                                    .transform_misses
-                                    .fetch_add(1, Ordering::Relaxed);
-                                positions.insert(hash.clone(), pending.len());
-                                requests.push(json!({"id": hash, "name": name, "args": args}));
-                                asked.insert(hash.clone(), (name.clone(), args));
-                            }
+                    let args = Json::Array(args.unwrap_or_default());
+                    let ast = match self.state.transforms.lookup(&self.identity, &name, &args) {
+                        Some(cached) => {
+                            self.state
+                                .stats
+                                .transform_hits
+                                .fetch_add(1, Ordering::Relaxed);
+                            Some(cached)
                         }
-                    }
+                        None => {
+                            self.state
+                                .stats
+                                .transform_misses
+                                .fetch_add(1, Ordering::Relaxed);
+                            positions.insert(hash.clone(), pending.len());
+                            requests.push(json!({"id": hash, "name": name, "args": args}));
+                            asked.insert(hash.clone(), (name.clone(), args));
+                            None
+                        }
+                    };
                     pending.push(Pending::Put {
                         hash,
                         name,
