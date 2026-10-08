@@ -235,8 +235,20 @@ static GLOBAL: OnceLock<Arc<Stats>> = OnceLock::new();
 /// - `read_rows`: rows per storage read.
 /// - `land_step`: the engine landing one read's rows (compute).
 ///
-/// Durations of a mutation: `push`, the application server's round trip,
-/// and `mutation_ack`, from the push to the poke that acknowledges it.
+/// Durations of a mutation: `push_queue`, a push's wait in its
+/// connection's queue for the pushes before it; `push`, the application
+/// server's round trip; and `mutation_ack`, from the push to the poke
+/// that acknowledges it.
+///
+/// Waits that are invisible from the outside unless measured:
+/// - `read_pool_wait`: a storage read's wait for one of the read pool's
+///   connections (every read on the pool: the engine's, the planner's
+///   counts, the mutation state read at connect).
+/// - `connect_mutations`: a connecting client's read of its group's
+///   mutation state on PostgreSQL.
+/// - `connect_group`: a connecting client's Connect request, from being
+///   sent to the group thread to that thread's reply (the thread's queue
+///   and its catch-up work).
 ///
 /// Counts: transactions and writes routed, pokes and frames written, rows
 /// serialized and rows found already serialized in the same flush,
@@ -263,8 +275,12 @@ pub struct Stats {
     pub read_io: Histogram,
     pub read_rows: Histogram,
     pub land_step: Histogram,
+    pub push_queue: Histogram,
     pub push: Histogram,
     pub mutation_ack: Histogram,
+    pub read_pool_wait: Histogram,
+    pub connect_mutations: Histogram,
+    pub connect_group: Histogram,
     pub transactions: AtomicU64,
     pub writes: AtomicU64,
     pub pokes: AtomicU64,
@@ -285,6 +301,9 @@ pub struct Stats {
     pub plans_page_driven: AtomicU64,
     pub pushes_ok: AtomicU64,
     pub pushes_failed: AtomicU64,
+    /// Pushes that found their connection's queue full, so the reader
+    /// waited for room before the client's next message.
+    pub push_queue_full: AtomicU64,
     /// Mutation results heard from the application server's result table
     /// (a result recorded or cleaned up) for a client group this server
     /// holds, each for the group's next poke's `mutationsPatch`.
@@ -425,8 +444,12 @@ impl Stats {
             read_io: Histogram::new(),
             read_rows: Histogram::new(),
             land_step: Histogram::new(),
+            push_queue: Histogram::new(),
             push: Histogram::new(),
             mutation_ack: Histogram::new(),
+            read_pool_wait: Histogram::new(),
+            connect_mutations: Histogram::new(),
+            connect_group: Histogram::new(),
             transactions: AtomicU64::new(0),
             writes: AtomicU64::new(0),
             pokes: AtomicU64::new(0),
@@ -447,6 +470,7 @@ impl Stats {
             plans_page_driven: AtomicU64::new(0),
             pushes_ok: AtomicU64::new(0),
             pushes_failed: AtomicU64::new(0),
+            push_queue_full: AtomicU64::new(0),
             mutation_results: AtomicU64::new(0),
             mutation_cleanups: AtomicU64::new(0),
             connections_opened: AtomicU64::new(0),
@@ -658,8 +682,12 @@ impl Stats {
             ("read_io", &self.read_io),
             ("read_rows", &self.read_rows),
             ("land_step", &self.land_step),
+            ("push_queue", &self.push_queue),
             ("push", &self.push),
             ("mutation_ack", &self.mutation_ack),
+            ("read_pool_wait", &self.read_pool_wait),
+            ("connect_mutations", &self.connect_mutations),
+            ("connect_group", &self.connect_group),
         ]
     }
 
@@ -688,6 +716,7 @@ impl Stats {
             ("pages_short", load(&self.pages_short)),
             ("pushes_ok", load(&self.pushes_ok)),
             ("pushes_failed", load(&self.pushes_failed)),
+            ("push_queue_full", load(&self.push_queue_full)),
             ("mutation_results", load(&self.mutation_results)),
             ("mutation_cleanups", load(&self.mutation_cleanups)),
             ("connections_opened", load(&self.connections_opened)),
@@ -1486,8 +1515,11 @@ fn metric_of(stage: &str) -> &'static str {
         "count_io" => "xyne_sync_count_seconds",
         "hydrate_cold" | "hydrate_warm" => "xyne_sync_hydrate_seconds",
         "read_io" => "xyne_sync_read_seconds",
+        "push_queue" => "xyne_sync_push_queue_seconds",
         "push" => "xyne_sync_push_seconds",
         "mutation_ack" => "xyne_sync_mutation_ack_seconds",
+        "read_pool_wait" => "xyne_sync_read_pool_wait_seconds",
+        "connect_mutations" | "connect_group" => "xyne_sync_connect_seconds",
         _ => "xyne_sync_unknown_seconds",
     }
 }
@@ -1501,6 +1533,8 @@ fn stage_labels(stage: &str) -> Vec<(&'static str, String)> {
         "land_step" => ("step", "land"),
         "hydrate_cold" => ("kind", "cold"),
         "hydrate_warm" => ("kind", "warm"),
+        "connect_mutations" => ("stage", "mutations"),
+        "connect_group" => ("stage", "group"),
         _ => return Vec::new(),
     };
     vec![(key, value.to_owned())]
@@ -1525,8 +1559,13 @@ fn stage_help(stage: &str) -> &'static str {
         "hydrate_cold" | "hydrate_warm" => "a query's registration to its rows present",
         "read_io" => "a storage read from issue to its rows back on the engine thread",
         "read_rows" => "rows per storage read",
+        "push_queue" => "a push's wait in its connection's queue for the pushes before it",
         "push" => "the application server's push round trip",
         "mutation_ack" => "a push to the poke acknowledging it",
+        "read_pool_wait" => "a storage read's wait for a read pool connection",
+        "connect_mutations" | "connect_group" => {
+            "a connecting client's wait, by stage: the mutation state read, the group thread's reply"
+        }
         _ => "",
     }
 }
@@ -1546,6 +1585,7 @@ fn counter_name(name: &str) -> (String, Vec<(&'static str, String)>) {
         "plans_page_driven" => ("plans", &[("kind", "page_drives")]),
         "pushes_ok" => ("pushes", &[("result", "ok")]),
         "pushes_failed" => ("pushes", &[("result", "failed")]),
+        "push_queue_full" => ("push_queue_full", &[]),
         "mutation_results" => ("mutation_results", &[]),
         "mutation_cleanups" => ("mutation_cleanups", &[]),
         "connections_opened" => ("connections", &[("event", "opened")]),
@@ -1608,6 +1648,7 @@ fn measure_help(name: &str) -> &'static str {
         "pages_short" => "pages served short of their limit",
         "plans_page_driven" => "plans in which a page drives its own join",
         "pushes_ok" | "pushes_failed" => "pushes forwarded to the application server, by outcome",
+        "push_queue_full" => "pushes that waited for room in their connection's queue",
         "mutation_results" => {
             "mutation results (recorded or cleaned up) taken by a client group held here, for its next poke's mutationsPatch"
         }
