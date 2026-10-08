@@ -46,6 +46,9 @@ fn run(state: Arc<AppState>, interval: Duration) {
             .plan_cache_entries
             .store(state.plans.len() as u64, Ordering::Relaxed);
         stats
+            .plan_count_cache_entries
+            .store(state.plans.counts() as u64, Ordering::Relaxed);
+        stats
             .transform_cache_entries
             .store(state.transforms.len() as u64, Ordering::Relaxed);
         stats
