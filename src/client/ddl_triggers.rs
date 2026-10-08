@@ -378,8 +378,8 @@ mod tests {
     /// The copy checked in for app `xyne`, shard 0 and publication
     /// `xyne_sync_pub` (`scripts/sql/ddl-triggers.sql`, what the CI smoke
     /// and a lab run through `psql`) is the generator's output, so the two
-    /// cannot drift: regenerate it with `cargo run --example ddl_triggers --
-    /// xyne 0 xyne_sync_pub > scripts/sql/ddl-triggers.sql`.
+    /// cannot drift: regenerate it from `trigger_stack_sql("xyne", 0,
+    /// &["xyne_sync_pub"])` and check the output in.
     #[test]
     fn the_checked_in_stack_is_the_generators() {
         let checked_in = include_str!("../../scripts/sql/ddl-triggers.sql");

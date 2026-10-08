@@ -102,9 +102,12 @@ at:
    refuses to start without it:
 
    ```bash
-   cargo run --example ddl_triggers -- <app> <shard> <publication> | psql "$DATABASE_URL"
-   # for example: -- xyne 0 xyne_sync_pub
+   psql "$DATABASE_URL" < scripts/sql/ddl-triggers.sql
    ```
+
+   The checked-in stack is for app `xyne`, shard 0 and publication
+   `xyne_sync_pub`. For another app, shard or publication, generate the
+   stack with `trigger_stack_sql` in `src/client/ddl_triggers.rs`.
 
    This creates the event trigger `<app>_ddl_end_<shard>`. During every
    migration, inside the migration's own transaction, it records the published
