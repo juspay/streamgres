@@ -6,6 +6,8 @@
 //! writes the summary line, so a log alone says how the server is doing.
 //! Nothing here runs on a thread that serves clients.
 
+use std::collections::{BTreeMap, HashMap};
+use std::ops::AddAssign;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -113,15 +115,15 @@ pub struct ThreadSample {
 }
 
 /// Every thread of the process, sampled from `/proc` on Linux; nothing
-/// elsewhere.
+/// elsewhere. A kernel without the `sched` file says so on the first
+/// thread, and the rest of the round is not asked.
 pub fn thread_samples() -> Vec<ThreadSample> {
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut samples = Vec::new();
     #[cfg(target_os = "linux")]
     {
-        // SAFETY: sysconf reads a constant.
-        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
-        let ticks = if ticks > 0 { ticks as f64 } else { 100.0 };
+        let ticks = clock_ticks();
+        let mut sched_exposed = true;
         if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
             for task in tasks.flatten() {
                 let path = task.path();
@@ -141,9 +143,17 @@ pub fn thread_samples() -> Vec<ThreadSample> {
                 let Some((seconds, core)) = parse_stat(&stat, ticks) else {
                     continue;
                 };
-                let migrations = std::fs::read_to_string(path.join("sched"))
-                    .ok()
-                    .and_then(|sched| parse_sched_migrations(&sched));
+                let migrations = if sched_exposed {
+                    match std::fs::read_to_string(path.join("sched")) {
+                        Ok(sched) => parse_sched_migrations(&sched),
+                        Err(error) => {
+                            sched_exposed = error.kind() != std::io::ErrorKind::NotFound;
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 samples.push(ThreadSample {
                     tid,
                     name: thread_label(comm.trim()),
@@ -157,6 +167,18 @@ pub fn thread_samples() -> Vec<ThreadSample> {
     samples
 }
 
+/// Clock ticks a second as the system reports them, read once (100 when
+/// it will not say).
+#[cfg(target_os = "linux")]
+fn clock_ticks() -> f64 {
+    static TICKS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *TICKS.get_or_init(|| {
+        // SAFETY: sysconf reads a constant.
+        let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if ticks > 0 { ticks as f64 } else { 100.0 }
+    })
+}
+
 /// The CPU time and the core of a `/proc/<tid>/stat` line: `utime` and
 /// `stime` (fields 14 and 15, in clock ticks of `ticks` a second)
 /// summed, and `processor` (field 39), the fields taken after the last
@@ -164,10 +186,10 @@ pub fn thread_samples() -> Vec<ThreadSample> {
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_stat(stat: &str, ticks: f64) -> Option<(f64, Option<u32>)> {
     let after = stat.rsplit(')').next()?;
-    let fields: Vec<&str> = after.split_whitespace().collect();
-    let utime: f64 = fields.get(11)?.parse().ok()?;
-    let stime: f64 = fields.get(12)?.parse().ok()?;
-    let core = fields.get(36).and_then(|text| text.parse::<u32>().ok());
+    let mut fields = after.split_whitespace();
+    let utime: f64 = fields.nth(11)?.parse().ok()?;
+    let stime: f64 = fields.next()?.parse().ok()?;
+    let core = fields.nth(23).and_then(|text| text.parse::<u32>().ok());
     Some(((utime + stime) / ticks, core))
 }
 
@@ -187,7 +209,7 @@ fn parse_sched_migrations(sched: &str) -> Option<u64> {
 /// the `xyne-sync-` prefix and summed over a pool's threads), from
 /// `samples`.
 pub fn thread_cpu_seconds(samples: &[ThreadSample]) -> Vec<(String, f64)> {
-    let mut by_name: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    let mut by_name: BTreeMap<String, f64> = BTreeMap::new();
     for sample in samples {
         *by_name.entry(sample.name.clone()).or_insert(0.0) += sample.seconds;
     }
@@ -217,33 +239,50 @@ pub struct Attribution {
 /// forgotten.
 #[derive(Default)]
 pub struct CoreAccount {
-    last: std::collections::HashMap<u64, (f64, Option<u64>)>,
-    cores: std::collections::BTreeMap<u32, f64>,
-    thread_cores: std::collections::BTreeMap<(String, u32), f64>,
-    migrations: std::collections::BTreeMap<String, u64>,
+    last: HashMap<u64, (f64, Option<u64>)>,
+    cores: BTreeMap<u32, f64>,
+    thread_cores: BTreeMap<String, BTreeMap<u32, f64>>,
+    migrations: BTreeMap<String, u64>,
+}
+
+/// Add `amount` to what `map` holds for `name`, the name copied only when
+/// it is new there.
+fn add<T: AddAssign>(map: &mut BTreeMap<String, T>, name: &str, amount: T) {
+    match map.get_mut(name) {
+        Some(total) => *total += amount,
+        None => {
+            map.insert(name.to_owned(), amount);
+        }
+    }
 }
 
 impl CoreAccount {
     /// Take `samples` in and return the attribution so far.
     pub fn account(&mut self, samples: &[ThreadSample]) -> Attribution {
-        let mut seen = std::collections::HashMap::with_capacity(samples.len());
+        let mut seen = HashMap::with_capacity(samples.len());
         let mut placement = Vec::with_capacity(samples.len());
         for sample in samples {
             if let Some(&(before, moved_before)) = self.last.get(&sample.tid) {
                 if let Some(core) = sample.core {
                     let burned = (sample.seconds - before).max(0.0);
                     *self.cores.entry(core).or_insert(0.0) += burned;
-                    *self
-                        .thread_cores
-                        .entry((sample.name.clone(), core))
-                        .or_insert(0.0) += burned;
+                    match self.thread_cores.get_mut(sample.name.as_str()) {
+                        Some(cores) => *cores.entry(core).or_insert(0.0) += burned,
+                        None => {
+                            self.thread_cores
+                                .insert(sample.name.clone(), BTreeMap::from([(core, burned)]));
+                        }
+                    }
                 }
                 if let (Some(moved), Some(moved_before)) = (sample.migrations, moved_before) {
-                    *self.migrations.entry(sample.name.clone()).or_insert(0) +=
-                        moved.saturating_sub(moved_before);
+                    add(
+                        &mut self.migrations,
+                        &sample.name,
+                        moved.saturating_sub(moved_before),
+                    );
                 }
             } else if sample.migrations.is_some() {
-                self.migrations.entry(sample.name.clone()).or_insert(0);
+                add(&mut self.migrations, &sample.name, 0);
             }
             if let Some(core) = sample.core {
                 placement.push((sample.name.clone(), sample.tid, core));
@@ -261,7 +300,11 @@ impl CoreAccount {
             thread_cores: self
                 .thread_cores
                 .iter()
-                .map(|((name, core), &seconds)| (name.clone(), *core, seconds))
+                .flat_map(|(name, cores)| {
+                    cores
+                        .iter()
+                        .map(move |(&core, &seconds)| (name.clone(), core, seconds))
+                })
                 .collect(),
             placement,
             migrations: self
@@ -341,7 +384,9 @@ mod tests {
         assert_eq!(account.account(&[sample(1, 10.0, 3)]).cores, vec![]);
         assert_eq!(account.account(&[sample(1, 12.5, 3)]).cores, vec![(3, 2.5)]);
         assert_eq!(
-            account.account(&[sample(1, 13.0, 5), sample(2, 1.0, 5)]).cores,
+            account
+                .account(&[sample(1, 13.0, 5), sample(2, 1.0, 5)])
+                .cores,
             vec![(3, 2.5), (5, 0.5)],
             "a move charges the new core; a new thread nothing yet"
         );
@@ -434,7 +479,10 @@ mod tests {
         );
         assert_eq!(
             account
-                .account(&[sample(1, "engine", Some(15)), sample(3, "groups", Some(102))])
+                .account(&[
+                    sample(1, "engine", Some(15)),
+                    sample(3, "groups", Some(102))
+                ])
                 .migrations,
             vec![("engine".to_owned(), 5), ("groups".to_owned(), 2)],
             "a thread gone takes nothing away"
