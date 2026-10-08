@@ -238,6 +238,16 @@ static GLOBAL: OnceLock<Arc<Stats>> = OnceLock::new();
 /// Durations of a mutation: `push`, the application server's round trip,
 /// and `mutation_ack`, from the push to the poke that acknowledges it.
 ///
+/// Waits that are invisible from the outside unless measured:
+/// - `read_pool_wait`: a storage read's wait for one of the read pool's
+///   connections (every read on the pool: the engine's, the planner's
+///   counts, the mutation state read at connect).
+/// - `connect_mutations`: a connecting client's read of its group's
+///   mutation state on PostgreSQL.
+/// - `connect_group`: a connecting client's Connect request, from being
+///   sent to the group thread to that thread's reply (the thread's queue
+///   and its catch-up work).
+///
 /// Counts: transactions and writes routed, pokes and frames written, rows
 /// serialized and rows found already serialized in the same flush,
 /// transforms answered from the cache and not, pushes by outcome,
@@ -265,6 +275,9 @@ pub struct Stats {
     pub land_step: Histogram,
     pub push: Histogram,
     pub mutation_ack: Histogram,
+    pub read_pool_wait: Histogram,
+    pub connect_mutations: Histogram,
+    pub connect_group: Histogram,
     pub transactions: AtomicU64,
     pub writes: AtomicU64,
     pub pokes: AtomicU64,
@@ -285,6 +298,9 @@ pub struct Stats {
     pub plans_page_driven: AtomicU64,
     pub pushes_ok: AtomicU64,
     pub pushes_failed: AtomicU64,
+    /// Pushes in flight to the application server right now, over every
+    /// connection: what the mutate endpoint is behind by.
+    pub pushes_queued: AtomicU64,
     /// Mutation results heard from the application server's result table
     /// (a result recorded or cleaned up) for a client group this server
     /// holds, each for the group's next poke's `mutationsPatch`.
@@ -427,6 +443,9 @@ impl Stats {
             land_step: Histogram::new(),
             push: Histogram::new(),
             mutation_ack: Histogram::new(),
+            read_pool_wait: Histogram::new(),
+            connect_mutations: Histogram::new(),
+            connect_group: Histogram::new(),
             transactions: AtomicU64::new(0),
             writes: AtomicU64::new(0),
             pokes: AtomicU64::new(0),
@@ -447,6 +466,7 @@ impl Stats {
             plans_page_driven: AtomicU64::new(0),
             pushes_ok: AtomicU64::new(0),
             pushes_failed: AtomicU64::new(0),
+            pushes_queued: AtomicU64::new(0),
             mutation_results: AtomicU64::new(0),
             mutation_cleanups: AtomicU64::new(0),
             connections_opened: AtomicU64::new(0),
@@ -660,6 +680,9 @@ impl Stats {
             ("land_step", &self.land_step),
             ("push", &self.push),
             ("mutation_ack", &self.mutation_ack),
+            ("read_pool_wait", &self.read_pool_wait),
+            ("connect_mutations", &self.connect_mutations),
+            ("connect_group", &self.connect_group),
         ]
     }
 
@@ -732,6 +755,7 @@ impl Stats {
         };
         vec![
             ("connections_open", load(&self.connections_open)),
+            ("pushes_queued", load(&self.pushes_queued)),
             ("client_groups", load(&self.client_groups)),
             ("clients", load(&self.clients)),
             ("engine_inbox", load(&self.engine_inbox)),
@@ -1488,6 +1512,8 @@ fn metric_of(stage: &str) -> &'static str {
         "read_io" => "xyne_sync_read_seconds",
         "push" => "xyne_sync_push_seconds",
         "mutation_ack" => "xyne_sync_mutation_ack_seconds",
+        "read_pool_wait" => "xyne_sync_read_pool_wait_seconds",
+        "connect_mutations" | "connect_group" => "xyne_sync_connect_seconds",
         _ => "xyne_sync_unknown_seconds",
     }
 }
@@ -1501,6 +1527,8 @@ fn stage_labels(stage: &str) -> Vec<(&'static str, String)> {
         "land_step" => ("step", "land"),
         "hydrate_cold" => ("kind", "cold"),
         "hydrate_warm" => ("kind", "warm"),
+        "connect_mutations" => ("stage", "mutations"),
+        "connect_group" => ("stage", "group"),
         _ => return Vec::new(),
     };
     vec![(key, value.to_owned())]
@@ -1527,6 +1555,10 @@ fn stage_help(stage: &str) -> &'static str {
         "read_rows" => "rows per storage read",
         "push" => "the application server's push round trip",
         "mutation_ack" => "a push to the poke acknowledging it",
+        "read_pool_wait" => "a storage read's wait for a read pool connection",
+        "connect_mutations" | "connect_group" => {
+            "a connecting client's wait, by stage: the mutation state read, the group thread's reply"
+        }
         _ => "",
     }
 }
@@ -1630,6 +1662,7 @@ fn measure_help(name: &str) -> &'static str {
         "otel_export_failures" => "OTLP export requests that failed",
         "otel_logs_dropped" => "log records dropped because the OTLP queue was full",
         "connections_open" => "client connections open now",
+        "pushes_queued" => "pushes in flight to the application server now",
         "client_groups" => "client groups the group threads hold",
         "clients" => "clients connected across those groups",
         "engine_inbox" => "commands waiting for the engine thread",

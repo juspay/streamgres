@@ -398,7 +398,10 @@ async fn handle(
         let _ = writer.await;
         return;
     }
+    let reading = Instant::now();
     let (lmids, results) = state.mutations.read(&group_id).await;
+    state.stats.connect_mutations.record(reading.elapsed());
+    let asked = Instant::now();
     let (reply_tx, reply_rx) = oneshot::channel();
     let request = Request::Connect {
         group: group_id.clone(),
@@ -420,6 +423,7 @@ async fn handle(
         },
         Err(_) => Some("the group thread is gone".to_owned()),
     };
+    state.stats.connect_group.record(asked.elapsed());
     if let Some(reason) = refusal {
         log_event!(
             Level::Info,
@@ -1000,7 +1004,15 @@ impl Conn {
         for mutation in &push.mutation_ids {
             self.state.stats.push_sent(&mutation.client_id, mutation.id);
         }
+        self.state
+            .stats
+            .pushes_queued
+            .fetch_add(1, Ordering::Relaxed);
         let outcome = self.state.backend.push(&self.identity, &push.body).await;
+        self.state
+            .stats
+            .pushes_queued
+            .fetch_sub(1, Ordering::Relaxed);
         let elapsed = started.elapsed();
         self.state.stats.push.record(elapsed);
         let failed = matches!(outcome, PushOutcome::Failed { .. });
