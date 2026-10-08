@@ -21,7 +21,7 @@ use serde_json::Value as Json;
 use crate::ivm::QueryPart;
 use crate::model::ComparisonOperator::{EQ, GT, GTE, IN, LT, LTE, NEQ, NOT_IN};
 use crate::model::{
-    Catalog, ComparisonOperator, DbTable, Join, MultiTableReadQuery, Order, OrderBy,
+    Catalog, ComparisonOperator, DbTable, Driver, Join, MultiTableReadQuery, Order, OrderBy,
     SingleTableReadQuery, Value, ValueType, Where,
 };
 
@@ -199,12 +199,16 @@ fn node(
     for (index, sub) in ast.related.iter().enumerate() {
         let mut child_path = path.clone();
         child_path.push(index);
-        joins.push(edge(sub, child_path, concealed, false, catalog, hidden)?);
+        joins.push(edge(
+            sub, child_path, concealed, false, table, catalog, hidden,
+        )?);
     }
     for (offset, sub) in inner.iter().enumerate() {
         let mut child_path = path.clone();
         child_path.push(left_count + offset);
-        joins.push(edge(sub, child_path, concealed, true, catalog, hidden)?);
+        joins.push(edge(
+            sub, child_path, concealed, true, table, catalog, hidden,
+        )?);
     }
     Ok(MultiTableReadQuery::new(main_table, joins))
 }
@@ -378,25 +382,53 @@ fn edge(
     child_path: Vec<usize>,
     concealed_parent: bool,
     is_inner: bool,
+    parent_table: &DbTable,
     catalog: &Catalog,
     hidden: &mut HashSet<QueryPart>,
 ) -> Result<Join, String> {
-    let (Some(parent_column), Some(child_column)) = (
-        sub.correlation.parent_field.first(),
-        sub.correlation.child_field.first(),
-    ) else {
+    if sub.correlation.parent_field.is_empty() {
         return Err("a join without columns".to_owned());
-    };
-    if sub.correlation.parent_field.len() != 1 || sub.correlation.child_field.len() != 1 {
-        return Err("compound join keys are not supported".to_owned());
+    }
+    if sub.correlation.parent_field.len() != sub.correlation.child_field.len() {
+        return Err("a join must have the same number of parent and child columns".to_owned());
+    }
+    let child_table = catalog
+        .table(&sub.subquery.table)
+        .ok_or_else(|| format!("unknown table `{}`", sub.subquery.table))?;
+    for (parent, child) in sub
+        .correlation
+        .parent_field
+        .iter()
+        .zip(&sub.correlation.child_field)
+    {
+        if parent_table.column(parent).is_none() {
+            return Err(format!(
+                "unknown join column `{}.{parent}`",
+                parent_table.name
+            ));
+        }
+        if child_table.column(child).is_none() {
+            return Err(format!(
+                "unknown join column `{}.{child}`",
+                child_table.name
+            ));
+        }
     }
     let concealed = concealed_parent || sub.system.as_deref() == Some("permissions");
     let child = node(&sub.subquery, child_path, concealed, catalog, hidden)?;
-    Ok(if is_inner {
-        Join::inner(child, parent_column.as_str(), child_column.as_str())
-    } else {
-        Join::left(child, parent_column.as_str(), child_column.as_str())
-    })
+    let columns = sub
+        .correlation
+        .parent_field
+        .iter()
+        .zip(&sub.correlation.child_field)
+        .map(|(parent, child)| (parent.as_str().into(), child.as_str().into()));
+    Ok(Join::with_columns(
+        child,
+        columns,
+        if is_inner { Driver::Sub } else { Driver::Main },
+        is_inner,
+    )
+    .expect("nonempty correlation checked above"))
 }
 
 /// A predicate node as a `Where`; `EXISTS` subqueries are collected into
@@ -930,6 +962,38 @@ mod tests {
             translate(&not_exists, &catalog())
                 .unwrap_err()
                 .contains("NOT EXISTS")
+        );
+    }
+
+    #[test]
+    fn translates_composite_correlations_in_order() {
+        let ast: Ast = serde_json::from_str(r#"{
+            "table": "messages",
+            "where": {"type": "correlatedSubquery", "op": "EXISTS", "related": {
+                "correlation": {"parentField": ["conversationId", "visibleTo"], "childField": ["channelId", "userId"]},
+                "subquery": {"table": "channel_participants"}
+            }}
+        }"#).unwrap();
+        let translated = translate(&ast, &catalog()).unwrap();
+        let join = &translated.query.joins[0];
+        assert_eq!(
+            join.columns()
+                .map(|(parent, child)| (parent.as_str(), child.as_str()))
+                .collect::<Vec<_>>(),
+            [("conversationId", "channelId"), ("visibleTo", "userId")]
+        );
+
+        let malformed: Ast = serde_json::from_str(r#"{
+            "table": "messages",
+            "related": [{
+                "correlation": {"parentField": ["conversationId", "visibleTo"], "childField": ["channelId"]},
+                "subquery": {"table": "channel_participants"}
+            }]
+        }"#).unwrap();
+        assert!(
+            translate(&malformed, &catalog())
+                .unwrap_err()
+                .contains("same number")
         );
     }
 

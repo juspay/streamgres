@@ -171,10 +171,17 @@ fn matching_rows<'a, S: Storage + ?Sized>(
             let mut carried = HashSet::new();
             if join.is_inner {
                 for (_, row) in matching_rows(storage, &join.sub).await? {
-                    if let Some(value) = row.data.get(&join.sub_table_column)
-                        && !value.is_null()
-                    {
-                        carried.insert(value.clone());
+                    let key: Option<Vec<Value>> = join
+                        .columns()
+                        .map(|(_, child)| {
+                            row.data
+                                .get(child)
+                                .filter(|value| !value.is_null())
+                                .cloned()
+                        })
+                        .collect();
+                    if let Some(key) = key {
+                        carried.insert(Value::List(key));
                     }
                 }
             }
@@ -195,9 +202,13 @@ fn matching_rows<'a, S: Storage + ?Sized>(
             .filter(|(_, row)| {
                 let carries = |position: usize| {
                     let join = &node.joins[position];
-                    row.data
-                        .get(&join.main_table_column)
-                        .is_some_and(|value| values[position].contains(value))
+                    let key: Option<Vec<Value>> = join
+                        .columns()
+                        .map(|(main, _)| {
+                            row.data.get(main).filter(|value| !value.is_null()).cloned()
+                        })
+                        .collect();
+                    key.is_some_and(|key| values[position].contains(&Value::List(key)))
                 };
                 let exists =
                     |leaf: &Condition| exists_position(&inner, &leaf.value).is_some_and(carries);

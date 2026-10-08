@@ -39,6 +39,7 @@ fn members_table() -> DbTable {
         vec![
             DbColumn::new("id", ValueType::Int),
             DbColumn::new("team", ValueType::Int),
+            DbColumn::new("project", ValueType::Int),
         ],
     )
 }
@@ -108,6 +109,419 @@ fn tickets_members_query() -> MultiTableReadQuery {
             "team",
         )],
     )
+}
+
+fn tickets_members_composite_query(inner: bool) -> MultiTableReadQuery {
+    let join = Join::with_columns(
+        MultiTableReadQuery::single(query(&members_table(), Where::AND(vec![]))),
+        [
+            ("team_id".into(), "team".into()),
+            ("project".into(), "project".into()),
+        ],
+        if inner { Driver::Sub } else { Driver::Main },
+        inner,
+    )
+    .unwrap();
+    MultiTableReadQuery::new(open_tickets(), vec![join])
+}
+
+#[test]
+fn composite_left_join_requires_both_columns_and_tracks_updates() {
+    let (mut ivm, storage, names) = engine();
+    for w in [
+        insert(
+            "tickets",
+            1,
+            &[
+                ("status", "OPEN".into()),
+                ("team_id", 7.into()),
+                ("project", 10.into()),
+            ],
+        ),
+        insert(
+            "tickets",
+            2,
+            &[
+                ("status", "OPEN".into()),
+                ("team_id", 7.into()),
+                ("project", 20.into()),
+            ],
+        ),
+        insert("members", 3, &[("team", 7.into()), ("project", 10.into())]),
+        insert("members", 4, &[("team", 7.into()), ("project", 30.into())]),
+    ] {
+        storage.apply(&w);
+    }
+    let snapshot = names.register(&mut ivm, "q", tickets_members_composite_query(false));
+    assert_eq!(
+        names.tags(&snapshot),
+        [
+            "q/join0/add:Int(3)",
+            "q/main/add:Int(1)",
+            "q/main/add:Int(2)"
+        ]
+    );
+
+    let ops = write(
+        &mut ivm,
+        &storage,
+        update("members", 4, &[("team", 7.into()), ("project", 20.into())]),
+    );
+    assert_eq!(names.tags(&ops), ["q/join0/add:Int(4)"]);
+
+    let ops = write(
+        &mut ivm,
+        &storage,
+        update(
+            "tickets",
+            1,
+            &[
+                ("status", "OPEN".into()),
+                ("team_id", 7.into()),
+                ("project", 30.into()),
+            ],
+        ),
+    );
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/del:Int(3)", "q/main/add:Int(1)"]
+    );
+}
+
+#[test]
+fn composite_inner_join_gates_on_the_full_key() {
+    let (mut ivm, storage, names) = engine();
+    for w in [
+        insert(
+            "tickets",
+            1,
+            &[
+                ("status", "OPEN".into()),
+                ("team_id", 7.into()),
+                ("project", 10.into()),
+            ],
+        ),
+        insert(
+            "tickets",
+            2,
+            &[
+                ("status", "OPEN".into()),
+                ("team_id", 7.into()),
+                ("project", 20.into()),
+            ],
+        ),
+        insert("members", 3, &[("team", 7.into()), ("project", 10.into())]),
+    ] {
+        storage.apply(&w);
+    }
+    let snapshot = names.register(&mut ivm, "q", tickets_members_composite_query(true));
+    assert_eq!(
+        names.tags(&snapshot),
+        ["q/join0/add:Int(3)", "q/main/add:Int(1)"]
+    );
+
+    let ops = write(
+        &mut ivm,
+        &storage,
+        insert("members", 4, &[("team", 7.into()), ("project", 20.into())]),
+    );
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/add:Int(4)", "q/main/add:Int(2)"]
+    );
+
+    let ops = write(
+        &mut ivm,
+        &storage,
+        update("members", 3, &[("team", 7.into()), ("project", 30.into())]),
+    );
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/del:Int(3)", "q/main/del:Int(1)"]
+    );
+}
+
+#[test]
+fn composite_main_driven_inner_join_uses_both_columns() {
+    let (mut ivm, storage, names) = engine();
+    for w in [
+        insert(
+            "tickets",
+            1,
+            &[
+                ("status", "OPEN".into()),
+                ("team_id", 7.into()),
+                ("project", 10.into()),
+            ],
+        ),
+        insert(
+            "tickets",
+            2,
+            &[
+                ("status", "OPEN".into()),
+                ("team_id", 7.into()),
+                ("project", 20.into()),
+            ],
+        ),
+        insert("members", 3, &[("team", 7.into()), ("project", 10.into())]),
+    ] {
+        storage.apply(&w);
+    }
+    let join = Join::with_columns(
+        MultiTableReadQuery::single(query(&members_table(), Where::AND(vec![]))),
+        [
+            ("team_id".into(), "team".into()),
+            ("project".into(), "project".into()),
+        ],
+        Driver::Main,
+        true,
+    )
+    .unwrap();
+    let spec = MultiTableReadQuery::new(open_tickets(), vec![join]);
+    let snapshot = names.register(&mut ivm, "q", spec);
+    assert_eq!(
+        names.tags(&snapshot),
+        ["q/join0/add:Int(3)", "q/main/add:Int(1)"]
+    );
+
+    let ops = write(
+        &mut ivm,
+        &storage,
+        insert("members", 4, &[("team", 7.into()), ("project", 20.into())]),
+    );
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/add:Int(4)", "q/main/add:Int(2)"]
+    );
+
+    let ops = write(&mut ivm, &storage, delete("members", 3));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/del:Int(3)", "q/main/del:Int(1)"]
+    );
+}
+
+#[test]
+fn composite_related_limit_is_per_full_key() {
+    let (mut ivm, storage, names) = engine();
+    for w in [
+        insert(
+            "tickets",
+            1,
+            &[
+                ("status", "OPEN".into()),
+                ("team_id", 7.into()),
+                ("project", 10.into()),
+            ],
+        ),
+        insert(
+            "tickets",
+            2,
+            &[
+                ("status", "OPEN".into()),
+                ("team_id", 7.into()),
+                ("project", 20.into()),
+            ],
+        ),
+        insert("members", 3, &[("team", 7.into()), ("project", 10.into())]),
+        insert("members", 4, &[("team", 7.into()), ("project", 10.into())]),
+        insert("members", 5, &[("team", 7.into()), ("project", 20.into())]),
+    ] {
+        storage.apply(&w);
+    }
+    let mut child = query(&members_table(), Where::AND(vec![]));
+    child.limit = 1;
+    let join = Join::with_columns(
+        MultiTableReadQuery::single(child),
+        [
+            ("team_id".into(), "team".into()),
+            ("project".into(), "project".into()),
+        ],
+        Driver::Main,
+        false,
+    )
+    .unwrap();
+    let snapshot = names.register(
+        &mut ivm,
+        "q",
+        MultiTableReadQuery::new(open_tickets(), vec![join]),
+    );
+    assert_eq!(
+        names.tags(&snapshot),
+        [
+            "q/join0/add:Int(3)",
+            "q/join0/add:Int(5)",
+            "q/main/add:Int(1)",
+            "q/main/add:Int(2)"
+        ]
+    );
+
+    let ops = write(&mut ivm, &storage, delete("members", 3));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/add:Int(4)", "q/join0/del:Int(3)"]
+    );
+}
+
+#[test]
+fn composite_exists_inside_or_keeps_the_other_branch() {
+    let (mut ivm, storage, names) = engine();
+    for w in [
+        insert(
+            "tickets",
+            1,
+            &[
+                ("status", "PRIVATE".into()),
+                ("team_id", 7.into()),
+                ("project", 10.into()),
+            ],
+        ),
+        insert(
+            "tickets",
+            2,
+            &[
+                ("status", "PUBLIC".into()),
+                ("team_id", 7.into()),
+                ("project", 20.into()),
+            ],
+        ),
+        insert(
+            "tickets",
+            3,
+            &[
+                ("status", "PRIVATE".into()),
+                ("team_id", 7.into()),
+                ("project", 30.into()),
+            ],
+        ),
+        insert("members", 4, &[("team", 7.into()), ("project", 10.into())]),
+    ] {
+        storage.apply(&w);
+    }
+    let parent = query(
+        &tickets_table(),
+        Where::OR(vec![
+            Where::condition("status", ComparisonOperator::EQ, "PUBLIC"),
+            Where::exists("team_id", 0),
+        ]),
+    );
+    let join = Join::with_columns(
+        MultiTableReadQuery::single(query(&members_table(), Where::AND(vec![]))),
+        [
+            ("team_id".into(), "team".into()),
+            ("project".into(), "project".into()),
+        ],
+        Driver::Sub,
+        true,
+    )
+    .unwrap();
+    let snapshot = names.register(&mut ivm, "q", MultiTableReadQuery::new(parent, vec![join]));
+    assert_eq!(
+        names.tags(&snapshot),
+        [
+            "q/join0/add:Int(4)",
+            "q/main/add:Int(1)",
+            "q/main/add:Int(2)"
+        ]
+    );
+
+    let ops = write(
+        &mut ivm,
+        &storage,
+        insert("members", 5, &[("team", 7.into()), ("project", 30.into())]),
+    );
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/add:Int(5)", "q/main/add:Int(3)"]
+    );
+
+    let ops = write(&mut ivm, &storage, delete("members", 4));
+    assert_eq!(
+        names.tags(&ops),
+        ["q/join0/del:Int(4)", "q/main/del:Int(1)"]
+    );
+}
+
+#[test]
+fn composite_join_never_matches_a_null_component() {
+    let (mut ivm, storage, names) = engine();
+    storage.apply(&insert(
+        "tickets",
+        1,
+        &[
+            ("status", "OPEN".into()),
+            ("team_id", 7.into()),
+            ("project", Value::Null),
+        ],
+    ));
+    storage.apply(&insert(
+        "members",
+        2,
+        &[("team", 7.into()), ("project", Value::Null)],
+    ));
+    let snapshot = names.register(&mut ivm, "q", tickets_members_composite_query(true));
+    assert!(names.tags(&snapshot).is_empty());
+}
+
+#[test]
+fn composite_page_gate_reopens_the_matching_tuple() {
+    for read in [PageRead::Whole, PageRead::Batched] {
+        let (mut ivm, storage, names) = engine();
+        for w in [
+            insert(
+                "tickets",
+                1,
+                &[
+                    ("status", "OPEN".into()),
+                    ("team_id", 7.into()),
+                    ("project", 10.into()),
+                ],
+            ),
+            insert(
+                "tickets",
+                2,
+                &[
+                    ("status", "OPEN".into()),
+                    ("team_id", 7.into()),
+                    ("project", 20.into()),
+                ],
+            ),
+            insert("members", 3, &[("team", 7.into()), ("project", 20.into())]),
+        ] {
+            storage.apply(&w);
+        }
+        let mut parent = query(&tickets_table(), Where::exists("team_id", 0));
+        parent.limit = 1;
+        let join = Join::with_columns(
+            MultiTableReadQuery::single(query(&members_table(), Where::AND(vec![]))),
+            [
+                ("team_id".into(), "team".into()),
+                ("project".into(), "project".into()),
+            ],
+            Driver::Main,
+            true,
+        )
+        .unwrap();
+        let mut spec = MultiTableReadQuery::new(parent, vec![join]);
+        spec.page = read;
+        names.register(&mut ivm, "q", spec);
+        assert_eq!(
+            shown_ids(&ivm, &names, "q", QueryPart::main()),
+            [2],
+            "{read:?}"
+        );
+
+        write(
+            &mut ivm,
+            &storage,
+            insert("members", 4, &[("team", 7.into()), ("project", 10.into())]),
+        );
+        assert_eq!(
+            shown_ids(&ivm, &names, "q", QueryPart::main()),
+            [1],
+            "{read:?}"
+        );
+    }
 }
 
 /// OPEN tickets LEFT JOINed to `users` TWICE — `assigned_to = users.id`

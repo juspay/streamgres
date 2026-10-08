@@ -189,14 +189,24 @@ impl<'a> Scope<'a> {
         let Some(sub) = Scope::counted(&join.sub, catalog, aliases) else {
             return "FALSE".to_owned();
         };
+        let equalities = join
+            .columns()
+            .map(|(main, child)| {
+                format!(
+                    "{}.{} = {}.{}",
+                    sub.alias,
+                    quote_ident(child.as_str()),
+                    self.alias,
+                    quote_ident(main.as_str())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
         format!(
-            "EXISTS (SELECT 1 FROM {} AS {} WHERE ({}.{} = {}.{} AND {}))",
+            "EXISTS (SELECT 1 FROM {} AS {} WHERE ({} AND {}))",
             quote_ident(join.sub.main_table.table.as_str()),
             sub.alias,
-            sub.alias,
-            quote_ident(join.sub_table_column.as_str()),
-            self.alias,
-            quote_ident(join.main_table_column.as_str()),
+            equalities,
             sub.render_node()
         )
     }
@@ -399,7 +409,58 @@ pub fn quote_literal(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DbColumn, Join, OrderBy, SharedSet};
+    use crate::model::{DbColumn, Driver, Join, OrderBy, SharedSet};
+
+    #[test]
+    fn composite_exists_renders_every_equality() {
+        let parent = DbTable::new(
+            "parents",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("tenant", ValueType::Int),
+            ],
+        );
+        let child = DbTable::new(
+            "children",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("tenant", ValueType::Int),
+            ],
+        );
+        let catalog = Catalog::new([parent, child]);
+        let query = MultiTableReadQuery::new(
+            SingleTableReadQuery::new(
+                "parents",
+                Where::exists("id", 0),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            ),
+            vec![
+                Join::with_columns(
+                    MultiTableReadQuery::single(SingleTableReadQuery::new(
+                        "children",
+                        Where::AND(vec![]),
+                        OrderBy::new("id", Order::ASC),
+                        u32::MAX,
+                    )),
+                    [
+                        ("id".into(), "id".into()),
+                        ("tenant".into(), "tenant".into()),
+                    ],
+                    Driver::Sub,
+                    true,
+                )
+                .unwrap(),
+            ],
+        );
+        let sql = count_sql(&query, &catalog, 100).unwrap();
+        assert!(
+            sql.contains("t1.\"id\" = t0.\"id\" AND t1.\"tenant\" = t0.\"tenant\""),
+            "{sql}"
+        );
+    }
 
     /// `tickets(id, status, points)`.
     fn tickets() -> DbTable {

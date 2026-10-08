@@ -67,8 +67,9 @@ pub enum Driver {
 }
 
 /// One join edge of a [`MultiTableReadQuery`]: rows of `sub`'s main table
-/// attach to rows of the enclosing node where
-/// `sub.<sub_table_column> = enclosing.<main_table_column>`.
+/// attach to rows of the enclosing node where every ordered column pair
+/// matches. The first pair is stored in `main_table_column` and
+/// `sub_table_column`; `additional_columns` carries any remaining pairs.
 ///
 /// `sub` is a full multi-table query, so a leaf is a node whose `joins`
 /// are empty and nesting costs nothing. Two flags spell the edge out:
@@ -104,6 +105,8 @@ pub struct Join {
     pub sub: MultiTableReadQuery,
     pub main_table_column: ColumnName,
     pub sub_table_column: ColumnName,
+    /// Further ordered equality pairs in a composite correlation.
+    pub additional_columns: Vec<(ColumnName, ColumnName)>,
     pub driver: Driver,
     pub is_inner: bool,
 }
@@ -123,9 +126,38 @@ impl Join {
             sub,
             main_table_column: main_table_column.into(),
             sub_table_column: sub_table_column.into(),
+            additional_columns: Vec::new(),
             driver,
             is_inner,
         }
+    }
+
+    /// Build a join from one or more ordered `(main, sub)` column pairs.
+    pub fn with_columns(
+        sub: MultiTableReadQuery,
+        columns: impl IntoIterator<Item = (ColumnName, ColumnName)>,
+        driver: Driver,
+        is_inner: bool,
+    ) -> Option<Self> {
+        let mut columns = columns.into_iter();
+        let (main_table_column, sub_table_column) = columns.next()?;
+        Some(Self {
+            sub,
+            main_table_column,
+            sub_table_column,
+            additional_columns: columns.collect(),
+            driver,
+            is_inner,
+        })
+    }
+
+    /// Every equality pair, in correlation order.
+    pub fn columns(&self) -> impl Iterator<Item = (&ColumnName, &ColumnName)> {
+        std::iter::once((&self.main_table_column, &self.sub_table_column)).chain(
+            self.additional_columns
+                .iter()
+                .map(|(main, sub)| (main, sub)),
+        )
     }
 
     /// A LEFT edge: the main rows drive and stand on their own.

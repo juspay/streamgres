@@ -675,6 +675,7 @@ fn same_skeleton(a: &MultiTableReadQuery, b: &MultiTableReadQuery) -> bool {
         && a.joins.iter().zip(&b.joins).all(|(x, y)| {
             x.main_table_column == y.main_table_column
                 && x.sub_table_column == y.sub_table_column
+                && x.additional_columns == y.additional_columns
                 && x.is_inner == y.is_inner
                 && same_skeleton(&x.sub, &y.sub)
         })
