@@ -59,7 +59,7 @@ pub mod threads;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore};
@@ -648,13 +648,20 @@ impl Pool {
         Ok((alias, aliases.catalog.clone()))
     }
 
-    /// A permit to hold a connection.
+    /// A permit to hold a connection; the wait for one, when every
+    /// connection is taken, is measured as `read_pool_wait`.
     async fn permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StorageError> {
-        self.permits
+        let started = Instant::now();
+        let permit = self
+            .permits
             .clone()
             .acquire_owned()
             .await
-            .map_err(|_| StorageError("the read pool is closed".to_owned()))
+            .map_err(|_| StorageError("the read pool is closed".to_owned()));
+        if let Some(stats) = crate::stats::Stats::global() {
+            stats.read_pool_wait.record(started.elapsed());
+        }
+        permit
     }
 
     /// An idle connection that is still open, or a new one. A connection
