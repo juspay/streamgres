@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Router;
@@ -118,12 +118,12 @@ enum PushWork {
     },
 }
 
-/// How many pushes may wait for the push worker before the reader waits
-/// too. Pushes are forwarded one at a time, in order; a mutate endpoint
-/// slower than the client's mutations fills the queue, and from then on
-/// the reader paces the client as it did when every push was forwarded
-/// inline.
-const PUSH_QUEUE: usize = 32;
+/// The queue is unbounded, so the reader never waits on it and a
+/// client's queries are served however far its mutations are behind; a
+/// connection whose backlog reaches this many, and each doubling after,
+/// is logged, since it means the mutate endpoint is slower than that
+/// client's mutations.
+const PUSH_BACKLOG_WARN: u64 = 32;
 
 /// The connect URL's parameters.
 #[derive(Debug, Clone)]
@@ -333,7 +333,8 @@ struct Conn {
     identity: Identity,
     out: mpsc::UnboundedSender<Outbound>,
     requests: mpsc::Sender<Request>,
-    pushes: mpsc::Sender<QueuedPush>,
+    pushes: mpsc::UnboundedSender<QueuedPush>,
+    backlog: Arc<AtomicU64>,
     joined: bool,
 }
 
@@ -406,9 +407,11 @@ async fn handle(
         None => protocol::Handshake::default(),
     };
     let requests = state.requests[shard_of(&group_id, state.requests.len())].clone();
-    let (pushes, pushes_rx) = mpsc::channel::<QueuedPush>(PUSH_QUEUE);
+    let (pushes, pushes_rx) = mpsc::unbounded_channel::<QueuedPush>();
+    let backlog = Arc::new(AtomicU64::new(0));
     tokio::spawn(push_loop(
         pushes_rx,
+        backlog.clone(),
         state.clone(),
         params.clone(),
         out.clone(),
@@ -425,6 +428,7 @@ async fn handle(
         out: out.clone(),
         requests: requests.clone(),
         pushes,
+        backlog,
         joined: false,
     };
     let declared = handshake
@@ -730,17 +734,16 @@ impl Conn {
                     && let Some(cleanup) =
                         protocol::cleanup_clients(&self.params.group_id, &deleted.client_ids)
                 {
-                    self.clean_up(cleanup).await;
+                    self.clean_up(cleanup);
                 }
                 true
             }
             Upstream::AckMutationResponses(upto) => {
-                self.clean_up(protocol::cleanup_results(&self.params.group_id, &upto))
-                    .await;
+                self.clean_up(protocol::cleanup_results(&self.params.group_id, &upto));
                 true
             }
             Upstream::Push(push) => {
-                self.push(push).await;
+                self.push(push);
                 true
             }
             Upstream::Pull(pull) => {
@@ -805,32 +808,32 @@ impl Conn {
     /// pushes queued before it: the answer matters only to the counters
     /// and the log, and a slow endpoint must not hold up this connection's
     /// messages, its pings among them.
-    async fn clean_up(&self, body: Json) {
+    fn clean_up(&self, body: Json) {
         self.queue_push(PushWork::Cleanup {
             body,
             identity: self.identity.clone(),
-        })
-        .await;
+        });
     }
 
-    /// Hand `work` to the push worker: at once when the queue has room,
-    /// else once it has, which is counted (`push_queue_full`) since the
-    /// client's next message waits meanwhile.
-    async fn queue_push(&self, work: PushWork) {
-        let queued = QueuedPush {
-            queued: Instant::now(),
-            work,
-        };
-        let queued = match self.pushes.try_send(queued) {
-            Ok(()) => return,
-            Err(mpsc::error::TrySendError::Full(queued)) => queued,
-            Err(mpsc::error::TrySendError::Closed(_)) => return,
-        };
+    /// Hand `work` to the push worker, at once: the queue never makes the
+    /// reader wait. The backlog is counted, for the gauge and for the log
+    /// when one connection's grows past [`PUSH_BACKLOG_WARN`].
+    fn queue_push(&self, work: PushWork) {
+        let waiting = self.backlog.fetch_add(1, Ordering::Relaxed) + 1;
         self.state
             .stats
-            .push_queue_full
+            .pushes_queued
             .fetch_add(1, Ordering::Relaxed);
-        let _ = self.pushes.send(queued).await;
+        if waiting >= PUSH_BACKLOG_WARN && waiting.is_power_of_two() {
+            log_warn!(
+                "connection {}: {waiting} pushes waiting for the mutate endpoint",
+                self.params.wsid
+            );
+        }
+        let _ = self.pushes.send(QueuedPush {
+            queued: Instant::now(),
+            work,
+        });
     }
 
     /// Clients the client says are gone: their queries go, and the client
@@ -1035,10 +1038,9 @@ impl Conn {
 
     /// A push: queued for the push worker, which forwards it as is after
     /// the pushes before it. The reader goes on to the client's next
-    /// message at once (a query change, a pull, a ping), which no longer
-    /// waits for the mutate endpoint's round trip; it waits only when the
-    /// queue is full ([`PUSH_QUEUE`]).
-    async fn push(&mut self, push: protocol::Push) {
+    /// message at once (a query change, a pull, a ping), which never
+    /// waits for the mutate endpoint's round trip.
+    fn push(&mut self, push: protocol::Push) {
         if push.client_group_id != self.params.group_id {
             log_warn!(
                 "connection {}: a push for client group {} on the connection of {}",
@@ -1053,8 +1055,7 @@ impl Conn {
         self.queue_push(PushWork::Mutations {
             push,
             identity: self.identity.clone(),
-        })
-        .await;
+        });
     }
 }
 
@@ -1065,7 +1066,8 @@ impl Conn {
 /// push read from the client is sent whether or not the client stays
 /// to hear about it, as it was when pushes were forwarded inline.
 async fn push_loop(
-    mut pushes: mpsc::Receiver<QueuedPush>,
+    mut pushes: mpsc::UnboundedReceiver<QueuedPush>,
+    backlog: Arc<AtomicU64>,
     state: Arc<AppState>,
     params: ConnectParams,
     out: mpsc::UnboundedSender<Outbound>,
@@ -1080,6 +1082,8 @@ async fn push_loop(
                 clean_up_results(&state, &params.wsid, &identity, body).await;
             }
         }
+        backlog.fetch_sub(1, Ordering::Relaxed);
+        state.stats.pushes_queued.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

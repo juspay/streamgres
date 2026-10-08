@@ -301,9 +301,9 @@ pub struct Stats {
     pub plans_page_driven: AtomicU64,
     pub pushes_ok: AtomicU64,
     pub pushes_failed: AtomicU64,
-    /// Pushes that found their connection's queue full, so the reader
-    /// waited for room before the client's next message.
-    pub push_queue_full: AtomicU64,
+    /// Pushes queued or in flight to the application server right now,
+    /// over every connection: what the mutate endpoint is behind by.
+    pub pushes_queued: AtomicU64,
     /// Mutation results heard from the application server's result table
     /// (a result recorded or cleaned up) for a client group this server
     /// holds, each for the group's next poke's `mutationsPatch`.
@@ -470,7 +470,7 @@ impl Stats {
             plans_page_driven: AtomicU64::new(0),
             pushes_ok: AtomicU64::new(0),
             pushes_failed: AtomicU64::new(0),
-            push_queue_full: AtomicU64::new(0),
+            pushes_queued: AtomicU64::new(0),
             mutation_results: AtomicU64::new(0),
             mutation_cleanups: AtomicU64::new(0),
             connections_opened: AtomicU64::new(0),
@@ -716,7 +716,6 @@ impl Stats {
             ("pages_short", load(&self.pages_short)),
             ("pushes_ok", load(&self.pushes_ok)),
             ("pushes_failed", load(&self.pushes_failed)),
-            ("push_queue_full", load(&self.push_queue_full)),
             ("mutation_results", load(&self.mutation_results)),
             ("mutation_cleanups", load(&self.mutation_cleanups)),
             ("connections_opened", load(&self.connections_opened)),
@@ -761,6 +760,7 @@ impl Stats {
         };
         vec![
             ("connections_open", load(&self.connections_open)),
+            ("pushes_queued", load(&self.pushes_queued)),
             ("client_groups", load(&self.client_groups)),
             ("clients", load(&self.clients)),
             ("engine_inbox", load(&self.engine_inbox)),
@@ -1585,7 +1585,6 @@ fn counter_name(name: &str) -> (String, Vec<(&'static str, String)>) {
         "plans_page_driven" => ("plans", &[("kind", "page_drives")]),
         "pushes_ok" => ("pushes", &[("result", "ok")]),
         "pushes_failed" => ("pushes", &[("result", "failed")]),
-        "push_queue_full" => ("push_queue_full", &[]),
         "mutation_results" => ("mutation_results", &[]),
         "mutation_cleanups" => ("mutation_cleanups", &[]),
         "connections_opened" => ("connections", &[("event", "opened")]),
@@ -1648,7 +1647,6 @@ fn measure_help(name: &str) -> &'static str {
         "pages_short" => "pages served short of their limit",
         "plans_page_driven" => "plans in which a page drives its own join",
         "pushes_ok" | "pushes_failed" => "pushes forwarded to the application server, by outcome",
-        "push_queue_full" => "pushes that waited for room in their connection's queue",
         "mutation_results" => {
             "mutation results (recorded or cleaned up) taken by a client group held here, for its next poke's mutationsPatch"
         }
@@ -1671,6 +1669,7 @@ fn measure_help(name: &str) -> &'static str {
         "otel_export_failures" => "OTLP export requests that failed",
         "otel_logs_dropped" => "log records dropped because the OTLP queue was full",
         "connections_open" => "client connections open now",
+        "pushes_queued" => "pushes queued or in flight to the application server now",
         "client_groups" => "client groups the group threads hold",
         "clients" => "clients connected across those groups",
         "engine_inbox" => "commands waiting for the engine thread",
