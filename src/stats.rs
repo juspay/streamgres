@@ -191,6 +191,9 @@ struct PendingPush {
 struct Sampled {
     thread_cpu: Vec<(String, f64)>,
     core_cpu: Vec<(u32, f64)>,
+    thread_core_cpu: Vec<(String, u32, f64)>,
+    thread_core: Vec<(String, u64, u32)>,
+    thread_migrations: Vec<(String, u64)>,
     groups_inbox: Vec<u64>,
 }
 
@@ -557,6 +560,29 @@ impl Stats {
     pub fn publish_core_cpu(&self, core_cpu: Vec<(u32, f64)>) {
         if let Ok(mut sampled) = self.sampled.lock() {
             sampled.core_cpu = core_cpu;
+        }
+    }
+
+    /// Publish the CPU seconds by thread name and core the sampler
+    /// attributed.
+    pub fn publish_thread_core_cpu(&self, thread_core_cpu: Vec<(String, u32, f64)>) {
+        if let Ok(mut sampled) = self.sampled.lock() {
+            sampled.thread_core_cpu = thread_core_cpu;
+        }
+    }
+
+    /// Publish where every thread was at the last sample: its name, id
+    /// and core.
+    pub fn publish_thread_core(&self, thread_core: Vec<(String, u64, u32)>) {
+        if let Ok(mut sampled) = self.sampled.lock() {
+            sampled.thread_core = thread_core;
+        }
+    }
+
+    /// Publish the moves between cores by thread name the sampler summed.
+    pub fn publish_thread_migrations(&self, thread_migrations: Vec<(String, u64)>) {
+        if let Ok(mut sampled) = self.sampled.lock() {
+            sampled.thread_migrations = thread_migrations;
         }
     }
 
@@ -946,6 +972,25 @@ impl Stats {
             .iter()
             .map(|(core, seconds)| (core.to_string(), json!(seconds)))
             .collect();
+        let mut thread_core_cpu: serde_json::Map<String, Json> = serde_json::Map::new();
+        for (thread, core, seconds) in &sampled.thread_core_cpu {
+            let by_core = thread_core_cpu
+                .entry(thread.clone())
+                .or_insert_with(|| json!({}));
+            if let Some(map) = by_core.as_object_mut() {
+                map.insert(core.to_string(), json!(seconds));
+            }
+        }
+        let thread_core: Vec<Json> = sampled
+            .thread_core
+            .iter()
+            .map(|(thread, tid, core)| json!({"thread": thread, "tid": tid, "core": core}))
+            .collect();
+        let thread_migrations: serde_json::Map<String, Json> = sampled
+            .thread_migrations
+            .iter()
+            .map(|(thread, moves)| (thread.clone(), json!(moves)))
+            .collect();
         let refused: Vec<Json> = self
             .refused_queries()
             .into_iter()
@@ -987,6 +1032,9 @@ impl Stats {
             },
             "threads_cpu_s": thread_cpu,
             "cores_cpu_s": core_cpu,
+            "threads_core_cpu_s": thread_core_cpu,
+            "threads_core": thread_core,
+            "threads_migrations": thread_migrations,
             "groups_inbox": sampled.groups_inbox,
             "refused_queries": refused,
             "heavy_queries": heavy,
@@ -1150,6 +1198,36 @@ impl Stats {
                 "CPU time of the process by core, each thread's time attributed to the core it was sampled on; a core's rate is the process's use of it",
                 vec![("core", core.to_string())],
                 Value::Float(*seconds),
+            );
+        }
+        for (thread, core, seconds) in &sampled.thread_core_cpu {
+            catalogue.point(
+                "xyne_sync_thread_core_cpu_seconds_total",
+                Kind::Counter,
+                "s",
+                "CPU time by thread name and core, each thread's time attributed to the core it was sampled on; sums over threads to xyne_sync_core_cpu_seconds_total",
+                vec![("thread", thread.clone()), ("core", core.to_string())],
+                Value::Float(*seconds),
+            );
+        }
+        for (thread, tid, core) in &sampled.thread_core {
+            catalogue.point(
+                "xyne_sync_thread_core",
+                Kind::Gauge,
+                "",
+                "the core each thread was on at the last sample, by thread name and id",
+                vec![("thread", thread.clone()), ("tid", tid.to_string())],
+                Value::Int(u64::from(*core)),
+            );
+        }
+        for (thread, moves) in &sampled.thread_migrations {
+            catalogue.point(
+                "xyne_sync_thread_migrations_total",
+                Kind::Counter,
+                "",
+                "moves between cores by thread name since the sampler started (se.nr_migrations), summed over a pool's threads; a high rate means the per-core split of that thread is a blur",
+                vec![("thread", thread.clone())],
+                Value::Int(*moves),
             );
         }
         for (shard, depth) in sampled.groups_inbox.iter().enumerate() {
@@ -1629,6 +1707,9 @@ mod tests {
             rows_by_table: vec![("messages".to_owned(), 900)],
         });
         stats.publish_core_cpu(vec![(3, 1.5)]);
+        stats.publish_thread_core_cpu(vec![("engine".to_owned(), 3, 1.5)]);
+        stats.publish_thread_core(vec![("engine".to_owned(), 4242, 3)]);
+        stats.publish_thread_migrations(vec![("engine".to_owned(), 7)]);
         let text = stats.prometheus();
         let line = |needle: &str| {
             text.lines()
@@ -1683,6 +1764,18 @@ mod tests {
         assert_eq!(
             line("xyne_sync_core_cpu_seconds_total{core=\"3\"}"),
             "xyne_sync_core_cpu_seconds_total{core=\"3\"} 1.5"
+        );
+        assert_eq!(
+            line("xyne_sync_thread_core_cpu_seconds_total{"),
+            "xyne_sync_thread_core_cpu_seconds_total{thread=\"engine\",core=\"3\"} 1.5"
+        );
+        assert_eq!(
+            line("xyne_sync_thread_core{"),
+            "xyne_sync_thread_core{thread=\"engine\",tid=\"4242\"} 3"
+        );
+        assert_eq!(
+            line("xyne_sync_thread_migrations_total{"),
+            "xyne_sync_thread_migrations_total{thread=\"engine\"} 7"
         );
         let cumulative: Vec<u64> = text
             .lines()

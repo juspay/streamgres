@@ -1,7 +1,8 @@
 //! The metrics thread: every interval it reads what only sampling can
 //! give (the process's resident set, each thread's CPU time by name and,
-//! attributed to the core each thread was on, by core, the caches'
-//! sizes) into the shared measurements, and every sixth sample it
+//! attributed to the core each thread was on, by core and by thread and
+//! core, where each thread is, how often the threads move cores, the
+//! caches' sizes) into the shared measurements, and every sixth sample it
 //! writes the summary line, so a log alone says how the server is doing.
 //! Nothing here runs on a thread that serves clients.
 
@@ -50,7 +51,11 @@ fn run(state: Arc<AppState>, interval: Duration) {
             .store(state.warm.len() as u64, Ordering::Relaxed);
         let samples = thread_samples();
         stats.publish_thread_cpu(thread_cpu_seconds(&samples));
-        stats.publish_core_cpu(cores.account(&samples));
+        let attributed = cores.account(&samples);
+        stats.publish_core_cpu(attributed.cores);
+        stats.publish_thread_core_cpu(attributed.thread_cores);
+        stats.publish_thread_core(attributed.placement);
+        stats.publish_thread_migrations(attributed.migrations);
         if ticks % 6 == 0 {
             let (message, fields) = stats.summary_line(&previous, last_summary.elapsed());
             crate::log::event(Level::Info, message, fields);
@@ -93,14 +98,18 @@ pub fn resident_bytes() -> u64 {
 }
 
 /// One thread of the process as sampled: its id, its label
-/// ([`thread_label`]), its CPU time so far in seconds, and the core it
-/// last ran on (`processor` in `/proc/<tid>/stat`; `None` off Linux).
+/// ([`thread_label`]), its CPU time so far in seconds, the core it last
+/// ran on (`processor` in `/proc/<tid>/stat`; `None` off Linux) and how
+/// many times the scheduler has moved it between cores so far
+/// (`se.nr_migrations` in `/proc/<tid>/sched`; `None` where the kernel
+/// does not say).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThreadSample {
     pub tid: u64,
     pub name: String,
     pub seconds: f64,
     pub core: Option<u32>,
+    pub migrations: Option<u64>,
 }
 
 /// Every thread of the process, sampled from `/proc` on Linux; nothing
@@ -132,11 +141,15 @@ pub fn thread_samples() -> Vec<ThreadSample> {
                 let Some((seconds, core)) = parse_stat(&stat, ticks) else {
                     continue;
                 };
+                let migrations = std::fs::read_to_string(path.join("sched"))
+                    .ok()
+                    .and_then(|sched| parse_sched_migrations(&sched));
                 samples.push(ThreadSample {
                     tid,
                     name: thread_label(comm.trim()),
                     seconds,
                     core,
+                    migrations,
                 });
             }
         }
@@ -158,6 +171,18 @@ fn parse_stat(stat: &str, ticks: f64) -> Option<(f64, Option<u32>)> {
     Some(((utime + stime) / ticks, core))
 }
 
+/// The `se.nr_migrations` line of `/proc/<tid>/sched`: how many times the
+/// scheduler has moved the thread to another core; `None` when the
+/// kernel does not expose it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_sched_migrations(sched: &str) -> Option<u64> {
+    sched
+        .lines()
+        .find_map(|line| line.strip_prefix("se.nr_migrations"))
+        .and_then(|rest| rest.trim_start().strip_prefix(':'))
+        .and_then(|value| value.trim().parse().ok())
+}
+
 /// CPU seconds so far by thread name (the server's own names, without
 /// the `xyne-sync-` prefix and summed over a pool's threads), from
 /// `samples`.
@@ -169,33 +194,82 @@ pub fn thread_cpu_seconds(samples: &[ThreadSample]) -> Vec<(String, f64)> {
     by_name.into_iter().collect()
 }
 
+/// What one round of attribution says: CPU seconds by core, by thread
+/// name and core, where every thread is (its label, id and core), and
+/// the moves between cores by thread name so far.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Attribution {
+    pub cores: Vec<(u32, f64)>,
+    pub thread_cores: Vec<(String, u32, f64)>,
+    pub placement: Vec<(String, u64, u32)>,
+    pub migrations: Vec<(String, u64)>,
+}
+
 /// CPU time by core: each thread's CPU time since the last sample is
 /// attributed to the core it was on at the sample, so a core's total is
 /// what the process burned there, as closely as the sampling interval
 /// tells a thread's moves apart (a shorter `XYNE_SYNC_METRICS_INTERVAL_MS`
-/// sharpens it). A thread seen for the first time contributes nothing
-/// yet; one gone is forgotten.
+/// sharpens it). The same seconds are kept by thread name and core, so
+/// which thread burned a core is known too, and each thread's moves
+/// between cores since the last sample are summed by name: a name whose
+/// moves climb quickly is one whose per-core split is a blur. A thread
+/// seen for the first time contributes nothing yet; one gone is
+/// forgotten.
 #[derive(Default)]
 pub struct CoreAccount {
-    last: std::collections::HashMap<u64, f64>,
+    last: std::collections::HashMap<u64, (f64, Option<u64>)>,
     cores: std::collections::BTreeMap<u32, f64>,
+    thread_cores: std::collections::BTreeMap<(String, u32), f64>,
+    migrations: std::collections::BTreeMap<String, u64>,
 }
 
 impl CoreAccount {
-    /// Take `samples` in and return the CPU seconds by core so far.
-    pub fn account(&mut self, samples: &[ThreadSample]) -> Vec<(u32, f64)> {
+    /// Take `samples` in and return the attribution so far.
+    pub fn account(&mut self, samples: &[ThreadSample]) -> Attribution {
         let mut seen = std::collections::HashMap::with_capacity(samples.len());
+        let mut placement = Vec::with_capacity(samples.len());
         for sample in samples {
-            if let (Some(core), Some(&before)) = (sample.core, self.last.get(&sample.tid)) {
-                *self.cores.entry(core).or_insert(0.0) += (sample.seconds - before).max(0.0);
+            if let Some(&(before, moved_before)) = self.last.get(&sample.tid) {
+                if let Some(core) = sample.core {
+                    let burned = (sample.seconds - before).max(0.0);
+                    *self.cores.entry(core).or_insert(0.0) += burned;
+                    *self
+                        .thread_cores
+                        .entry((sample.name.clone(), core))
+                        .or_insert(0.0) += burned;
+                }
+                if let (Some(moved), Some(moved_before)) = (sample.migrations, moved_before) {
+                    *self.migrations.entry(sample.name.clone()).or_insert(0) +=
+                        moved.saturating_sub(moved_before);
+                }
+            } else if sample.migrations.is_some() {
+                self.migrations.entry(sample.name.clone()).or_insert(0);
             }
-            seen.insert(sample.tid, sample.seconds);
+            if let Some(core) = sample.core {
+                placement.push((sample.name.clone(), sample.tid, core));
+            }
+            seen.insert(sample.tid, (sample.seconds, sample.migrations));
         }
         self.last = seen;
-        self.cores
-            .iter()
-            .map(|(&core, &seconds)| (core, seconds))
-            .collect()
+        placement.sort();
+        Attribution {
+            cores: self
+                .cores
+                .iter()
+                .map(|(&core, &seconds)| (core, seconds))
+                .collect(),
+            thread_cores: self
+                .thread_cores
+                .iter()
+                .map(|((name, core), &seconds)| (name.clone(), *core, seconds))
+                .collect(),
+            placement,
+            migrations: self
+                .migrations
+                .iter()
+                .map(|(name, &moves)| (name.clone(), moves))
+                .collect(),
+        }
     }
 }
 
@@ -261,17 +335,18 @@ mod tests {
             name: "engine".to_owned(),
             seconds,
             core: Some(core),
+            migrations: None,
         };
         let mut account = CoreAccount::default();
-        assert_eq!(account.account(&[sample(1, 10.0, 3)]), vec![]);
-        assert_eq!(account.account(&[sample(1, 12.5, 3)]), vec![(3, 2.5)]);
+        assert_eq!(account.account(&[sample(1, 10.0, 3)]).cores, vec![]);
+        assert_eq!(account.account(&[sample(1, 12.5, 3)]).cores, vec![(3, 2.5)]);
         assert_eq!(
-            account.account(&[sample(1, 13.0, 5), sample(2, 1.0, 5)]),
+            account.account(&[sample(1, 13.0, 5), sample(2, 1.0, 5)]).cores,
             vec![(3, 2.5), (5, 0.5)],
             "a move charges the new core; a new thread nothing yet"
         );
         assert_eq!(
-            account.account(&[sample(2, 1.25, 5)]),
+            account.account(&[sample(2, 1.25, 5)]).cores,
             vec![(3, 2.5), (5, 0.75)],
             "the thread gone is forgotten"
         );
@@ -279,5 +354,104 @@ mod tests {
             thread_cpu_seconds(&[sample(1, 1.0, 0), sample(2, 2.0, 1)]),
             vec![("engine".to_owned(), 3.0)]
         );
+    }
+
+    /// The same seconds are kept by thread name and core, so the by-core
+    /// total is the sum over threads of the by-thread-and-core series, a
+    /// pool's threads summing under their one name; and every sampled
+    /// thread reports where it is.
+    #[test]
+    fn cpu_time_is_kept_by_thread_and_core_and_every_thread_says_where_it_is() {
+        let sample = |tid: u64, name: &str, seconds: f64, core: u32| ThreadSample {
+            tid,
+            name: name.to_owned(),
+            seconds,
+            core: Some(core),
+            migrations: None,
+        };
+        let mut account = CoreAccount::default();
+        account.account(&[
+            sample(1, "engine", 10.0, 3),
+            sample(2, "groups", 4.0, 3),
+            sample(3, "groups", 4.0, 6),
+        ]);
+        let got = account.account(&[
+            sample(1, "engine", 12.0, 3),
+            sample(2, "groups", 4.5, 3),
+            sample(3, "groups", 5.0, 6),
+        ]);
+        assert_eq!(got.cores, vec![(3, 2.5), (6, 1.0)]);
+        assert_eq!(
+            got.thread_cores,
+            vec![
+                ("engine".to_owned(), 3, 2.0),
+                ("groups".to_owned(), 3, 0.5),
+                ("groups".to_owned(), 6, 1.0),
+            ]
+        );
+        let by_core: f64 = got.cores.iter().map(|(_, s)| s).sum();
+        let by_thread_core: f64 = got.thread_cores.iter().map(|(_, _, s)| s).sum();
+        assert_eq!(by_core, by_thread_core, "the two series sum alike");
+        assert_eq!(
+            got.placement,
+            vec![
+                ("engine".to_owned(), 1, 3),
+                ("groups".to_owned(), 2, 3),
+                ("groups".to_owned(), 3, 6),
+            ]
+        );
+    }
+
+    /// Moves between cores are summed by thread name from each thread's
+    /// own counter, as deltas, so a thread gone takes nothing away and a
+    /// kernel that does not count them leaves the series out.
+    #[test]
+    fn moves_between_cores_are_summed_by_thread_name() {
+        let sample = |tid: u64, name: &str, moved: Option<u64>| ThreadSample {
+            tid,
+            name: name.to_owned(),
+            seconds: 1.0,
+            core: Some(0),
+            migrations: moved,
+        };
+        let mut account = CoreAccount::default();
+        assert_eq!(
+            account
+                .account(&[sample(1, "engine", Some(10)), sample(2, "groups", Some(3))])
+                .migrations,
+            vec![("engine".to_owned(), 0), ("groups".to_owned(), 0)],
+            "a first sample sets the baseline"
+        );
+        assert_eq!(
+            account
+                .account(&[
+                    sample(1, "engine", Some(14)),
+                    sample(2, "groups", Some(3)),
+                    sample(3, "groups", Some(100))
+                ])
+                .migrations,
+            vec![("engine".to_owned(), 4), ("groups".to_owned(), 0)]
+        );
+        assert_eq!(
+            account
+                .account(&[sample(1, "engine", Some(15)), sample(3, "groups", Some(102))])
+                .migrations,
+            vec![("engine".to_owned(), 5), ("groups".to_owned(), 2)],
+            "a thread gone takes nothing away"
+        );
+        assert_eq!(
+            CoreAccount::default()
+                .account(&[sample(1, "engine", None)])
+                .migrations,
+            vec![],
+            "no counter, no series"
+        );
+        assert_eq!(
+            parse_sched_migrations(
+                "x (1, #threads: 1)\n---\nse.exec_start   :  1.5\nse.nr_migrations  :   42\nnr_switches : 7\n"
+            ),
+            Some(42)
+        );
+        assert_eq!(parse_sched_migrations("nr_switches : 7\n"), None);
     }
 }
