@@ -1,4 +1,4 @@
-# Xyne-Sync
+# Streamgres
 
 **A subscription-native sync engine for PostgreSQL.** Clients subscribe to SQL
 queries over a WebSocket and keep receiving the *delta*: the rows that entered,
@@ -10,7 +10,7 @@ is routed to exactly the views it affects, at a cost that depends on how many
 conditions the write matches, not on how many subscriptions exist.
 
 ```text
-clients                       Xyne-Sync                              PostgreSQL
+clients                       Streamgres                             PostgreSQL
   │                              │                                        │
   ├─ subscribe(SQL) ────────────>│                                        │
   │                              ├─ initial read at a consistent snapshot>│
