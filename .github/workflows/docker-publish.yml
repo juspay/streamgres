@@ -6,6 +6,7 @@ on:
       - main
       - feat/build
       - feat/schema_upgrade
+      - metrics/wait-histograms
     tags:
       - "v*"
   workflow_dispatch:
