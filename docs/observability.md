@@ -124,6 +124,7 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | --- | --- |
 | `xyne_sync_process_rss_bytes` | resident set, sampled |
 | `xyne_sync_thread_cpu_seconds_total{thread}` | CPU by thread name (engine, groups, reads, server, feed, reaper, log, metrics), sampled; the engine's rate is its utilisation |
+| `xyne_sync_core_cpu_seconds_total{core}` | CPU by core: each thread's time since the last sample attributed to the core it was sampled on (`processor` in `/proc`); a core's rate is the process's use of that core. A thread that moves cores inside an interval is charged to the core it ended on, so a shorter `XYNE_SYNC_METRICS_INTERVAL_MS` sharpens it |
 | `xyne_sync_rows_held{table}` | rows in the shared frames per table |
 | `xyne_sync_connects_total{owed=nothing,state,log,start_over}` | connections by what they were owed since their cookie: nothing (the usual reconnect: a group with no connection stands still), the group's whole state (a tab without a cookie joining a group under way), the logged pokes after an older cookie, or told to start over and sync afresh; `start_over` climbing is clients paying a full download |
 | `xyne_sync_connections_open`, `xyne_sync_connections_total{event=opened,closed,refused}` | sockets; `event="refused",reason="client_schema"` counts clients whose schema the server cannot serve, which climbs when a client build is deployed ahead of its database |

@@ -1,6 +1,7 @@
 //! The metrics thread: every interval it reads what only sampling can
-//! give (the process's resident set, each thread's CPU time by name, the
-//! caches' sizes) into the shared measurements, and every sixth sample it
+//! give (the process's resident set, each thread's CPU time by name and,
+//! attributed to the core each thread was on, by core, the caches'
+//! sizes) into the shared measurements, and every sixth sample it
 //! writes the summary line, so a log alone says how the server is doing.
 //! Nothing here runs on a thread that serves clients.
 
@@ -31,6 +32,7 @@ fn run(state: Arc<AppState>, interval: Duration) {
     let mut previous = stats.snapshot();
     let mut last_summary = Instant::now();
     let mut ticks = 0u64;
+    let mut cores = CoreAccount::default();
     loop {
         std::thread::sleep(interval);
         ticks += 1;
@@ -46,7 +48,9 @@ fn run(state: Arc<AppState>, interval: Duration) {
         stats
             .warm_shapes
             .store(state.warm.len() as u64, Ordering::Relaxed);
-        stats.publish_thread_cpu(thread_cpu_seconds());
+        let samples = thread_samples();
+        stats.publish_thread_cpu(thread_cpu_seconds(&samples));
+        stats.publish_core_cpu(cores.account(&samples));
         if ticks % 6 == 0 {
             let (message, fields) = stats.summary_line(&previous, last_summary.elapsed());
             crate::log::event(Level::Info, message, fields);
@@ -88,12 +92,22 @@ pub fn resident_bytes() -> u64 {
     }
 }
 
-/// CPU seconds so far by thread name (the server's own names, without
-/// the `xyne-sync-` prefix and summed over a pool's threads); Linux
-/// only, from `/proc`, nothing elsewhere.
-pub fn thread_cpu_seconds() -> Vec<(String, f64)> {
+/// One thread of the process as sampled: its id, its label
+/// ([`thread_label`]), its CPU time so far in seconds, and the core it
+/// last ran on (`processor` in `/proc/<tid>/stat`; `None` off Linux).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThreadSample {
+    pub tid: u64,
+    pub name: String,
+    pub seconds: f64,
+    pub core: Option<u32>,
+}
+
+/// Every thread of the process, sampled from `/proc` on Linux; nothing
+/// elsewhere.
+pub fn thread_samples() -> Vec<ThreadSample> {
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut by_name: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    let mut samples = Vec::new();
     #[cfg(target_os = "linux")]
     {
         // SAFETY: sysconf reads a constant.
@@ -102,28 +116,87 @@ pub fn thread_cpu_seconds() -> Vec<(String, f64)> {
         if let Ok(tasks) = std::fs::read_dir("/proc/self/task") {
             for task in tasks.flatten() {
                 let path = task.path();
+                let Some(tid) = task
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<u64>().ok())
+                else {
+                    continue;
+                };
                 let Ok(comm) = std::fs::read_to_string(path.join("comm")) else {
                     continue;
                 };
                 let Ok(stat) = std::fs::read_to_string(path.join("stat")) else {
                     continue;
                 };
-                let Some(after) = stat.rsplit(')').next() else {
+                let Some((seconds, core)) = parse_stat(&stat, ticks) else {
                     continue;
                 };
-                let fields: Vec<&str> = after.split_whitespace().collect();
-                let (Some(utime), Some(stime)) = (fields.get(11), fields.get(12)) else {
-                    continue;
-                };
-                let seconds = (utime.parse::<f64>().unwrap_or(0.0)
-                    + stime.parse::<f64>().unwrap_or(0.0))
-                    / ticks;
-                let name = thread_label(comm.trim());
-                *by_name.entry(name).or_insert(0.0) += seconds;
+                samples.push(ThreadSample {
+                    tid,
+                    name: thread_label(comm.trim()),
+                    seconds,
+                    core,
+                });
             }
         }
     }
+    samples
+}
+
+/// The CPU time and the core of a `/proc/<tid>/stat` line: `utime` and
+/// `stime` (fields 14 and 15, in clock ticks of `ticks` a second)
+/// summed, and `processor` (field 39), the fields taken after the last
+/// `)` since the thread's name before it may hold spaces or parentheses.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_stat(stat: &str, ticks: f64) -> Option<(f64, Option<u32>)> {
+    let after = stat.rsplit(')').next()?;
+    let fields: Vec<&str> = after.split_whitespace().collect();
+    let utime: f64 = fields.get(11)?.parse().ok()?;
+    let stime: f64 = fields.get(12)?.parse().ok()?;
+    let core = fields.get(36).and_then(|text| text.parse::<u32>().ok());
+    Some(((utime + stime) / ticks, core))
+}
+
+/// CPU seconds so far by thread name (the server's own names, without
+/// the `xyne-sync-` prefix and summed over a pool's threads), from
+/// `samples`.
+pub fn thread_cpu_seconds(samples: &[ThreadSample]) -> Vec<(String, f64)> {
+    let mut by_name: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+    for sample in samples {
+        *by_name.entry(sample.name.clone()).or_insert(0.0) += sample.seconds;
+    }
     by_name.into_iter().collect()
+}
+
+/// CPU time by core: each thread's CPU time since the last sample is
+/// attributed to the core it was on at the sample, so a core's total is
+/// what the process burned there, as closely as the sampling interval
+/// tells a thread's moves apart (a shorter `XYNE_SYNC_METRICS_INTERVAL_MS`
+/// sharpens it). A thread seen for the first time contributes nothing
+/// yet; one gone is forgotten.
+#[derive(Default)]
+pub struct CoreAccount {
+    last: std::collections::HashMap<u64, f64>,
+    cores: std::collections::BTreeMap<u32, f64>,
+}
+
+impl CoreAccount {
+    /// Take `samples` in and return the CPU seconds by core so far.
+    pub fn account(&mut self, samples: &[ThreadSample]) -> Vec<(u32, f64)> {
+        let mut seen = std::collections::HashMap::with_capacity(samples.len());
+        for sample in samples {
+            if let (Some(core), Some(&before)) = (sample.core, self.last.get(&sample.tid)) {
+                *self.cores.entry(core).or_insert(0.0) += (sample.seconds - before).max(0.0);
+            }
+            seen.insert(sample.tid, sample.seconds);
+        }
+        self.last = seen;
+        self.cores
+            .iter()
+            .map(|(&core, &seconds)| (core, seconds))
+            .collect()
+    }
 }
 
 /// A thread's label from its (15-character) kernel name.
@@ -163,5 +236,48 @@ mod tests {
     #[test]
     fn the_resident_set_is_read() {
         assert!(resident_bytes() > 0);
+    }
+
+    /// A stat line's CPU time is `utime + stime` in ticks and its core the
+    /// `processor` field, both read past the thread's name, which may
+    /// hold spaces and parentheses.
+    #[test]
+    fn a_stat_line_gives_cpu_time_and_the_core() {
+        let stat = "12345 (xyne-sync (eng) x) R 1 1 1 0 -1 4194560 100 0 0 0 250 50 0 0 20 0 1 0 999 \
+                    1000000 500 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 7 0 0 0 0 0 0 0 0 0 0 0 0 0";
+        let (seconds, core) = parse_stat(stat, 100.0).expect("parsed");
+        assert_eq!(seconds, 3.0);
+        assert_eq!(core, Some(7));
+        assert!(parse_stat("1 (x) R 1", 100.0).is_none());
+    }
+
+    /// CPU time since the last sample goes to the core the thread was
+    /// sampled on; a first sample only sets the baseline, a thread gone is
+    /// forgotten.
+    #[test]
+    fn cpu_time_is_attributed_to_the_core_a_thread_was_sampled_on() {
+        let sample = |tid: u64, seconds: f64, core: u32| ThreadSample {
+            tid,
+            name: "engine".to_owned(),
+            seconds,
+            core: Some(core),
+        };
+        let mut account = CoreAccount::default();
+        assert_eq!(account.account(&[sample(1, 10.0, 3)]), vec![]);
+        assert_eq!(account.account(&[sample(1, 12.5, 3)]), vec![(3, 2.5)]);
+        assert_eq!(
+            account.account(&[sample(1, 13.0, 5), sample(2, 1.0, 5)]),
+            vec![(3, 2.5), (5, 0.5)],
+            "a move charges the new core; a new thread nothing yet"
+        );
+        assert_eq!(
+            account.account(&[sample(2, 1.25, 5)]),
+            vec![(3, 2.5), (5, 0.75)],
+            "the thread gone is forgotten"
+        );
+        assert_eq!(
+            thread_cpu_seconds(&[sample(1, 1.0, 0), sample(2, 2.0, 1)]),
+            vec![("engine".to_owned(), 3.0)]
+        );
     }
 }

@@ -190,6 +190,7 @@ struct PendingPush {
 #[derive(Default, Clone)]
 struct Sampled {
     thread_cpu: Vec<(String, f64)>,
+    core_cpu: Vec<(u32, f64)>,
     groups_inbox: Vec<u64>,
 }
 
@@ -549,6 +550,13 @@ impl Stats {
     pub fn publish_thread_cpu(&self, thread_cpu: Vec<(String, f64)>) {
         if let Ok(mut sampled) = self.sampled.lock() {
             sampled.thread_cpu = thread_cpu;
+        }
+    }
+
+    /// Publish the CPU seconds by core the sampler attributed.
+    pub fn publish_core_cpu(&self, core_cpu: Vec<(u32, f64)>) {
+        if let Ok(mut sampled) = self.sampled.lock() {
+            sampled.core_cpu = core_cpu;
         }
     }
 
@@ -933,6 +941,11 @@ impl Stats {
             .iter()
             .map(|(name, seconds)| (name.clone(), json!(seconds)))
             .collect();
+        let core_cpu: serde_json::Map<String, Json> = sampled
+            .core_cpu
+            .iter()
+            .map(|(core, seconds)| (core.to_string(), json!(seconds)))
+            .collect();
         let refused: Vec<Json> = self
             .refused_queries()
             .into_iter()
@@ -973,6 +986,7 @@ impl Stats {
                 "rows_by_table": rows_held,
             },
             "threads_cpu_s": thread_cpu,
+            "cores_cpu_s": core_cpu,
             "groups_inbox": sampled.groups_inbox,
             "refused_queries": refused,
             "heavy_queries": heavy,
@@ -1125,6 +1139,16 @@ impl Stats {
                 "s",
                 "CPU time by thread name, sampled; a thread's rate is its share of one core",
                 vec![("thread", thread.clone())],
+                Value::Float(*seconds),
+            );
+        }
+        for (core, seconds) in &sampled.core_cpu {
+            catalogue.point(
+                "xyne_sync_core_cpu_seconds_total",
+                Kind::Counter,
+                "s",
+                "CPU time of the process by core, each thread's time attributed to the core it was sampled on; a core's rate is the process's use of it",
+                vec![("core", core.to_string())],
                 Value::Float(*seconds),
             );
         }
@@ -1604,6 +1628,7 @@ mod tests {
             trees: 4,
             rows_by_table: vec![("messages".to_owned(), 900)],
         });
+        stats.publish_core_cpu(vec![(3, 1.5)]);
         let text = stats.prometheus();
         let line = |needle: &str| {
             text.lines()
@@ -1654,6 +1679,10 @@ mod tests {
         assert_eq!(
             line("xyne_sync_rows_held{table=\"messages\"}"),
             "xyne_sync_rows_held{table=\"messages\"} 900"
+        );
+        assert_eq!(
+            line("xyne_sync_core_cpu_seconds_total{core=\"3\"}"),
+            "xyne_sync_core_cpu_seconds_total{core=\"3\"} 1.5"
         );
         let cumulative: Vec<u64> = text
             .lines()
