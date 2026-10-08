@@ -34,6 +34,12 @@ pub enum Upstream {
 
 /// The first message of a connection: what the client wants synced, and
 /// its schema on a first connection.
+///
+/// The protocol also lets a client name its own query and push endpoints
+/// (`userQueryURL`, `userPushURL` and their header maps). This server
+/// ignores them: the endpoints are the operator's `XYNE_SYNC_QUERY_URL`
+/// and `XYNE_SYNC_MUTATE_URL`, whatever the client sends, so a client
+/// cannot point the server at an endpoint of its own choosing.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InitConnection {
@@ -44,18 +50,16 @@ pub struct InitConnection {
     #[serde(default)]
     pub deleted: Option<DeleteClients>,
     #[serde(default)]
-    pub user_push_url: Option<String>,
-    #[serde(default)]
-    pub user_push_headers: Option<HashMap<String, String>>,
-    #[serde(default)]
-    pub user_query_url: Option<String>,
-    #[serde(default)]
-    pub user_query_headers: Option<HashMap<String, String>>,
-    #[serde(default)]
     pub active_clients: Option<Vec<String>>,
 }
 
 /// One change to a client's desired queries.
+///
+/// A `put` may carry an `ast` of the client's own making (the protocol's
+/// legacy queries). This server ignores it: every query's AST comes from
+/// the application server's transform of its name and arguments, which is
+/// where permissions are applied, so a client cannot hand the server a
+/// query the application never authorised.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum QueryPatchOp {
@@ -67,8 +71,6 @@ pub enum QueryPatchOp {
         name: Option<String>,
         #[serde(default)]
         args: Option<Vec<Json>>,
-        #[serde(default)]
-        ast: Option<Json>,
     },
     Del {
         hash: String,
@@ -584,6 +586,27 @@ mod tests {
         assert_eq!(init.desired_queries_patch.len(), 1);
         assert!(
             matches!(&init.desired_queries_patch[0], QueryPatchOp::Put { hash, name: Some(name), .. } if hash == "h1" && name == "q")
+        );
+    }
+
+    /// A client's own endpoints and ASTs are accepted on the wire and
+    /// dropped: the handshake still decodes, and nothing of them survives
+    /// into the parsed message. The endpoints are the server's
+    /// configuration and the AST is the application server's transform.
+    #[test]
+    fn client_endpoints_and_asts_are_ignored() {
+        let payload = r#"{"initConnectionMessage":["initConnection",{"userQueryURL":"https://attacker.example/query","userQueryHeaders":{"X-Evil":"1"},"userPushURL":"https://attacker.example/push","userPushHeaders":{"X-Evil":"1"},"desiredQueriesPatch":[{"op":"put","hash":"h1","name":"q","args":[1],"ast":{"table":"users","where":null}}]}],"authToken":"t"}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload.as_bytes());
+        let header =
+            percent_encoding::utf8_percent_encode(&encoded, percent_encoding::NON_ALPHANUMERIC)
+                .to_string();
+        let init = decode_handshake(&header).unwrap().init.unwrap();
+        let debug = format!("{init:?}");
+        assert!(!debug.contains("attacker.example"), "{debug}");
+        assert!(!debug.contains("X-Evil"), "{debug}");
+        assert!(!debug.contains("users"), "{debug}");
+        assert!(
+            matches!(&init.desired_queries_patch[0], QueryPatchOp::Put { hash, name: Some(name), args: Some(args), .. } if hash == "h1" && name == "q" && args.len() == 1)
         );
     }
 

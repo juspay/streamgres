@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // A self-contained check of a running sync server, with nothing of the application
-// behind it: a PostgreSQL with `wal_level = logical`, the server, and this script as a
-// client speaking the sync protocol with a query AST of its own. It creates one
-// table, subscribes, and checks that the rows hydrate, that an insert, an update out of
+// behind it: a PostgreSQL with `wal_level = logical`, the server, and this script as
+// both the client speaking the sync protocol and the application server the sync
+// server asks for each query's AST (the server takes no AST from a client). It creates
+// one table, subscribes, and checks that the rows hydrate, that an insert, an update out of
 // the filter and a delete made straight in PostgreSQL arrive as pokes, that a JSON
 // column is filtered by value however the stored value was spelled (a number with a
 // padded fraction, a `json` object with its own spacing and key order), that the feed
@@ -20,18 +21,22 @@
 // SMOKE_GATEWAY (ws://localhost:4848/sync), SMOKE_HTTP (http://localhost:4848),
 // XYNE_SYNC_APP_ID (xyne) and XYNE_SYNC_SHARD (0), which name the `<app>_<shard>` schema,
 // SMOKE_COLLECTOR (the collector's Prometheus endpoint, http://localhost:9464/metrics;
-// unset skips that check). The server is expected to run with
+// unset skips that check), and SMOKE_APP_PORT (4849), where this script serves the
+// query endpoint: the server must run with XYNE_SYNC_QUERY_URL pointing at
+// http://127.0.0.1:<SMOKE_APP_PORT>/query. The server is expected to run with
 // XYNE_SYNC_ROW_LIMIT=600, so the 400 seeded rows make a heavy read. The table must
 // exist before the server starts (it reads the catalog once): run with `--prepare` first.
 
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
 
 const PG = process.env.SMOKE_PG ?? 'postgresql://postgres:postgres@localhost:5432/postgres';
 const GATEWAY = process.env.SMOKE_GATEWAY ?? 'ws://localhost:4848/sync';
 const SHARD_SCHEMA = `${process.env.XYNE_SYNC_APP_ID ?? 'xyne'}_${process.env.XYNE_SYNC_SHARD ?? '0'}`;
 const HTTP = process.env.SMOKE_HTTP ?? 'http://localhost:4848';
 const COLLECTOR = process.env.SMOKE_COLLECTOR;
+const APP_PORT = Number(process.env.SMOKE_APP_PORT ?? 4849);
 const SEEDED = 400;
 const t0 = Date.now();
 const log = (...a) => console.log(`${String(Date.now() - t0).padStart(6)}ms`, ...a);
@@ -49,7 +54,37 @@ if (process.argv.includes('--prepare')) {
   process.exit(0);
 }
 
-const open = { table: 'smoke_items', where: { type: 'simple', op: '=', left: { type: 'column', name: 'status' }, right: { type: 'literal', value: 'OPEN' } }, orderBy: [['id', 'asc']] };
+/// The queries, by the names the clients ask for them: `column` takes a column and a
+/// value as its arguments, the others take none.
+const column = (name, value) => ({ table: 'smoke_items', where: { type: 'simple', op: '=', left: { type: 'column', name }, right: { type: 'literal', value } }, orderBy: [['id', 'asc']] });
+const queries = {
+  open: () => column('status', 'OPEN'),
+  tagged: () => column('tag', 't3'),
+  column,
+};
+const put = (hash, name, ...args) => ({ op: 'put', hash, name, args, ttl: 300000 });
+
+/// The application server, as far as the sync server needs one: the query endpoint,
+/// answering `["transform", [{id, name, args}...]]` with each query's AST, or an error
+/// for a name it does not know. The sync server takes no AST from a client, so every
+/// subscription below passes through here.
+const app = createServer((request, response) => {
+  let body = '';
+  request.on('data', (chunk) => { body += chunk; });
+  request.on('end', () => {
+    const path = new URL(request.url, 'http://localhost').pathname;
+    if (request.method !== 'POST' || path !== '/query') { response.writeHead(404).end(); return; }
+    const [tag, requests] = JSON.parse(body);
+    if (tag !== 'transform') { response.writeHead(400).end(); return; }
+    const answered = requests.map(({ id, name, args }) => {
+      const make = queries[name];
+      return make ? { id, name, ast: make(...(args ?? [])) } : { error: 'app', id, name, message: `no query named ${name}` };
+    });
+    response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ kind: 'QueryResponse', queries: answered }));
+  });
+});
+await new Promise((resolve, reject) => { app.once('error', reject); app.listen(APP_PORT, '127.0.0.1', resolve); });
+log(`serving the query endpoint at http://127.0.0.1:${APP_PORT}/query`);
 
 /// One connection with its own view of the rows it was sent; `group` and `baseCookie`
 /// make it a tab of an existing client group, or a client coming back.
@@ -83,7 +118,7 @@ function connect(name, { clientSchema, patch = [], group, baseCookie = '', rows 
   return state;
 }
 
-const a = connect('A', { patch: [{ op: 'put', hash: 'open', ast: open, ttl: 300000 }] });
+const a = connect('A', { patch: [put('open', 'open')] });
 await a.until('hydration', (s) => s.got.has('open'));
 if (a.errors.length) fail('A was refused: ' + JSON.stringify(a.errors[0]));
 if (a.rows.size !== SEEDED) fail(`A hydrated ${a.rows.size} rows, expected ${SEEDED}`);
@@ -102,8 +137,7 @@ sql(`DELETE FROM smoke_items WHERE id = 'live-1'`);
 await a.until('the deleted row', (s) => !s.rows.has('live-1'));
 log('an insert, an update out of the filter, an update in place and a delete all arrived by poke');
 
-const tagged = { table: 'smoke_items', where: { type: 'simple', op: '=', left: { type: 'column', name: 'tag' }, right: { type: 'literal', value: 't3' } }, orderBy: [['id', 'asc']] };
-const j = connect('J', { patch: [{ op: 'put', hash: 'tagged', ast: tagged, ttl: 300000 }] });
+const j = connect('J', { patch: [put('tagged', 'tagged')] });
 await j.until('the JSON filter', (s) => s.got.has('tagged') || s.errors.length > 0);
 if (j.errors.length) fail('a filter on a JSON column was refused: ' + JSON.stringify(j.errors[0]));
 if (j.rows.size !== SEEDED / 5 || [...j.rows.values()].some((r) => r.tag !== 't3')) fail(`tag = "t3" delivered ${j.rows.size} rows, expected ${SEEDED / 5}`);
@@ -114,8 +148,7 @@ await j.until('a row leaving the JSON filter', (s) => !s.rows.has('seed-5'));
 j.ws.close();
 log(`a JSON column filtered by value: ${SEEDED / 5} rows, and rows enter and leave the filter live`);
 
-const column = (name, value) => ({ table: 'smoke_items', where: { type: 'simple', op: '=', left: { type: 'column', name }, right: { type: 'literal', value } }, orderBy: [['id', 'asc']] });
-const n = connect('N', { patch: [{ op: 'put', hash: 'scored', ast: column('score', 1.5), ttl: 300000 }, { op: 'put', hash: 'loose', ast: column('loose', { a: [10], k: 1.5 }), ttl: 300000 }] });
+const n = connect('N', { patch: [put('scored', 'column', 'score', 1.5), put('loose', 'column', 'loose', { a: [10], k: 1.5 })] });
 await n.until('the JSON number and object filters', (s) => (s.got.has('scored') && s.got.has('loose')) || s.errors.length > 0);
 if (n.errors.length) fail('a filter on a JSON number or object was refused: ' + JSON.stringify(n.errors[0]));
 if (n.rows.size !== SEEDED / 5 || [...n.rows.values()].some((r) => r.score !== 1.5 || r.loose?.k !== 1.5 || r.loose?.a?.[0] !== 10)) fail(`score = 1.5 (stored as 1.50) and loose = {a:[10],k:1.5} (stored with its own spelling) delivered ${n.rows.size} rows, expected ${SEEDED / 5}`);
@@ -126,7 +159,7 @@ await n.until('a row leaving the JSON number filter', (s) => !s.rows.has('seed-6
 n.ws.close();
 log(`a number stored as 1.50 is found by 1.5, a json object by its value whatever its spelling: ${SEEDED / 5} rows, live changes included`);
 
-const r1 = connect('R1', { patch: [{ op: 'put', hash: 'open', ast: open, ttl: 300000 }] });
+const r1 = connect('R1', { patch: [put('open', 'open')] });
 await r1.until('hydration', (s) => s.got.has('open'));
 const leftAt = r1.cookie;
 r1.ws.close();
@@ -135,14 +168,14 @@ sql(`INSERT INTO smoke_items (id, status, points) VALUES ('away-1', 'OPEN', 1), 
      UPDATE smoke_items SET points = 71 WHERE id = 'seed-7'; UPDATE smoke_items SET points = 72 WHERE id = 'seed-7';
      DELETE FROM smoke_items WHERE id = 'away-2'; UPDATE smoke_items SET status = 'DONE' WHERE id = 'seed-9';`);
 await new Promise((resolve) => setTimeout(resolve, 1500));
-const r2 = connect('R2', { group: r1.group, baseCookie: leftAt, rows: r1.rows, patch: [{ op: 'put', hash: 'open', ast: open, ttl: 300000 }] });
+const r2 = connect('R2', { group: r1.group, baseCookie: leftAt, rows: r1.rows, patch: [put('open', 'open')] });
 await r2.until('what it missed', (s) => s.errors.length > 0 || (s.rows.has('away-1') && s.rows.get('seed-7')?.points === 72 && !s.rows.has('seed-9')));
 if (r2.errors.length) fail('a client back with its cookie was told to start over: ' + JSON.stringify(r2.errors[0]));
 if (r2.bases[0] !== leftAt) fail(`the catch-up should start from ${leftAt}, it started from ${r2.bases[0]}`);
 if (r2.puts > 5 || r2.rows.has('away-2')) fail(`the catch-up should carry the net of what changed, it carried ${r2.puts} puts`);
 log(`a client back after six writes was sent their net from its cookie ${leftAt}: ${r2.puts} puts, no fresh sync`);
 
-const t2 = connect('T2', { group: r1.group, patch: [{ op: 'put', hash: 'open', ast: open, ttl: 300000 }] });
+const t2 = connect('T2', { group: r1.group, patch: [put('open', 'open')] });
 await t2.until('the group\'s state', (s) => s.errors.length > 0 || s.got.has('open'));
 if (t2.errors.length) fail('a tab without a cookie was refused by a live group: ' + JSON.stringify(t2.errors[0]));
 if (t2.bases[0] !== null || t2.rows.size !== r2.rows.size) fail(`the late tab should hold the group's ${r2.rows.size} rows from nothing, it holds ${t2.rows.size} from ${t2.bases[0]}`);
@@ -165,11 +198,11 @@ log(`a tab behind its group was sent the ${t3.pokes} pokes it missed, from ${beh
 r2.ws.close(); t3.ws.close();
 
 const fits = { tables: { smoke_items: { columns: { id: { type: 'string' }, points: { type: 'number' }, meta: { type: 'json' } }, primaryKey: ['id'] } } };
-const b = connect('B', { clientSchema: fits, patch: [{ op: 'put', hash: 'open', ast: open, ttl: 300000 }] });
+const b = connect('B', { clientSchema: fits, patch: [put('open', 'open')] });
 await b.until('hydration', (s) => s.got.has('open') || s.errors.length > 0);
 if (b.errors.length) fail('a fitting client schema was refused: ' + JSON.stringify(b.errors[0]));
 const ahead = { tables: { smoke_items: { columns: { id: { type: 'string' }, noSuchColumn: { type: 'string' } }, primaryKey: ['id'] } } };
-const c = connect('C', { clientSchema: ahead, patch: [{ op: 'put', hash: 'open', ast: open, ttl: 300000 }] });
+const c = connect('C', { clientSchema: ahead, patch: [put('open', 'open')] });
 await c.until('the refusal', (s) => s.closed);
 if (c.errors[0]?.kind !== 'SchemaVersionNotSupported' || c.pokes > 0) fail('a client ahead of the database was not refused as the reference server refuses it: ' + JSON.stringify(c.errors));
 log('a fitting client schema was served and one naming an unknown column was refused with SchemaVersionNotSupported');
@@ -205,6 +238,6 @@ if (COLLECTOR) {
   log(`the collector holds every series /metrics serves (${pushed.size} names), pushed over OTLP`);
 }
 
-a.ws.close(); b.ws.close();
+a.ws.close(); b.ws.close(); app.close();
 log('PASS');
 setTimeout(() => process.exit(0), 200);
