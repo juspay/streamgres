@@ -1,11 +1,11 @@
 //! Continuous profiling pushed to Pyroscope: where the server's CPU time
 //! goes and which code holds its heap, by function, as flame graphs beside
 //! the stage histograms `/metrics` serves. Off unless
-//! `XYNE_SYNC_PYROSCOPE_URL` is set; off, nothing is installed, no signal
+//! `STREAMGRES_PYROSCOPE_URL` is set; off, nothing is installed, no signal
 //! handler, no timer, no thread, and jemalloc's heap sampling stays off.
 //!
 //! On, the pprof-rs backend of the `pyroscope` crate arms `ITIMER_PROF`
-//! at `XYNE_SYNC_PYROSCOPE_SAMPLE_RATE` (100 Hz): the kernel sends
+//! at `STREAMGRES_PYROSCOPE_SAMPLE_RATE` (100 Hz): the kernel sends
 //! `SIGPROF` to a running thread for every 1/rate s of CPU time the
 //! process spends, so an idle server is not interrupted at all and a busy
 //! one pays for one stack walk (framehop, from the unwind tables) per
@@ -14,7 +14,7 @@
 //! `/push.v1.PusherService/Push`; nothing here runs on a thread that
 //! serves clients. A failed upload is logged and the next one tried.
 //!
-//! The heap profile (`XYNE_SYNC_PYROSCOPE_HEAP`, on by default) is
+//! The heap profile (`STREAMGRES_PYROSCOPE_HEAP`, on by default) is
 //! jemalloc's: the binaries run on jemalloc built with its profiler and
 //! started with sampling off (`malloc_conf` in `src/bin/server.rs`); here
 //! sampling is switched on, one allocation per 512 KiB allocated has its
@@ -26,7 +26,7 @@
 //! `thread_name` (so the engine thread's graph is read apart from the
 //! groups' and the reads'), `version` (the crate's, with the image's
 //! `SOURCE_COMMIT`), `service_git_ref` (the commit alone), `instance`
-//! (`HOSTNAME`, the pod) and whatever `XYNE_SYNC_PYROSCOPE_TAGS` adds.
+//! (`HOSTNAME`, the pod) and whatever `STREAMGRES_PYROSCOPE_TAGS` adds.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -43,23 +43,23 @@ use crate::log::{self, Level, log_event, log_warn};
 /// What the environment asks of the profiler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// `XYNE_SYNC_PYROSCOPE_URL`: the server's base URL, no trailing `/`.
+    /// `STREAMGRES_PYROSCOPE_URL`: the server's base URL, no trailing `/`.
     pub url: String,
-    /// `XYNE_SYNC_PYROSCOPE_APPLICATION` (`xyne-sync`): the profiles'
+    /// `STREAMGRES_PYROSCOPE_APPLICATION` (`xyne-sync`): the profiles'
     /// `service_name`.
     pub application: String,
-    /// `XYNE_SYNC_PYROSCOPE_SAMPLE_RATE` (100): samples per second of CPU
+    /// `STREAMGRES_PYROSCOPE_SAMPLE_RATE` (100): samples per second of CPU
     /// time, 1 to 1000.
     pub sample_rate: u32,
-    /// `XYNE_SYNC_PYROSCOPE_USER` and `XYNE_SYNC_PYROSCOPE_PASSWORD`:
+    /// `STREAMGRES_PYROSCOPE_USER` and `STREAMGRES_PYROSCOPE_PASSWORD`:
     /// basic authentication, as Grafana Cloud asks for.
     pub basic_auth: Option<(String, String)>,
-    /// `XYNE_SYNC_PYROSCOPE_TENANT`: sent as `X-Scope-OrgID` to a
+    /// `STREAMGRES_PYROSCOPE_TENANT`: sent as `X-Scope-OrgID` to a
     /// multi-tenant server.
     pub tenant: Option<String>,
     /// The labels every profile carries, in order.
     pub tags: Vec<(String, String)>,
-    /// `XYNE_SYNC_PYROSCOPE_HEAP` (true): whether the heap is profiled
+    /// `STREAMGRES_PYROSCOPE_HEAP` (true): whether the heap is profiled
     /// beside the CPU.
     pub heap: bool,
 }
@@ -78,46 +78,52 @@ impl Config {
             lookup(key)
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    key.strip_prefix("STREAMGRES_")
+                        .and_then(|suffix| lookup(&format!("XYNE_SYNC_{suffix}")))
+                        .map(|value| value.trim().to_owned())
+                        .filter(|value| !value.is_empty())
+                })
         };
-        let Some(text) = get("XYNE_SYNC_PYROSCOPE_URL") else {
+        let Some(text) = get("STREAMGRES_PYROSCOPE_URL") else {
             return Ok(None);
         };
         let url = base_url(&text)
-            .map_err(|why| format!("XYNE_SYNC_PYROSCOPE_URL {why}, got `{text}`"))?;
+            .map_err(|why| format!("STREAMGRES_PYROSCOPE_URL {why}, got `{text}`"))?;
         let application =
-            get("XYNE_SYNC_PYROSCOPE_APPLICATION").unwrap_or_else(|| "xyne-sync".to_owned());
-        let sample_rate = match get("XYNE_SYNC_PYROSCOPE_SAMPLE_RATE") {
+            get("STREAMGRES_PYROSCOPE_APPLICATION").unwrap_or_else(|| "xyne-sync".to_owned());
+        let sample_rate = match get("STREAMGRES_PYROSCOPE_SAMPLE_RATE") {
             Some(text) => text
                 .parse::<u32>()
                 .ok()
                 .filter(|rate| (1..=1000).contains(rate))
                 .ok_or_else(|| {
                     format!(
-                        "XYNE_SYNC_PYROSCOPE_SAMPLE_RATE must be a number of samples a second from 1 to 1000, got `{text}`"
+                        "STREAMGRES_PYROSCOPE_SAMPLE_RATE must be a number of samples a second from 1 to 1000, got `{text}`"
                     )
                 })?,
             None => 100,
         };
         let basic_auth = match (
-            get("XYNE_SYNC_PYROSCOPE_USER"),
-            get("XYNE_SYNC_PYROSCOPE_PASSWORD"),
+            get("STREAMGRES_PYROSCOPE_USER"),
+            get("STREAMGRES_PYROSCOPE_PASSWORD"),
         ) {
             (Some(user), Some(password)) => Some((user, password)),
             (None, None) => None,
             _ => {
                 return Err(
-                    "XYNE_SYNC_PYROSCOPE_USER and XYNE_SYNC_PYROSCOPE_PASSWORD are set together or not at all"
+                    "STREAMGRES_PYROSCOPE_USER and STREAMGRES_PYROSCOPE_PASSWORD are set together or not at all"
                         .to_owned(),
                 );
             }
         };
-        let tenant = get("XYNE_SYNC_PYROSCOPE_TENANT");
-        let heap = match get("XYNE_SYNC_PYROSCOPE_HEAP").as_deref() {
+        let tenant = get("STREAMGRES_PYROSCOPE_TENANT");
+        let heap = match get("STREAMGRES_PYROSCOPE_HEAP").as_deref() {
             None | Some("true") | Some("1") => true,
             Some("false") | Some("0") => false,
             Some(other) => {
                 return Err(format!(
-                    "XYNE_SYNC_PYROSCOPE_HEAP must be true or false, got `{other}`"
+                    "STREAMGRES_PYROSCOPE_HEAP must be true or false, got `{other}`"
                 ));
             }
         };
@@ -135,7 +141,7 @@ impl Config {
         if let Some(host) = get("HOSTNAME") {
             tags.push(("instance".to_owned(), host));
         }
-        if let Some(text) = get("XYNE_SYNC_PYROSCOPE_TAGS") {
+        if let Some(text) = get("STREAMGRES_PYROSCOPE_TAGS") {
             for pair in text.split(',').filter(|pair| !pair.trim().is_empty()) {
                 let (key, value) = pair
                     .split_once('=')
@@ -143,13 +149,13 @@ impl Config {
                     .filter(|(key, value)| label_name(key) && !value.is_empty())
                     .ok_or_else(|| {
                         format!(
-                            "XYNE_SYNC_PYROSCOPE_TAGS must be `name=value,...` with names of letters, digits and `_` not starting with a digit, got `{}`",
+                            "STREAMGRES_PYROSCOPE_TAGS must be `name=value,...` with names of letters, digits and `_` not starting with a digit, got `{}`",
                             pair.trim()
                         )
                     })?;
                 if RESERVED.contains(&key) {
                     return Err(format!(
-                        "XYNE_SYNC_PYROSCOPE_TAGS cannot set `{key}`: the server sets it"
+                        "STREAMGRES_PYROSCOPE_TAGS cannot set `{key}`: the server sets it"
                     ));
                 }
                 match tags.iter_mut().find(|(known, _)| known == key) {
@@ -506,12 +512,28 @@ mod tests {
     #[test]
     fn without_a_url_profiling_is_off() {
         assert_eq!(config(&[]), Ok(None));
-        assert_eq!(config(&[("XYNE_SYNC_PYROSCOPE_URL", "  ")]), Ok(None));
+        assert_eq!(config(&[("STREAMGRES_PYROSCOPE_URL", "  ")]), Ok(None));
         assert_eq!(
-            config(&[("XYNE_SYNC_PYROSCOPE_SAMPLE_RATE", "50")]),
+            config(&[("STREAMGRES_PYROSCOPE_SAMPLE_RATE", "50")]),
             Ok(None)
         );
         assert!(matches!(start(None), Ok(None)));
+    }
+
+    #[test]
+    fn streamgres_profile_names_precede_legacy_xyne_names() {
+        let legacy = config(&[("XYNE_SYNC_PYROSCOPE_URL", "http://legacy:4040")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.url, "http://legacy:4040");
+
+        let preferred = config(&[
+            ("STREAMGRES_PYROSCOPE_URL", "http://new:4040"),
+            ("XYNE_SYNC_PYROSCOPE_URL", "http://legacy:4040"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(preferred.url, "http://new:4040");
     }
 
     /// A URL alone takes every default; the image's commit and the pod's
@@ -519,7 +541,7 @@ mod tests {
     #[test]
     fn a_url_alone_takes_the_defaults() {
         let on = config(&[
-            ("XYNE_SYNC_PYROSCOPE_URL", "http://pyroscope:4040/"),
+            ("STREAMGRES_PYROSCOPE_URL", "http://pyroscope:4040/"),
             ("SOURCE_COMMIT", "a12bb82"),
             ("HOSTNAME", "xyne-sync-0"),
         ])
@@ -543,7 +565,7 @@ mod tests {
             }
         );
         let placeholder = config(&[
-            ("XYNE_SYNC_PYROSCOPE_URL", "http://pyroscope:4040"),
+            ("STREAMGRES_PYROSCOPE_URL", "http://pyroscope:4040"),
             ("SOURCE_COMMIT", "unknown"),
         ])
         .unwrap()
@@ -561,16 +583,16 @@ mod tests {
     fn every_setting_is_read() {
         let on = config(&[
             (
-                "XYNE_SYNC_PYROSCOPE_URL",
+                "STREAMGRES_PYROSCOPE_URL",
                 "https://profiles-prod-001.grafana.net",
             ),
-            ("XYNE_SYNC_PYROSCOPE_APPLICATION", "xyne-sync-sandbox"),
-            ("XYNE_SYNC_PYROSCOPE_SAMPLE_RATE", "49"),
-            ("XYNE_SYNC_PYROSCOPE_USER", "123456"),
-            ("XYNE_SYNC_PYROSCOPE_PASSWORD", "glc_token"),
-            ("XYNE_SYNC_PYROSCOPE_TENANT", "team-a"),
+            ("STREAMGRES_PYROSCOPE_APPLICATION", "xyne-sync-sandbox"),
+            ("STREAMGRES_PYROSCOPE_SAMPLE_RATE", "49"),
+            ("STREAMGRES_PYROSCOPE_USER", "123456"),
+            ("STREAMGRES_PYROSCOPE_PASSWORD", "glc_token"),
+            ("STREAMGRES_PYROSCOPE_TENANT", "team-a"),
             (
-                "XYNE_SYNC_PYROSCOPE_TAGS",
+                "STREAMGRES_PYROSCOPE_TAGS",
                 "env=sandbox, region = asia_south1 ,version=canary,",
             ),
         ])
@@ -587,8 +609,8 @@ mod tests {
         assert!(on.heap);
         for (text, heap) in [("false", false), ("0", false), ("true", true), ("1", true)] {
             let set = config(&[
-                ("XYNE_SYNC_PYROSCOPE_URL", "http://pyroscope:4040"),
-                ("XYNE_SYNC_PYROSCOPE_HEAP", text),
+                ("STREAMGRES_PYROSCOPE_URL", "http://pyroscope:4040"),
+                ("STREAMGRES_PYROSCOPE_HEAP", text),
             ])
             .unwrap()
             .unwrap();
@@ -608,7 +630,7 @@ mod tests {
     /// rather than profiling with something else than was asked.
     #[test]
     fn a_malformed_setting_is_refused() {
-        let url = ("XYNE_SYNC_PYROSCOPE_URL", "http://pyroscope:4040");
+        let url = ("STREAMGRES_PYROSCOPE_URL", "http://pyroscope:4040");
         let refused = |vars: &[(&str, &str)], names: &str| {
             let error = config(vars).unwrap_err();
             assert!(error.contains(names), "{error}");
@@ -622,23 +644,23 @@ mod tests {
             "http://pyroscope:4040/#top",
         ] {
             refused(
-                &[("XYNE_SYNC_PYROSCOPE_URL", bad)],
-                "XYNE_SYNC_PYROSCOPE_URL",
+                &[("STREAMGRES_PYROSCOPE_URL", bad)],
+                "STREAMGRES_PYROSCOPE_URL",
             );
         }
         for bad in ["0", "1001", "-5", "fast", "1.5"] {
             refused(
-                &[url, ("XYNE_SYNC_PYROSCOPE_SAMPLE_RATE", bad)],
-                "XYNE_SYNC_PYROSCOPE_SAMPLE_RATE",
+                &[url, ("STREAMGRES_PYROSCOPE_SAMPLE_RATE", bad)],
+                "STREAMGRES_PYROSCOPE_SAMPLE_RATE",
             );
         }
         refused(
-            &[url, ("XYNE_SYNC_PYROSCOPE_USER", "123456")],
-            "XYNE_SYNC_PYROSCOPE_PASSWORD",
+            &[url, ("STREAMGRES_PYROSCOPE_USER", "123456")],
+            "STREAMGRES_PYROSCOPE_PASSWORD",
         );
         refused(
-            &[url, ("XYNE_SYNC_PYROSCOPE_PASSWORD", "glc_token")],
-            "XYNE_SYNC_PYROSCOPE_USER",
+            &[url, ("STREAMGRES_PYROSCOPE_PASSWORD", "glc_token")],
+            "STREAMGRES_PYROSCOPE_USER",
         );
         for bad in [
             "env",
@@ -650,18 +672,18 @@ mod tests {
             "__name__=x",
         ] {
             refused(
-                &[url, ("XYNE_SYNC_PYROSCOPE_TAGS", bad)],
-                "XYNE_SYNC_PYROSCOPE_TAGS",
+                &[url, ("STREAMGRES_PYROSCOPE_TAGS", bad)],
+                "STREAMGRES_PYROSCOPE_TAGS",
             );
         }
         for bad in ["yes", "off", "TRUE"] {
             refused(
-                &[url, ("XYNE_SYNC_PYROSCOPE_HEAP", bad)],
-                "XYNE_SYNC_PYROSCOPE_HEAP",
+                &[url, ("STREAMGRES_PYROSCOPE_HEAP", bad)],
+                "STREAMGRES_PYROSCOPE_HEAP",
             );
         }
         refused(
-            &[url, ("XYNE_SYNC_PYROSCOPE_TAGS", "thread_name=x")],
+            &[url, ("STREAMGRES_PYROSCOPE_TAGS", "thread_name=x")],
             "`thread_name`",
         );
     }

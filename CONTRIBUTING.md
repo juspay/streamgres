@@ -37,14 +37,14 @@ cargo run --bin xyne_sync           # demo: every check must end in PASS
 cargo run --release --bin bench     # benchmarks
 ```
 
-The tests against a real PostgreSQL run when `XYNE_SYNC_PG_DSN` is set and
+The tests against a real PostgreSQL run when `STREAMGRES_PG_DSN` is set and
 report themselves skipped otherwise. To run them the way CI does:
 
 ```bash
 docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17 \
   -c wal_level=logical -c max_replication_slots=32 -c max_wal_senders=32
 
-XYNE_SYNC_PG_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
+STREAMGRES_PG_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
   cargo test --release
 ```
 

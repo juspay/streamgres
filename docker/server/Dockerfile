@@ -23,8 +23,8 @@ COPY --from=builder /build/target/release/server /app/server
 
 ARG SOURCE_COMMIT=unknown
 ENV SOURCE_COMMIT=${SOURCE_COMMIT} \
-    XYNE_SYNC_ADDR=0.0.0.0:4848 \
-    XYNE_SYNC_LOG_FORMAT=json
+    STREAMGRES_ADDR=0.0.0.0:4848 \
+    STREAMGRES_LOG_FORMAT=json
 
 USER xyne-sync
 EXPOSE 4848

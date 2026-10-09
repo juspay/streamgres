@@ -14,7 +14,7 @@ import {randomUUID} from 'node:crypto';
 const pg = process.env.RACE_PG;
 if (!pg) throw new Error('RACE_PG is required');
 const gateway = process.env.RACE_GATEWAY ?? 'ws://127.0.0.1:4848/sync';
-const shardSchema = `${process.env.XYNE_SYNC_APP_ID ?? 'xyne'}_${process.env.XYNE_SYNC_SHARD ?? '0'}`;
+const shardSchema = `${process.env.STREAMGRES_APP_ID ?? 'xyne'}_${process.env.STREAMGRES_SHARD ?? '0'}`;
 const port = Number(process.env.RACE_MUTATE_PORT ?? 4781);
 const group = `race-group-${randomUUID()}`;
 const client = `race-client-${randomUUID()}`;

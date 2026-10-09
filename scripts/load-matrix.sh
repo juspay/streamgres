@@ -45,9 +45,9 @@ for cpus in $CPUS; do
   [ -n "${LINUX_BIN:-}" ] || { echo "LINUX_BIN is required for the container runs"; exit 2; }
   docker rm -f xs-load >/dev/null 2>&1 || true
   docker run -d --name xs-load --network host --cpus "$cpus" -v "$LINUX_BIN:/server:ro" \
-    -e XYNE_SYNC_ADDR=0.0.0.0:$PORT -e XYNE_SYNC_PUBLICATION=xyne_load_pub -e XYNE_SYNC_PG_DSN="$PG_DSN" \
-    -e XYNE_SYNC_BASE_PATH=/sync -e XYNE_SYNC_APP_ID="${APP_ID:-xyne}" \
-    -e XYNE_SYNC_QUERY_URL="$QUERY_URL" -e XYNE_SYNC_MUTATE_URL="$MUTATE_URL" -e XYNE_SYNC_LOG=info \
+    -e STREAMGRES_ADDR=0.0.0.0:$PORT -e STREAMGRES_PUBLICATION=xyne_load_pub -e STREAMGRES_PG_DSN="$PG_DSN" \
+    -e STREAMGRES_BASE_PATH=/sync -e STREAMGRES_APP_ID="${APP_ID:-xyne}" \
+    -e STREAMGRES_QUERY_URL="$QUERY_URL" -e STREAMGRES_MUTATE_URL="$MUTATE_URL" -e STREAMGRES_LOG=info \
     debian:bookworm-slim /server >/dev/null
   for _ in $(seq 1 50); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 0.2; done
   echo "== server pinned to $cpus cpu(s)"

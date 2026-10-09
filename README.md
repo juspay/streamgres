@@ -108,17 +108,19 @@ with `trigger_stack_sql` in `src/client/ddl_triggers.rs`.
 ### 2. Configure and run
 
 ```bash
-cp .env.example .env     # set XYNE_SYNC_PG_DSN, XYNE_SYNC_QUERY_URL, XYNE_SYNC_MUTATE_URL
+cp .env.example .env     # set STREAMGRES_PG_DSN, STREAMGRES_QUERY_URL, STREAMGRES_MUTATE_URL
 cargo run --release --bin server
 ```
 
 The server listens on `0.0.0.0:4848`. Point the client's `server` option at
-`http://<host>:4848/sync`, which is the `XYNE_SYNC_BASE_PATH` from
+`http://<host>:4848/sync`, which is the `STREAMGRES_BASE_PATH` from
 `.env.example`. `GET /health` returns `200` once the server is ready to serve
 queries.
 
-Configuration is all `XYNE_SYNC_*` environment variables, each documented in
-[`.env.example`](.env.example). For production setup see
+Configuration uses `STREAMGRES_*` environment variables, each documented in
+[`.env.example`](.env.example). Existing `XYNE_SYNC_*` variables are still
+accepted as fallbacks; a `STREAMGRES_*` value takes precedence when both are
+set. For production setup see
 [`docs/deploy.md`](docs/deploy.md): sizing, PostgreSQL roles and replicas,
 probes and routing. For metrics, logs and alerts see
 [`docs/observability.md`](docs/observability.md).
@@ -206,11 +208,11 @@ cargo run --release --bin bench     # benchmarks: routing, registration, windows
 cargo clippy --all-targets
 ```
 
-Tests against a real PostgreSQL run when `XYNE_SYNC_PG_DSN` is set, and report
+Tests against a real PostgreSQL run when `STREAMGRES_PG_DSN` is set, and report
 themselves skipped otherwise:
 
 ```bash
-XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5432/xyne_sync cargo test --test pg_live
+STREAMGRES_PG_DSN=postgresql://postgres@localhost:5432/xyne_sync cargo test --test pg_live
 ```
 
 `scripts/` holds the end-to-end checks:

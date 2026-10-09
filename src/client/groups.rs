@@ -8,7 +8,7 @@
 //!
 //! # Threads, batches, bytes
 //!
-//! There are `XYNE_SYNC_GROUP_THREADS` of these threads, each owning the
+//! There are `STREAMGRES_GROUP_THREADS` of these threads, each owning the
 //! groups whose id hashes to it; the engine side knows which thread
 //! registered each subscription and sends it that subscription's share of
 //! every delta, so a thread hears only of its own groups. A thread
@@ -55,7 +55,7 @@
 //! - **An older cookie the group's log still reaches** (a tab that was
 //!   away while another kept the group moving). The group keeps its most
 //!   recent pokes, as the frames it already built, up to
-//!   `XYNE_SYNC_GROUP_LOG_BYTES`: every poke sent is kept and the oldest
+//!   `STREAMGRES_GROUP_LOG_BYTES`: every poke sent is kept and the oldest
 //!   dropped until the rest fit, whether or not anyone was really
 //!   listening (a socket that died unnoticed is sent to, and logged for,
 //!   until the server learns of it). The returning connection is sent the
@@ -1918,10 +1918,10 @@ mod tests {
         /// given.
         fn new(log_bytes: &str) -> Self {
             let vars: HashMap<&str, &str> = HashMap::from([
-                ("XYNE_SYNC_PG_DSN", "postgresql://none/none"),
-                ("XYNE_SYNC_QUERY_URL", "http://none/query"),
-                ("XYNE_SYNC_MUTATE_URL", "http://none/push"),
-                ("XYNE_SYNC_GROUP_LOG_BYTES", log_bytes),
+                ("STREAMGRES_PG_DSN", "postgresql://none/none"),
+                ("STREAMGRES_QUERY_URL", "http://none/query"),
+                ("STREAMGRES_MUTATE_URL", "http://none/push"),
+                ("STREAMGRES_GROUP_LOG_BYTES", log_bytes),
             ]);
             let config = Config::from_lookup(|name| vars.get(name).map(|v| (*v).to_owned()))
                 .expect("a configuration");
@@ -3253,9 +3253,9 @@ mod tests {
         };
 
         let vars: HashMap<&str, &str> = HashMap::from([
-            ("XYNE_SYNC_PG_DSN", "postgresql://none/none"),
-            ("XYNE_SYNC_QUERY_URL", "http://none/query"),
-            ("XYNE_SYNC_MUTATE_URL", "http://none/push"),
+            ("STREAMGRES_PG_DSN", "postgresql://none/none"),
+            ("STREAMGRES_QUERY_URL", "http://none/query"),
+            ("STREAMGRES_MUTATE_URL", "http://none/push"),
         ]);
         let config = Config::from_lookup(|name| vars.get(name).map(|v| (*v).to_owned()))
             .expect("a configuration");
@@ -3935,9 +3935,9 @@ mod tests {
         }
 
         let vars: HashMap<&str, &str> = HashMap::from([
-            ("XYNE_SYNC_PG_DSN", "postgresql://none/none"),
-            ("XYNE_SYNC_QUERY_URL", "http://none/query"),
-            ("XYNE_SYNC_MUTATE_URL", "http://none/push"),
+            ("STREAMGRES_PG_DSN", "postgresql://none/none"),
+            ("STREAMGRES_QUERY_URL", "http://none/query"),
+            ("STREAMGRES_MUTATE_URL", "http://none/push"),
         ]);
         let config = Config::from_lookup(|name| vars.get(name).map(|v| (*v).to_owned()))
             .expect("a configuration");

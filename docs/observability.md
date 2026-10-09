@@ -35,7 +35,7 @@ Every cell is a metric below; the rows of the table are the labels.
   summary line are rendered on the request task or the metrics thread
   from the atomics; percentiles are computed at read time.
 - **Sampling is a thread.** `xyne-sync-metrics` wakes every
-  `XYNE_SYNC_METRICS_INTERVAL_MS` (10 s), reads what only sampling can
+  `STREAMGRES_METRICS_INTERVAL_MS` (10 s), reads what only sampling can
   give (the process's resident set, each thread's CPU time by name from
   `/proc`, the queues' depths, the caches' sizes) into gauges, and every
   sixth wake-up writes the summary line.
@@ -45,7 +45,7 @@ Every cell is a metric below; the rows of the table are the labels.
   batches. A full queue drops the line and counts the drop; the count is
   a metric and appears in the summary, so a flood is visible without
   ever blocking the thread that logged. Format is `text` or `json`
-  (`XYNE_SYNC_LOG_FORMAT`); every line carries its time, level, the
+  (`STREAMGRES_LOG_FORMAT`); every line carries its time, level, the
   thread that wrote it and, for structured events, its fields.
 - **One catalogue, two carriers.** The measurements are listed once
   (`Stats::metrics`, `src/metric.rs`) and written out as Prometheus text
@@ -80,13 +80,13 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_engine_step_seconds{step=register,land,unregister}` | the engine's own compute per step |
 | `xyne_sync_read_seconds` | a storage read from issue to its rows back on the engine thread (queue + PostgreSQL + decode) |
 | `xyne_sync_read_rows` | rows per storage read (histogram over counts) |
-| `xyne_sync_read_row_limit` | the most rows one storage read may return, and the planner reads whole, as configured (`XYNE_SYNC_ROW_LIMIT`) |
+| `xyne_sync_read_row_limit` | the most rows one storage read may return, and the planner reads whole, as configured (`STREAMGRES_ROW_LIMIT`) |
 | `xyne_sync_read_rows_max` | the largest storage read of the last minute or two (a window closed every minute, the one before kept), so the ratio to the limit is one division |
 | `xyne_sync_reads_near_limit_total{over=50,80}` | storage reads that returned at least half, and at least four fifths, of the row limit; exact, where the histogram's bounds are coarse |
 | `xyne_sync_query_read_rows_max{name,table}`, `xyne_sync_query_heavy_reads_total{name}` | per query name, for queries whose subscriptions waited on a read of at least half the limit: the largest such read with its table, and how many; at most 256 names, also `/stats.heavy_queries` |
 | `xyne_sync_reads_total{outcome=issued,landed,refused,shared}` | storage reads, and registrations served from a twin without one |
 | `xyne_sync_subscriptions`, `xyne_sync_trees` | what the engine holds |
-| `xyne_sync_queries_refused_total{reason=unsupported,plan_limit,read_limit,read_timeout,other}` | queries the server refused, by why: the translation cannot express it (`LIKE`, `NOT EXISTS`), the planner found no side of a join small enough to read, a read came back over the row limit, a read or a count ran past `XYNE_SYNC_READ_TIMEOUT_MS`, anything else |
+| `xyne_sync_queries_refused_total{reason=unsupported,plan_limit,read_limit,read_timeout,other}` | queries the server refused, by why: the translation cannot express it (`LIKE`, `NOT EXISTS`), the planner found no side of a join small enough to read, a read came back over the row limit, a read or a count ran past `STREAMGRES_READ_TIMEOUT_MS`, anything else |
 | `xyne_sync_plans_total{kind=page_drives}` | plans in which a node with a `LIMIT` drives an inner edge (the page is kept to the rows the edge admits) |
 | `xyne_sync_page_rows_rejected_total`, `xyne_sync_pages_capped_total` | rows a join gate rejected inside a page (dropped by a page read in batches, kept apart by one read whole); pages that stopped reaching further after ten rounds without filling |
 | `xyne_sync_page_rounds_total`, `xyne_sync_page_lookups_total` | rounds pages took past their first batch, each a batch twice the last (a read from the frontier, or a promotion from the rows a page read whole holds); reads pages asked for of one join value they had dropped, because a write on the driven side concerned it |
@@ -126,7 +126,7 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | --- | --- |
 | `xyne_sync_process_rss_bytes` | resident set, sampled |
 | `xyne_sync_thread_cpu_seconds_total{thread}` | CPU by thread name (engine, groups, reads, server, feed, reaper, log, metrics), sampled; the engine's rate is its utilisation |
-| `xyne_sync_core_cpu_seconds_total{core}` | CPU by core: each thread's time since the last sample attributed to the core it was sampled on (`processor` in `/proc`); a core's rate is the process's use of that core. A thread that moves cores inside an interval is charged to the core it ended on, so a shorter `XYNE_SYNC_METRICS_INTERVAL_MS` sharpens it |
+| `xyne_sync_core_cpu_seconds_total{core}` | CPU by core: each thread's time since the last sample attributed to the core it was sampled on (`processor` in `/proc`); a core's rate is the process's use of that core. A thread that moves cores inside an interval is charged to the core it ended on, so a shorter `STREAMGRES_METRICS_INTERVAL_MS` sharpens it |
 | `xyne_sync_thread_core_cpu_seconds_total{thread,core}` | the same seconds kept by thread name and core, so which thread burned a core is known; sums over `thread` to `xyne_sync_core_cpu_seconds_total`. Cardinality is threads × cores the node exposes (about 8 × 8 on a prod pod) |
 | `xyne_sync_thread_core{thread,tid}` | the core each thread was on at the last sample (a pool's threads told apart by `tid`); a snapshot, not a history |
 | `xyne_sync_thread_migrations_total{thread}` | moves between cores by thread name since the sampler started (`se.nr_migrations` in `/proc/<tid>/sched`, summed over a pool's threads, absent where the kernel does not count them); the honesty check for the two above: a thread that moves many times an interval has its time smeared across cores, so read its per-core split with that rate in mind |
@@ -153,7 +153,7 @@ object per line, `{"ts","level","thread","msg", ...fields}`.
 | heavy read | info, warn from 80 % | name, hash, group, table, rows, limit, percent: a read the query waited on returned at least half the row limit; once per read, under the query that waited on it |
 | telemetry export started / failed | info / warn, at most once a minute | the endpoints and the interval; the signal, the error and the failures so far |
 | query hydrated | debug | group, name, hash, kind (cold or warm), ms from registration to rows present |
-| slow query | warn | the same, when hydration exceeds `XYNE_SYNC_SLOW_QUERY_MS` (1 000) |
+| slow query | warn | the same, when hydration exceeds `STREAMGRES_SLOW_QUERY_MS` (1 000) |
 | query refused | warn | name, hash, kind (`unsupported`, `plan_limit`, `read_limit`, `read_timeout`, `other`), at (`plan`: before it registered; `read`: a read it depended on), group, connection, the reason in full |
 | query planned | debug | name, the root's table, whether a page drives an inner edge, ms |
 | page capped | warn | name, hash, group: a page of the query stopped reaching past the rows its join rejects; it is served, short of its limit |
@@ -183,10 +183,10 @@ JSON log with `component` and `worker` fields map onto the rows above.
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `XYNE_SYNC_LOG` | `info` | level |
-| `XYNE_SYNC_LOG_FORMAT` | `text` | `text` or `json` |
-| `XYNE_SYNC_SLOW_QUERY_MS` | `1000` | a query hydrating slower than this is logged at warn |
-| `XYNE_SYNC_METRICS_INTERVAL_MS` | `10000` | the sampler's period; the summary line every sixth sample; `0` turns the sampler off |
+| `STREAMGRES_LOG` | `info` | level |
+| `STREAMGRES_LOG_FORMAT` | `text` | `text` or `json` |
+| `STREAMGRES_SLOW_QUERY_MS` | `1000` | a query hydrating slower than this is logged at warn |
+| `STREAMGRES_METRICS_INTERVAL_MS` | `10000` | the sampler's period; the summary line every sixth sample; `0` turns the sampler off |
 
 The push to a collector is configured by the variables the reference server is
 configured by, read as it and the OpenTelemetry specification read them;

@@ -531,7 +531,7 @@ impl Transport {
             .get(0);
         if version < 170_000 {
             return Err(StorageError(format!(
-                "XYNE_SYNC_SLOT_CLEANUP_AGE_MS requires PostgreSQL 17 or later (server is {version}); PostgreSQL 16 has no inactive_since timestamp, so safe age-bounded cleanup is impossible"
+                "STREAMGRES_SLOT_CLEANUP_AGE_MS requires PostgreSQL 17 or later (server is {version}); PostgreSQL 16 has no inactive_since timestamp, so safe age-bounded cleanup is impossible"
             )));
         }
         let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);

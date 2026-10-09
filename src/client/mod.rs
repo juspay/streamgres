@@ -22,7 +22,7 @@
 //!   side.
 //! - **Engine thread.** The service: the runtime and the engine, and
 //!   nothing else; the storage reads it asks for run on the reads pool.
-//! - **Group threads.** `XYNE_SYNC_GROUP_THREADS` of them, each keeping
+//! - **Group threads.** `STREAMGRES_GROUP_THREADS` of them, each keeping
 //!   the views of the client groups that hash to it and building their
 //!   pokes ([`groups`]).
 //! - **Reads pool.** A small runtime for the storage: the SQL, the

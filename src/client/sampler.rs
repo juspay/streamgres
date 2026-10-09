@@ -230,7 +230,7 @@ pub struct Attribution {
 /// CPU time by core: each thread's CPU time since the last sample is
 /// attributed to the core it was on at the sample, so a core's total is
 /// what the process burned there, as closely as the sampling interval
-/// tells a thread's moves apart (a shorter `XYNE_SYNC_METRICS_INTERVAL_MS`
+/// tells a thread's moves apart (a shorter `STREAMGRES_METRICS_INTERVAL_MS`
 /// sharpens it). The same seconds are kept by thread name and core, so
 /// which thread burned a core is known too, and each thread's moves
 /// between cores since the last sample are summed by name: a name whose

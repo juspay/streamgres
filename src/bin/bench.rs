@@ -44,7 +44,7 @@
 //!    out (PostgreSQL's "unchanged" for an out-of-line value), on rows a
 //!    subscription holds (completed from the frame) and on rows moving
 //!    into a subscription that nobody holds (read again by key).
-//! 5. **Postgres** (only when `XYNE_SYNC_PG_DSN` names a database with
+//! 5. **Postgres** (only when `STREAMGRES_PG_DSN` names a database with
 //!    `wal_level = logical` and `bench` in its name, since the scenario
 //!    replaces its `users` and `tickets` tables) — the same join over real tables: a
 //!    registration's end-to-end latency (two positioned reads), writes
@@ -1445,13 +1445,13 @@ fn main() {
         partial_images();
     }
     if wanted("postgres") {
-        match std::env::var("XYNE_SYNC_PG_DSN") {
+        match std::env::var("STREAMGRES_PG_DSN") {
             Ok(dsn) if bench_database(&dsn) => postgres(&dsn),
             Ok(dsn) => println!(
                 "\n== 5. postgres: skipped ({dsn} does not name a database with `bench` in its name; the scenario drops and recreates `users` and `tickets` there) =="
             ),
             Err(_) => println!(
-                "\n== 5. postgres: skipped (set XYNE_SYNC_PG_DSN to a database with wal_level = logical and `bench` in its name) =="
+                "\n== 5. postgres: skipped (set STREAMGRES_PG_DSN to a database with wal_level = logical and `bench` in its name) =="
             ),
         }
     }
@@ -1473,10 +1473,10 @@ fn bench_database(dsn: &str) -> bool {
 }
 
 /// Whether scenario `name` runs: every scenario unless
-/// `XYNE_SYNC_BENCH_ONLY` names some (comma-separated: `routing`,
+/// `STREAMGRES_BENCH_ONLY` names some (comma-separated: `routing`,
 /// `twins`, `release`, `window`, `join`, `xyne`, `toast`, `postgres`).
 fn wanted(name: &str) -> bool {
-    std::env::var("XYNE_SYNC_BENCH_ONLY")
+    std::env::var("STREAMGRES_BENCH_ONLY")
         .map(|only| only.split(',').any(|scenario| scenario.trim() == name))
         .unwrap_or(true)
 }

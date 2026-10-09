@@ -68,7 +68,7 @@ percent-encoding = "2"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 # Continuous CPU and heap profiling pushed to Pyroscope (`src/profile.rs`), off
-# unless XYNE_SYNC_PYROSCOPE_URL is set. The pprof-rs backend samples on
+# unless STREAMGRES_PYROSCOPE_URL is set. The pprof-rs backend samples on
 # SIGPROF and unwinds with framehop from the unwind tables, so no frame
 # pointers are needed. TLS is rustls without a provider of its own: the
 # ring provider the reqwest above already builds is installed for it,

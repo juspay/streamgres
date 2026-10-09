@@ -18,10 +18,10 @@
 //
 // Environment: SMOKE_PG (postgresql://postgres:postgres@localhost:5432/postgres),
 // SMOKE_GATEWAY (ws://localhost:4848/sync), SMOKE_HTTP (http://localhost:4848),
-// XYNE_SYNC_APP_ID (xyne) and XYNE_SYNC_SHARD (0), which name the `<app>_<shard>` schema,
+// STREAMGRES_APP_ID (xyne) and STREAMGRES_SHARD (0), which name the `<app>_<shard>` schema,
 // SMOKE_COLLECTOR (the collector's Prometheus endpoint, http://localhost:9464/metrics;
 // unset skips that check). The server is expected to run with
-// XYNE_SYNC_ROW_LIMIT=600, so the 400 seeded rows make a heavy read. The table must
+// STREAMGRES_ROW_LIMIT=600, so the 400 seeded rows make a heavy read. The table must
 // exist before the server starts (it reads the catalog once): run with `--prepare` first.
 
 import { execFileSync } from 'node:child_process';
@@ -29,7 +29,7 @@ import { randomUUID } from 'node:crypto';
 
 const PG = process.env.SMOKE_PG ?? 'postgresql://postgres:postgres@localhost:5432/postgres';
 const GATEWAY = process.env.SMOKE_GATEWAY ?? 'ws://localhost:4848/sync';
-const SHARD_SCHEMA = `${process.env.XYNE_SYNC_APP_ID ?? 'xyne'}_${process.env.XYNE_SYNC_SHARD ?? '0'}`;
+const SHARD_SCHEMA = `${process.env.STREAMGRES_APP_ID ?? 'xyne'}_${process.env.STREAMGRES_SHARD ?? '0'}`;
 const HTTP = process.env.SMOKE_HTTP ?? 'http://localhost:4848';
 const COLLECTOR = process.env.SMOKE_COLLECTOR;
 const SEEDED = 400;
@@ -177,7 +177,7 @@ log('a fitting client schema was served and one naming an unknown column was ref
 const stats = await (await fetch(`${HTTP}/stats`)).json();
 const limit = stats.gauges.read_row_limit;
 const heavy = stats.heavy_queries?.[0];
-if (limit !== 600) fail(`the server should run with XYNE_SYNC_ROW_LIMIT=600, it reports ${limit}`);
+if (limit !== 600) fail(`the server should run with STREAMGRES_ROW_LIMIT=600, it reports ${limit}`);
 if (!heavy || heavy.table !== 'smoke_items' || heavy.rows < SEEDED - 1 || heavy.percent_of_limit < 60) fail('the heavy read was not reported: ' + JSON.stringify(stats.heavy_queries));
 await new Promise((resolve) => setTimeout(resolve, 3000));
 const metrics = await (await fetch(`${HTTP}/metrics`)).text();

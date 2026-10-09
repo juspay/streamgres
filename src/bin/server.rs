@@ -4,7 +4,7 @@
 //! cargo run --release --bin server
 //! ```
 //!
-//! Configured by `XYNE_SYNC_*` environment variables (see `.env.example`);
+//! Configured by `STREAMGRES_*` environment variables (see `.env.example`);
 //! a `.env` file in the working directory is read first, without
 //! overriding variables already set.
 #[global_allocator]
