@@ -179,8 +179,10 @@ impl Join {
 }
 
 /// How a node with a `LIMIT` that drives an inner edge — a page whose
-/// rows the edge admits or rejects — is read. The planner decides from
-/// the node's count; for every other node the value has no effect.
+/// rows the edge admits or rejects — is read. The server always reads a
+/// page `Batched`, whatever its count (the planner leaves the value as
+/// translated); `Whole` is the engine's to support for trees built by
+/// hand. For every other node the value has no effect.
 ///
 /// - `Whole`: every row the node's filter matches is read in one go and
 ///   held; the `LIMIT` is applied in memory. The rows the edge rejects
