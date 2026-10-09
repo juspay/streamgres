@@ -206,6 +206,21 @@ cargo run --release --bin bench     # benchmarks: routing, registration, windows
 cargo clippy --all-targets
 ```
 
+The load bench runs the whole server over the wire under a production-shaped
+load and reports its CPU, cores by thread and memory at the median, 90th and
+99th percentile, beside the commit-to-client latency of every kind of row. It
+needs a PostgreSQL with `wal_level = logical` and a database with `bench` in
+its name, whose tables it drops and makes again:
+
+```bash
+cargo build --release --bin server
+XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5432/xyne_bench \
+  cargo run --release --bin load -- --connections 200 --duration 60
+```
+
+The options (clients, users, channels, write rate, rows per transaction, push
+rate, churn, body sizes) are listed at the top of `src/bin/load.rs`.
+
 Tests against a real PostgreSQL run when `XYNE_SYNC_PG_DSN` is set, and report
 themselves skipped otherwise:
 
@@ -255,7 +270,7 @@ src/
   ivm/       the engine: routing index, frames, windows, join tree
   sync/      runtime, storage trait, in-memory store, PostgreSQL reads and change feed
   client/    the WebSocket server and Zero protocol, query planning, client groups
-  bin/       server and bench binaries
+  bin/       server, bench and load binaries
 tests/       scenario tests, live PostgreSQL tests, and a 283-query suite
              taken from a production application
 scripts/     smoke, end-to-end and load scripts; CI helpers
