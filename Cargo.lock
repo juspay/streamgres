@@ -2971,6 +2971,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-postgres",
+ "tokio-tungstenite",
  "uuid",
 ]
 
