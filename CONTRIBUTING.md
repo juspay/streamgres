@@ -35,6 +35,7 @@ cargo test                          # unit and scenario tests
 cargo clippy --all-targets -- -D warnings
 cargo run --bin streamgres           # Streamgres demo: every check must end in PASS
 cargo run --release --bin bench     # benchmarks
+cargo run --release --bin load      # the server over the wire: latency, cores, memory (needs XYNE_SYNC_PG_DSN)
 ```
 
 The tests against a real PostgreSQL run when `STREAMGRES_PG_DSN` is set and
