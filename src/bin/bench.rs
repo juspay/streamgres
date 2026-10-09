@@ -70,13 +70,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use xyne_sync::ivm::{
+use streamgres::ivm::{
     Fetch, IvmStats, MultiTableIVM, SingleTableIVM, complete_image, evaluate, order_rows,
 };
-use xyne_sync::model::ComparisonOperator::{EQ, GTE};
-use xyne_sync::model::*;
-use xyne_sync::sync::pg::{PgStorage, PgStream};
-use xyne_sync::sync::{Local, Lsn, Runtime, Snapshot, Storage, StorageError};
+use streamgres::model::ComparisonOperator::{EQ, GTE};
+use streamgres::model::*;
+use streamgres::sync::pg::{PgStorage, PgStream};
+use streamgres::sync::{Local, Lsn, Runtime, Snapshot, Storage, StorageError};
 
 /// The production-app catalog shared with the query scenario tests.
 #[path = "../../tests/streamgres_queries/catalog.rs"]
@@ -1403,12 +1403,12 @@ unsafe impl Sync for MallocConf {}
 
 fn main() {
     println!(
-        "xyne_sync bench: release build, single thread, xorshift seed {SEED:#x}, tables {} / {}",
+        "streamgres bench: release build, single thread, xorshift seed {SEED:#x}, tables {} / {}",
         tickets_table().name,
         users_table().name
     );
     let profiler =
-        match xyne_sync::profile::Config::from_env().and_then(xyne_sync::profile::start) {
+        match streamgres::profile::Config::from_env().and_then(streamgres::profile::start) {
             Ok(profiler) => profiler,
             Err(error) => {
                 eprintln!("{error}");

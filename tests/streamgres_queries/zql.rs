@@ -13,11 +13,11 @@
 
 use std::collections::HashMap;
 
-use xyne_sync::ivm::QueryPart;
-use xyne_sync::model::ComparisonOperator::{
+use streamgres::ivm::QueryPart;
+use streamgres::model::ComparisonOperator::{
     EQ, EXISTS, GT, GTE, IN, IS, IS_NOT, LT, LTE, NEQ, NOT_IN,
 };
-use xyne_sync::model::{
+use streamgres::model::{
     ComparisonOperator, Join, MultiTableReadQuery, Order, OrderBy, SingleTableReadQuery, Value,
     Where,
 };

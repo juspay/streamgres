@@ -3491,7 +3491,7 @@ mod tests {
     }
 
     /// One hour of prod's traffic through the real group threads, at
-    /// the rates prod showed over its 36 h on xyne-sync (2026-10-03 16:28
+    /// the rates prod showed over its 36 h on streamgres (2026-10-03 16:28
     /// to 10-05 04:48 UTC): 4 group threads; 700 client groups already
     /// there, their rows already sent (a warm-up, not measured); then, in
     /// the hour, 162 new groups each hydrating a startup set (5 876 groups

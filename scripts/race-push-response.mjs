@@ -1,6 +1,6 @@
 // An end-to-end regression check for the retry race that used to be caused by
 // forwarding ordinary MutateResponses as pushResponse. It expects a running
-// xyne-sync and Postgres, starts its own mutate endpoint, then:
+// streamgres and Postgres, starts its own mutate endpoint, then:
 //
 //   1. writes an application error for A/1 and returns it normally;
 //   2. immediately retries A/1, returning alreadyProcessed;

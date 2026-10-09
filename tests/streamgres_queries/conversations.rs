@@ -6,9 +6,9 @@
 //! messages (`m1`, `m5`) arrive beside the caller's own wherever it
 //! applies.
 
-use xyne_sync::model::ComparisonOperator::{GT, LTE};
-use xyne_sync::model::Order::{ASC, DESC};
-use xyne_sync::model::Value;
+use streamgres::model::ComparisonOperator::{GT, LTE};
+use streamgres::model::Order::{ASC, DESC};
+use streamgres::model::Value;
 
 use super::world::{ME, WS, World, ops, with};
 use super::zql::{Q, eq, is_not_null, is_null, or, same, zql};

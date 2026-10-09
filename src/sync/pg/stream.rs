@@ -782,7 +782,7 @@ async fn prepare_slot(
         .is_some();
     if !published {
         return Err(StorageError(format!(
-            "publication `{publication}` does not exist; create it before starting xyne-sync (for example, on the primary: CREATE PUBLICATION \"{publication}\" FOR ALL TABLES)"
+            "publication `{publication}` does not exist; create it before starting streamgres (for example, on the primary: CREATE PUBLICATION \"{publication}\" FOR ALL TABLES)"
         )));
     }
     let exists = client

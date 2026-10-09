@@ -6,9 +6,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use xyne_sync::ivm::{Delta, Engine, MultiTableIVM, QueryPart, SubId};
-use xyne_sync::model::*;
-use xyne_sync::sync::{Local, MemoryStorage};
+use streamgres::ivm::{Delta, Engine, MultiTableIVM, QueryPart, SubId};
+use streamgres::model::*;
+use streamgres::sync::{Local, MemoryStorage};
 
 /// The join layer under the synchronous driver, over in-process storage:
 /// every read a registration or a crossing asks for is landed inline.
@@ -211,7 +211,7 @@ fn write(ivm: &mut Ivm, storage: &MemoryStorage, w: WriteQuery) -> Vec<Delta> {
 
 /// A fresh engine, a shared storage handle, and an empty name directory.
 fn engine() -> (Ivm, Rc<MemoryStorage>, Names) {
-    engine_with_row_limit(xyne_sync::ivm::DEFAULT_ROW_LIMIT)
+    engine_with_row_limit(streamgres::ivm::DEFAULT_ROW_LIMIT)
 }
 
 /// [`engine`] with `row_limit` as the most rows one batch of a page

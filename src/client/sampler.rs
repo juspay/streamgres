@@ -22,7 +22,7 @@ pub fn spawn(state: Arc<AppState>, interval: Duration) {
         return;
     }
     let spawned = std::thread::Builder::new()
-        .name("xyne-sync-metrics".to_owned())
+        .name("streamgres-metrics".to_owned())
         .spawn(move || run(state, interval));
     if let Err(error) = spawned {
         log_error!("metrics thread: {error}");
@@ -206,7 +206,7 @@ fn parse_sched_migrations(sched: &str) -> Option<u64> {
 }
 
 /// CPU seconds so far by thread name (the server's own names, without
-/// the `xyne-sync-` prefix and summed over a pool's threads), from
+/// the `streamgres-` prefix and summed over a pool's threads), from
 /// `samples`.
 pub fn thread_cpu_seconds(samples: &[ThreadSample]) -> Vec<(String, f64)> {
     let mut by_name: BTreeMap<String, f64> = BTreeMap::new();
@@ -319,14 +319,16 @@ impl CoreAccount {
 /// A thread's label from its (15-character) kernel name.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn thread_label(comm: &str) -> String {
-    let name = comm.strip_prefix("xyne-sync-").unwrap_or(comm);
+    // Linux truncates `comm` at 15 bytes. With the longer Streamgres prefix,
+    // several worker names are shortened further than their full names.
+    let name = comm.strip_prefix("streamgres-").unwrap_or(comm);
     let name = match name {
-        "engin" | "engine" => "engine",
-        "reape" | "reaper" => "reaper",
-        "serve" | "server" => "server",
-        "metri" | "metrics" => "metrics",
-        other if other.starts_with("group") => "groups",
-        other if other.starts_with("reads") => "reads",
+        "engi" | "engin" | "engine" => "engine",
+        "reap" | "reape" | "reaper" => "reaper",
+        "serv" | "serve" | "server" => "server",
+        "metr" | "metri" | "metrics" => "metrics",
+        other if other.starts_with("grou") => "groups",
+        other if other.starts_with("read") => "reads",
         other if other.starts_with("feed") => "feed",
         other if other.starts_with("log") => "log",
         other if other.starts_with("tokio") => "tokio",
@@ -341,12 +343,12 @@ mod tests {
 
     #[test]
     fn thread_names_fold_into_their_pools() {
-        assert_eq!(thread_label("xyne-sync-engin"), "engine");
-        assert_eq!(thread_label("xyne-sync-group"), "groups");
-        assert_eq!(thread_label("xyne-sync-groups-3"), "groups");
-        assert_eq!(thread_label("xyne-sync-reads"), "reads");
-        assert_eq!(thread_label("xyne-sync-serve"), "server");
-        assert_eq!(thread_label("xyne-sync-log"), "log");
+        assert_eq!(thread_label("streamgres-engi"), "engine");
+        assert_eq!(thread_label("streamgres-grou"), "groups");
+        assert_eq!(thread_label("streamgres-read"), "reads");
+        assert_eq!(thread_label("streamgres-serv"), "server");
+        assert_eq!(thread_label("streamgres-metr"), "metrics");
+        assert_eq!(thread_label("streamgres-log"), "log");
         assert_eq!(thread_label("server"), "server");
     }
 
@@ -360,7 +362,7 @@ mod tests {
     /// hold spaces and parentheses.
     #[test]
     fn a_stat_line_gives_cpu_time_and_the_core() {
-        let stat = "12345 (xyne-sync (eng) x) R 1 1 1 0 -1 4194560 100 0 0 0 250 50 0 0 20 0 1 0 999 \
+        let stat = "12345 (streamgres (eng) x) R 1 1 1 0 -1 4194560 100 0 0 0 250 50 0 0 20 0 1 0 999 \
                     1000000 500 18446744073709551615 1 1 0 0 0 0 0 0 0 0 0 0 17 7 0 0 0 0 0 0 0 0 0 0 0 0 0";
         let (seconds, core) = parse_stat(stat, 100.0).expect("parsed");
         assert_eq!(seconds, 3.0);

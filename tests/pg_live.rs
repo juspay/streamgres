@@ -15,12 +15,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, NoTls};
-use xyne_sync::ivm::{Delta, Engine, Fetch, MultiTableIVM, QueryPart};
-use xyne_sync::model::*;
-use xyne_sync::client::ddl_triggers::trigger_stack_sql;
-use xyne_sync::sync::pg::ddl::DdlSource;
-use xyne_sync::sync::pg::{PgStorage, PgStream};
-use xyne_sync::sync::{
+use streamgres::ivm::{Delta, Engine, Fetch, MultiTableIVM, QueryPart};
+use streamgres::model::*;
+use streamgres::client::ddl_triggers::trigger_stack_sql;
+use streamgres::sync::pg::ddl::DdlSource;
+use streamgres::sync::pg::{PgStorage, PgStream};
+use streamgres::sync::{
     CatalogHandle, Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
 };
 
@@ -898,13 +898,13 @@ fn a_json_column_is_filtered_by_value() {
                 Where::condition(
                     column,
                     ComparisonOperator::EQ,
-                    xyne_sync::sync::pg::text::jsonb_text(&literal).as_str(),
+                    streamgres::sync::pg::text::jsonb_text(&literal).as_str(),
                 ),
                 OrderBy::new("id", Order::ASC),
                 u32::MAX,
             )
         };
-        let ids = |snapshot: &xyne_sync::model::Snapshot| -> Vec<i64> {
+        let ids = |snapshot: &streamgres::model::Snapshot| -> Vec<i64> {
             snapshot
                 .rows
                 .iter()
@@ -933,7 +933,7 @@ fn a_json_column_is_filtered_by_value() {
                 assert_eq!(
                     read.rows[0].1.data.get(&ColumnName::from(column)),
                     Some(&Value::from(
-                        xyne_sync::sync::pg::text::jsonb_text(&literal).as_str()
+                        streamgres::sync::pg::text::jsonb_text(&literal).as_str()
                     )),
                     "the {column} cell a read brings back is the text the literal was given"
                 );

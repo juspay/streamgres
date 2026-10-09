@@ -8,7 +8,7 @@
 //! schema is one hop on one column pair, and every primary key is one
 //! column, so nothing here needed approximating.
 
-use xyne_sync::model::{Catalog, DbColumn, DbTable, ValueType};
+use streamgres::model::{Catalog, DbColumn, DbTable, ValueType};
 
 /// One relationship of the application's schema: rows of `table` reach rows of
 /// `dest_table` where `table.source = dest_table.dest` (the schema's `one` /

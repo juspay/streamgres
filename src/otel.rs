@@ -7,7 +7,7 @@
 //! `OTEL_METRIC_EXPORT_INTERVAL`; log records, when the logs exporter is
 //! on, go out in batches as the log thread writes them, beside the lines
 //! it writes to stderr (the reference server tees the same way). One thread,
-//! `xyne-sync-otel`, does all of it from its own small runtime: nothing
+//! `streamgres-otel`, does all of it from its own small runtime: nothing
 //! here runs on a thread that serves clients, a slow or absent collector
 //! costs a dropped batch and a counted failure, never a wait.
 //!
@@ -20,7 +20,7 @@
 //! as it is. `OTEL_EXPORTER_OTLP_HEADERS` (and per signal) are sent with
 //! every request; `OTEL_EXPORTER_OTLP_TIMEOUT` bounds one; the resource is
 //! `OTEL_RESOURCE_ATTRIBUTES` with `OTEL_SERVICE_NAME` (default
-//! `xyne-sync`), the version and the instance added. Traces are not
+//! `streamgres`), the version and the instance added. Traces are not
 //! produced: `OTEL_TRACES_EXPORTER` is accepted and ignored.
 //!
 //! The metrics are [`crate::stats::Stats::metrics`], the same names,
@@ -156,7 +156,7 @@ impl Config {
         };
         match get("OTEL_SERVICE_NAME") {
             Some(name) => set("service.name", name, true),
-            None => set("service.name", "xyne-sync".to_owned(), false),
+            None => set("service.name", "streamgres".to_owned(), false),
         }
         let version = match get("SOURCE_COMMIT") {
             Some(commit) => format!("{}+{commit}", env!("CARGO_PKG_VERSION")),
@@ -225,7 +225,7 @@ pub fn spawn(config: Config, stats: Arc<Stats>) {
         protocol = "http/json"
     );
     let spawned = std::thread::Builder::new()
-        .name("xyne-sync-otel".to_owned())
+        .name("streamgres-otel".to_owned())
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -466,7 +466,7 @@ pub fn metrics_request(
     json!({"resourceMetrics": [{
         "resource": {"attributes": attributes(resource)},
         "scopeMetrics": [{
-            "scope": {"name": "xyne-sync", "version": env!("CARGO_PKG_VERSION")},
+            "scope": {"name": "streamgres", "version": env!("CARGO_PKG_VERSION")},
             "metrics": encoded,
         }],
     }]})
@@ -516,7 +516,7 @@ pub fn logs_request(resource: &[(String, String)], lines: &[Line]) -> Json {
     json!({"resourceLogs": [{
         "resource": {"attributes": attributes(resource)},
         "scopeLogs": [{
-            "scope": {"name": "xyne-sync", "version": env!("CARGO_PKG_VERSION")},
+            "scope": {"name": "streamgres", "version": env!("CARGO_PKG_VERSION")},
             "logRecords": records,
         }],
     }]})
@@ -563,7 +563,7 @@ mod tests {
         assert!(
             sandbox
                 .resource
-                .contains(&("service.name".to_owned(), "xyne-sync".to_owned()))
+                .contains(&("service.name".to_owned(), "streamgres".to_owned()))
         );
 
         let unset = config(&[]);
@@ -597,7 +597,7 @@ mod tests {
                 "authorization=Bearer%20abc,x-scope=team",
             ),
             ("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "x-logs=1"),
-            ("OTEL_SERVICE_NAME", "xyne-sync-sandbox"),
+            ("OTEL_SERVICE_NAME", "streamgres-sandbox"),
             (
                 "OTEL_RESOURCE_ATTRIBUTES",
                 "service.name=ignored,deployment.environment=sandbox",
@@ -609,7 +609,7 @@ mod tests {
         assert_eq!(logs.headers, vec![("x-logs".to_owned(), "1".to_owned())]);
         assert!(
             own.resource
-                .contains(&("service.name".to_owned(), "xyne-sync-sandbox".to_owned()))
+                .contains(&("service.name".to_owned(), "streamgres-sandbox".to_owned()))
         );
         assert!(
             own.resource
@@ -675,12 +675,12 @@ mod tests {
                 max: 4.0,
             },
         );
-        let resource = vec![("service.name".to_owned(), "xyne-sync".to_owned())];
+        let resource = vec![("service.name".to_owned(), "streamgres".to_owned())];
         let body = metrics_request(&resource, &catalogue.into_metrics(), 1_000, 2_000, 3_000);
         let scope = &body["resourceMetrics"][0]["scopeMetrics"][0];
         assert_eq!(
             body["resourceMetrics"][0]["resource"]["attributes"][0]["value"]["stringValue"],
-            "xyne-sync"
+            "streamgres"
         );
         let counter = &scope["metrics"][0];
         assert_eq!(counter["name"], "x_total");
@@ -711,7 +711,7 @@ mod tests {
         let line = Line {
             at: chrono::DateTime::from_timestamp(1_700_000_000, 5).expect("a time"),
             level: Level::Warn,
-            thread: "xyne-sync-server".to_owned(),
+            thread: "streamgres-server".to_owned(),
             message: "heavy read".to_owned(),
             fields: vec![
                 ("name", "channelMessages".to_owned()),
@@ -727,7 +727,7 @@ mod tests {
         assert_eq!(record["timeUnixNano"], "1700000000000000005");
         assert_eq!(
             record["attributes"][0]["value"]["stringValue"],
-            "xyne-sync-server"
+            "streamgres-server"
         );
         assert_eq!(record["attributes"][2]["value"]["intValue"], "16000");
         assert_eq!(record["attributes"][3]["value"]["boolValue"], true);

@@ -33,7 +33,7 @@ Build and test:
 cargo build
 cargo test                          # unit and scenario tests
 cargo clippy --all-targets -- -D warnings
-cargo run --bin xyne_sync           # Streamgres demo: every check must end in PASS
+cargo run --bin streamgres           # Streamgres demo: every check must end in PASS
 cargo run --release --bin bench     # benchmarks
 ```
 

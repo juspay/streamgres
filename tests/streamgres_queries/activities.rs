@@ -3,9 +3,9 @@
 //! `userId = ctx.userID`, which these tests include because without it
 //! the set is plainly wrong.
 
-use xyne_sync::model::ComparisonOperator::GT;
-use xyne_sync::model::Order::DESC;
-use xyne_sync::model::Value;
+use streamgres::model::ComparisonOperator::GT;
+use streamgres::model::Order::DESC;
+use streamgres::model::Value;
 
 use super::world::{ME, World, ops, with};
 use super::zql::{eq, is_null, or, same, zql};

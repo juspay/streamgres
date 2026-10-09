@@ -128,8 +128,8 @@ probes and routing. For metrics, logs and alerts see
 ### Docker
 
 ```bash
-docker build -f docker/server/Dockerfile -t xyne-sync .
-docker run --env-file .env -p 4848:4848 xyne-sync
+docker build -f docker/server/Dockerfile -t streamgres .
+docker run --env-file .env -p 4848:4848 streamgres
 ```
 
 ---
@@ -203,7 +203,7 @@ for one subscriber or ten thousand.
 
 ```bash
 cargo test                          # unit and scenario tests
-cargo run --bin xyne_sync           # demo: SQL in, routed operations and cost counters out
+cargo run --bin streamgres           # demo: SQL in, routed operations and cost counters out
 cargo run --release --bin bench     # benchmarks: routing, registration, windows, joins
 cargo clippy --all-targets
 ```
@@ -212,7 +212,7 @@ Tests against a real PostgreSQL run when `STREAMGRES_PG_DSN` is set, and report
 themselves skipped otherwise:
 
 ```bash
-STREAMGRES_PG_DSN=postgresql://postgres@localhost:5432/xyne_sync cargo test --test pg_live
+STREAMGRES_PG_DSN=postgresql://postgres@localhost:5432/streamgres cargo test --test pg_live
 ```
 
 `scripts/` holds the end-to-end checks:
@@ -225,10 +225,10 @@ STREAMGRES_PG_DSN=postgresql://postgres@localhost:5432/xyne_sync cargo test --te
 
 ```rust
 use std::rc::Rc;
-use xyne_sync::ivm::SingleTableIVM;
-use xyne_sync::model::*;
-use xyne_sync::parser::{parse_read, parse_write};
-use xyne_sync::sync::{Local, MemoryStorage};
+use streamgres::ivm::SingleTableIVM;
+use streamgres::model::*;
+use streamgres::parser::{parse_read, parse_write};
+use streamgres::sync::{Local, MemoryStorage};
 
 let catalog = Catalog::new(vec![DbTable::new("tickets", ["id"], vec![
     DbColumn::new("id", ValueType::Int),
@@ -272,7 +272,7 @@ docs/        deployment and observability guides
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, what CI checks and the code
 conventions. In short:
 
-- Run `cargo test && cargo clippy --all-targets && cargo run --bin xyne_sync`
+- Run `cargo test && cargo clippy --all-targets && cargo run --bin streamgres`
   before opening a pull request. The demo must end with every check `PASS`.
 - Engine behaviour lives in `src/ivm/`. A change to *what matches* belongs in
   `predicate.rs`, with a test alongside it. Routing changes are expected to

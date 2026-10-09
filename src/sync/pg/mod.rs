@@ -88,16 +88,28 @@ const WAITING_ALIASES: usize = 2;
 const DEFAULT_READ_CONNECTIONS: usize = 16;
 
 /// The most rows one read may bring back before it is refused, unless
-/// `STREAMGRES_ROW_LIMIT` says otherwise (`STREAMGRES_READ_ROW_LIMIT`, its
-/// older name, is still read): a query without a `LIMIT` over a large
-/// table would otherwise be buffered whole, and one such query is enough
-/// to take the process down. The planner reads whole no side of a join
-/// past the same number, so a side it calls small is one a read returns.
+/// `STREAMGRES_ROW_LIMIT` says otherwise. Older `STREAMGRES_READ_ROW_LIMIT`,
+/// `STREAMGRES_JOIN_LIMIT`, and `XYNE_SYNC_ROW_LIMIT`/`XYNE_SYNC_READ_ROW_LIMIT`/
+/// `XYNE_SYNC_JOIN_LIMIT` names remain accepted: a query
+/// without a `LIMIT` over a large table would otherwise be buffered whole,
+/// and one such query is enough to take the process down. The planner reads
+/// whole no side of a join past the same number, so a side it calls small is
+/// one a read returns.
 const DEFAULT_READ_ROW_LIMIT: usize = 100_000;
 
 /// [`DEFAULT_READ_ROW_LIMIT`], or the environment's override.
 pub fn read_row_limit() -> usize {
-    ["STREAMGRES_ROW_LIMIT", "STREAMGRES_READ_ROW_LIMIT"]
+    [
+        "STREAMGRES_ROW_LIMIT",
+        "STREAMGRES_SYNC_ROW_LIMIT",
+        "XYNE_SYNC_ROW_LIMIT",
+        "STREAMGRES_READ_ROW_LIMIT",
+        "STREAMGRES_SYNC_READ_ROW_LIMIT",
+        "XYNE_SYNC_READ_ROW_LIMIT",
+        "STREAMGRES_JOIN_LIMIT",
+        "STREAMGRES_SYNC_JOIN_LIMIT",
+        "XYNE_SYNC_JOIN_LIMIT",
+    ]
         .iter()
         .find_map(|name| std::env::var(name).ok())
         .and_then(|value| value.trim().parse().ok())

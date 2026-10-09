@@ -198,7 +198,7 @@ pub fn spawn_feed(
     let (out, transactions) = mpsc::channel(1024);
     let (stop, mut stop_rx) = watch::channel(false);
     let thread = std::thread::Builder::new()
-        .name("xyne-sync-feed".to_owned())
+        .name("streamgres-feed".to_owned())
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -314,7 +314,7 @@ pub async fn stop_feed(mut feed: FeedHandle) -> Result<(), String> {
     };
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
-        .name("xyne-sync-feed-join".to_owned())
+        .name("streamgres-feed-join".to_owned())
         .spawn(move || {
             let outcome = thread
                 .join()
