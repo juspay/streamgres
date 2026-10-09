@@ -137,7 +137,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         .thread_name("xyne-sync-reads")
         .build()
         .map_err(|error| format!("tokio: {error}"))?;
-    let stats = crate::stats::Stats::shared();
+    let stats = crate::stats::Stats::shared_with_metric_prefix(config.metrics_prefix.clone());
     crate::stats::Stats::install(&stats);
     let shards = config.group_threads.max(1);
     stats.read_row_limit.store(

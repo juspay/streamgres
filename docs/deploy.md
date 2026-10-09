@@ -1,4 +1,4 @@
-# Deploying Xyne-Sync
+# Deploying Streamgres
 
 This guide covers running the sync server in production:
 - what it needs from PostgreSQL and from your application server
@@ -265,6 +265,7 @@ depend on what the defaults happen to be:
 | `STREAMGRES_LOG` | `info` | `error`, `warn`, `info` or `debug`. `debug` costs throughput |
 | `STREAMGRES_SLOW_QUERY_MS` | `1000` | queries and pushes slower than this are logged at `warn` |
 | `STREAMGRES_METRICS_INTERVAL_MS` | `10000` | how often process metrics are sampled |
+| `STREAMGRES_METRICS_PREFIX` | `xyne_sync` | prefix for exported metric names. Keep the default for existing Grafana dashboards; set `streamgres` to use `streamgres_*` names and update dashboard queries accordingly |
 | other `OTEL_*` | | see [observability](observability.md), section 5 |
 
 ## 6. Ports, probes and shutdown

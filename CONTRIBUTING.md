@@ -1,4 +1,4 @@
-# Contributing to Xyne-Sync
+# Contributing to Streamgres
 
 Thanks for your interest in improving Xyne-Sync. This guide covers how to set
 up a development environment, what a pull request needs before it is merged,
@@ -33,7 +33,7 @@ Build and test:
 cargo build
 cargo test                          # unit and scenario tests
 cargo clippy --all-targets -- -D warnings
-cargo run --bin xyne_sync           # demo: every check must end in PASS
+cargo run --bin xyne_sync           # Streamgres demo: every check must end in PASS
 cargo run --release --bin bench     # benchmarks
 ```
 
@@ -90,8 +90,8 @@ unrelated files in the same pull request.
   `tests/multi_table_scenarios.rs`, `tests/gated_pages.rs`).
 - Anything that touches PostgreSQL, snapshots or the change feed needs a live
   test in `tests/pg_live.rs` or `tests/schema_changes.rs`.
-- `tests/xyne_spaces_queries/` is a suite of real queries from a production
-  application. A change that makes one of them fail or get refused needs a
+- `tests/streamgres_queries/` is a suite of production-application queries.
+  A change that makes one of them fail or get refused needs a
   reason in the pull request.
 
 ### Performance

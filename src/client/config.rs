@@ -28,15 +28,15 @@ pub struct Config {
     /// (`public` plus the app's `zero_<shard>` schema by default).
     pub schemas: Vec<String>,
     /// The replication slot of the change feed, not configurable: each
-    /// process names its own, `xyne_sync_slot_<uuid>`.
+    /// process names its own using the existing compatible naming scheme.
     pub slot: String,
-    /// `STREAMGRES_SLOT_CLEANUP_AGE_MS`: how long a xyne-sync feed slot
+    /// `STREAMGRES_SLOT_CLEANUP_AGE_MS`: how long a Streamgres feed slot
     /// must have stayed inactive before startup drops it (zero disables
     /// cleanup). PostgreSQL 17 or later is required when this is enabled,
     /// because that is where `inactive_since` is available.
     pub slot_cleanup_age: Duration,
-    /// `STREAMGRES_PUBLICATION`: the publication the change feed streams
-    /// (`xyne_sync_pub`); it must exist before the server starts.
+    /// `STREAMGRES_PUBLICATION`: the publication the change feed streams;
+    /// it must exist before the server starts.
     pub publication: String,
     /// `STREAMGRES_DDL_TRIGGER`: the event trigger on `ddl_command_end`
     /// through which the server hears of schema changes, zero-cache's
@@ -184,6 +184,9 @@ pub struct Config {
     /// the process (10000; 0 turns it off); the summary line goes out every
     /// sixth sample.
     pub metrics_interval: Duration,
+    /// `STREAMGRES_METRICS_PREFIX`: prefix of exported metric names
+    /// the default preserves existing series names.
+    pub metrics_prefix: String,
 }
 
 impl Config {
@@ -201,13 +204,16 @@ impl Config {
                 .filter(|value| !value.is_empty())
                 .or_else(|| {
                     name.strip_prefix("STREAMGRES_")
+                        .and_then(|suffix| lookup(&format!("STREAMGRES_SYNC_{suffix}")))
+                        .filter(|value| !value.is_empty())
+                })
+                .or_else(|| {
+                    name.strip_prefix("STREAMGRES_")
                         .and_then(|suffix| lookup(&format!("XYNE_SYNC_{suffix}")))
                         .filter(|value| !value.is_empty())
                 })
         };
-        let first = |names: &[&str]| {
-            names.iter().find_map(|name| value(name))
-        };
+        let first = |names: &[&str]| names.iter().find_map(|name| value(name));
         let millis = |name: &str, default: u64| -> Result<Duration, String> {
             match first(&[name]) {
                 Some(text) => text
@@ -294,6 +300,13 @@ impl Config {
                 ));
             }
         };
+        let metrics_prefix =
+            first(&["STREAMGRES_METRICS_PREFIX"]).unwrap_or_else(|| "xyne_sync".to_owned());
+        if !Self::valid_metrics_prefix(&metrics_prefix) {
+            return Err(format!(
+                "STREAMGRES_METRICS_PREFIX must start with an ASCII letter or underscore and contain only ASCII letters, digits, or underscores, got `{metrics_prefix}`"
+            ));
+        }
         let mut base_path = first(&["STREAMGRES_BASE_PATH"]).unwrap_or_else(|| "/zero".to_owned());
         if !base_path.starts_with('/') {
             base_path.insert(0, '/');
@@ -403,7 +416,17 @@ impl Config {
             log_format,
             slow_query: millis("STREAMGRES_SLOW_QUERY_MS", 1_000)?,
             metrics_interval: millis("STREAMGRES_METRICS_INTERVAL_MS", 10_000)?,
+            metrics_prefix,
         })
+    }
+
+    /// Whether `prefix` can safely begin a Prometheus metric name.
+    fn valid_metrics_prefix(prefix: &str) -> bool {
+        let mut bytes = prefix.bytes();
+        bytes
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     }
 
     /// The join planner's settings.
@@ -514,11 +537,26 @@ mod tests {
         let legacy = config_with(&[("XYNE_SYNC_ADDR", "127.0.0.1:4848")]);
         assert_eq!(legacy.bind, "127.0.0.1:4848");
 
+        let transitional = config_with(&[("STREAMGRES_SYNC_ADDR", "127.0.0.1:5000")]);
+        assert_eq!(transitional.bind, "127.0.0.1:5000");
+
         let preferred = config_with(&[
             ("STREAMGRES_ADDR", "0.0.0.0:5000"),
+            ("STREAMGRES_SYNC_ADDR", "127.0.0.1:5000"),
             ("XYNE_SYNC_ADDR", "127.0.0.1:4848"),
         ]);
         assert_eq!(preferred.bind, "0.0.0.0:5000");
+    }
+
+    #[test]
+    fn metrics_prefix_is_configurable_and_validated() {
+        assert_eq!(config(&[]).unwrap().metrics_prefix, "xyne_sync");
+        assert_eq!(
+            config_with(&[("STREAMGRES_METRICS_PREFIX", "streamgres")]).metrics_prefix,
+            "streamgres"
+        );
+        let error = config(&[("STREAMGRES_METRICS_PREFIX", "bad-prefix")]).unwrap_err();
+        assert!(error.contains("STREAMGRES_METRICS_PREFIX"), "{error}");
     }
 
     #[test]

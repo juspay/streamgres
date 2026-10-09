@@ -67,6 +67,12 @@ Every cell is a metric below; the rows of the table are the labels.
 Names as `/metrics` exposes them (`/stats` has the same numbers under the
 older names); durations are histograms in seconds with `_bucket`, `_sum`
 and `_count`; counts are `_total` counters; the rest are gauges.
+The names below use the default `xyne_sync` prefix for compatibility with
+existing dashboards. Set `STREAMGRES_METRICS_PREFIX` to another Prometheus
+name prefix (for example, `streamgres`) to rename all exported series in both
+Prometheus and OTLP. A custom prefix requires updating Grafana queries to use
+that prefix; leaving it unset preserves existing dashboards. The `/stats`
+JSON field names are unchanged by this setting.
 
 ### Select
 

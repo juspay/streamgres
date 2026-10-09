@@ -1,4 +1,4 @@
-//! # xyne_sync
+//! # Streamgres
 //!
 //! A sync engine: clients subscribe to read queries over a WebSocket and
 //! keep receiving incremental updates to those queries as the underlying

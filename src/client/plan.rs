@@ -39,7 +39,7 @@
 //! before any of this (`ast::merge_exists`), so they are counted and
 //! compared as one.
 //!
-//! So the canvases a reader may see — `createdBy = me OR EXISTS
+//! For example, the canvases a reader may see — `createdBy = me OR EXISTS
 //! participants(userId = me OR EXISTS group(EXISTS member = me) OR EXISTS
 //! channel(EXISTS member = me))`, twenty thousand canvases, a page of
 //! twenty — are read from the leaves: the reader's few memberships drive
@@ -1341,7 +1341,7 @@ mod tests {
         }
     }
 
-    /// The canvas rule as xyne-spaces states it: `canvases WHERE <own>
+    /// The canvas rule: `canvases WHERE <own>
     /// AND (createdBy = me OR EXISTS participants OR visibility = PUBLIC)
     /// AND EXISTS users LIMIT limit`, the participants `userId = me OR
     /// EXISTS group(EXISTS member = me) OR EXISTS channel(EXISTS member =

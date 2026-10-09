@@ -1,5 +1,5 @@
 //! The harness: the join engine under the synchronous driver over
-//! in-process storage, with the xyne-spaces catalog. Rows are built as full
+//! in-process storage, with the production application catalog. Rows are built as full
 //! images (every column present, unset ones `NULL`, `workspaceId` defaulting
 //! to the caller's workspace), every subscription gets the ACL's tenant
 //! backstop (`workspaceId = <caller's>` on a workspace-scoped root, `apps`

@@ -30,6 +30,8 @@ import { randomUUID } from 'node:crypto';
 const PG = process.env.SMOKE_PG ?? 'postgresql://postgres:postgres@localhost:5432/postgres';
 const GATEWAY = process.env.SMOKE_GATEWAY ?? 'ws://localhost:4848/sync';
 const SHARD_SCHEMA = `${process.env.STREAMGRES_APP_ID ?? 'xyne'}_${process.env.STREAMGRES_SHARD ?? '0'}`;
+const METRICS_PREFIX = process.env.STREAMGRES_METRICS_PREFIX ?? 'xyne_sync';
+const metric = (name) => `${METRICS_PREFIX}_${name}`;
 const HTTP = process.env.SMOKE_HTTP ?? 'http://localhost:4848';
 const COLLECTOR = process.env.SMOKE_COLLECTOR;
 const SEEDED = 400;
@@ -181,10 +183,10 @@ if (limit !== 600) fail(`the server should run with STREAMGRES_ROW_LIMIT=600, it
 if (!heavy || heavy.table !== 'smoke_items' || heavy.rows < SEEDED - 1 || heavy.percent_of_limit < 60) fail('the heavy read was not reported: ' + JSON.stringify(stats.heavy_queries));
 await new Promise((resolve) => setTimeout(resolve, 3000));
 const metrics = await (await fetch(`${HTTP}/metrics`)).text();
-const silent = Number(/^xyne_sync_feed_heartbeat_age_seconds (\S+)/m.exec(metrics)?.[1] ?? NaN);
+const silent = Number(new RegExp(`^${metric('feed_heartbeat_age_seconds')} (\\S+)`, 'm').exec(metrics)?.[1] ?? NaN);
 if (!(silent < 2.5)) fail(`the feed was last heard ${silent} s ago with nobody writing; PostgreSQL's keepalives should keep it under the snapshot rotation`);
 log(`with nobody writing for three seconds the feed was last heard ${silent} s ago, and nothing was written to be heard`);
-for (const needle of ['xyne_sync_connects_total{owed="state"} 1', 'xyne_sync_connects_total{owed="log"} 1', 'xyne_sync_connects_total{owed="start_over"} 0', 'xyne_sync_read_row_limit 600', 'xyne_sync_reads_near_limit_total{over="50"}', 'xyne_sync_query_read_rows_max{', 'xyne_sync_connections_total{event="refused",reason="client_schema"} 1', 'xyne_sync_end_to_end_seconds_bucket']) {
+for (const needle of [metric('connects_total{owed="state"} 1'), metric('connects_total{owed="log"} 1'), metric('connects_total{owed="start_over"} 0'), metric('read_row_limit 600'), metric('reads_near_limit_total{over="50"}'), metric('query_read_rows_max{'), metric('connections_total{event="refused",reason="client_schema"} 1'), metric('end_to_end_seconds_bucket')]) {
   if (!metrics.includes(needle)) fail(`/metrics lacks ${needle}`);
 }
 log(`the read of ${heavy.rows} rows (${heavy.percent_of_limit}% of the limit of ${limit}) is reported under its query, and /metrics carries it`);
@@ -194,10 +196,10 @@ if (COLLECTOR) {
   let seen = '';
   while (Date.now() < deadline) {
     seen = await (await fetch(COLLECTOR)).text().catch(() => '');
-    if (/^xyne_sync_read_row_limit\{[^}]*\} 600$/m.test(seen) && /^xyne_sync_connections_total\{[^}]*event="refused"[^}]*\} 1$/m.test(seen) && seen.includes('xyne_sync_end_to_end_seconds_bucket')) break;
+    if (new RegExp(`^${metric('read_row_limit')}\\{[^}]*\\} 600$`, 'm').test(seen) && new RegExp(`^${metric('connections_total')}\\{[^}]*event="refused"[^}]*\\} 1$`, 'm').test(seen) && seen.includes(metric('end_to_end_seconds_bucket'))) break;
     await new Promise((r) => setTimeout(r, 1000));
   }
-  if (Date.now() >= deadline) fail('the collector did not receive the metrics over OTLP:\n' + seen.split('\n').filter((l) => l.startsWith('xyne_sync_read')).join('\n'));
+  if (Date.now() >= deadline) fail('the collector did not receive the metrics over OTLP:\n' + seen.split('\n').filter((l) => l.startsWith(metric('read'))).join('\n'));
   const names = (text) => new Set(text.split('\n').filter((l) => l && !l.startsWith('#')).map((l) => l.replace(/[{ ].*/, '')));
   const pushed = names(seen);
   const missing = [...names(metrics)].filter((n) => !pushed.has(n));

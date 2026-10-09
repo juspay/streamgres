@@ -30,8 +30,8 @@
 //! 4. **LEFT JOIN** — `tickets LEFT JOIN users ON assigned_to = users.id`
 //!    with 1_000 identical subscriptions plus 100 distinct ones over 1_000
 //!    users: ticket inserts, ticket reassignments, and user updates.
-//! 6. **xyne-spaces** — three of the dashboard's query shapes on the real
-//!    catalog over synthetic data: `browsableChannels` (an existence test
+//! 6. **Production query workload** — three dashboard query shapes over
+//!    synthetic data: `browsableChannels` (an existence test
 //!    inside an `OR`), `conversationMessages` under the channel-access
 //!    chain (three INNER edges deep, the visibility rule with `IS NULL`),
 //!    and the board view (`IS NULL`, `OR` with `IS NULL`, two LEFT edges,
@@ -78,11 +78,10 @@ use xyne_sync::model::*;
 use xyne_sync::sync::pg::{PgStorage, PgStream};
 use xyne_sync::sync::{Local, Lsn, Runtime, Snapshot, Storage, StorageError};
 
-/// The xyne-spaces catalog, generated from the application's schema, shared with
-/// the test suite of the same name.
-#[path = "../../tests/xyne_spaces_queries/catalog.rs"]
+/// The production-app catalog shared with the query scenario tests.
+#[path = "../../tests/streamgres_queries/catalog.rs"]
 #[allow(dead_code)]
-mod xyne;
+mod workload;
 
 /// The single-table engine under the synchronous driver over bench storage.
 type Single = Local<SingleTableIVM, BenchStorage>;
@@ -1439,7 +1438,7 @@ fn main() {
         left_join();
     }
     if wanted("xyne") {
-        xyne_spaces();
+        production_query_workload();
     }
     if wanted("toast") {
         partial_images();
@@ -2076,14 +2075,14 @@ fn postgres(dsn: &str) {
 /// A full row image of the xyne table `table`: every declared column,
 /// `pairs` where given, `NULL` elsewhere, with its key.
 fn xy_row(table: &str, pairs: &[(&str, Value)]) -> (DataFrameKey, DataFrameRow) {
-    let mut data: HashMap<ColumnName, Value> = xyne::columns(table)
+    let mut data: HashMap<ColumnName, Value> = workload::columns(table)
         .iter()
         .map(|(column, _)| (ColumnName::from(*column), Value::Null))
         .collect();
     for (column, value) in pairs {
         data.insert(ColumnName::from(*column), value.clone());
     }
-    let key = DataFrameKey::new([(xyne::pkey(table), data[xyne::pkey(table)].clone())]);
+    let key = DataFrameKey::new([(workload::pkey(table), data[workload::pkey(table)].clone())]);
     (key, DataFrameRow::from(data))
 }
 
@@ -2111,7 +2110,7 @@ fn xy_update(table: &str, pairs: &[(&str, Value)]) -> WriteQuery {
 fn xy_delete(table: &str, id: &str) -> WriteQuery {
     WriteQuery::DELETE(DeleteQuery {
         table: table.into(),
-        pkey_value: DataFrameKey::new([(xyne::pkey(table), Value::from(id))]),
+        pkey_value: DataFrameKey::new([(workload::pkey(table), Value::from(id))]),
     })
 }
 
@@ -2120,21 +2119,21 @@ fn xy_query(table: &str, filter: Where) -> SingleTableReadQuery {
     SingleTableReadQuery::new(
         table,
         filter,
-        OrderBy::new(xyne::pkey(table), Order::ASC),
+        OrderBy::new(workload::pkey(table), Order::ASC),
         u32::MAX,
     )
 }
 
 /// A join edge along the schema relationship `name` of `table`.
 fn xy_left(table: &str, name: &str, sub: MultiTableReadQuery) -> Join {
-    let rel = xyne::rel(table, name);
+    let rel = workload::rel(table, name);
     Join::left(sub, rel.source, rel.dest)
 }
 
 /// The INNER edge (driven from the sub) of the xyne relationship `name`
 /// of `table` to `sub`.
 fn xy_inner(table: &str, name: &str, sub: MultiTableReadQuery) -> Join {
-    let rel = xyne::rel(table, name);
+    let rel = workload::rel(table, name);
     Join::inner(sub, rel.source, rel.dest)
 }
 
@@ -2146,7 +2145,7 @@ fn xy_channel_access(user: &str) -> MultiTableReadQuery {
             "channels",
             Where::OR(vec![
                 Where::condition("visibility", EQ, "PUBLIC"),
-                Where::exists(xyne::rel("channels", "participants").source, 0),
+                Where::exists(workload::rel("channels", "participants").source, 0),
             ]),
         ),
         vec![xy_inner(
@@ -2458,10 +2457,10 @@ fn xy_route(
     (run, delivered)
 }
 
-/// Scenario 6: the xyne-spaces query shapes over synthetic data.
-fn xyne_spaces() {
+/// Scenario 6: production-app query shapes over synthetic data.
+fn production_query_workload() {
     println!(
-        "\n== 6. xyne-spaces: browsableChannels, conversationMessages under the channel ACL, the board view as a page of {XY_BOARD_PAGE} ({XY_USERS} users, {XY_CHANNELS} channels, {} conversations, {} messages, {XY_TICKETS} tickets on {XY_BOARDS} boards) ==",
+        "\n== 6. production query workload: browsableChannels, conversationMessages under the channel ACL, the board view as a page of {XY_BOARD_PAGE} ({XY_USERS} users, {XY_CHANNELS} channels, {} conversations, {} messages, {XY_TICKETS} tickets on {XY_BOARDS} boards) ==",
         XY_CHANNELS * XY_CONVERSATIONS_PER_CHANNEL,
         XY_CHANNELS * XY_CONVERSATIONS_PER_CHANNEL * XY_MESSAGES_PER_CONVERSATION
     );

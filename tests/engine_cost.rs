@@ -15,10 +15,10 @@ macro_rules! row {
     };
 }
 
-#[path = "xyne_spaces_queries/catalog.rs"]
+#[path = "streamgres_queries/catalog.rs"]
 #[allow(dead_code)]
 mod catalog;
-#[path = "xyne_spaces_queries/zql.rs"]
+#[path = "streamgres_queries/zql.rs"]
 #[allow(dead_code)]
 mod zql;
 

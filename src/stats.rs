@@ -28,6 +28,9 @@ use crate::sync::SyncStats;
 /// plus one for zero.
 const BUCKETS: usize = 1 + 64 * 4;
 
+/// The legacy metric prefix keeps existing dashboards working by default.
+const DEFAULT_METRICS_PREFIX: &str = "xyne_sync";
+
 /// A distribution of durations in microseconds (or of counts), four
 /// buckets per octave.
 pub struct Histogram {
@@ -257,6 +260,7 @@ static GLOBAL: OnceLock<Arc<Stats>> = OnceLock::new();
 /// and queued right now.
 pub struct Stats {
     started: Instant,
+    metric_prefix: String,
     pub feed_decode: Histogram,
     pub feed_lag: Histogram,
     pub feed_to_engine: Histogram,
@@ -424,8 +428,14 @@ impl Default for Stats {
 impl Stats {
     /// Fresh measurements, the clock started now.
     pub fn new() -> Self {
+        Self::with_metric_prefix(DEFAULT_METRICS_PREFIX.to_owned())
+    }
+
+    /// Fresh measurements using `prefix` for every exported metric name.
+    pub(crate) fn with_metric_prefix(prefix: String) -> Self {
         Stats {
             started: Instant::now(),
+            metric_prefix: prefix,
             feed_decode: Histogram::new(),
             feed_lag: Histogram::new(),
             feed_to_engine: Histogram::new(),
@@ -513,6 +523,11 @@ impl Stats {
     /// Fresh measurements behind a shared handle.
     pub fn shared() -> Arc<Self> {
         Arc::new(Self::new())
+    }
+
+    /// Fresh measurements behind a shared handle, using `prefix` for metric names.
+    pub(crate) fn shared_with_metric_prefix(prefix: String) -> Arc<Self> {
+        Arc::new(Self::with_metric_prefix(prefix))
     }
 
     /// Make `stats` the process's measurements, reachable from code that
@@ -1116,10 +1131,20 @@ impl Stats {
             .unwrap_or_default();
         for (name, histogram) in self.histograms() {
             let seconds = name != "read_rows";
-            let (metric, unit, scale, bounds): (&str, &'static str, f64, &[u64]) = if seconds {
-                (metric_of(name), "s", 1_000_000.0, &SECONDS_BOUNDS_US)
+            let (metric, unit, scale, bounds): (String, &'static str, f64, &[u64]) = if seconds {
+                (
+                    metric_name(&self.metric_prefix, metric_of(name)),
+                    "s",
+                    1_000_000.0,
+                    &SECONDS_BOUNDS_US,
+                )
             } else {
-                ("xyne_sync_read_rows", "", 1.0, &COUNT_BOUNDS)
+                (
+                    metric_name(&self.metric_prefix, "read_rows"),
+                    "",
+                    1.0,
+                    &COUNT_BOUNDS,
+                )
             };
             let cumulative: Vec<u64> = bounds
                 .iter()
@@ -1128,7 +1153,7 @@ impl Stats {
             let (count, sum) = histogram.count_and_sum();
             let count = count.max(cumulative.last().copied().unwrap_or(0));
             catalogue.point(
-                metric,
+                &metric,
                 Kind::Histogram,
                 unit,
                 stage_help(name),
@@ -1143,7 +1168,7 @@ impl Stats {
             );
         }
         for (name, value) in self.counters() {
-            let (metric, labels) = counter_name(name);
+            let (metric, labels) = counter_name(name, &self.metric_prefix);
             catalogue.point(
                 &metric,
                 Kind::Counter,
@@ -1156,7 +1181,7 @@ impl Stats {
         for (name, value) in self.gauges() {
             match name {
                 "feed_heartbeat_age_ms" => catalogue.point(
-                    "xyne_sync_feed_heartbeat_age_seconds",
+                    &metric_name(&self.metric_prefix, "feed_heartbeat_age_seconds"),
                     Kind::Gauge,
                     "s",
                     measure_help(name),
@@ -1164,7 +1189,7 @@ impl Stats {
                     Value::Float(value as f64 / 1000.0),
                 ),
                 _ => catalogue.point(
-                    &format!("xyne_sync_{name}"),
+                    &metric_name(&self.metric_prefix, name),
                     Kind::Gauge,
                     if name.ends_with("_bytes") { "By" } else { "" },
                     measure_help(name),
@@ -1174,7 +1199,7 @@ impl Stats {
             }
         }
         catalogue.point(
-            "xyne_sync_uptime_seconds",
+            &metric_name(&self.metric_prefix, "uptime_seconds"),
             Kind::Gauge,
             "s",
             "since the process started",
@@ -1182,7 +1207,7 @@ impl Stats {
             Value::Int(self.started.elapsed().as_secs()),
         );
         catalogue.point(
-            "xyne_sync_engine_busy_seconds_total",
+            &metric_name(&self.metric_prefix, "engine_busy_seconds_total"),
             Kind::Counter,
             "s",
             "the engine thread's own compute; its rate is the engine's share of one core",
@@ -1190,7 +1215,7 @@ impl Stats {
             Value::Float(self.engine_busy().as_secs_f64()),
         );
         catalogue.point(
-            "xyne_sync_subscriptions",
+            &metric_name(&self.metric_prefix, "subscriptions"),
             Kind::Gauge,
             "",
             "subscriptions the engine holds",
@@ -1198,7 +1223,7 @@ impl Stats {
             Value::Int(engine.footprint.subscriptions),
         );
         catalogue.point(
-            "xyne_sync_trees",
+            &metric_name(&self.metric_prefix, "trees"),
             Kind::Gauge,
             "",
             "join trees the engine holds, each shared by the subscriptions of one query shape",
@@ -1207,7 +1232,7 @@ impl Stats {
         );
         for (table, rows) in &engine.footprint.rows_by_table {
             catalogue.point(
-                "xyne_sync_rows_held",
+                &metric_name(&self.metric_prefix, "rows_held"),
                 Kind::Gauge,
                 "",
                 "rows in the shared frames, per table",
@@ -1217,7 +1242,7 @@ impl Stats {
         }
         for (thread, seconds) in &sampled.thread_cpu {
             catalogue.point(
-                "xyne_sync_thread_cpu_seconds_total",
+                &metric_name(&self.metric_prefix, "thread_cpu_seconds_total"),
                 Kind::Counter,
                 "s",
                 "CPU time by thread name, sampled; a thread's rate is its share of one core",
@@ -1227,7 +1252,7 @@ impl Stats {
         }
         for (core, seconds) in &sampled.core_cpu {
             catalogue.point(
-                "xyne_sync_core_cpu_seconds_total",
+                &metric_name(&self.metric_prefix, "core_cpu_seconds_total"),
                 Kind::Counter,
                 "s",
                 "CPU time of the process by core, each thread's time attributed to the core it was sampled on; a core's rate is the process's use of it",
@@ -1237,17 +1262,17 @@ impl Stats {
         }
         for (thread, core, seconds) in &sampled.thread_core_cpu {
             catalogue.point(
-                "xyne_sync_thread_core_cpu_seconds_total",
+                &metric_name(&self.metric_prefix, "thread_core_cpu_seconds_total"),
                 Kind::Counter,
                 "s",
-                "CPU time by thread name and core, each thread's time attributed to the core it was sampled on; sums over threads to xyne_sync_core_cpu_seconds_total",
+                "CPU time by thread name and core, each thread's time attributed to the core it was sampled on; sums over threads to the core CPU metric",
                 vec![("thread", thread.clone()), ("core", core.to_string())],
                 Value::Float(*seconds),
             );
         }
         for (thread, tid, core) in &sampled.thread_core {
             catalogue.point(
-                "xyne_sync_thread_core",
+                &metric_name(&self.metric_prefix, "thread_core"),
                 Kind::Gauge,
                 "",
                 "the core each thread was on at the last sample, by thread name and id",
@@ -1257,7 +1282,7 @@ impl Stats {
         }
         for (thread, moves) in &sampled.thread_migrations {
             catalogue.point(
-                "xyne_sync_thread_migrations_total",
+                &metric_name(&self.metric_prefix, "thread_migrations_total"),
                 Kind::Counter,
                 "",
                 "moves between cores by thread name since the sampler started (se.nr_migrations), summed over a pool's threads; a high rate means the per-core split of that thread is a blur",
@@ -1267,7 +1292,7 @@ impl Stats {
         }
         for (shard, depth) in sampled.groups_inbox.iter().enumerate() {
             catalogue.point(
-                "xyne_sync_groups_inbox",
+                &metric_name(&self.metric_prefix, "groups_inbox"),
                 Kind::Gauge,
                 "",
                 "events waiting for a group thread",
@@ -1294,7 +1319,7 @@ impl Stats {
             ("client_updates_delete_total", engine.ivm.ops_delete),
         ] {
             catalogue.point(
-                &format!("xyne_sync_{name}"),
+                &metric_name(&self.metric_prefix, name),
                 Kind::Counter,
                 "",
                 measure_help(name),
@@ -1304,7 +1329,7 @@ impl Stats {
         }
         for (name, entry) in self.heavy_queries() {
             catalogue.point(
-                "xyne_sync_query_read_rows_max",
+                &metric_name(&self.metric_prefix, "query_read_rows_max"),
                 Kind::Gauge,
                 "",
                 "the largest storage read a query's subscription waited on, for queries that took at least half the row limit",
@@ -1312,7 +1337,7 @@ impl Stats {
                 Value::Int(entry.rows),
             );
             catalogue.point(
-                "xyne_sync_query_heavy_reads_total",
+                &metric_name(&self.metric_prefix, "query_heavy_reads_total"),
                 Kind::Counter,
                 "",
                 "storage reads of at least half the row limit, by the query that waited on them",
@@ -1500,28 +1525,31 @@ const COUNT_BOUNDS: [u64; 10] = [1, 10, 50, 100, 500, 1_000, 5_000, 10_000, 50_0
 /// label ([`stage_labels`]).
 fn metric_of(stage: &str) -> &'static str {
     match stage {
-        "feed_decode" => "xyne_sync_feed_decode_seconds",
-        "feed_lag" => "xyne_sync_feed_lag_seconds",
-        "feed_to_engine" => "xyne_sync_feed_to_engine_seconds",
-        "engine_step" | "register_step" | "unregister_step" | "land_step" => {
-            "xyne_sync_engine_step_seconds"
-        }
-        "engine_to_groups" => "xyne_sync_engine_to_groups_seconds",
-        "groups_flush" => "xyne_sync_groups_flush_seconds",
-        "groups_to_socket" => "xyne_sync_groups_to_socket_seconds",
-        "end_to_end" => "xyne_sync_end_to_end_seconds",
-        "transform" => "xyne_sync_transform_seconds",
-        "plan" => "xyne_sync_plan_seconds",
-        "count_io" => "xyne_sync_count_seconds",
-        "hydrate_cold" | "hydrate_warm" => "xyne_sync_hydrate_seconds",
-        "read_io" => "xyne_sync_read_seconds",
-        "push_queue" => "xyne_sync_push_queue_seconds",
-        "push" => "xyne_sync_push_seconds",
-        "mutation_ack" => "xyne_sync_mutation_ack_seconds",
-        "read_pool_wait" => "xyne_sync_read_pool_wait_seconds",
-        "connect_mutations" | "connect_group" => "xyne_sync_connect_seconds",
-        _ => "xyne_sync_unknown_seconds",
+        "feed_decode" => "feed_decode_seconds",
+        "feed_lag" => "feed_lag_seconds",
+        "feed_to_engine" => "feed_to_engine_seconds",
+        "engine_step" | "register_step" | "unregister_step" | "land_step" => "engine_step_seconds",
+        "engine_to_groups" => "engine_to_groups_seconds",
+        "groups_flush" => "groups_flush_seconds",
+        "groups_to_socket" => "groups_to_socket_seconds",
+        "end_to_end" => "end_to_end_seconds",
+        "transform" => "transform_seconds",
+        "plan" => "plan_seconds",
+        "count_io" => "count_seconds",
+        "hydrate_cold" | "hydrate_warm" => "hydrate_seconds",
+        "read_io" => "read_seconds",
+        "push_queue" => "push_queue_seconds",
+        "push" => "push_seconds",
+        "mutation_ack" => "mutation_ack_seconds",
+        "read_pool_wait" => "read_pool_wait_seconds",
+        "connect_mutations" | "connect_group" => "connect_seconds",
+        _ => "unknown_seconds",
     }
+}
+
+/// Add the configured namespace to a metric's suffix.
+fn metric_name(prefix: &str, suffix: &str) -> String {
+    format!("{prefix}_{suffix}")
 }
 
 /// The label that tells apart stages sharing a metric, or none.
@@ -1571,7 +1599,7 @@ fn stage_help(stage: &str) -> &'static str {
 }
 
 /// A counter's metric name and labels.
-fn counter_name(name: &str) -> (String, Vec<(&'static str, String)>) {
+fn counter_name(name: &str, prefix: &str) -> (String, Vec<(&'static str, String)>) {
     let (metric, labels): (&str, &[(&'static str, &str)]) = match name {
         "transform_hits" => ("transforms", &[("result", "hit")]),
         "transform_misses" => ("transforms", &[("result", "miss")]),
@@ -1613,7 +1641,7 @@ fn counter_name(name: &str) -> (String, Vec<(&'static str, String)>) {
         other => (other, &[]),
     };
     (
-        format!("xyne_sync_{metric}_total"),
+        metric_name(prefix, &format!("{metric}_total")),
         labels
             .iter()
             .map(|(key, value)| (*key, (*value).to_owned()))
@@ -1857,6 +1885,16 @@ mod tests {
         assert_eq!(json["held"]["subscriptions"], 12);
         assert_eq!(json["counts"]["transform_hits"], 3);
         assert_eq!(json["gauges"]["connections_open"], 7);
+    }
+
+    #[test]
+    fn metric_names_use_the_configured_prefix() {
+        let stats = Stats::with_metric_prefix("streamgres".to_owned());
+        stats.transform_hits.fetch_add(1, Ordering::Relaxed);
+        let text = stats.prometheus();
+        assert!(text.contains("streamgres_transforms_total{result=\"hit\"} 1"));
+        assert!(text.contains("# TYPE streamgres_engine_step_seconds histogram"));
+        assert!(!text.contains("xyne_sync_"));
     }
 
     #[test]

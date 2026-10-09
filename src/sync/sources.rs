@@ -2,7 +2,8 @@
 //! same write stream and read without a round trip), the rest are read
 //! from Postgres. Which tables live in memory is configuration
 //! (`STREAMGRES_MEMORY_TABLES`, a comma-separated list; the old
-//! `XYNE_SYNC_MEMORY_TABLES` name remains accepted); by default every
+//! `STREAMGRES_SYNC_MEMORY_TABLES` and `XYNE_SYNC_MEMORY_TABLES` names remain
+//! accepted); by default every
 //! read goes to Postgres.
 
 use std::collections::HashSet;
@@ -53,12 +54,22 @@ impl Sources {
     }
 
     /// The tables named in `STREAMGRES_MEMORY_TABLES` (or the legacy
-    /// `XYNE_SYNC_MEMORY_TABLES`; empty when unset).
+    /// `STREAMGRES_SYNC_MEMORY_TABLES` or `XYNE_SYNC_MEMORY_TABLES`; empty
+    /// when unset).
     pub fn cached_from_env() -> Vec<TableName> {
         std::env::var(MEMORY_TABLES_VAR)
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .or_else(|| std::env::var("XYNE_SYNC_MEMORY_TABLES").ok())
+            .or_else(|| {
+                std::env::var("STREAMGRES_SYNC_MEMORY_TABLES")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .or_else(|| {
+                std::env::var("XYNE_SYNC_MEMORY_TABLES")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            })
             .map(|value| {
                 value
                     .split(',')

@@ -80,6 +80,12 @@ impl Config {
                 .filter(|value| !value.is_empty())
                 .or_else(|| {
                     key.strip_prefix("STREAMGRES_")
+                        .and_then(|suffix| lookup(&format!("STREAMGRES_SYNC_{suffix}")))
+                        .map(|value| value.trim().to_owned())
+                        .filter(|value| !value.is_empty())
+                })
+                .or_else(|| {
+                    key.strip_prefix("STREAMGRES_")
                         .and_then(|suffix| lookup(&format!("XYNE_SYNC_{suffix}")))
                         .map(|value| value.trim().to_owned())
                         .filter(|value| !value.is_empty())
@@ -527,8 +533,14 @@ mod tests {
             .unwrap();
         assert_eq!(legacy.url, "http://legacy:4040");
 
+        let transitional = config(&[("STREAMGRES_SYNC_PYROSCOPE_URL", "http://old:4040")])
+            .unwrap()
+            .unwrap();
+        assert_eq!(transitional.url, "http://old:4040");
+
         let preferred = config(&[
             ("STREAMGRES_PYROSCOPE_URL", "http://new:4040"),
+            ("STREAMGRES_SYNC_PYROSCOPE_URL", "http://old:4040"),
             ("XYNE_SYNC_PYROSCOPE_URL", "http://legacy:4040"),
         ])
         .unwrap()
