@@ -151,12 +151,12 @@ pub struct Config {
     /// the query is counted again (600000).
     pub plan_ttl: Duration,
     /// `STREAMGRES_PLAN_CACHE`: how many join plans are remembered at most
-    /// (10000), by tree and, apart, by query name.
+    /// (10000), by tree and, apart, by query name and arguments.
     pub plan_cache: usize,
     /// `STREAMGRES_PLAN_QUERY_TTL_MS`: how long a plan made for a query is
-    /// laid onto every later query of the same name (and join skeleton),
-    /// whatever its arguments, before the name is counted again (86400000,
-    /// a day; 0 plans every tree on its own).
+    /// laid onto every later asking of the same name with the same
+    /// arguments before they are counted again (86400000, a day; 0
+    /// remembers none by name).
     pub plan_query_ttl: Duration,
     /// `STREAMGRES_TRANSFORM_TTL_MS`: how long the application server's
     /// transform of a query is kept per identity (60000; zero-cache keeps

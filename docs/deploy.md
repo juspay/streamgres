@@ -254,7 +254,7 @@ depend on what the defaults happen to be:
 | `STREAMGRES_PG_KEEPALIVE_IDLE_MS`, `_INTERVAL_MS`, `_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on database connections. `0` idle time turns it off |
 | `STREAMGRES_WHOLE_PAGE_LIMIT` | `5000` | a page that drives a join is read whole up to this many rows, in growing batches past it |
 | `STREAMGRES_JOIN_PREFERRED_SIDE` | `parent` | which side drives a join when both plans cost the same |
-| `STREAMGRES_PLAN_QUERY_TTL_MS` | `86400000` | how long one plan is reused for every query of the same name and join shape. `0` plans every query separately |
+| `STREAMGRES_PLAN_QUERY_TTL_MS` | `86400000` | how long one plan is reused for every query of the same name and arguments (the arguments decide the plan: a busy channel and a quiet one are planned apart). `0` remembers none by name |
 | `STREAMGRES_PLAN_TTL_MS`, `STREAMGRES_PLAN_CACHE` | `600000`, `10000` | how long refused plans are remembered, and how many plans are kept |
 | `STREAMGRES_TRANSFORM_TTL_MS`, `STREAMGRES_TRANSFORM_CACHE` | `60000`, `20000` | how long query ASTs from the application server are cached per user, and how many |
 | `STREAMGRES_WARM_START_MS` | `20000` | most time spent re-planning saved query shapes at startup |

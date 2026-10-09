@@ -72,22 +72,21 @@
 //! The planner does no I/O: it hands out the counts it wants and takes
 //! the answers back, so the caller runs them wherever it can and the
 //! decision stays a pure function that tests drive with numbers. [`plan`]
-//! is that caller for the server, and it plans a query once per **name**
-//! rather than once per set of arguments: the plan (every edge's driver,
-//! every page's read) is remembered by the query's name for
-//! `STREAMGRES_PLAN_QUERY_TTL_MS` (a day) and laid onto every later tree
-//! of that name, whoever asks and with whatever arguments — ids, lists,
-//! page sizes, cursors — so the counts run a few dozen times a day, not
-//! once per user, channel or cursor. A plan is about the join tree, not
-//! the filters, so it lays onto any tree of the same join skeleton; a name
-//! whose arguments add or drop a join (an optional `whereExists`) is
-//! planned once per skeleton. So a plan is made on the numbers of the
-//! first arguments that ask, and a later argument the plan does not suit
-//! is bounded by the read limit like any read. Only a plan that was made
-//! is remembered by name; a refusal is remembered for its own tree only
-//! (keyed as translated, the identity the engine's twin sharing uses, for
-//! `STREAMGRES_PLAN_TTL_MS`), so one argument's refusal never spreads to
-//! every other.
+//! is that caller for the server, and it plans a query once per **name
+//! and arguments**: the plan (every edge's driver, every page's read) is
+//! remembered by the query's name and the tree its arguments translated
+//! to — ids, lists, cursors, page sizes — for `STREAMGRES_PLAN_QUERY_TTL_MS`
+//! (a day) and laid onto every later asking of that name with those
+//! arguments, whoever asks, so the counts run once a day per argument
+//! set, not once per user or connection. The arguments stay in the key
+//! because the numbers they select decide the plan: a channel of five
+//! messages drives its conversations where a channel of a thousand is
+//! driven by them, and a plan made on the first would be laid onto the
+//! second, and read the wrong side, if the name alone were the key. Only
+//! a plan that was made is remembered by name; a refusal is remembered
+//! for its own tree only (keyed as translated, the identity the engine's
+//! twin sharing uses, for `STREAMGRES_PLAN_TTL_MS`), so a refusal is
+//! counted again sooner than a plan.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -665,30 +664,7 @@ fn join_at<'a>(
     node.joins.get_mut(position)
 }
 
-/// Whether `a` and `b` have one join skeleton: at every position the same
-/// table, and under it the same joins — the same columns, inner or outer,
-/// in the same order, down to the leaves. Filters, cursors, limits and
-/// literals may differ; a plan made for one lays onto the other.
-fn same_skeleton(a: &MultiTableReadQuery, b: &MultiTableReadQuery) -> bool {
-    a.main_table.table == b.main_table.table
-        && a.joins.len() == b.joins.len()
-        && a.joins.iter().zip(&b.joins).all(|(x, y)| {
-            x.main_table_column == y.main_table_column
-                && x.sub_table_column == y.sub_table_column
-                && x.is_inner == y.is_inner
-                && same_skeleton(&x.sub, &y.sub)
-        })
-}
 
-/// Lay the plan of `planned` onto `query`, a tree of the same skeleton:
-/// every edge's driver and every node's page read.
-fn copy_plan(planned: &MultiTableReadQuery, query: &mut MultiTableReadQuery) {
-    query.page = planned.page;
-    for (from, to) in planned.joins.iter().zip(query.joins.iter_mut()) {
-        to.driver = from.driver;
-        copy_plan(&from.sub, &mut to.sub);
-    }
-}
 
 /// One remembered decision.
 struct Entry {
@@ -706,16 +682,17 @@ struct CacheState {
     tick: u64,
 }
 
-/// The plans made per query name, each tree planned with when it was
-/// made: one per join skeleton the name's arguments give it.
-type ByName = HashMap<String, Vec<(MultiTableReadQuery, Instant)>>;
+/// The plans made per query name: by the tree the name's arguments
+/// translated to, the tree planned and when it was.
+type ByName = HashMap<String, HashMap<MultiTableReadQuery, (MultiTableReadQuery, Instant)>>;
 
-/// Remembered plans, two ways: by **query name**, the plans that were made,
-/// laid onto every later tree of the name with the same join skeleton for
-/// `name_ttl`; and by the tree as translated, every outcome, refusals
-/// included, for `ttl` (a table that grew past the limit is re-counted
-/// eventually). Each way holds at most `capacity` entries: the least
-/// recently used tree leaves, and the oldest query name.
+/// Remembered plans, two ways: by **query name and arguments** (the tree
+/// as translated), the plans that were made, laid onto every later asking
+/// of the name with those arguments for `name_ttl`; and by the tree as
+/// translated alone, every outcome, refusals included, for `ttl` (a
+/// table that grew past the limit is re-counted eventually). Each way
+/// holds at most `capacity` entries: the least recently used tree leaves,
+/// and the plan made longest ago.
 pub struct PlanCache {
     state: Mutex<CacheState>,
     names: Mutex<ByName>,
@@ -725,8 +702,9 @@ pub struct PlanCache {
 }
 
 impl PlanCache {
-    /// A cache keeping each tree's outcome for `ttl` and each query name's
-    /// plans for `name_ttl` (zero keeps none), at most `capacity` of each.
+    /// A cache keeping each tree's outcome for `ttl` and the plans made
+    /// per query name and arguments for `name_ttl` (zero keeps none), at
+    /// most `capacity` of each.
     pub fn new(ttl: Duration, capacity: usize, name_ttl: Duration) -> Self {
         PlanCache {
             state: Mutex::new(CacheState::default()),
@@ -737,48 +715,58 @@ impl PlanCache {
         }
     }
 
-    /// `query` planned as the plan remembered for `name` says, when the
-    /// name has one younger than its TTL made for a tree of the same
-    /// join skeleton.
+    /// The plan remembered for `name` asked with the arguments that
+    /// translated to `query`, when there is one younger than its TTL.
     pub fn by_name(&self, name: &str, query: &MultiTableReadQuery) -> Option<MultiTableReadQuery> {
         let mut names = self.lock_names();
         let plans = names.get_mut(name)?;
-        plans.retain(|(_, at)| at.elapsed() <= self.name_ttl);
-        let planned = plans
-            .iter()
-            .find(|(planned, _)| same_skeleton(planned, query))
-            .map(|(planned, _)| planned);
-        let mut laid = query.clone();
-        copy_plan(planned?, &mut laid);
-        Some(laid)
+        plans.retain(|_, (_, at)| at.elapsed() <= self.name_ttl);
+        plans.get(query).map(|(planned, _)| planned.clone())
     }
 
-    /// Remember `planned`, the plan made for a query `name`, for every
-    /// later tree of the name with its join skeleton (in place of an
-    /// earlier plan of that skeleton); the oldest name leaves when the
-    /// cache is full.
-    pub fn remember(&self, name: &str, planned: &MultiTableReadQuery) {
+    /// Remember `planned`, the plan made for a query `name` asked with the
+    /// arguments that translated to `query`, for every later asking of
+    /// both (in place of an earlier plan for them); the plan made longest
+    /// ago, whatever its name, leaves when the cache is full.
+    pub fn remember(&self, name: &str, query: MultiTableReadQuery, planned: &MultiTableReadQuery) {
         if self.name_ttl.is_zero() {
             return;
         }
         let mut names = self.lock_names();
-        if !names.contains_key(name) && names.len() >= self.capacity {
+        let known = names.get(name).is_some_and(|plans| plans.contains_key(&query));
+        if !known && names.values().map(HashMap::len).sum::<usize>() >= self.capacity {
             let oldest = names
                 .iter()
-                .min_by_key(|(_, plans)| plans.iter().map(|(_, at)| *at).max())
-                .map(|(name, _)| name.clone());
-            if let Some(oldest) = oldest {
-                names.remove(&oldest);
+                .flat_map(|(name, plans)| {
+                    plans
+                        .iter()
+                        .map(move |(query, (_, at))| (*at, name.clone(), query.clone()))
+                })
+                .min_by_key(|(at, _, _)| *at);
+            if let Some((_, name, query)) = oldest {
+                if let Some(plans) = names.get_mut(&name) {
+                    plans.remove(&query);
+                    if plans.is_empty() {
+                        names.remove(&name);
+                    }
+                }
             }
         }
-        let plans = names.entry(name.to_owned()).or_default();
-        plans.retain(|(known, _)| !same_skeleton(known, planned));
-        plans.push((planned.clone(), Instant::now()));
+        names
+            .entry(name.to_owned())
+            .or_default()
+            .insert(query, (planned.clone(), Instant::now()));
     }
 
     /// How many query names have a plan remembered.
     pub fn queries(&self) -> usize {
         self.lock_names().len()
+    }
+
+    /// How many plans are remembered by name, over every query name and
+    /// its arguments.
+    pub fn plans(&self) -> usize {
+        self.lock_names().values().map(HashMap::len).sum()
     }
 
     /// The plans by name, read through a poisoned lock.
@@ -855,11 +843,12 @@ impl PlanCache {
 }
 
 /// Plan `translated`, the query `name`, under `policy`: the plan
-/// remembered for its name, laid onto it, when there is one for its join
-/// skeleton, else the outcome remembered for this very tree, else the
-/// counts on `storage` (concurrently) and the planner's decision —
-/// remembered by name when it is a plan, and by tree either way. A count that fails (the database
-/// was unreachable, the count ran past the read timeout) refuses the
+/// remembered for its name and arguments when there is one, else the
+/// outcome remembered for this very tree, else the counts on `storage`
+/// (concurrently) and the planner's decision — remembered by name and
+/// arguments when it is a plan, and by tree either way. A count that
+/// fails (the database was unreachable, the count ran past the read
+/// timeout) refuses the
 /// query, saying so, and is not remembered: it says nothing about the
 /// query, and the next asking counts again. The counts are logged at
 /// debug level, `table alone/narrowed` per node.
@@ -917,7 +906,7 @@ pub async fn plan<S: Storage + ?Sized>(
         None => planner.decide(),
     };
     if let Ok(planned) = &outcome {
-        cache.remember(name, planned);
+        cache.remember(name, query.clone(), planned);
     }
     cache.put(query, outcome.clone());
     outcome.map(|query| Translated { query, hidden })
@@ -1880,11 +1869,26 @@ mod tests {
         assert!(brief.get(&first).is_none(), "expired");
     }
 
-    /// A store whose every count answers `rows`, keeping how many it
-    /// answered; it holds no rows to read.
+    /// A store whose counts answer what `rows` says of the counted query,
+    /// keeping how many it answered; it holds no rows to read.
     struct Counting {
-        rows: u64,
+        rows: Box<dyn Fn(&MultiTableReadQuery) -> u64>,
         counts: std::cell::Cell<usize>,
+    }
+
+    impl Counting {
+        /// A store answering `rows` to every count.
+        fn answering(rows: u64) -> Self {
+            Counting::by(move |_| rows)
+        }
+
+        /// A store answering each count what `rows` says of its query.
+        fn by(rows: impl Fn(&MultiTableReadQuery) -> u64 + 'static) -> Self {
+            Counting {
+                rows: Box::new(rows),
+                counts: std::cell::Cell::new(0),
+            }
+        }
     }
 
     impl Storage for Counting {
@@ -1899,14 +1903,14 @@ mod tests {
             })
         }
 
-        /// `rows`, counted.
+        /// What `rows` says of `query`, counted.
         async fn count(
             &self,
-            _query: &MultiTableReadQuery,
+            query: &MultiTableReadQuery,
             cap: u64,
         ) -> Result<u64, crate::sync::StorageError> {
             self.counts.set(self.counts.get() + 1);
-            Ok(self.rows.min(cap))
+            Ok((self.rows)(query).min(cap))
         }
 
         /// Nothing to follow.
@@ -1927,38 +1931,16 @@ mod tests {
             .block_on(future)
     }
 
-    /// Two trees of one join skeleton — same tables and joins at every
-    /// position — whatever their filters, cursors, limits and literals;
-    /// a join more or less, or another table, is another skeleton.
-    #[test]
-    fn a_join_skeleton_is_the_tree_without_its_filters() {
-        let one = messages_in("c1", 50).query;
-        assert!(same_skeleton(&one, &messages_in("c2", 20).query));
-        assert!(same_skeleton(&one, &messages_in("c1", u32::MAX).query));
-        let mut cursor = messages_in("c1", 50).query;
-        cursor.main_table.filter = Where::AND(vec![
-            cursor.main_table.filter.clone(),
-            Where::condition("id", ComparisonOperator::GT, "m9"),
-        ]);
-        assert!(same_skeleton(&one, &cursor), "a cursor adds no join");
-        let alone = MultiTableReadQuery::single(one.main_table.clone());
-        assert!(!same_skeleton(&one, &alone), "a join less");
-        let mut elsewhere = messages_in("c1", 50).query;
-        elsewhere.joins[0].sub.main_table.table = "threads".into();
-        assert!(!same_skeleton(&one, &elsewhere), "another table");
-    }
 
-    /// A query is counted once per name: the plan made for one channel is
-    /// laid onto another channel with another page size without a count,
-    /// its own arguments kept; another query name is planned on its own.
+    /// A query is counted once per name and arguments: the plan made for
+    /// a channel is laid onto the next asking of the same channel without
+    /// a count; another channel, another page size, and another query
+    /// name are each counted and planned on their own.
     #[test]
-    fn a_plan_is_counted_once_per_name_and_laid_onto_every_argument() {
+    fn a_plan_is_counted_once_per_name_and_arguments() {
         run(async {
             let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
-            let storage = Counting {
-                rows: 5,
-                counts: std::cell::Cell::new(0),
-            };
+            let storage = Counting::answering(5);
             let policy = policy(100, Side::Child);
             let first = plan(
                 "messagesIn",
@@ -1978,27 +1960,48 @@ mod tests {
             );
             assert_eq!(cache.queries(), 1);
 
-            let second = plan(
+            let again = plan(
                 "messagesIn",
-                messages_in("c2", 20),
+                messages_in("c1", 50),
                 policy,
                 &cache,
                 &storage,
             )
             .await
             .expect("planned");
-            assert_eq!(storage.counts.get(), asked, "no count for other arguments");
-            let mut expected = messages_in("c2", 20).query;
-            expected.joins[0].driver = Driver::Main;
-            assert_eq!(
-                second.query, expected,
-                "the name's plan, its own arguments kept"
-            );
-            assert_eq!(second.hidden, messages_in("c2", 20).hidden);
+            assert_eq!(storage.counts.get(), asked, "no count for the same arguments");
+            assert_eq!(again.query, first.query, "the plan remembered");
+            assert_eq!(again.hidden, first.hidden);
+
+            plan(
+                "messagesIn",
+                messages_in("c2", 50),
+                policy,
+                &cache,
+                &storage,
+            )
+            .await
+            .expect("planned");
+            let other = storage.counts.get();
+            assert!(other > asked, "another channel is counted");
+
+            plan(
+                "messagesIn",
+                messages_in("c1", 20),
+                policy,
+                &cache,
+                &storage,
+            )
+            .await
+            .expect("planned");
+            let paged = storage.counts.get();
+            assert!(paged > other, "another page size is counted");
+            assert_eq!(cache.queries(), 1);
+            assert_eq!(cache.plans(), 3, "one plan per arguments");
 
             plan(
                 "messagesElsewhere",
-                messages_in("c3", 20),
+                messages_in("c3", 50),
                 policy,
                 &cache,
                 &storage,
@@ -2006,46 +2009,130 @@ mod tests {
             .await
             .expect("planned");
             assert!(
-                storage.counts.get() > asked,
+                storage.counts.get() > paged,
                 "another name is planned on its own"
             );
             assert_eq!(cache.queries(), 2);
         });
     }
 
-    /// A name whose arguments give it another join skeleton is planned
-    /// for that skeleton too, and both plans stay: neither is laid onto
-    /// the other's tree.
+    /// Every argument is in the key: a cursor, or a sort order, under the
+    /// same name and channel is counted and planned on its own; another
+    /// name asking the very same tree is answered by the tree cache, which
+    /// knows no names.
     #[test]
-    fn a_name_is_planned_once_per_join_skeleton() {
+    fn a_cursor_or_an_order_is_another_argument_and_a_tree_knows_no_name() {
         run(async {
             let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
-            let storage = Counting {
-                rows: 5,
-                counts: std::cell::Cell::new(0),
-            };
+            let storage = Counting::answering(5);
             let policy = policy(100, Side::Child);
             plan("q", messages_in("c1", 50), policy, &cache, &storage)
                 .await
                 .expect("planned");
-            let asked = storage.counts.get();
-            let mut other = messages_in("c1", 50);
-            other.query.joins[0].sub.main_table.table = "threads".into();
-            plan("q", other.clone(), policy, &cache, &storage)
+            let first = storage.counts.get();
+
+            let mut after = messages_in("c1", 50);
+            after.query.main_table.filter = Where::AND(vec![
+                after.query.main_table.filter.clone(),
+                Where::condition("id", ComparisonOperator::GT, "m9"),
+            ]);
+            plan("q", after.clone(), policy, &cache, &storage)
                 .await
                 .expect("planned");
-            let both = storage.counts.get();
-            assert!(both > asked, "another skeleton is counted");
-            other.query.joins[0].sub.main_table.filter =
-                Where::condition("channelId", ComparisonOperator::EQ, "c9");
-            plan("q", other, policy, &cache, &storage)
+            let cursor = storage.counts.get();
+            assert!(cursor > first, "a cursor is counted");
+            plan("q", after, policy, &cache, &storage)
                 .await
                 .expect("planned");
-            plan("q", messages_in("c7", 50), policy, &cache, &storage)
+            assert_eq!(storage.counts.get(), cursor, "the same cursor again: cached");
+
+            let mut newest = messages_in("c1", 50);
+            newest.query.main_table.order_by = vec![OrderBy::new("id", Order::DESC)];
+            plan("q", newest, policy, &cache, &storage)
                 .await
                 .expect("planned");
-            assert_eq!(storage.counts.get(), both, "each skeleton's plan kept");
-            assert_eq!(cache.queries(), 1);
+            let order = storage.counts.get();
+            assert!(order > cursor, "another order is counted");
+            assert_eq!(cache.plans(), 3);
+
+            plan("other", messages_in("c1", 50), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            assert_eq!(storage.counts.get(), order, "the same tree, from the tree cache");
+            assert_eq!(cache.queries(), 1, "and not remembered under the other name");
+        });
+    }
+
+    /// Remembering a name's arguments again replaces their plan: one plan
+    /// per name and arguments, the latest, and a repeat makes no room.
+    #[test]
+    fn remembering_the_same_arguments_again_replaces_the_plan() {
+        let translated = messages_in("c1", 50).query;
+        let mut main = translated.clone();
+        main.joins[0].driver = Driver::Main;
+        let mut sub = translated.clone();
+        sub.joins[0].driver = Driver::Sub;
+        let other = messages_in("c2", 50).query;
+
+        let cache = PlanCache::new(Duration::from_secs(60), 2, Duration::from_secs(60));
+        cache.remember("q", other.clone(), &other);
+        cache.remember("q", translated.clone(), &main);
+        assert_eq!(cache.plans(), 2);
+        cache.remember("q", translated.clone(), &sub);
+        assert_eq!(cache.plans(), 2, "replaced, not added");
+        assert_eq!(
+            cache.by_name("q", &translated).expect("kept").joins[0].driver,
+            Driver::Sub,
+            "the latest plan"
+        );
+        assert!(cache.by_name("q", &other).is_some(), "a repeat evicts nothing");
+    }
+
+    /// The plan of one channel is not laid onto another: of fifty
+    /// messages, a channel holding every one has the page drive its five
+    /// conversations (fifty against fifty-five), and a channel of ten,
+    /// asked next under the same name, is counted on its own numbers and
+    /// is driven by them (fifteen against fifty) — each plan kept for its
+    /// own arguments.
+    #[test]
+    fn another_argument_is_planned_on_its_own_numbers() {
+        run(async {
+            let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
+            let storage = Counting::by(|query| {
+                let narrowed = !query.joins.is_empty();
+                match query.main_table.table.as_str() {
+                    "conversations" => 5,
+                    _ if narrowed && format!("{query:?}").contains("quiet") => 10,
+                    _ => 50,
+                }
+            });
+            let policy = policy(100, Side::Child);
+            let busy = plan("q", messages_in("busy", 50), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            assert_eq!(
+                busy.query.joins[0].driver,
+                Driver::Main,
+                "the page holding every message drives"
+            );
+            let quiet = plan("q", messages_in("quiet", 50), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            assert_eq!(
+                quiet.query.joins[0].driver,
+                Driver::Sub,
+                "the page of ten is driven by its conversations"
+            );
+            let counted = storage.counts.get();
+            let busy_again = plan("q", messages_in("busy", 50), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            let quiet_again = plan("q", messages_in("quiet", 50), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            assert_eq!(storage.counts.get(), counted, "both from the cache");
+            assert_eq!(busy_again.query, busy.query);
+            assert_eq!(quiet_again.query, quiet.query);
         });
     }
 
@@ -2056,10 +2143,7 @@ mod tests {
     fn a_refusal_is_not_laid_onto_other_arguments() {
         run(async {
             let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
-            let storage = Counting {
-                rows: 101,
-                counts: std::cell::Cell::new(0),
-            };
+            let storage = Counting::answering(101);
             let policy = policy(100, Side::Child);
             let refused = |channel: &'static str| messages_in(channel, u32::MAX);
             assert!(
@@ -2085,31 +2169,40 @@ mod tests {
         });
     }
 
-    /// A name's plan lasts its TTL (none at zero), and when the cache is
-    /// full the name planned longest ago leaves.
+    /// A plan lasts its TTL (none at zero), and when the cache is full the
+    /// plan made longest ago leaves, whether of another name or of another
+    /// argument of the same name.
     #[test]
     fn a_name_plan_expires_and_the_oldest_leaves() {
         let translated = messages_in("c1", 50).query;
         let mut planned = translated.clone();
-        planned.joins[0].driver = Driver::Main;
+        planned.joins[0].driver = Driver::Sub;
+        let other = messages_in("c2", 50).query;
 
         let none = PlanCache::new(Duration::from_secs(60), 10, Duration::ZERO);
-        none.remember("q", &planned);
+        none.remember("q", translated.clone(), &planned);
         assert_eq!(none.queries(), 0);
         assert!(none.by_name("q", &translated).is_none());
 
         let brief = PlanCache::new(Duration::from_secs(60), 10, Duration::from_millis(1));
-        brief.remember("q", &planned);
+        brief.remember("q", translated.clone(), &planned);
         std::thread::sleep(Duration::from_millis(3));
         assert!(brief.by_name("q", &translated).is_none(), "expired");
 
         let small = PlanCache::new(Duration::from_secs(60), 1, Duration::from_secs(60));
-        small.remember("a", &planned);
+        small.remember("a", translated.clone(), &planned);
         std::thread::sleep(Duration::from_millis(1));
-        small.remember("b", &planned);
+        small.remember("b", translated.clone(), &planned);
         assert_eq!(small.queries(), 1);
+        assert_eq!(small.plans(), 1);
         assert!(small.by_name("a", &translated).is_none(), "the oldest left");
         let laid = small.by_name("b", &translated).expect("kept");
-        assert_eq!(laid.joins[0].driver, Driver::Main);
+        assert_eq!(laid.joins[0].driver, Driver::Sub);
+        std::thread::sleep(Duration::from_millis(1));
+        small.remember("b", other.clone(), &other);
+        assert_eq!(small.plans(), 1);
+        assert!(small.by_name("b", &translated).is_none(), "the older argument left");
+        assert!(small.by_name("b", &other).is_some());
+        assert!(small.by_name("b", &translated).is_none(), "another argument, no plan");
     }
 }
