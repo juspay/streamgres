@@ -299,6 +299,8 @@ pub struct Stats {
     pub refused_other: AtomicU64,
     pub pages_short: AtomicU64,
     pub plans_page_driven: AtomicU64,
+    pub plan_count_hits: AtomicU64,
+    pub plan_count_misses: AtomicU64,
     pub pushes_ok: AtomicU64,
     pub pushes_failed: AtomicU64,
     /// Pushes that found their connection's queue full, so the reader
@@ -348,6 +350,7 @@ pub struct Stats {
     pub clients: AtomicU64,
     pub engine_inbox: AtomicU64,
     pub plan_cache_entries: AtomicU64,
+    pub plan_count_cache_entries: AtomicU64,
     pub transform_cache_entries: AtomicU64,
     pub warm_shapes: AtomicU64,
     pub feed_lsn: AtomicU64,
@@ -468,6 +471,8 @@ impl Stats {
             refused_other: AtomicU64::new(0),
             pages_short: AtomicU64::new(0),
             plans_page_driven: AtomicU64::new(0),
+            plan_count_hits: AtomicU64::new(0),
+            plan_count_misses: AtomicU64::new(0),
             pushes_ok: AtomicU64::new(0),
             pushes_failed: AtomicU64::new(0),
             push_queue_full: AtomicU64::new(0),
@@ -497,6 +502,7 @@ impl Stats {
             clients: AtomicU64::new(0),
             engine_inbox: AtomicU64::new(0),
             plan_cache_entries: AtomicU64::new(0),
+            plan_count_cache_entries: AtomicU64::new(0),
             transform_cache_entries: AtomicU64::new(0),
             warm_shapes: AtomicU64::new(0),
             feed_lsn: AtomicU64::new(0),
@@ -713,6 +719,8 @@ impl Stats {
             ("refused_read_timeout", load(&self.refused_read_timeout)),
             ("refused_other", load(&self.refused_other)),
             ("plans_page_driven", load(&self.plans_page_driven)),
+            ("plan_count_hits", load(&self.plan_count_hits)),
+            ("plan_count_misses", load(&self.plan_count_misses)),
             ("pages_short", load(&self.pages_short)),
             ("pushes_ok", load(&self.pushes_ok)),
             ("pushes_failed", load(&self.pushes_failed)),
@@ -765,6 +773,10 @@ impl Stats {
             ("clients", load(&self.clients)),
             ("engine_inbox", load(&self.engine_inbox)),
             ("plan_cache_entries", load(&self.plan_cache_entries)),
+            (
+                "plan_count_cache_entries",
+                load(&self.plan_count_cache_entries),
+            ),
             (
                 "transform_cache_entries",
                 load(&self.transform_cache_entries),
@@ -1583,6 +1595,8 @@ fn counter_name(name: &str) -> (String, Vec<(&'static str, String)>) {
         "refused_other" => ("queries_refused", &[("reason", "other")]),
         "pages_short" => ("queries_short", &[("reason", "page_capped")]),
         "plans_page_driven" => ("plans", &[("kind", "page_drives")]),
+        "plan_count_hits" => ("plan_counts", &[("result", "hit")]),
+        "plan_count_misses" => ("plan_counts", &[("result", "miss")]),
         "pushes_ok" => ("pushes", &[("result", "ok")]),
         "pushes_failed" => ("pushes", &[("result", "failed")]),
         "push_queue_full" => ("push_queue_full", &[]),
@@ -1647,6 +1661,9 @@ fn measure_help(name: &str) -> &'static str {
         | "refused_other" => "queries refused, by class of reason",
         "pages_short" => "pages served short of their limit",
         "plans_page_driven" => "plans in which a page drives its own join",
+        "plan_count_hits" | "plan_count_misses" => {
+            "planner counts by where they were answered: from the count cache, or run on PostgreSQL"
+        }
         "pushes_ok" | "pushes_failed" => "pushes forwarded to the application server, by outcome",
         "push_queue_full" => "pushes that waited for room in their connection's queue",
         "mutation_results" => {
@@ -1675,6 +1692,7 @@ fn measure_help(name: &str) -> &'static str {
         "clients" => "clients connected across those groups",
         "engine_inbox" => "commands waiting for the engine thread",
         "plan_cache_entries" => "join plans remembered",
+        "plan_count_cache_entries" => "planner counts remembered",
         "transform_cache_entries" => "query transforms remembered",
         "warm_shapes" => "query shapes kept for a warm start",
         "feed_lsn" => "the feed's position in PostgreSQL's log",

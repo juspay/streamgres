@@ -271,7 +271,8 @@ pub fn serve(config: Config) -> Result<(), String> {
     let plans = Arc::new(plan::PlanCache::new(
         config.plan_ttl,
         config.plan_cache,
-        config.plan_query_ttl,
+        config.plan_count_ttl,
+        config.plan_count_cache,
     ));
     let warm = Arc::new(warm::WarmStart::new(
         config.plan_file.clone(),

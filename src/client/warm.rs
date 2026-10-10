@@ -335,7 +335,7 @@ mod tests {
                 DbColumn::new("conversationId", ValueType::String),
             ],
         )]);
-        let cache = PlanCache::new(Duration::from_secs(60), 100, Duration::from_secs(60));
+        let cache = PlanCache::new(Duration::from_secs(60), 100, Duration::from_secs(60), 1_000);
         let storage = MemoryStorage::new();
         let policy = Policy {
             limit: 1000,
@@ -378,16 +378,12 @@ mod tests {
                 skipped: 0
             }
         );
-        assert_eq!(cache.queries(), 1, "two threads of one query are one plan");
-        assert!(
-            (1..=2).contains(&cache.len()),
-            "the second thread is planned by the name once the first is"
-        );
+        assert_eq!(cache.len(), 2, "each thread's tree is remembered");
         let none = WarmStart::replay(
             shapes,
             &catalog,
             policy,
-            &PlanCache::new(Duration::from_secs(60), 100, Duration::from_secs(60)),
+            &PlanCache::new(Duration::from_secs(60), 100, Duration::from_secs(60), 1_000),
             &storage,
             Duration::ZERO,
             4,
