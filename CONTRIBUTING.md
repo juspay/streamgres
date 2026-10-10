@@ -1,6 +1,6 @@
 # Contributing to Streamgres
 
-Thanks for your interest in improving Xyne-Sync. This guide covers how to set
+Thanks for your interest in improving Streamgres. This guide covers how to set
 up a development environment, what a pull request needs before it is merged,
 and the conventions the code follows.
 
@@ -35,7 +35,7 @@ cargo test                          # unit and scenario tests
 cargo clippy --all-targets -- -D warnings
 cargo run --bin streamgres           # Streamgres demo: every check must end in PASS
 cargo run --release --bin bench     # benchmarks
-cargo run --release --bin load      # the server over the wire: latency, cores, memory (needs XYNE_SYNC_PG_DSN)
+cargo run --release --bin load      # the server over the wire: latency, cores, memory (needs STREAMGRES_PG_DSN)
 ```
 
 The tests against a real PostgreSQL run when `STREAMGRES_PG_DSN` is set and
@@ -128,7 +128,7 @@ comparison needs an explanation.
 
 ## License
 
-Xyne-Sync is licensed under the [Apache License, Version 2.0](LICENSE). Unless
+Streamgres is licensed under the [Apache License, Version 2.0](LICENSE). Unless
 you say otherwise, any contribution you submit is licensed under the same
 terms, as section 5 of the licence provides.
 
