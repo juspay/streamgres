@@ -30,8 +30,8 @@
 //! 4. **LEFT JOIN** — `tickets LEFT JOIN users ON assigned_to = users.id`
 //!    with 1_000 identical subscriptions plus 100 distinct ones over 1_000
 //!    users: ticket inserts, ticket reassignments, and user updates.
-//! 6. **xyne-spaces** — three of the dashboard's query shapes on the real
-//!    catalog over synthetic data: `browsableChannels` (an existence test
+//! 6. **Production query workload** — three dashboard query shapes over
+//!    synthetic data: `browsableChannels` (an existence test
 //!    inside an `OR`), `conversationMessages` under the channel-access
 //!    chain (three INNER edges deep, the visibility rule with `IS NULL`),
 //!    and the board view (`IS NULL`, `OR` with `IS NULL`, two LEFT edges,
@@ -44,7 +44,7 @@
 //!    out (PostgreSQL's "unchanged" for an out-of-line value), on rows a
 //!    subscription holds (completed from the frame) and on rows moving
 //!    into a subscription that nobody holds (read again by key).
-//! 5. **Postgres** (only when `XYNE_SYNC_PG_DSN` names a database with
+//! 5. **Postgres** (only when `STREAMGRES_PG_DSN` names a database with
 //!    `wal_level = logical` and `bench` in its name, since the scenario
 //!    replaces its `users` and `tickets` tables) — the same join over real tables: a
 //!    registration's end-to-end latency (two positioned reads), writes
@@ -70,19 +70,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use xyne_sync::ivm::{
+use streamgres::ivm::{
     Fetch, IvmStats, MultiTableIVM, SingleTableIVM, complete_image, evaluate, order_rows,
 };
-use xyne_sync::model::ComparisonOperator::{EQ, GTE};
-use xyne_sync::model::*;
-use xyne_sync::sync::pg::{PgStorage, PgStream};
-use xyne_sync::sync::{Local, Lsn, Runtime, Snapshot, Storage, StorageError};
+use streamgres::model::ComparisonOperator::{EQ, GTE};
+use streamgres::model::*;
+use streamgres::sync::pg::{PgStorage, PgStream};
+use streamgres::sync::{Local, Lsn, Runtime, Snapshot, Storage, StorageError};
 
-/// The xyne-spaces catalog, generated from the application's schema, shared with
-/// the test suite of the same name.
-#[path = "../../tests/xyne_spaces_queries/catalog.rs"]
+/// The production-app catalog shared with the query scenario tests.
+#[path = "../../tests/streamgres_queries/catalog.rs"]
 #[allow(dead_code)]
-mod xyne;
+mod workload;
 
 /// The single-table engine under the synchronous driver over bench storage.
 type Single = Local<SingleTableIVM, BenchStorage>;
@@ -1404,12 +1403,12 @@ unsafe impl Sync for MallocConf {}
 
 fn main() {
     println!(
-        "xyne_sync bench: release build, single thread, xorshift seed {SEED:#x}, tables {} / {}",
+        "streamgres bench: release build, single thread, xorshift seed {SEED:#x}, tables {} / {}",
         tickets_table().name,
         users_table().name
     );
     let profiler =
-        match xyne_sync::profile::Config::from_env().and_then(xyne_sync::profile::start) {
+        match streamgres::profile::Config::from_env().and_then(streamgres::profile::start) {
             Ok(profiler) => profiler,
             Err(error) => {
                 eprintln!("{error}");
@@ -1439,19 +1438,19 @@ fn main() {
         left_join();
     }
     if wanted("xyne") {
-        xyne_spaces();
+        production_query_workload();
     }
     if wanted("toast") {
         partial_images();
     }
     if wanted("postgres") {
-        match std::env::var("XYNE_SYNC_PG_DSN") {
+        match std::env::var("STREAMGRES_PG_DSN") {
             Ok(dsn) if bench_database(&dsn) => postgres(&dsn),
             Ok(dsn) => println!(
                 "\n== 5. postgres: skipped ({dsn} does not name a database with `bench` in its name; the scenario drops and recreates `users` and `tickets` there) =="
             ),
             Err(_) => println!(
-                "\n== 5. postgres: skipped (set XYNE_SYNC_PG_DSN to a database with wal_level = logical and `bench` in its name) =="
+                "\n== 5. postgres: skipped (set STREAMGRES_PG_DSN to a database with wal_level = logical and `bench` in its name) =="
             ),
         }
     }
@@ -1473,10 +1472,10 @@ fn bench_database(dsn: &str) -> bool {
 }
 
 /// Whether scenario `name` runs: every scenario unless
-/// `XYNE_SYNC_BENCH_ONLY` names some (comma-separated: `routing`,
+/// `STREAMGRES_BENCH_ONLY` names some (comma-separated: `routing`,
 /// `twins`, `release`, `window`, `join`, `xyne`, `toast`, `postgres`).
 fn wanted(name: &str) -> bool {
-    std::env::var("XYNE_SYNC_BENCH_ONLY")
+    std::env::var("STREAMGRES_BENCH_ONLY")
         .map(|only| only.split(',').any(|scenario| scenario.trim() == name))
         .unwrap_or(true)
 }
@@ -2076,14 +2075,14 @@ fn postgres(dsn: &str) {
 /// A full row image of the xyne table `table`: every declared column,
 /// `pairs` where given, `NULL` elsewhere, with its key.
 fn xy_row(table: &str, pairs: &[(&str, Value)]) -> (DataFrameKey, DataFrameRow) {
-    let mut data: HashMap<ColumnName, Value> = xyne::columns(table)
+    let mut data: HashMap<ColumnName, Value> = workload::columns(table)
         .iter()
         .map(|(column, _)| (ColumnName::from(*column), Value::Null))
         .collect();
     for (column, value) in pairs {
         data.insert(ColumnName::from(*column), value.clone());
     }
-    let key = DataFrameKey::new([(xyne::pkey(table), data[xyne::pkey(table)].clone())]);
+    let key = DataFrameKey::new([(workload::pkey(table), data[workload::pkey(table)].clone())]);
     (key, DataFrameRow::from(data))
 }
 
@@ -2111,7 +2110,7 @@ fn xy_update(table: &str, pairs: &[(&str, Value)]) -> WriteQuery {
 fn xy_delete(table: &str, id: &str) -> WriteQuery {
     WriteQuery::DELETE(DeleteQuery {
         table: table.into(),
-        pkey_value: DataFrameKey::new([(xyne::pkey(table), Value::from(id))]),
+        pkey_value: DataFrameKey::new([(workload::pkey(table), Value::from(id))]),
     })
 }
 
@@ -2120,21 +2119,21 @@ fn xy_query(table: &str, filter: Where) -> SingleTableReadQuery {
     SingleTableReadQuery::new(
         table,
         filter,
-        OrderBy::new(xyne::pkey(table), Order::ASC),
+        OrderBy::new(workload::pkey(table), Order::ASC),
         u32::MAX,
     )
 }
 
 /// A join edge along the schema relationship `name` of `table`.
 fn xy_left(table: &str, name: &str, sub: MultiTableReadQuery) -> Join {
-    let rel = xyne::rel(table, name);
+    let rel = workload::rel(table, name);
     Join::left(sub, rel.source, rel.dest)
 }
 
 /// The INNER edge (driven from the sub) of the xyne relationship `name`
 /// of `table` to `sub`.
 fn xy_inner(table: &str, name: &str, sub: MultiTableReadQuery) -> Join {
-    let rel = xyne::rel(table, name);
+    let rel = workload::rel(table, name);
     Join::inner(sub, rel.source, rel.dest)
 }
 
@@ -2146,7 +2145,7 @@ fn xy_channel_access(user: &str) -> MultiTableReadQuery {
             "channels",
             Where::OR(vec![
                 Where::condition("visibility", EQ, "PUBLIC"),
-                Where::exists(xyne::rel("channels", "participants").source, 0),
+                Where::exists(workload::rel("channels", "participants").source, 0),
             ]),
         ),
         vec![xy_inner(
@@ -2458,10 +2457,10 @@ fn xy_route(
     (run, delivered)
 }
 
-/// Scenario 6: the xyne-spaces query shapes over synthetic data.
-fn xyne_spaces() {
+/// Scenario 6: production-app query shapes over synthetic data.
+fn production_query_workload() {
     println!(
-        "\n== 6. xyne-spaces: browsableChannels, conversationMessages under the channel ACL, the board view as a page of {XY_BOARD_PAGE} ({XY_USERS} users, {XY_CHANNELS} channels, {} conversations, {} messages, {XY_TICKETS} tickets on {XY_BOARDS} boards) ==",
+        "\n== 6. production query workload: browsableChannels, conversationMessages under the channel ACL, the board view as a page of {XY_BOARD_PAGE} ({XY_USERS} users, {XY_CHANNELS} channels, {} conversations, {} messages, {XY_TICKETS} tickets on {XY_BOARDS} boards) ==",
         XY_CHANNELS * XY_CONVERSATIONS_PER_CHANNEL,
         XY_CHANNELS * XY_CONVERSATIONS_PER_CHANNEL * XY_MESSAGES_PER_CONVERSATION
     );

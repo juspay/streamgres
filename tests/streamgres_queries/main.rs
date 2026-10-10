@@ -32,7 +32,7 @@
 /// `row!["id" => "t1", "createdAt" => 100]`.
 macro_rules! row {
     ($($column:expr => $value:expr),* $(,)?) => {
-        &[$(($column, ::xyne_sync::model::Value::from($value))),*][..]
+        &[$(($column, ::streamgres::model::Value::from($value))),*][..]
     };
 }
 

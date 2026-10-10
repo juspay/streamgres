@@ -2,9 +2,9 @@
 //! participants and status rows, sections, bookmarks, links, and the SDLC
 //! hub queries, one test per registry entry over one workspace fixture.
 
-use xyne_sync::model::ComparisonOperator::{GT, NEQ};
-use xyne_sync::model::Order::{ASC, DESC};
-use xyne_sync::model::Value;
+use streamgres::model::ComparisonOperator::{GT, NEQ};
+use streamgres::model::Order::{ASC, DESC};
+use streamgres::model::Value;
 
 use super::world::{ME, World, ops, with};
 use super::zql::{and, eq, is_null, or, same, zql};
@@ -752,7 +752,7 @@ fn get_sdlc_links() {
 }
 
 /// `column != value`.
-fn cmp_ne(column: &str, value: &str) -> xyne_sync::model::Where {
+fn cmp_ne(column: &str, value: &str) -> streamgres::model::Where {
     super::zql::cmp(column, NEQ, value)
 }
 

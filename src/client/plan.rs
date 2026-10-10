@@ -39,7 +39,7 @@
 //! before any of this (`ast::merge_exists`), so they are counted and
 //! compared as one.
 //!
-//! So the canvases a reader may see — `createdBy = me OR EXISTS
+//! For example, the canvases a reader may see — `createdBy = me OR EXISTS
 //! participants(userId = me OR EXISTS group(EXISTS member = me) OR EXISTS
 //! channel(EXISTS member = me))`, twenty thousand canvases, a page of
 //! twenty — are read from the leaves: the reader's few memberships drive
@@ -75,7 +75,7 @@
 //! is that caller for the server, and it plans a query once per **name**
 //! rather than once per set of arguments: the plan (every edge's driver,
 //! every page's read) is remembered by the query's name for
-//! `XYNE_SYNC_PLAN_QUERY_TTL_MS` (a day) and laid onto every later tree
+//! `STREAMGRES_PLAN_QUERY_TTL_MS` (a day) and laid onto every later tree
 //! of that name, whoever asks and with whatever arguments — ids, lists,
 //! page sizes, cursors — so the counts run a few dozen times a day, not
 //! once per user, channel or cursor. A plan is about the join tree, not
@@ -86,7 +86,7 @@
 //! is bounded by the read limit like any read. Only a plan that was made
 //! is remembered by name; a refusal is remembered for its own tree only
 //! (keyed as translated, the identity the engine's twin sharing uses, for
-//! `XYNE_SYNC_PLAN_TTL_MS`), so one argument's refusal never spreads to
+//! `STREAMGRES_PLAN_TTL_MS`), so one argument's refusal never spreads to
 //! every other.
 
 use std::collections::{BTreeMap, HashMap};
@@ -1341,7 +1341,7 @@ mod tests {
         }
     }
 
-    /// The canvas rule as xyne-spaces states it: `canvases WHERE <own>
+    /// The canvas rule: `canvases WHERE <own>
     /// AND (createdBy = me OR EXISTS participants OR visibility = PUBLIC)
     /// AND EXISTS users LIMIT limit`, the participants `userId = me OR
     /// EXISTS group(EXISTS member = me) OR EXISTS channel(EXISTS member =

@@ -6,6 +6,7 @@ on:
       - main
       - feat/build
       - feat/schema_upgrade
+      - env_var_namechange
     tags:
       - "v*"
   workflow_dispatch:

@@ -1,4 +1,4 @@
-//! # xyne_sync
+//! # Streamgres
 //!
 //! A sync engine: clients subscribe to read queries over a WebSocket and
 //! keep receiving incremental updates to those queries as the underlying
@@ -21,7 +21,7 @@
 //! | [`client`] | The client side: the WebSocket server the sync client connects to, the sync protocol, the AST translation, and each client group's view. It drives the engine only through [`sync::Service`]'s two channels. |
 //! | [`log`] | The leveled log the binary and the client side write to. |
 //! | [`stats`] | The server's own measurements: per-stage latency histograms and counters, served at `/stats`. |
-//! | [`profile`] | Continuous CPU and heap profiling pushed to Pyroscope, when `XYNE_SYNC_PYROSCOPE_URL` asks for it. |
+//! | [`profile`] | Continuous CPU and heap profiling pushed to Pyroscope, when `STREAMGRES_PYROSCOPE_URL` asks for it. |
 //!
 //! The demo binary (`src/main.rs`) runs a scripted scenario — SQL text in,
 //! routed operations out — and prints, per write, which subscriptions were

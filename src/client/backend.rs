@@ -5,7 +5,7 @@
 //! connection's cookies and origin, its auth token when it has one, and
 //! the `schema` and `appID` parameters the server library reads. Every
 //! call is given the configured time to answer
-//! (`XYNE_SYNC_BACKEND_TIMEOUT_MS`); one that ran out of it is reported as
+//! (`STREAMGRES_BACKEND_TIMEOUT_MS`); one that ran out of it is reported as
 //! failed and not made again, since a slow server is not helped by the
 //! same question asked three times.
 

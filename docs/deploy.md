@@ -1,4 +1,4 @@
-# Deploying Xyne-Sync
+# Deploying Streamgres
 
 This guide covers running the sync server in production:
 - what it needs from PostgreSQL and from your application server
@@ -23,18 +23,18 @@ For a local first run, see the README's Quick start.
 ### The image
 
 ```bash
-docker build -f docker/server/Dockerfile -t xyne-sync .
+docker build -f docker/server/Dockerfile -t streamgres .
 ```
 
 The image is a slim Debian image of about 125 MB:
-- It has one binary, `/app/server`, run as the unprivileged user `xyne-sync`
+- It has one binary, `/app/server`, run as the unprivileged user `streamgres`
   (uid 10001).
 - It listens on port 4848 and writes JSON log lines to stderr.
 - It needs no file system, except an optional writable directory for
-  `XYNE_SYNC_PLAN_FILE` (section 5).
+  `STREAMGRES_PLAN_FILE` (section 5).
 
 `.github/workflows/docker-publish.yml` publishes the image to the GitHub
-Container Registry as `ghcr.io/<owner>/xyne-sync`. It runs on pushes to the
+Container Registry as `ghcr.io/<owner>/streamgres`. It runs on pushes to the
 branches listed in that file and on `v*` tags, tagging each image with the
 branch name and the short commit SHA.
 
@@ -53,7 +53,7 @@ branch name and the short commit SHA.
   and opening a new one every 0.75 s used about 0.6 of a core on average.
 - **Memory.** It grows with the rows clients hold: about 2 KB per row. Clients
   holding the same row share one copy. A client group's rows are kept for
-  `XYNE_SYNC_GROUP_TTL_MS` after its last connection closes, so memory tracks
+  `STREAMGRES_GROUP_TTL_MS` after its last connection closes, so memory tracks
   the clients seen within that window, not just the ones connected now.
 - **One replica.** State lives in memory. Every tab of one client group has to
   reach the same instance, which nothing routes for yet, so run a single
@@ -72,14 +72,14 @@ branch name and the short commit SHA.
   for its change feed, `xyne_sync_slot_<uuid>`, plus short-lived ones,
   `xyne_sync_snap_*`, behind its read snapshots.
 - **Spare connections.** Allow about 40 connections:
-  `XYNE_SYNC_READ_CONNECTIONS`, plus the feed, plus a few more.
+  `STREAMGRES_READ_CONNECTIONS`, plus the feed, plus a few more.
 - **A role** with `REPLICATION` and `SELECT` on the served schemas.
 - **A direct connection, not PgBouncer.** Logical replication does not pass
   through PgBouncer.
 
 **The server writes nothing to the database it follows.** It reads rows and
 the replication stream. Its position in the stream comes from each commit and
-from the keepalives PostgreSQL sends anyway. So `XYNE_SYNC_PG_DSN` can point
+from the keepalives PostgreSQL sends anyway. So `STREAMGRES_PG_DSN` can point
 at:
 - the primary,
 - a logical replica, or
@@ -95,7 +95,7 @@ at:
    CREATE PUBLICATION xyne_sync_pub FOR ALL TABLES;  -- needs a superuser
    ```
 
-   The name is set by `XYNE_SYNC_PUBLICATION`. The publication must include
+   The name is set by `STREAMGRES_PUBLICATION`. The publication must include
    your application's mutation-tracking tables (section 4).
 
 2. **Install the schema-change event trigger** on the primary. The server
@@ -113,15 +113,15 @@ at:
    migration, inside the migration's own transaction, it records the published
    schema before and after into the WAL. The server therefore sees each schema
    change at its commit, on any topology. Use the same app id and shard you set
-   in `XYNE_SYNC_APP_ID` and `XYNE_SYNC_SHARD`.
+   in `STREAMGRES_APP_ID` and `STREAMGRES_SHARD`.
 
 ### Replication slots
 
 - **Each server process creates its own slot** at startup, on the database
-  `XYNE_SYNC_PG_DSN` names. On `SIGTERM` it drops the slot. A restart needs
+  `STREAMGRES_PG_DSN` names. On `SIGTERM` it drops the slot. A restart needs
   nothing from the previous slot.
 - **A slot left behind by a crash holds WAL.** Either:
-  - set `XYNE_SYNC_SLOT_CLEANUP_AGE_MS` so the next startup drops inactive
+  - set `STREAMGRES_SLOT_CLEANUP_AGE_MS` so the next startup drops inactive
     `xyne_sync_slot_*` slots older than that age (needs PostgreSQL 17+, which
     records `inactive_since`), or
   - drop them by hand: `SELECT pg_drop_replication_slot('<slot name>');`
@@ -145,7 +145,7 @@ at:
 - **Read snapshots sit on silent connections.** Each read snapshot lives on a
   connection that must stay idle inside a transaction for its whole life,
   because any command would discard the snapshot.
-  - TCP keepalive (`XYNE_SYNC_PG_KEEPALIVE_*`) keeps these connections through
+  - TCP keepalive (`STREAMGRES_PG_KEEPALIVE_*`) keeps these connections through
     NATs and load balancers, so keep its idle time below whatever drops silent
     connections on your network.
   - The server turns off `idle_in_transaction_session_timeout` for its own
@@ -184,10 +184,10 @@ shipping a frontend that needs the change.
 The server sends the client's requests to your application server:
 
 - **Queries.** A client asks for queries by name and arguments. The server
-  posts them to `XYNE_SYNC_QUERY_URL`, forwarding the connection's cookies
-  unless `XYNE_SYNC_FORWARD_COOKIES=false`, and receives query ASTs back.
+  posts them to `STREAMGRES_QUERY_URL`, forwarding the connection's cookies
+  unless `STREAMGRES_FORWARD_COOKIES=false`, and receives query ASTs back.
 - **Mutations.** A client's pushes are forwarded unchanged to
-  `XYNE_SYNC_MUTATE_URL`, with the cookies, plus `schema` and `appID`
+  `STREAMGRES_MUTATE_URL`, with the cookies, plus `schema` and `appID`
   parameters.
 - **Recording mutations.** In the same transaction as each mutation, your
   application server records the client's last mutation id in
@@ -209,9 +209,9 @@ directory is read first, and variables already set take precedence.
 
 | variable | meaning |
 |---|---|
-| `XYNE_SYNC_PG_DSN` | the PostgreSQL to follow, reached directly (section 3) |
-| `XYNE_SYNC_QUERY_URL` | the application server's query endpoint |
-| `XYNE_SYNC_MUTATE_URL` | the application server's mutate endpoint |
+| `STREAMGRES_PG_DSN` | the PostgreSQL to follow, reached directly (section 3) |
+| `STREAMGRES_QUERY_URL` | the application server's query endpoint |
+| `STREAMGRES_MUTATE_URL` | the application server's mutate endpoint |
 
 ### Set explicitly
 
@@ -220,51 +220,52 @@ depend on what the defaults happen to be:
 
 | variable | example | meaning |
 |---|---|---|
-| `XYNE_SYNC_BASE_PATH` | `/sync` | URL path prefix clients connect under. A client's server URL ends in it |
-| `XYNE_SYNC_APP_ID` | `xyne` | app id. With the shard, it names the `<app>_<shard>` schema of the mutation tables, the event trigger and its message prefix |
-| `XYNE_SYNC_SHARD` | `0` | shard number |
+| `STREAMGRES_BASE_PATH` | `/sync` | URL path prefix clients connect under. A client's server URL ends in it |
+| `STREAMGRES_APP_ID` | `xyne` | app id. With the shard, it names the `<app>_<shard>` schema of the mutation tables, the event trigger and its message prefix |
+| `STREAMGRES_SHARD` | `0` | shard number |
 
 ### Recommended for production
 
 | variable | suggested | default | why |
 |---|---|---|---|
-| `XYNE_SYNC_GROUP_TTL_MS` | `3600000` | `60000` | how long a disconnected client group's state is kept. A client back within it resumes instead of re-downloading everything |
-| `XYNE_SYNC_GROUP_THREADS` | `2` | `1` | threads that build and send updates to clients |
-| `XYNE_SYNC_READ_THREADS` | `4` | `2` | threads that run and decode database reads |
-| `XYNE_SYNC_READ_CONNECTIONS` | `32` | `16` | database connections for reads |
-| `XYNE_SYNC_ROW_LIMIT` | sized to your data | `100000` | the most rows read into memory at once. A larger read is refused, and the query named in logs and metrics |
-| `XYNE_SYNC_PLAN_FILE` | `/var/lib/xyne-sync/plans.json` | unset | query shapes seen so far, planned again at startup, so the first clients after a restart are fast. Needs a writable volume |
-| `XYNE_SYNC_LOG_FORMAT` | `json` | `text` | already set in the image |
+| `STREAMGRES_GROUP_TTL_MS` | `3600000` | `60000` | how long a disconnected client group's state is kept. A client back within it resumes instead of re-downloading everything |
+| `STREAMGRES_GROUP_THREADS` | `2` | `1` | threads that build and send updates to clients |
+| `STREAMGRES_READ_THREADS` | `4` | `2` | threads that run and decode database reads |
+| `STREAMGRES_READ_CONNECTIONS` | `32` | `16` | database connections for reads |
+| `STREAMGRES_ROW_LIMIT` | sized to your data | `100000` | the most rows read into memory at once. A larger read is refused, and the query named in logs and metrics |
+| `STREAMGRES_PLAN_FILE` | `/var/lib/streamgres/plans.json` | unset | query shapes seen so far, planned again at startup, so the first clients after a restart are fast. Needs a writable volume |
+| `STREAMGRES_LOG_FORMAT` | `json` | `text` | already set in the image |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://<collector>:4318` | unset | push metrics (and optionally logs) over OTLP. See [observability](observability.md) |
 
 ### All other settings
 
 | variable | default | meaning |
 |---|---|---|
-| `XYNE_SYNC_ADDR` | `0.0.0.0:4848` | listen address |
-| `XYNE_SYNC_SCHEMAS` | `public,<app>_<shard>` | schemas whose tables are served |
-| `XYNE_SYNC_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams |
-| `XYNE_SYNC_DDL_TRIGGER` | `<app>_ddl_end_<shard>` | the schema-change event trigger the server requires |
-| `XYNE_SYNC_DDL_PREFIX` | `<app>/<shard>/ddl` | the prefix of that trigger's messages |
-| `XYNE_SYNC_FORWARD_COOKIES` | `true` | forward the connection's cookies to the application server |
-| `XYNE_SYNC_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is created |
-| `XYNE_SYNC_SLOT_CLEANUP_AGE_MS` | `0` (off) | at startup, drop inactive slots of ended processes older than this (PostgreSQL 17+) |
-| `XYNE_SYNC_READ_TIMEOUT_MS` | `10000` | longest a database read may take before it is cancelled and its query refused. `0` means no limit |
-| `XYNE_SYNC_BACKEND_TIMEOUT_MS` | `30000` | longest a call to the application server may take. `0` means no limit |
-| `XYNE_SYNC_PG_KEEPALIVE_IDLE_MS`, `_INTERVAL_MS`, `_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on database connections. `0` idle time turns it off |
-| `XYNE_SYNC_WHOLE_PAGE_LIMIT` | `5000` | a page that drives a join is read whole up to this many rows, in growing batches past it |
-| `XYNE_SYNC_JOIN_PREFERRED_SIDE` | `parent` | which side drives a join when both plans cost the same |
-| `XYNE_SYNC_PLAN_QUERY_TTL_MS` | `86400000` | how long one plan is reused for every query of the same name and join shape. `0` plans every query separately |
-| `XYNE_SYNC_PLAN_TTL_MS`, `XYNE_SYNC_PLAN_CACHE` | `600000`, `10000` | how long refused plans are remembered, and how many plans are kept |
-| `XYNE_SYNC_TRANSFORM_TTL_MS`, `XYNE_SYNC_TRANSFORM_CACHE` | `60000`, `20000` | how long query ASTs from the application server are cached per user, and how many |
-| `XYNE_SYNC_WARM_START_MS` | `20000` | most time spent re-planning saved query shapes at startup |
-| `XYNE_SYNC_PING_INTERVAL_MS`, `XYNE_SYNC_CLIENT_TIMEOUT_MS`, `XYNE_SYNC_PONG_INTERVAL_MS` | `30000`, `45000`, `3000` | connection liveness |
-| `XYNE_SYNC_GROUP_LOG_BYTES` | `262144` | recent updates kept per client group, so a briefly disconnected tab catches up instead of starting over. `0` keeps none |
-| `XYNE_SYNC_MAX_MESSAGE_BYTES` | `16777216` | largest message accepted from a client |
-| `XYNE_SYNC_ROWS_PER_PART` | `500` | row changes per message part |
-| `XYNE_SYNC_LOG` | `info` | `error`, `warn`, `info` or `debug`. `debug` costs throughput |
-| `XYNE_SYNC_SLOW_QUERY_MS` | `1000` | queries and pushes slower than this are logged at `warn` |
-| `XYNE_SYNC_METRICS_INTERVAL_MS` | `10000` | how often process metrics are sampled |
+| `STREAMGRES_ADDR` | `0.0.0.0:4848` | listen address |
+| `STREAMGRES_SCHEMAS` | `public,<app>_<shard>` | schemas whose tables are served |
+| `STREAMGRES_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams |
+| `STREAMGRES_DDL_TRIGGER` | `<app>_ddl_end_<shard>` | the schema-change event trigger the server requires |
+| `STREAMGRES_DDL_PREFIX` | `<app>/<shard>/ddl` | the prefix of that trigger's messages |
+| `STREAMGRES_FORWARD_COOKIES` | `true` | forward the connection's cookies to the application server |
+| `STREAMGRES_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is created |
+| `STREAMGRES_SLOT_CLEANUP_AGE_MS` | `0` (off) | at startup, drop inactive slots of ended processes older than this (PostgreSQL 17+) |
+| `STREAMGRES_READ_TIMEOUT_MS` | `10000` | longest a database read may take before it is cancelled and its query refused. `0` means no limit |
+| `STREAMGRES_BACKEND_TIMEOUT_MS` | `30000` | longest a call to the application server may take. `0` means no limit |
+| `STREAMGRES_PG_KEEPALIVE_IDLE_MS`, `_INTERVAL_MS`, `_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on database connections. `0` idle time turns it off |
+| `STREAMGRES_WHOLE_PAGE_LIMIT` | `5000` | a page that drives a join is read whole up to this many rows, in growing batches past it |
+| `STREAMGRES_JOIN_PREFERRED_SIDE` | `parent` | which side drives a join when both plans cost the same |
+| `STREAMGRES_PLAN_QUERY_TTL_MS` | `86400000` | how long one plan is reused for every query of the same name and join shape. `0` plans every query separately |
+| `STREAMGRES_PLAN_TTL_MS`, `STREAMGRES_PLAN_CACHE` | `600000`, `10000` | how long refused plans are remembered, and how many plans are kept |
+| `STREAMGRES_TRANSFORM_TTL_MS`, `STREAMGRES_TRANSFORM_CACHE` | `60000`, `20000` | how long query ASTs from the application server are cached per user, and how many |
+| `STREAMGRES_WARM_START_MS` | `20000` | most time spent re-planning saved query shapes at startup |
+| `STREAMGRES_PING_INTERVAL_MS`, `STREAMGRES_CLIENT_TIMEOUT_MS`, `STREAMGRES_PONG_INTERVAL_MS` | `30000`, `45000`, `3000` | connection liveness |
+| `STREAMGRES_GROUP_LOG_BYTES` | `262144` | recent updates kept per client group, so a briefly disconnected tab catches up instead of starting over. `0` keeps none |
+| `STREAMGRES_MAX_MESSAGE_BYTES` | `16777216` | largest message accepted from a client |
+| `STREAMGRES_ROWS_PER_PART` | `500` | row changes per message part |
+| `STREAMGRES_LOG` | `info` | `error`, `warn`, `info` or `debug`. `debug` costs throughput |
+| `STREAMGRES_SLOW_QUERY_MS` | `1000` | queries and pushes slower than this are logged at `warn` |
+| `STREAMGRES_METRICS_INTERVAL_MS` | `10000` | how often process metrics are sampled |
+| `STREAMGRES_METRICS_PREFIX` | `xyne_sync` | prefix for exported metric names. Keep the default for existing Grafana dashboards; set `streamgres` to use `streamgres_*` names and update dashboard queries accordingly |
 | other `OTEL_*` | | see [observability](observability.md), section 5 |
 
 ## 6. Ports, probes and shutdown
@@ -300,7 +301,7 @@ Clients connect to `<scheme>://<host>/<base path>`.
   routing change. The servers don't share state, so a client that moves
   starts a fresh sync on its own.
 - **Two servers side by side.** For example, to test a new deployment:
-  - give each server its own base path (`XYNE_SYNC_BASE_PATH`) and route
+  - give each server its own base path (`STREAMGRES_BASE_PATH`) and route
     each path to its own server;
   - build the client that uses the second path with a different local storage
     key, so the two don't overwrite each other's local data in the browser.
@@ -338,7 +339,7 @@ though nothing is wrong.
 ## 9. Known limits
 
 - **Unsupported queries are refused, not run.** This covers `LIKE`/`ILIKE`,
-  `NOT EXISTS`, compound join keys, and any read over `XYNE_SYNC_ROW_LIMIT`.
+  `NOT EXISTS`, compound join keys, and any read over `STREAMGRES_ROW_LIMIT`.
   Each one is refused by name, in `/stats.refused_queries` and in the
   `query refused` log event. The client sees that one query fail; the rest of
   the app is unaffected.

@@ -1,5 +1,5 @@
 [package]
-name = "xyne_sync"
+name = "streamgres"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
@@ -73,7 +73,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
 
 # Continuous CPU and heap profiling pushed to Pyroscope (`src/profile.rs`), off
-# unless XYNE_SYNC_PYROSCOPE_URL is set. The pprof-rs backend samples on
+# unless STREAMGRES_PYROSCOPE_URL is set. The pprof-rs backend samples on
 # SIGPROF and unwinds with framehop from the unwind tables, so no frame
 # pointers are needed. TLS is rustls without a provider of its own: the
 # ring provider the reqwest above already builds is installed for it,
@@ -92,7 +92,7 @@ log = "0.4"
 
 # Limited debug info in the release binary, so a profile's frames name
 # the functions inlined into their callers by their full paths
-# (`xyne_sync::ivm::multi::MultiTableIVM::incremental_update`): line
+# (`ivm::multi::MultiTableIVM::incremental_update`): line
 # tables alone name an inlined function by its last segment only
 # (`incremental_update`). No types or variables; the code generated is
 # the same.

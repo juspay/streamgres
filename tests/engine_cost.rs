@@ -11,14 +11,14 @@
 
 macro_rules! row {
     ($($column:expr => $value:expr),* $(,)?) => {
-        &[$(($column, ::xyne_sync::model::Value::from($value))),*][..]
+        &[$(($column, ::streamgres::model::Value::from($value))),*][..]
     };
 }
 
-#[path = "xyne_spaces_queries/catalog.rs"]
+#[path = "streamgres_queries/catalog.rs"]
 #[allow(dead_code)]
 mod catalog;
-#[path = "xyne_spaces_queries/zql.rs"]
+#[path = "streamgres_queries/zql.rs"]
 #[allow(dead_code)]
 mod zql;
 
@@ -27,14 +27,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use xyne_sync::client::plan::{Planner, Policy, Side};
-use xyne_sync::ivm::MultiTableIVM;
-use xyne_sync::model::Order::DESC;
-use xyne_sync::model::{
+use streamgres::client::plan::{Planner, Policy, Side};
+use streamgres::ivm::MultiTableIVM;
+use streamgres::model::Order::DESC;
+use streamgres::model::{
     ColumnName, DataFrameKey, DataFrameRow, InsertQuery, Lsn, MultiTableReadQuery,
     SingleTableReadQuery, Snapshot, Value, WriteQuery,
 };
-use xyne_sync::sync::{Local, MemoryStorage, Storage, StorageError};
+use streamgres::sync::{Local, MemoryStorage, Storage, StorageError};
 use zql::{Q, eq, is_null, or, zql};
 
 const ME: &str = "u-me";
@@ -166,7 +166,7 @@ impl Bench {
         self.storage.inner.apply(&image(table, pairs));
     }
     /// Register `query`, printing engine time (total minus storage) and storage stats.
-    fn register(&mut self, label: &str, query: MultiTableReadQuery) -> xyne_sync::model::SubId {
+    fn register(&mut self, label: &str, query: MultiTableReadQuery) -> streamgres::model::SubId {
         self.storage.take();
         let started = Instant::now();
         let (sub, updates) = self.ivm.register_query(query);
@@ -419,7 +419,7 @@ fn b_small_writes_into_big_trees() {
     b.write_all("B 2000 conversation inserts", writes);
     let writes: Vec<WriteQuery> = (0..2000).map(|k| {
         image("channels", row!["id" => format!("c{}", k % 20_000).as_str(), "name" => format!("renamed {k}").as_str(), "visibility" => "PRIVATE", "updatedAt" => 99_000 + k as i64])
-    }).map(|w| match w { WriteQuery::INSERT(i) => WriteQuery::UPDATE(xyne_sync::model::UpdateQuery { table: i.table, pkey_value: i.pkey_value, record: i.record }), other => other }).collect();
+    }).map(|w| match w { WriteQuery::INSERT(i) => WriteQuery::UPDATE(streamgres::model::UpdateQuery { table: i.table, pkey_value: i.pkey_value, record: i.record }), other => other }).collect();
     b.write_all("B 2000 channel renames (3 admins hold all)", writes);
     let writes: Vec<WriteQuery> = (0..2000).map(|k| {
         image("messages", row!["messageId" => format!("m{k}").as_str(), "conversationId" => format!("cv{}-{}", k % 200, k % 40).as_str(), "content" => "hi", "createdAt" => k as i64])

@@ -3,10 +3,10 @@
 //! plus the two rewrites that need no engine change (keyset cursors and the
 //! empty `IN` list), shown to be exact.
 
-use xyne_sync::model::ComparisonOperator::{GT, NEQ};
-use xyne_sync::model::Order::{ASC, DESC};
-use xyne_sync::model::{OrderBy, Value, ValueType, Where};
-use xyne_sync::parser::parse_read;
+use streamgres::model::ComparisonOperator::{GT, NEQ};
+use streamgres::model::Order::{ASC, DESC};
+use streamgres::model::{OrderBy, Value, ValueType, Where};
+use streamgres::parser::parse_read;
 
 use super::catalog::catalog;
 use super::world::{ME, World, ops};

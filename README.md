@@ -108,17 +108,19 @@ with `trigger_stack_sql` in `src/client/ddl_triggers.rs`.
 ### 2. Configure and run
 
 ```bash
-cp .env.example .env     # set XYNE_SYNC_PG_DSN, XYNE_SYNC_QUERY_URL, XYNE_SYNC_MUTATE_URL
+cp .env.example .env     # set STREAMGRES_PG_DSN, STREAMGRES_QUERY_URL, STREAMGRES_MUTATE_URL
 cargo run --release --bin server
 ```
 
 The server listens on `0.0.0.0:4848`. Point the client's `server` option at
-`http://<host>:4848/sync`, which is the `XYNE_SYNC_BASE_PATH` from
+`http://<host>:4848/sync`, which is the `STREAMGRES_BASE_PATH` from
 `.env.example`. `GET /health` returns `200` once the server is ready to serve
 queries.
 
-Configuration is all `XYNE_SYNC_*` environment variables, each documented in
-[`.env.example`](.env.example). For production setup see
+Configuration uses `STREAMGRES_*` environment variables, each documented in
+[`.env.example`](.env.example). Existing `XYNE_SYNC_*` variables are still
+accepted as fallbacks; a `STREAMGRES_*` value takes precedence when both are
+set. For production setup see
 [`docs/deploy.md`](docs/deploy.md): sizing, PostgreSQL roles and replicas,
 probes and routing. For metrics, logs and alerts see
 [`docs/observability.md`](docs/observability.md).
@@ -126,8 +128,8 @@ probes and routing. For metrics, logs and alerts see
 ### Docker
 
 ```bash
-docker build -f docker/server/Dockerfile -t xyne-sync .
-docker run --env-file .env -p 4848:4848 xyne-sync
+docker build -f docker/server/Dockerfile -t streamgres .
+docker run --env-file .env -p 4848:4848 streamgres
 ```
 
 ---
@@ -201,11 +203,12 @@ for one subscriber or ten thousand.
 
 ```bash
 cargo test                          # unit and scenario tests
-cargo run --bin xyne_sync           # demo: SQL in, routed operations and cost counters out
+cargo run --bin streamgres           # demo: SQL in, routed operations and cost counters out
 cargo run --release --bin bench     # benchmarks: routing, registration, windows, joins
 cargo clippy --all-targets
 ```
 
+Tests against a real PostgreSQL run when `STREAMGRES_PG_DSN` is set, and report
 The load bench runs the whole server over the wire under a production-shaped
 load and reports its CPU, cores by thread and memory at the median, 90th and
 99th percentile, beside the commit-to-client latency of every kind of row. It
@@ -225,7 +228,7 @@ Tests against a real PostgreSQL run when `XYNE_SYNC_PG_DSN` is set, and report
 themselves skipped otherwise:
 
 ```bash
-XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5432/xyne_sync cargo test --test pg_live
+STREAMGRES_PG_DSN=postgresql://postgres@localhost:5432/streamgres cargo test --test pg_live
 ```
 
 `scripts/` holds the end-to-end checks:
@@ -238,10 +241,10 @@ XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5432/xyne_sync cargo test --tes
 
 ```rust
 use std::rc::Rc;
-use xyne_sync::ivm::SingleTableIVM;
-use xyne_sync::model::*;
-use xyne_sync::parser::{parse_read, parse_write};
-use xyne_sync::sync::{Local, MemoryStorage};
+use streamgres::ivm::SingleTableIVM;
+use streamgres::model::*;
+use streamgres::parser::{parse_read, parse_write};
+use streamgres::sync::{Local, MemoryStorage};
 
 let catalog = Catalog::new(vec![DbTable::new("tickets", ["id"], vec![
     DbColumn::new("id", ValueType::Int),
@@ -285,7 +288,7 @@ docs/        deployment and observability guides
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, what CI checks and the code
 conventions. In short:
 
-- Run `cargo test && cargo clippy --all-targets && cargo run --bin xyne_sync`
+- Run `cargo test && cargo clippy --all-targets && cargo run --bin streamgres`
   before opening a pull request. The demo must end with every check `PASS`.
 - Engine behaviour lives in `src/ivm/`. A change to *what matches* belongs in
   `predicate.rs`, with a test alongside it. Routing changes are expected to

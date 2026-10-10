@@ -5,9 +5,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use std::rc::Rc;
-use xyne_sync::ivm::{Delta, SingleTableIVM, SubId};
-use xyne_sync::model::*;
-use xyne_sync::sync::{Local, MemoryStorage};
+use streamgres::ivm::{Delta, SingleTableIVM, SubId};
+use streamgres::model::*;
+use streamgres::sync::{Local, MemoryStorage};
 
 /// The single-table engine under the synchronous driver, over in-process
 /// storage: registration and routing keep the engine's own call shape,
@@ -734,7 +734,7 @@ fn shared_counter_survives_partial_unregistration() {
 #[test]
 fn counting_agrees_with_tree_evaluation() {
     use ComparisonOperator::*;
-    use xyne_sync::ivm::evaluate;
+    use streamgres::ivm::evaluate;
 
     let tickets = table("tickets");
     let filters: Vec<Where> = vec![

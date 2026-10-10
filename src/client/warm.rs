@@ -268,7 +268,7 @@ mod tests {
     /// A file of its own for one test.
     fn scratch(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("xyne-sync-warm-{name}-{}.json", std::process::id()));
+        path.push(format!("streamgres-warm-{name}-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
     }

@@ -1,7 +1,7 @@
 //! The server's configuration, read from the environment: where to
 //! listen, which database the engine side follows, where the application
 //! server answers query and mutation requests, and the timings of the
-//! connection protocol. Every setting has a `XYNE_SYNC_` name; the
+//! connection protocol. Every setting has a `STREAMGRES_` name; the
 //! database and application-server URLs also accept the `ZERO_` names a
 //! zero-cache deployment already sets, so one `.env` serves both.
 
@@ -16,43 +16,43 @@ use crate::sync::pg::{Keepalive, Settings, threads};
 /// Everything the server reads from the environment.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// `XYNE_SYNC_ADDR`: the address to listen on (`0.0.0.0:4848`).
+    /// `STREAMGRES_ADDR`: the address to listen on (`0.0.0.0:4848`).
     pub bind: String,
-    /// `XYNE_SYNC_BASE_PATH`: the path prefix the client connects under
+    /// `STREAMGRES_BASE_PATH`: the path prefix the client connects under
     /// (`/zero`, so the connect route is `/zero/sync/v51/connect`).
     pub base_path: String,
-    /// `XYNE_SYNC_PG_DSN` (or `ZERO_UPSTREAM_DB`): the database, with the
+    /// `STREAMGRES_PG_DSN` (or `ZERO_UPSTREAM_DB`): the database, with the
     /// user and password in the URL.
     pub dsn: String,
-    /// `XYNE_SYNC_SCHEMAS`: the schemas whose tables the catalog carries
+    /// `STREAMGRES_SCHEMAS`: the schemas whose tables the catalog carries
     /// (`public` plus the app's `zero_<shard>` schema by default).
     pub schemas: Vec<String>,
     /// The replication slot of the change feed, not configurable: each
-    /// process names its own, `xyne_sync_slot_<uuid>`.
+    /// process names its own using the existing compatible naming scheme.
     pub slot: String,
-    /// `XYNE_SYNC_SLOT_CLEANUP_AGE_MS`: how long a xyne-sync feed slot
+    /// `STREAMGRES_SLOT_CLEANUP_AGE_MS`: how long a Streamgres feed slot
     /// must have stayed inactive before startup drops it (zero disables
     /// cleanup). PostgreSQL 17 or later is required when this is enabled,
     /// because that is where `inactive_since` is available.
     pub slot_cleanup_age: Duration,
-    /// `XYNE_SYNC_PUBLICATION`: the publication the change feed streams
-    /// (`xyne_sync_pub`); it must exist before the server starts.
+    /// `STREAMGRES_PUBLICATION`: the publication the change feed streams;
+    /// it must exist before the server starts.
     pub publication: String,
-    /// `XYNE_SYNC_DDL_TRIGGER`: the event trigger on `ddl_command_end`
+    /// `STREAMGRES_DDL_TRIGGER`: the event trigger on `ddl_command_end`
     /// through which the server hears of schema changes, zero-cache's
     /// (`<app>_ddl_end_<shard>`, so `zero_ddl_end_0`); the server refuses
     /// to start without it.
     pub ddl_trigger: String,
-    /// `XYNE_SYNC_DDL_PREFIX`: the prefix of that trigger's logical
+    /// `STREAMGRES_DDL_PREFIX`: the prefix of that trigger's logical
     /// messages (`<app>/<shard>/ddl`, so `zero/0/ddl`).
     pub ddl_prefix: String,
-    /// `XYNE_SYNC_SNAPSHOT_ROTATION_MS`: how often a fresh exported
+    /// `STREAMGRES_SNAPSHOT_ROTATION_MS`: how often a fresh exported
     /// snapshot (a temporary replication slot) is minted for reads (1000).
     pub snapshot_rotation: Duration,
-    /// `XYNE_SYNC_READ_CONNECTIONS`: how many storage reads may hold a
+    /// `STREAMGRES_READ_CONNECTIONS`: how many storage reads may hold a
     /// Postgres connection at once; the rest queue (16).
     pub read_connections: usize,
-    /// `XYNE_SYNC_READ_TIMEOUT_MS`: how long one storage read (a query's
+    /// `STREAMGRES_READ_TIMEOUT_MS`: how long one storage read (a query's
     /// rows, a planner's count, a client group's mutation ids) may take,
     /// the connection it may have to open included and the wait for a free
     /// connection not. PostgreSQL is told to cancel the statement at that
@@ -60,130 +60,133 @@ pub struct Config {
     /// the read is refused, by name, rather than read again (10000; 0 sets
     /// no limit).
     pub read_timeout: Duration,
-    /// `XYNE_SYNC_READ_THREADS`: how many threads run the storage reads,
+    /// `STREAMGRES_READ_THREADS`: how many threads run the storage reads,
     /// their connections and their row decoding (2).
     pub read_threads: usize,
-    /// `XYNE_SYNC_PG_KEEPALIVE_IDLE_MS`: how long a connection to the
+    /// `STREAMGRES_PG_KEEPALIVE_IDLE_MS`: how long a connection to the
     /// database may go without a byte either way before the kernel probes
     /// the peer, so that nothing between (a NAT, a load balancer) drops it
     /// as idle. The connection behind each read snapshot is silent for its
     /// whole life, and the snapshot dies with it (30000; 0 turns the
     /// probing off).
     pub pg_keepalive_idle: Duration,
-    /// `XYNE_SYNC_PG_KEEPALIVE_INTERVAL_MS`: how long after an unanswered
+    /// `STREAMGRES_PG_KEEPALIVE_INTERVAL_MS`: how long after an unanswered
     /// probe the next one goes out (10000; 0 leaves the kernel's default).
     pub pg_keepalive_interval: Duration,
-    /// `XYNE_SYNC_PG_KEEPALIVE_RETRIES`: how many probes in a row may go
+    /// `STREAMGRES_PG_KEEPALIVE_RETRIES`: how many probes in a row may go
     /// unanswered before the kernel gives the connection up (3; 0 leaves
     /// the kernel's default).
     pub pg_keepalive_retries: u32,
-    /// `XYNE_SYNC_GROUP_THREADS`: how many threads keep the client groups'
+    /// `STREAMGRES_GROUP_THREADS`: how many threads keep the client groups'
     /// views and build their pokes, each owning a share of the groups (1).
     pub group_threads: usize,
-    /// `XYNE_SYNC_QUERY_URL` (or `ZERO_QUERY_URL`): the application
+    /// `STREAMGRES_QUERY_URL` (or `ZERO_QUERY_URL`): the application
     /// server's query endpoint, which turns query names into ASTs.
     pub query_url: String,
-    /// `XYNE_SYNC_MUTATE_URL` (or `ZERO_MUTATE_URL`): the application
+    /// `STREAMGRES_MUTATE_URL` (or `ZERO_MUTATE_URL`): the application
     /// server's mutation endpoint.
     pub mutate_url: String,
-    /// `XYNE_SYNC_BACKEND_TIMEOUT_MS`: how long one call to the
+    /// `STREAMGRES_BACKEND_TIMEOUT_MS`: how long one call to the
     /// application server (a transform of query names, a push of
     /// mutations) may take before it is given up; a call that timed out is
     /// not tried again (30000; 0 sets no limit).
     pub backend_timeout: Duration,
-    /// `XYNE_SYNC_FORWARD_COOKIES` (or `ZERO_QUERY_FORWARD_COOKIES`):
+    /// `STREAMGRES_FORWARD_COOKIES` (or `ZERO_QUERY_FORWARD_COOKIES`):
     /// whether the connection's cookies go along to those endpoints
     /// (true).
     pub forward_cookies: bool,
-    /// `XYNE_SYNC_APP_ID` (or `ZERO_APP_ID`): Zero's application id
+    /// `STREAMGRES_APP_ID` (or `ZERO_APP_ID`): Zero's application id
     /// (`zero`); with the shard it names the schema the application
     /// server records mutations in.
     pub app_id: String,
-    /// `XYNE_SYNC_SHARD` (or `ZERO_SHARD_NUM`): the shard number (0).
+    /// `STREAMGRES_SHARD` (or `ZERO_SHARD_NUM`): the shard number (0).
     pub shard: u32,
-    /// `XYNE_SYNC_PING_INTERVAL_MS`: how often a WebSocket ping frame goes
+    /// `STREAMGRES_PING_INTERVAL_MS`: how often a WebSocket ping frame goes
     /// to an idle connection (30000).
     pub ping_interval: Duration,
-    /// `XYNE_SYNC_CLIENT_TIMEOUT_MS`: how long a connection may stay silent
+    /// `STREAMGRES_CLIENT_TIMEOUT_MS`: how long a connection may stay silent
     /// (no message, no pong) before it is closed (45000).
     pub client_timeout: Duration,
-    /// `XYNE_SYNC_PONG_INTERVAL_MS`: how long the server lets a connection
+    /// `STREAMGRES_PONG_INTERVAL_MS`: how long the server lets a connection
     /// go without any downstream message before it sends a `pong` on its
     /// own (3000).
     pub pong_interval: Duration,
-    /// `XYNE_SYNC_GROUP_TTL_MS`: how long a client group's subscriptions
+    /// `STREAMGRES_GROUP_TTL_MS`: how long a client group's subscriptions
     /// stay registered after its last connection closes (60000).
     pub group_ttl: Duration,
-    /// `XYNE_SYNC_GROUP_LOG_BYTES`: how many bytes of its most recent
+    /// `STREAMGRES_GROUP_LOG_BYTES`: how many bytes of its most recent
     /// pokes a client group keeps, the oldest dropped as new ones are
     /// sent, so a client that reconnects behind the group (its socket
     /// died unnoticed while the server went on sending, or another tab
     /// kept the group moving) is sent what it missed instead of being
     /// told to start over (262144; 0 keeps none).
     pub group_log_bytes: usize,
-    /// `XYNE_SYNC_MAX_MESSAGE_BYTES`: the largest inbound WebSocket message
+    /// `STREAMGRES_MAX_MESSAGE_BYTES`: the largest inbound WebSocket message
     /// accepted (16 MiB).
     pub max_message_bytes: usize,
-    /// `XYNE_SYNC_ROWS_PER_PART`: how many row operations one poke part
+    /// `STREAMGRES_ROWS_PER_PART`: how many row operations one poke part
     /// carries at most (500).
     pub rows_per_part: usize,
-    /// `XYNE_SYNC_ROW_LIMIT`: the most rows the server reads into memory
+    /// `STREAMGRES_ROW_LIMIT`: the most rows the server reads into memory
     /// at once (100000), one number for the planner and the storage: the
     /// planner reads whole no side of a join past it, driving that side
     /// from the other when the other fits and refusing the query when
     /// neither does, and a storage read returning more is refused.
-    /// `XYNE_SYNC_JOIN_LIMIT`, the planner's older name, is still read.
+    /// `STREAMGRES_JOIN_LIMIT`, the planner's older name, is still read.
     pub row_limit: u64,
-    /// `XYNE_SYNC_WHOLE_PAGE_LIMIT`: the most rows a page that drives an
+    /// `STREAMGRES_WHOLE_PAGE_LIMIT`: the most rows a page that drives an
     /// inner join is read whole for (5000): within it the page's rows are
     /// all read in one go and the limit applied in memory, so the join's
     /// restriction stays exact; past it the page is read in batches that
     /// double per round, the rows the join rejects dropped.
     pub whole_page_limit: u64,
-    /// `XYNE_SYNC_JOIN_PREFERRED_SIDE`: which side of an INNER join drives
+    /// `STREAMGRES_JOIN_PREFERRED_SIDE`: which side of an INNER join drives
     /// it when reading the node whole and having its subs drive it would
     /// hold the same rows (the plan holding fewer wins otherwise, and a
     /// page is always driven by subs that hold the same), `parent` (the
     /// default) or `child` (the subquery, Zero's `whereExists` as
     /// translated).
     pub join_preferred_side: Side,
-    /// `XYNE_SYNC_PLAN_TTL_MS`: how long a join plan is remembered before
+    /// `STREAMGRES_PLAN_TTL_MS`: how long a join plan is remembered before
     /// the query is counted again (600000).
     pub plan_ttl: Duration,
-    /// `XYNE_SYNC_PLAN_CACHE`: how many join plans are remembered at most
+    /// `STREAMGRES_PLAN_CACHE`: how many join plans are remembered at most
     /// (10000), by tree and, apart, by query name.
     pub plan_cache: usize,
-    /// `XYNE_SYNC_PLAN_QUERY_TTL_MS`: how long a plan made for a query is
+    /// `STREAMGRES_PLAN_QUERY_TTL_MS`: how long a plan made for a query is
     /// laid onto every later query of the same name (and join skeleton),
     /// whatever its arguments, before the name is counted again (86400000,
     /// a day; 0 plans every tree on its own).
     pub plan_query_ttl: Duration,
-    /// `XYNE_SYNC_TRANSFORM_TTL_MS`: how long the application server's
+    /// `STREAMGRES_TRANSFORM_TTL_MS`: how long the application server's
     /// transform of a query is kept per identity (60000; zero-cache keeps
     /// its own for 5000; 0 keeps none).
     pub transform_ttl: Duration,
-    /// `XYNE_SYNC_TRANSFORM_CACHE`: how many transforms are kept at most
+    /// `STREAMGRES_TRANSFORM_CACHE`: how many transforms are kept at most
     /// (20000).
     pub transform_cache: usize,
-    /// `XYNE_SYNC_PLAN_FILE`: where the query shapes asked for are kept
+    /// `STREAMGRES_PLAN_FILE`: where the query shapes asked for are kept
     /// between runs, to be planned again before the next process says it
     /// is ready (unset: nothing is kept or replayed).
     pub plan_file: Option<PathBuf>,
-    /// `XYNE_SYNC_WARM_START_MS`: the most time spent planning the kept
+    /// `STREAMGRES_WARM_START_MS`: the most time spent planning the kept
     /// shapes before the process says it is ready (20000; 0 keeps shapes
     /// but plans none at startup).
     pub warm_start: Duration,
-    /// `XYNE_SYNC_LOG`: `error`, `warn`, `info` or `debug` (`info`).
+    /// `STREAMGRES_LOG`: `error`, `warn`, `info` or `debug` (`info`).
     pub log: Level,
-    /// `XYNE_SYNC_LOG_FORMAT`: `text` or `json` (`text`).
+    /// `STREAMGRES_LOG_FORMAT`: `text` or `json` (`text`).
     pub log_format: Format,
-    /// `XYNE_SYNC_SLOW_QUERY_MS`: a query hydrating slower than this, or a
+    /// `STREAMGRES_SLOW_QUERY_MS`: a query hydrating slower than this, or a
     /// push slower than this, is logged at warn (1000).
     pub slow_query: Duration,
-    /// `XYNE_SYNC_METRICS_INTERVAL_MS`: how often the metrics thread samples
+    /// `STREAMGRES_METRICS_INTERVAL_MS`: how often the metrics thread samples
     /// the process (10000; 0 turns it off); the summary line goes out every
     /// sixth sample.
     pub metrics_interval: Duration,
+    /// `STREAMGRES_METRICS_PREFIX`: prefix of exported metric names
+    /// the default preserves existing series names.
+    pub metrics_prefix: String,
 }
 
 impl Config {
@@ -196,11 +199,21 @@ impl Config {
     /// The configuration `lookup` describes (the environment's, or a
     /// test's): an unset or empty variable takes its default.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, String> {
-        let first = |names: &[&str]| {
-            names
-                .iter()
-                .find_map(|name| lookup(name).filter(|value| !value.is_empty()))
+        let value = |name: &str| {
+            lookup(name)
+                .filter(|value| !value.is_empty())
+                .or_else(|| {
+                    name.strip_prefix("STREAMGRES_")
+                        .and_then(|suffix| lookup(&format!("STREAMGRES_SYNC_{suffix}")))
+                        .filter(|value| !value.is_empty())
+                })
+                .or_else(|| {
+                    name.strip_prefix("STREAMGRES_")
+                        .and_then(|suffix| lookup(&format!("XYNE_SYNC_{suffix}")))
+                        .filter(|value| !value.is_empty())
+                })
         };
+        let first = |names: &[&str]| names.iter().find_map(|name| value(name));
         let millis = |name: &str, default: u64| -> Result<Duration, String> {
             match first(&[name]) {
                 Some(text) => text
@@ -210,25 +223,25 @@ impl Config {
                 None => Ok(Duration::from_millis(default)),
             }
         };
-        let dsn = first(&["XYNE_SYNC_PG_DSN", "ZERO_UPSTREAM_DB"])
-            .ok_or("XYNE_SYNC_PG_DSN (or ZERO_UPSTREAM_DB) must name the database")?;
-        let query_url = first(&["XYNE_SYNC_QUERY_URL", "ZERO_QUERY_URL"])
-            .ok_or("XYNE_SYNC_QUERY_URL (or ZERO_QUERY_URL) must name the query endpoint")?;
-        let mutate_url = first(&["XYNE_SYNC_MUTATE_URL", "ZERO_MUTATE_URL"])
-            .ok_or("XYNE_SYNC_MUTATE_URL (or ZERO_MUTATE_URL) must name the mutate endpoint")?;
+        let dsn = first(&["STREAMGRES_PG_DSN", "ZERO_UPSTREAM_DB"])
+            .ok_or("STREAMGRES_PG_DSN (or ZERO_UPSTREAM_DB) must name the database")?;
+        let query_url = first(&["STREAMGRES_QUERY_URL", "ZERO_QUERY_URL"])
+            .ok_or("STREAMGRES_QUERY_URL (or ZERO_QUERY_URL) must name the query endpoint")?;
+        let mutate_url = first(&["STREAMGRES_MUTATE_URL", "ZERO_MUTATE_URL"])
+            .ok_or("STREAMGRES_MUTATE_URL (or ZERO_MUTATE_URL) must name the mutate endpoint")?;
         let app_id =
-            first(&["XYNE_SYNC_APP_ID", "ZERO_APP_ID"]).unwrap_or_else(|| "zero".to_owned());
-        let shard = match first(&["XYNE_SYNC_SHARD", "ZERO_SHARD_NUM"]) {
+            first(&["STREAMGRES_APP_ID", "ZERO_APP_ID"]).unwrap_or_else(|| "zero".to_owned());
+        let shard = match first(&["STREAMGRES_SHARD", "ZERO_SHARD_NUM"]) {
             Some(text) => text
                 .parse::<u32>()
-                .map_err(|_| format!("XYNE_SYNC_SHARD must be a number, got `{text}`"))?,
+                .map_err(|_| format!("STREAMGRES_SHARD must be a number, got `{text}`"))?,
             None => 0,
         };
-        let ddl_trigger = first(&["XYNE_SYNC_DDL_TRIGGER"])
+        let ddl_trigger = first(&["STREAMGRES_DDL_TRIGGER"])
             .unwrap_or_else(|| format!("{app_id}_ddl_end_{shard}"));
         let ddl_prefix =
-            first(&["XYNE_SYNC_DDL_PREFIX"]).unwrap_or_else(|| format!("{app_id}/{shard}/ddl"));
-        let schemas = match first(&["XYNE_SYNC_SCHEMAS"]) {
+            first(&["STREAMGRES_DDL_PREFIX"]).unwrap_or_else(|| format!("{app_id}/{shard}/ddl"));
+        let schemas = match first(&["STREAMGRES_SCHEMAS"]) {
             Some(text) => text
                 .split(',')
                 .map(|schema| schema.trim().to_owned())
@@ -236,54 +249,65 @@ impl Config {
                 .collect(),
             None => vec!["public".to_owned(), format!("{app_id}_{shard}")],
         };
-        let forward_cookies = first(&["XYNE_SYNC_FORWARD_COOKIES", "ZERO_QUERY_FORWARD_COOKIES"])
+        let forward_cookies = first(&["STREAMGRES_FORWARD_COOKIES", "ZERO_QUERY_FORWARD_COOKIES"])
             .is_none_or(|value| value != "false" && value != "0");
-        let row_limit = match first(&["XYNE_SYNC_ROW_LIMIT", "XYNE_SYNC_JOIN_LIMIT"]) {
+        let row_limit = match first(&[
+            "STREAMGRES_ROW_LIMIT",
+            "STREAMGRES_READ_ROW_LIMIT",
+            "STREAMGRES_JOIN_LIMIT",
+        ]) {
             Some(text) => text
                 .parse::<u64>()
                 .ok()
                 .filter(|limit| *limit > 0)
                 .ok_or_else(|| {
-                    format!("XYNE_SYNC_ROW_LIMIT must be a positive number of rows, got `{text}`")
+                    format!("STREAMGRES_ROW_LIMIT must be a positive number of rows, got `{text}`")
                 })?,
             None => 100_000,
         };
-        let whole_page_limit = match first(&["XYNE_SYNC_WHOLE_PAGE_LIMIT"]) {
+        let whole_page_limit = match first(&["STREAMGRES_WHOLE_PAGE_LIMIT"]) {
             Some(text) => text.parse::<u64>().map_err(|_| {
-                format!("XYNE_SYNC_WHOLE_PAGE_LIMIT must be a number of rows, got `{text}`")
+                format!("STREAMGRES_WHOLE_PAGE_LIMIT must be a number of rows, got `{text}`")
             })?,
             None => 5_000,
         };
-        let join_preferred_side = match first(&["XYNE_SYNC_JOIN_PREFERRED_SIDE"]).as_deref() {
+        let join_preferred_side = match first(&["STREAMGRES_JOIN_PREFERRED_SIDE"]).as_deref() {
             None | Some("parent") => Side::Parent,
             Some("child") => Side::Child,
             Some(other) => {
                 return Err(format!(
-                    "XYNE_SYNC_JOIN_PREFERRED_SIDE must be child or parent, got `{other}`"
+                    "STREAMGRES_JOIN_PREFERRED_SIDE must be child or parent, got `{other}`"
                 ));
             }
         };
-        let log = match first(&["XYNE_SYNC_LOG"]).as_deref() {
+        let log = match first(&["STREAMGRES_LOG"]).as_deref() {
             None | Some("info") => Level::Info,
             Some("debug") => Level::Debug,
             Some("warn") => Level::Warn,
             Some("error") => Level::Error,
             Some(other) => {
                 return Err(format!(
-                    "XYNE_SYNC_LOG must be error, warn, info or debug, got `{other}`"
+                    "STREAMGRES_LOG must be error, warn, info or debug, got `{other}`"
                 ));
             }
         };
-        let log_format = match first(&["XYNE_SYNC_LOG_FORMAT"]).as_deref() {
+        let log_format = match first(&["STREAMGRES_LOG_FORMAT"]).as_deref() {
             None | Some("text") => Format::Text,
             Some("json") => Format::Json,
             Some(other) => {
                 return Err(format!(
-                    "XYNE_SYNC_LOG_FORMAT must be text or json, got `{other}`"
+                    "STREAMGRES_LOG_FORMAT must be text or json, got `{other}`"
                 ));
             }
         };
-        let mut base_path = first(&["XYNE_SYNC_BASE_PATH"]).unwrap_or_else(|| "/zero".to_owned());
+        let metrics_prefix =
+            first(&["STREAMGRES_METRICS_PREFIX"]).unwrap_or_else(|| "xyne_sync".to_owned());
+        if !Self::valid_metrics_prefix(&metrics_prefix) {
+            return Err(format!(
+                "STREAMGRES_METRICS_PREFIX must start with an ASCII letter or underscore and contain only ASCII letters, digits, or underscores, got `{metrics_prefix}`"
+            ));
+        }
+        let mut base_path = first(&["STREAMGRES_BASE_PATH"]).unwrap_or_else(|| "/zero".to_owned());
         if !base_path.starts_with('/') {
             base_path.insert(0, '/');
         }
@@ -294,105 +318,115 @@ impl Config {
             base_path.clear();
         }
         Ok(Config {
-            bind: first(&["XYNE_SYNC_ADDR"]).unwrap_or_else(|| "0.0.0.0:4848".to_owned()),
+            bind: first(&["STREAMGRES_ADDR"]).unwrap_or_else(|| "0.0.0.0:4848".to_owned()),
             base_path,
             dsn,
             schemas,
             slot: threads::slot_name(),
-            slot_cleanup_age: millis("XYNE_SYNC_SLOT_CLEANUP_AGE_MS", 0)?,
-            publication: first(&["XYNE_SYNC_PUBLICATION"])
+            slot_cleanup_age: millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
+            publication: first(&["STREAMGRES_PUBLICATION"])
                 .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
             ddl_trigger,
             ddl_prefix,
-            snapshot_rotation: millis("XYNE_SYNC_SNAPSHOT_ROTATION_MS", 1_000)?,
-            read_connections: match first(&["XYNE_SYNC_READ_CONNECTIONS"]) {
+            snapshot_rotation: millis("STREAMGRES_SNAPSHOT_ROTATION_MS", 1_000)?,
+            read_connections: match first(&["STREAMGRES_READ_CONNECTIONS"]) {
                 Some(text) => text.parse().map_err(|_| {
-                    format!("XYNE_SYNC_READ_CONNECTIONS must be a number, got `{text}`")
+                    format!("STREAMGRES_READ_CONNECTIONS must be a number, got `{text}`")
                 })?,
                 None => 16,
             },
-            read_timeout: millis("XYNE_SYNC_READ_TIMEOUT_MS", 10_000)?,
-            read_threads: match first(&["XYNE_SYNC_READ_THREADS"]) {
+            read_timeout: millis("STREAMGRES_READ_TIMEOUT_MS", 10_000)?,
+            read_threads: match first(&["STREAMGRES_READ_THREADS"]) {
                 Some(text) => text
                     .parse::<usize>()
                     .ok()
                     .filter(|threads| *threads > 0)
                     .ok_or_else(|| {
-                        format!("XYNE_SYNC_READ_THREADS must be a positive number, got `{text}`")
+                        format!("STREAMGRES_READ_THREADS must be a positive number, got `{text}`")
                     })?,
                 None => 2,
             },
-            pg_keepalive_idle: millis("XYNE_SYNC_PG_KEEPALIVE_IDLE_MS", 30_000)?,
-            pg_keepalive_interval: millis("XYNE_SYNC_PG_KEEPALIVE_INTERVAL_MS", 10_000)?,
-            pg_keepalive_retries: match first(&["XYNE_SYNC_PG_KEEPALIVE_RETRIES"]) {
+            pg_keepalive_idle: millis("STREAMGRES_PG_KEEPALIVE_IDLE_MS", 30_000)?,
+            pg_keepalive_interval: millis("STREAMGRES_PG_KEEPALIVE_INTERVAL_MS", 10_000)?,
+            pg_keepalive_retries: match first(&["STREAMGRES_PG_KEEPALIVE_RETRIES"]) {
                 Some(text) => text.parse().map_err(|_| {
-                    format!("XYNE_SYNC_PG_KEEPALIVE_RETRIES must be a number, got `{text}`")
+                    format!("STREAMGRES_PG_KEEPALIVE_RETRIES must be a number, got `{text}`")
                 })?,
                 None => 3,
             },
-            group_threads: match first(&["XYNE_SYNC_GROUP_THREADS"]) {
+            group_threads: match first(&["STREAMGRES_GROUP_THREADS"]) {
                 Some(text) => text
                     .parse::<usize>()
                     .ok()
                     .filter(|threads| *threads > 0)
                     .ok_or_else(|| {
-                        format!("XYNE_SYNC_GROUP_THREADS must be a positive number, got `{text}`")
+                        format!("STREAMGRES_GROUP_THREADS must be a positive number, got `{text}`")
                     })?,
                 None => 1,
             },
             query_url,
             mutate_url,
-            backend_timeout: millis("XYNE_SYNC_BACKEND_TIMEOUT_MS", 30_000)?,
+            backend_timeout: millis("STREAMGRES_BACKEND_TIMEOUT_MS", 30_000)?,
             forward_cookies,
             app_id,
             shard,
-            ping_interval: millis("XYNE_SYNC_PING_INTERVAL_MS", 30_000)?,
-            client_timeout: millis("XYNE_SYNC_CLIENT_TIMEOUT_MS", 45_000)?,
-            pong_interval: millis("XYNE_SYNC_PONG_INTERVAL_MS", 3_000)?,
-            group_ttl: millis("XYNE_SYNC_GROUP_TTL_MS", 60_000)?,
-            group_log_bytes: match first(&["XYNE_SYNC_GROUP_LOG_BYTES"]) {
+            ping_interval: millis("STREAMGRES_PING_INTERVAL_MS", 30_000)?,
+            client_timeout: millis("STREAMGRES_CLIENT_TIMEOUT_MS", 45_000)?,
+            pong_interval: millis("STREAMGRES_PONG_INTERVAL_MS", 3_000)?,
+            group_ttl: millis("STREAMGRES_GROUP_TTL_MS", 60_000)?,
+            group_log_bytes: match first(&["STREAMGRES_GROUP_LOG_BYTES"]) {
                 Some(text) => text.parse().map_err(|_| {
-                    format!("XYNE_SYNC_GROUP_LOG_BYTES must be a number of bytes, got `{text}`")
+                    format!("STREAMGRES_GROUP_LOG_BYTES must be a number of bytes, got `{text}`")
                 })?,
                 None => 256 * 1024,
             },
-            max_message_bytes: match first(&["XYNE_SYNC_MAX_MESSAGE_BYTES"]) {
+            max_message_bytes: match first(&["STREAMGRES_MAX_MESSAGE_BYTES"]) {
                 Some(text) => text.parse().map_err(|_| {
-                    format!("XYNE_SYNC_MAX_MESSAGE_BYTES must be a number, got `{text}`")
+                    format!("STREAMGRES_MAX_MESSAGE_BYTES must be a number, got `{text}`")
                 })?,
                 None => 16 * 1024 * 1024,
             },
-            rows_per_part: match first(&["XYNE_SYNC_ROWS_PER_PART"]) {
+            rows_per_part: match first(&["STREAMGRES_ROWS_PER_PART"]) {
                 Some(text) => text.parse().map_err(|_| {
-                    format!("XYNE_SYNC_ROWS_PER_PART must be a number, got `{text}`")
+                    format!("STREAMGRES_ROWS_PER_PART must be a number, got `{text}`")
                 })?,
                 None => 500,
             },
             row_limit,
             whole_page_limit,
             join_preferred_side,
-            plan_ttl: millis("XYNE_SYNC_PLAN_TTL_MS", 600_000)?,
-            plan_cache: match first(&["XYNE_SYNC_PLAN_CACHE"]) {
+            plan_ttl: millis("STREAMGRES_PLAN_TTL_MS", 600_000)?,
+            plan_cache: match first(&["STREAMGRES_PLAN_CACHE"]) {
                 Some(text) => text
                     .parse()
-                    .map_err(|_| format!("XYNE_SYNC_PLAN_CACHE must be a number, got `{text}`"))?,
+                    .map_err(|_| format!("STREAMGRES_PLAN_CACHE must be a number, got `{text}`"))?,
                 None => 10_000,
             },
-            plan_query_ttl: millis("XYNE_SYNC_PLAN_QUERY_TTL_MS", 86_400_000)?,
-            transform_ttl: millis("XYNE_SYNC_TRANSFORM_TTL_MS", 60_000)?,
-            transform_cache: match first(&["XYNE_SYNC_TRANSFORM_CACHE"]) {
+            plan_query_ttl: millis("STREAMGRES_PLAN_QUERY_TTL_MS", 86_400_000)?,
+            transform_ttl: millis("STREAMGRES_TRANSFORM_TTL_MS", 60_000)?,
+            transform_cache: match first(&["STREAMGRES_TRANSFORM_CACHE"]) {
                 Some(text) => text.parse().map_err(|_| {
-                    format!("XYNE_SYNC_TRANSFORM_CACHE must be a number, got `{text}`")
+                    format!("STREAMGRES_TRANSFORM_CACHE must be a number, got `{text}`")
                 })?,
                 None => 20_000,
             },
-            plan_file: first(&["XYNE_SYNC_PLAN_FILE"]).map(PathBuf::from),
-            warm_start: millis("XYNE_SYNC_WARM_START_MS", 20_000)?,
+            plan_file: first(&["STREAMGRES_PLAN_FILE"]).map(PathBuf::from),
+            warm_start: millis("STREAMGRES_WARM_START_MS", 20_000)?,
             log,
             log_format,
-            slow_query: millis("XYNE_SYNC_SLOW_QUERY_MS", 1_000)?,
-            metrics_interval: millis("XYNE_SYNC_METRICS_INTERVAL_MS", 10_000)?,
+            slow_query: millis("STREAMGRES_SLOW_QUERY_MS", 1_000)?,
+            metrics_interval: millis("STREAMGRES_METRICS_INTERVAL_MS", 10_000)?,
+            metrics_prefix,
         })
+    }
+
+    /// Whether `prefix` can safely begin a Prometheus metric name.
+    fn valid_metrics_prefix(prefix: &str) -> bool {
+        let mut bytes = prefix.bytes();
+        bytes
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == b'_')
+            && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
     }
 
     /// The join planner's settings.
@@ -461,9 +495,9 @@ mod tests {
     /// have no default.
     fn config(vars: &[(&str, &str)]) -> Result<Config, String> {
         Config::from_lookup(|name| match name {
-            "XYNE_SYNC_PG_DSN" => Some("postgresql://u:p@db/app".to_owned()),
-            "XYNE_SYNC_QUERY_URL" => Some("http://app/query".to_owned()),
-            "XYNE_SYNC_MUTATE_URL" => Some("http://app/push".to_owned()),
+            "STREAMGRES_PG_DSN" => Some("postgresql://u:p@db/app".to_owned()),
+            "STREAMGRES_QUERY_URL" => Some("http://app/query".to_owned()),
+            "STREAMGRES_MUTATE_URL" => Some("http://app/push".to_owned()),
             _ => vars
                 .iter()
                 .find(|(key, _)| *key == name)
@@ -475,7 +509,7 @@ mod tests {
     /// from the app id and the shard unless named outright.
     #[test]
     fn each_config_names_a_slot_of_its_own() {
-        let first = config(&[("XYNE_SYNC_SLOT", "ignored")]).unwrap();
+        let first = config(&[("STREAMGRES_SLOT", "ignored")]).unwrap();
         let second = config(&[]).unwrap();
         for slot in [&first.slot, &second.slot] {
             let id = slot.strip_prefix("xyne_sync_slot_").expect("the prefix");
@@ -493,15 +527,42 @@ mod tests {
     #[test]
     fn the_publication_is_read_not_derived() {
         assert_eq!(config(&[]).unwrap().publication, "xyne_sync_pub");
-        let config = config_with(&[("XYNE_SYNC_PUBLICATION", "sdlc_feed")]);
+        let config = config_with(&[("STREAMGRES_PUBLICATION", "sdlc_feed")]);
         assert_eq!(config.publication, "sdlc_feed");
         assert_eq!(config.engine_settings().publication, "sdlc_feed");
     }
 
     #[test]
+    fn streamgres_names_take_precedence_and_xyne_names_remain_compatible() {
+        let legacy = config_with(&[("XYNE_SYNC_ADDR", "127.0.0.1:4848")]);
+        assert_eq!(legacy.bind, "127.0.0.1:4848");
+
+        let transitional = config_with(&[("STREAMGRES_SYNC_ADDR", "127.0.0.1:5000")]);
+        assert_eq!(transitional.bind, "127.0.0.1:5000");
+
+        let preferred = config_with(&[
+            ("STREAMGRES_ADDR", "0.0.0.0:5000"),
+            ("STREAMGRES_SYNC_ADDR", "127.0.0.1:5000"),
+            ("XYNE_SYNC_ADDR", "127.0.0.1:4848"),
+        ]);
+        assert_eq!(preferred.bind, "0.0.0.0:5000");
+    }
+
+    #[test]
+    fn metrics_prefix_is_configurable_and_validated() {
+        assert_eq!(config(&[]).unwrap().metrics_prefix, "xyne_sync");
+        assert_eq!(
+            config_with(&[("STREAMGRES_METRICS_PREFIX", "streamgres")]).metrics_prefix,
+            "streamgres"
+        );
+        let error = config(&[("STREAMGRES_METRICS_PREFIX", "bad-prefix")]).unwrap_err();
+        assert!(error.contains("STREAMGRES_METRICS_PREFIX"), "{error}");
+    }
+
+    #[test]
     fn inactive_slot_cleanup_is_off_unless_an_age_is_set() {
         assert_eq!(config(&[]).unwrap().slot_cleanup_age, Duration::ZERO);
-        let config = config_with(&[("XYNE_SYNC_SLOT_CLEANUP_AGE_MS", "3600000")]);
+        let config = config_with(&[("STREAMGRES_SLOT_CLEANUP_AGE_MS", "3600000")]);
         assert_eq!(config.slot_cleanup_age, Duration::from_secs(3600));
         assert_eq!(
             config.engine_settings().slot_cleanup_age,
@@ -514,12 +575,12 @@ mod tests {
         let config = config(&[]).unwrap();
         assert_eq!(config.ddl_trigger, "zero_ddl_end_0");
         assert_eq!(config.ddl_prefix, "zero/0/ddl");
-        let config = config_with(&[("XYNE_SYNC_APP_ID", "zero02"), ("XYNE_SYNC_SHARD", "3")]);
+        let config = config_with(&[("STREAMGRES_APP_ID", "zero02"), ("STREAMGRES_SHARD", "3")]);
         assert_eq!(config.ddl_trigger, "zero02_ddl_end_3");
         assert_eq!(config.ddl_prefix, "zero02/3/ddl");
         let config = config_with(&[
-            ("XYNE_SYNC_DDL_TRIGGER", "my_trigger"),
-            ("XYNE_SYNC_DDL_PREFIX", "mine/ddl"),
+            ("STREAMGRES_DDL_TRIGGER", "my_trigger"),
+            ("STREAMGRES_DDL_PREFIX", "mine/ddl"),
         ]);
         assert_eq!(config.ddl_trigger, "my_trigger");
         assert_eq!(config.ddl_prefix, "mine/ddl");
@@ -550,9 +611,9 @@ mod tests {
     #[test]
     fn the_keepalive_is_read_from_the_environment() {
         let keepalive = config(&[
-            ("XYNE_SYNC_PG_KEEPALIVE_IDLE_MS", "5000"),
-            ("XYNE_SYNC_PG_KEEPALIVE_INTERVAL_MS", "2000"),
-            ("XYNE_SYNC_PG_KEEPALIVE_RETRIES", "5"),
+            ("STREAMGRES_PG_KEEPALIVE_IDLE_MS", "5000"),
+            ("STREAMGRES_PG_KEEPALIVE_INTERVAL_MS", "2000"),
+            ("STREAMGRES_PG_KEEPALIVE_RETRIES", "5"),
         ])
         .unwrap()
         .engine_settings()
@@ -570,9 +631,9 @@ mod tests {
     /// A value that is not a number is refused by the variable's name.
     #[test]
     fn a_malformed_keepalive_is_refused_by_name() {
-        let error = config(&[("XYNE_SYNC_PG_KEEPALIVE_RETRIES", "three")]).unwrap_err();
-        assert!(error.contains("XYNE_SYNC_PG_KEEPALIVE_RETRIES"), "{error}");
-        let error = config(&[("XYNE_SYNC_PG_KEEPALIVE_IDLE_MS", "soon")]).unwrap_err();
-        assert!(error.contains("XYNE_SYNC_PG_KEEPALIVE_IDLE_MS"), "{error}");
+        let error = config(&[("STREAMGRES_PG_KEEPALIVE_RETRIES", "three")]).unwrap_err();
+        assert!(error.contains("STREAMGRES_PG_KEEPALIVE_RETRIES"), "{error}");
+        let error = config(&[("STREAMGRES_PG_KEEPALIVE_IDLE_MS", "soon")]).unwrap_err();
+        assert!(error.contains("STREAMGRES_PG_KEEPALIVE_IDLE_MS"), "{error}");
     }
 }

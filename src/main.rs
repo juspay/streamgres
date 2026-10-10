@@ -17,10 +17,10 @@
 //! `src/parser/mod.rs`.
 
 use std::rc::Rc;
-use xyne_sync::ivm::{IvmStats, SingleTableIVM, SubId};
-use xyne_sync::model::*;
-use xyne_sync::parser::{Catalog, parse_read, parse_write, point_at};
-use xyne_sync::sync::{Local, MemoryStorage};
+use streamgres::ivm::{IvmStats, SingleTableIVM, SubId};
+use streamgres::model::*;
+use streamgres::parser::{Catalog, parse_read, parse_write, point_at};
+use streamgres::sync::{Local, MemoryStorage};
 
 /// The engine under the synchronous driver over an (empty) in-process
 /// store: every write is routed from the stream alone.
@@ -31,7 +31,7 @@ type Demo = Local<SingleTableIVM, MemoryStorage>;
 /// through [`run_write`], then prints each subscription's final frame size
 /// and the engine's cumulative counters.
 fn main() {
-    println!("== xyne_sync SingleTableIVM demo ==================================================");
+    println!("== streamgres SingleTableIVM demo ==================================================");
 
     let catalog = Catalog::new(vec![tickets_table()]);
     let mut ivm: Demo = Local::new(SingleTableIVM::new(), Rc::new(MemoryStorage::new()));

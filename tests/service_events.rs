@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::{LocalSet, spawn_local};
-use xyne_sync::ivm::MultiTableIVM;
-use xyne_sync::model::*;
-use xyne_sync::sync::{
+use streamgres::ivm::MultiTableIVM;
+use streamgres::model::*;
+use streamgres::sync::{
     Command, Event, Lsn, MemoryStorage, Service, Storage, StorageError, SubId, Transaction,
 };
 
@@ -102,7 +102,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
 }
 
 /// The deltas an event carries.
-fn updates_of(event: &Event) -> &[xyne_sync::ivm::Delta] {
+fn updates_of(event: &Event) -> &[streamgres::ivm::Delta] {
     match event {
         Event::Registered { updates, .. }
         | Event::Landed { updates }
@@ -586,7 +586,7 @@ fn a_heavy_read_is_told_to_the_subscriptions_owner() {
             storage.apply(&insert(id, "OPEN"));
         }
         storage.apply(&insert(7, "DONE"));
-        let stats = xyne_sync::stats::Stats::shared();
+        let stats = streamgres::stats::Stats::shared();
         stats
             .read_row_limit
             .store(10, std::sync::atomic::Ordering::Relaxed);
