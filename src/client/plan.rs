@@ -52,8 +52,9 @@
 //! costs less than that.
 //!
 //! **A main with a page** is counted like any other node, on its own
-//! filter with its cursor and its `LIMIT` ignored, so a new cursor is a
-//! new plan and a page turn costs its counts on the root. Driven by its
+//! filter with its cursor, its order and its `LIMIT` ignored, so a new
+//! cursor is a new plan and a page turn costs its counts on the root,
+//! where another order of the same filter costs nothing. Driven by its
 //! subs it holds its window at most, so its narrowed count is taken no
 //! higher than its `LIMIT`, and a page whose counts are both over the
 //! limit is still served: driven by its bounded subs, else driving them
@@ -284,13 +285,16 @@ impl Planner {
     /// compare, the node alone (its own filter, cursor included, with its
     /// `EXISTS` leaves taken as true and no `LIMIT`) and, when it has
     /// inner subs, the node narrowed (its subtree, the `LIMIT` off the
-    /// node), each capped at the limit plus one.
+    /// node), each capped at the limit plus one. A count has no `ORDER
+    /// BY`: the rows are as many whatever their order, so the same filter
+    /// under another order is the same count.
     pub fn counts(&self) -> Vec<Count> {
         let cap = self.policy.limit + 1;
         let mut out = Vec::new();
         for &index in &self.counted {
             let node = &self.nodes[index];
             let main = SingleTableReadQuery {
+                order_by: Vec::new(),
                 limit: u32::MAX,
                 ..node.query.clone()
             };
@@ -1119,7 +1123,8 @@ mod tests {
 
     /// A node with inner subs is counted twice, alone (its `EXISTS`
     /// leaves taken as true, no joins) and narrowed (its subtree, the
-    /// filter as it stands); a leaf once; a `LIMIT` never.
+    /// filter as it stands); a leaf once; a `LIMIT` or an `ORDER BY`
+    /// never.
     #[test]
     fn a_node_is_counted_alone_and_narrowed() {
         let filter = Where::AND(vec![
@@ -1147,9 +1152,11 @@ mod tests {
             )])
         );
         assert!(counts[0].query.joins.is_empty());
+        assert!(counts[0].query.main_table.order_by.is_empty());
         assert_eq!((counts[1].node, counts[1].narrowed), (0, true));
         assert_eq!(counts[1].query.main_table.filter, filter);
         assert_eq!(counts[1].query.main_table.limit, u32::MAX);
+        assert!(counts[1].query.main_table.order_by.is_empty());
         assert_eq!(counts[1].query.joins, query.joins);
         assert_eq!((counts[2].node, counts[2].narrowed), (1, false));
         assert!(counts.iter().all(|count| count.cap == 101));
@@ -2152,6 +2159,33 @@ mod tests {
             assert_eq!(second.query.joins[0].driver, Driver::Main);
             assert_eq!(second.hidden, messages_in("c1", 20).hidden);
             assert_eq!(cache.len(), 2, "each tree's outcome is remembered");
+        });
+    }
+
+    /// The same filter under another order wants the same counts: a tree
+    /// sorted the other way is planned from them without a count of its
+    /// own.
+    #[test]
+    fn another_order_of_the_same_filter_shares_the_counts() {
+        run(async {
+            let cache = PlanCache::new(secs(60), 10, secs(60), 100);
+            let storage = Counting::answering(5);
+            let policy = policy(100, Side::Child);
+            plan("q", messages_in("c1", 50), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            let asked = storage.counts.get();
+            let mut reversed = messages_in("c1", 50);
+            reversed.query.main_table.order_by = vec![OrderBy::new("id", Order::DESC)];
+            let planned = plan("q", reversed.clone(), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            assert_eq!(storage.counts.get(), asked, "nothing counted again");
+            assert_eq!(
+                planned.query.main_table.order_by,
+                reversed.query.main_table.order_by
+            );
+            assert_eq!(planned.query.joins[0].driver, Driver::Main);
         });
     }
 
