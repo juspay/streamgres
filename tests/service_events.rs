@@ -797,11 +797,16 @@ fn every_change_and_read_is_counted_under_its_table() {
             .expect("send");
         drain(&mut events).await;
         let tickets = stats.flows.table(&TableName::from("tickets"));
+        let snapshot = xyne_sync::stats::flow::READ_KINDS
+            .iter()
+            .position(|kind| *kind == "snapshot")
+            .expect("a snapshot kind");
         assert_eq!(
-            tickets.reads[0].load(Relaxed),
+            tickets.reads[snapshot].load(Relaxed),
             1,
             "the registration's snapshot read"
         );
+        assert_eq!(tickets.reads_landed.load(Relaxed), 1);
         assert_eq!(
             tickets.rows_read.load(Relaxed),
             2,

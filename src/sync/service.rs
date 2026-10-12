@@ -47,7 +47,7 @@ use crate::model::{
     Catalog, DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
 };
 use crate::stats::Stats;
-use crate::stats::flow::LocalFlows;
+use crate::stats::flow::{LocalFlows, reach};
 
 /// What a client of the service can ask.
 ///
@@ -581,15 +581,19 @@ where
         let Some(stats) = &self.stats else {
             return;
         };
-        self.flows.get(&stats.flows, write.table()).note_change(
-            write,
-            took,
-            routed.updates.len(),
-            routed.selects.len(),
-        );
+        let table = write.table();
+        let (mut own_deltas, mut own_reach) = (0, 0);
         for delta in &routed.updates {
-            self.flows.get(&stats.flows, &delta.table).note_delta(delta);
+            if delta.table == *table {
+                own_deltas += 1;
+                own_reach += reach(delta);
+            } else {
+                self.flows.get(&stats.flows, &delta.table).note_delta(delta);
+            }
         }
+        let own = self.flows.get(&stats.flows, table);
+        own.note_change(write, took, routed.updates.len(), routed.selects.len());
+        own.note_deltas(own_deltas, own_reach);
     }
 
     /// A transaction committed at `at` carried schema `changes`, making

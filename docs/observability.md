@@ -101,9 +101,11 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_feed_lag_seconds` | PostgreSQL's commit time → the engine taking the transaction up (replication + queue) |
 | `xyne_sync_feed_to_engine_seconds` | decoded → taken up by the engine (the inbox's wait) |
 | `xyne_sync_engine_step_seconds{step=write}` | routing one transaction |
-| `xyne_sync_engine_to_groups_seconds`, `xyne_sync_groups_flush_seconds`, `xyne_sync_groups_to_socket_seconds`, `xyne_sync_end_to_end_seconds` | the client side's stages and the whole path inside the server |
+| `xyne_sync_engine_to_groups_seconds`, `xyne_sync_groups_flush_seconds`, `xyne_sync_groups_to_socket_seconds` | the client side's stages |
+| `xyne_sync_end_to_end_seconds` | the whole path inside the server: the feed decoding the oldest transaction of a poke to its last frame written, per poke and connection, for pokes that carry a change (rows a commit changed, or the mutation ids and results it acknowledged); a poke of rows a query's read brought in alone is not timed |
 | `xyne_sync_feed_transactions_total`, `xyne_sync_feed_writes_total` | what came through the feed |
-| `xyne_sync_writes_impacting_total`, `xyne_sync_client_updates_total{op=add,delete}`, `xyne_sync_narrowed_reads_total` | routing counters |
+| `xyne_sync_writes_impacting_total` | subscriptions the routed writes changed, one per write and subscription it changed (a write that changes fifteen open queries adds fifteen), so its rate over `xyne_sync_feed_writes_total`'s is the fan-out |
+| `xyne_sync_client_updates_total{op=add,delete}`, `xyne_sync_narrowed_reads_total` | routing counters |
 | `xyne_sync_pokes_total`, `xyne_sync_frames_total`, `xyne_sync_rows_serialized_total`, `xyne_sync_rows_shared_total` | the client side's output |
 | `xyne_sync_partial_images_total`, `xyne_sync_partial_rows_sent_total` | update images the feed decoded with a large value left out (PostgreSQL sent it as unchanged); such images that reached a client as a row, which should stay 0, since the engine completes them or reads the row again |
 | `xyne_sync_row_reads_total`, `xyne_sync_rows_completed_total` | rows read again by primary key because the only image at hand was partial; partial images completed from a read's row while it was brought up |
@@ -135,9 +137,10 @@ a count is one atomic add; the tables are those the catalog publishes.
 | `xyne_sync_table_route_seconds_total{table}` | the engine's compute routing the table's changes; its rate is the table's share of the engine thread |
 | `xyne_sync_table_deltas_total{table}`, `xyne_sync_table_delta_subscriptions_total{table}` | row changes of the table the engine handed to subscriptions while routing changes, and the subscriptions they reached (their ratio is the fan-out) |
 | `xyne_sync_table_reads_total{table,kind=snapshot,narrowed,refill,lookup,row}` | storage reads the engine issued on the table, by why it asked |
-| `xyne_sync_table_rows_read_total{table}`, `xyne_sync_table_read_seconds_total{table}` | rows those reads returned, and their time from issued to the rows back on the engine thread |
+| `xyne_sync_table_reads_landed_total{table}` | of those, the reads that came back with rows; issued minus landed is the reads refused, failed or still in flight |
+| `xyne_sync_table_rows_read_total{table}`, `xyne_sync_table_read_seconds_total{table}` | rows the landed reads returned, and their time from issued to the rows back on the engine thread |
 | `xyne_sync_table_rows_sent_total{table,op=put,del}` | the table's row operations written into the pokes of a flush, once per client group (a tab catching up from its group's state or log is not counted again) |
-| `xyne_sync_table_end_to_end_seconds{table}` | `xyne_sync_end_to_end_seconds` for each table a poke carries rows of: from the feed decoding the poke's oldest transaction to its last frame written, per poke and connection |
+| `xyne_sync_table_end_to_end_seconds{table}` | `xyne_sync_end_to_end_seconds` for each table a commit changed rows of in the poke; a table whose rows in that poke a query's read brought in is not timed under it |
 
 `/stats` has the same under `tables`, the arrival to socket as a summary in
 microseconds. Questions they answer:
@@ -156,13 +159,13 @@ sum by (table) (rate(xyne_sync_table_delta_subscriptions_total[5m]))
 # Reads and rows read per table, and the mean read time.
 sum by (table, kind) (rate(xyne_sync_table_reads_total[5m]))
 sum by (table) (rate(xyne_sync_table_read_seconds_total[5m]))
-  / sum by (table) (rate(xyne_sync_table_reads_total[5m]))
+  / sum by (table) (rate(xyne_sync_table_reads_landed_total[5m]))
 # Arrival to socket per table.
 histogram_quantile(0.99, sum by (table, le) (rate(xyne_sync_table_end_to_end_seconds_bucket[5m])))
 ```
 
-Cardinality is sixteen counter series and one histogram (eighteen
-bounds, `+Inf`, sum and count) per table, thirty-seven series in all, so a
+Cardinality is seventeen counter series and one histogram (eighteen
+bounds, `+Inf`, sum and count) per table, thirty-eight series in all, so a
 schema of eighty tables adds about 3,000 series per pod.
 
 ### Memory and process

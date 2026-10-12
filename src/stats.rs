@@ -218,7 +218,10 @@ static GLOBAL: OnceLock<Arc<Stats>> = OnceLock::new();
 /// - `groups_to_socket`: from a poke being handed to a connection's
 ///   writer to its last frame written (per poke and connection).
 /// - `end_to_end`: from the feed decoding the oldest transaction a poke
-///   carries to that poke's last frame written (per poke and connection).
+///   carries to that poke's last frame written (per poke and connection),
+///   for a poke that carries a change: rows a commit changed, or the
+///   mutation ids and results it acknowledged; a poke of rows a query's
+///   read brought in alone is not timed.
 ///
 /// Durations of the query path, so a hydration's time splits into the
 /// application server's, PostgreSQL's and the engine's own:
@@ -1138,6 +1141,7 @@ impl Stats {
                         "deltas": load(&flow.deltas),
                         "delta_subscriptions": load(&flow.delta_subscriptions),
                         "reads": reads,
+                        "reads_landed": load(&flow.reads_landed),
                         "rows_read": load(&flow.rows_read),
                         "read_us": load(&flow.read_us),
                         "rows_sent": {
@@ -1229,6 +1233,14 @@ impl Stats {
                     Value::Int(load(counter)),
                 );
             }
+            catalogue.point(
+                "xyne_sync_table_reads_landed_total",
+                Kind::Counter,
+                "",
+                "the engine's reads of the table that came back with rows; issued minus landed is those refused, failed or in flight",
+                with(None),
+                Value::Int(load(&flow.reads_landed)),
+            );
             catalogue.point(
                 "xyne_sync_table_rows_read_total",
                 Kind::Counter,
@@ -1735,7 +1747,9 @@ fn stage_help(stage: &str) -> &'static str {
         "engine_to_groups" => "the engine's commit event's wait for a group thread",
         "groups_flush" => "one flush of a group thread",
         "groups_to_socket" => "a poke's wait from the writer to its last frame written",
-        "end_to_end" => "the oldest transaction of a poke to its last frame written",
+        "end_to_end" => {
+            "the oldest transaction of a poke carrying a change to its last frame written"
+        }
         "transform" => "one round trip to the application server for ASTs",
         "plan" => "translating and planning one query",
         "count_io" => "one planner count on PostgreSQL",
@@ -1869,7 +1883,9 @@ fn measure_help(name: &str) -> &'static str {
             "the most rows one storage read may return and the planner reads whole, as configured"
         }
         "read_rows_max" => "the largest storage read of the last minute or two",
-        "writes_impacting_total" => "subscriptions the routed writes changed, one per write and subscription it changed",
+        "writes_impacting_total" => {
+            "subscriptions the routed writes changed, one per write and subscription it changed"
+        }
         "narrowed_reads_total" => "storage reads the engine asked for",
         "reads_issued_total" | "reads_landed_total" | "reads_refused_total" => {
             "storage reads by what became of them"
@@ -2093,6 +2109,10 @@ mod tests {
             "xyne_sync_table_reads_total{table=\"messages\",kind=\"refill\"} 1"
         );
         assert_eq!(
+            line("xyne_sync_table_reads_landed_total{table=\"messages\"}"),
+            "xyne_sync_table_reads_landed_total{table=\"messages\"} 1"
+        );
+        assert_eq!(
             line("xyne_sync_table_rows_read_total{table=\"messages\"}"),
             "xyne_sync_table_rows_read_total{table=\"messages\"} 12"
         );
@@ -2114,6 +2134,7 @@ mod tests {
         assert_eq!(messages["changes"]["matched"], 1);
         assert_eq!(messages["reads"]["refill"], 1);
         assert_eq!(messages["rows_read"], 12);
+        assert_eq!(messages["reads_landed"], 1);
         assert_eq!(messages["rows_sent"]["put"], 5);
         assert_eq!(messages["end_to_end_us"]["count"], 1);
     }

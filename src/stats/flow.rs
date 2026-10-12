@@ -10,13 +10,12 @@
 //! first time a thread meets a table. The tables are those the catalog
 //! publishes, so the series are bounded by the schema.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use crate::ivm::{Delta, FetchKind};
-use crate::model::{TableName, WriteQuery};
+use crate::model::{IdMap, TableName, WriteQuery};
 
 use super::Histogram;
 
@@ -30,14 +29,17 @@ pub const READ_KINDS: [&str; 5] = ["snapshot", "narrowed", "refill", "lookup", "
 /// - `route_us`: the engine's compute routing them.
 /// - `deltas`, `delta_subscriptions`: the row changes they handed to
 ///   subscriptions, and the subscriptions those reached.
-/// - `reads`, `rows_read`, `read_us`: the storage reads the engine ran on
-///   the table by kind, the rows they returned, and their time from being
-///   issued to the rows being back on the engine thread.
+/// - `reads`, `reads_landed`, `rows_read`, `read_us`: the storage reads
+///   the engine issued on the table by kind, those that came back with
+///   rows (a refused or failed read is issued and never lands), the rows
+///   they returned, and their time from being issued to the rows being
+///   back on the engine thread.
 /// - `rows_put`, `rows_deleted`: the table's row operations written into
 ///   pokes, once per client group.
 /// - `end_to_end`: from the feed decoding the oldest transaction of a
 ///   poke to that poke's last frame written, for each table the poke
-///   carries rows of.
+///   carries changed rows of (rows a query's read brought in are not a
+///   change, and are not timed).
 pub struct TableFlow {
     pub inserts: AtomicU64,
     pub updates: AtomicU64,
@@ -47,6 +49,7 @@ pub struct TableFlow {
     pub deltas: AtomicU64,
     pub delta_subscriptions: AtomicU64,
     pub reads: [AtomicU64; READ_KINDS.len()],
+    pub reads_landed: AtomicU64,
     pub rows_read: AtomicU64,
     pub read_us: AtomicU64,
     pub rows_put: AtomicU64,
@@ -66,6 +69,7 @@ impl Default for TableFlow {
             deltas: AtomicU64::new(0),
             delta_subscriptions: AtomicU64::new(0),
             reads: std::array::from_fn(|_| AtomicU64::new(0)),
+            reads_landed: AtomicU64::new(0),
             rows_read: AtomicU64::new(0),
             read_us: AtomicU64::new(0),
             rows_put: AtomicU64::new(0),
@@ -107,14 +111,14 @@ impl TableFlow {
     /// Count one row change a change handed out, and the subscriptions it
     /// reached.
     pub fn note_delta(&self, delta: &Delta) {
-        self.deltas.fetch_add(1, Ordering::Relaxed);
-        let reached: usize = delta
-            .audiences
-            .iter()
-            .map(|audience| audience.subs.len())
-            .sum();
+        self.note_deltas(1, reach(delta));
+    }
+
+    /// Count `deltas` row changes that reached `subscriptions` in all.
+    pub fn note_deltas(&self, deltas: u64, subscriptions: u64) {
+        self.deltas.fetch_add(deltas, Ordering::Relaxed);
         self.delta_subscriptions
-            .fetch_add(reached as u64, Ordering::Relaxed);
+            .fetch_add(subscriptions, Ordering::Relaxed);
     }
 
     /// Count one storage read of this table asked for `kind`.
@@ -125,6 +129,7 @@ impl TableFlow {
     /// Count one storage read of this table that came back with `rows`
     /// rows after `took`.
     pub fn note_read_landed(&self, rows: u64, took: Duration) {
+        self.reads_landed.fetch_add(1, Ordering::Relaxed);
         self.rows_read.fetch_add(rows, Ordering::Relaxed);
         self.read_us.fetch_add(micros(took), Ordering::Relaxed);
     }
@@ -141,6 +146,15 @@ impl TableFlow {
             + self.updates.load(Ordering::Relaxed)
             + self.deletes.load(Ordering::Relaxed)
     }
+}
+
+/// The subscriptions `delta` reaches, over all its audiences.
+pub fn reach(delta: &Delta) -> u64 {
+    delta
+        .audiences
+        .iter()
+        .map(|audience| audience.subs.len() as u64)
+        .sum()
 }
 
 /// The position of `kind` in [`READ_KINDS`].
@@ -162,7 +176,7 @@ fn micros(took: Duration) -> u64 {
 /// Every table's counts, shared by the threads that take them.
 #[derive(Default)]
 pub struct Flows {
-    tables: RwLock<HashMap<TableName, Arc<TableFlow>>>,
+    tables: RwLock<IdMap<TableName, Arc<TableFlow>>>,
 }
 
 impl Flows {
@@ -200,7 +214,7 @@ impl Flows {
 /// first count of a table touches the shared registry.
 #[derive(Default)]
 pub struct LocalFlows {
-    tables: HashMap<TableName, Arc<TableFlow>>,
+    tables: IdMap<TableName, Arc<TableFlow>>,
 }
 
 impl LocalFlows {
@@ -216,8 +230,12 @@ impl LocalFlows {
     /// The shared handle on `table`'s counts, for a thread that hands it
     /// on.
     pub fn handle(&mut self, flows: &Flows, table: &TableName) -> Arc<TableFlow> {
-        self.get(flows, table);
-        self.tables[table].clone()
+        if let Some(flow) = self.tables.get(table) {
+            return flow.clone();
+        }
+        let flow = flows.table(table);
+        self.tables.insert(table.clone(), flow.clone());
+        flow
     }
 }
 
@@ -315,6 +333,7 @@ mod tests {
             .map(|reads| reads.load(Ordering::Relaxed))
             .collect();
         assert_eq!(by_kind, vec![1, 0, 2, 0, 0]);
+        assert_eq!(flow.reads_landed.load(Ordering::Relaxed), 1);
         assert_eq!(flow.rows_read.load(Ordering::Relaxed), 40);
         assert_eq!(flow.read_us.load(Ordering::Relaxed), 3_000);
     }
