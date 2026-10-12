@@ -120,6 +120,51 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_mutation_results_total` | results of refused mutations recorded in, or cleaned up from, `<app>_<shard>.mutations`, taken by a client group held here for its next poke's `mutationsPatch` |
 | `xyne_sync_mutation_cleanups_total` | cleanup-results pushes the application server accepted, sent when a client acknowledged its results or clients were deleted (a refusal is a `WARN` log line) |
 
+### Per table
+
+What flows through the server, table by table: the changes the change feed
+brings in, what the engine does with them, the reads it runs, the rows it
+puts into pokes, and how long a table's changes take from arriving to a
+client's socket. Each thread counts through its own handle on a table, so
+a count is one atomic add; the tables are those the catalog publishes.
+
+| metric | what |
+| --- | --- |
+| `xyne_sync_table_changes_total{table,op=insert,update,delete}` | row changes of the table the feed brought in and the engine routed |
+| `xyne_sync_table_changes_matched_total{table}` | of those, the changes that reached at least one subscription or asked for a read; the rest cost decoding and routing and went nowhere |
+| `xyne_sync_table_route_seconds_total{table}` | the engine's compute routing the table's changes; its rate is the table's share of the engine thread |
+| `xyne_sync_table_deltas_total{table}`, `xyne_sync_table_delta_subscriptions_total{table}` | row changes of the table the engine handed to subscriptions while routing changes, and the subscriptions they reached (their ratio is the fan-out) |
+| `xyne_sync_table_reads_total{table,kind=snapshot,narrowed,refill,lookup,row}` | storage reads the engine issued on the table, by why it asked |
+| `xyne_sync_table_rows_read_total{table}`, `xyne_sync_table_read_seconds_total{table}` | rows those reads returned, and their time from issued to the rows back on the engine thread |
+| `xyne_sync_table_rows_sent_total{table,op=put,del}` | the table's row operations written into the pokes of a flush, once per client group (a tab catching up from its group's state or log is not counted again) |
+| `xyne_sync_table_end_to_end_seconds{table}` | `xyne_sync_end_to_end_seconds` for each table a poke carries rows of: from the feed decoding the poke's oldest transaction to its last frame written, per poke and connection |
+
+`/stats` has the same under `tables`, the arrival to socket as a summary in
+microseconds. Questions they answer:
+
+```
+# Changes coming in per table, per second.
+sum by (table) (rate(xyne_sync_table_changes_total[5m]))
+# The share of a table's changes that reached any client query.
+sum by (table) (rate(xyne_sync_table_changes_matched_total[5m]))
+  / sum by (table) (rate(xyne_sync_table_changes_total[5m]))
+# Where the engine's time goes, by table.
+sum by (table) (rate(xyne_sync_table_route_seconds_total[5m]))
+# Fan-out: subscriptions each row change reaches.
+sum by (table) (rate(xyne_sync_table_delta_subscriptions_total[5m]))
+  / sum by (table) (rate(xyne_sync_table_deltas_total[5m]))
+# Reads and rows read per table, and the mean read time.
+sum by (table, kind) (rate(xyne_sync_table_reads_total[5m]))
+sum by (table) (rate(xyne_sync_table_read_seconds_total[5m]))
+  / sum by (table) (rate(xyne_sync_table_reads_total[5m]))
+# Arrival to socket per table.
+histogram_quantile(0.99, sum by (table, le) (rate(xyne_sync_table_end_to_end_seconds_bucket[5m])))
+```
+
+Cardinality is sixteen counter series and one histogram (eighteen
+bounds, `+Inf`, sum and count) per table, thirty-seven series in all, so a
+schema of eighty tables adds about 3,000 series per pod.
+
 ### Memory and process
 
 | metric | what |

@@ -47,6 +47,7 @@ use crate::model::{
     Catalog, DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
 };
 use crate::stats::Stats;
+use crate::stats::flow::LocalFlows;
 
 /// What a client of the service can ask.
 ///
@@ -240,8 +241,11 @@ pub struct Service<E: Engine, S: Storage> {
     owners: IdMap<SubId, usize>,
     /// Subscriptions registered but not yet reported hydrated.
     awaiting: IdMap<SubId, ()>,
-    /// When each read in flight was handed to the driver, for `read_io`.
-    issued: IdMap<FetchId, Instant>,
+    /// When each read in flight was handed to the driver, and the table
+    /// it reads, for `read_io` and the table's flow.
+    issued: IdMap<FetchId, (Instant, TableName)>,
+    /// This thread's handles on the tables' flow counts.
+    flows: LocalFlows,
     /// When every awaited subscription was last checked for completion;
     /// the checks otherwise touch only what a step could have completed.
     swept: Instant,
@@ -294,6 +298,7 @@ where
             owners: IdMap::default(),
             awaiting: IdMap::default(),
             issued: IdMap::default(),
+            flows: LocalFlows::default(),
             swept: Instant::now(),
             reaper: spawn_reaper(),
             lag_warned: None,
@@ -372,10 +377,15 @@ where
                 result = self.results.recv() => match result {
                     Some((id, Ok(snapshot))) => {
                         let started = Instant::now();
+                        let issued = self.issued.remove(&id);
                         if let Some(stats) = &self.stats
-                            && let Some(issued) = self.issued.remove(&id)
+                            && let Some((issued, table)) = issued
                         {
-                            stats.read_io.record(started.duration_since(issued));
+                            let took = started.duration_since(issued);
+                            stats.read_io.record(took);
+                            self.flows
+                                .get(&stats.flows, &table)
+                                .note_read_landed(snapshot.rows.len() as u64, took);
                         }
                         let waiting = self.runtime.waiting_on(id);
                         self.note_heavy(id, snapshot.rows.len() as u64, &waiting);
@@ -486,7 +496,11 @@ where
         }
         for write in &writes {
             self.storage.absorb(write, at);
+            let began = self.stats.is_some().then(Instant::now);
             let routed = self.runtime.write(write, at);
+            if let Some(began) = began {
+                self.count_change(write, began.elapsed(), &routed);
+            }
             step.updates.extend(routed.updates);
             step.selects.extend(routed.selects);
         }
@@ -558,6 +572,24 @@ where
             },
         );
         self.reap();
+    }
+
+    /// Count one routed change in its table's flow: its operation, whether
+    /// it reached anything, its routing time, and every row change it
+    /// handed out in the table that row change lands on.
+    fn count_change(&mut self, write: &WriteQuery, took: Duration, routed: &Step) {
+        let Some(stats) = &self.stats else {
+            return;
+        };
+        self.flows.get(&stats.flows, write.table()).note_change(
+            write,
+            took,
+            routed.updates.len(),
+            routed.selects.len(),
+        );
+        for delta in &routed.updates {
+            self.flows.get(&stats.flows, &delta.table).note_delta(delta);
+        }
     }
 
     /// A transaction committed at `at` carried schema `changes`, making
@@ -831,7 +863,13 @@ where
 
     /// Run one read as its own task, reporting the result into the loop.
     fn spawn(&mut self, fetch: Fetch) {
-        self.issued.insert(fetch.id, Instant::now());
+        if let Some(stats) = &self.stats {
+            self.flows
+                .get(&stats.flows, &fetch.query.table)
+                .note_read_issued(fetch.kind);
+        }
+        self.issued
+            .insert(fetch.id, (Instant::now(), fetch.query.table.clone()));
         let storage = self.storage.clone();
         let report = self.report.clone();
         spawn_local(async move {

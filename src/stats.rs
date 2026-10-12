@@ -24,6 +24,10 @@ use crate::ivm::{Footprint, IvmStats};
 use crate::metric::{Catalogue, Kind, Metric, Value};
 use crate::sync::SyncStats;
 
+pub mod flow;
+
+use flow::{Flows, READ_KINDS};
+
 /// How many buckets a histogram has: four per power of two of a `u64`,
 /// plus one for zero.
 const BUCKETS: usize = 1 + 64 * 4;
@@ -358,6 +362,10 @@ pub struct Stats {
     sampled: Mutex<Sampled>,
     refused: Mutex<HashMap<String, RefusedQuery>>,
     heavy: Mutex<HashMap<String, HeavyQuery>>,
+    /// What flows through the server per table: the changes the feed
+    /// brings in, what the engine does with them, its reads, the rows put
+    /// into pokes, and arrival to socket ([`flow`]).
+    pub flows: Flows,
 }
 
 /// One query name whose subscriptions waited on a read of at least half
@@ -507,6 +515,7 @@ impl Stats {
             sampled: Mutex::new(Sampled::default()),
             refused: Mutex::new(HashMap::new()),
             heavy: Mutex::new(HashMap::new()),
+            flows: Flows::default(),
         }
     }
 
@@ -1071,6 +1080,7 @@ impl Stats {
             "groups_inbox": sampled.groups_inbox,
             "refused_queries": refused,
             "heavy_queries": heavy,
+            "tables": self.flows_json(),
             "engine": {
                 "writes_processed": engine.ivm.writes_processed,
                 "queries_registered": engine.ivm.queries_registered,
@@ -1097,6 +1107,178 @@ impl Stats {
                 "rows_added": engine.sync.rows_added,
             },
         })
+    }
+
+    /// Every table's flow for `/stats`: changes by operation and matched,
+    /// routing time, deltas and their reach, reads by kind with rows and
+    /// time, rows sent, and the arrival to socket summary in microseconds.
+    fn flows_json(&self) -> Json {
+        let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let tables: serde_json::Map<String, Json> = self
+            .flows
+            .snapshot()
+            .into_iter()
+            .map(|(table, flow)| {
+                let reads: serde_json::Map<String, Json> = READ_KINDS
+                    .iter()
+                    .zip(flow.reads.iter())
+                    .map(|(kind, counter)| ((*kind).to_owned(), json!(load(counter))))
+                    .collect();
+                let end_to_end = flow.end_to_end.summary();
+                (
+                    table.as_str().to_owned(),
+                    json!({
+                        "changes": {
+                            "insert": load(&flow.inserts),
+                            "update": load(&flow.updates),
+                            "delete": load(&flow.deletes),
+                            "matched": load(&flow.matched),
+                        },
+                        "route_us": load(&flow.route_us),
+                        "deltas": load(&flow.deltas),
+                        "delta_subscriptions": load(&flow.delta_subscriptions),
+                        "reads": reads,
+                        "rows_read": load(&flow.rows_read),
+                        "read_us": load(&flow.read_us),
+                        "rows_sent": {
+                            "put": load(&flow.rows_put),
+                            "del": load(&flow.rows_deleted),
+                        },
+                        "end_to_end_us": {
+                            "count": end_to_end.count,
+                            "p50": end_to_end.p50_us,
+                            "p90": end_to_end.p90_us,
+                            "p99": end_to_end.p99_us,
+                            "max": end_to_end.max_us,
+                        },
+                    }),
+                )
+            })
+            .collect();
+        Json::Object(tables)
+    }
+
+    /// Every table's flow ([`flow`]) as points: counters of changes,
+    /// matches, routing time, deltas and their reach, reads by kind with
+    /// their rows and time, rows put into pokes, and the arrival to
+    /// socket distribution.
+    fn flow_points(&self, catalogue: &mut Catalogue) {
+        for (table, flow) in self.flows.snapshot() {
+            let name = table.as_str().to_owned();
+            let with = |extra: Option<(&'static str, &str)>| {
+                let mut labels = vec![("table", name.clone())];
+                if let Some((key, value)) = extra {
+                    labels.push((key, value.to_owned()));
+                }
+                labels
+            };
+            let load = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+            for (op, counter) in [
+                ("insert", &flow.inserts),
+                ("update", &flow.updates),
+                ("delete", &flow.deletes),
+            ] {
+                catalogue.point(
+                    "xyne_sync_table_changes_total",
+                    Kind::Counter,
+                    "",
+                    "row changes of the table the change feed brought in and the engine routed, by operation",
+                    with(Some(("op", op))),
+                    Value::Int(load(counter)),
+                );
+            }
+            catalogue.point(
+                "xyne_sync_table_changes_matched_total",
+                Kind::Counter,
+                "",
+                "of the table's changes, those that reached at least one subscription or asked for a read",
+                with(None),
+                Value::Int(load(&flow.matched)),
+            );
+            catalogue.point(
+                "xyne_sync_table_route_seconds_total",
+                Kind::Counter,
+                "s",
+                "the engine's compute routing the table's changes",
+                with(None),
+                Value::Float(load(&flow.route_us) as f64 / 1_000_000.0),
+            );
+            catalogue.point(
+                "xyne_sync_table_deltas_total",
+                Kind::Counter,
+                "",
+                "row changes of the table the engine handed to subscriptions, routing changes",
+                with(None),
+                Value::Int(load(&flow.deltas)),
+            );
+            catalogue.point(
+                "xyne_sync_table_delta_subscriptions_total",
+                Kind::Counter,
+                "",
+                "subscriptions the table's row changes reached; over the deltas, the fan-out",
+                with(None),
+                Value::Int(load(&flow.delta_subscriptions)),
+            );
+            for (kind, counter) in READ_KINDS.iter().zip(flow.reads.iter()) {
+                catalogue.point(
+                    "xyne_sync_table_reads_total",
+                    Kind::Counter,
+                    "",
+                    "storage reads the engine issued on the table, by why it asked",
+                    with(Some(("kind", kind))),
+                    Value::Int(load(counter)),
+                );
+            }
+            catalogue.point(
+                "xyne_sync_table_rows_read_total",
+                Kind::Counter,
+                "",
+                "rows the engine's reads of the table returned",
+                with(None),
+                Value::Int(load(&flow.rows_read)),
+            );
+            catalogue.point(
+                "xyne_sync_table_read_seconds_total",
+                Kind::Counter,
+                "s",
+                "the engine's reads of the table, from issued to rows back on the engine thread",
+                with(None),
+                Value::Float(load(&flow.read_us) as f64 / 1_000_000.0),
+            );
+            for (op, counter) in [("put", &flow.rows_put), ("del", &flow.rows_deleted)] {
+                catalogue.point(
+                    "xyne_sync_table_rows_sent_total",
+                    Kind::Counter,
+                    "",
+                    "row operations of the table written into pokes, once per client group",
+                    with(Some(("op", op))),
+                    Value::Int(load(counter)),
+                );
+            }
+            let cumulative: Vec<u64> = SECONDS_BOUNDS_US
+                .iter()
+                .map(|bound| flow.end_to_end.at_most(*bound))
+                .collect();
+            let (count, sum) = flow.end_to_end.count_and_sum();
+            let count = count.max(cumulative.last().copied().unwrap_or(0));
+            catalogue.point(
+                "xyne_sync_table_end_to_end_seconds",
+                Kind::Histogram,
+                "s",
+                "from the feed decoding the oldest transaction of a poke to its last frame written, for each table the poke carries rows of",
+                with(None),
+                Value::Distribution {
+                    bounds: SECONDS_BOUNDS_US
+                        .iter()
+                        .map(|bound| *bound as f64 / 1_000_000.0)
+                        .collect(),
+                    cumulative,
+                    count,
+                    sum: sum as f64 / 1_000_000.0,
+                    max: flow.end_to_end.summary().max_us as f64 / 1_000_000.0,
+                },
+            );
+        }
     }
 
     /// Everything, as the metrics both carriers write out: durations in
@@ -1215,6 +1397,7 @@ impl Stats {
                 Value::Int(*rows),
             );
         }
+        self.flow_points(&mut catalogue);
         for (thread, seconds) in &sampled.thread_cpu {
             catalogue.point(
                 "xyne_sync_thread_cpu_seconds_total",
@@ -1857,6 +2040,82 @@ mod tests {
         assert_eq!(json["held"]["subscriptions"], 12);
         assert_eq!(json["counts"]["transform_hits"], 3);
         assert_eq!(json["gauges"]["connections_open"], 7);
+    }
+
+    /// Every table's flow is exposed under its `table` label: changes by
+    /// operation, matched, deltas and their reach, reads by kind with
+    /// their rows and time, rows sent by operation, and the arrival to
+    /// socket histogram; `/stats` carries the same under `tables`.
+    #[test]
+    fn a_table_flow_is_exposed_per_table_and_in_stats() {
+        use crate::ivm::FetchKind;
+        use crate::model::{
+            ColumnName, DataFrameKey, DataFrameRow, InsertQuery, TableName, Value as Cell,
+            WriteQuery,
+        };
+        let stats = Stats::new();
+        let messages = TableName::from("messages");
+        let flow = stats.flows.table(&messages);
+        let key = DataFrameKey::new(HashMap::from([(ColumnName::from("id"), Cell::Int(1))]));
+        let row = DataFrameRow::from(HashMap::from([(ColumnName::from("id"), Cell::Int(1))]));
+        let insert = WriteQuery::INSERT(InsertQuery {
+            table: messages.clone(),
+            pkey_value: key,
+            record: row,
+        });
+        flow.note_change(&insert, Duration::from_micros(250), 1, 0);
+        flow.note_change(&insert, Duration::from_micros(250), 0, 0);
+        flow.note_read_issued(FetchKind::Refill);
+        flow.note_read_landed(12, Duration::from_millis(4));
+        flow.note_sent(5, 2);
+        flow.end_to_end.record(Duration::from_millis(3));
+        let text = stats.prometheus();
+        let line = |needle: &str| -> String {
+            text.lines()
+                .find(|line| line.starts_with(needle))
+                .unwrap_or_else(|| panic!("no line starting with {needle}\n{text}"))
+                .to_owned()
+        };
+        assert_eq!(
+            line("xyne_sync_table_changes_total{table=\"messages\",op=\"insert\"}"),
+            "xyne_sync_table_changes_total{table=\"messages\",op=\"insert\"} 2"
+        );
+        assert_eq!(
+            line("xyne_sync_table_changes_matched_total{table=\"messages\"}"),
+            "xyne_sync_table_changes_matched_total{table=\"messages\"} 1"
+        );
+        assert_eq!(
+            line("xyne_sync_table_route_seconds_total{table=\"messages\"}"),
+            "xyne_sync_table_route_seconds_total{table=\"messages\"} 0.0005"
+        );
+        assert_eq!(
+            line("xyne_sync_table_reads_total{table=\"messages\",kind=\"refill\"}"),
+            "xyne_sync_table_reads_total{table=\"messages\",kind=\"refill\"} 1"
+        );
+        assert_eq!(
+            line("xyne_sync_table_rows_read_total{table=\"messages\"}"),
+            "xyne_sync_table_rows_read_total{table=\"messages\"} 12"
+        );
+        assert_eq!(
+            line("xyne_sync_table_rows_sent_total{table=\"messages\",op=\"del\"}"),
+            "xyne_sync_table_rows_sent_total{table=\"messages\",op=\"del\"} 2"
+        );
+        assert_eq!(
+            line("xyne_sync_table_end_to_end_seconds_bucket{table=\"messages\",le=\"0.0025\"}"),
+            "xyne_sync_table_end_to_end_seconds_bucket{table=\"messages\",le=\"0.0025\"} 0"
+        );
+        assert_eq!(
+            line("xyne_sync_table_end_to_end_seconds_bucket{table=\"messages\",le=\"0.005\"}"),
+            "xyne_sync_table_end_to_end_seconds_bucket{table=\"messages\",le=\"0.005\"} 1"
+        );
+        let json = stats.json();
+        let messages = &json["tables"]["messages"];
+        assert_eq!(messages["changes"]["insert"], 2);
+        assert_eq!(messages["changes"]["matched"], 1);
+        assert_eq!(messages["reads"]["refill"], 1);
+        assert_eq!(messages["rows_read"], 12);
+        assert_eq!(messages["rows_sent"]["put"], 5);
+        assert_eq!(messages["end_to_end_us"]["count"], 1);
     }
 
     #[test]
