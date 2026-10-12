@@ -95,6 +95,36 @@ enum Pending {
     Clear,
 }
 
+/// One push waiting for the connection's push worker ([`push_loop`]): a
+/// client's mutations, or a cleanup of mutation results the server
+/// composed, and when it was queued, for the wait it measures. Each
+/// carries the identity it is sent with, taken when it was queued: a
+/// later `initConnection` may change the mutate endpoint, and a push
+/// already read is sent where it was read for.
+struct QueuedPush {
+    queued: Instant,
+    work: PushWork,
+}
+
+/// What a queued push sends.
+enum PushWork {
+    Mutations {
+        push: protocol::Push,
+        identity: Identity,
+    },
+    Cleanup {
+        body: Json,
+        identity: Identity,
+    },
+}
+
+/// How many pushes may wait for the push worker before the reader waits
+/// too. Pushes are forwarded one at a time, in order; a mutate endpoint
+/// slower than the client's mutations fills the queue, and from then on
+/// the reader paces the client as it did when every push was forwarded
+/// inline.
+const PUSH_QUEUE: usize = 32;
+
 /// The connect URL's parameters.
 #[derive(Debug, Clone)]
 struct ConnectParams {
@@ -295,13 +325,15 @@ async fn connect(
 }
 
 /// One connection's mutable state on the server side; `requests` is the
-/// inlet of the group thread owning its client group.
+/// inlet of the group thread owning its client group, `pushes` that of
+/// its push worker ([`push_loop`]).
 struct Conn {
     state: Arc<AppState>,
     params: ConnectParams,
     identity: Identity,
     out: mpsc::UnboundedSender<Outbound>,
     requests: mpsc::Sender<Request>,
+    pushes: mpsc::Sender<QueuedPush>,
     joined: bool,
 }
 
@@ -374,6 +406,13 @@ async fn handle(
         None => protocol::Handshake::default(),
     };
     let requests = state.requests[shard_of(&group_id, state.requests.len())].clone();
+    let (pushes, pushes_rx) = mpsc::channel::<QueuedPush>(PUSH_QUEUE);
+    tokio::spawn(push_loop(
+        pushes_rx,
+        state.clone(),
+        params.clone(),
+        out.clone(),
+    ));
     let mut conn = Conn {
         identity: Identity {
             cookie,
@@ -385,6 +424,7 @@ async fn handle(
         params,
         out: out.clone(),
         requests: requests.clone(),
+        pushes,
         joined: false,
     };
     let declared = handshake
@@ -398,7 +438,10 @@ async fn handle(
         let _ = writer.await;
         return;
     }
+    let reading = Instant::now();
     let (lmids, results) = state.mutations.read(&group_id).await;
+    state.stats.connect_mutations.record(reading.elapsed());
+    let asked = Instant::now();
     let (reply_tx, reply_rx) = oneshot::channel();
     let request = Request::Connect {
         group: group_id.clone(),
@@ -420,6 +463,7 @@ async fn handle(
         },
         Err(_) => Some("the group thread is gone".to_owned()),
     };
+    state.stats.connect_group.record(asked.elapsed());
     if let Some(reason) = refusal {
         log_event!(
             Level::Info,
@@ -686,12 +730,13 @@ impl Conn {
                     && let Some(cleanup) =
                         protocol::cleanup_clients(&self.params.group_id, &deleted.client_ids)
                 {
-                    self.clean_up(cleanup);
+                    self.clean_up(cleanup).await;
                 }
                 true
             }
             Upstream::AckMutationResponses(upto) => {
-                self.clean_up(protocol::cleanup_results(&self.params.group_id, &upto));
+                self.clean_up(protocol::cleanup_results(&self.params.group_id, &upto))
+                    .await;
                 true
             }
             Upstream::Push(push) => {
@@ -756,30 +801,36 @@ impl Conn {
 
     /// Ask the application server to delete mutation results — `body`, a
     /// cleanup push, as zero-cache sends one when a client acknowledges its
-    /// results or clients are deleted — on a task of its own: the answer
-    /// matters only to the counters and the log, and a slow endpoint must
-    /// not hold up this connection's messages, its pings among them.
-    fn clean_up(&self, body: Json) {
-        let backend = self.state.backend.clone();
-        let identity = self.identity.clone();
-        let stats = self.state.stats.clone();
-        let wsid = self.params.wsid.clone();
-        tokio::spawn(async move {
-            match backend.push(&identity, &body).await {
-                PushOutcome::Response(json)
-                    if json.get("error").is_none()
-                        && json.get("kind").and_then(Json::as_str) != Some("PushFailed") =>
-                {
-                    stats.mutation_cleanups.fetch_add(1, Ordering::Relaxed);
-                }
-                PushOutcome::Response(json) => log_warn!(
-                    "connection {wsid}: the mutate endpoint refused a cleanup of mutation results: {json}"
-                ),
-                PushOutcome::Failed { message, .. } => {
-                    log_warn!("connection {wsid}: cleaning up mutation results failed: {message}")
-                }
-            }
-        });
+    /// results or clients are deleted — through the push worker, after the
+    /// pushes queued before it: the answer matters only to the counters
+    /// and the log, and a slow endpoint must not hold up this connection's
+    /// messages, its pings among them.
+    async fn clean_up(&self, body: Json) {
+        self.queue_push(PushWork::Cleanup {
+            body,
+            identity: self.identity.clone(),
+        })
+        .await;
+    }
+
+    /// Hand `work` to the push worker: at once when the queue has room,
+    /// else once it has, which is counted (`push_queue_full`) since the
+    /// client's next message waits meanwhile.
+    async fn queue_push(&self, work: PushWork) {
+        let queued = QueuedPush {
+            queued: Instant::now(),
+            work,
+        };
+        let queued = match self.pushes.try_send(queued) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Full(queued)) => queued,
+            Err(mpsc::error::TrySendError::Closed(_)) => return,
+        };
+        self.state
+            .stats
+            .push_queue_full
+            .fetch_add(1, Ordering::Relaxed);
+        let _ = self.pushes.send(queued).await;
     }
 
     /// Clients the client says are gone: their queries go, and the client
@@ -982,11 +1033,11 @@ impl Conn {
         self.requests.send(request).await.is_ok()
     }
 
-    /// A push: forwarded as is. Ordinary mutation results are not answered
-    /// here: successful mutations settle when their last mutation id arrives
-    /// in a poke, and application errors arrive durably in that poke's
-    /// `mutationsPatch`, as they do in zero-cache. Only an error that prevents
-    /// the push from being processed is answered directly.
+    /// A push: queued for the push worker, which forwards it as is after
+    /// the pushes before it. The reader goes on to the client's next
+    /// message at once (a query change, a pull, a ping), which no longer
+    /// waits for the mutate endpoint's round trip; it waits only when the
+    /// queue is full ([`PUSH_QUEUE`]).
     async fn push(&mut self, push: protocol::Push) {
         if push.client_group_id != self.params.group_id {
             log_warn!(
@@ -996,62 +1047,125 @@ impl Conn {
                 self.params.group_id
             );
         }
-        let started = Instant::now();
         for mutation in &push.mutation_ids {
             self.state.stats.push_sent(&mutation.client_id, mutation.id);
         }
-        let outcome = self.state.backend.push(&self.identity, &push.body).await;
-        let elapsed = started.elapsed();
-        self.state.stats.push.record(elapsed);
-        let failed = matches!(outcome, PushOutcome::Failed { .. });
-        if failed {
-            self.state
-                .stats
-                .pushes_failed
-                .fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.state.stats.pushes_ok.fetch_add(1, Ordering::Relaxed);
+        self.queue_push(PushWork::Mutations {
+            push,
+            identity: self.identity.clone(),
+        })
+        .await;
+    }
+}
+
+/// The push worker: one connection's pushes to the mutate endpoint, one
+/// at a time, in the order they were queued, so the application server
+/// sees a client's mutations in the client's order. It ends when the
+/// connection has ended and the pushes queued by then are forwarded: a
+/// push read from the client is sent whether or not the client stays
+/// to hear about it, as it was when pushes were forwarded inline.
+async fn push_loop(
+    mut pushes: mpsc::Receiver<QueuedPush>,
+    state: Arc<AppState>,
+    params: ConnectParams,
+    out: mpsc::UnboundedSender<Outbound>,
+) {
+    while let Some(QueuedPush { queued, work }) = pushes.recv().await {
+        state.stats.push_queue.record(queued.elapsed());
+        match work {
+            PushWork::Mutations { push, identity } => {
+                forward_push(&state, &params, &out, &identity, push).await;
+            }
+            PushWork::Cleanup { body, identity } => {
+                clean_up_results(&state, &params.wsid, &identity, body).await;
+            }
         }
-        log_event!(
-            if failed || elapsed >= self.state.config.slow_query {
-                Level::Warn
-            } else {
-                Level::Debug
-            },
-            "push forwarded",
-            wsid = self.params.wsid,
-            group = self.params.group_id,
-            mutations = push.mutation_ids.len(),
-            ms = format!("{:.1}", elapsed.as_secs_f64() * 1000.0),
-            failed = failed
-        );
-        match outcome {
-            PushOutcome::Response(json) => {
-                if let Some(reply) = direct_push_reply(&json, &push.mutation_ids) {
-                    if json.get("mutations").and_then(Json::as_array).is_none()
-                        && json.get("kind").and_then(Json::as_str) != Some("PushFailed")
-                    {
-                        log_warn!(
-                            "connection {}: unexpected mutate response: {json}",
-                            self.params.wsid
-                        );
-                    }
-                    send(&self.out, reply);
-                } else {
-                    // A valid ordinary MutateResponse is deliberately silent.
-                    // Its result reaches the client through the WAL poke.
+    }
+}
+
+/// Forward one push as is. Ordinary mutation results are not answered
+/// here: successful mutations settle when their last mutation id arrives
+/// in a poke, and application errors arrive durably in that poke's
+/// `mutationsPatch`, as they do in zero-cache. Only an error that prevents
+/// the push from being processed is answered directly.
+async fn forward_push(
+    state: &AppState,
+    params: &ConnectParams,
+    out: &mpsc::UnboundedSender<Outbound>,
+    identity: &Identity,
+    push: protocol::Push,
+) {
+    let started = Instant::now();
+    let outcome = state.backend.push(identity, &push.body).await;
+    let elapsed = started.elapsed();
+    state.stats.push.record(elapsed);
+    let failed = matches!(outcome, PushOutcome::Failed { .. });
+    if failed {
+        state.stats.pushes_failed.fetch_add(1, Ordering::Relaxed);
+    } else {
+        state.stats.pushes_ok.fetch_add(1, Ordering::Relaxed);
+    }
+    log_event!(
+        if failed || elapsed >= state.config.slow_query {
+            Level::Warn
+        } else {
+            Level::Debug
+        },
+        "push forwarded",
+        wsid = params.wsid,
+        group = params.group_id,
+        mutations = push.mutation_ids.len(),
+        ms = format!("{:.1}", elapsed.as_secs_f64() * 1000.0),
+        failed = failed
+    );
+    match outcome {
+        PushOutcome::Response(json) => {
+            if let Some(reply) = direct_push_reply(&json, &push.mutation_ids) {
+                if json.get("mutations").and_then(Json::as_array).is_none()
+                    && json.get("kind").and_then(Json::as_str) != Some("PushFailed")
+                {
+                    log_warn!(
+                        "connection {}: unexpected mutate response: {json}",
+                        params.wsid
+                    );
                 }
+                send(out, reply);
+            } else {
+                // A valid ordinary MutateResponse is deliberately silent.
+                // Its result reaches the client through the WAL poke.
             }
-            PushOutcome::Failed {
-                status,
-                preview,
-                message,
-            } => {
-                send(
-                    &self.out,
-                    protocol::push_failed(&push.mutation_ids, status, preview.as_deref(), &message),
-                );
-            }
+        }
+        PushOutcome::Failed {
+            status,
+            preview,
+            message,
+        } => {
+            send(
+                out,
+                protocol::push_failed(&push.mutation_ids, status, preview.as_deref(), &message),
+            );
+        }
+    }
+}
+
+/// Send one cleanup push; its answer matters only to the counters and
+/// the log.
+async fn clean_up_results(state: &AppState, wsid: &str, identity: &Identity, body: Json) {
+    match state.backend.push(identity, &body).await {
+        PushOutcome::Response(json)
+            if json.get("error").is_none()
+                && json.get("kind").and_then(Json::as_str) != Some("PushFailed") =>
+        {
+            state
+                .stats
+                .mutation_cleanups
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        PushOutcome::Response(json) => log_warn!(
+            "connection {wsid}: the mutate endpoint refused a cleanup of mutation results: {json}"
+        ),
+        PushOutcome::Failed { message, .. } => {
+            log_warn!("connection {wsid}: cleaning up mutation results failed: {message}")
         }
     }
 }
