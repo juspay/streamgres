@@ -534,7 +534,7 @@ CREATE PUBLICATION {publication} FOR ALL TABLES;
     insert_batches(&client, "channels", &rows).await?;
     let mut rows = Vec::new();
     let mut member_of: HashSet<(usize, usize)> = HashSet::new();
-    for user in 0..opts.seed_users {
+    for (user, user_name) in users.iter().enumerate() {
         let mut mine: Vec<usize> = Vec::new();
         if user < opts.users {
             // the load users: their own channel and the next few
@@ -551,7 +551,7 @@ CREATE PUBLICATION {publication} FOR ALL TABLES;
                 rows.push(format!(
                     "('cm-{user}-{channel}', {ch}, {u}, 'MEMBER', {created})",
                     ch = quote(&channels[channel]),
-                    u = quote(&users[user]),
+                    u = quote(user_name),
                     created = now - day * 200 + rng.below(day as u64) as i64,
                 ));
             }
@@ -564,7 +564,7 @@ CREATE PUBLICATION {publication} FOR ALL TABLES;
     let mut threads = Vec::with_capacity(opts.channels);
     let mut conv_rows = Vec::new();
     let mut msg_rows = Vec::new();
-    for channel in 0..opts.channels {
+    for (channel, channel_name) in channels.iter().enumerate() {
         let mut pool = Vec::with_capacity(THREAD_POOL);
         for n in 0..opts.seed_conversations {
             let id = conversation_id(channel, n);
@@ -577,7 +577,7 @@ CREATE PUBLICATION {publication} FOR ALL TABLES;
                 "({id}, '{ws}', {ch}, {by}, {title}, {md}, {replies}, {activity}, {created}, {created})",
                 id = quote(&id),
                 ws = WORKSPACE,
-                ch = quote(&channels[channel]),
+                ch = quote(channel_name),
                 by = quote(&users[author]),
                 title = quote(&words(&mut rng, 5)),
                 md = quote(&markdown(&mut rng, md_bytes)),
@@ -643,12 +643,12 @@ CREATE PUBLICATION {publication} FOR ALL TABLES;
     // activities: a few unread per load user
     let kinds = ["mention", "reply", "assigned", "reaction"];
     let mut rows = Vec::new();
-    for user in 0..opts.users {
+    for (user, user_name) in users.iter().enumerate().take(opts.users) {
         for k in 0..3 {
             rows.push(format!(
                 "('a-{user}-{k}', '{ws}', {u}, '{kind}', {ref_}, {read}, {created})",
                 ws = WORKSPACE,
-                u = quote(&users[user]),
+                u = quote(user_name),
                 kind = rng.word(&kinds),
                 ref_ = quote(&conversation_id(user % opts.channels, rng.index(opts.seed_conversations))),
                 read = if k == 0 { "NULL".to_owned() } else { (now - 3_600_000).to_string() },
@@ -1505,7 +1505,7 @@ fn read_process(pid: u32) -> Option<ProcessReading> {
     let rss = status
         .lines()
         .find_map(|line| line.strip_prefix("VmRSS:"))
-        .and_then(|rest| rest.trim().split_whitespace().next())
+        .and_then(|rest| rest.split_whitespace().next())
         .and_then(|kb| kb.parse::<u64>().ok())
         .map_or(0, |kb| kb * 1024);
     let mut threads = Vec::new();
