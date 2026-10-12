@@ -613,7 +613,7 @@ async fn write_loop(
                     }
                     last_sent = Instant::now();
                 }
-                Some(Outbound::Poke { frames: poke, since, sent }) => {
+                Some(Outbound::Poke { frames: poke, since, sent, tables }) => {
                     let mut failed = false;
                     for frame in poke.iter() {
                         let Ok(text) = Utf8Bytes::try_from(frame.clone()) else {
@@ -630,7 +630,11 @@ async fn write_loop(
                     last_sent = Instant::now();
                     stats.groups_to_socket.record(last_sent.duration_since(sent));
                     if let Some(since) = since {
-                        stats.end_to_end.record(last_sent.duration_since(since));
+                        let took = last_sent.duration_since(since);
+                        stats.end_to_end.record(took);
+                        for table in tables.iter() {
+                            table.end_to_end.record(took);
+                        }
                     }
                     stats.frames.fetch_add(poke.len() as u64, Ordering::Relaxed);
                 }

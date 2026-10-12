@@ -769,3 +769,73 @@ fn a_serving_consumer_is_not_woken_for_nothing() {
         assert_eq!(ids(&drain(&mut owner).await), vec![3]);
     });
 }
+
+/// The engine counts, per table, what each change did: its operation,
+/// whether it reached a subscription, the row changes it handed out and
+/// the subscriptions those reached; and the reads it ran on the table with
+/// the rows they returned.
+#[test]
+fn every_change_and_read_is_counted_under_its_table() {
+    use std::sync::atomic::Ordering::Relaxed;
+    block_on(async {
+        let storage = Rc::new(MemoryStorage::new());
+        storage.apply(&insert(1, "OPEN"));
+        storage.apply(&insert(2, "OPEN"));
+        storage.apply(&insert(3, "DONE"));
+        let stats = xyne_sync::stats::Stats::shared();
+        let (events_tx, mut events) = mpsc::unbounded_channel();
+        let (service, commands) = Service::new(MultiTableIVM::new(), storage, events_tx);
+        spawn_local(service.with_stats(stats.clone()).run());
+
+        commands
+            .send(Command::Register {
+                sink: 0,
+                query: open_tickets(),
+                token: 1,
+            })
+            .await
+            .expect("send");
+        drain(&mut events).await;
+        let tickets = stats.flows.table(&TableName::from("tickets"));
+        let snapshot = xyne_sync::stats::flow::READ_KINDS
+            .iter()
+            .position(|kind| *kind == "snapshot")
+            .expect("a snapshot kind");
+        assert_eq!(
+            tickets.reads[snapshot].load(Relaxed),
+            1,
+            "the registration's snapshot read"
+        );
+        assert_eq!(tickets.reads_landed.load(Relaxed), 1);
+        assert_eq!(
+            tickets.rows_read.load(Relaxed),
+            2,
+            "the two open tickets came back"
+        );
+        assert_eq!(tickets.changes(), 0, "no change has arrived yet");
+
+        commands
+            .send(Command::Transaction(Transaction::new(
+                vec![insert(10, "OPEN"), insert(11, "DONE"), insert(12, "DONE")],
+                Lsn(100),
+            )))
+            .await
+            .expect("send");
+        drain(&mut events).await;
+        assert_eq!(tickets.inserts.load(Relaxed), 3);
+        assert_eq!(
+            tickets.matched.load(Relaxed),
+            1,
+            "only the open ticket reached the subscription"
+        );
+        assert_eq!(tickets.deltas.load(Relaxed), 1);
+        assert_eq!(tickets.delta_subscriptions.load(Relaxed), 1);
+        let names: Vec<String> = stats
+            .flows
+            .snapshot()
+            .into_iter()
+            .map(|(name, _)| name.as_str().to_owned())
+            .collect();
+        assert_eq!(names, vec!["tickets".to_owned()]);
+    });
+}

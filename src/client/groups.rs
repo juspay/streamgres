@@ -116,6 +116,7 @@ use crate::model::{
     MultiTableReadQuery, RowData, SubId, TableName, Value, WriteQuery,
 };
 use crate::stats::Stats;
+use crate::stats::flow::{Flows, LocalFlows, TableFlow};
 use crate::sync::{CatalogHandle, Command, Event};
 
 /// What goes out on one connection: a text frame, one poke (its frames
@@ -130,6 +131,7 @@ pub enum Outbound {
         frames: Arc<[Bytes]>,
         since: Option<Instant>,
         sent: Instant,
+        tables: Arc<[Arc<TableFlow>]>,
     },
     Ping,
     Close,
@@ -146,6 +148,7 @@ type Ledger = IdMap<TableName, IdMap<DataFrameKey, Held>>;
 struct Pending {
     delta: Rc<Delta>,
     holders: Vec<(SubId, QueryPart)>,
+    changed: bool,
 }
 
 /// A connection's handle: the client it speaks for and where its frames
@@ -499,13 +502,19 @@ impl Group {
     }
 
     /// Send one poke's frames to every connection of the group.
-    fn broadcast(&self, frames: &Arc<[Bytes]>, since: Option<Instant>) {
+    fn broadcast(
+        &self,
+        frames: &Arc<[Bytes]>,
+        since: Option<Instant>,
+        tables: &Arc<[Arc<TableFlow>]>,
+    ) {
         let sent = Instant::now();
         for socket in self.sockets.values() {
             let _ = socket.sink.send(Outbound::Poke {
                 frames: frames.clone(),
                 since,
                 sent,
+                tables: tables.clone(),
             });
         }
     }
@@ -550,6 +559,8 @@ pub struct Groups {
     mutations_table: TableName,
     next_poke: u64,
     next_generation: u64,
+    /// This thread's handles on the tables' flow counts.
+    flows: LocalFlows,
 }
 
 /// Run group thread `shard` of `shards` until every request sender is
@@ -592,6 +603,7 @@ pub async fn run(
         dirty: HashSet::new(),
         next_poke: 1,
         next_generation: 0,
+        flows: LocalFlows::default(),
     };
     log_info!(
         "client groups {}/{} up; waiting for the change feed to pass the first snapshot before serving queries",
@@ -688,9 +700,9 @@ impl Groups {
                 reads,
             } => {
                 self.registered(token, sub, reads);
-                self.absorb(updates);
+                self.absorb(updates, false);
             }
-            Event::Landed { updates } => self.absorb(updates),
+            Event::Landed { updates } => self.absorb(updates, false),
             Event::Refused { sub, reason } => self.refused(sub, &reason),
             Event::Capped { sub } => self.capped(sub),
             Event::Heavy { sub, table, rows } => self.heavy(sub, table.as_str(), rows),
@@ -736,7 +748,7 @@ impl Groups {
                 received,
                 routed,
             } => {
-                self.absorb(updates);
+                self.absorb(updates, true);
                 self.stats.engine_to_groups.record(routed.elapsed());
                 self.oldest = Some(match self.oldest {
                     Some(oldest) => oldest.min(received),
@@ -757,7 +769,7 @@ impl Groups {
     /// Keep one step's deltas for their groups' next pokes: each delta is
     /// resolved to the groups owning its subscriptions and shared between
     /// them, with the subscriptions and parts of each group it applies to.
-    fn absorb(&mut self, updates: Vec<Delta>) {
+    fn absorb(&mut self, updates: Vec<Delta>, changed: bool) {
         for delta in updates {
             let delta = Rc::new(delta);
             for audience in &delta.audiences {
@@ -778,6 +790,7 @@ impl Groups {
                         _ => queue.push(Pending {
                             delta: delta.clone(),
                             holders: vec![(sub, audience.part)],
+                            changed,
                         }),
                     }
                     if !self.dirty.contains(group_id.as_str()) {
@@ -912,6 +925,7 @@ impl Groups {
                         frames: with_current(&poke_id, &frames, &group.lmids, &waiting),
                         since: None,
                         sent,
+                        tables: Arc::from([]),
                     });
                 }
             }
@@ -969,6 +983,7 @@ impl Groups {
                     frames,
                     since: None,
                     sent,
+                    tables: Arc::from([]),
                 });
             }
         }
@@ -1483,7 +1498,13 @@ impl Groups {
             .fetch_add(result_changes.len() as u64, Ordering::Relaxed);
         let updates = self.pending.remove(group_id).unwrap_or_default();
         let mut rows: Vec<RowOp> = std::mem::take(&mut group.queued_rows);
-        for Pending { delta, holders } in updates {
+        let mut changed_tables: Vec<TableName> = Vec::new();
+        for Pending {
+            delta,
+            holders,
+            changed,
+        } in updates
+        {
             let (key, image) = match &delta.op {
                 DataFrameOperation::Add(key, row) => (key, Some(row)),
                 DataFrameOperation::Delete(key, _) => (key, None),
@@ -1500,6 +1521,9 @@ impl Groups {
                 .collect();
             if let Some(op) = account(&mut group.rows, &delta.table, key, image, holders) {
                 rows.push(op);
+                if changed && !changed_tables.contains(&delta.table) {
+                    changed_tables.push(delta.table.clone());
+                }
             }
         }
         for (client, lmid) in lmid_changes {
@@ -1544,6 +1568,14 @@ impl Groups {
         let base = (group.version > 0).then(|| protocol::cookie(group.version));
         group.version += 1;
         let cookie = protocol::cookie(group.version);
+        let carries_change = !changed_tables.is_empty() || !lmids.is_empty() || !results.is_empty();
+        let since = since.filter(|_| carries_change);
+        let timed: &[TableName] = if since.is_some() {
+            &changed_tables
+        } else {
+            &[]
+        };
+        let tables = count_sent(&mut self.flows, &self.stats.flows, &patches, timed);
         let (frames, puts, dels) = build_poke(
             &self.catalog.load(),
             &self.stats,
@@ -1568,7 +1600,7 @@ impl Groups {
             &frames,
             self.config.group_log_bytes,
         );
-        group.broadcast(&frames, since);
+        group.broadcast(&frames, since, &tables);
     }
 }
 
@@ -1680,6 +1712,44 @@ fn with_current(
     ));
     replayed.push(end.clone());
     replayed.into()
+}
+
+/// Count one poke's row operations in each table's flow, and hand back
+/// the handles of the `timed` tables it carries rows of (those a commit
+/// changed), for its writers to time each table's arrival to socket.
+fn count_sent(
+    local: &mut LocalFlows,
+    flows: &Flows,
+    patches: &[Patch<'_>],
+    timed: &[TableName],
+) -> Arc<[Arc<TableFlow>]> {
+    let mut by_table: Vec<(&TableName, u64, u64)> = Vec::new();
+    for patch in patches {
+        let (table, put) = match patch {
+            Patch::Put(table, _) => (*table, true),
+            Patch::Del(table, _) => (*table, false),
+        };
+        let at = match by_table.iter().position(|(seen, _, _)| *seen == table) {
+            Some(at) => at,
+            None => {
+                by_table.push((table, 0, 0));
+                by_table.len() - 1
+            }
+        };
+        if put {
+            by_table[at].1 += 1;
+        } else {
+            by_table[at].2 += 1;
+        }
+    }
+    let mut handles = Vec::with_capacity(timed.len());
+    for (table, puts, dels) in by_table {
+        local.get(flows, table).note_sent(puts, dels);
+        if timed.contains(table) {
+            handles.push(local.handle(flows, table));
+        }
+    }
+    handles.into()
 }
 
 /// One poke as its frames, from `base` to `cookie`: the start, the parts
@@ -1824,6 +1894,40 @@ mod tests {
         )
     }
 
+    /// A poke's row operations are counted once per table, puts and dels
+    /// apart, and only the tables named as changed are handed back to be
+    /// timed.
+    #[test]
+    fn a_poke_counts_its_rows_per_table_and_hands_back_only_the_changed_tables() {
+        let flows = Flows::default();
+        let mut local = LocalFlows::default();
+        let (messages, channels) = (TableName::from("messages"), TableName::from("channels"));
+        let (key_1, row_1) = row(1, "a");
+        let (_, row_2) = row(2, "b");
+        let patches = vec![
+            Patch::Put(&messages, &row_1),
+            Patch::Put(&messages, &row_2),
+            Patch::Del(&messages, &key_1),
+            Patch::Put(&channels, &row_1),
+        ];
+        let timed = count_sent(
+            &mut local,
+            &flows,
+            &patches,
+            std::slice::from_ref(&channels),
+        );
+        let named: Vec<u64> = timed
+            .iter()
+            .map(|flow| flow.rows_put.load(Ordering::Relaxed))
+            .collect();
+        assert_eq!(named, vec![1], "only channels, the table named as changed");
+        let untimed = count_sent(&mut local, &flows, &patches, &[]);
+        assert!(untimed.is_empty(), "no changed table, nothing to time");
+        let messages = flows.table(&messages);
+        assert_eq!(messages.rows_put.load(Ordering::Relaxed), 4);
+        assert_eq!(messages.rows_deleted.load(Ordering::Relaxed), 2);
+    }
+
     /// A row two queries show stays on the client while either still
     /// holds it, and the second holder's arrival sends nothing when the
     /// image is the one already sent.
@@ -1957,6 +2061,7 @@ mod tests {
                 dirty: HashSet::new(),
                 next_poke: 1,
                 next_generation: 0,
+                flows: LocalFlows::default(),
             };
             Bench { core, commands }
         }
@@ -2106,6 +2211,29 @@ mod tests {
     }
 
     impl Tab {
+        /// For every poke sent since the last look: whether it was timed
+        /// (it carries a clock start) and the tables of `flows` it is timed
+        /// under.
+        fn timing(&mut self, flows: &Flows) -> Vec<(bool, Vec<String>)> {
+            let known = flows.snapshot();
+            let mut out = Vec::new();
+            while let Ok(outbound) = self.frames.try_recv() {
+                if let Outbound::Poke { since, tables, .. } = outbound {
+                    let names = tables
+                        .iter()
+                        .filter_map(|flow| {
+                            known
+                                .iter()
+                                .find(|(_, held)| Arc::ptr_eq(held, flow))
+                                .map(|(name, _)| name.as_str().to_owned())
+                        })
+                        .collect();
+                    out.push((since.is_some(), names));
+                }
+            }
+            out
+        }
+
         /// Every poke the tab's socket was sent since the last look.
         fn pokes(&mut self) -> Vec<Seen> {
             let mut out = Vec::new();
@@ -2236,6 +2364,57 @@ mod tests {
     /// version does not move, so the client that returns with its cookie
     /// is accepted and its next poke carries exactly the net of what it
     /// missed, once.
+    /// A flush that brings one table's committed change and another
+    /// table's freshly read rows to the same group times the poke under
+    /// the changed table alone; a poke of read rows alone is not timed,
+    /// even when a commit elsewhere started the flush's clock.
+    #[test]
+    fn only_a_change_is_timed_and_only_under_the_tables_it_changed() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut tab = bench.connect("a1", None).expect("accepted");
+            bench.hydrate(&tab, "h1", 1, &[(1, "one")]);
+            tab.pokes();
+            let mut read = put(1, 2, "read");
+            read.table = TableName::from("labels");
+            bench.core.event(Event::Landed {
+                updates: vec![read],
+            });
+            bench.core.event(Event::Committed {
+                updates: vec![put(1, 3, "changed")],
+                position: crate::model::Lsn(10),
+                floor: crate::model::Lsn(10),
+                watched: Vec::new(),
+                received: Instant::now(),
+                routed: Instant::now(),
+            });
+            bench.core.flush();
+            let timed = tab.timing(&bench.core.stats.flows);
+            assert_eq!(
+                timed,
+                vec![(true, vec!["notes".to_owned()])],
+                "timed, under notes alone"
+            );
+            bench.core.event(Event::Landed {
+                updates: vec![put(1, 4, "read again")],
+            });
+            bench.core.event(Event::Committed {
+                updates: Vec::new(),
+                position: crate::model::Lsn(11),
+                floor: crate::model::Lsn(11),
+                watched: Vec::new(),
+                received: Instant::now(),
+                routed: Instant::now(),
+            });
+            bench.core.flush();
+            assert_eq!(
+                tab.timing(&bench.core.stats.flows),
+                vec![(false, Vec::new())],
+                "read rows in the flush of a commit that changed nothing here are not timed"
+            );
+        });
+    }
+
     #[test]
     fn a_client_that_returns_is_sent_what_it_missed() {
         on_local(|| {
@@ -3330,6 +3509,7 @@ mod tests {
                 dirty: HashSet::new(),
                 next_poke: 1,
                 next_generation: 0,
+                flows: LocalFlows::default(),
             };
             let mut thread_time = Duration::ZERO;
             let mut flush_time = Duration::ZERO;
@@ -3987,6 +4167,7 @@ mod tests {
                     dirty: HashSet::new(),
                     next_poke: 1,
                     next_generation: 0,
+                    flows: LocalFlows::default(),
                 };
                 let mut tabs: HashMap<usize, mpsc::UnboundedReceiver<Outbound>> = HashMap::new();
                 let mut out = Measured::default();
