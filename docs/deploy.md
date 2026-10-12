@@ -252,7 +252,6 @@ depend on what the defaults happen to be:
 | `STREAMGRES_READ_TIMEOUT_MS` | `10000` | longest a database read may take before it is cancelled and its query refused. `0` means no limit |
 | `STREAMGRES_BACKEND_TIMEOUT_MS` | `30000` | longest a call to the application server may take. `0` means no limit |
 | `STREAMGRES_PG_KEEPALIVE_IDLE_MS`, `_INTERVAL_MS`, `_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on database connections. `0` idle time turns it off |
-| `STREAMGRES_WHOLE_PAGE_LIMIT` | `5000` | a page that drives a join is read whole up to this many rows, in growing batches past it |
 | `STREAMGRES_JOIN_PREFERRED_SIDE` | `parent` | which side drives a join when both plans cost the same |
 | `STREAMGRES_PLAN_QUERY_TTL_MS` | `86400000` | how long one plan is reused for every query of the same name and join shape. `0` plans every query separately |
 | `STREAMGRES_PLAN_TTL_MS`, `STREAMGRES_PLAN_CACHE` | `600000`, `10000` | how long refused plans are remembered, and how many plans are kept |

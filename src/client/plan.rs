@@ -60,14 +60,13 @@
 //! all, reading its window in batches and keeping it to the rows they
 //! admit.
 //!
-//! **How a page that drives is read** is the planner's last word
-//! ([`MultiTableReadQuery::page`]): a page whose alone count is within
-//! the whole-page limit ([`Policy::whole`]) is read **whole** — every row
-//! of its filter in one read, the `LIMIT` applied in memory, the rows its
-//! edge rejects kept, so the edge's restriction stays exact — and any
-//! other page in **batches** that double from one round to the next, the
-//! rows its edge rejects dropped and the driven side routing on its own
-//! filter (see the `multi` module).
+//! **How a page that drives is read** is not the planner's to decide: a
+//! page is always read in **batches** ([`MultiTableReadQuery::page`], as
+//! translated) — the first ten times its `LIMIT`, doubling from one round
+//! to the next, the rows its edge rejects dropped and the driven side
+//! routing on its own filter (see the `multi` module). A page is never
+//! read whole, whatever its count, so no page holds more than its rounds
+//! read for it.
 //!
 //! The planner does no I/O: it hands out the counts it wants and takes
 //! the answers back, so the caller runs them wherever it can and the
@@ -98,7 +97,7 @@ use futures_util::future::join_all;
 use super::ast::Translated;
 use crate::log::{Level, log_event};
 use crate::model::{
-    ColumnName, ComparisonOperator, Condition, Driver, Join, MultiTableReadQuery, PageRead,
+    ColumnName, ComparisonOperator, Condition, Driver, Join, MultiTableReadQuery,
     SingleTableReadQuery, Value,
 };
 use crate::sync::Storage;
@@ -112,14 +111,11 @@ pub enum Side {
 }
 
 /// The planner's settings: the most rows a whole node may hold (the same
-/// number a storage read may return), the side that breaks a tie, and
-/// the most rows a page that drives an inner edge is read whole for
-/// (past it the page is read in batches).
+/// number a storage read may return) and the side that breaks a tie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
     pub limit: u64,
     pub preferred: Side,
-    pub whole: u64,
 }
 
 /// One node of the tree being planned.
@@ -360,9 +356,8 @@ impl Planner {
     /// Decide every inner edge's driver from the counts in, or refuse:
     /// every node's plan from the leaves up ([`Planner::plans`]), then
     /// the tree from the root down, a compared node by its plan and a
-    /// node narrowed from above driving everything below it. Every page
-    /// left driving an inner edge is then marked read whole when its
-    /// alone count is within the whole-page limit, in batches otherwise.
+    /// node narrowed from above driving everything below it. A page's
+    /// read stays as translated: in batches, driving or driven.
     pub fn decide(mut self) -> Result<MultiTableReadQuery, String> {
         if self.counted.is_empty() {
             return Ok(self.query);
@@ -386,30 +381,6 @@ impl Planner {
         for (path, position, driver) in decisions {
             if let Some(join) = join_at(&mut self.query, &path, position) {
                 join.driver = driver;
-            }
-        }
-        let whole = self.policy.whole;
-        let pages: Vec<(Vec<usize>, PageRead)> =
-            self.nodes
-                .iter()
-                .enumerate()
-                .filter(|(index, node)| {
-                    node.query.limit != u32::MAX
-                        && self.edges.iter().enumerate().any(|(edge, e)| {
-                            e.parent == *index && drivers[edge] == Some(Driver::Main)
-                        })
-                })
-                .map(|(_, node)| {
-                    let read = match node.alone {
-                        Some(count) if count <= whole => PageRead::Whole,
-                        _ => PageRead::Batched,
-                    };
-                    (node.path.clone(), read)
-                })
-                .collect();
-        for (path, read) in pages {
-            if let Some(node) = self.query.node_at_mut(&path) {
-                node.page = read;
             }
         }
         Ok(self.query)
@@ -929,7 +900,7 @@ mod tests {
 
     use super::*;
     use crate::ivm::QueryPart;
-    use crate::model::{Join, Order, OrderBy, Where};
+    use crate::model::{Join, Order, OrderBy, PageRead, Where};
 
     /// `table WHERE filter`, pkey-ordered, with `limit`.
     fn node(table: &str, filter: Where, limit: u32) -> SingleTableReadQuery {
@@ -1003,14 +974,9 @@ mod tests {
         (asked, planner.decide())
     }
 
-    /// The policy with `limit`, preferring `preferred`, reading no page
-    /// whole.
+    /// The policy with `limit`, preferring `preferred`.
     fn policy(limit: u64, preferred: Side) -> Policy {
-        Policy {
-            limit,
-            preferred,
-            whole: 0,
-        }
+        Policy { limit, preferred }
     }
 
     /// A node with inner subs is counted twice, alone (its `EXISTS`
@@ -1051,28 +1017,24 @@ mod tests {
         assert!(counts.iter().all(|count| count.cap == 101));
     }
 
-    /// A page that drives is read whole when its alone count is within
-    /// the whole-page limit and in batches otherwise; a page a sub
-    /// drives, and a node without a page, are left as translated.
+    /// A page that drives is read in batches whatever its alone count —
+    /// one row or a hundred, never whole; a page a sub drives, and a node
+    /// without a page, are left as translated too.
     #[test]
-    fn a_driving_page_is_read_whole_within_the_whole_page_limit() {
-        let whole = Policy {
-            limit: 100,
-            preferred: Side::Parent,
-            whole: 10,
-        };
-        for (messages, expected) in [(10, PageRead::Whole), (11, PageRead::Batched)] {
+    fn a_driving_page_is_read_in_batches_whatever_its_count() {
+        let policy = policy(100, Side::Parent);
+        for messages in [1, 10, 11, 100] {
             let (_, outcome) = drive(
-                Planner::new(messages_in_channel(50).query, whole),
+                Planner::new(messages_in_channel(50).query, policy),
                 &[("messages", messages), ("conversations", 101)],
                 &[],
             );
             let planned = outcome.expect("planned");
             assert_eq!(planned.joins[0].driver, Driver::Main, "the page drives");
-            assert_eq!(planned.page, expected, "a page of {messages} rows");
+            assert_eq!(planned.page, PageRead::Batched, "a page of {messages} rows");
         }
         let (_, outcome) = drive(
-            Planner::new(messages_in_channel(50).query, whole),
+            Planner::new(messages_in_channel(50).query, policy),
             &[("messages", 50), ("conversations", 3)],
             &[("messages", 5)],
         );
@@ -1080,14 +1042,14 @@ mod tests {
         assert_eq!(planned.joins[0].driver, Driver::Sub, "the sub drives");
         assert_eq!(planned.page, PageRead::Batched, "left as translated");
         let (_, outcome) = drive(
-            Planner::new(messages_in_channel(u32::MAX).query, whole),
+            Planner::new(messages_in_channel(u32::MAX).query, policy),
             &[("messages", 5), ("conversations", 101)],
             &[],
         );
         assert_eq!(
             outcome.expect("planned").page,
             PageRead::Batched,
-            "no page, nothing to read whole"
+            "no page, nothing to batch"
         );
     }
 
@@ -1484,7 +1446,6 @@ mod tests {
         let sandbox = Policy {
             limit: 100_000,
             preferred: Side::Parent,
-            whole: 5_000,
         };
         let (_, outcome) = drive(
             Planner::new(query, sandbox),

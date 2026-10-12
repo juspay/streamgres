@@ -128,7 +128,6 @@ fn planned(q: &Q, counts: &dyn Fn(&str, bool) -> u64) -> MultiTableReadQuery {
         Policy {
             limit: 100_000,
             preferred: Side::Parent,
-            whole: 5_000,
         },
     );
     let asked: Vec<(usize, bool)> = planner
