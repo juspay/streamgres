@@ -1,5 +1,5 @@
 //! The harness: the join engine under the synchronous driver over
-//! in-process storage, with the xyne-spaces catalog. Rows are built as full
+//! in-process storage, with the production application catalog. Rows are built as full
 //! images (every column present, unset ones `NULL`, `workspaceId` defaulting
 //! to the caller's workspace), every subscription gets the ACL's tenant
 //! backstop (`workspaceId = <caller's>` on a workspace-scoped root, `apps`
@@ -16,13 +16,13 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use xyne_sync::ivm::{Delta, MultiTableIVM, QueryPart, SubId};
-use xyne_sync::model::{
+use streamgres::ivm::{Delta, MultiTableIVM, QueryPart, SubId};
+use streamgres::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameOperation, DataFrameRow, DeleteQuery, InsertQuery,
     UpdateQuery, Value, WriteQuery,
 };
-use xyne_sync::parser::parse_read;
-use xyne_sync::sync::{Local, MemoryStorage};
+use streamgres::parser::parse_read;
+use streamgres::sync::{Local, MemoryStorage};
 
 use super::catalog::{catalog, columns, pkey};
 use super::zql::Q;

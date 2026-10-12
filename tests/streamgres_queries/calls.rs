@@ -2,9 +2,9 @@
 //! their shares, summary templates and recurring series, one test per
 //! registry entry over one calls fixture.
 
-use xyne_sync::model::ComparisonOperator::NEQ;
-use xyne_sync::model::Order::{ASC, DESC};
-use xyne_sync::model::Value;
+use streamgres::model::ComparisonOperator::NEQ;
+use streamgres::model::Order::{ASC, DESC};
+use streamgres::model::Value;
 
 use super::world::{ME, WS, World, ops, with};
 use super::zql::{Q, eq, or, same, zql};

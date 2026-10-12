@@ -1,6 +1,6 @@
-# Contributing to Xyne-Sync
+# Contributing to Streamgres
 
-Thanks for your interest in improving Xyne-Sync. This guide covers how to set
+Thanks for your interest in improving Streamgres. This guide covers how to set
 up a development environment, what a pull request needs before it is merged,
 and the conventions the code follows.
 
@@ -33,19 +33,19 @@ Build and test:
 cargo build
 cargo test                          # unit and scenario tests
 cargo clippy --all-targets -- -D warnings
-cargo run --bin xyne_sync           # demo: every check must end in PASS
+cargo run --bin streamgres           # Streamgres demo: every check must end in PASS
 cargo run --release --bin bench     # benchmarks
-cargo run --release --bin load      # the server over the wire: latency, cores, memory (needs XYNE_SYNC_PG_DSN)
+cargo run --release --bin load      # the server over the wire: latency, cores, memory (needs STREAMGRES_PG_DSN)
 ```
 
-The tests against a real PostgreSQL run when `XYNE_SYNC_PG_DSN` is set and
+The tests against a real PostgreSQL run when `STREAMGRES_PG_DSN` is set and
 report themselves skipped otherwise. To run them the way CI does:
 
 ```bash
 docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17 \
   -c wal_level=logical -c max_replication_slots=32 -c max_wal_senders=32
 
-XYNE_SYNC_PG_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
+STREAMGRES_PG_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
   cargo test --release
 ```
 
@@ -91,8 +91,8 @@ unrelated files in the same pull request.
   `tests/multi_table_scenarios.rs`, `tests/gated_pages.rs`).
 - Anything that touches PostgreSQL, snapshots or the change feed needs a live
   test in `tests/pg_live.rs` or `tests/schema_changes.rs`.
-- `tests/xyne_spaces_queries/` is a suite of real queries from a production
-  application. A change that makes one of them fail or get refused needs a
+- `tests/streamgres_queries/` is a suite of production-application queries.
+  A change that makes one of them fail or get refused needs a
   reason in the pull request.
 
 ### Performance
@@ -128,7 +128,7 @@ comparison needs an explanation.
 
 ## License
 
-Xyne-Sync is licensed under the [Apache License, Version 2.0](LICENSE). Unless
+Streamgres is licensed under the [Apache License, Version 2.0](LICENSE). Unless
 you say otherwise, any contribution you submit is licensed under the same
 terms, as section 5 of the licence provides.
 

@@ -134,7 +134,7 @@ pub use update::{Audience, Delta, QueryPart, Subs, Target};
 pub use window::{PAGE_FIRST_BATCH, PAGE_ROUNDS, PageSpec, order_cmp, order_rows};
 
 /// The most rows one batch of a page reads when no other limit is set:
-/// the same number the server's `XYNE_SYNC_ROW_LIMIT` defaults to.
+/// the same number the server's `STREAMGRES_ROW_LIMIT` defaults to.
 pub const DEFAULT_ROW_LIMIT: usize = 100_000;
 
 use std::collections::{BTreeSet, HashMap};

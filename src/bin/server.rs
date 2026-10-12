@@ -4,7 +4,7 @@
 //! cargo run --release --bin server
 //! ```
 //!
-//! Configured by `XYNE_SYNC_*` environment variables (see `.env.example`);
+//! Configured by `STREAMGRES_*` environment variables (see `.env.example`);
 //! a `.env` file in the working directory is read first, without
 //! overriding variables already set.
 #[global_allocator]
@@ -22,10 +22,10 @@ unsafe impl Sync for MallocConf {}
 fn main() {
     load_dotenv(".env");
     raise_file_limit();
-    let outcome = xyne_sync::client::Config::from_env().and_then(xyne_sync::client::serve);
+    let outcome = streamgres::client::Config::from_env().and_then(streamgres::client::serve);
     if let Err(error) = outcome {
         eprintln!("{error}");
-        xyne_sync::log::exit(1);
+        streamgres::log::exit(1);
     }
 }
 

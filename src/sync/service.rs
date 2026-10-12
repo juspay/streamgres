@@ -866,7 +866,7 @@ enum Dead {
 fn spawn_reaper() -> std::sync::mpsc::Sender<Dead> {
     let (sender, receiver) = std::sync::mpsc::channel::<Dead>();
     let spawned = std::thread::Builder::new()
-        .name("xyne-sync-reaper".to_owned())
+        .name("streamgres-reaper".to_owned())
         .spawn(move || {
             while let Ok(batch) = receiver.recv() {
                 match batch {

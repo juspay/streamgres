@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // A self-contained load on a running sync server, with nothing of the application
 // behind it (the table of scripts/smoke.mjs, prepared with `smoke.mjs --prepare`, and a
-// server started with XYNE_SYNC_ROW_LIMIT of at least 600). Every connection is a
+// server started with STREAMGRES_ROW_LIMIT of at least 600). Every connection is a
 // client group of its own holding one of ten 40-row buckets of the table; one psql
 // session then writes `--writes` updates a second for `--duration` seconds, each reaching
 // the tenth of the connections that hold its bucket (so the load generator, one process,

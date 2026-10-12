@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::{LocalSet, spawn_local};
-use xyne_sync::ivm::{Engine, MultiTableIVM, QueryPart, SchemaChange, SingleTableIVM};
-use xyne_sync::model::*;
-use xyne_sync::sync::{
+use streamgres::ivm::{Engine, MultiTableIVM, QueryPart, SchemaChange, SingleTableIVM};
+use streamgres::model::*;
+use streamgres::sync::{
     CatalogHandle, Command, Event, Lsn, MemoryStorage, Runtime, Service, Snapshot, Storage,
     StorageError, Transaction,
 };

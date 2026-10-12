@@ -1,7 +1,7 @@
 //! The data model the whole engine operates on.
 //!
-//! Split by concern, re-exported flat — `use xyne_sync::model::*` gives the
-//! full vocabulary:
+//! Split by concern and re-exported flat for convenient access to the full
+//! vocabulary:
 //!
 //! - [`value`] — [`Value`] / [`ValueType`], the dynamic value representation
 //! - [`schema`] — [`Catalog`] / [`DbTable`] / [`DbColumn`]: the single

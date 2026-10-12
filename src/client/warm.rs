@@ -268,7 +268,7 @@ mod tests {
     /// A file of its own for one test.
     fn scratch(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("xyne-sync-warm-{name}-{}.json", std::process::id()));
+        path.push(format!("streamgres-warm-{name}-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
     }
@@ -340,7 +340,6 @@ mod tests {
         let policy = Policy {
             limit: 1000,
             preferred: super::super::plan::Side::Parent,
-            whole: 0,
         };
         let raw = |ast: Json| RawValue::from_string(ast.to_string()).unwrap();
         let shapes = vec![

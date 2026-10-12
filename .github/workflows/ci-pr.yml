@@ -53,7 +53,7 @@ jobs:
     name: Tests (accuracy)
     runs-on: ubuntu-latest
     env:
-      XYNE_SYNC_PG_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+      STREAMGRES_PG_DSN: postgresql://postgres:postgres@localhost:5432/postgres
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     env:
-      XYNE_SYNC_BENCH_ONLY: routing,twins,window,join
+      STREAMGRES_BENCH_ONLY: routing,twins,window,join
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -158,7 +158,7 @@ jobs:
           context: .
           file: docker/server/Dockerfile
           load: true
-          tags: xyne-sync:ci
+          tags: streamgres:ci
           build-args: |
             SOURCE_COMMIT=${{ github.sha }}
           cache-from: type=gha,scope=server
@@ -189,19 +189,19 @@ jobs:
       - name: Start the server from the image
         run: |
           docker run -d --name server --network host \
-            -e XYNE_SYNC_PG_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
-            -e XYNE_SYNC_BASE_PATH=/sync \
-            -e XYNE_SYNC_APP_ID=xyne \
-            -e XYNE_SYNC_QUERY_URL=http://127.0.0.1:9/query \
-            -e XYNE_SYNC_MUTATE_URL=http://127.0.0.1:9/push \
-            -e XYNE_SYNC_ROW_LIMIT=600 \
+            -e STREAMGRES_PG_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
+            -e STREAMGRES_BASE_PATH=/sync \
+            -e STREAMGRES_APP_ID=xyne \
+            -e STREAMGRES_QUERY_URL=http://127.0.0.1:9/query \
+            -e STREAMGRES_MUTATE_URL=http://127.0.0.1:9/push \
+            -e STREAMGRES_ROW_LIMIT=600 \
             -e OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
             -e OTEL_EXPORTER_OTLP_PROTOCOL=http/json \
             -e OTEL_METRICS_EXPORTER=otlp \
             -e OTEL_LOGS_EXPORTER=otlp \
             -e OTEL_TRACES_EXPORTER=none \
             -e OTEL_METRIC_EXPORT_INTERVAL=2000 \
-            xyne-sync:ci
+            streamgres:ci
           for _ in $(seq 1 60); do
             [ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4848/health)" = 200 ] && exit 0
             sleep 1

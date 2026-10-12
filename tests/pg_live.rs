@@ -2,7 +2,7 @@
 //! `test_decoding` change feed, with writes committed deliberately behind
 //! an open snapshot; the asynchronous service end to end with one table
 //! mirrored in memory; and schema changes followed through the
-//! schema-change trigger stack. They run only when `XYNE_SYNC_PG_DSN` names a
+//! schema-change trigger stack. They run only when `STREAMGRES_PG_DSN` names a
 //! database with `wal_level = logical` (and free replication slots), and
 //! report themselves skipped otherwise; each scenario uses its own tables
 //! and slot, so they can run in parallel.
@@ -15,20 +15,20 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, NoTls};
-use xyne_sync::ivm::{Delta, Engine, Fetch, MultiTableIVM, QueryPart};
-use xyne_sync::model::*;
-use xyne_sync::client::ddl_triggers::trigger_stack_sql;
-use xyne_sync::sync::pg::ddl::DdlSource;
-use xyne_sync::sync::pg::{PgStorage, PgStream};
-use xyne_sync::sync::{
+use streamgres::ivm::{Delta, Engine, Fetch, MultiTableIVM, QueryPart};
+use streamgres::model::*;
+use streamgres::client::ddl_triggers::trigger_stack_sql;
+use streamgres::sync::pg::ddl::DdlSource;
+use streamgres::sync::pg::{PgStorage, PgStream};
+use streamgres::sync::{
     CatalogHandle, Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
 };
 
 /// The database under test, if any.
 fn dsn() -> Option<String> {
-    let dsn = std::env::var("XYNE_SYNC_PG_DSN").ok();
+    let dsn = std::env::var("STREAMGRES_PG_DSN").ok();
     if dsn.is_none() {
-        eprintln!("XYNE_SYNC_PG_DSN not set: live Postgres scenario skipped");
+        eprintln!("STREAMGRES_PG_DSN not set: live Postgres scenario skipped");
     }
     dsn
 }
@@ -898,13 +898,13 @@ fn a_json_column_is_filtered_by_value() {
                 Where::condition(
                     column,
                     ComparisonOperator::EQ,
-                    xyne_sync::sync::pg::text::jsonb_text(&literal).as_str(),
+                    streamgres::sync::pg::text::jsonb_text(&literal).as_str(),
                 ),
                 OrderBy::new("id", Order::ASC),
                 u32::MAX,
             )
         };
-        let ids = |snapshot: &xyne_sync::model::Snapshot| -> Vec<i64> {
+        let ids = |snapshot: &streamgres::model::Snapshot| -> Vec<i64> {
             snapshot
                 .rows
                 .iter()
@@ -933,7 +933,7 @@ fn a_json_column_is_filtered_by_value() {
                 assert_eq!(
                     read.rows[0].1.data.get(&ColumnName::from(column)),
                     Some(&Value::from(
-                        xyne_sync::sync::pg::text::jsonb_text(&literal).as_str()
+                        streamgres::sync::pg::text::jsonb_text(&literal).as_str()
                     )),
                     "the {column} cell a read brings back is the text the literal was given"
                 );

@@ -1,6 +1,6 @@
 //! A log with four levels, written by its own thread: a call checks its
 //! level first (one atomic load), formats only when the level is on, and
-//! hands the finished line to a bounded queue that the `xyne-sync-log`
+//! hands the finished line to a bounded queue that the `streamgres-log`
 //! thread drains to stderr in batches. A full queue drops the line and
 //! counts the drop rather than making the caller wait, so a flood of
 //! lines never slows the thread that logged them; the count is a metric.
@@ -180,7 +180,7 @@ fn sender() -> &'static Mutex<SyncSender<Item>> {
     SENDER.get_or_init(|| {
         let (sender, receiver) = sync_channel(QUEUE);
         let spawned = std::thread::Builder::new()
-            .name("xyne-sync-log".to_owned())
+            .name("streamgres-log".to_owned())
             .spawn(move || write_loop(receiver));
         if spawned.is_err() {
             eprintln!("the log thread could not be started; lines are dropped");
@@ -356,7 +356,7 @@ mod tests {
         Line {
             at: chrono::DateTime::from_timestamp(1_789_819_200, 123_000_000).unwrap(),
             level,
-            thread: "xyne-sync-engine".to_owned(),
+            thread: "streamgres-engine".to_owned(),
             message: "query registered".to_owned(),
             fields: vec![
                 ("name", "channelMessages".to_owned()),
@@ -372,12 +372,12 @@ mod tests {
         let text = render(&line(Level::Warn), Format::Text);
         assert_eq!(
             text,
-            "12:00:00.123 WARN  [xyne-sync-engine] query registered name=channelMessages ms=12.5 rows=40 reason=\"row budget hit\"\n"
+            "12:00:00.123 WARN  [streamgres-engine] query registered name=channelMessages ms=12.5 rows=40 reason=\"row budget hit\"\n"
         );
         let json = render(&line(Level::Info), Format::Json);
         let parsed: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
         assert_eq!(parsed["level"], "info");
-        assert_eq!(parsed["thread"], "xyne-sync-engine");
+        assert_eq!(parsed["thread"], "streamgres-engine");
         assert_eq!(parsed["msg"], "query registered");
         assert_eq!(parsed["name"], "channelMessages");
         assert_eq!(parsed["ms"], 12.5);

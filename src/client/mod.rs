@@ -22,7 +22,7 @@
 //!   side.
 //! - **Engine thread.** The service: the runtime and the engine, and
 //!   nothing else; the storage reads it asks for run on the reads pool.
-//! - **Group threads.** `XYNE_SYNC_GROUP_THREADS` of them, each keeping
+//! - **Group threads.** `STREAMGRES_GROUP_THREADS` of them, each keeping
 //!   the views of the client groups that hash to it and building their
 //!   pokes ([`groups`]).
 //! - **Reads pool.** A small runtime for the storage: the SQL, the
@@ -94,7 +94,7 @@ async fn join_worker(
     let join_name = name.clone();
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
-        .name(format!("xyne-sync-{name}-join"))
+        .name(format!("streamgres-{name}-join"))
         .spawn(move || {
             let outcome = thread
                 .join()
@@ -121,7 +121,7 @@ pub fn serve(config: Config) -> Result<(), String> {
     let cleanup_settings = settings.clone();
     let server = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_name("xyne-sync-server")
+        .thread_name("streamgres-server")
         .build()
         .map_err(|error| format!("tokio: {error}"))?;
     let catalog = Arc::new(CatalogHandle::new(
@@ -134,10 +134,10 @@ pub fn serve(config: Config) -> Result<(), String> {
     let reads = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(settings.read_threads)
         .enable_all()
-        .thread_name("xyne-sync-reads")
+        .thread_name("streamgres-reads")
         .build()
         .map_err(|error| format!("tokio: {error}"))?;
-    let stats = crate::stats::Stats::shared();
+    let stats = crate::stats::Stats::shared_with_metric_prefix(config.metrics_prefix.clone());
     crate::stats::Stats::install(&stats);
     let shards = config.group_threads.max(1);
     stats.read_row_limit.store(
@@ -151,7 +151,7 @@ pub fn serve(config: Config) -> Result<(), String> {
     let engine_shutdown = shutdown.clone();
     let (started_tx, started_rx) = std::sync::mpsc::channel::<Result<threads::Started, String>>();
     let engine_thread = std::thread::Builder::new()
-        .name("xyne-sync-engine".to_owned())
+        .name("streamgres-engine".to_owned())
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -218,7 +218,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         let readiness = readiness.clone();
         let group_shutdown = shutdown.clone();
         let thread = std::thread::Builder::new()
-            .name(format!("xyne-sync-groups-{shard}"))
+            .name(format!("streamgres-groups-{shard}"))
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()

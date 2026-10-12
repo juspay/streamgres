@@ -4,7 +4,7 @@
 //!
 //! ```bash
 //! cargo build --release --bin server
-//! XYNE_SYNC_PG_DSN=postgres://user@localhost:5432/xyne_bench \
+//! STREAMGRES_PG_DSN=postgres://user@localhost:5432/streamgres_bench \
 //!   cargo run --release --bin load -- --connections 200 --duration 60
 //! ```
 //!
@@ -59,7 +59,7 @@
 //!    PASS when every committed row reached every client that held its
 //!    query and no connection dropped; `--out FILE` writes it all as JSON.
 //!
-//! Options (defaults in brackets): `--dsn` [`$XYNE_SYNC_PG_DSN`],
+//! Options (defaults in brackets): `--dsn` [`$STREAMGRES_PG_DSN`],
 //! `--connections` [200], `--users` [100], `--channels` [20], `--boards`
 //! [10], `--threads` [3], `--tps` [50], `--rows-per-tx` [5], `--writers`
 //! [4], `--pushers` [8], `--push-rate` [10], `--churn` [1], `--warmup` [5],
@@ -96,7 +96,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use xyne_sync::client::ddl_triggers::trigger_stack_sql;
+use streamgres::client::ddl_triggers::trigger_stack_sql;
 
 type Json = Json_;
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -193,8 +193,9 @@ impl Options {
             }
         }
         let dsn = get("dsn")
+            .or_else(|| std::env::var("STREAMGRES_PG_DSN").ok())
             .or_else(|| std::env::var("XYNE_SYNC_PG_DSN").ok())
-            .ok_or("--dsn (or XYNE_SYNC_PG_DSN) must name the database")?;
+            .ok_or("--dsn (or STREAMGRES_PG_DSN) must name the database")?;
         let database = dsn
             .rsplit('/')
             .next()
@@ -534,7 +535,7 @@ CREATE PUBLICATION {publication} FOR ALL TABLES;
     insert_batches(&client, "channels", &rows).await?;
     let mut rows = Vec::new();
     let mut member_of: HashSet<(usize, usize)> = HashSet::new();
-    for user in 0..opts.seed_users {
+    for (user, user_id) in users.iter().enumerate().take(opts.seed_users) {
         let mut mine: Vec<usize> = Vec::new();
         if user < opts.users {
             // the load users: their own channel and the next few
@@ -551,7 +552,7 @@ CREATE PUBLICATION {publication} FOR ALL TABLES;
                 rows.push(format!(
                     "('cm-{user}-{channel}', {ch}, {u}, 'MEMBER', {created})",
                     ch = quote(&channels[channel]),
-                    u = quote(&users[user]),
+                    u = quote(user_id),
                     created = now - day * 200 + rng.below(day as u64) as i64,
                 ));
             }
@@ -564,7 +565,7 @@ CREATE PUBLICATION {publication} FOR ALL TABLES;
     let mut threads = Vec::with_capacity(opts.channels);
     let mut conv_rows = Vec::new();
     let mut msg_rows = Vec::new();
-    for channel in 0..opts.channels {
+    for (channel, channel_id) in channels.iter().enumerate() {
         let mut pool = Vec::with_capacity(THREAD_POOL);
         for n in 0..opts.seed_conversations {
             let id = conversation_id(channel, n);
@@ -577,7 +578,7 @@ CREATE PUBLICATION {publication} FOR ALL TABLES;
                 "({id}, '{ws}', {ch}, {by}, {title}, {md}, {replies}, {activity}, {created}, {created})",
                 id = quote(&id),
                 ws = WORKSPACE,
-                ch = quote(&channels[channel]),
+                ch = quote(channel_id),
                 by = quote(&users[author]),
                 title = quote(&words(&mut rng, 5)),
                 md = quote(&markdown(&mut rng, md_bytes)),
@@ -643,12 +644,12 @@ CREATE PUBLICATION {publication} FOR ALL TABLES;
     // activities: a few unread per load user
     let kinds = ["mention", "reply", "assigned", "reaction"];
     let mut rows = Vec::new();
-    for user in 0..opts.users {
+    for (user, user_id) in users.iter().enumerate().take(opts.users) {
         for k in 0..3 {
             rows.push(format!(
                 "('a-{user}-{k}', '{ws}', {u}, '{kind}', {ref_}, {read}, {created})",
                 ws = WORKSPACE,
-                u = quote(&users[user]),
+                u = quote(user_id),
                 kind = rng.word(&kinds),
                 ref_ = quote(&conversation_id(user % opts.channels, rng.index(opts.seed_conversations))),
                 read = if k == 0 { "NULL".to_owned() } else { (now - 3_600_000).to_string() },
@@ -1293,23 +1294,23 @@ impl Server {
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", std::env::var("HOME").unwrap_or_default())
-            .env("XYNE_SYNC_ADDR", &addr)
-            .env("XYNE_SYNC_BASE_PATH", "/sync")
-            .env("XYNE_SYNC_PG_DSN", &opts.dsn)
-            .env("XYNE_SYNC_PUBLICATION", PUBLICATION)
-            .env("XYNE_SYNC_QUERY_URL", format!("http://127.0.0.1:{app_port}/query"))
-            .env("XYNE_SYNC_MUTATE_URL", format!("http://127.0.0.1:{app_port}/push"))
-            .env("XYNE_SYNC_APP_ID", APP_ID)
-            .env("XYNE_SYNC_SHARD", SHARD.to_string())
-            .env("XYNE_SYNC_SLOT_CLEANUP_AGE_MS", "0")
-            .env("XYNE_SYNC_WARM_START_MS", "0")
-            .env("XYNE_SYNC_METRICS_INTERVAL_MS", "1000")
-            .env("XYNE_SYNC_GROUP_THREADS", opts.group_threads.to_string())
-            .env("XYNE_SYNC_READ_THREADS", opts.read_threads.to_string())
-            .env("XYNE_SYNC_READ_CONNECTIONS", opts.read_connections.to_string())
-            .env("XYNE_SYNC_GROUP_TTL_MS", "2000")
-            .env("XYNE_SYNC_LOG", &opts.log_level)
-            .env("XYNE_SYNC_LOG_FORMAT", "text")
+            .env("STREAMGRES_ADDR", &addr)
+            .env("STREAMGRES_BASE_PATH", "/sync")
+            .env("STREAMGRES_PG_DSN", &opts.dsn)
+            .env("STREAMGRES_PUBLICATION", PUBLICATION)
+            .env("STREAMGRES_QUERY_URL", format!("http://127.0.0.1:{app_port}/query"))
+            .env("STREAMGRES_MUTATE_URL", format!("http://127.0.0.1:{app_port}/push"))
+            .env("STREAMGRES_APP_ID", APP_ID)
+            .env("STREAMGRES_SHARD", SHARD.to_string())
+            .env("STREAMGRES_SLOT_CLEANUP_AGE_MS", "0")
+            .env("STREAMGRES_WARM_START_MS", "0")
+            .env("STREAMGRES_METRICS_INTERVAL_MS", "1000")
+            .env("STREAMGRES_GROUP_THREADS", opts.group_threads.to_string())
+            .env("STREAMGRES_READ_THREADS", opts.read_threads.to_string())
+            .env("STREAMGRES_READ_CONNECTIONS", opts.read_connections.to_string())
+            .env("STREAMGRES_GROUP_TTL_MS", "2000")
+            .env("STREAMGRES_LOG", &opts.log_level)
+            .env("STREAMGRES_LOG_FORMAT", "text")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(log_err))
@@ -1505,7 +1506,7 @@ fn read_process(pid: u32) -> Option<ProcessReading> {
     let rss = status
         .lines()
         .find_map(|line| line.strip_prefix("VmRSS:"))
-        .and_then(|rest| rest.trim().split_whitespace().next())
+        .and_then(|rest| rest.split_whitespace().next())
         .and_then(|kb| kb.parse::<u64>().ok())
         .map_or(0, |kb| kb * 1024);
     let mut threads = Vec::new();
@@ -1532,10 +1533,13 @@ fn read_process(_pid: u32) -> Option<ProcessReading> {
     None
 }
 
-/// The name a thread is reported under: the server's `xyne-sync-` prefix
+/// The name a thread is reported under: the server's `streamgres-` prefix
 /// and a trailing shard or index taken off, the tokio workers as one.
 fn thread_group(name: &str) -> String {
-    let name = name.strip_prefix("xyne-sync-").unwrap_or(name);
+    let name = name
+        .strip_prefix("streamgres-")
+        .or_else(|| name.strip_prefix("xyne-sync-"))
+        .unwrap_or(name);
     if name.starts_with("tokio-runtime") || name.starts_with("tokio-rt") {
         return "tokio".to_owned();
     }
@@ -2664,7 +2668,7 @@ async fn run(opts: Options) -> i32 {
         format!(" [{}]", opts.label)
     };
     println!(
-        "xyne_sync load bench{label}: {} clients of {} users over {} channels and {} boards, {} open threads each; \
+        "streamgres load bench{label}: {} clients of {} users over {} channels and {} boards, {} open threads each; \
          {} tx/s × {} rows for {} s after {} s warmup; {} pushers at {}/s; churn {}/s; seed {}",
         opts.connections, opts.users, opts.channels, opts.boards, opts.threads,
         opts.tps, opts.rows_per_tx, opts.duration, opts.warmup, opts.pushers, opts.push_rate, opts.churn, opts.seed

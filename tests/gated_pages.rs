@@ -11,9 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
-use xyne_sync::ivm::{Engine, Fetch, MultiTableIVM, QueryPart, SubId, evaluate_with, order_rows};
-use xyne_sync::model::*;
-use xyne_sync::sync::{Local, Lsn, MemoryStorage, Runtime, Snapshot};
+use streamgres::ivm::{Engine, Fetch, MultiTableIVM, QueryPart, SubId, evaluate_with, order_rows};
+use streamgres::model::*;
+use streamgres::sync::{Local, Lsn, MemoryStorage, Runtime, Snapshot};
 
 /// The join layer under the synchronous driver: every read is landed
 /// inline.
@@ -327,7 +327,7 @@ fn descend(
             .map(|(_, row)| value_of(row, &join.main_table_column))
             .filter(|value| !value.is_null())
             .collect();
-        values.sort_by(xyne_sync::ivm::order_cmp);
+        values.sort_by(streamgres::ivm::order_cmp);
         values.dedup();
         let mut under = Vec::new();
         for value in values {
