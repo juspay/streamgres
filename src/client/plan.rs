@@ -99,6 +99,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
+use tokio::sync::watch;
 
 use super::ast::Translated;
 use crate::log::{Level, log_event};
@@ -107,7 +108,7 @@ use crate::model::{
     SingleTableReadQuery, Value,
 };
 use crate::stats::Stats;
-use crate::sync::Storage;
+use crate::sync::{Storage, StorageError};
 
 /// Which side of an inner edge drives when reading a node whole and
 /// having its subs drive it hold the same.
@@ -759,6 +760,13 @@ impl<V> Remembered<V> {
     }
 }
 
+/// The answer to a count under way, once it is in: `None` until then.
+type Answer = Option<Result<u64, StorageError>>;
+
+/// The counts under way, by query and cap, each with the channel its
+/// answer comes down.
+type Flights = HashMap<(MultiTableReadQuery, u64), watch::Receiver<Answer>>;
+
 /// Remembered plans, two ways. By the **tree** as translated: every
 /// outcome, refusals included, for `ttl`, so a table that grew past the
 /// limit is counted again eventually. And by **count**: every count the
@@ -766,14 +774,33 @@ impl<V> Remembered<V> {
 /// at, for `count_ttl`, so a tree never planned before is planned from
 /// the counts other trees already paid for — a count is about one table
 /// under one filter, whatever the query that wanted it. Each way keeps at
-/// most its capacity of entries, the least recently used leaving.
+/// most its capacity of entries, the least recently used leaving. A count
+/// is also run **once at a time**: an asking that finds its count under
+/// way (a hundred clients registering the same query at once, each
+/// missing the cache before the first answer is in) waits for that
+/// answer rather than running the count again.
 pub struct PlanCache {
     plans: Mutex<Remembered<Result<MultiTableReadQuery, String>>>,
     counts: Mutex<Remembered<Counted>>,
+    flights: Mutex<Flights>,
     ttl: Duration,
     count_ttl: Duration,
     capacity: usize,
     count_capacity: usize,
+}
+
+/// A count under way, taken out of the flights when its runner is done
+/// with it — answered or dropped mid-count, so that the next asking runs
+/// it afresh rather than waiting on no one.
+struct Flight<'a> {
+    cache: &'a PlanCache,
+    key: (MultiTableReadQuery, u64),
+}
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        self.cache.lock_flights().remove(&self.key);
+    }
 }
 
 impl PlanCache {
@@ -784,10 +811,51 @@ impl PlanCache {
         PlanCache {
             plans: Mutex::new(Remembered::default()),
             counts: Mutex::new(Remembered::default()),
+            flights: Mutex::new(HashMap::new()),
             ttl,
             count_ttl,
             capacity: capacity.max(1),
             count_capacity: count_capacity.max(1),
+        }
+    }
+
+    /// Count `query` no further than `cap` on `storage`, once at a time:
+    /// the answer, and whether this asking ran the count. An asking that
+    /// finds the same count under way waits for its answer instead, a
+    /// failure included (the next asking runs it again, nothing being
+    /// remembered of a failure); one whose runner went away mid-count
+    /// (its registration dropped) runs the count itself.
+    pub async fn count_once<S: Storage + ?Sized>(
+        &self,
+        storage: &S,
+        query: &MultiTableReadQuery,
+        cap: u64,
+    ) -> (Result<u64, StorageError>, bool) {
+        loop {
+            let key = (query.clone(), cap);
+            let (sender, receiver) = watch::channel(None);
+            let under_way = {
+                let mut flights = self.lock_flights();
+                match flights.get(&key) {
+                    Some(under_way) => Some(under_way.clone()),
+                    None => {
+                        flights.insert(key.clone(), receiver);
+                        None
+                    }
+                }
+            };
+            let Some(mut under_way) = under_way else {
+                let flight = Flight { cache: self, key };
+                let answer = storage.count(query, cap).await;
+                let _ = sender.send(Some(answer.clone()));
+                drop(flight);
+                return (answer, true);
+            };
+            if let Ok(answer) = under_way.wait_for(|answer| answer.is_some()).await
+                && let Some(answer) = answer.as_ref()
+            {
+                return (answer.clone(), false);
+            }
         }
     }
 
@@ -853,18 +921,27 @@ impl PlanCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    /// The counts under way, read through a poisoned lock.
+    fn lock_flights(&self) -> MutexGuard<'_, Flights> {
+        self.flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 /// Plan `translated`, the query `name`, under `policy`: the outcome
 /// remembered for this very tree, else the counts — each answered from
-/// the cache when a count of the same query is remembered, run on
+/// the cache when a count of the same query is remembered, waited for
+/// when the same count is under way for another asking, run on
 /// `storage` otherwise (concurrently) and remembered — and the planner's
 /// decision, remembered by tree, plans and refusals alike. A count that
 /// fails (the database was unreachable, the count ran past the read
 /// timeout) refuses the query, saying so, and is not remembered: it says
 /// nothing about the query, and the next asking counts again what failed,
 /// the counts that answered being kept. The counts are logged at debug
-/// level, `table alone/narrowed` per node, with how many were run.
+/// level, `table alone/narrowed` per node, with how many were run and
+/// how many waited for.
 pub async fn plan<S: Storage + ?Sized>(
     name: &str,
     translated: Translated,
@@ -888,7 +965,17 @@ pub async fn plan<S: Storage + ?Sized>(
             None => asked.push(count),
         }
     }
-    let counted = asked.len();
+    let answers = join_all(asked.iter().map(|count| async move {
+        let started = Instant::now();
+        let (answer, ran) = cache.count_once(storage, &count.query, count.cap).await;
+        if ran && let Some(stats) = Stats::global() {
+            stats.count_io.record(started.elapsed());
+        }
+        (answer, ran)
+    }))
+    .await;
+    let counted = answers.iter().filter(|(_, ran)| *ran).count();
+    let joined = answers.len() - counted;
     if let Some(stats) = Stats::global() {
         stats
             .plan_count_hits
@@ -896,18 +983,12 @@ pub async fn plan<S: Storage + ?Sized>(
         stats
             .plan_count_misses
             .fetch_add(counted as u64, Ordering::Relaxed);
+        stats
+            .plan_count_joined
+            .fetch_add(joined as u64, Ordering::Relaxed);
     }
-    let answers = join_all(asked.iter().map(|count| async move {
-        let started = Instant::now();
-        let answer = storage.count(&count.query, count.cap).await;
-        if let Some(stats) = Stats::global() {
-            stats.count_io.record(started.elapsed());
-        }
-        answer
-    }))
-    .await;
     let mut failed = None;
-    for (count, answer) in asked.into_iter().zip(answers) {
+    for (count, (answer, _)) in asked.into_iter().zip(answers) {
         match answer {
             Ok(rows) => {
                 planner.answer(count.node, count.narrowed, rows);
@@ -925,13 +1006,14 @@ pub async fn plan<S: Storage + ?Sized>(
             Err(_) => {}
         }
     }
-    if hits + counted > 0 {
+    if hits + counted + joined > 0 {
         log_event!(
             Level::Debug,
             "query counted",
             name = name,
             table = query.main_table.table,
             counted = counted,
+            joined = joined,
             counts = planner.report()
         );
     }
@@ -1906,11 +1988,13 @@ mod tests {
     /// A store that answers every count with `rows`, or with the rows of
     /// the channel a count names when `by_channel` knows it, and fails
     /// the first count of the table `fails_once` names; it keeps how many
-    /// counts it answered and holds no rows to read.
+    /// counts it asked for (before `held`, a gate every count waits at
+    /// until it opens) and holds no rows to read.
     struct Counting {
         rows: u64,
         by_channel: HashMap<String, u64>,
         fails_once: Cell<Option<&'static str>>,
+        held: Option<watch::Receiver<bool>>,
         counts: Cell<usize>,
     }
 
@@ -1921,8 +2005,22 @@ mod tests {
                 rows,
                 by_channel: HashMap::new(),
                 fails_once: Cell::new(None),
+                held: None,
                 counts: Cell::new(0),
             }
+        }
+
+        /// A store answering `rows` to every count once the gate returned
+        /// with it is opened (`send(true)`).
+        fn held(rows: u64) -> (watch::Sender<bool>, Self) {
+            let (open, held) = watch::channel(false);
+            (
+                open,
+                Counting {
+                    held: Some(held),
+                    ..Counting::answering(rows)
+                },
+            )
         }
 
         /// A store answering each channel's rows to the counts naming it;
@@ -1969,10 +2067,13 @@ mod tests {
             })
         }
 
-        /// The channel's rows or `rows`, counted; the first count of the
-        /// table `fails_once` names fails instead.
+        /// The channel's rows or `rows`, counted once the gate is open;
+        /// the first count of the table `fails_once` names fails instead.
         async fn count(&self, query: &MultiTableReadQuery, cap: u64) -> Result<u64, StorageError> {
             self.counts.set(self.counts.get() + 1);
+            if let Some(mut held) = self.held.clone() {
+                let _ = held.wait_for(|open| *open).await;
+            }
             if self.fails_once.get() == Some(query.main_table.table.as_str()) {
                 self.fails_once.set(None);
                 return Err(StorageError("the database went away".to_owned()));
@@ -2171,6 +2272,75 @@ mod tests {
                 asked + 1,
                 "only the failed count is run again"
             );
+        });
+    }
+
+    /// Three registrations of one query at once, none finding its counts
+    /// in the cache: the first runs them, the others wait for its
+    /// answers, and every one is planned the same — three counts on the
+    /// store, not nine. A query with the counts in hand afterwards finds
+    /// nothing under way.
+    #[test]
+    fn a_count_under_way_is_waited_for_rather_than_run_again() {
+        run(async {
+            let cache = PlanCache::new(secs(60), 10, secs(60), 100);
+            let (open, storage) = Counting::held(5);
+            let policy = policy(100, Side::Child);
+            let plans = join_all(
+                (0..3).map(|_| plan("q", messages_in("c1", 50), policy, &cache, &storage)),
+            );
+            let opened = async {
+                tokio::task::yield_now().await;
+                assert_eq!(storage.counts.get(), 3, "the first asking runs the counts");
+                assert_eq!(cache.lock_flights().len(), 3, "and the others wait on them");
+                open.send(true).expect("waited for");
+            };
+            let (outcomes, ()) = tokio::join!(plans, opened);
+            let planned: Vec<_> = outcomes
+                .into_iter()
+                .map(|outcome| outcome.expect("planned").query)
+                .collect();
+            assert_eq!(storage.counts.get(), 3, "no count ran twice");
+            assert_eq!(planned[0].joins[0].driver, Driver::Main);
+            assert!(planned.iter().all(|query| *query == planned[0]));
+            assert_eq!(cache.counts(), 3, "every count remembered once");
+            assert!(cache.lock_flights().is_empty(), "nothing left under way");
+            plan("q", messages_in("c1", 20), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            assert_eq!(storage.counts.get(), 3, "answered from the cache");
+        });
+    }
+
+    /// A registration dropped while its counts run (the client went
+    /// away) leaves nothing for the ones waiting on it: they run the
+    /// counts themselves, and nothing stays under way.
+    #[test]
+    fn a_count_whose_runner_went_away_is_run_by_the_one_waiting() {
+        run(async {
+            let cache = PlanCache::new(secs(60), 10, secs(60), 100);
+            let (open, storage) = Counting::held(5);
+            let policy = policy(100, Side::Child);
+            let mut leader = Box::pin(plan("q", messages_in("c1", 50), policy, &cache, &storage));
+            let mut waiting = Box::pin(plan("q", messages_in("c1", 50), policy, &cache, &storage));
+            tokio::select! {
+                biased;
+                _ = &mut leader => panic!("the gate is shut"),
+                _ = &mut waiting => panic!("the gate is shut"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert_eq!(storage.counts.get(), 3, "the first asking runs the counts");
+            drop(leader);
+            assert!(
+                cache.lock_flights().is_empty(),
+                "its counts are no longer under way"
+            );
+            open.send(true).expect("waited for");
+            let planned = waiting.await.expect("planned by the one waiting");
+            assert_eq!(planned.query.joins[0].driver, Driver::Main);
+            assert_eq!(storage.counts.get(), 6, "which ran the counts itself");
+            assert_eq!(cache.counts(), 3);
+            assert!(cache.lock_flights().is_empty());
         });
     }
 

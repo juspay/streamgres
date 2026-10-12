@@ -285,6 +285,7 @@ pub struct Stats {
     pub plans_page_driven: AtomicU64,
     pub plan_count_hits: AtomicU64,
     pub plan_count_misses: AtomicU64,
+    pub plan_count_joined: AtomicU64,
     pub pushes_ok: AtomicU64,
     pub pushes_failed: AtomicU64,
     /// Mutation results heard from the application server's result table
@@ -450,6 +451,7 @@ impl Stats {
             plans_page_driven: AtomicU64::new(0),
             plan_count_hits: AtomicU64::new(0),
             plan_count_misses: AtomicU64::new(0),
+            plan_count_joined: AtomicU64::new(0),
             pushes_ok: AtomicU64::new(0),
             pushes_failed: AtomicU64::new(0),
             mutation_results: AtomicU64::new(0),
@@ -693,6 +695,7 @@ impl Stats {
             ("plans_page_driven", load(&self.plans_page_driven)),
             ("plan_count_hits", load(&self.plan_count_hits)),
             ("plan_count_misses", load(&self.plan_count_misses)),
+            ("plan_count_joined", load(&self.plan_count_joined)),
             ("pages_short", load(&self.pages_short)),
             ("pushes_ok", load(&self.pushes_ok)),
             ("pushes_failed", load(&self.pushes_failed)),
@@ -1558,6 +1561,7 @@ fn counter_name(name: &str) -> (String, Vec<(&'static str, String)>) {
         "plans_page_driven" => ("plans", &[("kind", "page_drives")]),
         "plan_count_hits" => ("plan_counts", &[("result", "hit")]),
         "plan_count_misses" => ("plan_counts", &[("result", "miss")]),
+        "plan_count_joined" => ("plan_counts", &[("result", "joined")]),
         "pushes_ok" => ("pushes", &[("result", "ok")]),
         "pushes_failed" => ("pushes", &[("result", "failed")]),
         "mutation_results" => ("mutation_results", &[]),
@@ -1621,8 +1625,8 @@ fn measure_help(name: &str) -> &'static str {
         | "refused_other" => "queries refused, by class of reason",
         "pages_short" => "pages served short of their limit",
         "plans_page_driven" => "plans in which a page drives its own join",
-        "plan_count_hits" | "plan_count_misses" => {
-            "planner counts by where they were answered: from the count cache, or run on PostgreSQL"
+        "plan_count_hits" | "plan_count_misses" | "plan_count_joined" => {
+            "planner counts by where they were answered: from the count cache, run on PostgreSQL, or waited for while another asking ran the same count"
         }
         "pushes_ok" | "pushes_failed" => "pushes forwarded to the application server, by outcome",
         "mutation_results" => {

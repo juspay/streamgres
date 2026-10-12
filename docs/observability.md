@@ -76,7 +76,7 @@ and `_count`; counts are `_total` counters; the rest are gauges.
 | `xyne_sync_transforms_total{result=hit,miss,error}` | queries answered from the transform cache, sent to the application server, errored there |
 | `xyne_sync_plan_seconds` | translating and planning one query (a cache hit is microseconds) |
 | `xyne_sync_count_seconds` | one planner count on PostgreSQL (IO) |
-| `xyne_sync_plan_counts_total{result=hit,miss}` | planner counts answered from the count cache (the same table under the same filter, counted for an earlier query) and counts run on PostgreSQL |
+| `xyne_sync_plan_counts_total{result=hit,miss,joined}` | planner counts answered from the count cache (the same table under the same filter, counted for an earlier query), counts run on PostgreSQL, and counts waited for while another registration ran the same one (many clients registering one query at once run its counts once) |
 | `xyne_sync_hydrate_seconds{kind=cold,warm}` | registration sent → rows present, per query; cold read storage, warm was served from held frames |
 | `xyne_sync_engine_step_seconds{step=register,land,unregister}` | the engine's own compute per step |
 | `xyne_sync_read_seconds` | a storage read from issue to its rows back on the engine thread (queue + PostgreSQL + decode) |
@@ -157,7 +157,7 @@ object per line, `{"ts","level","thread","msg", ...fields}`.
 | slow query | warn | the same, when hydration exceeds `XYNE_SYNC_SLOW_QUERY_MS` (1 000) |
 | query refused | warn | name, hash, kind (`unsupported`, `plan_limit`, `read_limit`, `read_timeout`, `other`), at (`plan`: before it registered; `read`: a read it depended on), group, connection, the reason in full |
 | query planned | debug | name, the root's table, whether a page drives an inner edge, ms |
-| query counted | debug | name, the root's table, how many counts ran on PostgreSQL (the rest came from the count cache), each node's counts as `table alone/narrowed` |
+| query counted | debug | name, the root's table, how many counts ran on PostgreSQL and how many were waited for (the rest came from the count cache), each node's counts as `table alone/narrowed` |
 | page capped | warn | name, hash, group: a page of the query stopped reaching past the rows its join rejects; it is served, short of its limit |
 | transaction routed | debug | position, writes, client updates, reads asked, ms |
 | feed lag | warn | when commit → engine exceeds 5 s, once per minute |
