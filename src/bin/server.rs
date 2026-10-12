@@ -22,10 +22,10 @@ unsafe impl Sync for MallocConf {}
 fn main() {
     load_dotenv(".env");
     raise_file_limit();
-    let outcome = xyne_sync::client::Config::from_env().and_then(xyne_sync::client::serve);
+    let outcome = streamgres::client::Config::from_env().and_then(streamgres::client::serve);
     if let Err(error) = outcome {
         eprintln!("{error}");
-        xyne_sync::log::exit(1);
+        streamgres::log::exit(1);
     }
 }
 

@@ -128,8 +128,8 @@ probes and routing. For metrics, logs and alerts see
 ### Docker
 
 ```bash
-docker build -f docker/server/Dockerfile -t xyne-sync .
-docker run --env-file .env -p 4848:4848 xyne-sync
+docker build -f docker/server/Dockerfile -t streamgres .
+docker run --env-file .env -p 4848:4848 streamgres
 ```
 
 ---
@@ -203,16 +203,32 @@ for one subscriber or ten thousand.
 
 ```bash
 cargo test                          # unit and scenario tests
-cargo run --bin xyne_sync           # demo: SQL in, routed operations and cost counters out
+cargo run --bin streamgres           # demo: SQL in, routed operations and cost counters out
 cargo run --release --bin bench     # benchmarks: routing, registration, windows, joins
 cargo clippy --all-targets
 ```
 
 Tests against a real PostgreSQL run when `STREAMGRES_PG_DSN` is set, and report
+The load bench runs the whole server over the wire under a production-shaped
+load and reports its CPU, cores by thread and memory at the median, 90th and
+99th percentile, beside the commit-to-client latency of every kind of row. It
+needs a PostgreSQL with `wal_level = logical` and a database with `bench` in
+its name, whose tables it drops and makes again:
+
+```bash
+cargo build --release --bin server
+XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5432/xyne_bench \
+  cargo run --release --bin load -- --connections 200 --duration 60
+```
+
+The options (clients, users, channels, write rate, rows per transaction, push
+rate, churn, body sizes) are listed at the top of `src/bin/load.rs`.
+
+Tests against a real PostgreSQL run when `XYNE_SYNC_PG_DSN` is set, and report
 themselves skipped otherwise:
 
 ```bash
-STREAMGRES_PG_DSN=postgresql://postgres@localhost:5432/xyne_sync cargo test --test pg_live
+STREAMGRES_PG_DSN=postgresql://postgres@localhost:5432/streamgres cargo test --test pg_live
 ```
 
 `scripts/` holds the end-to-end checks:
@@ -225,10 +241,10 @@ STREAMGRES_PG_DSN=postgresql://postgres@localhost:5432/xyne_sync cargo test --te
 
 ```rust
 use std::rc::Rc;
-use xyne_sync::ivm::SingleTableIVM;
-use xyne_sync::model::*;
-use xyne_sync::parser::{parse_read, parse_write};
-use xyne_sync::sync::{Local, MemoryStorage};
+use streamgres::ivm::SingleTableIVM;
+use streamgres::model::*;
+use streamgres::parser::{parse_read, parse_write};
+use streamgres::sync::{Local, MemoryStorage};
 
 let catalog = Catalog::new(vec![DbTable::new("tickets", ["id"], vec![
     DbColumn::new("id", ValueType::Int),
@@ -257,7 +273,7 @@ src/
   ivm/       the engine: routing index, frames, windows, join tree
   sync/      runtime, storage trait, in-memory store, PostgreSQL reads and change feed
   client/    the WebSocket server and Zero protocol, query planning, client groups
-  bin/       server and bench binaries
+  bin/       server, bench and load binaries
 tests/       scenario tests, live PostgreSQL tests, and a 283-query suite
              taken from a production application
 scripts/     smoke, end-to-end and load scripts; CI helpers
@@ -272,7 +288,7 @@ docs/        deployment and observability guides
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, what CI checks and the code
 conventions. In short:
 
-- Run `cargo test && cargo clippy --all-targets && cargo run --bin xyne_sync`
+- Run `cargo test && cargo clippy --all-targets && cargo run --bin streamgres`
   before opening a pull request. The demo must end with every check `PASS`.
 - Engine behaviour lives in `src/ivm/`. A change to *what matches* belongs in
   `predicate.rs`, with a test alongside it. Routing changes are expected to

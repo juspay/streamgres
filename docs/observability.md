@@ -34,14 +34,14 @@ Every cell is a metric below; the rows of the table are the labels.
   `/metrics` (Prometheus exposition, for scraping) and the periodic
   summary line are rendered on the request task or the metrics thread
   from the atomics; percentiles are computed at read time.
-- **Sampling is a thread.** `xyne-sync-metrics` wakes every
+- **Sampling is a thread.** `streamgres-metrics` wakes every
   `STREAMGRES_METRICS_INTERVAL_MS` (10 s), reads what only sampling can
   give (the process's resident set, each thread's CPU time by name from
   `/proc`, the queues' depths, the caches' sizes) into gauges, and every
   sixth wake-up writes the summary line.
 - **Logs are a queue and a thread.** A log call checks its level first
   (a load of one atomic), formats only if enabled, and hands the line to
-  a bounded queue; `xyne-sync-log` drains the queue to stderr in
+  a bounded queue; `streamgres-log` drains the queue to stderr in
   batches. A full queue drops the line and counts the drop; the count is
   a metric and appears in the summary, so a flood is visible without
   ever blocking the thread that logged. Format is `text` or `json`
@@ -51,7 +51,7 @@ Every cell is a metric below; the rows of the table are the labels.
   (`Stats::metrics`, `src/metric.rs`) and written out as Prometheus text
   for whoever scrapes `/metrics`, and as OTLP for the collector the
   server pushes to: the same names, labels and values either way.
-- **Pushing is a thread, configured as the reference server's is.** `xyne-sync-otel`
+- **Pushing is a thread, configured as the reference server's is.** `streamgres-otel`
   (`src/otel.rs`) reads the standard `OTEL_*` variables the reference server reads
   (section 5): every `OTEL_METRIC_EXPORT_INTERVAL` it posts the catalogue
   to the collector over OTLP/HTTP as JSON, the reference server's own default
@@ -218,7 +218,7 @@ OTEL_METRIC_EXPORT_INTERVAL=5000
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | `10000` | one request's time limit, ms |
 | `OTEL_METRIC_EXPORT_INTERVAL` | `60000` | the metrics period, ms (the sandbox runs the reference server at 5000) |
 | `OTEL_BLRP_SCHEDULE_DELAY`, `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BLRP_MAX_QUEUE_SIZE` | `1000`, `512`, `2048` | the log batch: its longest wait, its size, and the queue past which records are dropped and counted |
-| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | `xyne-sync`, none | the resource; `service.version` (the crate's, with the image's `SOURCE_COMMIT`) and `service.instance.id` / `host.name` (from `HOSTNAME`, the pod) are added |
+| `OTEL_SERVICE_NAME`, `OTEL_RESOURCE_ATTRIBUTES` | `streamgres`, none | the resource; `service.version` (the crate's, with the image's `SOURCE_COMMIT`) and `service.instance.id` / `host.name` (from `HOSTNAME`, the pod) are added |
 | `OTEL_SDK_DISABLED` | `false` | `true` turns the push off whatever else is set |
 
 The exporter reports on itself: `xyne_sync_otel_metric_exports_total`,

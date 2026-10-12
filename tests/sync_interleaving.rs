@@ -9,9 +9,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use xyne_sync::ivm::{Engine, Fetch, MultiTableIVM, QueryPart, SingleTableIVM, SubId};
-use xyne_sync::model::*;
-use xyne_sync::sync::{Lsn, MemoryStorage, Runtime, Snapshot, Step};
+use streamgres::ivm::{Engine, Fetch, MultiTableIVM, QueryPart, SingleTableIVM, SubId};
+use streamgres::model::*;
+use streamgres::sync::{Lsn, MemoryStorage, Runtime, Snapshot, Step};
 
 /// `tickets(id, status, assigned_to, points)`.
 fn tickets_table() -> DbTable {
@@ -202,7 +202,7 @@ fn column_of(
 /// Run every read a step handed out against the database as it is right
 /// now and land it, repeating until nothing is out; the updates of every
 /// step, in order.
-fn settle<E: Engine>(runtime: &mut Runtime<E>, db: &Db, step: Step) -> Vec<xyne_sync::ivm::Delta> {
+fn settle<E: Engine>(runtime: &mut Runtime<E>, db: &Db, step: Step) -> Vec<streamgres::ivm::Delta> {
     let mut updates = step.updates;
     let mut queue = step.selects;
     while !queue.is_empty() {
@@ -1002,7 +1002,7 @@ fn md_and_replies(
 }
 
 /// No delta carries a partial image or one without `md` to a client.
-fn assert_whole(updates: &[xyne_sync::ivm::Delta]) {
+fn assert_whole(updates: &[streamgres::ivm::Delta]) {
     for delta in updates {
         if let DataFrameOperation::Add(_, row) = &delta.op {
             assert!(
@@ -1014,7 +1014,7 @@ fn assert_whole(updates: &[xyne_sync::ivm::Delta]) {
 }
 
 /// The ids the deltas add, in order.
-fn added(updates: &[xyne_sync::ivm::Delta]) -> Vec<i64> {
+fn added(updates: &[streamgres::ivm::Delta]) -> Vec<i64> {
     updates
         .iter()
         .filter_map(|delta| match &delta.op {

@@ -16,13 +16,13 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use xyne_sync::ivm::{Delta, MultiTableIVM, QueryPart, SubId};
-use xyne_sync::model::{
+use streamgres::ivm::{Delta, MultiTableIVM, QueryPart, SubId};
+use streamgres::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameOperation, DataFrameRow, DeleteQuery, InsertQuery,
     UpdateQuery, Value, WriteQuery,
 };
-use xyne_sync::parser::parse_read;
-use xyne_sync::sync::{Local, MemoryStorage};
+use streamgres::parser::parse_read;
+use streamgres::sync::{Local, MemoryStorage};
 
 use super::catalog::{catalog, columns, pkey};
 use super::zql::Q;

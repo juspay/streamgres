@@ -2,9 +2,9 @@
 //! tickets, ticket rows and detail, emails, drafts, labels, mailboxes and
 //! desk settings, one test per registry entry over one desk fixture.
 
-use xyne_sync::model::ComparisonOperator::{GTE, LTE};
-use xyne_sync::model::Order::{ASC, DESC};
-use xyne_sync::model::Value;
+use streamgres::model::ComparisonOperator::{GTE, LTE};
+use streamgres::model::Order::{ASC, DESC};
+use streamgres::model::Value;
 
 use super::world::{ME, World, ops, with};
 use super::zql::{Q, eq, is_null, or, same, zql};

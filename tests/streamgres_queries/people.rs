@@ -3,9 +3,9 @@
 //! workspaces and organisations, roles, saved views, lookups, emojis and
 //! dashboards, one test per registry entry.
 
-use xyne_sync::model::ComparisonOperator::GT;
-use xyne_sync::model::Order::{ASC, DESC};
-use xyne_sync::model::Value;
+use streamgres::model::ComparisonOperator::GT;
+use streamgres::model::Order::{ASC, DESC};
+use streamgres::model::Value;
 
 use super::world::{ME, WS, World, ops, with};
 use super::zql::{and, cmp, eq, or, same, zql};

@@ -23,18 +23,18 @@ For a local first run, see the README's Quick start.
 ### The image
 
 ```bash
-docker build -f docker/server/Dockerfile -t xyne-sync .
+docker build -f docker/server/Dockerfile -t streamgres .
 ```
 
 The image is a slim Debian image of about 125 MB:
-- It has one binary, `/app/server`, run as the unprivileged user `xyne-sync`
+- It has one binary, `/app/server`, run as the unprivileged user `streamgres`
   (uid 10001).
 - It listens on port 4848 and writes JSON log lines to stderr.
 - It needs no file system, except an optional writable directory for
   `STREAMGRES_PLAN_FILE` (section 5).
 
 `.github/workflows/docker-publish.yml` publishes the image to the GitHub
-Container Registry as `ghcr.io/<owner>/xyne-sync`. It runs on pushes to the
+Container Registry as `ghcr.io/<owner>/streamgres`. It runs on pushes to the
 branches listed in that file and on `v*` tags, tagging each image with the
 branch name and the short commit SHA.
 
@@ -233,7 +233,7 @@ depend on what the defaults happen to be:
 | `STREAMGRES_READ_THREADS` | `4` | `2` | threads that run and decode database reads |
 | `STREAMGRES_READ_CONNECTIONS` | `32` | `16` | database connections for reads |
 | `STREAMGRES_ROW_LIMIT` | sized to your data | `100000` | the most rows read into memory at once. A larger read is refused, and the query named in logs and metrics |
-| `STREAMGRES_PLAN_FILE` | `/var/lib/xyne-sync/plans.json` | unset | query shapes seen so far, planned again at startup, so the first clients after a restart are fast. Needs a writable volume |
+| `STREAMGRES_PLAN_FILE` | `/var/lib/streamgres/plans.json` | unset | query shapes seen so far, planned again at startup, so the first clients after a restart are fast. Needs a writable volume |
 | `STREAMGRES_LOG_FORMAT` | `json` | `text` | already set in the image |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://<collector>:4318` | unset | push metrics (and optionally logs) over OTLP. See [observability](observability.md) |
 

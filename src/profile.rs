@@ -45,7 +45,7 @@ use crate::log::{self, Level, log_event, log_warn};
 pub struct Config {
     /// `STREAMGRES_PYROSCOPE_URL`: the server's base URL, no trailing `/`.
     pub url: String,
-    /// `STREAMGRES_PYROSCOPE_APPLICATION` (`xyne-sync`): the profiles'
+    /// `STREAMGRES_PYROSCOPE_APPLICATION` (`streamgres`): the profiles'
     /// `service_name`.
     pub application: String,
     /// `STREAMGRES_PYROSCOPE_SAMPLE_RATE` (100): samples per second of CPU
@@ -97,7 +97,7 @@ impl Config {
         let url = base_url(&text)
             .map_err(|why| format!("STREAMGRES_PYROSCOPE_URL {why}, got `{text}`"))?;
         let application =
-            get("STREAMGRES_PYROSCOPE_APPLICATION").unwrap_or_else(|| "xyne-sync".to_owned());
+            get("STREAMGRES_PYROSCOPE_APPLICATION").unwrap_or_else(|| "streamgres".to_owned());
         let sample_rate = match get("STREAMGRES_PYROSCOPE_SAMPLE_RATE") {
             Some(text) => text
                 .parse::<u32>()
@@ -259,7 +259,7 @@ impl Drop for Profiler {
         for (kind, agent) in agents {
             let step_tx = step_tx.clone();
             let spawned = std::thread::Builder::new()
-                .name(format!("xyne-sync-profile-stop-{kind}"))
+                .name(format!("streamgres-profile-stop-{kind}"))
                 .spawn(move || match agent.stop() {
                     Ok(ready) => {
                         let _ = step_tx.send((kind, Ok(Step::Stopped)));
@@ -555,7 +555,7 @@ mod tests {
         let on = config(&[
             ("STREAMGRES_PYROSCOPE_URL", "http://pyroscope:4040/"),
             ("SOURCE_COMMIT", "a12bb82"),
-            ("HOSTNAME", "xyne-sync-0"),
+            ("HOSTNAME", "streamgres-0"),
         ])
         .unwrap()
         .unwrap();
@@ -564,14 +564,14 @@ mod tests {
             on,
             Config {
                 url: "http://pyroscope:4040".to_owned(),
-                application: "xyne-sync".to_owned(),
+                application: "streamgres".to_owned(),
                 sample_rate: 100,
                 basic_auth: None,
                 tenant: None,
                 tags: vec![
                     ("version".to_owned(), version),
                     ("service_git_ref".to_owned(), "a12bb82".to_owned()),
-                    ("instance".to_owned(), "xyne-sync-0".to_owned()),
+                    ("instance".to_owned(), "streamgres-0".to_owned()),
                 ],
                 heap: true,
             }
@@ -598,7 +598,7 @@ mod tests {
                 "STREAMGRES_PYROSCOPE_URL",
                 "https://profiles-prod-001.grafana.net",
             ),
-            ("STREAMGRES_PYROSCOPE_APPLICATION", "xyne-sync-sandbox"),
+            ("STREAMGRES_PYROSCOPE_APPLICATION", "streamgres-sandbox"),
             ("STREAMGRES_PYROSCOPE_SAMPLE_RATE", "49"),
             ("STREAMGRES_PYROSCOPE_USER", "123456"),
             ("STREAMGRES_PYROSCOPE_PASSWORD", "glc_token"),
@@ -611,7 +611,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(on.url, "https://profiles-prod-001.grafana.net");
-        assert_eq!(on.application, "xyne-sync-sandbox");
+        assert_eq!(on.application, "streamgres-sandbox");
         assert_eq!(on.sample_rate, 49);
         assert_eq!(
             on.basic_auth,
