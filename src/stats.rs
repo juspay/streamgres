@@ -1869,7 +1869,7 @@ fn measure_help(name: &str) -> &'static str {
             "the most rows one storage read may return and the planner reads whole, as configured"
         }
         "read_rows_max" => "the largest storage read of the last minute or two",
-        "writes_impacting_total" => "writes that changed at least one subscription",
+        "writes_impacting_total" => "subscriptions the routed writes changed, one per write and subscription it changed",
         "narrowed_reads_total" => "storage reads the engine asked for",
         "reads_issued_total" | "reads_landed_total" | "reads_refused_total" => {
             "storage reads by what became of them"
