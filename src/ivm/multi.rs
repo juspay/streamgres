@@ -49,6 +49,19 @@
 //! [`MultiTableIVM::matched_in`]), since the page may have dropped other
 //! rows with that value while it held one.
 //!
+//! # Composite keys
+//!
+//! An edge may join on several columns at once: its columns are then
+//! composite names ([`ColumnName::composite`]), one per side, and the
+//! join value of a row is the list of its components
+//! ([`ColumnName::of`], folded like any equality key). Nothing here
+//! knows the difference: the counts, the sets, the leaves and the
+//! narrowed reads carry the composite name and the list value as they
+//! carry a column and a scalar, the single engine indexes and probes the
+//! key by computing it from each row, and storage renders it as a row
+//! constructor. A row with a `NULL` in any component has no key and
+//! joins nothing.
+//!
 //! # Set-valued leaves, placed
 //!
 //! The restriction's operand is a [`SharedSet`] owned by the tree and
@@ -364,8 +377,8 @@ impl Edge {
     /// [`Edge::child_count`] for `row`'s value in `column`, the value
     /// borrowed from the row; a missing column joins like `NULL` (never).
     fn child_count_of(&self, row: &DataFrameRow, column: &ColumnName) -> u64 {
-        match row.data.get(column.as_str()) {
-            Some(value) => self.child_count(value),
+        match column.of(&row.data) {
+            Some(value) => self.child_count(&value),
             None => 0,
         }
     }
@@ -613,11 +626,13 @@ fn gate_open(tree: &Tree, node: &Node, row: &DataFrameRow) -> bool {
     })
 }
 
-/// The row's value in `column`; a missing column joins like `NULL` (never).
+/// The row's value in `column` ([`ColumnName::of`]: a composite key's
+/// components as one list); a missing column, or a composite with a
+/// `NULL` component, joins like `NULL` (never).
 fn join_value(row: &DataFrameRow, column: &ColumnName) -> Value {
-    row.data
-        .get(column.as_str())
-        .cloned()
+    column
+        .of(&row.data)
+        .map(std::borrow::Cow::into_owned)
         .unwrap_or(Value::Null)
 }
 

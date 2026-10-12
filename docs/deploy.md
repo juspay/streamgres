@@ -338,7 +338,7 @@ though nothing is wrong.
 ## 9. Known limits
 
 - **Unsupported queries are refused, not run.** This covers `LIKE`/`ILIKE`,
-  `NOT EXISTS`, compound join keys, and any read over `STREAMGRES_ROW_LIMIT`.
+  `NOT EXISTS`, and any read over `STREAMGRES_ROW_LIMIT`.
   Each one is refused by name, in `/stats.refused_queries` and in the
   `query refused` log event. The client sees that one query fail; the rest of
   the app is unaffected.

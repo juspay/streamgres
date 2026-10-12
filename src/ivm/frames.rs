@@ -591,15 +591,11 @@ impl SingleTableIVM {
         let mut out = Vec::new();
         for value in values {
             let Some(with_value) = frame.rows_with(column, value) else {
+                let key = ColumnName::from(column);
                 return ids
                     .iter()
                     .filter_map(|id| frame.row(*id))
-                    .filter(|row| {
-                        row.data
-                            .data
-                            .get(column)
-                            .is_some_and(|v| values.contains(v))
-                    })
+                    .filter(|row| key.of(&row.data.data).is_some_and(|v| values.contains(&*v)))
                     .map(|row| (row.key.clone(), row.data.clone()))
                     .collect();
             };

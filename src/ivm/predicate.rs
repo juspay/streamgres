@@ -54,10 +54,16 @@ pub fn evaluate_with(
 /// A `Null` inside the list makes `NOT_IN` unsatisfiable, per the
 /// module-level NULL rule (SQL agrees: `x NOT IN (a, NULL)` is never true);
 /// `IN` needs no such guard — a `Null` element simply never matches.
+/// A composite key is compared whole or not at all (`EQ`, `NEQ`, `IN`,
+/// `NOT_IN`): it has no order and is never `NULL` as such, since a key
+/// with a `NULL` in it simply has no value.
 pub fn eval_condition(cond: &Condition, row: &RowData, evaluated: &mut u64) -> bool {
     *evaluated += 1;
 
     use ComparisonOperator::*;
+    if cond.column.is_composite() && !matches!(cond.comparison_operator, EQ | NEQ | IN | NOT_IN) {
+        return false;
+    }
     match cond.comparison_operator {
         IS => return cond.value.is_null() && row.get(&cond.column).is_none_or(Value::is_null),
         IS_NOT => {
@@ -69,9 +75,10 @@ pub fn eval_condition(cond: &Condition, row: &RowData, evaluated: &mut u64) -> b
         EXISTS => return false,
         _ => {}
     }
-    let Some(actual) = row.get(&cond.column) else {
+    let Some(actual) = cond.column.of(row) else {
         return false;
     };
+    let actual = &*actual;
     if actual.is_null() || cond.value.is_null() {
         return false;
     }
@@ -254,6 +261,51 @@ mod tests {
         assert!(!check(&neither, &r));
         assert!(check(&Where::AND(vec![]), &r));
         assert!(!check(&Where::OR(vec![]), &r));
+    }
+
+    /// A composite key compares as one value: equal to a list of its
+    /// components, a member of a list or set of such lists; a `NULL`
+    /// component makes every comparison false, `NOT IN` included, and an
+    /// ordering or null test on a composite is never true.
+    #[test]
+    fn composite_keys_compare_whole() {
+        let key = ColumnName::composite(["org", "ticket"]);
+        let pair = |org: i64, ticket: i64| Value::List(vec![Value::Int(org), Value::Int(ticket)]);
+        let image = row(vec![("org", Value::Int(7)), ("ticket", Value::Float(42.0))]);
+        let leaf = |op: ComparisonOperator, value: Value| {
+            Where::Condition(Condition::new(key.clone(), op, value))
+        };
+        assert!(check(&leaf(EQ, pair(7, 42)), &image), "folded components");
+        assert!(!check(&leaf(EQ, pair(7, 43)), &image));
+        assert!(check(&leaf(NEQ, pair(7, 43)), &image));
+        assert!(check(
+            &leaf(IN, Value::List(vec![pair(1, 1), pair(7, 42)])),
+            &image
+        ));
+        assert!(!check(
+            &leaf(NOT_IN, Value::List(vec![pair(7, 42)])),
+            &image
+        ));
+        assert!(check(&leaf(NOT_IN, Value::List(vec![pair(7, 43)])), &image));
+        let set = crate::model::SharedSet::new();
+        set.insert(&pair(7, 42));
+        assert!(check(&leaf(IN, Value::Set(set.clone())), &image));
+        set.remove(&pair(7, 42));
+        assert!(!check(&leaf(IN, Value::Set(set)), &image));
+        for op in [GT, GTE, LT, LTE] {
+            assert!(!check(&leaf(op, pair(7, 42)), &image), "{op:?}");
+        }
+        assert!(!check(&leaf(IS, Value::Null), &image));
+        assert!(!check(&leaf(IS_NOT, Value::Null), &image));
+
+        let null_part = row(vec![("org", Value::Int(7)), ("ticket", Value::Null)]);
+        assert!(!check(&leaf(EQ, pair(7, 42)), &null_part));
+        assert!(!check(&leaf(NEQ, pair(7, 43)), &null_part));
+        assert!(!check(
+            &leaf(NOT_IN, Value::List(vec![pair(7, 43)])),
+            &null_part
+        ));
+        assert!(!check(&leaf(IS, Value::Null), &null_part));
     }
 
     /// The first AND child fails, so the second is never evaluated and the

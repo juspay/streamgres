@@ -395,8 +395,7 @@ pub const SHORT_PAGE: &str = "the page's join rejects more than eight rows for e
 const REFUSED_NAMES: usize = 256;
 
 /// The class of a refusal, from its reason: `unsupported` (something the
-/// translation does not express: `LIKE`, `NOT EXISTS`, a compound join
-/// key), `plan_limit` (the planner found no side of a join small enough
+/// translation does not express: `LIKE`, `NOT EXISTS`), `plan_limit` (the planner found no side of a join small enough
 /// to read), `read_limit` (a read came back larger than the row limit),
 /// `read_timeout` (a read or a count did not finish within the read
 /// timeout), `other` (a count that failed, an AST that does not parse).
@@ -411,6 +410,7 @@ pub fn refusal_kind(reason: &str) -> &'static str {
         || reason.contains("unknown ")
         || reason.contains("nests deeper")
         || reason.contains("without columns")
+        || reason.contains("parent columns and")
     {
         "unsupported"
     } else {
@@ -1962,6 +1962,13 @@ mod tests {
         );
         assert_eq!(
             stats.note_refusal(
+                "uneven",
+                "a join of `items` to `links` names 2 parent columns and 1 child columns"
+            ),
+            "unsupported"
+        );
+        assert_eq!(
+            stats.note_refusal(
                 "odd",
                 "counting the rows of tickets failed: connection reset"
             ),
@@ -1975,12 +1982,12 @@ mod tests {
         assert_eq!(refused[0].0, "kbRoot");
         assert_eq!(refused[0].1.count, 2);
         assert_eq!(refused[0].1.kind, "read_limit");
-        assert_eq!(refused.len(), 5);
+        assert_eq!(refused.len(), 6);
         let text = stats.prometheus();
         assert!(text.contains("xyne_sync_queries_refused_total{reason=\"read_limit\"} 2"));
         assert!(text.contains("xyne_sync_queries_refused_total{reason=\"read_timeout\"} 1"));
         assert!(text.contains("xyne_sync_queries_refused_total{reason=\"plan_limit\"} 1"));
-        assert!(text.contains("xyne_sync_queries_refused_total{reason=\"unsupported\"} 1"));
+        assert!(text.contains("xyne_sync_queries_refused_total{reason=\"unsupported\"} 2"));
         let json = stats.json();
         assert_eq!(json["refused_queries"][0]["name"], "kbRoot");
         assert_eq!(json["refused_queries"][0]["reason"], read);

@@ -184,9 +184,11 @@ for one subscriber or ten thousand.
 
 ### Limitations
 
-- **No `LIKE` / `ILIKE`, `NOT EXISTS`, compound join keys, or JSON
-  operators.** Such a query is refused with an error naming the reason; other
-  queries on the connection are unaffected.
+- **No `LIKE` / `ILIKE`, `NOT EXISTS`, or JSON operators.** Such a query is
+  refused with an error naming the reason; other queries on the connection
+  are unaffected. A join on several columns (a compound `related` or
+  `whereExists`) is supported; the child table needs an index on its join
+  columns together, as a single-column join needs one on its column.
 - **No history across server restarts.** A client that reconnects after
   missing changes starts a fresh sync, which drops its unsent mutations.
 - **No projections.** Every subscription holds full rows.

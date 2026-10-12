@@ -171,10 +171,10 @@ fn matching_rows<'a, S: Storage + ?Sized>(
             let mut carried = HashSet::new();
             if join.is_inner {
                 for (_, row) in matching_rows(storage, &join.sub).await? {
-                    if let Some(value) = row.data.get(&join.sub_table_column)
+                    if let Some(value) = join.sub_table_column.of(&row.data)
                         && !value.is_null()
                     {
-                        carried.insert(value.clone());
+                        carried.insert(value.into_owned());
                     }
                 }
             }
@@ -195,9 +195,9 @@ fn matching_rows<'a, S: Storage + ?Sized>(
             .filter(|(_, row)| {
                 let carries = |position: usize| {
                     let join = &node.joins[position];
-                    row.data
-                        .get(&join.main_table_column)
-                        .is_some_and(|value| values[position].contains(value))
+                    join.main_table_column
+                        .of(&row.data)
+                        .is_some_and(|value| values[position].contains(&*value))
                 };
                 let exists =
                     |leaf: &Condition| exists_position(&inner, &leaf.value).is_some_and(carries);
