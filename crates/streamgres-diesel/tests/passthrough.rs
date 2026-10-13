@@ -6,7 +6,7 @@
 //! nothing it writes outlives it.
 
 use diesel::connection::{Instrumentation, InstrumentationEvent, SimpleConnection};
-use diesel::pg::PgRowByRowLoadingMode;
+use diesel::pg::{PgMetadataLookup, PgRowByRowLoadingMode};
 use diesel::prelude::*;
 use diesel::r2d2::{ConnectionManager, Pool};
 use diesel::sql_query;
@@ -317,4 +317,14 @@ fn instrumentation_reaches_the_inner_connection() {
     let _: i64 = sg_items::table.count().get_result(&mut conn).expect("count");
 
     assert_eq!(started.load(Ordering::SeqCst), 2, "one insert, one count");
+}
+
+#[test]
+fn the_wrapper_resolves_type_metadata_like_the_inner_connection() {
+    let mut conn = conn();
+    let through_wrapper = PgMetadataLookup::lookup_type(&mut conn, "int4", None);
+    let through_inner = PgMetadataLookup::lookup_type(conn.inner(), "int4", None);
+    assert_eq!(through_wrapper.oid().ok(), through_inner.oid().ok());
+    assert_eq!(through_wrapper.oid().ok(), Some(23));
+    assert_eq!(through_wrapper.array_oid().ok(), Some(1007));
 }

@@ -28,7 +28,7 @@ use diesel::connection::{
     AnsiTransactionManager, ConnectionSealed, Instrumentation, LoadConnection, SimpleConnection,
 };
 use diesel::expression::QueryMetadata;
-use diesel::pg::Pg;
+use diesel::pg::{GetPgMetadataCache, Pg, PgMetadataCache};
 use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::r2d2::R2D2Connection;
 use diesel::{Connection, ConnectionResult, QueryResult};
@@ -145,5 +145,18 @@ where
 
     fn is_broken(&mut self) -> bool {
         self.inner.is_broken()
+    }
+}
+
+/// Lets the wrapper resolve Postgres type OIDs the way the inner connection
+/// does, which makes it a `PgMetadataLookup`. Diesel needs that whenever a
+/// query binds a custom type, and applications that collect binds themselves
+/// (Hyperswitch's KV path does) hand the connection in for the same reason.
+impl<C> GetPgMetadataCache for SyncedConnection<C>
+where
+    C: GetPgMetadataCache,
+{
+    fn get_metadata_cache(&mut self) -> &mut PgMetadataCache {
+        self.inner.get_metadata_cache()
     }
 }
