@@ -73,6 +73,9 @@ pub const MAX_NESTING_DEPTH: usize = 128;
 /// because the parser is their primary consumer.
 pub use crate::model::Catalog;
 
+pub mod binds;
+pub use binds::BindValue;
+
 /// A successfully parsed statement — either side of the read/write split.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedQuery {
@@ -82,10 +85,23 @@ pub enum ParsedQuery {
 
 /// Parse one statement of either kind.
 pub fn parse(sql: &str, catalog: &Catalog) -> Result<ParsedQuery, ParseError> {
+    parse_with_binds(sql, &[], catalog)
+}
+
+/// Parse a statement whose `$n` placeholders stand for `binds`, numbered
+/// from `$1` as Postgres numbers them. Each is decoded by its type OID
+/// ([`binds::decode`]) and then coerced to its column's declared type
+/// exactly as a literal is.
+pub fn parse_with_binds(
+    sql: &str,
+    binds: &[BindValue],
+    catalog: &Catalog,
+) -> Result<ParsedQuery, ParseError> {
     let mut parser = Parser {
         tokens: lex(sql)?,
         pos: 0,
         depth: 0,
+        binds,
     };
     let parsed = parser.query(catalog)?;
     if !matches!(parser.peek(), Tok::Eof) {
@@ -96,7 +112,16 @@ pub fn parse(sql: &str, catalog: &Catalog) -> Result<ParsedQuery, ParseError> {
 
 /// Parse a statement that must be a `SELECT`.
 pub fn parse_read(sql: &str, catalog: &Catalog) -> Result<SingleTableReadQuery, ParseError> {
-    match parse(sql, catalog)? {
+    parse_read_with_binds(sql, &[], catalog)
+}
+
+/// [`parse_read`] with `$n` placeholders standing for `binds`.
+pub fn parse_read_with_binds(
+    sql: &str,
+    binds: &[BindValue],
+    catalog: &Catalog,
+) -> Result<SingleTableReadQuery, ParseError> {
+    match parse_with_binds(sql, binds, catalog)? {
         ParsedQuery::Read(read) => Ok(read),
         ParsedQuery::Write(_) => Err(ParseError {
             message: "expected a SELECT, found a write statement".into(),
@@ -151,6 +176,8 @@ pub fn point_at(source: &str, error: &ParseError) -> String {
 /// One lexed token.
 ///
 /// - `Word`: identifiers and keywords alike; keywords match case-insensitively.
+/// - `Quoted`: a double-quoted identifier, never a keyword, case kept.
+/// - `Bind`: a `$n` placeholder, numbered from 1.
 /// - `Str`: the unquoted content of a single-quoted string literal.
 /// - `Num`: raw numeric text; the parser decides int vs float.
 /// - `Sym`: operators and punctuation, normalised (`<>` lexes as `!=`).
@@ -158,6 +185,8 @@ pub fn point_at(source: &str, error: &ParseError) -> String {
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
     Word(String),
+    Quoted(String),
+    Bind(usize),
     Str(String),
     Num(String),
     Sym(&'static str),
@@ -208,14 +237,15 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
                 tok: Tok::Num(number),
                 at,
             });
-        } else if c == '\'' {
+        } else if c == '\'' || c == '"' {
+            let quote = c;
             chars.next();
             let mut text = String::new();
             loop {
                 match chars.next() {
-                    Some((_, '\'')) => {
-                        if peek_at_is(&chars, 0, '\'') {
-                            text.push('\'');
+                    Some((_, c)) if c == quote => {
+                        if peek_at_is(&chars, 0, quote) {
+                            text.push(quote);
                             chars.next();
                         } else {
                             break;
@@ -224,16 +254,41 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
                     Some((_, c)) => text.push(c),
                     None => {
                         return Err(ParseError {
-                            message: "unterminated string literal".into(),
+                            message: if quote == '"' {
+                                "unterminated quoted identifier".into()
+                            } else {
+                                "unterminated string literal".into()
+                            },
                             position: at,
                         });
                     }
                 }
             }
             tokens.push(Spanned {
-                tok: Tok::Str(text),
+                tok: if quote == '"' {
+                    Tok::Quoted(text)
+                } else {
+                    Tok::Str(text)
+                },
                 at,
             });
+        } else if c == '$' {
+            chars.next();
+            let mut number = String::new();
+            take_digits(&mut chars, &mut number);
+            let index = number.parse::<usize>().ok().filter(|index| *index > 0);
+            match index {
+                Some(index) => tokens.push(Spanned {
+                    tok: Tok::Bind(index),
+                    at,
+                }),
+                None => {
+                    return Err(ParseError {
+                        message: "expected a parameter number after `$`".into(),
+                        position: at,
+                    });
+                }
+            }
         } else {
             chars.next();
             let sym: &'static str = match c {
@@ -242,6 +297,7 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
                 '[' => "[",
                 ']' => "]",
                 ',' => ",",
+                '.' => ".",
                 '*' => "*",
                 '-' => "-",
                 '=' => "=",
@@ -329,13 +385,15 @@ fn next_is_digit(chars: &Chars<'_>, ahead: usize) -> bool {
 /// - `tokens`: the lexed input, always ending with [`Tok::Eof`].
 /// - `pos`: index of the current token.
 /// - `depth`: current `(` / `[` nesting depth, bounded by [`MAX_NESTING_DEPTH`].
-struct Parser {
+/// - `binds`: what `$n` placeholders stand for, `$1` first.
+struct Parser<'b> {
     tokens: Vec<Spanned>,
     pos: usize,
     depth: usize,
+    binds: &'b [BindValue],
 }
 
-impl Parser {
+impl Parser<'_> {
     /// The current token.
     fn peek(&self) -> &Tok {
         &self.tokens[self.pos].tok
@@ -379,6 +437,8 @@ impl Parser {
     fn describe(&self) -> String {
         match self.peek() {
             Tok::Word(word) => format!("`{word}`"),
+            Tok::Quoted(word) => format!("`\"{word}\"`"),
+            Tok::Bind(index) => format!("parameter `${index}`"),
             Tok::Str(text) => format!("string `{text}`"),
             Tok::Num(number) => format!("number `{number}`"),
             Tok::Sym(symbol) => format!("`{symbol}`"),
@@ -435,11 +495,35 @@ impl Parser {
     /// A bare-word identifier.
     fn ident(&mut self) -> Result<String, ParseError> {
         match self.peek().clone() {
-            Tok::Word(word) => {
+            Tok::Word(word) | Tok::Quoted(word) => {
                 self.bump();
                 Ok(word)
             }
             _ => self.err(format!("expected a name, found {}", self.describe())),
+        }
+    }
+
+    /// A column, bare or qualified by its table (`t.c`, `"t"."c"`); a
+    /// qualifier must name the table being read.
+    fn column_name(&mut self, table: &DbTable) -> Result<ColumnName, ParseError> {
+        let at = self.at();
+        let mut name = self.ident()?;
+        if self.eat_sym(".") {
+            if name != table.name.as_str() {
+                return Err(ParseError {
+                    message: format!("`{name}` is not the table being read, `{}`", table.name),
+                    position: at,
+                });
+            }
+            name = self.ident()?;
+        }
+        if table.column(&name).is_some() {
+            Ok(ColumnName::from(name))
+        } else {
+            Err(ParseError {
+                message: format!("unknown column `{}` on table `{}`", name, table.name),
+                position: at,
+            })
         }
     }
 
@@ -454,19 +538,6 @@ impl Parser {
     }
 
     /// A column name, validated to exist on `table`.
-    fn column_name(&mut self, table: &DbTable) -> Result<ColumnName, ParseError> {
-        let at = self.at();
-        let name = self.ident()?;
-        if table.column(&name).is_some() {
-            Ok(ColumnName::from(name))
-        } else {
-            Err(ParseError {
-                message: format!("unknown column `{}` on table `{}`", name, table.name),
-                position: at,
-            })
-        }
-    }
-
     /// Dispatch on the leading keyword to a read or a write.
     fn query(&mut self, catalog: &Catalog) -> Result<ParsedQuery, ParseError> {
         if self.is_word("SELECT") {
@@ -489,11 +560,22 @@ impl Parser {
     /// mandatory, so absent means "no bound".
     fn read(&mut self, catalog: &Catalog) -> Result<SingleTableReadQuery, ParseError> {
         self.expect_word("SELECT")?;
-        self.expect_sym("*")?;
+        if self.is_word("DISTINCT") {
+            return self.err("DISTINCT is not supported");
+        }
+        // The projection is read after the table is known, so its columns
+        // can be checked; the engine follows whole rows whatever is
+        // selected, so what it names is validated and then dropped.
+        let projection = self.pos;
+        self.skip_projection()?;
         self.expect_word("FROM")?;
         let table = self.table(catalog)?;
+        let after_table = self.pos;
+        self.pos = projection;
+        self.projection(table)?;
+        self.pos = after_table;
 
-        if self.is_word("LEFT") || self.is_word("JOIN") {
+        if self.is_word("LEFT") || self.is_word("JOIN") || self.is_word("INNER") {
             return self.err("joins are not supported yet — single-table queries only");
         }
 
@@ -525,20 +607,34 @@ impl Parser {
         };
 
         let limit = if self.eat_word("LIMIT") {
+            let at = self.at();
             match self.peek().clone() {
                 Tok::Num(number) => {
-                    let at = self.at();
                     self.bump();
                     number.parse::<u32>().map_err(|_| ParseError {
                         message: format!("`{number}` is not a valid limit"),
                         position: at,
                     })?
                 }
+                Tok::Bind(_) => match self.value()? {
+                    Value::Int(limit) if limit >= 0 && limit <= i64::from(u32::MAX) => {
+                        limit as u32
+                    }
+                    other => {
+                        return Err(ParseError {
+                            message: format!("a limit parameter must be a non-negative integer, found {other:?}"),
+                            position: at,
+                        });
+                    }
+                },
                 _ => return self.err(format!("expected a limit, found {}", self.describe())),
             }
         } else {
             u32::MAX
         };
+        if self.is_word("OFFSET") {
+            return self.err("OFFSET is not supported");
+        }
 
         Ok(SingleTableReadQuery::new(
             table.name.clone(),
@@ -555,6 +651,44 @@ impl Parser {
     /// whole row is read. UPDATE must SET every non-pkey column because
     /// the engine evaluates predicates against `record` as the complete
     /// new row image — a partial SET would corrupt the views.
+    /// Advances past the projection without reading it, up to `FROM`.
+    fn skip_projection(&mut self) -> Result<(), ParseError> {
+        let mut depth = 0usize;
+        loop {
+            match self.peek() {
+                Tok::Eof => return self.err("expected FROM"),
+                Tok::Word(word) if depth == 0 && word.eq_ignore_ascii_case("FROM") => {
+                    return Ok(());
+                }
+                Tok::Sym("(") => depth += 1,
+                Tok::Sym(")") => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
+    /// The projection: `*`, `COUNT(*)`, or columns of `table`, each
+    /// optionally qualified.
+    fn projection(&mut self, table: &DbTable) -> Result<(), ParseError> {
+        if self.eat_sym("*") {
+            return Ok(());
+        }
+        if self.is_word("COUNT") {
+            self.bump();
+            self.expect_sym("(")?;
+            self.expect_sym("*")?;
+            self.expect_sym(")")?;
+            return Ok(());
+        }
+        loop {
+            self.column_name(table)?;
+            if !self.eat_sym(",") {
+                return Ok(());
+            }
+        }
+    }
+
     fn write(&mut self, catalog: &Catalog) -> Result<WriteQuery, ParseError> {
         if self.eat_word("INSERT") {
             self.expect_word("INTO")?;
@@ -886,6 +1020,20 @@ impl Parser {
                 self.bump();
                 Ok(Value::String(text))
             }
+            Tok::Bind(index) => {
+                self.bump();
+                let bind = self.binds.get(index - 1).ok_or(ParseError {
+                    message: format!(
+                        "`${index}` has no parameter; {} were given",
+                        self.binds.len()
+                    ),
+                    position: at,
+                })?;
+                binds::decode(bind).map_err(|message| ParseError {
+                    message: format!("`${index}`: {message}"),
+                    position: at,
+                })
+            }
             Tok::Word(word) if word.eq_ignore_ascii_case("NULL") => {
                 self.bump();
                 Ok(Value::Null)
@@ -1101,6 +1249,175 @@ fn collect_pkey_equalities(filter: &Where, out: &mut Vec<(ColumnName, Value)>) -
 mod tests {
     use super::*;
     use crate::model::{DbColumn, ValueType};
+
+    fn text_bind(text: &str) -> BindValue {
+        BindValue {
+            type_oid: 25,
+            bytes: Some(text.as_bytes().to_vec()),
+        }
+    }
+
+    fn int8_bind(value: i64) -> BindValue {
+        BindValue {
+            type_oid: 20,
+            bytes: Some(value.to_be_bytes().to_vec()),
+        }
+    }
+
+    fn int4_bind(value: i32) -> BindValue {
+        BindValue {
+            type_oid: 23,
+            bytes: Some(value.to_be_bytes().to_vec()),
+        }
+    }
+
+    #[test]
+    fn a_diesel_query_parses_like_its_literal_twin() {
+        // What Diesel renders for
+        // tickets.filter(status.eq("OPEN")).filter(points.gt(3)).order(id.desc()).first()
+        let diesel = r#"SELECT "tickets"."id", "tickets"."status", "tickets"."priority", "tickets"."points" FROM "tickets" WHERE (("tickets"."status" = $1) AND ("tickets"."points" > $2)) ORDER BY "tickets"."id" DESC LIMIT $3"#;
+        let bound = parse_read_with_binds(
+            diesel,
+            &[text_bind("OPEN"), int4_bind(3), int8_bind(1)],
+            &catalog(),
+        )
+        .expect("diesel shape parses");
+        let literal = parse_read(
+            "SELECT * FROM tickets WHERE status = 'OPEN' AND points > 3 ORDER BY id DESC LIMIT 1",
+            &catalog(),
+        )
+        .expect("literal parses");
+        assert_eq!(bound, literal);
+    }
+
+    #[test]
+    fn a_count_and_an_in_list_of_binds() {
+        let count = parse_read_with_binds(
+            r#"SELECT COUNT(*) FROM "tickets" WHERE ("tickets"."status" IN ($1, $2))"#,
+            &[text_bind("OPEN"), text_bind("DONE")],
+            &catalog(),
+        )
+        .expect("count parses");
+        let literal = parse_read(
+            "SELECT * FROM tickets WHERE status IN ('OPEN', 'DONE')",
+            &catalog(),
+        )
+        .expect("literal parses");
+        assert_eq!(count, literal);
+    }
+
+    #[test]
+    fn a_bind_takes_the_value_its_literal_would() {
+        // Reads keep a literal as spelled and compare by equality folding;
+        // a bind is decoded by its OID and kept the same way.
+        let q = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."points" = $1"#,
+            &[int8_bind(7)],
+            &catalog(),
+        )
+        .expect("int8 bind");
+        assert_eq!(
+            q.filter,
+            Where::Condition(Condition {
+                column: ColumnName::from("points"),
+                comparison_operator: ComparisonOperator::EQ,
+                value: Value::Int(7),
+            })
+        );
+        let null = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = $1"#,
+            &[BindValue {
+                type_oid: 25,
+                bytes: None,
+            }],
+            &catalog(),
+        )
+        .expect("a NULL bind");
+        assert!(matches!(
+            null.filter,
+            Where::Condition(Condition {
+                value: Value::Null,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn bind_and_projection_mistakes_are_named() {
+        let missing = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = $2"#,
+            &[text_bind("OPEN")],
+            &catalog(),
+        )
+        .expect_err("$2 with one bind");
+        assert!(missing.message.contains("`$2` has no parameter"), "{}", missing.message);
+
+        let other_table = parse_read(
+            r#"SELECT "users"."id" FROM "tickets""#,
+            &catalog(),
+        )
+        .expect_err("a column of another table");
+        assert!(other_table.message.contains("not the table being read"), "{}", other_table.message);
+
+        let unknown = parse_read(r#"SELECT "tickets"."owner" FROM "tickets""#, &catalog())
+            .expect_err("an unknown column");
+        assert!(unknown.message.contains("unknown column `owner`"), "{}", unknown.message);
+
+        let offset = parse_read(r#"SELECT * FROM "tickets" LIMIT 10 OFFSET 5"#, &catalog())
+            .expect_err("offset");
+        assert!(offset.message.contains("OFFSET"), "{}", offset.message);
+
+        let unsupported = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = $1"#,
+            &[BindValue {
+                type_oid: 600,
+                bytes: Some(vec![0; 16]),
+            }],
+            &catalog(),
+        )
+        .expect_err("a point bind");
+        assert!(unsupported.message.contains("oid 600"), "{}", unsupported.message);
+
+        let null_limit = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" LIMIT $1"#,
+            &[BindValue {
+                type_oid: 20,
+                bytes: None,
+            }],
+            &catalog(),
+        )
+        .expect_err("a NULL limit");
+        assert!(null_limit.message.contains("limit parameter"), "{}", null_limit.message);
+    }
+
+    #[test]
+    fn quoted_identifiers_keep_their_case_and_escapes() {
+        let catalog = Catalog::new(vec![DbTable::new(
+            "Mixed Case",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("a\"b", ValueType::String),
+            ],
+        )]);
+        let q = parse_read(
+            r#"SELECT "Mixed Case"."a""b" FROM "Mixed Case" WHERE "a""b" = 'x'"#,
+            &catalog,
+        )
+        .expect("quoted names parse");
+        assert_eq!(q.table.as_str(), "Mixed Case");
+        assert_eq!(
+            q.filter,
+            Where::Condition(Condition {
+                column: ColumnName::from("a\"b"),
+                comparison_operator: ComparisonOperator::EQ,
+                value: Value::String("x".into()),
+            })
+        );
+        let error = parse_read(r#"SELECT "unterminated FROM t"#, &catalog)
+            .expect_err("unterminated");
+        assert!(error.message.contains("quoted identifier"));
+    }
 
     /// A one-table catalog (`tickets`, pkey `id`) shared by most tests.
     fn catalog() -> Catalog {
