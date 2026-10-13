@@ -117,6 +117,17 @@ The server listens on `0.0.0.0:4848`. Point the client's `server` option at
 `.env.example`. `GET /health` returns `200` once the server is ready to serve
 queries.
 
+### Server-to-server clients
+
+A backend that caches what it reads (the `streamgres_diesel` wrapper, for
+one) does not speak the Zero protocol. It connects to
+`ws://<host>:4848/<base>/s2s/v1` and subscribes the SQL its ORM rendered,
+`$n` binds and all; the server answers `accepted` or `refused` and then
+sends `touched` with the ids of every subscription a committed transaction
+changed the rows of. No rows travel this way: the backend keeps reading
+Postgres and uses the touches to drop what is stale. The protocol is
+documented in `src/client/s2s.rs`.
+
 Configuration uses `STREAMGRES_*` environment variables, each documented in
 [`.env.example`](.env.example). Existing `XYNE_SYNC_*` variables are still
 accepted as fallbacks; a `STREAMGRES_*` value takes precedence when both are
