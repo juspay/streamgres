@@ -292,14 +292,23 @@ pub fn serve(config: Config) -> Result<(), String> {
     let metrics_interval = config.metrics_interval;
     let (warmed_tx, warmed) = tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
     let (s2s, s2s_requests) = s2s::Handle::new();
-    server.spawn(s2s::run(
+    let s2s_task = s2s::run(
         catalog.clone(),
         shards,
         commands.clone(),
         s2s_events,
         s2s_requests,
         ready.clone(),
-    ));
+    );
+    // Named for `tokio-console` when the runtime is built with
+    // `--cfg tokio_unstable`; a plain spawn otherwise.
+    #[cfg(tokio_unstable)]
+    tokio::task::Builder::new()
+        .name("s2s")
+        .spawn_on(s2s_task, server.handle())
+        .map_err(|error| format!("spawning the s2s task: {error}"))?;
+    #[cfg(not(tokio_unstable))]
+    server.spawn(s2s_task);
     let state = Arc::new(connection::AppState {
         config,
         requests,
