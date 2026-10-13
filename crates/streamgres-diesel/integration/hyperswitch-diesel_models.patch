@@ -1,0 +1,31 @@
+diff --git a/crates/diesel_models/Cargo.toml b/crates/diesel_models/Cargo.toml
+index 4ed5a11..c29697e 100644
+--- a/crates/diesel_models/Cargo.toml
++++ b/crates/diesel_models/Cargo.toml
+@@ -14,9 +14,11 @@ v1 = ["common_utils/v1", "common_types/v1"]
+ v2 = ["common_utils/v2", "common_types/v2"]
+ tokenization_v2 = []
+ deja = ["dep:deja", "deja/diesel-pg"]
++streamgres = ["dep:streamgres_diesel"]
+ 
+ [dependencies]
+ async-bb8-diesel = "0.2.1"
++streamgres_diesel = { path = "/Users/kartik.parsoya/Documents/streamgres-diesel", optional = true }
+ base64 = "0.22.1"
+ bb8 = "0.8.6"
+ diesel = { version = "2.2.10", features = ["postgres", "serde_json", "time", "128-column-tables", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+diff --git a/crates/diesel_models/src/lib.rs b/crates/diesel_models/src/lib.rs
+index f0c20a5..70afae2 100644
+--- a/crates/diesel_models/src/lib.rs
++++ b/crates/diesel_models/src/lib.rs
+@@ -83,7 +83,9 @@ pub type StorageResult<T> = error_stack::Result<T, errors::DatabaseError>;
+ /// `diesel::PgConnection`.
+ #[cfg(feature = "deja")]
+ pub type DejaPgConnection = deja::DejaLoadConnection<diesel::PgConnection>;
+-#[cfg(not(feature = "deja"))]
++#[cfg(all(feature = "streamgres", not(feature = "deja")))]
++pub type DejaPgConnection = streamgres_diesel::SyncedConnection<diesel::PgConnection>;
++#[cfg(not(any(feature = "deja", feature = "streamgres")))]
+ pub type DejaPgConnection = diesel::PgConnection;
+ 
+ pub type RawPgConnection = async_bb8_diesel::Connection<DejaPgConnection>;
