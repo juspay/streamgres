@@ -57,6 +57,7 @@ pub mod ddl_triggers;
 pub mod groups;
 pub mod plan;
 pub mod protocol;
+pub mod s2s;
 pub mod sampler;
 pub mod schema;
 pub mod transform;
@@ -163,7 +164,9 @@ pub fn serve(config: Config) -> Result<(), String> {
                     &settings,
                     engine_catalog,
                     reads_handle,
-                    shards,
+                    // One consumer per group thread, and one for the
+                    // server-to-server endpoint (the last sink).
+                    shards + 1,
                     engine_stats,
                     engine_shutdown.clone(),
                 )
@@ -206,6 +209,10 @@ pub fn serve(config: Config) -> Result<(), String> {
         .map_err(|_| "the engine thread ended before it was up".to_owned())??;
 
     let (readiness, ready) = tokio::sync::watch::channel(false);
+    let mut events = events;
+    let s2s_events = events
+        .pop()
+        .ok_or("the engine started without the s2s sink".to_owned())?;
     let mut requests = Vec::with_capacity(shards);
     let mut group_threads = Vec::with_capacity(shards);
     for (shard, events) in events.into_iter().enumerate() {
@@ -284,6 +291,15 @@ pub fn serve(config: Config) -> Result<(), String> {
     let warm_budget = config.warm_start;
     let metrics_interval = config.metrics_interval;
     let (warmed_tx, warmed) = tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
+    let (s2s, s2s_requests) = s2s::Handle::new();
+    server.spawn(s2s::run(
+        catalog.clone(),
+        shards,
+        commands.clone(),
+        s2s_events,
+        s2s_requests,
+        ready.clone(),
+    ));
     let state = Arc::new(connection::AppState {
         config,
         requests,
@@ -298,6 +314,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         warmed,
         transforms,
         shutdown: shutdown.clone(),
+        s2s,
     });
     drop(readiness);
     if warm.enabled() {
