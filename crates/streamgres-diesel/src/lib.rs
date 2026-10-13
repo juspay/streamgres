@@ -36,6 +36,7 @@
 
 pub mod cache;
 pub mod cursor;
+pub mod engine;
 pub mod key;
 pub mod row;
 pub mod subscriptions;
