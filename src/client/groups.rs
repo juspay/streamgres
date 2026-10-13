@@ -948,7 +948,7 @@ impl Groups {
                 let (frames, puts, _) = build_poke(
                     &self.catalog.load(),
                     &self.stats,
-                    self.config.rows_per_part.max(1),
+                    self.config.bytes_per_part.max(1),
                     &poke_id,
                     None,
                     &protocol::cookie(group.version),
@@ -1547,7 +1547,7 @@ impl Groups {
         let (frames, puts, dels) = build_poke(
             &self.catalog.load(),
             &self.stats,
-            self.config.rows_per_part.max(1),
+            self.config.bytes_per_part.max(1),
             &poke_id,
             base.as_deref(),
             &cookie,
@@ -1683,48 +1683,52 @@ fn with_current(
 }
 
 /// One poke as its frames, from `base` to `cookie`: the start, the parts
-/// (`head` in the first, `per_part` row operations each, every put taken
-/// from the bytes kept on its image when the image was sent before), the
-/// end. Also how many puts and dels it carries.
+/// (`head` in the first, row operations accumulated until their serialized
+/// size reaches `bytes_per_part`, every put taken from the bytes kept on
+/// its image when the image was sent before), the end. Also how many puts
+/// and dels it carries.
 #[allow(clippy::too_many_arguments)]
 fn build_poke(
     catalog: &Catalog,
     stats: &Stats,
-    per_part: usize,
+    bytes_per_part: usize,
     poke_id: &str,
     base: Option<&str>,
     cookie: &str,
     head: Vec<u8>,
     rows: &[Patch<'_>],
 ) -> (Arc<[Bytes]>, usize, usize) {
-    let mut frames: Vec<Bytes> = Vec::with_capacity(rows.len().div_ceil(per_part) + 3);
+    let mut frames: Vec<Bytes> = Vec::with_capacity(4);
     frames.push(Bytes::from(protocol::poke_start(poke_id, base)));
     let mut head = Some(head);
-    if rows.is_empty() {
-        frames.push(part_frame(poke_id, head.take(), &[]));
-    }
     let (mut puts, mut dels) = (0usize, 0usize);
-    for chunk in rows.chunks(per_part) {
-        let mut entries: Vec<Bytes> = Vec::with_capacity(chunk.len());
-        for op in chunk {
-            match op {
-                Patch::Put(table, row) => {
-                    let Some(fragment) = put_fragment(catalog, stats, table, row) else {
-                        continue;
-                    };
-                    puts += 1;
-                    entries.push(fragment);
-                }
-                Patch::Del(table, key) => {
-                    dels += 1;
-                    let mut bytes = Vec::with_capacity(64);
-                    wire::write_del(&mut bytes, table.as_str(), key);
-                    entries.push(Bytes::from(bytes));
-                }
+    let mut entries: Vec<Bytes> = Vec::new();
+    let mut current_bytes = 0usize;
+    for op in rows {
+        let entry = match op {
+            Patch::Put(table, row) => {
+                let Some(fragment) = put_fragment(catalog, stats, table, row) else {
+                    continue;
+                };
+                puts += 1;
+                fragment
             }
+            Patch::Del(table, key) => {
+                dels += 1;
+                let mut bytes = Vec::with_capacity(64);
+                wire::write_del(&mut bytes, table.as_str(), key);
+                Bytes::from(bytes)
+            }
+        };
+        if !entries.is_empty() && current_bytes + entry.len() > bytes_per_part {
+            frames.push(part_frame(poke_id, head.take(), &entries));
+            entries.clear();
+            current_bytes = 0;
         }
-        frames.push(part_frame(poke_id, head.take(), &entries));
+        current_bytes += entry.len();
+        entries.push(entry);
     }
+    frames.push(part_frame(poke_id, head.take(), &entries));
     frames.push(Bytes::from(protocol::poke_end(poke_id, cookie)));
     (frames.into(), puts, dels)
 }
