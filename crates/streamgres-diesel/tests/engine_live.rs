@@ -258,3 +258,53 @@ fn evicting_an_entry_unsubscribes_it_from_the_engine() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// Needs `STREAMGRES_RESTART_CMD`, a shell command that restarts the
+/// engine and returns once it serves again.
+#[test]
+fn an_engine_restart_is_survived_without_a_stale_read() {
+    let Some(mut live) = Live::start("restart") else {
+        return;
+    };
+    let Ok(restart) = std::env::var("STREAMGRES_RESTART_CMD") else {
+        eprintln!("STREAMGRES_RESTART_CMD not set; skipping");
+        return;
+    };
+    live.put("v", "1");
+    assert_eq!(live.read("v").as_deref(), Some("1"));
+    assert_eq!(live.engine.subscribed(), 1);
+
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&restart)
+        .status()
+        .expect("restart command");
+    assert!(status.success(), "the restart command failed");
+
+    // While the engine was away, the socket dropped and the cache was
+    // cleared; a change made meanwhile must be seen once reads resume.
+    live.put("v", "2");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !live.engine.is_connected() {
+        assert!(Instant::now() < deadline, "the client did not reconnect");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(live.read("v").as_deref(), Some("2"), "no stale read after the restart");
+    assert_eq!(live.engine.subscribed(), 1, "resubscribed under the same key");
+    assert_eq!(live.cache.len(), 1, "the read after the restart was cached again");
+    let touched_before = live.cache.stats.touched.load(Ordering::Relaxed);
+    let hits_before = live.cache.stats.hits.load(Ordering::Relaxed);
+    assert_eq!(live.read("v").as_deref(), Some("2"));
+    assert_eq!(live.cache.stats.hits.load(Ordering::Relaxed), hits_before + 1, "served from the cache");
+
+    // And the resubscription is live: a further change is reported.
+    live.put("v", "3");
+    let took = live
+        .read_until("v", "3", Duration::from_secs(10))
+        .expect("the change reached the cache through the resubscribed engine");
+    eprintln!("after restart, commit to refilled read: {took:?}");
+    assert!(
+        live.cache.stats.touched.load(Ordering::Relaxed) > touched_before,
+        "the refill came from a touch, not from a missing entry"
+    );
+}

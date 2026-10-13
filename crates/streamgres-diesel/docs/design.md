@@ -1,8 +1,10 @@
 # streamgres_diesel: design notes
 
-Status: option A below is chosen and implemented on the wrapper side
-(`cache`, `key`, `cursor`, `subscriptions` modules) against a fake engine.
-The engine client and the engine's S2S endpoint are next.
+Status: option A below is chosen and implemented end to end: the wrapper
+side (`cache`, `key`, `cursor`, `subscriptions`, `engine` modules) and
+the engine's S2S endpoint (`src/client/s2s.rs` on the engine's
+`feat/s2s-endpoint` branch, with the parser widened to the SQL Diesel
+renders). Option B is the later step.
 
 ## Where the wrapper sits
 
@@ -71,23 +73,55 @@ A ships in weeks and is correct for all types. B removes the read on every
 change and is the end state; A's cache, keys, subscription bookkeeping and
 reconnect logic carry over unchanged.
 
-## Contract with the engine (for A)
+## Contract with the engine (implemented)
 
-The engine already parses a SQL subset against its catalog
-(`src/parser`): single table, filter of `=`, `!=`, `<`, `>`, `IN`,
-`IS NULL` over `AND`/`OR`, `ORDER BY`, `LIMIT`. For A the client sends:
+WebSocket at `{base}/s2s/v1`, JSON `[tag, body]` frames.
 
-- `subscribe { id, sql, binds }` where `sql` is Diesel's text with `$n`
-  and `binds` the values as text. The engine substitutes and parses.
-  Queries outside the subset are refused with a reason, and the wrapper
-  then serves that query straight from Postgres with no cache.
-- `unsubscribe { id }` when the cache evicts the key.
-- Downstream: `touched { ids, position }` per transaction, and the
-  existing row pokes once B lands.
+Upstream:
+- `["subscribe", {"id", "sql", "binds": [{"oid", "bytes": base64|null}]}]`:
+  the SQL as Diesel rendered it (`$n` placeholders, quoted and qualified
+  names, a column list or `COUNT(*)`), each bind as its Postgres type OID
+  and binary bytes. The engine parses it against its catalog, decoding
+  binds by OID (integers, floats, numerics, booleans, text-like, UUID,
+  JSON, timestamps, dates).
+- `["unsubscribe", {"id"}]` when the cache evicts the key.
+- `["ping"]`.
 
-Reconnect: on a dropped stream the wrapper clears the whole cache and
-resubscribes, so no change is missed. A `position` cookie lets the
-engine replay instead once it keeps a short history.
+Downstream:
+- `["hello", {"protocol": 1}]`, `["pong"]`.
+- `["accepted", {"id"}]` once the engine's rows for the query are
+  hydrated; the wrapper reads Postgres only after it, so every later
+  change is reported.
+- `["refused", {"id", "reason"}]` for anything outside the subset (joins,
+  `LIKE`, `OFFSET`, `DISTINCT`, unknown columns, too many rows); the read
+  is served live. A refusal after acceptance means the engine stopped
+  following the query; the client drops the entry.
+- `["touched", {"ids"}]` per transaction that changed any of those
+  subscriptions' rows.
+
+The engine accepts first and the client reads second, so a change that
+lands between the two is reported redundantly and costs one refill,
+never a stale row.
+
+Reconnect: a dropped socket refuses every waiting subscribe, clears the
+cache, and on reconnect resubscribes every held key under its old id. A
+position cookie for replay is a later refinement.
+
+## Running it locally
+
+- Postgres 15 or newer with `wal_level = logical` (the engine's DDL
+  trigger stack needs 15+). A private Homebrew `postgresql@16` on its own
+  port works: `initdb`, set `wal_level = logical` and a short
+  `unix_socket_directories`, `pg_ctl start`.
+- In the database: `CREATE PUBLICATION xyne_sync_pub FOR ALL TABLES;`
+  and `psql -f scripts/sql/ddl-triggers.sql` from the engine repo.
+- The engine: `STREAMGRES_APP_ID=xyne STREAMGRES_PG_DSN=... STREAMGRES_QUERY_URL=http://127.0.0.1:1/q STREAMGRES_MUTATE_URL=http://127.0.0.1:1/m cargo run --release --bin server`.
+  The query and mutate URLs are required by the config and never called
+  on the S2S path.
+- For tokio-console: build the server with
+  `RUSTFLAGS="--cfg tokio_unstable" cargo build --release --bin server --features console`,
+  run it, then `tokio-console` (installed with `cargo install tokio-console`)
+  attaches on `127.0.0.1:6669`; the S2S task is named `s2s`.
 
 ## Consistency
 
