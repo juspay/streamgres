@@ -24,6 +24,8 @@
 //! enable it, so this crate does too rather than reaching into Diesel's
 //! hidden derive re-exports.
 
+pub mod row;
+
 use diesel::connection::{
     AnsiTransactionManager, ConnectionSealed, Instrumentation, LoadConnection, SimpleConnection,
 };
