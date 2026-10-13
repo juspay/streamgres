@@ -1,5 +1,5 @@
 diff --git a/crates/diesel_models/Cargo.toml b/crates/diesel_models/Cargo.toml
-index 4ed5a11..c29697e 100644
+index 4ed5a11..3d1a390 100644
 --- a/crates/diesel_models/Cargo.toml
 +++ b/crates/diesel_models/Cargo.toml
 @@ -14,9 +14,11 @@ v1 = ["common_utils/v1", "common_types/v1"]
@@ -14,6 +14,13 @@ index 4ed5a11..c29697e 100644
  base64 = "0.22.1"
  bb8 = "0.8.6"
  diesel = { version = "2.2.10", features = ["postgres", "serde_json", "time", "128-column-tables", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+@@ -38,3 +40,6 @@ deja = { git = "https://github.com/juspay/deja", rev = "9230641b943a469ef4b506c0
+ 
+ [lints]
+ workspace = true
++
++[dev-dependencies]
++tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 diff --git a/crates/diesel_models/src/lib.rs b/crates/diesel_models/src/lib.rs
 index f0c20a5..70afae2 100644
 --- a/crates/diesel_models/src/lib.rs
@@ -29,3 +36,118 @@ index f0c20a5..70afae2 100644
  pub type DejaPgConnection = diesel::PgConnection;
  
  pub type RawPgConnection = async_bb8_diesel::Connection<DejaPgConnection>;
+diff --git a/crates/diesel_models/tests/streamgres_live.rs b/crates/diesel_models/tests/streamgres_live.rs
+new file mode 100644
+index 0000000..754ef45
+--- /dev/null
++++ b/crates/diesel_models/tests/streamgres_live.rs
+@@ -0,0 +1,109 @@
++//! Hyperswitch's own config lookups through the Streamgres-synced
++//! connection, against a running engine.
++//!
++//! Needs `DATABASE_URL` (a database with the Hyperswitch schema that the
++//! engine streams) and `STREAMGRES_S2S_URL`; skips itself otherwise. Run
++//! with `--features v1,streamgres`.
++#![cfg(feature = "streamgres")]
++
++use std::sync::Arc;
++use std::sync::atomic::Ordering;
++use std::time::{Duration, Instant};
++
++use common_utils::external_service::NoOpEventEmitter;
++use diesel::prelude::*;
++use diesel_models::{
++    configs::{Config, ConfigNew, ConfigUpdate},
++    DatabaseConnectionWithContext, DejaPgConnection,
++};
++use streamgres_diesel::{cache::Cache, engine::EngineClient, install, Consistency, Settings};
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn config_lookups_are_served_from_the_synced_cache() {
++    let (Ok(database), Ok(s2s)) = (
++        std::env::var("DATABASE_URL"),
++        std::env::var("STREAMGRES_S2S_URL"),
++    ) else {
++        eprintln!("DATABASE_URL / STREAMGRES_S2S_URL not set; skipping");
++        return;
++    };
++
++    // What a Hyperswitch binary would do at startup.
++    let engine = EngineClient::connect(s2s);
++    let cache = Arc::new(Cache::new(64 * 1024 * 1024, Arc::new(engine.clone())));
++    engine.attach(&cache);
++    let _ = install(Settings {
++        cache: cache.clone(),
++        consistency_for: Box::new(|_| Consistency::Eventual),
++    });
++    let deadline = Instant::now() + Duration::from_secs(10);
++    while !engine.is_connected() {
++        assert!(Instant::now() < deadline, "the engine did not connect");
++        tokio::time::sleep(Duration::from_millis(50)).await;
++    }
++
++    // Hyperswitch's pool over its connection alias, now the synced wrapper.
++    let manager = async_bb8_diesel::ConnectionManager::<DejaPgConnection>::new(&database);
++    let pool = bb8::Pool::builder()
++        .max_size(2)
++        .build(manager)
++        .await
++        .expect("pool");
++    let pooled = pool.get().await.expect("connection");
++    let conn = DatabaseConnectionWithContext::new(pooled, None, Arc::new(NoOpEventEmitter));
++
++    let key = format!("sg-live-{}", std::process::id());
++    ConfigNew {
++        key: key.clone(),
++        config: "1".to_string(),
++    }
++    .insert(&conn)
++    .await
++    .expect("insert");
++
++    let first = Config::find_by_key(&conn, &key).await.expect("find");
++    assert_eq!(first.config, "1");
++    assert_eq!(engine.subscribed(), 1, "the engine follows Hyperswitch's lookup");
++    let second = Config::find_by_key(&conn, &key).await.expect("find again");
++    assert_eq!(second.config, "1");
++    assert_eq!(cache.stats.hits.load(Ordering::Relaxed), 1, "served from the cache");
++
++    // Hyperswitch's own update path: a write through the same connection,
++    // then the cached lookup catches up through the engine.
++    let started = Instant::now();
++    let updated = Config::update_by_key(
++        &conn,
++        &key,
++        ConfigUpdate::Update {
++            config: Some("2".to_string()),
++        },
++    )
++    .await
++    .expect("update");
++    assert_eq!(updated.config, "2", "the write returned the new row");
++    loop {
++        let seen = Config::find_by_key(&conn, &key).await.expect("find");
++        if seen.config == "2" {
++            break;
++        }
++        assert!(
++            started.elapsed() < Duration::from_secs(10),
++            "the update never reached the cached lookup"
++        );
++        tokio::time::sleep(Duration::from_millis(5)).await;
++    }
++    eprintln!("HYPERSWITCH update_by_key -> find_by_key sees it: {:?}", started.elapsed());
++    assert!(cache.stats.touched.load(Ordering::Relaxed) >= 1);
++    assert_eq!(engine.subscribed(), 1);
++
++    // Clean up with a plain connection.
++    tokio::task::spawn_blocking(move || {
++        use diesel_models::schema::configs::dsl;
++        let mut plain = PgConnection::establish(&database).expect("connect");
++        diesel::delete(dsl::configs.filter(dsl::key.eq(&key)))
++            .execute(&mut plain)
++            .expect("delete");
++    })
++    .await
++    .expect("cleanup");
++}
