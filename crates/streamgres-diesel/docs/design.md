@@ -1,7 +1,8 @@
 # streamgres_diesel: design notes
 
-Status: passthrough wrapper done and proven; everything below the first
-section is proposal.
+Status: option A below is chosen and implemented on the wrapper side
+(`cache`, `key`, `cursor`, `subscriptions` modules) against a fake engine.
+The engine client and the engine's S2S endpoint are next.
 
 ## Where the wrapper sits
 

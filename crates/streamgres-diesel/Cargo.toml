@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 diesel = { version = "2.2.10", features = ["postgres", "r2d2", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+moka = { version = "0.12", features = ["sync"] }
 
 [dev-dependencies]
 chrono = "0.4.45"

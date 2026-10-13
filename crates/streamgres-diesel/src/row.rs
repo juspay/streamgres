@@ -30,12 +30,13 @@ pub struct OwnedValue {
     bytes: Box<[u8]>,
 }
 
-/// A row that owns its bytes.
+/// A row that owns its bytes. Cloning shares them: a cached row is handed
+/// to every read that hits it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedRow {
     columns: Columns,
     /// One entry per column; `None` is SQL `NULL`.
-    values: Vec<Option<OwnedValue>>,
+    values: Arc<[Option<OwnedValue>]>,
 }
 
 impl OwnedRow {
@@ -70,7 +71,10 @@ impl OwnedRow {
             (None, Some(fresh)) => Arc::from(fresh),
             (None, None) => unreachable!("one of the two is always set"),
         };
-        Some(OwnedRow { columns, values })
+        Some(OwnedRow {
+            columns,
+            values: Arc::from(values),
+        })
     }
 
     /// The columns this row has, shared with the rest of its result set.
@@ -175,14 +179,13 @@ where
 /// Yields owned rows the way a live cursor yields live ones, so Diesel's
 /// `load` machinery can decode a cached result.
 pub struct OwnedCursor {
-    rows: std::vec::IntoIter<OwnedRow>,
+    rows: Arc<[OwnedRow]>,
+    next: usize,
 }
 
 impl OwnedCursor {
-    pub fn new(rows: Vec<OwnedRow>) -> Self {
-        OwnedCursor {
-            rows: rows.into_iter(),
-        }
+    pub fn new(rows: Arc<[OwnedRow]>) -> Self {
+        OwnedCursor { rows, next: 0 }
     }
 }
 
@@ -190,11 +193,14 @@ impl Iterator for OwnedCursor {
     type Item = QueryResult<OwnedRow>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.rows.next().map(Ok)
+        let row = self.rows.get(self.next)?.clone();
+        self.next += 1;
+        Some(Ok(row))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.rows.size_hint()
+        let left = self.rows.len() - self.next;
+        (left, Some(left))
     }
 }
 

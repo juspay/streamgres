@@ -1,4 +1,5 @@
-//! A Diesel connection that sits between an application and Postgres.
+//! A Diesel connection that sits between an application and Postgres and
+//! serves reads from a local copy the Streamgres engine keeps fresh.
 //!
 //! `SyncedConnection<C>` wraps any Diesel Postgres connection `C` and
 //! implements the same traits, so an application swaps its connection type
@@ -8,13 +9,22 @@
 //! Every read Diesel performs reaches [`LoadConnection::load`]; every write
 //! reaches [`Connection::execute_returning_count`]; raw multi-statement SQL
 //! reaches [`SimpleConnection::batch_execute`]. Those three methods are the
-//! whole interception surface, and the wrapper owns all of them.
+//! whole interception surface, and the wrapper owns all of them. Writes
+//! always go to Postgres. A read is answered from the [`cache::Cache`]
+//! when all of these hold:
 //!
-//! This first cut is a pure passthrough. It exists to prove that the wrapper
-//! is transparent to Diesel and to the pools applications use (`r2d2`, and
-//! through it `async-bb8-diesel`) before any read is served from a cache.
-//! The cache, the engine client and the consistency rules land on top of
-//! this type without changing its public surface.
+//! - the connection is [`Consistency::Eventual`];
+//! - no transaction is open on it (inside one, the application must see
+//!   its own writes);
+//! - the statement is a `SELECT` (Diesel sends `INSERT ... RETURNING`
+//!   through the same path);
+//! - the engine accepted a subscription for the query
+//!   ([`subscriptions::Subscriptions`]).
+//!
+//! On a miss the query is subscribed first, then read from Postgres, and
+//! the rows are kept byte for byte ([`row::OwnedRow`]). When the engine
+//! reports the query touched, the rows are dropped and the next read
+//! refills them. Every other read goes to Postgres as before.
 //!
 //! # Why the opt-in feature
 //!
@@ -24,16 +34,60 @@
 //! enable it, so this crate does too rather than reaching into Diesel's
 //! hidden derive re-exports.
 
+pub mod cache;
+pub mod cursor;
+pub mod key;
 pub mod row;
+pub mod subscriptions;
+
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 
 use diesel::connection::{
-    AnsiTransactionManager, ConnectionSealed, Instrumentation, LoadConnection, SimpleConnection,
+    AnsiTransactionManager, ConnectionSealed, DefaultLoadingMode, Instrumentation,
+    LoadConnection, SimpleConnection, TransactionManager,
 };
 use diesel::expression::QueryMetadata;
 use diesel::pg::{GetPgMetadataCache, Pg, PgMetadataCache};
 use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::r2d2::R2D2Connection;
 use diesel::{Connection, ConnectionResult, QueryResult};
+
+use crate::cache::Cache;
+use crate::cursor::{SyncedCursor, SyncedRow};
+use crate::key::QueryKey;
+use crate::row::{OwnedCursor, OwnedRow, capture_all};
+use crate::subscriptions::Verdict;
+
+/// How fresh a read on a connection must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Consistency {
+    /// Reads may come from the cache, which lags a commit by the engine's
+    /// propagation delay.
+    #[default]
+    Eventual,
+    /// Every read goes to Postgres.
+    Strong,
+}
+
+/// What a process shares between its connections: the cache and how to
+/// treat a connection by the URL it was established with.
+pub struct Settings {
+    pub cache: Arc<Cache>,
+    /// The consistency for a connection established with this URL, so a
+    /// master pool can be strong and a replica pool eventual.
+    pub consistency_for: Box<dyn Fn(&str) -> Consistency + Send + Sync>,
+}
+
+static SETTINGS: OnceLock<Settings> = OnceLock::new();
+
+/// Installs the process-wide settings. Connections established after this
+/// (including by pools, which call [`Connection::establish`]) use them;
+/// before it, every connection is a passthrough. Returns the settings back
+/// if some were already installed.
+pub fn install(settings: Settings) -> Result<(), Settings> {
+    SETTINGS.set(settings)
+}
 
 /// A Postgres connection whose reads can be served from a synced local copy.
 ///
@@ -42,12 +96,41 @@ use diesel::{Connection, ConnectionResult, QueryResult};
 /// delegated to it untouched.
 pub struct SyncedConnection<C = diesel::PgConnection> {
     inner: C,
+    cache: Option<Arc<Cache>>,
+    consistency: Consistency,
 }
 
 impl<C> SyncedConnection<C> {
-    /// Wraps an already established connection.
+    /// Wraps an already established connection as a passthrough.
     pub fn new(inner: C) -> Self {
-        SyncedConnection { inner }
+        SyncedConnection {
+            inner,
+            cache: None,
+            consistency: Consistency::Strong,
+        }
+    }
+
+    /// Wraps a connection with a cache and a consistency.
+    pub fn with_cache(inner: C, cache: Arc<Cache>, consistency: Consistency) -> Self {
+        SyncedConnection {
+            inner,
+            cache: Some(cache),
+            consistency,
+        }
+    }
+
+    /// Changes how fresh this connection's reads must be.
+    pub fn set_consistency(&mut self, consistency: Consistency) {
+        self.consistency = consistency;
+    }
+
+    pub fn consistency(&self) -> Consistency {
+        self.consistency
+    }
+
+    /// The cache this connection reads through, if any.
+    pub fn cache(&self) -> Option<&Arc<Cache>> {
+        self.cache.as_ref()
     }
 
     /// The connection that talks to Postgres.
@@ -85,7 +168,15 @@ where
     type TransactionManager = AnsiTransactionManager;
 
     fn establish(database_url: &str) -> ConnectionResult<Self> {
-        C::establish(database_url).map(SyncedConnection::new)
+        let inner = C::establish(database_url)?;
+        Ok(match SETTINGS.get() {
+            Some(settings) => SyncedConnection::with_cache(
+                inner,
+                Arc::clone(&settings.cache),
+                (settings.consistency_for)(database_url),
+            ),
+            None => SyncedConnection::new(inner),
+        })
     }
 
     fn begin_test_transaction(&mut self) -> QueryResult<()> {
@@ -114,14 +205,18 @@ where
 
 impl<C, B> LoadConnection<B> for SyncedConnection<C>
 where
-    C: LoadConnection<B> + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
+    C: LoadConnection<B>
+        + LoadConnection<DefaultLoadingMode>
+        + GetPgMetadataCache
+        + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>
+        + 'static,
 {
     type Cursor<'conn, 'query>
-        = C::Cursor<'conn, 'query>
+        = SyncedCursor<<C as LoadConnection<B>>::Cursor<'conn, 'query>>
     where
         Self: 'conn;
     type Row<'conn, 'query>
-        = C::Row<'conn, 'query>
+        = SyncedRow<<C as LoadConnection<B>>::Row<'conn, 'query>>
     where
         Self: 'conn;
 
@@ -133,8 +228,52 @@ where
         T: Query + QueryFragment<Pg> + QueryId + 'query,
         Pg: QueryMetadata<T::SqlType>,
     {
-        self.inner.load(source)
+        let cache = match self.cache.as_ref() {
+            Some(cache)
+                if self.consistency == Consistency::Eventual
+                    && !in_transaction(&mut self.inner) =>
+            {
+                Arc::clone(cache)
+            }
+            _ => return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live),
+        };
+
+        let key = QueryKey::of(&source, &mut self.inner)?;
+        if !key.is_select() {
+            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+        }
+        if let Some(entry) = cache.get(&key) {
+            return Ok(SyncedCursor::Cached(OwnedCursor::new(Arc::clone(
+                &entry.rows,
+            ))));
+        }
+        if let Verdict::Refused(_) = cache.subscriptions().subscribe(&key) {
+            cache.stats.refused.fetch_add(1, Ordering::Relaxed);
+            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+        }
+
+        // Subscribed: the engine reports every change from here on, so
+        // what Postgres returns now is current until the first touch.
+        let generation = cache.reserve(&key);
+        let live = LoadConnection::<DefaultLoadingMode>::load(&mut self.inner, source)?;
+        let rows: Arc<[OwnedRow]> = Arc::from(capture_all(live)?);
+        cache.fill(key, generation, Arc::clone(&rows));
+        Ok(SyncedCursor::Cached(OwnedCursor::new(rows)))
     }
+}
+
+/// Whether a transaction is open on the connection. Inside one, reads must
+/// see the connection's own uncommitted writes, which no cache has.
+fn in_transaction<C>(conn: &mut C) -> bool
+where
+    C: Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
+{
+    AnsiTransactionManager::transaction_manager_status_mut(conn)
+        .transaction_depth()
+        .map(|depth| depth.is_some())
+        // A broken transaction state counts as open: the inner connection
+        // reports it on the read.
+        .unwrap_or(true)
 }
 
 impl<C> R2D2Connection for SyncedConnection<C>

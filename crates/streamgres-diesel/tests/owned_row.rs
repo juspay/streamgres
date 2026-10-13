@@ -151,7 +151,7 @@ fn an_owned_cursor_yields_the_rows_in_order() {
     let mut conn = conn();
     seed(&mut conn);
     let rows = captured(&mut conn);
-    let cursor = OwnedCursor::new(rows.clone());
+    let cursor = OwnedCursor::new(rows.clone().into());
     assert_eq!(cursor.len(), 3);
     let back: Vec<OwnedRow> = cursor.map(|row| row.expect("row")).collect();
     assert_eq!(back, rows);
