@@ -669,23 +669,46 @@ impl Parser<'_> {
     }
 
     /// The projection: `*`, `COUNT(*)`, or columns of `table`, each
-    /// optionally qualified.
+    /// optionally qualified and optionally aliased (`AS v`, or a bare
+    /// alias). Ends at `FROM`.
     fn projection(&mut self, table: &DbTable) -> Result<(), ParseError> {
         if self.eat_sym("*") {
-            return Ok(());
+            return self.expect_from();
         }
         if self.is_word("COUNT") {
             self.bump();
             self.expect_sym("(")?;
             self.expect_sym("*")?;
             self.expect_sym(")")?;
-            return Ok(());
+            self.alias()?;
+            return self.expect_from();
         }
         loop {
             self.column_name(table)?;
+            self.alias()?;
             if !self.eat_sym(",") {
-                return Ok(());
+                return self.expect_from();
             }
+        }
+    }
+
+    /// An optional `AS name` or bare `name` after a projected column.
+    fn alias(&mut self) -> Result<(), ParseError> {
+        if self.eat_word("AS") {
+            self.ident()?;
+            return Ok(());
+        }
+        if !self.is_word("FROM") && matches!(self.peek(), Tok::Word(_) | Tok::Quoted(_)) {
+            self.bump();
+        }
+        Ok(())
+    }
+
+    fn expect_from(&mut self) -> Result<(), ParseError> {
+        if self.is_word("FROM") {
+            Ok(())
+        } else {
+            self.err(format!("expected FROM after the projection, found {}", self.describe()))
         }
     }
 
@@ -1288,6 +1311,20 @@ mod tests {
         )
         .expect("literal parses");
         assert_eq!(bound, literal);
+    }
+
+    #[test]
+    fn projected_columns_may_be_aliased() {
+        let aliased = parse_read(
+            r#"SELECT "tickets"."status" AS s, "tickets"."points" p FROM "tickets" WHERE "tickets"."id" = 1"#,
+            &catalog(),
+        )
+        .expect("aliases parse");
+        let plain = parse_read("SELECT * FROM tickets WHERE id = 1", &catalog()).expect("plain");
+        assert_eq!(aliased, plain);
+        let junk = parse_read(r#"SELECT "tickets"."status" 'x' FROM "tickets""#, &catalog())
+            .expect_err("a literal where a column list belongs");
+        assert!(junk.message.contains("expected FROM"), "{}", junk.message);
     }
 
     #[test]
