@@ -67,6 +67,14 @@ pub trait Subscriptions: Send + Sync {
     /// the engine need not follow the query any more.
     fn unsubscribe(&self, key: &QueryKey);
 
+    /// Whether a refusal with this reason will hold for a while (the
+    /// engine cannot follow the query's shape), so the cache may stop
+    /// asking for a time, or is transient (the engine side was down or
+    /// full, or did not answer) and the next read should ask again.
+    fn refusal_is_final(&self, _reason: &str) -> bool {
+        true
+    }
+
     /// Both steps on a blocking connection: `lookup` is the connection
     /// the read is on.
     fn subscribe_with(&self, key: &QueryKey, lookup: &mut dyn TypeLookup) -> Verdict {

@@ -814,3 +814,88 @@ fn the_subscription_cap_serves_the_rest_live() {
     assert_eq!(read(&mut conn, live.key("c2")).as_deref(), Some("v2b"));
     assert_eq!(engine.subscribed(), 2, "the freed slot went to the next miss");
 }
+
+diesel::table! {
+    sg_blobs (id) {
+        id -> Int4,
+        name -> Text,
+        data -> Nullable<Bytea>,
+        n -> Int4,
+    }
+}
+
+/// `bytea` travels as hex text and comes back as bytes; `OFFSET` is
+/// applied by the client over the rows the engine keeps.
+#[test]
+fn bytea_and_offset_are_served_from_engine_rows() {
+    let Some(mut live) = Live::start("blobs") else {
+        return;
+    };
+    live.other
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS sg_blobs (
+                id serial PRIMARY KEY, name text NOT NULL, data bytea, n int NOT NULL)",
+        )
+        .unwrap();
+    let prefix = live.key("b");
+    diesel::delete(sg_blobs::table.filter(sg_blobs::name.like(format!("{prefix}%"))))
+        .execute(&mut live.other)
+        .unwrap();
+    let rows: Vec<_> = (0..5)
+        .map(|i| {
+            (
+                sg_blobs::name.eq(format!("{prefix}{i}")),
+                sg_blobs::data.eq(if i == 3 { None } else { Some(vec![i as u8, 0xff, 0x10]) }),
+                sg_blobs::n.eq(i),
+            )
+        })
+        .collect();
+    diesel::insert_into(sg_blobs::table).values(&rows).execute(&mut live.other).unwrap();
+
+    let names: Vec<String> = (0..5).map(|i| format!("{prefix}{i}")).collect();
+    let page = |conn: &mut SyncedConnection<PgConnection>| -> Vec<(i32, Option<Vec<u8>>)> {
+        sg_blobs::table
+            .filter(sg_blobs::name.eq_any(&names))
+            .select((sg_blobs::n, sg_blobs::data))
+            .order(sg_blobs::n.asc())
+            .limit(2)
+            .offset(1)
+            .load(conn)
+            .unwrap()
+    };
+    let got = page(&mut live.conn);
+    assert_eq!(
+        got,
+        vec![(1, Some(vec![1, 0xff, 0x10])), (2, Some(vec![2, 0xff, 0x10]))],
+        "skipped one, took two, bytes intact"
+    );
+    assert_eq!(live.engine.materialized(), 1, "rows mode: {:?}", live.engine.fallbacks());
+    assert_eq!(live.engine.subscribed(), 1);
+
+    // A change inside the page arrives as a delta; the NULL row and the
+    // offset still apply.
+    diesel::update(sg_blobs::table.filter(sg_blobs::name.eq(format!("{prefix}2"))))
+        .set(sg_blobs::data.eq(Some(vec![0xab])))
+        .execute(&mut live.other)
+        .unwrap();
+    let started = Instant::now();
+    loop {
+        let got = page(&mut live.conn);
+        if got[1].1.as_deref() == Some(&[0xab][..]) {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "the delta did not arrive: {got:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let third: Vec<(i32, Option<Vec<u8>>)> = sg_blobs::table
+        .filter(sg_blobs::name.eq_any(&names))
+        .select((sg_blobs::n, sg_blobs::data))
+        .order(sg_blobs::n.asc())
+        .limit(1)
+        .offset(3)
+        .load(&mut live.conn)
+        .unwrap();
+    assert_eq!(third, vec![(3, None)], "a NULL bytea stays NULL");
+    assert_eq!(live.engine.materialized(), 2, "{:?}", live.engine.fallbacks());
+    let _ = diesel::delete(sg_blobs::table.filter(sg_blobs::name.like(format!("{prefix}%")))).execute(&mut live.other);
+}

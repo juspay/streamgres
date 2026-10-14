@@ -58,6 +58,9 @@ pub struct Snapshot {
     /// Root-table column and whether ascending.
     pub order: Vec<(String, bool)>,
     pub limit: Option<usize>,
+    /// Rows to skip before the limit; the engine hydrates `offset +
+    /// limit` rows and the client cuts.
+    pub offset: usize,
 }
 
 impl Snapshot {
@@ -139,6 +142,11 @@ impl Snapshot {
             },
             count: body.get("count").and_then(Json::as_bool).unwrap_or(false),
             order,
+            offset: body
+                .get("offset")
+                .and_then(Json::as_u64)
+                .map(|offset| offset as usize)
+                .unwrap_or(0),
             limit: body
                 .get("limit")
                 .and_then(Json::as_u64)
@@ -177,6 +185,7 @@ pub struct Materialized {
     projection: Projection,
     order: Vec<(usize, bool)>,
     limit: Option<usize>,
+    offset: usize,
     columns: Columns,
 }
 
@@ -318,6 +327,7 @@ impl Materialized {
             projection,
             order,
             limit: snapshot.limit,
+            offset: snapshot.offset,
             columns,
         };
         for node in snapshot.nodes {
@@ -383,6 +393,7 @@ impl Materialized {
         let limit = self.limit.unwrap_or(usize::MAX);
         combos
             .into_iter()
+            .skip(self.offset)
             .take(limit)
             .map(|combo| {
                 let values = pairs
@@ -597,6 +608,7 @@ mod tests {
             count: false,
             order: order.into_iter().map(|(c, a)| (c.to_string(), a)).collect(),
             limit,
+            offset: 0,
         }
     }
 
@@ -604,6 +616,25 @@ mod tests {
         rows.iter()
             .map(|row| <(i32, String) as FromSqlRow<(Integer, Text), Pg>>::build_from_row(row).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn an_offset_skips_rows_before_the_limit() {
+        let mut snap = snapshot(
+            vec![
+                json!({"id": 1, "key": "a", "value": "1"}),
+                json!({"id": 2, "key": "b", "value": "2"}),
+                json!({"id": 3, "key": "c", "value": "3"}),
+                json!({"id": 4, "key": "d", "value": "4"}),
+            ],
+            vec![("id", true)],
+            Some(2),
+        );
+        snap.offset = 1;
+        let store = Materialized::new(snap, &types()).unwrap();
+        let rows = store.rows().unwrap();
+        let ids: Vec<i32> = rows.iter().map(|row| i32::from_be_bytes(row.value(0).unwrap().bytes().try_into().unwrap())).collect();
+        assert_eq!(ids, vec![2, 3], "skipped one, took two");
     }
 
     #[test]
@@ -729,6 +760,7 @@ mod tests {
             count: false,
             order: vec![("id".into(), true)],
             limit,
+            offset: 0,
         }
     }
 

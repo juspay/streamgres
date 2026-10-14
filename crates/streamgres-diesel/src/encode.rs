@@ -24,6 +24,7 @@ pub struct Unsupported(pub String);
 
 mod oid {
     pub const BOOL: u32 = 16;
+    pub const BYTEA: u32 = 17;
     pub const CHAR: u32 = 18;
     pub const NAME: u32 = 19;
     pub const INT8: u32 = 20;
@@ -87,6 +88,7 @@ fn supports_scalar(type_oid: u32, typmod: i32, name: &str) -> Result<(), Unsuppo
         | oid::UUID
         | oid::JSON
         | oid::JSONB
+        | oid::BYTEA
         | oid::DATE => Ok(()),
         // The engine keeps a time as milliseconds; a column that may hold
         // finer fractions would come back rounded.
@@ -153,6 +155,21 @@ fn scalar(cell: &Json, type_oid: u32, name: &str) -> Result<Vec<u8>, Unsupported
                 .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16))
                 .collect::<Result<Vec<u8>, _>>()
                 .map_err(|_| mismatch(name, "a UUID"))?
+        }
+        // The engine carries `bytea` as Postgres's hex text, `\x` and two
+        // digits per byte; the binary format is the bytes themselves.
+        oid::BYTEA => {
+            let text = text(cell, name)?;
+            let hex = text
+                .strip_prefix("\\x")
+                .ok_or_else(|| mismatch(name, "hex bytea"))?;
+            if hex.len() % 2 != 0 {
+                return Err(mismatch(name, "hex bytea"));
+            }
+            (0..hex.len() / 2)
+                .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|_| mismatch(name, "hex bytea"))?
         }
         oid::JSON => serde_json::to_vec(cell).map_err(|_| mismatch(name, "JSON"))?,
         oid::JSONB => {
@@ -275,13 +292,29 @@ mod tests {
     }
 
     #[test]
+    fn bytea_is_decoded_from_hex_text() {
+        let column = ColumnType {
+            name: "blob".into(),
+            oid: oid::BYTEA,
+            typmod: -1,
+            kind: TypeKind::Base,
+        };
+        assert!(supports(&column).is_ok());
+        let value = encode(&json!("\\x00ff10"), &column).unwrap().unwrap();
+        assert_eq!(value.bytes(), &[0x00, 0xff, 0x10]);
+        assert!(encode(&json!("00ff"), &column).is_err(), "no prefix");
+        assert!(encode(&json!("\\x0"), &column).is_err(), "odd digits");
+    }
+
+    #[test]
     fn what_is_refused_up_front() {
         assert!(supports(&base(oid::TIMESTAMP)).is_err(), "default precision is microseconds");
         let mut ms = base(oid::TIMESTAMP);
         ms.typmod = 3;
         assert!(supports(&ms).is_ok());
         assert!(supports(&base(1700)).is_err(), "numeric");
-        assert!(supports(&base(17)).is_err(), "bytea");
+        assert!(supports(&base(oid::BYTEA)).is_ok(), "bytea comes as hex text");
+        assert!(supports(&base(3904)).is_err(), "an int4 range");
         let text_array = ColumnType {
             name: "tags".into(),
             oid: 1009,

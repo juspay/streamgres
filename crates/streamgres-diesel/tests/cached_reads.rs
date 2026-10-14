@@ -350,7 +350,11 @@ fn a_refused_query_is_read_live_every_time() {
     assert_eq!(w.read("k").as_deref(), Some("v"));
     w.put("k", "w");
     assert_eq!(w.read("k").as_deref(), Some("w"), "live, so the change is seen");
-    assert_eq!(w.cache.stats.refused.load(Ordering::Relaxed), 2);
+    // The engine was asked once; the refusal is remembered and the second
+    // read went to Postgres without asking.
+    assert_eq!(w.cache.stats.refused.load(Ordering::Relaxed), 1);
+    assert_eq!(w.cache.stats.refused_recently.load(Ordering::Relaxed), 1);
+    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 0);
     assert!(w.cache.is_empty());
 
     // Raw SQL against another table is refused by this engine too.

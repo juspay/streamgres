@@ -52,14 +52,16 @@ impl Entry {
 /// accounting.
 const ROW_OVERHEAD: usize = 64;
 
-/// What bounds the cache: bytes, idle time and time to live. From the
-/// environment through [`Limits::from_env`]:
+/// What bounds the cache: bytes, idle time, time to live, and how long a
+/// refusal is remembered. From the environment through
+/// [`Limits::from_env`]:
 ///
-/// | variable                     | meaning                                    | default   |
-/// |------------------------------|--------------------------------------------|-----------|
-/// | `STREAMGRES_CACHE_MAX_BYTES` | rows and keys held, in bytes               | 268435456 |
-/// | `STREAMGRES_CACHE_IDLE_MS`   | drop an entry unread for this long; 0 never| 1800000   |
-/// | `STREAMGRES_CACHE_TTL_MS`    | drop an entry this old however read; 0 never| 0        |
+/// | variable                       | meaning                                      | default   |
+/// |--------------------------------|----------------------------------------------|-----------|
+/// | `STREAMGRES_CACHE_MAX_BYTES`   | rows and keys held, in bytes                 | 268435456 |
+/// | `STREAMGRES_CACHE_IDLE_MS`     | drop an entry unread for this long; 0 never  | 1800000   |
+/// | `STREAMGRES_CACHE_TTL_MS`      | drop an entry this old however read; 0 never | 0         |
+/// | `STREAMGRES_REFUSED_TTL_MS`    | do not re-ask the engine about a refused query for this long; 0 always ask | 30000 |
 ///
 /// A value that is missing or not a number leaves the default.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,10 +69,15 @@ pub struct Limits {
     pub max_bytes: u64,
     pub time_to_idle: Option<Duration>,
     pub time_to_live: Option<Duration>,
+    /// A query the engine refused (a shape outside its subset) would
+    /// otherwise cost a round trip to the engine on every read; for this
+    /// long it goes straight to Postgres instead.
+    pub refused_for: Option<Duration>,
 }
 
 pub const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_TIME_TO_IDLE: Duration = Duration::from_secs(30 * 60);
+pub const DEFAULT_REFUSED_FOR: Duration = Duration::from_secs(30);
 
 impl Default for Limits {
     fn default() -> Limits {
@@ -78,6 +85,7 @@ impl Default for Limits {
             max_bytes: DEFAULT_MAX_BYTES,
             time_to_idle: Some(DEFAULT_TIME_TO_IDLE),
             time_to_live: None,
+            refused_for: Some(DEFAULT_REFUSED_FOR),
         }
     }
 }
@@ -94,6 +102,7 @@ impl Limits {
             max_bytes: env_number("STREAMGRES_CACHE_MAX_BYTES").unwrap_or(defaults.max_bytes),
             time_to_idle: millis("STREAMGRES_CACHE_IDLE_MS", defaults.time_to_idle),
             time_to_live: millis("STREAMGRES_CACHE_TTL_MS", defaults.time_to_live),
+            refused_for: millis("STREAMGRES_REFUSED_TTL_MS", defaults.refused_for),
         }
     }
 }
@@ -107,7 +116,12 @@ fn env_number(name: &str) -> Option<u64> {
 pub struct Stats {
     pub hits: AtomicU64,
     pub misses: AtomicU64,
+    /// Reads the engine (or the client's own limits) refused; each one
+    /// asked.
     pub refused: AtomicU64,
+    /// Reads sent to Postgres without asking because the query was
+    /// refused recently.
+    pub refused_recently: AtomicU64,
     pub touched: AtomicU64,
     /// Entries dropped for the byte budget.
     pub evicted: AtomicU64,
@@ -133,6 +147,9 @@ pub struct Cache {
     entries: moka::sync::Cache<QueryKey, Arc<Entry>>,
     generations: Generations,
     subscriptions: Arc<dyn Subscriptions>,
+    /// Keys refused recently, each with the reason, dropped on their
+    /// own clock.
+    refused: Option<moka::sync::Cache<QueryKey, Arc<str>>>,
     limits: Limits,
     pub stats: Arc<Stats>,
 }
@@ -181,13 +198,39 @@ impl Cache {
         if let Some(live) = limits.time_to_live {
             builder = builder.time_to_live(live);
         }
+        let refused = limits.refused_for.map(|window| {
+            moka::sync::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(window)
+                .build()
+        });
         Cache {
             entries: builder.build(),
             generations,
             subscriptions,
+            refused,
             limits,
             stats,
         }
+    }
+
+    /// Counts a refusal of `key`, and when the engine side says the
+    /// reason will hold, remembers it so reads of the key skip the engine
+    /// for [`Limits::refused_for`].
+    pub fn refused(&self, key: &QueryKey, reason: &str) {
+        Stats::bump(&self.stats.refused);
+        if let Some(refused) = &self.refused
+            && self.subscriptions.refusal_is_final(reason)
+        {
+            refused.insert(key.clone(), Arc::from(reason));
+        }
+    }
+
+    /// Why `key` was refused recently, if it was; counts the skipped ask.
+    pub fn refused_recently(&self, key: &QueryKey) -> Option<Arc<str>> {
+        let reason = self.refused.as_ref()?.get(key)?;
+        Stats::bump(&self.stats.refused_recently);
+        Some(reason)
     }
 
     pub fn limits(&self) -> &Limits {

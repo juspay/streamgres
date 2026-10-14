@@ -151,6 +151,9 @@ struct Shared {
     /// Why the latest subscriptions fell back from rows to refills, most
     /// recent last, at most a few.
     fallbacks: Mutex<Vec<String>>,
+    /// Why the latest subscriptions were refused, by the engine or by
+    /// this client, most recent last, at most a few.
+    refusals: Mutex<Vec<String>>,
     cache: Mutex<Option<Weak<Cache>>>,
 }
 
@@ -160,11 +163,28 @@ impl Shared {
     }
 
     fn fell_back(&self, reason: String) {
-        let mut fallbacks = self.fallbacks.lock().expect("fallbacks");
-        if fallbacks.len() >= 8 {
-            fallbacks.remove(0);
+        Self::remember(&self.fallbacks, reason);
+    }
+
+    fn refused(&self, reason: String) -> Verdict {
+        Self::remember(&self.refusals, reason.clone());
+        Verdict::Refused(reason)
+    }
+
+    /// The reasons this client refuses on its own, all of which pass.
+    const TRANSIENT: [&'static str; 4] = [
+        "the engine is not connected",
+        "the engine client has stopped",
+        "the engine did not answer in time",
+        "the subscription limit of ",
+    ];
+
+    fn remember(log: &Mutex<Vec<String>>, reason: String) {
+        let mut log = log.lock().expect("log");
+        if log.len() >= 8 {
+            log.remove(0);
         }
-        fallbacks.push(reason);
+        log.push(reason);
     }
 
     /// Drops `key` from the routing map if `worker` is the one holding
@@ -241,6 +261,7 @@ impl EngineClient {
             max_subscriptions: config.max_subscriptions,
             types: Mutex::new(HashMap::new()),
             fallbacks: Mutex::new(Vec::new()),
+            refusals: Mutex::new(Vec::new()),
             cache: Mutex::new(None),
         });
         let workers = (0..config.connections)
@@ -311,6 +332,13 @@ impl EngineClient {
         self.pool.shared.fallbacks.lock().expect("fallbacks").clone()
     }
 
+    /// Why recent subscriptions were refused, by the engine or by this
+    /// client (not connected, over the cap, no answer in time), oldest
+    /// first; the last few only.
+    pub fn refusals(&self) -> Vec<String> {
+        self.pool.shared.refusals.lock().expect("refusals").clone()
+    }
+
     /// The connected worker carrying the fewest subscriptions.
     fn least_loaded(&self) -> Option<&Arc<Worker>> {
         self.pool
@@ -334,13 +362,13 @@ impl Subscriptions for EngineClient {
                 Some(index) => Arc::clone(&self.pool.workers[*index]),
                 None => {
                     if by_key.len() >= shared.max_subscriptions {
-                        return Outcome::Verdict(Verdict::Refused(format!(
+                        return Outcome::Verdict(shared.refused(format!(
                             "the subscription limit of {} is reached",
                             shared.max_subscriptions
                         )));
                     }
                     let Some(worker) = self.least_loaded() else {
-                        return Outcome::Verdict(Verdict::Refused("the engine is not connected".to_string()));
+                        return Outcome::Verdict(shared.refused("the engine is not connected".to_string()));
                     };
                     by_key.insert(key.clone(), worker.index);
                     Arc::clone(worker)
@@ -364,6 +392,10 @@ impl Subscriptions for EngineClient {
             Some(worker) => worker.materialize_key(key, snapshot),
             None => Verdict::Refused("the subscription ended before its rows were built".to_string()),
         }
+    }
+
+    fn refusal_is_final(&self, reason: &str) -> bool {
+        !Shared::TRANSIENT.iter().any(|transient| reason.starts_with(transient))
     }
 
     fn unsubscribe(&self, key: &QueryKey) {
@@ -429,7 +461,7 @@ impl Worker {
             if !self.connected.load(Ordering::Acquire) {
                 drop(state);
                 self.shared.release(key, self.index);
-                return Outcome::Verdict(Verdict::Refused("the engine is not connected".to_string()));
+                return Outcome::Verdict(self.shared.refused("the engine is not connected".to_string()));
             }
             let id = state.next_id;
             state.next_id += 1;
@@ -448,7 +480,7 @@ impl Worker {
             .is_err()
         {
             self.forget(id);
-            return Outcome::Verdict(Verdict::Refused("the engine client has stopped".to_string()));
+            return Outcome::Verdict(self.shared.refused("the engine client has stopped".to_string()));
         }
         match verdict.recv_timeout(self.verdict_timeout) {
             Ok(Reply::Verdict(verdict)) => Outcome::Verdict(verdict),
@@ -470,7 +502,7 @@ impl Worker {
             Err(_) => {
                 self.forget(id);
                 let _ = self.outgoing.send(Outgoing::Unsubscribe { id });
-                Outcome::Verdict(Verdict::Refused("the engine did not answer in time".to_string()))
+                Outcome::Verdict(self.shared.refused("the engine did not answer in time".to_string()))
             }
         }
     }
@@ -719,7 +751,7 @@ fn inbound(worker: &Worker, text: &str) {
             }
             match reply {
                 Some(reply) => {
-                    let _ = reply.try_send(Reply::Verdict(Verdict::Refused(reason)));
+                    let _ = reply.try_send(Reply::Verdict(shared.refused(reason)));
                 }
                 // A refusal after acceptance (the engine stopped following
                 // the query): the cache must not serve it.

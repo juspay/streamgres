@@ -380,13 +380,16 @@ where
                 &entry.rows,
             ))));
         }
+        if cache.refused_recently(&key).is_some() {
+            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+        }
         // The generation is taken before subscribing: a touch, or an
         // expiry that ends the subscription, between here and the fill
         // leaves nothing cached rather than something no one updates.
         let generation = cache.reserve(&key);
         match cache.subscriptions().subscribe_with(&key, &mut self.inner) {
-            Verdict::Refused(_) => {
-                cache.stats.refused.fetch_add(1, Ordering::Relaxed);
+            Verdict::Refused(reason) => {
+                cache.refused(&key, &reason);
                 return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
             }
             Verdict::Rows(rows) => {

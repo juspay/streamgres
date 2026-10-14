@@ -330,6 +330,9 @@ impl AsyncConnection for AsyncSyncedConnection {
         if let Some(entry) = cache.get(&key) {
             return std::future::ready(Ok(Self::cached_stream(Arc::clone(&entry.rows)))).boxed();
         }
+        if cache.refused_recently(&key).is_some() {
+            return self.inner.load(query).map_ok(Self::live_stream).boxed();
+        }
 
         // A miss. The futures the read may need are built now; which
         // are polled depends on the engine's answer.
@@ -381,8 +384,8 @@ impl AsyncConnection for AsyncSyncedConnection {
                 }
             };
             match verdict {
-                Verdict::Refused(_) => {
-                    cache.stats.refused.fetch_add(1, Ordering::Relaxed);
+                Verdict::Refused(reason) => {
+                    cache.refused(&key, &reason);
                     live.await.map(Self::live_stream)
                 }
                 Verdict::Rows(rows) => {

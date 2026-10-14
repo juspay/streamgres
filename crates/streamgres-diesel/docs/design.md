@@ -108,11 +108,22 @@ reconnect logic carry over unchanged.
   null-extending, then the limit over joined rows, projection, count.
   Refused by name: a table joined twice, RIGHT/FULL/CROSS, OR across
   tables, WHERE on a LEFT-joined table, ORDER BY on a joined table,
-  compound keys.
+  compound keys, `LIKE`, `DISTINCT`.
+- `OFFSET`: the engine keeps `limit + offset` rows and the client skips
+  `offset` of them on each rebuild. `bytea`: the engine carries it as
+  Postgres's hex text and the client turns it back into bytes. A bind of
+  a user enum (or an array of one) is read by the engine as the label
+  text; the catalog tells it which OIDs are enums.
+- A query the engine refuses is remembered for
+  `STREAMGRES_REFUSED_TTL_MS` (default 30 s, 0 never), so its reads go
+  straight to Postgres instead of asking the engine every time. A
+  refusal from the client's own side (not connected, over the
+  subscription cap, no answer in time) is not remembered.
 - Known gaps: a column under a linguistic collation may order
   differently from Postgres; the engine's timestamps are milliseconds,
-  so microsecond columns fall back to A until the engine carries
-  microseconds for S2S rows.
+  so microsecond columns (`timestamp(6)`, Postgres's default, which is
+  every `created_at` in Hyperswitch) fall back to A until the engine
+  carries microseconds for S2S rows.
 
 ## Contract with the engine (implemented)
 
@@ -176,6 +187,22 @@ is, and `Stats::refused` counts it; a key freed by eviction or an
 engine refusal gives its slot back. One socket dropping affects only
 its own keys.
 
+## What Hyperswitch's queries do through it
+
+`integration/hyperswitch-diesel_models.patch` adds, besides the alias,
+a coverage test (`tests/streamgres_coverage.rs`) that drives 24 of
+Hyperswitch's own model lookups over 17 tables through the wrapper and
+a plain connection side by side: find-by-id, composite keys, `AND`/`OR`
+predicates, enum binds, `ORDER BY ... LIMIT`, `LIMIT OFFSET`, lists.
+Every answer equals Postgres's before and after a change, every lookup
+is subscribed and served from the cache, and a change reaches the cached
+answer in about 7 ms (5 ms of which is the test's polling). One query
+(`configs`) runs in rows mode; the other 23 run in refill mode because
+every Hyperswitch table has `timestamp(6)` columns. Three engine
+changes came out of the first run: `bytea` columns were unknown to the
+engine (Hyperswitch's encrypted fields), enum binds were not decoded,
+and `OFFSET` was refused.
+
 ## Running it locally
 
 - Postgres 15 or newer with `wal_level = logical` (the engine's DDL
@@ -233,6 +260,7 @@ through `Limits::from_env` or set in code with `Cache::with_limits`:
 | `STREAMGRES_CACHE_MAX_BYTES` | rows and keys held                           | 256 MiB |
 | `STREAMGRES_CACHE_IDLE_MS`   | drop an entry unread for this long; 0 never  | 30 min  |
 | `STREAMGRES_CACHE_TTL_MS`    | drop an entry this old however read; 0 never | off     |
+| `STREAMGRES_REFUSED_TTL_MS`  | skip the engine for a refused query this long; 0 never | 30 s |
 
 Idle time makes the cache follow what the backend reads now: a query
 nobody asks for anymore loses its entry and its subscription. Time to
