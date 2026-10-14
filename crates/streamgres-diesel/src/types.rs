@@ -6,6 +6,7 @@
 //! and an `int8` eight. So the exact column types come from Postgres
 //! itself, once per table, through the connection the read came in on.
 
+use std::collections::HashMap;
 use diesel::connection::{DefaultLoadingMode, LoadConnection};
 use diesel::pg::Pg;
 use diesel::prelude::*;
@@ -155,7 +156,7 @@ pub const ALL_TABLES_SQL: &str = "SELECT c.relname, a.attname, a.atttypid, a.att
 
 /// Groups [`ALL_TABLES_SQL`]'s rows by table.
 pub fn all_table_types(rows: Vec<TableAttribute>) -> std::collections::HashMap<String, TableTypes> {
-    let mut tables: std::collections::HashMap<String, TableTypes> = std::collections::HashMap::new();
+    let mut tables: HashMap<String, TableTypes> = HashMap::new();
     // Rows of one table are contiguous. A later run under a name already
     // taken is the same name in a later schema, which a bare name does
     // not mean, so it is skipped whole.

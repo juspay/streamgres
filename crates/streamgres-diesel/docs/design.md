@@ -301,6 +301,30 @@ read holds a reservation on its key (`Cache::reserve` returns one, and
 invalidate but the entry, so the map holds the keys in flight, not
 every key ever seen.
 
+The same rule binds the engine side's own writes. A delta or a
+snapshot reserves the key before it builds the rows, `replace` bumps
+the generation (so a Postgres fill in flight, which holds older rows,
+loses) and checks it again after the insert; and every path that ends
+a subscription bumps the generation as it drops the key, under the
+worker's lock. So rows built for a key that was unsubscribed in the
+meantime, by a dropped read, a failed read, an oversized result or an
+eviction, are dropped again rather than kept with nothing to update
+them. The wrapper never unsubscribes directly: `Cache::abandon` does,
+in that order. Nothing holds a lock across a moka insert (the eviction
+listener runs on the inserting thread), so a fill checks the
+generation before and after instead, and a newer image that landed in
+between costs one refill, never a stale row.
+
+Between the engine's `accepted` and the store being built there is a
+window too: the reader thread puts an empty `Building` store in place
+under the same lock in which it ends the wait, so a delta right behind
+the frame queues there; `materialize` drains the queue and turns that
+one store `Ready` in place, so a delta handler holding the store finds
+the live one. A key resubscribed after a reconnect is pending again
+until the engine accepts it, and a read of it goes live meanwhile; a
+subscribe cut short by the drop is forgotten, and an acceptance for an
+id nobody holds is answered with an unsubscribe.
+
 Three reads never cache whatever the flags say: `FOR UPDATE` and its
 variants (the lock is the point, `Stats::locking`), a `WITH` whose
 expressions modify data, and a read whose Postgres read fails after

@@ -427,7 +427,7 @@ where
         let rows: Arc<[OwnedRow]> = match rows {
             Ok(rows) => Arc::from(rows),
             Err(error) => {
-                cache.subscriptions().unsubscribe(&key);
+                cache.abandon(&key);
                 return Err(error);
             }
         };

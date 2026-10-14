@@ -460,7 +460,9 @@ fn microsecond_timestamps_are_exact_and_an_interval_falls_back() {
     // The engine learns a new column from the DDL trigger; give it a moment.
     std::thread::sleep(Duration::from_millis(500));
     let name = live.key("item");
-    diesel::delete(sg_items::table.filter(sg_items::name.eq(&name)))
+    // This row and any left by an earlier run that died before its own
+    // cleanup: the passthrough and owned-row suites read the whole table.
+    diesel::delete(sg_items::table.filter(sg_items::name.like("fallback-%")))
         .execute(&mut live.other)
         .unwrap();
     diesel::insert_into(sg_items::table)

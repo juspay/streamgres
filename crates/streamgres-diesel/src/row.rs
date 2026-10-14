@@ -16,6 +16,7 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use diesel::result::Error;
 use diesel::QueryResult;
 use diesel::pg::{Pg, PgValue};
 use diesel::row::{Field, PartialRow, Row, RowIndex, RowSealed};
@@ -202,7 +203,7 @@ where
     for row in cursor {
         let row = row?;
         let owned = OwnedRow::capture(&row, columns.as_ref())
-            .ok_or(diesel::result::Error::DeserializationError(
+            .ok_or(Error::DeserializationError(
                 "a result row without column names cannot be kept".into(),
             ))?;
         if columns.is_none() {

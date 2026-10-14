@@ -353,30 +353,62 @@ impl Cache {
 
     /// [`Cache::fill`] for rows the engine serves itself, weighing the
     /// store kept for them too.
+    ///
+    /// The generation is checked before and after the insert: a touch
+    /// or a replace between the two would otherwise leave the older
+    /// rows in, since nothing holds a lock across the insert (moka runs
+    /// the eviction listener on the inserting thread, and the listener
+    /// takes the generations lock).
     pub fn fill_weighing(&self, reservation: Reservation, rows: Arc<[OwnedRow]>, store_bytes: usize) -> bool {
         if self.generation(&reservation.key) != reservation.generation {
             Stats::bump(&self.stats.stale_fills);
             return false;
         }
         let entry = Entry::new(rows, &reservation.key, store_bytes);
-        self.insert(&reservation.key, entry)
+        if !self.insert(&reservation.key, entry) {
+            return false;
+        }
+        if self.generation(&reservation.key) != reservation.generation {
+            // Something newer landed while the rows went in: what it
+            // left is dropped too, which costs one refill, never a stale
+            // row.
+            Stats::bump(&self.stats.stale_fills);
+            self.entries.invalidate(&reservation.key);
+            return false;
+        }
+        true
     }
 
-    /// The engine served the rows itself: store them whatever the
-    /// generation. Used by rows-mode subscriptions, whose entries are
-    /// never filled from a Postgres read; `store_bytes` is what the
-    /// store kept for them weighs.
-    pub fn replace(&self, key: &QueryKey, rows: Arc<[OwnedRow]>, store_bytes: usize) {
+    /// The engine served the rows itself: store them, and fail any fill
+    /// in flight, whose rows are older than these. Used by rows-mode
+    /// subscriptions; `store_bytes` is what the store kept for them
+    /// weighs. The caller reserves the key before it builds the rows,
+    /// so a subscription ended meanwhile (which bumps the generation
+    /// once more) drops them again: the engine side's own writes are
+    /// held to the same rule as a Postgres read's.
+    pub fn replace(&self, reservation: Reservation, rows: Arc<[OwnedRow]>, store_bytes: usize) {
         Stats::bump(&self.stats.replaced);
+        let key = &reservation.key;
+        bump(&self.generations, key);
         let entry = Entry::new(rows, key, store_bytes);
-        self.insert(key, entry);
+        if self.insert(key, entry) && self.generation(key) != reservation.generation + 1 {
+            Stats::bump(&self.stats.stale_fills);
+            self.entries.invalidate(key);
+        }
+    }
+
+    /// Fails any fill or replace in flight for `key`, without touching
+    /// the entry. For the engine side to call while it drops the key,
+    /// under its own lock, so that no rows built before the drop can
+    /// land after it.
+    pub fn bump_generation(&self, key: &QueryKey) {
+        bump(&self.generations, key);
     }
 
     fn insert(&self, key: &QueryKey, entry: Entry) -> bool {
         if entry.bytes as u64 > self.limits.max_entry_bytes {
             Stats::bump(&self.stats.oversized);
-            self.entries.invalidate(key);
-            self.subscriptions.unsubscribe(key);
+            self.abandon(key);
             return false;
         }
         self.entries.insert(key.clone(), Arc::new(entry));
@@ -387,6 +419,23 @@ impl Cache {
     /// next read refills from Postgres, and fail any fill in flight.
     pub fn touched(&self, key: &QueryKey) {
         Stats::bump(&self.stats.touched);
+        bump(&self.generations, key);
+        self.entries.invalidate(key);
+    }
+
+    /// Ends the key's subscription from the cache's side: a read gave up
+    /// on it (dropped, or its Postgres read failed) or its result was
+    /// too large to keep. The generation is bumped first, so a fill in
+    /// flight for the key by another read is dropped rather than kept
+    /// with nothing to update it: the sequence the eviction listener
+    /// uses, and the only way the wrapper may unsubscribe.
+    pub fn abandon(&self, key: &QueryKey) {
+        // The subscription first: the engine side bumps the generation
+        // as it drops the key, so an engine delta that checked the key
+        // before this point and inserts after it is dropped by its own
+        // re-check. Then the bump again for a Postgres fill in flight,
+        // and the entry.
+        self.subscriptions.unsubscribe(key);
         bump(&self.generations, key);
         self.entries.invalidate(key);
     }
@@ -484,7 +533,9 @@ impl std::fmt::Debug for Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subscriptions::Unsynced;
+    use crate::materialized::Snapshot;
+    use crate::subscriptions::{Outcome, Unsynced, Verdict};
+    use crate::types::TableTypes;
 
     fn key(sql: &str) -> QueryKey {
         QueryKey {
@@ -495,6 +546,91 @@ mod tests {
 
     fn no_rows() -> Arc<[OwnedRow]> {
         Arc::from(Vec::new())
+    }
+
+    /// Accepts everything and records what is unsubscribed.
+    #[derive(Default)]
+    struct Recording {
+        unsubscribed: Mutex<Vec<QueryKey>>,
+    }
+
+    impl Subscriptions for Recording {
+        fn subscribe(&self, _: &QueryKey) -> Outcome {
+            Outcome::Verdict(Verdict::Accepted)
+        }
+
+        fn materialize(&self, _: &QueryKey, _: Snapshot, _: HashMap<String, Arc<TableTypes>>) -> Verdict {
+            Verdict::Accepted
+        }
+
+        fn unsubscribe(&self, key: &QueryKey) {
+            self.unsubscribed.lock().unwrap().push(key.clone());
+        }
+    }
+
+    #[test]
+    fn abandoning_a_key_fails_the_other_readers_fill() {
+        // Two readers of one key; the second gives up (its future was
+        // dropped, or its read failed) and ends the subscription. The
+        // first must not then store an entry nothing will invalidate.
+        let engine = Arc::new(Recording::default());
+        let cache = Cache::new(1 << 20, engine.clone());
+        let k = key("SELECT 1");
+        let first = cache.reserve(&k);
+        let second = cache.reserve(&k);
+        drop(second);
+        cache.abandon(&k);
+        assert_eq!(engine.unsubscribed.lock().unwrap().len(), 1);
+        assert!(!cache.fill(first, no_rows()), "the first reader's fill is refused");
+        assert!(cache.is_empty());
+        assert_eq!(cache.reservations(), 0);
+    }
+
+    #[test]
+    fn engine_rows_beat_a_fill_in_flight() {
+        // A rows-mode caller holds the snapshot's rows; a delta replaces
+        // the entry before the caller fills. The older rows must lose.
+        let cache = Cache::new(1 << 20, Arc::new(Unsynced));
+        let k = key("SELECT 1");
+        let reservation = cache.reserve(&k);
+        let columns: crate::row::Columns = Arc::from(vec!["a".to_string()]);
+        let newer: Arc<[OwnedRow]> = Arc::from(vec![OwnedRow::new(columns, vec![None])]);
+        let engine_side = cache.reserve(&k);
+        cache.replace(engine_side, Arc::clone(&newer), 0);
+        assert!(!cache.fill(reservation, no_rows()), "the snapshot's rows are older than the delta's");
+        assert_eq!(cache.get(&k).map(|entry| entry.rows.len()), Some(1), "the delta's rows stay");
+        assert_eq!(cache.stats.stale_fills.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_replace_after_the_key_was_abandoned_does_not_stick() {
+        // The engine side reserved before building its rows; the key is
+        // abandoned (which bumps as the subscription goes) in between.
+        let engine = Arc::new(Recording::default());
+        let cache = Cache::new(1 << 20, engine.clone());
+        let k = key("SELECT 1");
+        let engine_side = cache.reserve(&k);
+        cache.abandon(&k);
+        cache.replace(engine_side, no_rows(), 0);
+        assert!(cache.is_empty(), "rows built for a subscription that ended are not kept");
+    }
+
+    #[test]
+    fn an_oversized_result_ends_the_subscription_and_the_other_fill() {
+        let engine = Arc::new(Recording::default());
+        let cache = Cache::with_limits(
+            Limits {
+                max_entry_bytes: 8,
+                ..Limits::default()
+            },
+            engine.clone(),
+        );
+        let k = key("SELECT a long enough statement");
+        let other = cache.reserve(&k);
+        let engine_side = cache.reserve(&k);
+        cache.replace(engine_side, no_rows(), 0);
+        assert_eq!(engine.unsubscribed.lock().unwrap().len(), 1);
+        assert!(!cache.fill(other, no_rows()), "the other reader's smaller fill cannot keep a key with no subscription");
     }
 
     #[test]
@@ -557,7 +693,8 @@ mod tests {
         assert!(!cache.fill(reservation, no_rows()));
         assert_eq!(cache.stats.oversized.load(Ordering::Relaxed), 1);
         assert!(cache.is_empty());
-        cache.replace(&k, no_rows(), 0);
+        let engine_side = cache.reserve(&k);
+        cache.replace(engine_side, no_rows(), 0);
         assert!(cache.is_empty(), "the engine's rows are bounded the same way");
     }
 

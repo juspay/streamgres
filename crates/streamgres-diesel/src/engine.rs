@@ -41,7 +41,9 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, Weak};
+use std::thread;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -49,6 +51,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value as Json, json};
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::cache::Cache;
@@ -70,6 +73,11 @@ pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
 
 /// How long to wait before trying the engine again after a lost socket.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+/// How long one frame may take to go out before the socket is given up
+/// on: an engine that holds the socket open but stops reading would
+/// otherwise block the worker, and its thread, for good.
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The pool's shape. [`Config::from_env`] reads it from the environment:
 ///
@@ -176,12 +184,14 @@ impl Shared {
     }
 
     /// The reasons this client refuses on its own, all of which pass.
-    const TRANSIENT: [&'static str; 5] = [
+    const TRANSIENT: [&'static str; 7] = [
         "the engine is not connected",
         "the engine client has stopped",
         "the engine did not answer in time",
+        "the engine connection dropped",
         "the subscription limit of ",
         "the subscription is pending",
+        "the subscription ended before its rows were built",
     ];
 
     fn remember(log: &Mutex<Vec<String>>, reason: String) {
@@ -206,8 +216,12 @@ struct WorkerState {
     next_id: u64,
     by_key: HashMap<QueryKey, u64>,
     by_id: HashMap<u64, QueryKey>,
-    /// Subscribes waiting for a verdict, with where to deliver it.
-    pending: HashMap<u64, std::sync::mpsc::SyncSender<Reply>>,
+    /// Subscriptions the engine has not accepted yet: a subscribe
+    /// waiting for its verdict, with where to deliver it, or `None` for
+    /// a key resubscribed after a reconnect, which nobody waits for. A
+    /// read of a pending key goes live: until the engine accepts, a
+    /// commit can land that no frame reports.
+    pending: HashMap<u64, Option<SyncSender<Reply>>>,
     /// Subscriptions served from the engine's rows, each behind its own
     /// lock so a delta to one is applied without holding up the rest.
     materialized: HashMap<u64, Arc<Mutex<Store>>>,
@@ -461,7 +475,7 @@ impl Subscriptions for EngineClient {
 }
 
 impl Worker {
-    fn start(index: usize, url: String, verdict_timeout: Duration, shared: Arc<Shared>) -> Arc<Worker> {
+    fn new(index: usize, url: String, verdict_timeout: Duration, shared: Arc<Shared>) -> (Arc<Worker>, mpsc::UnboundedReceiver<Outgoing>) {
         let (outgoing, outgoing_rx) = mpsc::unbounded_channel();
         let worker = Arc::new(Worker {
             index,
@@ -479,8 +493,13 @@ impl Worker {
             }),
             shared,
         });
+        (worker, outgoing_rx)
+    }
+
+    fn start(index: usize, url: String, verdict_timeout: Duration, shared: Arc<Shared>) -> Arc<Worker> {
+        let (worker, outgoing_rx) = Worker::new(index, url, verdict_timeout, shared);
         let task = Arc::clone(&worker);
-        std::thread::Builder::new()
+        thread::Builder::new()
             .name(format!("streamgres-engine-{index}"))
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -494,7 +513,7 @@ impl Worker {
     }
 
     fn subscribe(&self, key: &QueryKey) -> Outcome {
-        let (reply, verdict) = std::sync::mpsc::sync_channel(1);
+        let (reply, verdict) = sync_channel(1);
         let id = {
             let mut state = self.state.lock().expect("state");
             let held = state.by_key.get(key).copied();
@@ -539,7 +558,7 @@ impl Worker {
             state.next_id += 1;
             state.by_key.insert(key.clone(), id);
             state.by_id.insert(id, key.clone());
-            state.pending.insert(id, reply);
+            state.pending.insert(id, Some(reply));
             self.note_held(&state);
             id
         };
@@ -566,16 +585,12 @@ impl Worker {
                         .map(str::to_string)
                         .collect()
                 };
+                // The reader thread put a `Building` store in place
+                // before it handed the snapshot over, so every delta
+                // from that moment on queues there.
                 if missing.is_empty() {
                     Outcome::Verdict(self.materialize(id, snapshot))
                 } else {
-                    // The deltas that land while the caller looks the
-                    // types up queue in the store's place.
-                    self.state
-                        .lock()
-                        .expect("state")
-                        .materialized
-                        .insert(id, Arc::new(Mutex::new(Store::Building(Vec::new()))));
                     Outcome::NeedsTypes { snapshot, missing }
                 }
             }
@@ -600,16 +615,31 @@ impl Worker {
     fn unsubscribe(&self, key: &QueryKey) {
         let id = {
             let mut state = self.state.lock().expect("state");
-            let Some(id) = state.by_key.remove(key) else {
+            let Some(id) = state.by_key.get(key).copied() else {
                 return;
             };
-            state.by_id.remove(&id);
-            state.pending.remove(&id);
-            state.materialized.remove(&id);
-            self.note_held(&state);
+            self.drop_id(&mut state, id);
             id
         };
         let _ = self.outgoing.send(Outgoing::Unsubscribe { id });
+    }
+
+    /// Removes a subscription from the worker's maps, under the state
+    /// lock the caller holds, and fails any rows in flight for its key
+    /// in the cache: an engine delta or snapshot that found the key held
+    /// a moment ago must not land after this.
+    fn drop_id(&self, state: &mut WorkerState, id: u64) -> Option<QueryKey> {
+        let key = state.by_id.remove(&id);
+        if let Some(key) = &key {
+            state.by_key.remove(key);
+            if let Some(cache) = self.shared.cache() {
+                cache.bump_generation(key);
+            }
+        }
+        state.pending.remove(&id);
+        state.materialized.remove(&id);
+        self.note_held(state);
+        key
     }
 
     /// Builds the store for an accepted subscription from its snapshot
@@ -644,25 +674,26 @@ impl Worker {
             Ok(materialized) => materialized,
             Err(error) => return fallback(error.0),
         };
-        // Swap the store in under the state lock, so no delta lands
-        // between taking the queue and installing the store.
+        // The store is transitioned in place, under the state lock and
+        // its own: the one `Arc` lives for the subscription, so a delta
+        // handler that took a clone of it before this point finds it
+        // `Ready` and applies to the live store, and no delta lands
+        // between taking the queue and installing the rows.
         let mut state = self.state.lock().expect("state");
         if !state.by_id.contains_key(&id) {
             state.materialized.remove(&id);
             return Verdict::Refused("the subscription ended before its rows were built".to_string());
         }
-        let queued = match state.materialized.remove(&id) {
-            Some(store) => match Arc::try_unwrap(store) {
-                Ok(store) => match store.into_inner().expect("store") {
-                    Store::Building(queued) => queued,
-                    Store::Ready(_) => Vec::new(),
-                },
-                Err(shared_store) => match &mut *shared_store.lock().expect("store") {
-                    Store::Building(queued) => std::mem::take(queued),
-                    Store::Ready(_) => Vec::new(),
-                },
-            },
-            None => Vec::new(),
+        let store = Arc::clone(
+            state
+                .materialized
+                .entry(id)
+                .or_insert_with(|| Arc::new(Mutex::new(Store::Building(Vec::new())))),
+        );
+        let mut store = store.lock().expect("store");
+        let queued = match &mut *store {
+            Store::Building(queued) => std::mem::take(queued),
+            Store::Ready(_) => Vec::new(),
         };
         for body in &queued {
             apply_delta(&mut materialized, body);
@@ -670,14 +701,15 @@ impl Worker {
         match materialized.rows() {
             Ok(rows) => {
                 let store_bytes = materialized.byte_len();
-                state
-                    .materialized
-                    .insert(id, Arc::new(Mutex::new(Store::Ready(materialized))));
+                *store = Store::Ready(materialized);
                 Verdict::Rows { rows, store_bytes }
             }
             Err(error) => {
+                drop(store);
+                state.materialized.remove(&id);
                 drop(state);
-                fallback(error.0)
+                shared.fell_back(error.0);
+                Verdict::Accepted
             }
         }
     }
@@ -686,14 +718,7 @@ impl Worker {
     fn forget(&self, id: u64) {
         let key = {
             let mut state = self.state.lock().expect("state");
-            let key = state.by_id.remove(&id);
-            if let Some(key) = &key {
-                state.by_key.remove(key);
-            }
-            state.pending.remove(&id);
-            state.materialized.remove(&id);
-            self.note_held(&state);
-            key
+            self.drop_id(&mut state, id)
         };
         if let Some(key) = key {
             self.shared.release(&key, self.index);
@@ -748,70 +773,100 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
 
         // Up: a reconnect resubscribes what this worker still holds,
         // under the same ids. Their cache entries went when the socket
-        // did, so nothing stale is served meanwhile.
+        // did, and each is pending again until the engine accepts it,
+        // so nothing stale is served meanwhile.
         let resubscribe: Vec<(u64, QueryKey)> = {
-            let state = worker.state.lock().expect("state");
+            let mut state = worker.state.lock().expect("state");
             worker.connected.store(true, Ordering::Release);
-            state
-                .by_id
-                .iter()
-                .map(|(id, key)| (*id, key.clone()))
-                .collect()
+            let held: Vec<(u64, QueryKey)> = state.by_id.iter().map(|(id, key)| (*id, key.clone())).collect();
+            for (id, _) in &held {
+                state.pending.insert(*id, None);
+            }
+            held
         };
+        let mut up = true;
         for (id, key) in resubscribe {
             let frame = subscribe_frame(id, &key.sql, &key.binds.iter().map(bind_json).collect::<Vec<_>>());
-            if sink.send(Message::Text(frame.into())).await.is_err() {
+            if !send_frame(&mut sink, frame).await {
+                up = false;
                 break;
             }
         }
 
-        loop {
-            tokio::select! {
+        // Serve until the socket breaks either way.
+        while up {
+            up = tokio::select! {
                 frame = stream.next() => match frame {
-                    Some(Ok(Message::Text(text))) => inbound(&worker, &text),
-                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {}
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(Message::Text(text))) => {
+                        inbound(&worker, &text);
+                        true
+                    }
+                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => true,
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => false,
                 },
                 message = outgoing.recv() => match message {
                     Some(Outgoing::Subscribe { id, sql, binds }) => {
-                        if sink.send(Message::Text(subscribe_frame(id, &sql, &binds).into())).await.is_err() {
-                            break;
-                        }
+                        send_frame(&mut sink, subscribe_frame(id, &sql, &binds)).await
                     }
                     Some(Outgoing::Unsubscribe { id }) => {
-                        let frame = json!(["unsubscribe", {"id": id}]).to_string();
-                        if sink.send(Message::Text(frame.into())).await.is_err() {
-                            break;
-                        }
+                        send_frame(&mut sink, json!(["unsubscribe", {"id": id}]).to_string()).await
                     }
                     Some(Outgoing::Stop) | None => {
                         let _ = sink.close().await;
                         return;
                     }
                 },
-            }
+            };
         }
+        disconnected(&worker);
+    }
+}
 
-        // Down: every wait ends refused, the stores go, and this
-        // worker's keys leave the cache until the engine is back. The
-        // other workers' keys are untouched.
-        let (pending, keys): (Vec<std::sync::mpsc::SyncSender<Reply>>, Vec<QueryKey>) = {
-            let mut state = worker.state.lock().expect("state");
-            worker.connected.store(false, Ordering::Release);
-            state.materialized.clear();
-            let pending = state.pending.drain().map(|(_, reply)| reply).collect();
-            let keys = state.by_key.keys().cloned().collect();
-            (pending, keys)
-        };
-        for reply in pending {
-            let _ = reply.try_send(Reply::Verdict(Verdict::Refused(
-                "the engine connection dropped".to_string(),
-            )));
-        }
-        if let Some(cache) = worker.shared.cache() {
-            for key in &keys {
-                cache.touched(key);
+/// Sends one frame, giving the socket up if it does not take it in time.
+async fn send_frame<S>(sink: &mut S, frame: String) -> bool
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    matches!(timeout(SEND_TIMEOUT, sink.send(Message::Text(frame.into()))).await, Ok(Ok(())))
+}
+
+/// The socket is down. Every wait ends refused, and what it waited for
+/// is forgotten: the engine never accepted it, so there is nothing to
+/// resubscribe, and a frame for it still queued would otherwise
+/// register it twice. The stores go, the keys the engine had accepted
+/// stay held, pending again, and leave the cache until the engine is
+/// back. The other workers' keys are untouched.
+fn disconnected(worker: &Worker) {
+    let (waiting, released, keys) = {
+        let mut state = worker.state.lock().expect("state");
+        worker.connected.store(false, Ordering::Release);
+        state.materialized.clear();
+        let mut waiting: Vec<SyncSender<Reply>> = Vec::new();
+        let mut released: Vec<QueryKey> = Vec::new();
+        for (id, reply) in state.pending.drain().collect::<Vec<_>>() {
+            if let Some(reply) = reply {
+                waiting.push(reply);
+                if let Some(key) = worker.drop_id(&mut state, id) {
+                    released.push(key);
+                }
             }
+        }
+        let held: Vec<u64> = state.by_id.keys().copied().collect();
+        for id in held {
+            state.pending.insert(id, None);
+        }
+        let keys: Vec<QueryKey> = state.by_key.keys().cloned().collect();
+        (waiting, released, keys)
+    };
+    for key in &released {
+        worker.shared.release(key, worker.index);
+    }
+    for reply in &waiting {
+        let _ = reply.try_send(Reply::Verdict(worker.shared.refused("the engine connection dropped".to_string())));
+    }
+    if let Some(cache) = worker.shared.cache() {
+        for key in &keys {
+            cache.touched(key);
         }
     }
 }
@@ -840,30 +895,52 @@ fn inbound(worker: &Worker, text: &str) {
             if snapshot.is_none() && body.get("rows").is_some() {
                 shared.fell_back("the accepted frame was not understood".to_string());
             }
-            let reply = worker.state.lock().expect("state").pending.remove(&id);
-            match (reply, snapshot) {
-                (Some(reply), Some(snapshot)) => {
+            // Under one lock: the wait ends, and for a rows-mode
+            // subscription the `Building` store is in place before
+            // anyone can see the snapshot, so a delta right behind this
+            // frame queues there rather than being lost.
+            let (waiter, key) = {
+                let mut state = worker.state.lock().expect("state");
+                let waiter = state.pending.remove(&id);
+                let key = state.by_id.get(&id).cloned();
+                if key.is_some() && snapshot.is_some() {
+                    state
+                        .materialized
+                        .entry(id)
+                        .or_insert_with(|| Arc::new(Mutex::new(Store::Building(Vec::new()))));
+                }
+                (waiter, key)
+            };
+            let Some(key) = key else {
+                // Nobody holds the id (the wait timed out, and the
+                // frame for it was still queued): the engine must not
+                // keep following it.
+                let _ = worker.outgoing.send(Outgoing::Unsubscribe { id });
+                return;
+            };
+            match (waiter, snapshot) {
+                (Some(Some(reply)), Some(snapshot)) => {
                     let _ = reply.try_send(Reply::Snapshot(snapshot));
                 }
-                (Some(reply), None) => {
+                (Some(Some(reply)), None) => {
                     let _ = reply.try_send(Reply::Verdict(Verdict::Accepted));
                 }
-                (None, Some(snapshot)) => {
+                (Some(None) | None, Some(snapshot)) => {
                     // A resubscribe after a reconnect: no caller waits, so
                     // the store is built from the types already known and
-                    // the cache refilled without a read. An id nobody
-                    // holds any more (the wait timed out) gets no store.
-                    let key = worker.state.lock().expect("state").by_id.get(&id).cloned();
-                    let Some(key) = key else {
-                        return;
-                    };
+                    // the cache refilled without a read. The key is
+                    // reserved before the rows are built, as a Postgres
+                    // read reserves it.
+                    let reservation = shared.cache().map(|cache| cache.reserve(&key));
                     if let Verdict::Rows { rows, store_bytes } = worker.materialize(id, snapshot)
-                        && let Some(cache) = shared.cache()
+                        && let (Some(cache), Some(reservation)) = (shared.cache(), reservation)
                     {
-                        cache.replace(&key, rows, store_bytes);
+                        cache.replace(reservation, rows, store_bytes);
                     }
                 }
-                (None, None) => {}
+                // A resubscribe in touch mode: accepted, and the next
+                // read refills it.
+                (Some(None) | None, None) => {}
             }
         }
         "refused" => {
@@ -878,24 +955,20 @@ fn inbound(worker: &Worker, text: &str) {
             let (reply, key) = {
                 let mut state = worker.state.lock().expect("state");
                 let reply = state.pending.remove(&id);
-                state.materialized.remove(&id);
-                let key = state.by_id.remove(&id);
-                if let Some(key) = &key {
-                    state.by_key.remove(key);
-                }
-                worker.note_held(&state);
+                let key = worker.drop_id(&mut state, id);
                 (reply, key)
             };
             if let Some(key) = &key {
                 shared.release(key, worker.index);
             }
             match reply {
-                Some(reply) => {
+                Some(Some(reply)) => {
                     let _ = reply.try_send(Reply::Verdict(shared.refused(reason)));
                 }
                 // A refusal after acceptance (the engine stopped following
-                // the query): the cache must not serve it.
-                None => {
+                // the query), or of a resubscribe: the cache must not
+                // serve it.
+                Some(None) | None => {
                     if let (Some(key), Some(cache)) = (key, shared.cache()) {
                         cache.touched(&key);
                     }
@@ -907,13 +980,21 @@ fn inbound(worker: &Worker, text: &str) {
                 return;
             };
             // The worker's lock is held only to find the store; the
-            // delta is applied under the store's own.
-            let (key, store) = {
-                let state = worker.state.lock().expect("state");
-                (state.by_id.get(&id).cloned(), state.materialized.get(&id).cloned())
-            };
+            // delta is applied under the store's own. The key is
+            // reserved before the store is read, and the store looked
+            // up again after, so a subscription ended in between (which
+            // bumps the generation as it goes) fails the replace.
+            let key = worker.state.lock().expect("state").by_id.get(&id).cloned();
             let Some(key) = key else {
                 return;
+            };
+            let reservation = shared.cache().map(|cache| cache.reserve(&key));
+            let store = {
+                let state = worker.state.lock().expect("state");
+                if !state.by_id.contains_key(&id) {
+                    return;
+                }
+                state.materialized.get(&id).cloned()
             };
             let rows = match store {
                 Some(store) => {
@@ -942,9 +1023,9 @@ fn inbound(worker: &Worker, text: &str) {
                 }
                 None => None,
             };
-            if let Some(cache) = shared.cache() {
+            if let (Some(cache), Some(reservation)) = (shared.cache(), reservation) {
                 match rows {
-                    Some((rows, store_bytes)) => cache.replace(&key, rows, store_bytes),
+                    Some((rows, store_bytes)) => cache.replace(reservation, rows, store_bytes),
                     None => cache.touched(&key),
                 }
             }
@@ -972,7 +1053,186 @@ fn inbound(worker: &Worker, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
+    use crate::row::OwnedRow;
+    use crate::types::{ColumnType, TypeKind};
+    use diesel::deserialize::FromSqlRow;
+    use diesel::pg::Pg;
+    use diesel::sql_types::{Integer, Text};
+
+    /// A worker with no socket: `connected` is set by hand and frames are
+    /// fed to `inbound` directly, so the orderings the reader thread and
+    /// the subscribing thread can take are forced rather than hoped for.
+    fn worker() -> (Arc<Worker>, mpsc::UnboundedReceiver<Outgoing>, Arc<Shared>) {
+        let shared = Arc::new(Shared {
+            by_key: Mutex::new(HashMap::new()),
+            max_subscriptions: 100,
+            types: Mutex::new(HashMap::new()),
+            fallbacks: Mutex::new(Vec::new()),
+            refusals: Mutex::new(Vec::new()),
+            cache: Mutex::new(None),
+            stopped: AtomicBool::new(false),
+        });
+        let (worker, outgoing) = Worker::new(0, "ws://127.0.0.1:1/never".to_string(), Duration::from_secs(5), Arc::clone(&shared));
+        worker.connected.store(true, Ordering::Release);
+        (worker, outgoing, shared)
+    }
+
+    fn t_types() -> Arc<TableTypes> {
+        let base = |name: &str, oid: u32| ColumnType {
+            name: name.into(),
+            oid,
+            typmod: -1,
+            kind: TypeKind::Base,
+        };
+        Arc::new(TableTypes {
+            columns: vec![base("id", 23), base("name", 25)],
+        })
+    }
+
+    fn key() -> QueryKey {
+        QueryKey {
+            sql: "SELECT id, name FROM t".to_string(),
+            binds: Vec::new(),
+        }
+    }
+
+    fn accepted_with_rows(id: u64) -> String {
+        json!(["accepted", {
+            "id": id,
+            "nodes": [{"table": "t", "key": ["id"], "parent": null, "rows": [{"id": 1, "name": "a"}]}],
+            "columns": [["t", "id"], ["t", "name"]],
+            "names": ["id", "name"],
+            "count": false,
+            "order": [["id", "asc"]],
+            "limit": null,
+            "offset": 0
+        }])
+        .to_string()
+    }
+
+    fn delta(id: u64) -> String {
+        json!(["delta", {"id": id, "changes": [{"table": "t", "put": [{"id": 2, "name": "b"}], "del": []}]}]).to_string()
+    }
+
+    fn decoded(rows: &Arc<[OwnedRow]>) -> Vec<(i32, String)> {
+        rows.iter()
+            .map(|row| <(i32, String) as FromSqlRow<(Integer, Text), Pg>>::build_from_row(row).unwrap())
+            .collect()
+    }
+
+    /// Starts a subscribe on another thread and returns once the worker
+    /// has it pending.
+    fn subscribing(worker: &Arc<Worker>) -> std::thread::JoinHandle<Outcome> {
+        let subscriber = Arc::clone(worker);
+        let handle = std::thread::spawn(move || subscriber.subscribe(&key()));
+        let started = Instant::now();
+        while worker.state.lock().unwrap().pending.is_empty() {
+            assert!(started.elapsed() < Duration::from_secs(5), "the subscribe never became pending");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        handle
+    }
+
+    #[test]
+    fn a_delta_right_behind_accepted_is_in_the_store() {
+        let (worker, _outgoing, shared) = worker();
+        shared.types.lock().unwrap().insert("t".to_string(), t_types());
+        let handle = subscribing(&worker);
+        // The reader thread handles both frames back to back; whether
+        // the subscribing thread has woken up in between must not
+        // matter.
+        inbound(&worker, &accepted_with_rows(1));
+        inbound(&worker, &delta(1));
+        let Outcome::Verdict(Verdict::Rows { .. }) = handle.join().unwrap() else {
+            panic!("rows mode");
+        };
+        let Outcome::Verdict(Verdict::Rows { rows, .. }) = worker.subscribe(&key()) else {
+            panic!("held in rows mode");
+        };
+        assert_eq!(decoded(&rows), vec![(1, "a".into()), (2, "b".into())], "the store has the delta's row");
+    }
+
+    #[test]
+    fn deltas_during_the_type_lookup_queue_and_apply_once() {
+        let (worker, _outgoing, shared) = worker();
+        let handle = subscribing(&worker);
+        inbound(&worker, &accepted_with_rows(1));
+        let Outcome::NeedsTypes { snapshot, missing } = handle.join().unwrap() else {
+            panic!("the types of t are not known yet");
+        };
+        assert_eq!(missing, vec!["t".to_string()]);
+        // The caller is off looking the types up; a delta lands.
+        inbound(&worker, &delta(1));
+        shared.types.lock().unwrap().insert("t".to_string(), t_types());
+        let Verdict::Rows { rows, .. } = worker.materialize_key(&key(), snapshot) else {
+            panic!("rows mode once the types are in: {:?}", shared.fallbacks.lock().unwrap());
+        };
+        assert_eq!(decoded(&rows), vec![(1, "a".into()), (2, "b".into())]);
+        // And a delta after the store is built reaches the same store.
+        inbound(&worker, &json!(["delta", {"id": 1, "changes": [{"table": "t", "put": [], "del": [{"id": 1}]}]}]).to_string());
+        let Outcome::Verdict(Verdict::Rows { rows, .. }) = worker.subscribe(&key()) else {
+            panic!("held in rows mode");
+        };
+        assert_eq!(decoded(&rows), vec![(2, "b".into())]);
+    }
+
+    #[test]
+    fn a_wait_cut_by_a_socket_drop_is_forgotten_and_a_late_accept_is_unsubscribed() {
+        let (worker, mut outgoing, _shared) = worker();
+        let handle = subscribing(&worker);
+        disconnected(&worker);
+        let Outcome::Verdict(Verdict::Refused(reason)) = handle.join().unwrap() else {
+            panic!("refused");
+        };
+        assert_eq!(reason, "the engine connection dropped");
+        assert!(worker.state.lock().unwrap().by_id.is_empty(), "nothing to resubscribe");
+        assert_eq!(worker.held.load(Ordering::Relaxed), 0);
+
+        // The frame for it was still queued and went out on the next
+        // socket; the engine's acceptance names an id nobody holds.
+        worker.connected.store(true, Ordering::Release);
+        inbound(&worker, &accepted_with_rows(1));
+        let mut unsubscribed = false;
+        while let Ok(message) = outgoing.try_recv() {
+            if matches!(message, Outgoing::Unsubscribe { id: 1 }) {
+                unsubscribed = true;
+            }
+        }
+        assert!(unsubscribed, "the engine is told to drop it");
+        assert!(worker.state.lock().unwrap().materialized.is_empty(), "no store for an id nobody holds");
+    }
+
+    #[test]
+    fn a_resubscribed_key_is_pending_until_the_engine_accepts_it() {
+        let (worker, _outgoing, _shared) = worker();
+        let handle = subscribing(&worker);
+        inbound(&worker, &json!(["accepted", {"id": 1}]).to_string());
+        assert!(matches!(handle.join().unwrap(), Outcome::Verdict(Verdict::Accepted)));
+
+        // The socket drops and comes back: the key is held, resubscribed,
+        // and not to be trusted until the engine says so.
+        disconnected(&worker);
+        assert!(worker.state.lock().unwrap().by_id.contains_key(&1), "an accepted key stays held");
+        worker.connected.store(true, Ordering::Release);
+        let Outcome::Verdict(Verdict::Refused(reason)) = worker.subscribe(&key()) else {
+            panic!("a read in the window goes live");
+        };
+        assert_eq!(reason, "the subscription is pending");
+        inbound(&worker, &json!(["accepted", {"id": 1}]).to_string());
+        assert!(matches!(worker.subscribe(&key()), Outcome::Verdict(Verdict::Accepted)));
+    }
+
+    #[test]
+    fn every_client_side_reason_is_transient() {
+        let client = EngineClient::with_config("ws://127.0.0.1:1/never/s2s/v1", Config::default());
+        for reason in Shared::TRANSIENT {
+            assert!(!client.refusal_is_final(&format!("{reason} and more")), "{reason}");
+        }
+        assert!(client.refusal_is_final("the query joins more tables than the engine follows"));
+    }
 
     #[test]
     fn config_defaults_and_env() {

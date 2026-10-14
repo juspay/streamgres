@@ -68,6 +68,7 @@
 //! - `["pong"]`
 
 use std::collections::{HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -77,8 +78,10 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures_util::stream::SplitStream;
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::{Value as Json, json};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use super::ast::Translated;
@@ -174,12 +177,12 @@ impl Conn {
     fn send(&mut self, message: Json) {
         match self.out.try_send(message.to_string()) {
             Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(TrySendError::Full(_)) => {
                 if let Some(close) = self.close.take() {
                     let _ = close.send("the backend is not reading its frames");
                 }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(TrySendError::Closed(_)) => {}
         }
     }
 }
@@ -639,8 +642,10 @@ impl Task {
 
     /// The engine stopped following a subscription, or this task cannot
     /// serve it: the backend must stop trusting its cache for it, and
-    /// the engine must stop routing to it. A refusal from the engine
-    /// itself leaves the subscription registered until unregistered.
+    /// the engine must stop routing to it. The engine's own `Refused`
+    /// has already unregistered the subscription, and the extra
+    /// unregister is a no-op (ids are never reused); `Capped` and this
+    /// task's own refusals leave it registered, and need it.
     async fn drop_sub(&mut self, sub: SubId, reason: &str) {
         if let Some((conn, id)) = self.by_sub.get(&sub).copied()
             && let Some(connection) = self.conns.get_mut(&conn)
@@ -716,7 +721,7 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
     // the task hears the connection is gone, or its subscriptions would
     // outlive it.
     let session = serve(conn, stream, closed, &out, &state);
-    if std::panic::AssertUnwindSafe(session).catch_unwind().await.is_err() {
+    if AssertUnwindSafe(session).catch_unwind().await.is_err() {
         log_warn!("s2s connection {conn}: a frame's handling panicked");
     }
     let _ = handle.requests.send(Request::Disconnected { conn }).await;
@@ -729,7 +734,7 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
 /// the task is gone.
 async fn serve(
     conn: u64,
-    mut stream: futures_util::stream::SplitStream<WebSocket>,
+    mut stream: SplitStream<WebSocket>,
     mut closed: oneshot::Receiver<&'static str>,
     out: &mpsc::Sender<String>,
     state: &Arc<AppState>,

@@ -449,17 +449,30 @@ async fn a_read_dropped_after_subscribing_ends_its_subscription() {
         .filter(sg_configs::key.eq(w.key("mode")))
         .select(sg_configs::value)
         .limit(1);
-    let dropped = tokio::time::timeout(Duration::ZERO, AsyncConnection::load(&mut w.conn, query)).await;
-    assert!(dropped.is_err(), "polled once, then dropped");
-    for _ in 0..50 {
-        if !w.engine.unsubscribed.lock().unwrap().is_empty() {
+    // Exactly one poll, then the drop: the subscribe may already have
+    // landed on its blocking thread by then, and the Postgres read has
+    // at best been sent.
+    let mut read = Box::pin(AsyncConnection::load(&mut w.conn, query));
+    assert!(futures_util::poll!(read.as_mut()).is_pending(), "a miss cannot complete in one poll");
+    drop(read);
+    // The drop ends the subscription at once (a no-op on the engine side
+    // if the subscribe has not landed yet); the blocking thread's
+    // subscribe lands after, and finds the read gone.
+    for _ in 0..100 {
+        let subscribed = w.engine.subscribed.lock().unwrap().len();
+        let unsubscribed = w.engine.unsubscribed.lock().unwrap().len();
+        if subscribed == 1 && unsubscribed >= 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let subscribed = w.engine.subscribed.lock().unwrap().len();
     let unsubscribed = w.engine.unsubscribed.lock().unwrap().len();
-    assert_eq!((subscribed, unsubscribed), (1, 1), "the subscription the dropped read made was ended");
+    assert_eq!(subscribed, 1, "the subscribe landed on its blocking thread");
+    // The guard's drop and the blocking thread's check can both end it;
+    // the second is a no-op on the engine side, so either count is right.
+    assert!((1..=2).contains(&unsubscribed), "the subscription the dropped read made was ended: {unsubscribed}");
+    tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(w.cache.reservations(), 0, "and its reservation released");
     assert_eq!(w.cache.len(), 0);
     w.clean().await;

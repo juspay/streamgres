@@ -57,6 +57,7 @@ use diesel::pg::{
 use diesel::query_builder::{AsQuery, QueryFragment, QueryId};
 use diesel::sql_query;
 use diesel::sql_types::{Oid, Text, Untyped};
+use diesel::result::Error;
 use diesel::{ConnectionResult, QueryResult};
 use diesel_async::pooled_connection::PoolableConnection;
 use diesel_async::{
@@ -64,13 +65,14 @@ use diesel_async::{
 };
 use futures_util::future::{BoxFuture, FutureExt, TryFutureExt};
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
+use tokio::task::spawn_blocking;
 
 use crate::cache::Cache;
 use crate::cursor::SyncedRow;
 use crate::key::QueryKey;
 use crate::route::Route;
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
-use crate::subscriptions::{Outcome, Subscriptions, Verdict};
+use crate::subscriptions::{Outcome, Verdict};
 use crate::types::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
 use crate::{Attachment, SETTINGS, may_write, read_your_writes_from_env};
 
@@ -236,11 +238,10 @@ impl AsyncSyncedConnection {
     /// goes into the bind) has no key yet: `Ok((None, unknown))`.
     fn key_of<T: QueryFragment<Pg>>(&mut self, query: &T) -> QueryResult<(Option<QueryKey>, Vec<TypeName>)> {
         let mut lookup = Lookup {
-            cache: std::mem::replace(&mut *self.metadata.lock().expect("metadata"), PgMetadataCache::new()),
+            cache: Arc::clone(&self.metadata),
             unknown: Vec::new(),
         };
         let key = QueryKey::of(query, &mut lookup);
-        *self.metadata.lock().expect("metadata") = lookup.cache;
         match key {
             Ok(key) => Ok((Some(key), lookup.unknown)),
             Err(error) if !lookup.unknown.is_empty() => {
@@ -269,7 +270,7 @@ impl AsyncSyncedConnection {
                 let rows: Vec<PgRow> = resolver.await?.try_collect().await?;
                 if let Some(row) = rows.first() {
                     let oids = <TypeOids as FromSqlRow<Untyped, Pg>>::build_from_row(row)
-                        .map_err(diesel::result::Error::DeserializationError)?;
+                        .map_err(Error::DeserializationError)?;
                     metadata
                         .lock()
                         .expect("metadata")
@@ -297,15 +298,18 @@ impl TypeName {
 
 /// A type lookup over the OIDs already known, remembering what it did
 /// not know rather than asking the database (it cannot, synchronously).
+/// The cache is shared by every connection through one `Cache`, so it
+/// is locked per lookup, never taken out: a connection that took it out
+/// would leave the others an empty one and lose their writes.
 struct Lookup {
-    cache: PgMetadataCache,
+    cache: Arc<Mutex<PgMetadataCache>>,
     unknown: Vec<TypeName>,
 }
 
 impl PgMetadataLookup for Lookup {
     fn lookup_type(&mut self, type_name: &str, schema: Option<&str>) -> PgTypeMetadata {
         let key = PgMetadataCacheKey::new(schema.map(Cow::Borrowed), Cow::Borrowed(type_name));
-        if let Some(metadata) = self.cache.lookup_type(&key) {
+        if let Some(metadata) = self.cache.lock().expect("metadata").lookup_type(&key) {
             return metadata;
         }
         let name = TypeName {
@@ -352,19 +356,6 @@ fn type_oids_query(name: &TypeName) -> diesel::query_builder::BoxedSqlQuery<'sta
 
 type LoadFuture<'query> = BoxFuture<'query, QueryResult<BoxStream<'static, QueryResult<PgRow>>>>;
 
-/// Ends a subscription if the read that made it is dropped before the
-/// fill. The subscribe itself runs on a blocking thread and cannot be
-/// cancelled, so the flag is checked once it returns: a subscription
-/// made for a read nobody waits for is dropped at once.
-struct Cancelled {
-    flag: Arc<AtomicBool>,
-}
-
-impl Drop for Cancelled {
-    fn drop(&mut self) {
-        self.flag.store(true, Ordering::Release);
-    }
-}
 
 impl SimpleAsyncConnection for AsyncSyncedConnection {
     fn batch_execute(&mut self, query: &str) -> impl std::future::Future<Output = QueryResult<()>> + Send {
@@ -470,32 +461,32 @@ impl AsyncConnection for AsyncSyncedConnection {
         async move {
             let _pending = token;
             let reservation = cache.reserve(&key);
-            let cancelled = Arc::new(AtomicBool::new(false));
+            // The future owns the subscription from the moment the
+            // subscribe may have made it until the fill; dropped before
+            // that, it ends it. The subscribe runs on a blocking thread
+            // and cannot be cancelled, so it checks the guard's flag once
+            // it returns: a subscription made for a read that has gone
+            // is ended there, by the same path.
+            let guard = Unfilled {
+                cache: Arc::clone(&cache),
+                key: key.clone(),
+                gone: Arc::new(AtomicBool::new(false)),
+                armed: true,
+            };
             let outcome = {
                 let subscriptions = Arc::clone(&subscriptions);
+                let cache = Arc::clone(&cache);
                 let key = key.clone();
-                let cancelled = Arc::clone(&cancelled);
-                let guard = Cancelled {
-                    flag: Arc::clone(&cancelled),
-                };
-                let outcome = tokio::task::spawn_blocking(move || {
+                let gone = Arc::clone(&guard.gone);
+                spawn_blocking(move || {
                     let outcome = subscriptions.subscribe(&key);
-                    if cancelled.load(Ordering::Acquire) {
-                        subscriptions.unsubscribe(&key);
+                    if gone.load(Ordering::Acquire) {
+                        cache.abandon(&key);
                     }
                     outcome
                 })
                 .await
-                .map_err(|error| diesel::result::Error::QueryBuilderError(Box::new(error)))?;
-                std::mem::forget(guard);
-                outcome
-            };
-            // From here the future owns the subscription until the fill;
-            // dropped before that, it ends it.
-            let guard = Unfilled {
-                subscriptions: Arc::clone(&subscriptions),
-                key: key.clone(),
-                armed: true,
+                .map_err(|error| Error::QueryBuilderError(Box::new(error)))?
             };
             let verdict = match outcome {
                 Outcome::Verdict(verdict) => verdict,
@@ -508,7 +499,7 @@ impl AsyncConnection for AsyncSyncedConnection {
                                 .iter()
                                 .map(|row| {
                                     <TableAttribute as FromSqlRow<Untyped, Pg>>::build_from_row(row)
-                                        .map_err(diesel::result::Error::DeserializationError)
+                                        .map_err(Error::DeserializationError)
                                 })
                                 .collect::<QueryResult<Vec<_>>>()?;
                             let mut all = all_table_types(attributes);
@@ -576,11 +567,17 @@ impl AsyncConnection for AsyncSyncedConnection {
 }
 
 /// A subscription made for a read whose future may be dropped before
-/// the fill (the `Accepted` read of Postgres, the catalog lookup). Armed
-/// until the fill; dropped armed, it ends the subscription.
+/// the fill (while the subscribe runs on its blocking thread, during
+/// the `Accepted` read of Postgres, during the catalog lookup). Armed
+/// until the fill; dropped armed, it ends the subscription through the
+/// cache, which also fails any other reader's fill in flight for the
+/// key, and raises `gone` for the blocking thread. Ending it twice is
+/// harmless: the cache side is idempotent, and a subscription another
+/// read made since is protected by that reader's own generation.
 struct Unfilled {
-    subscriptions: Arc<dyn Subscriptions>,
+    cache: Arc<Cache>,
     key: QueryKey,
+    gone: Arc<AtomicBool>,
     armed: bool,
 }
 
@@ -593,7 +590,8 @@ impl Unfilled {
 impl Drop for Unfilled {
     fn drop(&mut self) {
         if self.armed {
-            self.subscriptions.unsubscribe(&self.key);
+            self.gone.store(true, Ordering::Release);
+            self.cache.abandon(&self.key);
         }
     }
 }
