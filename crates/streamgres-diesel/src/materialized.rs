@@ -354,6 +354,14 @@ impl Materialized {
         }
     }
 
+    /// What the store weighs, roughly: every row's JSON as it is held.
+    pub fn byte_len(&self) -> usize {
+        self.nodes
+            .iter()
+            .map(|node| node.rows.iter().map(|(key, row)| key.len() + json_bytes(row)).sum::<usize>())
+            .sum()
+    }
+
     /// How many rows are held, over every table.
     pub fn len(&self) -> usize {
         self.nodes.iter().map(|node| node.rows.len()).sum()
@@ -507,6 +515,18 @@ impl Materialized {
     }
 }
 
+/// A rough size of a JSON value in memory: what it holds plus what each
+/// node costs.
+fn json_bytes(value: &Json) -> usize {
+    const NODE: usize = 32;
+    match value {
+        Json::Null | Json::Bool(_) | Json::Number(_) => NODE,
+        Json::String(s) => NODE + s.len(),
+        Json::Array(items) => NODE + items.iter().map(json_bytes).sum::<usize>(),
+        Json::Object(fields) => NODE + fields.iter().map(|(k, v)| k.len() + NODE + json_bytes(v)).sum::<usize>(),
+    }
+}
+
 /// Postgres's order for one clause: NULLs last ascending, first
 /// descending; numbers numerically, strings bytewise, booleans false
 /// first.
@@ -515,8 +535,14 @@ fn compare(a: Option<&Json>, b: Option<&Json>, ascending: bool) -> Ordering {
     let b = b.filter(|v| !v.is_null());
     match (a, b) {
         (None, None) => Ordering::Equal,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(_), None) => Ordering::Less,
+        // NULLs last ascending, first descending: the reversal below
+        // applies to them as it does to values.
+        (None, Some(_)) => {
+            if ascending { Ordering::Greater } else { Ordering::Less }
+        }
+        (Some(_), None) => {
+            if ascending { Ordering::Less } else { Ordering::Greater }
+        }
         (Some(a), Some(b)) => {
             let natural = match (a, b) {
                 (Json::Number(x), Json::Number(y)) => match (x.as_i64(), y.as_i64()) {
@@ -650,6 +676,35 @@ mod tests {
         );
         let m = Materialized::new(snap, &types()).unwrap();
         assert_eq!(decoded(&m.rows().unwrap()), vec![(3, "c".into()), (1, "b".into())], "NULL rank last, cut to 2");
+    }
+
+    #[test]
+    fn descending_puts_nulls_first_as_postgres_does() {
+        let snap = snapshot(
+            vec![
+                json!({"id": 1, "name": "b", "rank": 2}),
+                json!({"id": 2, "name": "a", "rank": null}),
+                json!({"id": 3, "name": "c", "rank": 1}),
+            ],
+            vec![("rank", false), ("id", true)],
+            None,
+        );
+        let m = Materialized::new(snap, &types()).unwrap();
+        assert_eq!(
+            decoded(&m.rows().unwrap()),
+            vec![(2, "a".into()), (1, "b".into()), (3, "c".into())],
+            "NULL first under DESC, then 2, 1"
+        );
+    }
+
+    #[test]
+    fn the_store_weighs_its_rows() {
+        let snap = snapshot(vec![json!({"id": 1, "name": "b", "rank": 2})], vec![], None);
+        let mut m = Materialized::new(snap, &types()).unwrap();
+        let one = m.byte_len();
+        assert!(one > 0);
+        m.put("t", json!({"id": 2, "name": "a much longer name than before", "rank": 1}));
+        assert!(m.byte_len() > one * 2 - 16, "a second, longer row weighs more");
     }
 
     #[test]

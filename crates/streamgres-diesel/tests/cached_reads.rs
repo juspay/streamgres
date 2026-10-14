@@ -268,11 +268,11 @@ fn a_touch_during_the_read_is_not_lost() {
 
     // What `load` does on a miss, with a touch landing between the
     // reservation and the fill.
-    let generation = w.cache.reserve(&key);
+    let reservation = w.cache.reserve(&key);
     w.put("flag", "on");
     w.cache.touched(&key);
     let stale_rows: Arc<[streamgres_diesel::row::OwnedRow]> = Arc::from(Vec::new());
-    assert!(!w.cache.fill(key.clone(), generation, stale_rows), "the fill is refused");
+    assert!(!w.cache.fill(reservation, stale_rows), "the fill is refused");
     assert_eq!(w.cache.stats.stale_fills.load(Ordering::Relaxed), 1);
     assert!(w.cache.is_empty());
 
@@ -595,4 +595,101 @@ fn after_a_write_the_connection_reads_postgres_for_a_window() {
         })
         .unwrap();
     assert_eq!(w.read("mode").as_deref(), Some("c"));
+}
+
+#[test]
+fn a_locking_read_always_goes_to_postgres() {
+    let mut w = World::new("locking");
+    w.put("row", "a");
+    let key = w.key("row");
+    for _ in 0..2 {
+        let seen: Option<String> = sg_configs::table
+            .filter(sg_configs::key.eq(&key))
+            .select(sg_configs::value)
+            .for_update()
+            .first(&mut w.conn)
+            .optional()
+            .unwrap();
+        assert_eq!(seen.as_deref(), Some("a"));
+    }
+    assert_eq!(w.cache.stats.locking.load(Ordering::Relaxed), 2);
+    assert!(w.cache.is_empty(), "nothing cached");
+    assert!(w.engine.subscribed.lock().unwrap().is_empty(), "nothing subscribed");
+}
+
+#[test]
+fn a_route_scope_ends_when_the_closure_panics() {
+    let mut w = World::new("scope-panic");
+    w.put("mode", "a");
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    w.put("mode", "b");
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        w.conn.with_route(Route::Postgres, |_| panic!("inside the scope"));
+    }));
+    assert!(outcome.is_err());
+    assert_eq!(w.read("mode").as_deref(), Some("a"), "the scope was restored, the cache answers");
+}
+
+#[test]
+fn opening_and_abandoning_a_transaction_is_not_a_write() {
+    let mut w = World::new("txn-control");
+    w.conn.set_read_your_writes(std::time::Duration::from_secs(5));
+    w.put("mode", "a");
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    w.put("mode", "b");
+    w.conn.batch_execute("BEGIN").unwrap();
+    w.conn.batch_execute("ROLLBACK").unwrap();
+    w.conn.batch_execute("SET statement_timeout = 0").unwrap();
+    assert_eq!(w.read("mode").as_deref(), Some("a"), "still from the cache");
+    assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 0);
+    w.conn.batch_execute("SELECT 1").unwrap();
+    assert_eq!(w.read("mode").as_deref(), Some("b"), "any other raw SQL counts as a write");
+    assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_write_on_one_connection_is_seen_by_reads_on_another_of_the_same_cache() {
+    let mut w = World::new("ryw-pool");
+    w.conn.set_read_your_writes(std::time::Duration::from_secs(5));
+    w.put("mode", "a");
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+
+    // A second connection of the "pool": same cache, its own socket.
+    let mut sibling = SyncedConnection::with_cache(
+        PgConnection::establish(&url()).expect("connect"),
+        Arc::clone(&w.cache),
+        Consistency::Eventual,
+    );
+    let key = w.key("mode");
+    diesel::update(sg_configs::table.filter(sg_configs::key.eq(&key)))
+        .set(sg_configs::value.eq("b"))
+        .execute(&mut sibling)
+        .unwrap();
+    assert_eq!(w.read("mode").as_deref(), Some("b"), "the first connection reads Postgres for the window");
+    assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn a_read_that_fails_after_the_engine_accepted_ends_its_subscription() {
+    let mut w = World::new("accepted-error");
+    let failing = sql_query("SELECT no_such_column FROM sg_configs WHERE key = $1").bind::<Text, _>(w.key("x"));
+    let outcome: Result<Vec<Config>, _> = failing.load(&mut w.conn);
+    assert!(outcome.is_err());
+    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 1, "the engine accepted it");
+    assert_eq!(w.engine.unsubscribed.lock().unwrap().len(), 1, "and was told to drop it");
+    assert!(w.cache.is_empty());
+}
+
+#[test]
+fn a_refusal_is_remembered_for_the_shape_not_the_value() {
+    let mut w = World::new("refused-shape");
+    w.put("a", "1");
+    w.put("b", "2");
+    w.engine.refuse_all.store(true, Ordering::SeqCst);
+    assert_eq!(w.read("a").as_deref(), Some("1"));
+    w.engine.refuse_all.store(false, Ordering::SeqCst);
+    assert_eq!(w.read("b").as_deref(), Some("2"));
+    assert_eq!(w.cache.stats.refused.load(Ordering::Relaxed), 1, "asked once");
+    assert_eq!(w.cache.stats.refused_recently.load(Ordering::Relaxed), 1, "the other value skipped the ask");
+    assert!(w.engine.subscribed.lock().unwrap().is_empty());
 }

@@ -116,14 +116,22 @@ impl OwnedRow {
         self.values.get(index)?.as_ref()
     }
 
-    /// How many bytes the values hold, for a size-bounded cache.
+    /// What the row costs, for a size-bounded cache: its values' bytes
+    /// plus what each value and the row itself cost to hold. A rough
+    /// figure; the budget is a ceiling, not an accounting.
     pub fn byte_len(&self) -> usize {
         self.values
             .iter()
-            .map(|value| value.as_ref().map_or(0, |value| value.bytes.len()))
-            .sum()
+            .map(|value| VALUE_OVERHEAD + value.as_ref().map_or(0, |value| value.bytes.len()))
+            .sum::<usize>()
+            + ROW_OVERHEAD
     }
 }
+
+/// A boxed value's pointer, length, type and the `Option` around it.
+const VALUE_OVERHEAD: usize = 32;
+/// The row's two `Arc`s and the vector of values.
+const ROW_OVERHEAD: usize = 64;
 
 impl RowSealed for OwnedRow {}
 

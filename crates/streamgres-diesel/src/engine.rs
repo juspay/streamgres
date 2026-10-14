@@ -40,7 +40,7 @@
 //! refills on its next read. Keys the engine then refuses are forgotten.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -129,6 +129,8 @@ enum Outgoing {
     Unsubscribe {
         id: u64,
     },
+    /// The pool is gone: close the socket and end the thread.
+    Stop,
 }
 
 /// What the reader hands a waiting subscribe.
@@ -155,6 +157,8 @@ struct Shared {
     /// this client, most recent last, at most a few.
     refusals: Mutex<Vec<String>>,
     cache: Mutex<Option<Weak<Cache>>>,
+    /// Set when the pool is dropped; the worker threads then end.
+    stopped: AtomicBool,
 }
 
 impl Shared {
@@ -172,11 +176,12 @@ impl Shared {
     }
 
     /// The reasons this client refuses on its own, all of which pass.
-    const TRANSIENT: [&'static str; 4] = [
+    const TRANSIENT: [&'static str; 5] = [
         "the engine is not connected",
         "the engine client has stopped",
         "the engine did not answer in time",
         "the subscription limit of ",
+        "the subscription is pending",
     ];
 
     fn remember(log: &Mutex<Vec<String>>, reason: String) {
@@ -203,8 +208,19 @@ struct WorkerState {
     by_id: HashMap<u64, QueryKey>,
     /// Subscribes waiting for a verdict, with where to deliver it.
     pending: HashMap<u64, std::sync::mpsc::SyncSender<Reply>>,
-    /// Subscriptions served from the engine's rows.
-    materialized: HashMap<u64, Materialized>,
+    /// Subscriptions served from the engine's rows, each behind its own
+    /// lock so a delta to one is applied without holding up the rest.
+    materialized: HashMap<u64, Arc<Mutex<Store>>>,
+}
+
+/// A rows-mode subscription's store, from the moment the engine's
+/// snapshot lands.
+enum Store {
+    /// The snapshot is with the caller, which is looking the column
+    /// types up; the deltas that land meanwhile wait here and are
+    /// applied once the store is built, so none is lost.
+    Building(Vec<Json>),
+    Ready(Materialized),
 }
 
 /// One socket to the engine and the subscriptions it carries.
@@ -214,6 +230,9 @@ struct Worker {
     verdict_timeout: Duration,
     outgoing: mpsc::UnboundedSender<Outgoing>,
     connected: AtomicBool,
+    /// How many keys this worker holds, kept beside the state so the
+    /// pool can pick the least loaded worker without locking each one.
+    held: AtomicUsize,
     state: Mutex<WorkerState>,
     shared: Arc<Shared>,
 }
@@ -222,6 +241,15 @@ struct Pool {
     workers: Vec<Arc<Worker>>,
     shared: Arc<Shared>,
     config: Config,
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.shared.stopped.store(true, Ordering::Release);
+        for worker in &self.workers {
+            let _ = worker.outgoing.send(Outgoing::Stop);
+        }
+    }
 }
 
 /// A client of the engine's S2S endpoint, shared by every connection of a
@@ -263,6 +291,7 @@ impl EngineClient {
             fallbacks: Mutex::new(Vec::new()),
             refusals: Mutex::new(Vec::new()),
             cache: Mutex::new(None),
+            stopped: AtomicBool::new(false),
         });
         let workers = (0..config.connections)
             .map(|index| Worker::start(index, url.clone(), config.verdict_timeout, Arc::clone(&shared)))
@@ -312,8 +341,26 @@ impl EngineClient {
         self.pool
             .workers
             .iter()
-            .map(|worker| worker.state.lock().expect("state").by_key.len())
+            .map(|worker| worker.held.load(Ordering::Relaxed))
             .collect()
+    }
+
+    /// What the rows-mode stores weigh, roughly, over every socket.
+    pub fn store_bytes(&self) -> usize {
+        self.pool
+            .workers
+            .iter()
+            .map(|worker| {
+                let stores: Vec<Arc<Mutex<Store>>> = worker.state.lock().expect("state").materialized.values().cloned().collect();
+                stores
+                    .iter()
+                    .map(|store| match &*store.lock().expect("store") {
+                        Store::Ready(materialized) => materialized.byte_len(),
+                        Store::Building(_) => 0,
+                    })
+                    .sum::<usize>()
+            })
+            .sum()
     }
 
     /// How many subscriptions are served from the engine's rows rather
@@ -345,7 +392,7 @@ impl EngineClient {
             .workers
             .iter()
             .filter(|worker| worker.connected.load(Ordering::Acquire))
-            .min_by_key(|worker| worker.state.lock().expect("state").by_key.len())
+            .min_by_key(|worker| worker.held.load(Ordering::Relaxed))
     }
 }
 
@@ -422,6 +469,7 @@ impl Worker {
             verdict_timeout,
             outgoing,
             connected: AtomicBool::new(false),
+            held: AtomicUsize::new(0),
             state: Mutex::new(WorkerState {
                 next_id: 1,
                 by_key: HashMap::new(),
@@ -449,25 +497,50 @@ impl Worker {
         let (reply, verdict) = std::sync::mpsc::sync_channel(1);
         let id = {
             let mut state = self.state.lock().expect("state");
-            if let Some(id) = state.by_key.get(key).copied() {
+            let held = state.by_key.get(key).copied();
+            if !self.connected.load(Ordering::Acquire) {
+                // A key this worker holds stays routed to it, to be
+                // resubscribed when the socket is back; a new one is
+                // released for another worker or another time.
+                drop(state);
+                if held.is_none() {
+                    self.shared.release(key, self.index);
+                }
+                return Outcome::Verdict(self.shared.refused("the engine is not connected".to_string()));
+            }
+            if let Some(id) = held {
+                if state.pending.contains_key(&id) {
+                    // Another read is waiting for the verdict. Accepting
+                    // now would fill an entry that a refusal or a timeout
+                    // then leaves without a subscription; this read goes
+                    // live and the next one finds the answer.
+                    return Outcome::Verdict(self.shared.refused("the subscription is pending".to_string()));
+                }
                 // Already subscribed (a refill after a touch, or a
                 // resubscribe the reader could not materialise without
                 // a connection): the rows if the store has them.
-                return Outcome::Verdict(match state.materialized.get(&id).map(Materialized::rows) {
-                    Some(Ok(rows)) => Verdict::Rows(rows),
-                    _ => Verdict::Accepted,
-                });
-            }
-            if !self.connected.load(Ordering::Acquire) {
+                let store = state.materialized.get(&id).cloned();
                 drop(state);
-                self.shared.release(key, self.index);
-                return Outcome::Verdict(self.shared.refused("the engine is not connected".to_string()));
+                return Outcome::Verdict(match store {
+                    Some(store) => match &*store.lock().expect("store") {
+                        Store::Ready(materialized) => match materialized.rows() {
+                            Ok(rows) => Verdict::Rows {
+                                rows,
+                                store_bytes: materialized.byte_len(),
+                            },
+                            Err(_) => Verdict::Accepted,
+                        },
+                        Store::Building(_) => Verdict::Accepted,
+                    },
+                    None => Verdict::Accepted,
+                });
             }
             let id = state.next_id;
             state.next_id += 1;
             state.by_key.insert(key.clone(), id);
             state.by_id.insert(id, key.clone());
             state.pending.insert(id, reply);
+            self.note_held(&state);
             id
         };
         if self
@@ -496,6 +569,13 @@ impl Worker {
                 if missing.is_empty() {
                     Outcome::Verdict(self.materialize(id, snapshot))
                 } else {
+                    // The deltas that land while the caller looks the
+                    // types up queue in the store's place.
+                    self.state
+                        .lock()
+                        .expect("state")
+                        .materialized
+                        .insert(id, Arc::new(Mutex::new(Store::Building(Vec::new()))));
                     Outcome::NeedsTypes { snapshot, missing }
                 }
             }
@@ -526,16 +606,24 @@ impl Worker {
             state.by_id.remove(&id);
             state.pending.remove(&id);
             state.materialized.remove(&id);
+            self.note_held(&state);
             id
         };
         let _ = self.outgoing.send(Outgoing::Unsubscribe { id });
     }
 
     /// Builds the store for an accepted subscription from its snapshot
-    /// and the types already known. Falls back to touches when a
-    /// table's types are not known or the rows cannot be encoded.
+    /// and the types already known, applies the deltas that landed
+    /// while the types were looked up, and installs it. Falls back to
+    /// touches when a table's types are not known or the rows cannot be
+    /// encoded. A subscription that ended meanwhile gets nothing.
     fn materialize(&self, id: u64, snapshot: Snapshot) -> Verdict {
         let shared = &self.shared;
+        let fallback = |reason: String| {
+            self.state.lock().expect("state").materialized.remove(&id);
+            shared.fell_back(reason);
+            Verdict::Accepted
+        };
         let types: HashMap<String, Arc<TableTypes>> = {
             let known = shared.types.lock().expect("types");
             let mut types = HashMap::new();
@@ -546,31 +634,50 @@ impl Worker {
                     }
                     None => {
                         drop(known);
-                        shared.fell_back(format!("types of `{table}` unavailable"));
-                        return Verdict::Accepted;
+                        return fallback(format!("types of `{table}` unavailable"));
                     }
                 }
             }
             types
         };
-        match Materialized::new(snapshot, &types) {
-            Ok(materialized) => match materialized.rows() {
-                Ok(rows) => {
-                    self.state
-                        .lock()
-                        .expect("state")
-                        .materialized
-                        .insert(id, materialized);
-                    Verdict::Rows(rows)
-                }
-                Err(error) => {
-                    shared.fell_back(error.0);
-                    Verdict::Accepted
-                }
+        let mut materialized = match Materialized::new(snapshot, &types) {
+            Ok(materialized) => materialized,
+            Err(error) => return fallback(error.0),
+        };
+        // Swap the store in under the state lock, so no delta lands
+        // between taking the queue and installing the store.
+        let mut state = self.state.lock().expect("state");
+        if !state.by_id.contains_key(&id) {
+            state.materialized.remove(&id);
+            return Verdict::Refused("the subscription ended before its rows were built".to_string());
+        }
+        let queued = match state.materialized.remove(&id) {
+            Some(store) => match Arc::try_unwrap(store) {
+                Ok(store) => match store.into_inner().expect("store") {
+                    Store::Building(queued) => queued,
+                    Store::Ready(_) => Vec::new(),
+                },
+                Err(shared_store) => match &mut *shared_store.lock().expect("store") {
+                    Store::Building(queued) => std::mem::take(queued),
+                    Store::Ready(_) => Vec::new(),
+                },
             },
+            None => Vec::new(),
+        };
+        for body in &queued {
+            apply_delta(&mut materialized, body);
+        }
+        match materialized.rows() {
+            Ok(rows) => {
+                let store_bytes = materialized.byte_len();
+                state
+                    .materialized
+                    .insert(id, Arc::new(Mutex::new(Store::Ready(materialized))));
+                Verdict::Rows { rows, store_bytes }
+            }
             Err(error) => {
-                shared.fell_back(error.0);
-                Verdict::Accepted
+                drop(state);
+                fallback(error.0)
             }
         }
     }
@@ -585,10 +692,32 @@ impl Worker {
             }
             state.pending.remove(&id);
             state.materialized.remove(&id);
+            self.note_held(&state);
             key
         };
         if let Some(key) = key {
             self.shared.release(&key, self.index);
+        }
+    }
+
+    fn note_held(&self, state: &WorkerState) {
+        self.held.store(state.by_key.len(), Ordering::Relaxed);
+    }
+}
+
+/// Applies one `delta` body to a store: every table's departures, then
+/// its arrivals. The engine coalesces a frame per key, so no key is in
+/// both lists and the order between them does not matter.
+fn apply_delta(materialized: &mut Materialized, body: &Json) {
+    for change in body.get("changes").and_then(Json::as_array).into_iter().flatten() {
+        let Some(table) = change.get("table").and_then(Json::as_str) else {
+            continue;
+        };
+        for row in change.get("del").and_then(Json::as_array).into_iter().flatten() {
+            materialized.del(table, row);
+        }
+        for row in change.get("put").and_then(Json::as_array).into_iter().flatten() {
+            materialized.put(table, row.clone());
         }
     }
 }
@@ -608,6 +737,9 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
             tokio::time::sleep(RECONNECT_DELAY).await;
         }
         first = false;
+        if worker.shared.stopped.load(Ordering::Acquire) {
+            return;
+        }
         let socket = match tokio_tungstenite::connect_async(&worker.url).await {
             Ok((socket, _)) => socket,
             Err(_) => continue,
@@ -652,7 +784,10 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
                             break;
                         }
                     }
-                    None => return,
+                    Some(Outgoing::Stop) | None => {
+                        let _ = sink.close().await;
+                        return;
+                    }
                 },
             }
         }
@@ -716,12 +851,16 @@ fn inbound(worker: &Worker, text: &str) {
                 (None, Some(snapshot)) => {
                     // A resubscribe after a reconnect: no caller waits, so
                     // the store is built from the types already known and
-                    // the cache refilled without a read.
-                    if let Verdict::Rows(rows) = worker.materialize(id, snapshot) {
-                        let key = worker.state.lock().expect("state").by_id.get(&id).cloned();
-                        if let (Some(key), Some(cache)) = (key, shared.cache()) {
-                            cache.replace(&key, rows);
-                        }
+                    // the cache refilled without a read. An id nobody
+                    // holds any more (the wait timed out) gets no store.
+                    let key = worker.state.lock().expect("state").by_id.get(&id).cloned();
+                    let Some(key) = key else {
+                        return;
+                    };
+                    if let Verdict::Rows { rows, store_bytes } = worker.materialize(id, snapshot)
+                        && let Some(cache) = shared.cache()
+                    {
+                        cache.replace(&key, rows, store_bytes);
                     }
                 }
                 (None, None) => {}
@@ -744,6 +883,7 @@ fn inbound(worker: &Worker, text: &str) {
                 if let Some(key) = &key {
                     state.by_key.remove(key);
                 }
+                worker.note_held(&state);
                 (reply, key)
             };
             if let Some(key) = &key {
@@ -766,31 +906,45 @@ fn inbound(worker: &Worker, text: &str) {
             let Some(id) = body.get("id").and_then(Json::as_u64) else {
                 return;
             };
-            let outcome = {
-                let mut state = worker.state.lock().expect("state");
-                let key = state.by_id.get(&id).cloned();
-                match (key, state.materialized.get_mut(&id)) {
-                    (Some(key), Some(materialized)) => {
-                        for change in body.get("changes").and_then(Json::as_array).into_iter().flatten() {
-                            let Some(table) = change.get("table").and_then(Json::as_str) else {
-                                continue;
-                            };
-                            for row in change.get("del").and_then(Json::as_array).into_iter().flatten() {
-                                materialized.del(table, row);
-                            }
-                            for row in change.get("put").and_then(Json::as_array).into_iter().flatten() {
-                                materialized.put(table, row.clone());
+            // The worker's lock is held only to find the store; the
+            // delta is applied under the store's own.
+            let (key, store) = {
+                let state = worker.state.lock().expect("state");
+                (state.by_id.get(&id).cloned(), state.materialized.get(&id).cloned())
+            };
+            let Some(key) = key else {
+                return;
+            };
+            let rows = match store {
+                Some(store) => {
+                    let mut store = store.lock().expect("store");
+                    match &mut *store {
+                        Store::Building(queued) => {
+                            queued.push(body);
+                            return;
+                        }
+                        Store::Ready(materialized) => {
+                            apply_delta(materialized, &body);
+                            match materialized.rows() {
+                                Ok(rows) => Some((rows, materialized.byte_len())),
+                                Err(error) => {
+                                    // A value the client cannot encode
+                                    // arrived: from here on the query is
+                                    // refilled from Postgres.
+                                    drop(store);
+                                    worker.state.lock().expect("state").materialized.remove(&id);
+                                    shared.fell_back(error.0);
+                                    None
+                                }
                             }
                         }
-                        Some((key, materialized.rows().ok()))
                     }
-                    (Some(key), None) => Some((key, None)),
-                    (None, _) => None,
                 }
+                None => None,
             };
-            if let (Some((key, rows)), Some(cache)) = (outcome, shared.cache()) {
+            if let Some(cache) = shared.cache() {
                 match rows {
-                    Some(rows) => cache.replace(&key, rows),
+                    Some((rows, store_bytes)) => cache.replace(&key, rows, store_bytes),
                     None => cache.touched(&key),
                 }
             }

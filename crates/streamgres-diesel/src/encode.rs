@@ -149,13 +149,11 @@ fn scalar(cell: &Json, type_oid: u32, name: &str) -> Result<Vec<u8>, Unsupported
         oid::UUID => {
             let text = text(cell, name)?;
             let hex: String = text.chars().filter(|c| *c != '-').collect();
-            if hex.len() != 32 {
+            let bytes = hex_bytes(&hex).ok_or_else(|| mismatch(name, "a UUID"))?;
+            if bytes.len() != 16 {
                 return Err(mismatch(name, "a UUID"));
             }
-            (0..16)
-                .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16))
-                .collect::<Result<Vec<u8>, _>>()
-                .map_err(|_| mismatch(name, "a UUID"))?
+            bytes
         }
         // The engine carries `bytea` as Postgres's hex text, `\x` and two
         // digits per byte; the binary format is the bytes themselves.
@@ -164,13 +162,7 @@ fn scalar(cell: &Json, type_oid: u32, name: &str) -> Result<Vec<u8>, Unsupported
             let hex = text
                 .strip_prefix("\\x")
                 .ok_or_else(|| mismatch(name, "hex bytea"))?;
-            if hex.len() % 2 != 0 {
-                return Err(mismatch(name, "hex bytea"));
-            }
-            (0..hex.len() / 2)
-                .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16))
-                .collect::<Result<Vec<u8>, _>>()
-                .map_err(|_| mismatch(name, "hex bytea"))?
+            hex_bytes(hex).ok_or_else(|| mismatch(name, "hex bytea"))?
         }
         oid::JSON => serde_json::to_vec(cell).map_err(|_| mismatch(name, "JSON"))?,
         oid::JSONB => {
@@ -229,6 +221,24 @@ fn integer(cell: &Json, name: &str) -> Result<i64, Unsupported> {
 
 fn float(cell: &Json, name: &str) -> Result<f64, Unsupported> {
     cell.as_f64().ok_or_else(|| mismatch(name, "a number"))
+}
+
+/// Decodes hex digits, two per byte. `None` for an odd length or
+/// anything that is not an ASCII hex digit; never panics, whatever the
+/// text holds.
+fn hex_bytes(hex: &str) -> Option<Vec<u8>> {
+    let digits = hex.as_bytes();
+    if !digits.len().is_multiple_of(2) {
+        return None;
+    }
+    digits
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16)?;
+            let low = (pair[1] as char).to_digit(16)?;
+            Some((high * 16 + low) as u8)
+        })
+        .collect()
 }
 
 fn text(cell: &Json, name: &str) -> Result<String, Unsupported> {
@@ -290,6 +300,21 @@ mod tests {
             bytes(encode(&json!(PG_EPOCH_MICROS + 2 * 86_400_000_000), &base(oid::DATE)).unwrap()),
             2i32.to_be_bytes()
         );
+    }
+
+    #[test]
+    fn malformed_hex_is_refused_not_panicked() {
+        // A multi-byte character where a hex digit should be: slicing by
+        // byte index would land inside it and panic.
+        let uuid = base(oid::UUID);
+        assert!(encode(&json!("é1234567-89ab-cdef-0123-456789abcdef"), &uuid).is_err());
+        assert!(encode(&json!("ééééééééééééééééééééééééééééééé"), &uuid).is_err());
+        assert!(encode(&json!("12345678-89ab-cdef-0123-456789abcde"), &uuid).is_err(), "too short");
+        let bytea = base(oid::BYTEA);
+        assert!(encode(&json!("\\xé0"), &bytea).is_err());
+        assert!(encode(&json!("\\xzz"), &bytea).is_err());
+        assert!(encode(&json!("\\x0"), &bytea).is_err(), "odd length");
+        assert_eq!(hex_bytes("00ff"), Some(vec![0, 255]));
     }
 
     #[test]

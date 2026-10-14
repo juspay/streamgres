@@ -36,7 +36,9 @@ pub enum Verdict {
     Accepted,
     /// The engine serves the rows itself: here is the result, and every
     /// change will replace the cache's entry. No Postgres read.
-    Rows(Arc<[OwnedRow]>),
+    /// `store_bytes` is what the engine side keeps for the query, so
+    /// the cache can weigh it.
+    Rows { rows: Arc<[OwnedRow]>, store_bytes: usize },
     /// The engine cannot follow this query; the read goes to Postgres and
     /// is not cached. The reason is for logs and stats.
     Refused(String),

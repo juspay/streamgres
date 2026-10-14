@@ -18,16 +18,26 @@
 //! Between subscribing and filling there is a window: the read runs, and a
 //! touch may arrive for the key before the rows are in. A generation per
 //! key closes it. [`Cache::reserve`] takes the generation before the read,
-//! [`Cache::fill`] stores the rows only if no touch bumped it since.
+//! [`Cache::fill`] stores the rows only if no touch bumped it since. A
+//! generation exists only while a read holds a [`Reservation`] on its
+//! key: a touch on a key nobody is filling has nothing to invalidate but
+//! the entry, so the map holds the keys in flight, not every key ever
+//! seen.
+//!
+//! The cache also keeps the one clock the read-your-writes window needs:
+//! when any connection through it last wrote. A pool's connections
+//! share a cache, so a write on one is followed by reads on another, and
+//! those must see it too.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use diesel::pg::PgMetadataCache;
 use moka::notification::RemovalCause;
 
-use crate::key::QueryKey;
+use crate::key::{QueryKey, QueryShape};
 use crate::row::OwnedRow;
 use crate::subscriptions::Subscriptions;
 
@@ -39,34 +49,38 @@ pub struct Entry {
 }
 
 impl Entry {
-    fn new(rows: Arc<[OwnedRow]>, key: &QueryKey) -> Entry {
-        let bytes = key.byte_len()
-            + rows.iter().map(OwnedRow::byte_len).sum::<usize>()
-            + rows.len() * ROW_OVERHEAD;
+    /// `extra` is what the entry costs beyond its rows: the engine-side
+    /// store a rows-mode subscription keeps for it.
+    fn new(rows: Arc<[OwnedRow]>, key: &QueryKey, extra: usize) -> Entry {
+        let bytes = key.byte_len() + rows.iter().map(OwnedRow::byte_len).sum::<usize>() + extra;
         Entry { rows, bytes }
     }
-}
 
-/// What a row costs beyond its bytes: its vector of values and the
-/// bookkeeping around it. A rough figure; the budget is a ceiling, not an
-/// accounting.
-const ROW_OVERHEAD: usize = 64;
+    /// What the entry weighs against the byte budget.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
 
 /// What bounds the cache: bytes, idle time, time to live, and how long a
 /// refusal is remembered. From the environment through
 /// [`Limits::from_env`]:
 ///
-/// | variable                       | meaning                                      | default   |
-/// |--------------------------------|----------------------------------------------|-----------|
-/// | `STREAMGRES_CACHE_MAX_BYTES`   | rows and keys held, in bytes                 | 268435456 |
-/// | `STREAMGRES_CACHE_IDLE_MS`     | drop an entry unread for this long; 0 never  | 1800000   |
-/// | `STREAMGRES_CACHE_TTL_MS`      | drop an entry this old however read; 0 never | 0         |
-/// | `STREAMGRES_REFUSED_TTL_MS`    | do not re-ask the engine about a refused query for this long; 0 always ask | 30000 |
+/// | variable                           | meaning                                      | default   |
+/// |------------------------------------|----------------------------------------------|-----------|
+/// | `STREAMGRES_CACHE_MAX_BYTES`       | rows and keys held, in bytes                 | 268435456 |
+/// | `STREAMGRES_CACHE_MAX_ENTRY_BYTES` | the largest result kept; 0 no limit          | 16777216  |
+/// | `STREAMGRES_CACHE_IDLE_MS`         | drop an entry unread for this long; 0 never  | 1800000   |
+/// | `STREAMGRES_CACHE_TTL_MS`          | drop an entry this old however read; 0 never | 0         |
+/// | `STREAMGRES_REFUSED_TTL_MS`        | do not re-ask the engine about a refused query for this long; 0 always ask | 30000 |
 ///
 /// A value that is missing or not a number leaves the default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
     pub max_bytes: u64,
+    /// A result larger than this is served but not kept, and its
+    /// subscription ends: one query must not take the whole budget.
+    pub max_entry_bytes: u64,
     pub time_to_idle: Option<Duration>,
     pub time_to_live: Option<Duration>,
     /// A query the engine refused (a shape outside its subset) would
@@ -76,6 +90,7 @@ pub struct Limits {
 }
 
 pub const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_TIME_TO_IDLE: Duration = Duration::from_secs(30 * 60);
 pub const DEFAULT_REFUSED_FOR: Duration = Duration::from_secs(30);
 
@@ -83,6 +98,7 @@ impl Default for Limits {
     fn default() -> Limits {
         Limits {
             max_bytes: DEFAULT_MAX_BYTES,
+            max_entry_bytes: DEFAULT_MAX_ENTRY_BYTES,
             time_to_idle: Some(DEFAULT_TIME_TO_IDLE),
             time_to_live: None,
             refused_for: Some(DEFAULT_REFUSED_FOR),
@@ -100,6 +116,11 @@ impl Limits {
         };
         Limits {
             max_bytes: env_number("STREAMGRES_CACHE_MAX_BYTES").unwrap_or(defaults.max_bytes),
+            max_entry_bytes: match env_number("STREAMGRES_CACHE_MAX_ENTRY_BYTES") {
+                Some(0) => u64::MAX,
+                Some(bytes) => bytes,
+                None => defaults.max_entry_bytes,
+            },
             time_to_idle: millis("STREAMGRES_CACHE_IDLE_MS", defaults.time_to_idle),
             time_to_live: millis("STREAMGRES_CACHE_TTL_MS", defaults.time_to_live),
             refused_for: millis("STREAMGRES_REFUSED_TTL_MS", defaults.refused_for),
@@ -129,10 +150,16 @@ pub struct Stats {
     pub expired: AtomicU64,
     /// Fills dropped because the key was touched during the read.
     pub stale_fills: AtomicU64,
+    /// Results served but not kept because they were larger than
+    /// [`Limits::max_entry_bytes`].
+    pub oversized: AtomicU64,
     /// Entries the engine's own rows replaced (rows mode).
     pub replaced: AtomicU64,
     /// Reads sent to Postgres because their connection had just written.
     pub after_write: AtomicU64,
+    /// Reads sent to Postgres because the read's lock (`FOR UPDATE`)
+    /// cannot be taken on a cache.
+    pub locking: AtomicU64,
 }
 
 impl Stats {
@@ -141,16 +168,57 @@ impl Stats {
     }
 }
 
-type Generations = Arc<Mutex<HashMap<QueryKey, u64>>>;
+/// A key's generation while reads are in flight for it.
+#[derive(Default)]
+struct Slot {
+    generation: u64,
+    inflight: u32,
+}
+
+type Generations = Arc<Mutex<HashMap<QueryKey, Slot>>>;
+
+/// A read's claim on a key between reserving it and filling it. Dropping
+/// it, with or without a fill, lets the key's generation go once no
+/// other read holds one.
+pub struct Reservation {
+    generations: Generations,
+    key: QueryKey,
+    generation: u64,
+}
+
+impl Reservation {
+    pub fn key(&self) -> &QueryKey {
+        &self.key
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let mut generations = self.generations.lock().expect("generations");
+        if let Some(slot) = generations.get_mut(&self.key) {
+            slot.inflight = slot.inflight.saturating_sub(1);
+            if slot.inflight == 0 {
+                generations.remove(&self.key);
+            }
+        }
+    }
+}
 
 pub struct Cache {
     entries: moka::sync::Cache<QueryKey, Arc<Entry>>,
     generations: Generations,
     subscriptions: Arc<dyn Subscriptions>,
-    /// Keys refused recently, each with the reason, dropped on their
+    /// Shapes refused recently, each with the reason, dropped on their
     /// own clock.
-    refused: Option<moka::sync::Cache<QueryKey, Arc<str>>>,
+    refused: Option<moka::sync::Cache<QueryShape, Arc<str>>>,
     limits: Limits,
+    /// When a connection through this cache last wrote, as nanoseconds
+    /// since `started` plus one; 0 is never.
+    last_write: AtomicU64,
+    started: Instant,
+    /// The OIDs of user-defined types, resolved once per database for
+    /// the async wrapper (the blocking one asks its connection).
+    type_metadata: Arc<Mutex<PgMetadataCache>>,
     pub stats: Arc<Stats>,
 }
 
@@ -210,25 +278,29 @@ impl Cache {
             subscriptions,
             refused,
             limits,
+            last_write: AtomicU64::new(0),
+            started: Instant::now(),
+            type_metadata: Arc::new(Mutex::new(PgMetadataCache::new())),
             stats,
         }
     }
 
     /// Counts a refusal of `key`, and when the engine side says the
-    /// reason will hold, remembers it so reads of the key skip the engine
-    /// for [`Limits::refused_for`].
+    /// reason will hold, remembers it so reads of the key's shape skip
+    /// the engine for [`Limits::refused_for`].
     pub fn refused(&self, key: &QueryKey, reason: &str) {
         Stats::bump(&self.stats.refused);
         if let Some(refused) = &self.refused
             && self.subscriptions.refusal_is_final(reason)
         {
-            refused.insert(key.clone(), Arc::from(reason));
+            refused.insert(key.shape(), Arc::from(reason));
         }
     }
 
-    /// Why `key` was refused recently, if it was; counts the skipped ask.
+    /// Why `key`'s shape was refused recently, if it was; counts the
+    /// skipped ask.
     pub fn refused_recently(&self, key: &QueryKey) -> Option<Arc<str>> {
-        let reason = self.refused.as_ref()?.get(key)?;
+        let reason = self.refused.as_ref()?.get(&key.shape())?;
         Stats::bump(&self.stats.refused_recently);
         Some(reason)
     }
@@ -258,29 +330,57 @@ impl Cache {
     }
 
     /// The key's generation, taken before the read that will fill it.
-    pub fn reserve(&self, key: &QueryKey) -> u64 {
-        self.generation(key)
+    pub fn reserve(&self, key: &QueryKey) -> Reservation {
+        let generation = {
+            let mut generations = self.generations.lock().expect("generations");
+            let slot = generations.entry(key.clone()).or_default();
+            slot.inflight += 1;
+            slot.generation
+        };
+        Reservation {
+            generations: Arc::clone(&self.generations),
+            key: key.clone(),
+            generation,
+        }
     }
 
     /// Stores the rows a read returned, unless the key was touched since
-    /// `generation` was taken. Returns whether they were stored.
-    pub fn fill(&self, key: QueryKey, generation: u64, rows: Arc<[OwnedRow]>) -> bool {
-        if self.generation(&key) != generation {
+    /// the reservation was taken or the result is over the entry limit.
+    /// Returns whether they were stored.
+    pub fn fill(&self, reservation: Reservation, rows: Arc<[OwnedRow]>) -> bool {
+        self.fill_weighing(reservation, rows, 0)
+    }
+
+    /// [`Cache::fill`] for rows the engine serves itself, weighing the
+    /// store kept for them too.
+    pub fn fill_weighing(&self, reservation: Reservation, rows: Arc<[OwnedRow]>, store_bytes: usize) -> bool {
+        if self.generation(&reservation.key) != reservation.generation {
             Stats::bump(&self.stats.stale_fills);
             return false;
         }
-        let entry = Entry::new(rows, &key);
-        self.entries.insert(key, Arc::new(entry));
-        true
+        let entry = Entry::new(rows, &reservation.key, store_bytes);
+        self.insert(&reservation.key, entry)
     }
 
     /// The engine served the rows itself: store them whatever the
     /// generation. Used by rows-mode subscriptions, whose entries are
-    /// never filled from a Postgres read.
-    pub fn replace(&self, key: &QueryKey, rows: Arc<[OwnedRow]>) {
+    /// never filled from a Postgres read; `store_bytes` is what the
+    /// store kept for them weighs.
+    pub fn replace(&self, key: &QueryKey, rows: Arc<[OwnedRow]>, store_bytes: usize) {
         Stats::bump(&self.stats.replaced);
-        let entry = Entry::new(rows, key);
+        let entry = Entry::new(rows, key, store_bytes);
+        self.insert(key, entry);
+    }
+
+    fn insert(&self, key: &QueryKey, entry: Entry) -> bool {
+        if entry.bytes as u64 > self.limits.max_entry_bytes {
+            Stats::bump(&self.stats.oversized);
+            self.entries.invalidate(key);
+            self.subscriptions.unsubscribe(key);
+            return false;
+        }
         self.entries.insert(key.clone(), Arc::new(entry));
+        true
     }
 
     /// The engine reported a change to the query's rows: drop them, so the
@@ -291,6 +391,31 @@ impl Cache {
         self.entries.invalidate(key);
     }
 
+    /// A connection through this cache wrote.
+    pub fn mark_write(&self) {
+        let nanos = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
+        self.last_write.fetch_max(nanos + 1, Ordering::Release);
+    }
+
+    /// Whether a connection through this cache wrote within `window`.
+    pub fn wrote_within(&self, window: Duration) -> bool {
+        if window.is_zero() {
+            return false;
+        }
+        match self.last_write.load(Ordering::Acquire) {
+            0 => false,
+            marked => {
+                let since = self.started.elapsed().saturating_sub(Duration::from_nanos(marked - 1));
+                since < window
+            }
+        }
+    }
+
+    /// The OIDs of user-defined types resolved so far for this database.
+    pub fn type_metadata(&self) -> &Arc<Mutex<PgMetadataCache>> {
+        &self.type_metadata
+    }
+
     /// Runs the maintenance the clocks need, so expired entries are
     /// dropped (and unsubscribed) now rather than on the next access.
     /// moka does this on its own as the cache is used; this is for
@@ -299,11 +424,14 @@ impl Cache {
         self.entries.run_pending_tasks();
     }
 
-    /// Drops every entry. Used when the engine connection was lost and the
-    /// subscriptions are re-registered from scratch.
+    /// Drops every entry and fails every fill in flight. Used when the
+    /// engine connection was lost and the subscriptions are
+    /// re-registered from scratch.
     pub fn clear(&self) {
         self.entries.invalidate_all();
-        self.generations.lock().expect("generations").clear();
+        for slot in self.generations.lock().expect("generations").values_mut() {
+            slot.generation += 1;
+        }
     }
 
     /// How many entries are in, after pending maintenance.
@@ -322,23 +450,25 @@ impl Cache {
         self.entries.weighted_size()
     }
 
+    /// How many keys have a read in flight, for tests.
+    pub fn reservations(&self) -> usize {
+        self.generations.lock().expect("generations").len()
+    }
+
     fn generation(&self, key: &QueryKey) -> u64 {
         self.generations
             .lock()
             .expect("generations")
             .get(key)
-            .copied()
-            .unwrap_or(0)
+            .map_or(0, |slot| slot.generation)
     }
 }
 
+/// Fails every fill in flight for `key`. A key with none has no
+/// generation to bump: its entry, if any, is what the caller drops.
 fn bump(generations: &Generations, key: &QueryKey) {
-    let mut generations = generations.lock().expect("generations");
-    match generations.get_mut(key) {
-        Some(generation) => *generation += 1,
-        None => {
-            generations.insert(key.clone(), 1);
-        }
+    if let Some(slot) = generations.lock().expect("generations").get_mut(key) {
+        slot.generation += 1;
     }
 }
 
@@ -354,13 +484,103 @@ impl std::fmt::Debug for Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subscriptions::Unsynced;
+
+    fn key(sql: &str) -> QueryKey {
+        QueryKey {
+            sql: sql.to_string(),
+            binds: Vec::new(),
+        }
+    }
+
+    fn no_rows() -> Arc<[OwnedRow]> {
+        Arc::from(Vec::new())
+    }
 
     #[test]
     fn limits_default_to_idle_on_and_ttl_off() {
         let limits = Limits::default();
         assert_eq!(limits.max_bytes, DEFAULT_MAX_BYTES);
+        assert_eq!(limits.max_entry_bytes, DEFAULT_MAX_ENTRY_BYTES);
         assert_eq!(limits.time_to_idle, Some(DEFAULT_TIME_TO_IDLE));
         assert_eq!(limits.time_to_live, None);
         assert_eq!(env_number("STREAMGRES_CACHE_TEST_UNSET_VARIABLE"), None);
+    }
+
+    #[test]
+    fn generations_live_only_while_a_read_is_in_flight() {
+        let cache = Cache::new(1 << 20, Arc::new(Unsynced));
+        let k = key("SELECT 1");
+        assert_eq!(cache.reservations(), 0);
+        let reservation = cache.reserve(&k);
+        assert_eq!(cache.reservations(), 1);
+        cache.touched(&k);
+        assert!(!cache.fill(reservation, no_rows()), "touched during the read");
+        assert_eq!(cache.reservations(), 0, "the reservation went with the fill");
+
+        // Touches, evictions and expiries of keys nobody is reading leave
+        // nothing behind.
+        for i in 0..1000 {
+            cache.touched(&key(&format!("SELECT {i}")));
+        }
+        assert_eq!(cache.reservations(), 0);
+
+        // A reservation dropped without a fill goes too.
+        let dropped = cache.reserve(&k);
+        drop(dropped);
+        assert_eq!(cache.reservations(), 0);
+    }
+
+    #[test]
+    fn an_older_reservation_cannot_fill_after_a_newer_one_did() {
+        let cache = Cache::new(1 << 20, Arc::new(Unsynced));
+        let k = key("SELECT 1");
+        let older = cache.reserve(&k);
+        cache.touched(&k);
+        let newer = cache.reserve(&k);
+        assert!(cache.fill(newer, no_rows()), "the newer read saw the change");
+        assert!(!cache.fill(older, no_rows()), "the older read did not");
+        assert_eq!(cache.reservations(), 0);
+    }
+
+    #[test]
+    fn a_result_over_the_entry_limit_is_not_kept() {
+        let cache = Cache::with_limits(
+            Limits {
+                max_entry_bytes: 8,
+                ..Limits::default()
+            },
+            Arc::new(Unsynced),
+        );
+        let k = key("SELECT a long enough statement");
+        let reservation = cache.reserve(&k);
+        assert!(!cache.fill(reservation, no_rows()));
+        assert_eq!(cache.stats.oversized.load(Ordering::Relaxed), 1);
+        assert!(cache.is_empty());
+        cache.replace(&k, no_rows(), 0);
+        assert!(cache.is_empty(), "the engine's rows are bounded the same way");
+    }
+
+    #[test]
+    fn the_write_clock_is_shared() {
+        let cache = Cache::new(1 << 20, Arc::new(Unsynced));
+        assert!(!cache.wrote_within(Duration::from_secs(1)));
+        cache.mark_write();
+        assert!(cache.wrote_within(Duration::from_secs(1)));
+        assert!(!cache.wrote_within(Duration::ZERO), "a zero window is off");
+    }
+
+    #[test]
+    fn a_refusal_covers_every_value_of_the_shape() {
+        let cache = Cache::new(1 << 20, Arc::new(Unsynced));
+        let mut a = key("SELECT $1");
+        a.binds.push(crate::key::Bind {
+            type_oid: 25,
+            bytes: Some(b"a".to_vec()),
+        });
+        let mut b = a.clone();
+        b.binds[0].bytes = Some(b"b".to_vec());
+        cache.refused(&a, "unsupported");
+        assert!(cache.refused_recently(&b).is_some());
     }
 }

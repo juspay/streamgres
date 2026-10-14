@@ -57,7 +57,7 @@ pub mod types;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use diesel::connection::{
     AnsiTransactionManager, ConnectionSealed, DefaultLoadingMode, Instrumentation,
@@ -171,8 +171,6 @@ pub struct SyncedConnection<C = diesel::PgConnection> {
     route: Route,
     /// A [`SyncedConnection::with_route`] scope in progress.
     scoped: Option<Route>,
-    /// When this connection last wrote, for the read-your-writes window.
-    wrote_at: Option<Instant>,
     read_your_writes: Duration,
 }
 
@@ -184,7 +182,6 @@ impl<C> SyncedConnection<C> {
             cache: None,
             route: Route::Postgres,
             scoped: None,
-            wrote_at: None,
             read_your_writes: Duration::ZERO,
         }
     }
@@ -197,7 +194,6 @@ impl<C> SyncedConnection<C> {
             cache: Some(cache),
             route,
             scoped: None,
-            wrote_at: None,
             read_your_writes: read_your_writes_from_env(),
         }
     }
@@ -221,11 +217,13 @@ impl<C> SyncedConnection<C> {
         self.route()
     }
 
-    /// How long after a write this connection's reads go to Postgres.
-    /// A write on a connection is followed, in the same flow, by reads
-    /// that expect to see it; the cache sees it only once the engine
-    /// has shipped the commit, so for this window the connection reads
-    /// the database. From `STREAMGRES_READ_YOUR_WRITES_MS` by default.
+    /// How long after a write reads through this connection's cache go
+    /// to Postgres. A write is followed, in the same flow, by reads that
+    /// expect to see it, often on another connection of the same pool;
+    /// the cache sees the write only once the engine has shipped the
+    /// commit, so for this window every connection sharing the cache
+    /// reads the database. The clock is the cache's; the window is this
+    /// connection's. From `STREAMGRES_READ_YOUR_WRITES_MS` by default.
     pub fn set_read_your_writes(&mut self, window: Duration) {
         self.read_your_writes = window;
     }
@@ -235,25 +233,35 @@ impl<C> SyncedConnection<C> {
     }
 
     fn wrote(&mut self) {
-        if !self.read_your_writes.is_zero() {
-            self.wrote_at = Some(Instant::now());
+        if let Some(cache) = &self.cache {
+            cache.mark_write();
         }
     }
 
     fn within_write_window(&self) -> bool {
-        self.wrote_at
-            .is_some_and(|wrote_at| wrote_at.elapsed() < self.read_your_writes)
+        self.cache
+            .as_ref()
+            .is_some_and(|cache| cache.wrote_within(self.read_your_writes))
     }
 
     /// Runs `f` with every read inside it routed `route`, whatever the
     /// connection's own route; a flag on the query itself still wins.
     /// For code that holds the connection anyway, such as a pool's
-    /// `interact` closure.
+    /// `interact` closure. The outer route is restored however `f`
+    /// ends, a panic included.
     pub fn with_route<R>(&mut self, route: Route, f: impl FnOnce(&mut Self) -> R) -> R {
+        struct Restore<'a, C> {
+            conn: &'a mut SyncedConnection<C>,
+            outer: Option<Route>,
+        }
+        impl<C> Drop for Restore<'_, C> {
+            fn drop(&mut self) {
+                self.conn.scoped = self.outer;
+            }
+        }
         let outer = self.scoped.replace(route);
-        let result = f(self);
-        self.scoped = outer;
-        result
+        let restore = Restore { conn: self, outer };
+        f(&mut *restore.conn)
     }
 
     /// The cache this connection reads through, if any.
@@ -279,7 +287,11 @@ where
     fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
         // Raw SQL may write; so does the ANSI manager's COMMIT, which is
         // when a transaction's writes become what the next read expects.
-        self.wrote();
+        // Opening, naming a point in, or abandoning a transaction writes
+        // nothing.
+        if may_write(query) {
+            self.wrote();
+        }
         self.inner.batch_execute(query)
     }
 }
@@ -371,6 +383,12 @@ where
         if route == Route::Postgres || in_transaction(&mut self.inner) {
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
+        if key.is_locking() {
+            // The lock is the point: `FOR UPDATE` outside a transaction
+            // still blocks a concurrent writer for the statement.
+            cache.stats.locking.fetch_add(1, Ordering::Relaxed);
+            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+        }
         if self.within_write_window() {
             cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
@@ -386,27 +404,49 @@ where
         // The generation is taken before subscribing: a touch, or an
         // expiry that ends the subscription, between here and the fill
         // leaves nothing cached rather than something no one updates.
-        let generation = cache.reserve(&key);
+        let reservation = cache.reserve(&key);
         match cache.subscriptions().subscribe_with(&key, &mut self.inner) {
             Verdict::Refused(reason) => {
                 cache.refused(&key, &reason);
                 return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
             }
-            Verdict::Rows(rows) => {
+            Verdict::Rows { rows, store_bytes } => {
                 // The engine's own rows: no Postgres read at all.
-                cache.fill(key, generation, Arc::clone(&rows));
+                cache.fill_weighing(reservation, Arc::clone(&rows), store_bytes);
                 return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
             }
             Verdict::Accepted => {}
         }
 
         // Subscribed: the engine reports every change from here on, so
-        // what Postgres returns now is current until the first touch.
-        let live = LoadConnection::<DefaultLoadingMode>::load(&mut self.inner, source)?;
-        let rows: Arc<[OwnedRow]> = Arc::from(capture_all(live)?);
-        cache.fill(key, generation, Arc::clone(&rows));
+        // what Postgres returns now is current until the first touch. A
+        // read that fails leaves no entry, so the subscription ends with
+        // it rather than being held for nothing.
+        let rows = LoadConnection::<DefaultLoadingMode>::load(&mut self.inner, source)
+            .and_then(capture_all);
+        let rows: Arc<[OwnedRow]> = match rows {
+            Ok(rows) => Arc::from(rows),
+            Err(error) => {
+                cache.subscriptions().unsubscribe(&key);
+                return Err(error);
+            }
+        };
+        cache.fill(reservation, Arc::clone(&rows));
         Ok(SyncedCursor::Cached(OwnedCursor::new(rows)))
     }
+}
+
+/// Whether raw SQL could change what a read sees: anything but the
+/// statements that only move a transaction along without committing it.
+pub(crate) fn may_write(sql: &str) -> bool {
+    let head = sql.trim_start().trim_start_matches('(');
+    let word = head
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("");
+    !["BEGIN", "START", "SAVEPOINT", "RELEASE", "ROLLBACK", "SET", "RESET", "SHOW"]
+        .iter()
+        .any(|statement| word.eq_ignore_ascii_case(statement))
 }
 
 /// Whether a transaction is open on the connection. Inside one, reads must

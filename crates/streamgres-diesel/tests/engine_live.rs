@@ -908,3 +908,50 @@ fn bytea_and_offset_are_served_from_engine_rows() {
     assert_eq!(live.engine.materialized(), 2, "{:?}", live.engine.fallbacks());
     let _ = diesel::delete(sg_blobs::table.filter(sg_blobs::name.like(format!("{prefix}%")))).execute(&mut live.other);
 }
+
+#[test]
+fn a_row_inserted_and_deleted_in_one_transaction_is_not_kept() {
+    let Some(mut live) = Live::start("ghost") else {
+        return;
+    };
+    live.put("real", "1");
+    let names = vec![live.key("real"), live.key("ghost")];
+    let page = |conn: &mut SyncedConnection<PgConnection>| -> Vec<(String, String)> {
+        sg_configs::table
+            .filter(sg_configs::key.eq_any(&names))
+            .select((sg_configs::key, sg_configs::value))
+            .order(sg_configs::key.asc())
+            .load(conn)
+            .unwrap()
+    };
+    assert_eq!(page(&mut live.conn), vec![(live.key("real"), "1".to_string())]);
+    assert_eq!(live.engine.materialized(), 1, "rows mode: {:?}", live.engine.fallbacks());
+
+    // One transaction: a matching row comes and goes, and another row
+    // changes so the delta's arrival can be seen. The engine folds the
+    // ghost into an add and a delete; one frame must not leave it behind.
+    let (real, ghost) = (live.key("real"), live.key("ghost"));
+    live.other
+        .transaction::<_, diesel::result::Error, _>(|conn| {
+            diesel::insert_into(sg_configs::table)
+                .values((sg_configs::key.eq(&ghost), sg_configs::value.eq("boo")))
+                .execute(conn)?;
+            diesel::delete(sg_configs::table.filter(sg_configs::key.eq(&ghost))).execute(conn)?;
+            diesel::update(sg_configs::table.filter(sg_configs::key.eq(&real)))
+                .set(sg_configs::value.eq("2"))
+                .execute(conn)?;
+            Ok(())
+        })
+        .unwrap();
+    let started = Instant::now();
+    loop {
+        let got = page(&mut live.conn);
+        if got.iter().any(|(_, value)| value == "2") {
+            assert_eq!(got, vec![(real.clone(), "2".to_string())], "the ghost row must not be in the result");
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "the delta did not arrive: {got:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(live.cache.stats.touched.load(Ordering::Relaxed), 0, "served from engine rows throughout");
+}
