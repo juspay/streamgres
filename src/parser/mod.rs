@@ -983,8 +983,24 @@ impl Parser<'_> {
             }));
         }
         let comparison_operator = if self.eat_sym("=") {
+            // `= ANY($1)` with an array parameter is how ORMs render an
+            // `IN` list: one bind, many values.
+            if self.eat_word("ANY") {
+                return Ok(Where::Condition(Condition {
+                    column,
+                    comparison_operator: ComparisonOperator::IN,
+                    value: self.quantified_list("ANY")?,
+                }));
+            }
             ComparisonOperator::EQ
         } else if self.eat_sym("!=") {
+            if self.eat_word("ALL") {
+                return Ok(Where::Condition(Condition {
+                    column,
+                    comparison_operator: ComparisonOperator::NOT_IN,
+                    value: self.quantified_list("ALL")?,
+                }));
+            }
             ComparisonOperator::NEQ
         } else if self.eat_sym(">=") {
             ComparisonOperator::GTE
@@ -1021,6 +1037,22 @@ impl Parser<'_> {
     }
 
     /// The parenthesised value list of `IN` / `NOT IN`.
+    /// The `(value)` after `ANY` / `ALL`: a list literal or a bind that
+    /// decodes to one.
+    fn quantified_list(&mut self, quantifier: &str) -> Result<Value, ParseError> {
+        let at = self.at();
+        self.expect_sym("(")?;
+        let value = self.value()?;
+        self.expect_sym(")")?;
+        match value {
+            Value::List(_) => Ok(value),
+            other => Err(ParseError {
+                message: format!("{quantifier} needs an array, found {other:?}"),
+                position: at,
+            }),
+        }
+    }
+
     fn value_list(&mut self) -> Result<Value, ParseError> {
         self.expect_sym("(")?;
         let mut items = Vec::new();
@@ -1382,6 +1414,54 @@ mod tests {
         let junk = parse_read(r#"SELECT "tickets"."status" 'x' FROM "tickets""#, &catalog())
             .expect_err("a literal where a column list belongs");
         assert!(junk.message.contains("expected FROM"), "{}", junk.message);
+    }
+
+    #[test]
+    fn eq_any_with_an_array_bind_is_an_in_list() {
+        // text[] of ["OPEN", "DONE"] as Diesel binds `eq_any`.
+        let mut bytes = Vec::new();
+        for word in [1i32, 0, 25, 2, 1] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        for item in ["OPEN", "DONE"] {
+            bytes.extend_from_slice(&(item.len() as i32).to_be_bytes());
+            bytes.extend_from_slice(item.as_bytes());
+        }
+        let array = BindValue {
+            type_oid: 1009,
+            bytes: Some(bytes),
+        };
+        let any = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE ("tickets"."status" = ANY($1))"#,
+            std::slice::from_ref(&array),
+            &catalog(),
+        )
+        .expect("= ANY parses");
+        let literal = parse_read(
+            "SELECT * FROM tickets WHERE status IN ('OPEN', 'DONE')",
+            &catalog(),
+        )
+        .unwrap();
+        assert_eq!(any, literal);
+        let all = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE ("tickets"."status" != ALL($1))"#,
+            &[array],
+            &catalog(),
+        )
+        .expect("!= ALL parses");
+        let literal = parse_read(
+            "SELECT * FROM tickets WHERE status NOT IN ('OPEN', 'DONE')",
+            &catalog(),
+        )
+        .unwrap();
+        assert_eq!(all, literal);
+        let scalar = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = ANY($1)"#,
+            &[text_bind("OPEN")],
+            &catalog(),
+        )
+        .expect_err("a scalar after ANY");
+        assert!(scalar.message.contains("needs an array"), "{}", scalar.message);
     }
 
     #[test]

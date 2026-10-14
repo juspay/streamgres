@@ -43,6 +43,23 @@ mod oid {
     pub const NUMERIC: u32 = 1700;
     pub const UUID: u32 = 2950;
     pub const JSONB: u32 = 3802;
+
+    /// Array types, by element: what `= ANY($1)` binds.
+    pub const BOOL_ARRAY: u32 = 1000;
+    pub const INT2_ARRAY: u32 = 1005;
+    pub const INT4_ARRAY: u32 = 1007;
+    pub const INT8_ARRAY: u32 = 1016;
+    pub const TEXT_ARRAY: u32 = 1009;
+    pub const VARCHAR_ARRAY: u32 = 1015;
+    pub const BPCHAR_ARRAY: u32 = 1014;
+    pub const FLOAT4_ARRAY: u32 = 1021;
+    pub const FLOAT8_ARRAY: u32 = 1022;
+    pub const NUMERIC_ARRAY: u32 = 1231;
+    pub const DATE_ARRAY: u32 = 1182;
+    pub const TIMESTAMP_ARRAY: u32 = 1115;
+    pub const TIMESTAMPTZ_ARRAY: u32 = 1185;
+    pub const UUID_ARRAY: u32 = 2951;
+    pub const JSONB_ARRAY: u32 = 3807;
 }
 
 /// Milliseconds from the Unix epoch to Postgres's epoch (2000-01-01).
@@ -108,8 +125,65 @@ pub fn decode(bind: &BindValue) -> Result<Value, String> {
             Value::Int(i64::from(days) * 86_400_000 + PG_EPOCH_MILLIS)
         }
         oid::BYTEA => return Err("a bytea bind cannot be compared on".to_string()),
+        oid::BOOL_ARRAY
+        | oid::INT2_ARRAY
+        | oid::INT4_ARRAY
+        | oid::INT8_ARRAY
+        | oid::TEXT_ARRAY
+        | oid::VARCHAR_ARRAY
+        | oid::BPCHAR_ARRAY
+        | oid::FLOAT4_ARRAY
+        | oid::FLOAT8_ARRAY
+        | oid::NUMERIC_ARRAY
+        | oid::DATE_ARRAY
+        | oid::TIMESTAMP_ARRAY
+        | oid::TIMESTAMPTZ_ARRAY
+        | oid::UUID_ARRAY
+        | oid::JSONB_ARRAY => Value::List(array(bytes)?),
         other => return Err(format!("a bind of type oid {other} is not supported")),
     })
+}
+
+/// Postgres's binary array: dimensions, a has-nulls flag, the element
+/// type, then per dimension a length and lower bound, then each element
+/// as its length (`-1` for NULL) and bytes. Only one dimension is a list
+/// a predicate can use.
+fn array(bytes: &[u8]) -> Result<Vec<Value>, String> {
+    let word = |at: usize| -> Result<i32, String> {
+        bytes
+            .get(at..at + 4)
+            .map(|b| i32::from_be_bytes(b.try_into().unwrap()))
+            .ok_or_else(|| "an array bind ends inside its header".to_string())
+    };
+    let dimensions = word(0)?;
+    let element_oid = word(8)? as u32;
+    if dimensions == 0 {
+        return Ok(Vec::new());
+    }
+    if dimensions != 1 {
+        return Err(format!("an array bind has {dimensions} dimensions, not one"));
+    }
+    let length = usize::try_from(word(12)?).map_err(|_| "an array bind has a negative length")?;
+    let mut at = 20;
+    let mut items = Vec::with_capacity(length);
+    for _ in 0..length {
+        let size = word(at)?;
+        at += 4;
+        if size < 0 {
+            items.push(Value::Null);
+            continue;
+        }
+        let size = size as usize;
+        let element = bytes
+            .get(at..at + size)
+            .ok_or_else(|| "an array bind ends inside an element".to_string())?;
+        items.push(decode(&BindValue {
+            type_oid: element_oid,
+            bytes: Some(element.to_vec()),
+        })?);
+        at += size;
+    }
+    Ok(items)
 }
 
 fn utf8(bytes: &[u8], type_oid: u32) -> Result<&str, String> {
@@ -279,6 +353,42 @@ mod tests {
             bytes.extend_from_slice(&word.to_be_bytes());
         }
         assert_eq!(decode(&bind(oid::NUMERIC, &bytes)), Ok(Value::Float(70000.0)));
+    }
+
+    #[test]
+    fn arrays_become_lists() {
+        // text[] of ["OPEN", NULL, "DONE"]
+        let mut bytes = Vec::new();
+        for word in [1i32, 1, 25, 3, 1] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        bytes.extend_from_slice(&4i32.to_be_bytes());
+        bytes.extend_from_slice(b"OPEN");
+        bytes.extend_from_slice(&(-1i32).to_be_bytes());
+        bytes.extend_from_slice(&4i32.to_be_bytes());
+        bytes.extend_from_slice(b"DONE");
+        assert_eq!(
+            decode(&bind(oid::TEXT_ARRAY, &bytes)),
+            Ok(Value::List(vec![
+                Value::String("OPEN".into()),
+                Value::Null,
+                Value::String("DONE".into())
+            ]))
+        );
+        // int8[] of [7]
+        let mut bytes = Vec::new();
+        for word in [1i32, 0, 20, 1, 1, 8] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        bytes.extend_from_slice(&7i64.to_be_bytes());
+        assert_eq!(decode(&bind(oid::INT8_ARRAY, &bytes)), Ok(Value::List(vec![Value::Int(7)])));
+        // an empty array: zero dimensions
+        let mut bytes = Vec::new();
+        for word in [0i32, 0, 25] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        assert_eq!(decode(&bind(oid::TEXT_ARRAY, &bytes)), Ok(Value::List(vec![])));
+        assert!(decode(&bind(oid::TEXT_ARRAY, &[0, 0, 0, 2])).is_err());
     }
 
     #[test]
