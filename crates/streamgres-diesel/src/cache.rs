@@ -117,6 +117,8 @@ pub struct Stats {
     pub stale_fills: AtomicU64,
     /// Entries the engine's own rows replaced (rows mode).
     pub replaced: AtomicU64,
+    /// Reads sent to Postgres because their connection had just written.
+    pub after_write: AtomicU64,
 }
 
 impl Stats {

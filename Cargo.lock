@@ -500,6 +500,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "diesel-async"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fcc26599f590c7e5b182a05061cfb445f216bb069df72eb31f38cffde8ca598"
+dependencies = [
+ "diesel",
+ "futures-core",
+ "futures-util",
+ "scoped-futures",
+ "tokio",
+ "tokio-postgres",
+]
+
+[[package]]
 name = "diesel_derives"
 version = "2.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2309,6 +2323,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scoped-futures"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b24aae2d0636530f359e9d5ef0c04669d11c5e756699b27a6a6d845d8329091"
+dependencies = [
+ "pin-project-lite",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2585,6 +2608,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "diesel",
+ "diesel-async",
  "futures-util",
  "moka",
  "serde_json",

@@ -303,8 +303,15 @@ fn inside_a_transaction_reads_see_the_connections_own_writes() {
         })
         .expect("transaction");
     assert_eq!(seen, "2", "the read inside the transaction went to Postgres");
-    assert_eq!(w.read("count").as_deref(), Some("1"), "outside it the cache still holds the old row until a touch");
     assert_eq!(w.engine.subscribed.lock().unwrap().len(), 1, "the transactional read did not subscribe");
+    // Right after the COMMIT the connection is in its read-your-writes
+    // window and reads Postgres; the entry itself is untouched until the
+    // engine says so.
+    assert_eq!(w.read("count").as_deref(), Some("2"));
+    let cache_key = w.key_of("count");
+    assert_eq!(w.cache.get(&cache_key).map(|entry| entry.rows.len()), Some(1), "the entry is still the old row");
+    w.conn.set_read_your_writes(std::time::Duration::ZERO);
+    assert_eq!(w.read("count").as_deref(), Some("1"), "outside the window the cache still holds the old row until a touch");
 }
 
 #[test]
@@ -538,4 +545,41 @@ fn time_to_live_drops_an_entry_however_often_it_is_read() {
     w.put("mode", "b");
     assert_eq!(w.read("mode").as_deref(), Some("b"), "resubscribed and refilled");
     assert_eq!(w.engine.subscribed.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn after_a_write_the_connection_reads_postgres_for_a_window() {
+    let mut w = World::new("ryw");
+    w.conn.set_read_your_writes(std::time::Duration::from_millis(150));
+    w.put("mode", "a");
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+
+    // The write goes through the synced connection itself.
+    let key = w.key("mode");
+    diesel::update(sg_configs::table.filter(sg_configs::key.eq(&key)))
+        .set(sg_configs::value.eq("b"))
+        .execute(&mut w.conn)
+        .unwrap();
+    let sent = w.sent();
+    assert_eq!(w.read("mode").as_deref(), Some("b"), "its own write is seen at once");
+    assert_eq!(w.sent(), sent + 1, "read from Postgres");
+    assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 1);
+
+    // The window closes; the entry was neither used nor refreshed by the
+    // bypass, so without an engine touch the old rows are back.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let sent = w.sent();
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    assert_eq!(w.sent(), sent, "served from the cache again");
+
+    // A transaction's writes count from its COMMIT.
+    w.conn
+        .transaction::<_, diesel::result::Error, _>(|conn| {
+            diesel::update(sg_configs::table.filter(sg_configs::key.eq(&key)))
+                .set(sg_configs::value.eq("c"))
+                .execute(conn)?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(w.read("mode").as_deref(), Some("c"));
 }

@@ -249,6 +249,20 @@ engine streams is therefore just a live read.
 `Consistency::Eventual` and `Consistency::Strong` remain as the earlier
 names of the two routes.
 
+The two routes can disagree for a moment, by design: between a commit
+and the engine's delta, a Postgres read sees the new row and a
+Streamgres read of the same query still sees the old one. A Postgres
+read is a bypass, not a write-through: it does not refresh the entry.
+Where that bites is one flow that writes and then reads. So after any
+write on a connection (`execute`, raw SQL, `INSERT ... RETURNING`, a
+transaction's COMMIT) that connection's reads go to Postgres for
+`STREAMGRES_READ_YOUR_WRITES_MS` (default 1000; 0 turns it off;
+`set_read_your_writes` per connection), counted in
+`Stats::after_write`. A read that must never be behind the database is
+flagged Postgres; everything else accepts being the engine's
+propagation delay behind, a fraction of a millisecond locally and the
+WAL lag in production.
+
 ## Open points carried from the roadmap call
 
 - id construct: subscription id = hash of SQL plus binds; client id per

@@ -17,7 +17,9 @@
 //!   ([`RouteDsl::via`]), or in a [`SyncedConnection::with_route`] scope,
 //!   or by the connection's own route, in that order of precedence;
 //! - no transaction is open on it (inside one, the application must see
-//!   its own writes);
+//!   its own writes), and the connection has not written for the last
+//!   [`SyncedConnection::read_your_writes`] window (after one, it must
+//!   see what it wrote before the engine has shipped it);
 //! - the statement is a `SELECT` (Diesel sends `INSERT ... RETURNING`
 //!   through the same path);
 //! - the engine accepted a subscription for the query
@@ -53,6 +55,7 @@ pub mod types;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use diesel::connection::{
     AnsiTransactionManager, ConnectionSealed, DefaultLoadingMode, Instrumentation,
@@ -126,6 +129,25 @@ impl Settings {
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
+/// How long after a write a connection's reads go to Postgres when the
+/// environment says nothing.
+pub const DEFAULT_READ_YOUR_WRITES: Duration = Duration::from_millis(1000);
+
+/// `STREAMGRES_READ_YOUR_WRITES_MS`: how long after a write a
+/// connection's reads go to Postgres, so a flow that writes and then
+/// reads sees its own write before the engine has shipped it. 0 turns
+/// the window off. Read once per process.
+pub fn read_your_writes_from_env() -> Duration {
+    static WINDOW: OnceLock<Duration> = OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        std::env::var("STREAMGRES_READ_YOUR_WRITES_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_READ_YOUR_WRITES)
+    })
+}
+
 /// Installs the process-wide settings. Connections established after this
 /// (including by pools, which call [`Connection::establish`]) use them;
 /// before it, every connection is a passthrough. Returns the settings back
@@ -145,6 +167,9 @@ pub struct SyncedConnection<C = diesel::PgConnection> {
     route: Route,
     /// A [`SyncedConnection::with_route`] scope in progress.
     scoped: Option<Route>,
+    /// When this connection last wrote, for the read-your-writes window.
+    wrote_at: Option<Instant>,
+    read_your_writes: Duration,
 }
 
 impl<C> SyncedConnection<C> {
@@ -155,6 +180,8 @@ impl<C> SyncedConnection<C> {
             cache: None,
             route: Route::Postgres,
             scoped: None,
+            wrote_at: None,
+            read_your_writes: Duration::ZERO,
         }
     }
 
@@ -166,6 +193,8 @@ impl<C> SyncedConnection<C> {
             cache: Some(cache),
             route,
             scoped: None,
+            wrote_at: None,
+            read_your_writes: read_your_writes_from_env(),
         }
     }
 
@@ -186,6 +215,30 @@ impl<C> SyncedConnection<C> {
     /// The earlier name of [`SyncedConnection::route`].
     pub fn consistency(&self) -> Consistency {
         self.route()
+    }
+
+    /// How long after a write this connection's reads go to Postgres.
+    /// A write on a connection is followed, in the same flow, by reads
+    /// that expect to see it; the cache sees it only once the engine
+    /// has shipped the commit, so for this window the connection reads
+    /// the database. From `STREAMGRES_READ_YOUR_WRITES_MS` by default.
+    pub fn set_read_your_writes(&mut self, window: Duration) {
+        self.read_your_writes = window;
+    }
+
+    pub fn read_your_writes(&self) -> Duration {
+        self.read_your_writes
+    }
+
+    fn wrote(&mut self) {
+        if !self.read_your_writes.is_zero() {
+            self.wrote_at = Some(Instant::now());
+        }
+    }
+
+    fn within_write_window(&self) -> bool {
+        self.wrote_at
+            .is_some_and(|wrote_at| wrote_at.elapsed() < self.read_your_writes)
     }
 
     /// Runs `f` with every read inside it routed `route`, whatever the
@@ -220,6 +273,9 @@ where
     C: SimpleConnection,
 {
     fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
+        // Raw SQL may write; so does the ANSI manager's COMMIT, which is
+        // when a transaction's writes become what the next read expects.
+        self.wrote();
         self.inner.batch_execute(query)
     }
 }
@@ -254,6 +310,7 @@ where
     where
         T: QueryFragment<Pg> + QueryId,
     {
+        self.wrote();
         self.inner.execute_returning_count(source)
     }
 
@@ -302,7 +359,16 @@ where
         // query travels in its SQL, and is stripped from the key here.
         let mut key = QueryKey::of(&source, &mut self.inner)?;
         let route = key.take_route().or(self.scoped).unwrap_or(self.route);
-        if route == Route::Postgres || in_transaction(&mut self.inner) || !key.is_select() {
+        if !key.is_select() {
+            // `INSERT ... RETURNING` and friends come through `load`.
+            self.wrote();
+            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+        }
+        if route == Route::Postgres || in_transaction(&mut self.inner) {
+            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+        }
+        if self.within_write_window() {
+            cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
         if let Some(entry) = cache.get(&key) {

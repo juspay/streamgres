@@ -9,6 +9,7 @@ description = "A Diesel connection wrapper serving reads from a cache the Stream
 [dependencies]
 base64 = "0.23.1"
 diesel = { version = "2.2.10", features = ["postgres", "r2d2", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+diesel-async = { version = "0.6", features = ["postgres"], optional = true }
 futures-util = "0.3.34"
 moka = { version = "0.12", features = ["sync"] }
 serde_json = "1.0.154"
@@ -19,3 +20,6 @@ tokio-tungstenite = "0.30.0"
 chrono = "0.4.45"
 diesel = { version = "2.2.10", features = ["chrono", "postgres", "r2d2", "serde_json"] }
 serde_json = "1.0.154"
+
+[features]
+diesel-async = ["dep:diesel-async"]
