@@ -14,6 +14,7 @@ use diesel::prelude::*;
 use diesel::sql_types::Text;
 use streamgres_diesel::cache::Cache;
 use streamgres_diesel::engine::EngineClient;
+use streamgres_diesel::subscriptions::Subscriptions;
 use streamgres_diesel::{Consistency, SyncedConnection};
 
 diesel::table! {
@@ -659,4 +660,151 @@ fn joins_are_composed_from_the_engines_rows() {
 
     diesel::delete(sg_books::table.filter(sg_books::title.like(format!("{p}%")))).execute(&mut plain).unwrap();
     diesel::delete(sg_authors::table.filter(sg_authors::name.like(format!("{p}%")))).execute(&mut plain).unwrap();
+}
+
+/// A pool of sockets spreads the subscriptions across them, and a key
+/// stays with the socket that first took it.
+#[test]
+fn a_pool_spreads_subscriptions_across_its_sockets() {
+    let Some(mut live) = Live::start("pool") else {
+        return;
+    };
+    let url = std::env::var("STREAMGRES_S2S_URL").unwrap();
+    let database = std::env::var("DATABASE_URL").unwrap();
+    let engine = EngineClient::with_config(
+        url,
+        streamgres_diesel::engine::Config {
+            connections: 3,
+            ..streamgres_diesel::engine::Config::default()
+        },
+    );
+    let cache = Arc::new(Cache::new(64 * 1024 * 1024, Arc::new(engine.clone())));
+    engine.attach(&cache);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while engine.connections() < 3 {
+        assert!(Instant::now() < deadline, "only {} sockets connected", engine.connections());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut conn = SyncedConnection::with_cache(
+        PgConnection::establish(&database).unwrap(),
+        cache.clone(),
+        Consistency::Eventual,
+    );
+    for i in 0..6 {
+        live.put(&format!("p{i}"), &format!("v{i}"));
+    }
+    let read = |conn: &mut SyncedConnection<PgConnection>, key: String| -> Option<String> {
+        sg_configs::table
+            .filter(sg_configs::key.eq(key))
+            .select(sg_configs::value)
+            .first(conn)
+            .optional()
+            .unwrap()
+    };
+    for i in 0..6 {
+        assert_eq!(read(&mut conn, live.key(&format!("p{i}"))).as_deref(), Some(format!("v{i}").as_str()));
+    }
+    assert_eq!(engine.subscribed(), 6);
+    assert_eq!(engine.per_worker(), vec![2, 2, 2], "least-loaded routing");
+    assert_eq!(engine.materialized(), 6, "{:?}", engine.fallbacks());
+
+    // A change on a key held by any socket reaches the cache.
+    let before = changes(&cache);
+    live.put("p4", "v4b");
+    let started = Instant::now();
+    loop {
+        if read(&mut conn, live.key("p4")).as_deref() == Some("v4b") {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "the change on a pooled key was not seen");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(changes(&cache) > before);
+    assert_eq!(engine.per_worker(), vec![2, 2, 2], "a change keeps the key where it was");
+    assert_eq!(engine.subscribed(), 6);
+
+    // Dropping one subscription frees its slot on its socket only.
+    let key = query_key(&mut conn, live.key("p4"));
+    engine.unsubscribe(&key);
+    cache.touched(&key);
+    assert_eq!(engine.subscribed(), 5);
+    assert_eq!(engine.per_worker().iter().sum::<usize>(), 5);
+    assert_eq!(read(&mut conn, live.key("p4")).as_deref(), Some("v4b"));
+    assert_eq!(engine.subscribed(), 6, "the next miss subscribes again");
+}
+
+/// The cache key of the test's lookup: what `first` renders, bind values
+/// included.
+fn query_key(conn: &mut SyncedConnection<PgConnection>, key: String) -> streamgres_diesel::key::QueryKey {
+    let query = sg_configs::table
+        .filter(sg_configs::key.eq(key))
+        .select(sg_configs::value)
+        .limit(1);
+    streamgres_diesel::key::QueryKey::of(&query, conn.inner()).unwrap()
+}
+
+/// Past the subscription cap the engine is not asked and the read is
+/// served live, like a refused query; a held key still comes from the
+/// cache.
+#[test]
+fn the_subscription_cap_serves_the_rest_live() {
+    let Some(mut live) = Live::start("cap") else {
+        return;
+    };
+    let url = std::env::var("STREAMGRES_S2S_URL").unwrap();
+    let database = std::env::var("DATABASE_URL").unwrap();
+    let engine = EngineClient::with_config(
+        url,
+        streamgres_diesel::engine::Config {
+            connections: 1,
+            max_subscriptions: 2,
+            ..streamgres_diesel::engine::Config::default()
+        },
+    );
+    let cache = Arc::new(Cache::new(64 * 1024 * 1024, Arc::new(engine.clone())));
+    engine.attach(&cache);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !engine.is_connected() {
+        assert!(Instant::now() < deadline, "the engine did not connect");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut conn = SyncedConnection::with_cache(
+        PgConnection::establish(&database).unwrap(),
+        cache.clone(),
+        Consistency::Eventual,
+    );
+    for i in 0..3 {
+        live.put(&format!("c{i}"), &format!("v{i}"));
+    }
+    let read = |conn: &mut SyncedConnection<PgConnection>, key: String| -> Option<String> {
+        sg_configs::table
+            .filter(sg_configs::key.eq(key))
+            .select(sg_configs::value)
+            .first(conn)
+            .optional()
+            .unwrap()
+    };
+    for i in 0..3 {
+        assert_eq!(read(&mut conn, live.key(&format!("c{i}"))).as_deref(), Some(format!("v{i}").as_str()));
+    }
+    assert_eq!(engine.subscribed(), 2, "the cap holds");
+    assert_eq!(cache.len(), 2);
+    assert_eq!(cache.stats.refused.load(Ordering::Relaxed), 1, "the third was refused by the client");
+
+    // The third key is live every time, so a change is seen at once;
+    // the held keys are cached.
+    live.put("c2", "v2b");
+    assert_eq!(read(&mut conn, live.key("c2")).as_deref(), Some("v2b"));
+    let hits = cache.stats.hits.load(Ordering::Relaxed);
+    assert_eq!(read(&mut conn, live.key("c0")).as_deref(), Some("v0"));
+    assert_eq!(cache.stats.hits.load(Ordering::Relaxed), hits + 1);
+    assert_eq!(engine.subscribed(), 2);
+
+    // Freeing a slot lets the next miss subscribe.
+    let key = query_key(&mut conn, live.key("c0"));
+    engine.unsubscribe(&key);
+    cache.touched(&key);
+    assert_eq!(engine.subscribed(), 1);
+    assert_eq!(read(&mut conn, live.key("c2")).as_deref(), Some("v2b"));
+    assert_eq!(engine.subscribed(), 2, "the freed slot went to the next miss");
 }

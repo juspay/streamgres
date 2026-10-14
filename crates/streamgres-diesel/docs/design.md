@@ -147,9 +147,34 @@ The engine accepts first and the client reads second, so a change that
 lands between the two is reported redundantly and costs one refill,
 never a stale row.
 
-Reconnect: a dropped socket refuses every waiting subscribe, clears the
-cache, and on reconnect resubscribes every held key under its old id. A
-position cookie for replay is a later refinement.
+Reconnect: a dropped socket refuses every subscribe waiting on it,
+drops the cache entries of the keys it carried (they are served live
+until it is back), and on reconnect resubscribes every held key under
+its old id; a rows-mode key refills from the snapshot with no Postgres
+read. A position cookie for replay is a later refinement.
+
+## The connection pool
+
+A backend subscribes to whatever its code reads; nothing like a screen
+bounds the set. So the client holds a pool of sockets to the engine and
+a cap on the subscriptions it will carry, both from the environment:
+
+| variable                            | meaning                                   | default |
+|-------------------------------------|-------------------------------------------|---------|
+| `STREAMGRES_S2S_CONNECTIONS`        | sockets to the engine, each on its thread | 2       |
+| `STREAMGRES_S2S_MAX_SUBSCRIPTIONS`  | subscriptions held across all sockets     | 10000   |
+| `STREAMGRES_S2S_VERDICT_TIMEOUT_MS` | wait for `accepted` or `refused`          | 5000    |
+
+`EngineClient::connect` reads them (`Config::from_env`);
+`EngineClient::with_config` takes them explicitly. Each socket is a
+worker with its own thread, runtime, subscription ids, waiting
+subscribes and rows-mode stores; the pool keeps one map from key to
+worker. A miss goes to the worker already holding the key, else to the
+connected worker with the fewest subscriptions. Past the cap the engine
+is not asked and the read is served live, exactly as a refused query
+is, and `Stats::refused` counts it; a key freed by eviction or an
+engine refusal gives its slot back. One socket dropping affects only
+its own keys.
 
 ## Running it locally
 
@@ -182,7 +207,7 @@ position cookie for replay is a later refinement.
   process; group id per application. Proposed, not agreed.
 - memory limit: entries and bytes, from an init config, with LRU and
   unsubscribe on eviction.
-- one engine connection per process, multiplexing subscriptions; measured
-  under tokio-console before deciding on a pool.
+- engine connections: a pool with a per-process cap, both from the
+  environment (decided; see "The connection pool").
 - joins: the engine ships rows per table; for A this is invisible (the
   rows come from Postgres), for B the merge is the hard part.

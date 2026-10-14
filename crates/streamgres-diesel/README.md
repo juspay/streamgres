@@ -19,6 +19,8 @@ resubscribes and refills. See `docs/design.md`.
 ## Using it
 
 ```rust
+// Pool size and subscription cap from STREAMGRES_S2S_CONNECTIONS and
+// STREAMGRES_S2S_MAX_SUBSCRIPTIONS (defaults 2 and 10000).
 let engine = EngineClient::connect("ws://engine:4848/zero/s2s/v1");
 let cache = Arc::new(Cache::new(256 * 1024 * 1024, Arc::new(engine.clone())));
 engine.attach(&cache);
