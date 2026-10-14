@@ -115,6 +115,38 @@ pub fn parse_read(sql: &str, catalog: &Catalog) -> Result<SingleTableReadQuery, 
     parse_read_with_binds(sql, &[], catalog)
 }
 
+/// What a `SELECT` asks for: everything, a count of the rows, or named
+/// columns in order. The engine follows whole rows whatever is selected;
+/// a client that ships rows uses this to shape them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Projection {
+    All,
+    Count,
+    Columns(Vec<ColumnName>),
+}
+
+/// [`parse_read_with_binds`], also returning what the statement selects.
+pub fn parse_select(
+    sql: &str,
+    binds: &[BindValue],
+    catalog: &Catalog,
+) -> Result<(SingleTableReadQuery, Projection), ParseError> {
+    let mut parser = Parser {
+        tokens: lex(sql)?,
+        pos: 0,
+        depth: 0,
+        binds,
+    };
+    if !parser.is_word("SELECT") {
+        return parser.err(format!("expected SELECT, found {}", parser.describe()));
+    }
+    let (read, projection) = parser.read(catalog)?;
+    if !matches!(parser.peek(), Tok::Eof) {
+        return parser.err(format!("unexpected trailing input: {}", parser.describe()));
+    }
+    Ok((read, projection))
+}
+
 /// [`parse_read`] with `$n` placeholders standing for `binds`.
 pub fn parse_read_with_binds(
     sql: &str,
@@ -541,7 +573,7 @@ impl Parser<'_> {
     /// Dispatch on the leading keyword to a read or a write.
     fn query(&mut self, catalog: &Catalog) -> Result<ParsedQuery, ParseError> {
         if self.is_word("SELECT") {
-            Ok(ParsedQuery::Read(self.read(catalog)?))
+            Ok(ParsedQuery::Read(self.read(catalog)?.0))
         } else if self.is_word("INSERT") || self.is_word("UPDATE") || self.is_word("DELETE") {
             Ok(ParsedQuery::Write(self.write(catalog)?))
         } else {
@@ -558,7 +590,10 @@ impl Parser<'_> {
     /// `AND(vec![])`). A missing ORDER BY defaults via [`default_order`],
     /// and a missing LIMIT becomes `u32::MAX` — the model makes `limit`
     /// mandatory, so absent means "no bound".
-    fn read(&mut self, catalog: &Catalog) -> Result<SingleTableReadQuery, ParseError> {
+    fn read(
+        &mut self,
+        catalog: &Catalog,
+    ) -> Result<(SingleTableReadQuery, Projection), ParseError> {
         self.expect_word("SELECT")?;
         if self.is_word("DISTINCT") {
             return self.err("DISTINCT is not supported");
@@ -572,7 +607,7 @@ impl Parser<'_> {
         let table = self.table(catalog)?;
         let after_table = self.pos;
         self.pos = projection;
-        self.projection(table)?;
+        let projection = self.projection(table)?;
         self.pos = after_table;
 
         if self.is_word("LEFT") || self.is_word("JOIN") || self.is_word("INNER") {
@@ -636,11 +671,9 @@ impl Parser<'_> {
             return self.err("OFFSET is not supported");
         }
 
-        Ok(SingleTableReadQuery::new(
-            table.name.clone(),
-            filter,
-            order_by,
-            limit,
+        Ok((
+            SingleTableReadQuery::new(table.name.clone(), filter, order_by, limit),
+            projection,
         ))
     }
 
@@ -671,9 +704,10 @@ impl Parser<'_> {
     /// The projection: `*`, `COUNT(*)`, or columns of `table`, each
     /// optionally qualified and optionally aliased (`AS v`, or a bare
     /// alias). Ends at `FROM`.
-    fn projection(&mut self, table: &DbTable) -> Result<(), ParseError> {
+    fn projection(&mut self, table: &DbTable) -> Result<Projection, ParseError> {
         if self.eat_sym("*") {
-            return self.expect_from();
+            self.expect_from()?;
+            return Ok(Projection::All);
         }
         if self.is_word("COUNT") {
             self.bump();
@@ -681,13 +715,16 @@ impl Parser<'_> {
             self.expect_sym("*")?;
             self.expect_sym(")")?;
             self.alias()?;
-            return self.expect_from();
+            self.expect_from()?;
+            return Ok(Projection::Count);
         }
+        let mut columns = Vec::new();
         loop {
-            self.column_name(table)?;
+            columns.push(self.column_name(table)?);
             self.alias()?;
             if !self.eat_sym(",") {
-                return self.expect_from();
+                self.expect_from()?;
+                return Ok(Projection::Columns(columns));
             }
         }
     }
@@ -1311,6 +1348,26 @@ mod tests {
         )
         .expect("literal parses");
         assert_eq!(bound, literal);
+    }
+
+    #[test]
+    fn parse_select_tells_what_is_selected() {
+        let (_, all) = parse_select("SELECT * FROM tickets", &[], &catalog()).unwrap();
+        assert_eq!(all, Projection::All);
+        let (_, count) = parse_select(r#"SELECT COUNT(*) FROM "tickets""#, &[], &catalog()).unwrap();
+        assert_eq!(count, Projection::Count);
+        let (q, columns) = parse_select(
+            r#"SELECT "tickets"."points" AS p, "tickets"."id" FROM "tickets" LIMIT $1"#,
+            &[int8_bind(5)],
+            &catalog(),
+        )
+        .unwrap();
+        assert_eq!(
+            columns,
+            Projection::Columns(vec![ColumnName::from("points"), ColumnName::from("id")])
+        );
+        assert_eq!(q.limit, 5);
+        assert!(parse_select("UPDATE tickets SET status = 'x' WHERE id = 1", &[], &catalog()).is_err());
     }
 
     #[test]

@@ -21,10 +21,11 @@
 //! WebSocket at `{base}/s2s/v1`.
 //!
 //! Upstream:
-//! - `["subscribe", {"id": n, "sql": "...", "binds": [{"oid": 25, "bytes": "<base64>"}, {"oid": 20, "bytes": null}]}]`
+//! - `["subscribe", {"id": n, "sql": "...", "binds": [{"oid": 25, "bytes": "<base64>"}, {"oid": 20, "bytes": null}], "rows": bool}]`
 //!   `sql` is what the ORM rendered, with `$1..` placeholders; each bind
 //!   is the parameter's Postgres type OID and its binary bytes, `null`
 //!   for SQL `NULL`. `id` is the backend's own, unique per connection.
+//!   `rows` asks for the rows themselves (below) rather than touches.
 //! - `["unsubscribe", {"id": n}]`
 //! - `["ping"]`
 //!
@@ -32,12 +33,22 @@
 //! - `["hello", {"protocol": 1}]` first.
 //! - `["accepted", {"id": n}]` once the engine follows the query; from
 //!   that moment every change to its rows is reported, so the backend
-//!   reads Postgres only after it.
+//!   reads Postgres only after it. In rows mode the body also carries
+//!   the hydrated result: `"table"`, `"key"` (the primary-key columns),
+//!   `"columns"` (the projection, `null` for `*`), `"count"` (a
+//!   `COUNT(*)`), `"order"` (`[[column, "asc"|"desc"], ...]`), `"limit"`
+//!   (`null` for none) and `"rows"` (JSON objects keyed by column, every
+//!   column of the row).
 //! - `["refused", {"id": n, "reason": "..."}]` when the engine cannot
 //!   follow the query (outside the SQL subset, an unknown table, too many
 //!   rows). The backend serves that query live.
 //! - `["touched", {"ids": [n, ...]}]` per transaction that changed the
-//!   rows of those subscriptions.
+//!   rows of those subscriptions, for subscriptions not in rows mode.
+//! - `["delta", {"id": n, "put": [row, ...], "del": [key, ...]}]` per
+//!   transaction, for one subscription in rows mode: rows that entered
+//!   or changed, and the keys of rows that left, in the order applied.
+//!   A changed row appears as a `del` of its key and a `put` of its new
+//!   image in the same frame.
 //! - `["pong"]`
 
 use std::collections::{HashMap, HashSet};
@@ -55,10 +66,14 @@ use serde_json::{Value as Json, json};
 use tokio::sync::{mpsc, watch};
 
 use super::connection::AppState;
+use super::wire;
 use crate::ivm::Delta;
 use crate::log::{log_debug, log_info, log_warn};
-use crate::model::{MultiTableReadQuery, SubId};
-use crate::parser::{BindValue, parse_read_with_binds};
+use crate::model::{
+    DataFrameKey, DataFrameOperation, DataFrameRow, MultiTableReadQuery, Order, OrderBy,
+    SingleTableReadQuery, SubId, TableName,
+};
+use crate::parser::{BindValue, Projection, parse_select};
 use crate::sync::{CatalogHandle, Command, Event};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -79,6 +94,7 @@ pub enum Request {
         id: u64,
         sql: String,
         binds: Vec<BindValue>,
+        rows: bool,
     },
     Unsubscribe {
         conn: u64,
@@ -116,15 +132,53 @@ struct Conn {
     subs: HashMap<u64, SubId>,
 }
 
+/// What a rows-mode subscription needs beyond its ids: the query's shape
+/// for the backend to order and project by, and the rows gathered while
+/// the engine hydrates it.
+struct Shape {
+    table: TableName,
+    projection: Projection,
+    order: Vec<OrderBy>,
+    limit: u32,
+    /// The hydrating result: a key's latest image, `None` once deleted.
+    snapshot: Vec<(DataFrameKey, Option<DataFrameRow>)>,
+}
+
+impl Shape {
+    fn new(query: &SingleTableReadQuery, projection: Projection) -> Shape {
+        Shape {
+            table: query.table.clone(),
+            projection,
+            order: query.order_by.clone(),
+            limit: query.limit,
+            snapshot: Vec::new(),
+        }
+    }
+
+    fn absorb(&mut self, op: &DataFrameOperation) {
+        let (key, row) = match op {
+            DataFrameOperation::Add(key, row) => (key, Some(row.clone())),
+            DataFrameOperation::Delete(key, _) => (key, None),
+        };
+        match self.snapshot.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = row,
+            None => self.snapshot.push((key.clone(), row)),
+        }
+    }
+}
+
 struct Task {
     catalog: Arc<CatalogHandle>,
     sink: usize,
     commands: mpsc::Sender<Command<MultiTableReadQuery>>,
     conns: HashMap<u64, Conn>,
-    /// Registrations in flight, by the token the command carried.
-    by_token: HashMap<u64, (u64, u64)>,
+    /// Registrations in flight, by the token the command carried: the
+    /// connection, its id, and the shape when rows were asked for.
+    by_token: HashMap<u64, (u64, u64, Option<Shape>)>,
     /// Every live subscription, back to its connection and id.
     by_sub: HashMap<SubId, (u64, u64)>,
+    /// Rows-mode subscriptions, by the engine's id.
+    shapes: HashMap<SubId, Shape>,
     /// Registered but not yet hydrated: `accepted` waits for the rows,
     /// so the backend's first read lands after the engine's.
     hydrating: HashSet<SubId>,
@@ -157,6 +211,7 @@ pub async fn run(
         conns: HashMap::new(),
         by_token: HashMap::new(),
         by_sub: HashMap::new(),
+        shapes: HashMap::new(),
         hydrating: HashSet::new(),
         next_token: 1,
     };
@@ -191,7 +246,8 @@ impl Task {
                 id,
                 sql,
                 binds,
-            } => self.subscribe(conn, id, &sql, &binds).await,
+                rows,
+            } => self.subscribe(conn, id, &sql, &binds, rows).await,
             Request::Unsubscribe { conn, id } => {
                 let sub = self
                     .conns
@@ -208,7 +264,7 @@ impl Task {
                     for sub in &subs {
                         self.forget(*sub);
                     }
-                    self.by_token.retain(|_, (owner, _)| *owner != conn);
+                    self.by_token.retain(|_, (owner, _, _)| *owner != conn);
                     if !subs.is_empty() {
                         let _ = self.commands.send(Command::UnregisterAll(subs)).await;
                     }
@@ -217,28 +273,29 @@ impl Task {
         }
     }
 
-    async fn subscribe(&mut self, conn: u64, id: u64, sql: &str, binds: &[BindValue]) {
+    async fn subscribe(&mut self, conn: u64, id: u64, sql: &str, binds: &[BindValue], rows: bool) {
         let Some(connection) = self.conns.get(&conn) else {
             return;
         };
         if connection.subs.contains_key(&id)
-            || self.by_token.values().any(|(c, i)| *c == conn && *i == id)
+            || self.by_token.values().any(|(c, i, _)| *c == conn && *i == id)
         {
             send(&connection.out, refused(id, "that id is already subscribed"));
             return;
         }
         let catalog = self.catalog.load();
-        let query = match parse_read_with_binds(sql, binds, &catalog) {
-            Ok(query) => query,
+        let (query, projection) = match parse_select(sql, binds, &catalog) {
+            Ok(parsed) => parsed,
             Err(error) => {
                 log_debug!("s2s connection {conn}: query {id} refused: {}", error.message);
                 send(&connection.out, refused(id, &error.message));
                 return;
             }
         };
+        let shape = rows.then(|| Shape::new(&query, projection));
         let token = self.next_token;
         self.next_token += 1;
-        self.by_token.insert(token, (conn, id));
+        self.by_token.insert(token, (conn, id, shape));
         let command = Command::Register {
             sink: self.sink,
             query: MultiTableReadQuery::single(query),
@@ -253,9 +310,12 @@ impl Task {
     fn event(&mut self, event: Event) {
         match event {
             Event::Registered {
-                token, sub, reads, ..
+                token,
+                sub,
+                reads,
+                updates,
             } => {
-                let Some((conn, id)) = self.by_token.remove(&token) else {
+                let Some((conn, id, shape)) = self.by_token.remove(&token) else {
                     // The connection went away while the registration
                     // was in flight: the subscription is not wanted.
                     let _ = self.commands.try_send(Command::Unregister(sub));
@@ -267,19 +327,25 @@ impl Task {
                 };
                 connection.subs.insert(id, sub);
                 self.by_sub.insert(sub, (conn, id));
+                if let Some(mut shape) = shape {
+                    // A twin's rows come with the registration.
+                    for delta in &updates {
+                        if delta.targets().any(|target| target.sub == sub) {
+                            shape.absorb(&delta.op);
+                        }
+                    }
+                    self.shapes.insert(sub, shape);
+                }
                 if reads == 0 {
-                    send(&connection.out, accepted(id));
+                    self.accept(sub);
                 } else {
                     self.hydrating.insert(sub);
                 }
             }
             Event::Hydrated(subs) => {
                 for sub in subs {
-                    if self.hydrating.remove(&sub)
-                        && let Some((conn, id)) = self.by_sub.get(&sub)
-                        && let Some(connection) = self.conns.get(conn)
-                    {
-                        send(&connection.out, accepted(*id));
+                    if self.hydrating.remove(&sub) {
+                        self.accept(sub);
                     }
                 }
             }
@@ -287,7 +353,7 @@ impl Task {
             Event::Capped { sub } => {
                 self.drop_sub(sub, "the query has more rows than the engine follows");
             }
-            Event::Committed { updates, .. } | Event::Landed { updates } => self.touched(&updates),
+            Event::Committed { updates, .. } | Event::Landed { updates } => self.changed(&updates),
             Event::Heavy { sub, table, rows } => {
                 if let Some((conn, id)) = self.by_sub.get(&sub) {
                     log_warn!(
@@ -298,20 +364,111 @@ impl Task {
         }
     }
 
-    /// Tells each connection which of its subscriptions the deltas touch.
-    fn touched(&mut self, updates: &[Delta]) {
-        let mut per_conn: HashMap<u64, Vec<u64>> = HashMap::new();
+    /// `accepted`, with the hydrated rows for a rows-mode subscription.
+    fn accept(&mut self, sub: SubId) {
+        let Some((conn, id)) = self.by_sub.get(&sub).copied() else {
+            return;
+        };
+        let Some(connection) = self.conns.get(&conn) else {
+            return;
+        };
+        let Some(shape) = self.shapes.get_mut(&sub) else {
+            send(&connection.out, accepted(id));
+            return;
+        };
+        let catalog = self.catalog.load();
+        let Some(table) = catalog.table(shape.table.as_str()) else {
+            send(&connection.out, refused(id, "the table left the catalog"));
+            return;
+        };
+        let rows: Vec<Json> = shape
+            .snapshot
+            .drain(..)
+            .filter_map(|(_, row)| row)
+            .map(|row| wire::row_json(&row, table))
+            .collect();
+        let columns = match &shape.projection {
+            Projection::All => Json::Null,
+            Projection::Count => Json::Null,
+            Projection::Columns(columns) => {
+                Json::Array(columns.iter().map(|c| Json::from(c.as_str())).collect())
+            }
+        };
+        let order: Vec<Json> = shape
+            .order
+            .iter()
+            .map(|clause| {
+                json!([
+                    clause.column.as_str(),
+                    match clause.direction {
+                        Order::ASC => "asc",
+                        Order::DESC => "desc",
+                    }
+                ])
+            })
+            .collect();
+        let limit = (shape.limit != u32::MAX).then_some(shape.limit);
+        send(
+            &connection.out,
+            json!(["accepted", {
+                "id": id,
+                "table": table.name.as_str(),
+                "key": table.pkey.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+                "columns": columns,
+                "count": matches!(shape.projection, Projection::Count),
+                "order": order,
+                "limit": limit,
+                "rows": rows,
+            }]),
+        );
+    }
+
+    /// Tells each connection what the deltas did to its subscriptions:
+    /// rows-mode ones get the rows, the rest a touch.
+    fn changed(&mut self, updates: &[Delta]) {
+        let mut touched: HashMap<u64, Vec<u64>> = HashMap::new();
+        // Per rows-mode subscription, the puts and deletes in order.
+        let mut deltas: HashMap<SubId, (Vec<Json>, Vec<Json>)> = HashMap::new();
+        let catalog = self.catalog.load();
         for delta in updates {
+            let table = catalog.table(delta.table.as_str());
             for target in delta.targets() {
-                if let Some((conn, id)) = self.by_sub.get(&target.sub) {
-                    let ids = per_conn.entry(*conn).or_default();
+                let Some((conn, id)) = self.by_sub.get(&target.sub) else {
+                    continue;
+                };
+                if let Some(shape) = self.shapes.get_mut(&target.sub) {
+                    if self.hydrating.contains(&target.sub) {
+                        shape.absorb(&delta.op);
+                        continue;
+                    }
+                    let (puts, dels) = deltas.entry(target.sub).or_default();
+                    match (&delta.op, table) {
+                        (DataFrameOperation::Add(_, row), Some(table)) => {
+                            puts.push(wire::row_json(row, table));
+                        }
+                        (DataFrameOperation::Delete(key, _), _) => dels.push(wire::key_json(key)),
+                        (DataFrameOperation::Add(key, _), None) => {
+                            // The table left the catalog mid-flight: the
+                            // backend cannot keep the row, so drop it.
+                            dels.push(wire::key_json(key));
+                        }
+                    }
+                } else {
+                    let ids = touched.entry(*conn).or_default();
                     if !ids.contains(id) {
                         ids.push(*id);
                     }
                 }
             }
         }
-        for (conn, ids) in per_conn {
+        for (sub, (put, del)) in deltas {
+            if let Some((conn, id)) = self.by_sub.get(&sub)
+                && let Some(connection) = self.conns.get(conn)
+            {
+                send(&connection.out, json!(["delta", {"id": id, "put": put, "del": del}]));
+            }
+        }
+        for (conn, ids) in touched {
             if let Some(connection) = self.conns.get(&conn) {
                 send(&connection.out, json!(["touched", {"ids": ids}]));
             }
@@ -332,6 +489,7 @@ impl Task {
 
     fn forget(&mut self, sub: SubId) {
         self.by_sub.remove(&sub);
+        self.shapes.remove(&sub);
         self.hydrating.remove(&sub);
     }
 }
@@ -438,11 +596,13 @@ fn upstream(conn: u64, text: &str) -> Result<Option<Request>, String> {
                 .map(|binds| binds.iter().map(bind).collect::<Result<Vec<_>, _>>())
                 .transpose()?
                 .unwrap_or_default();
+            let rows = body.get("rows").and_then(Json::as_bool).unwrap_or(false);
             Ok(Some(Request::Subscribe {
                 conn,
                 id,
                 sql,
                 binds,
+                rows,
             }))
         }
         "unsubscribe" => Ok(Some(Request::Unsubscribe { conn, id: id(body)? })),
@@ -486,8 +646,10 @@ mod tests {
                 id,
                 sql,
                 binds,
+                rows,
             } => {
                 assert_eq!((conn, id), (3, 7));
+                assert!(!rows);
                 assert_eq!(sql, "SELECT * FROM t WHERE a = $1");
                 assert_eq!(
                     binds,
