@@ -1046,6 +1046,7 @@ impl Conn {
                 push.client_group_id,
                 self.params.group_id
             );
+            return;
         }
         for mutation in &push.mutation_ids {
             self.state.stats.push_sent(&mutation.client_id, mutation.id);
