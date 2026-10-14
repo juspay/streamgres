@@ -44,7 +44,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -72,7 +72,7 @@ use tokio::task::spawn_blocking;
 use crate::cache::Cache;
 use crate::cursor::SyncedRow;
 use crate::key::QueryKey;
-use crate::route::Route;
+use crate::route::{Route, Served};
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::{Outcome, Verdict};
 use crate::types::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
@@ -105,6 +105,9 @@ pub struct AsyncSyncedConnection {
     /// Cloned into every future the wrapper hands out: while the count
     /// is above one, a future is pending on this connection.
     inflight: Arc<()>,
+    /// Where the last read was served from, written by the read's
+    /// future once it knows: 0 before any read, else [`Served`] + 1.
+    served: Arc<AtomicU8>,
 }
 
 impl AsyncSyncedConnection {
@@ -119,6 +122,19 @@ impl AsyncSyncedConnection {
             metadata: Arc::new(Mutex::new(PgMetadataCache::new())),
             catalog_loaded: Arc::new(AtomicBool::new(false)),
             inflight: Arc::new(()),
+            served: Arc::new(AtomicU8::new(0)),
+        }
+    }
+
+    /// Where this connection's last read was served from: the cache,
+    /// the engine's rows, or Postgres. `None` before any read. A read
+    /// still in flight has not written it yet.
+    pub fn last_served(&self) -> Option<Served> {
+        match self.served.load(Ordering::Acquire) {
+            1 => Some(Served::Cache),
+            2 => Some(Served::Engine),
+            3 => Some(Served::Postgres),
+            _ => None,
         }
     }
 
@@ -437,6 +453,7 @@ impl AsyncConnection for AsyncSyncedConnection {
         T::Query: QueryFragment<Pg> + QueryId + 'query,
     {
         let query = source.as_query();
+        self.served.store(3, Ordering::Release);
         let Some(cache) = self.cache.clone() else {
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
             return self.tracked(live);
@@ -484,6 +501,7 @@ impl AsyncConnection for AsyncSyncedConnection {
             return self.tracked(live);
         }
         if let Some(entry) = cache.get(&key) {
+            self.served.store(1, Ordering::Release);
             return std::future::ready(Ok(Self::cached_stream(Arc::clone(&entry.rows)))).boxed();
         }
         if cache.refused_recently(&key).is_some() {
@@ -502,6 +520,7 @@ impl AsyncConnection for AsyncSyncedConnection {
         let catalog_loaded = Arc::clone(&self.catalog_loaded);
         let subscriptions = cache.shared_subscriptions();
         let token = Arc::clone(&self.inflight);
+        let served = Arc::clone(&self.served);
         async move {
             let _pending = token;
             let reservation = cache.reserve(&key);
@@ -578,6 +597,7 @@ impl AsyncConnection for AsyncSyncedConnection {
                 Verdict::Rows { rows, store_bytes } => {
                     guard.disarm();
                     cache.fill_weighing(reservation, Arc::clone(&rows), store_bytes);
+                    served.store(2, Ordering::Release);
                     Ok(Self::cached_stream(rows))
                 }
                 Verdict::Accepted => {

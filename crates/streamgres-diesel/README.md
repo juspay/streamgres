@@ -14,7 +14,8 @@ Postgres read, a commit lands in the cache in about 0.3 ms locally.
 Otherwise the rows are read from Postgres once and refilled when the
 engine reports a change. Strong connections, transactions, writes and
 queries the engine refuses go to Postgres as before. An engine restart
-resubscribes and refills. See `docs/design.md`.
+resubscribes and refills, and asks again about what was refused. See
+`docs/design.md`.
 
 ## Using it
 

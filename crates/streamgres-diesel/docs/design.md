@@ -119,7 +119,10 @@ reconnect logic carry over unchanged.
   `STREAMGRES_REFUSED_TTL_MS` (default 30 s, 0 never), so its reads go
   straight to Postgres instead of asking the engine every time. A
   refusal from the client's own side (not connected, over the
-  subscription cap, no answer in time) is not remembered.
+  subscription cap, no answer in time) is not remembered, and every
+  remembered refusal is forgotten when the engine connection drops: the
+  engine that comes back may be a restarted one whose catalog knows a
+  type created after the old one started.
 - Times: the engine keeps every `timestamp`, `timestamptz` and `date`
   as microseconds since the epoch, Postgres's own precision, and ships
   them so to S2S clients; the Zero protocol keeps seeing milliseconds
@@ -170,7 +173,14 @@ Reconnect: a dropped socket refuses every subscribe waiting on it,
 drops the cache entries of the keys it carried (they are served live
 until it is back), and on reconnect resubscribes every held key under
 its old id; a rows-mode key refills from the snapshot with no Postgres
-read. A position cookie for replay is a later refinement.
+read. A position cookie for replay is a later refinement. Measured on
+a 32-core box (2026-10-14): one hour of 15.9 M reads over nine shapes
+with a write every 200 ms and the engine restarted every four minutes
+(seven graceful, seven `kill -9`); 3.18 M reads compared row for row
+against Postgres, none stale, no errors; every restart had all 285
+subscriptions back by the time the engine was healthy (5.5 s), the
+first read after it a hit; both processes' memory grew only with the
+data (6,000 comments inserted).
 
 ## The connection pool
 
@@ -350,6 +360,10 @@ three levels, the most specific winning:
    URL it was established with (`Settings`), so a master pool goes to
    Postgres and a replica pool through Streamgres, matching
    Hyperswitch's split. `set_route` changes it on one connection.
+   `last_served()` says where the connection's last read came from
+   (`Served::Cache`, `Engine` or `Postgres`), per connection, so a
+   request handler can report it exactly where the cache's shared
+   counters could not.
    The same lookup picks the cache: one engine streams one database
    and keeps one cache fresh, so pools against one database share a
    cache (`Settings::single`) and pools against different databases

@@ -27,6 +27,7 @@ use diesel::prelude::*;
 use diesel_async::RunQueryDsl;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use streamgres_diesel::Served;
 
 use crate::models::TicketStatus;
 use crate::pools::Stack;
@@ -142,7 +143,6 @@ async fn read(app: &Stack, params: &ReadParams, lookup: Lookup) -> Reply {
         Some("streamgres") => Some(streamgres_diesel::Route::Streamgres),
         _ => None,
     };
-    let hits_before = AtomicU64::load(&app.cache.stats.hits, Ordering::Relaxed);
     let started = Instant::now();
     // The query flag for one request: set on the pooled connection for
     // the read and put back before the connection returns to the pool.
@@ -154,14 +154,20 @@ async fn read(app: &Stack, params: &ReadParams, lookup: Lookup) -> Reply {
     conn.set_route(pool_route);
     let rows = rows.map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let elapsed = started.elapsed();
-    let hit = AtomicU64::load(&app.cache.stats.hits, Ordering::Relaxed) > hits_before;
+    // Per connection, so it is right under concurrent requests, where a
+    // delta of the cache's shared counters would not be.
+    let source = match conn.last_served() {
+        Some(Served::Cache) => "cache",
+        Some(Served::Engine) => "engine",
+        Some(Served::Postgres) | None => "postgres",
+    };
     Ok(Json(json!({
         "lookup": lookup.name(),
         "route": route.map(|route| format!("{route:?}").to_lowercase()).unwrap_or_else(|| match params.pool.as_deref() {
             Some("reporting") => "postgres (reporting pool)".to_string(),
             _ => "streamgres (main pool)".to_string(),
         }),
-        "source": if hit { "cache" } else { "postgres" },
+        "source": source,
         "micros": elapsed.as_micros(),
         "rows": rows,
     })))

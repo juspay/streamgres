@@ -26,6 +26,22 @@ use diesel::query_builder::{AstPass, Query, QueryFragment, QueryId};
 use diesel::query_dsl::RunQueryDsl;
 use diesel::query_dsl::methods::{LimitDsl, OffsetDsl};
 
+/// Where a connection's last read was served from, as
+/// [`crate::SyncedConnection::last_served`] reports it. Per connection,
+/// so it is exact under concurrency where the cache's shared counters
+/// are not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Served {
+    /// The cache had the rows: no round trip at all.
+    Cache,
+    /// The engine shipped the rows when the query was subscribed: no
+    /// Postgres read.
+    Engine,
+    /// Postgres ran the query (a miss the engine only accepted, a
+    /// refusal, a write window, a transaction, or the Postgres route).
+    Postgres,
+}
+
 /// Where a read goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Route {

@@ -74,7 +74,7 @@ pub use crate::asynchronous::AsyncSyncedConnection;
 use crate::cache::Cache;
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
-pub use crate::route::{Route, RouteDsl, Via};
+pub use crate::route::{Route, RouteDsl, Served, Via};
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::Verdict;
 
@@ -177,6 +177,8 @@ pub struct SyncedConnection<C = diesel::PgConnection> {
     /// A [`SyncedConnection::with_route`] scope in progress.
     scoped: Option<Route>,
     read_your_writes: Duration,
+    /// Where the last read was served from; `None` before the first.
+    served: Option<Served>,
 }
 
 impl<C> SyncedConnection<C> {
@@ -188,6 +190,7 @@ impl<C> SyncedConnection<C> {
             route: Route::Postgres,
             scoped: None,
             read_your_writes: Duration::ZERO,
+            served: None,
         }
     }
 
@@ -200,7 +203,14 @@ impl<C> SyncedConnection<C> {
             route,
             scoped: None,
             read_your_writes: read_your_writes_from_env(),
+            served: None,
         }
+    }
+
+    /// Where this connection's last read was served from: the cache,
+    /// the engine's rows, or Postgres. `None` before any read.
+    pub fn last_served(&self) -> Option<Served> {
+        self.served
     }
 
     /// Changes the route this connection's reads take by default.
@@ -384,6 +394,7 @@ where
         T: Query + QueryFragment<Pg> + QueryId + 'query,
         Pg: QueryMetadata<T::SqlType>,
     {
+        self.served = Some(Served::Postgres);
         let Some(cache) = self.cache.clone() else {
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         };
@@ -410,6 +421,7 @@ where
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
         if let Some(entry) = cache.get(&key) {
+            self.served = Some(Served::Cache);
             return Ok(SyncedCursor::Cached(OwnedCursor::new(Arc::clone(
                 &entry.rows,
             ))));
@@ -429,6 +441,7 @@ where
             Verdict::Rows { rows, store_bytes } => {
                 // The engine's own rows: no Postgres read at all.
                 cache.fill_weighing(reservation, Arc::clone(&rows), store_bytes);
+                self.served = Some(Served::Engine);
                 return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
             }
             Verdict::Accepted => {}

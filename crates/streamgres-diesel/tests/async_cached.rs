@@ -16,7 +16,7 @@ use streamgres_diesel::key::QueryKey;
 use streamgres_diesel::materialized::Snapshot;
 use streamgres_diesel::subscriptions::{Outcome, Subscriptions, Verdict};
 use streamgres_diesel::types::TableTypes;
-use streamgres_diesel::{AsyncSyncedConnection, Route, RouteDsl};
+use streamgres_diesel::{AsyncSyncedConnection, Route, RouteDsl, Served};
 
 /// diesel-async's `RunQueryDsl::load` shadows `AtomicU64::load`.
 fn stat(counter: &AtomicU64) -> u64 {
@@ -244,6 +244,29 @@ async fn a_repeated_read_is_served_from_the_cache() {
     // Without a touch the cache keeps the old row.
     w.put("mode", "b").await;
     assert_eq!(w.read("mode").await.as_deref(), Some("a"));
+    w.clean().await;
+}
+
+#[tokio::test]
+async fn the_connection_says_where_each_read_was_served_from() {
+    let mut w = World::new("async-served").await;
+    assert_eq!(w.conn.last_served(), None, "nothing read yet");
+    w.put("k", "1").await;
+
+    assert_eq!(w.read("k").await.as_deref(), Some("1"));
+    assert_eq!(
+        w.conn.last_served(),
+        Some(Served::Postgres),
+        "the miss the engine accepted"
+    );
+    assert_eq!(w.read("k").await.as_deref(), Some("1"));
+    assert_eq!(w.conn.last_served(), Some(Served::Cache));
+    assert_eq!(w.read_via("k", Route::Postgres).await.as_deref(), Some("1"));
+    assert_eq!(
+        w.conn.last_served(),
+        Some(Served::Postgres),
+        "the flag sent it live"
+    );
     w.clean().await;
 }
 

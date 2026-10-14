@@ -918,7 +918,8 @@ where
 /// resubscribe, and a frame for it still queued would otherwise
 /// register it twice. The stores go, the keys the engine had accepted
 /// stay held, pending again, and leave the cache until the engine is
-/// back. The other workers' keys are untouched.
+/// back. The other workers' keys are untouched. The cache's memory of
+/// refusals goes too: the engine coming back may be a restarted one.
 fn disconnected(worker: &Worker) {
     let (waiting, released, keys) = {
         let mut state = worker.state.lock().expect("state");
@@ -955,6 +956,7 @@ fn disconnected(worker: &Worker) {
         for key in &keys {
             cache.touched(key);
         }
+        cache.forget_refusals();
     }
 }
 
@@ -1350,6 +1352,28 @@ mod tests {
             worker.subscribe(&key()),
             Outcome::Verdict(Verdict::Accepted)
         ));
+    }
+
+    #[test]
+    fn a_dropped_socket_forgets_the_engines_refusals() {
+        let (worker, _outgoing, shared) = worker();
+        let cache = Arc::new(Cache::new(
+            1 << 20,
+            Arc::new(crate::subscriptions::Unsynced),
+        ));
+        *shared.cache.lock().unwrap() = Some(Arc::downgrade(&cache));
+        cache.refused(&key(), "`$2`: a bind of type oid 16406 is not supported");
+        assert!(
+            cache.refused_recently(&key()).is_some(),
+            "remembered while the engine is the same"
+        );
+
+        // The engine that comes back may know the type: ask it again.
+        disconnected(&worker);
+        assert!(
+            cache.refused_recently(&key()).is_none(),
+            "forgotten with the socket"
+        );
     }
 
     #[test]

@@ -23,8 +23,8 @@ curl -s localhost:8080/tickets/1 | jq '{source, micros}'
 ```
 
 The first read subscribes the query with the engine, which ships the
-rows; the second is served from the cache (`"source": "cache"`), with
-no round trip to Postgres.
+rows (`"source": "engine"`, no Postgres read); the second is served
+from the cache (`"source": "cache"`), with no round trip at all.
 
 ## 2. A change from outside
 

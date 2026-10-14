@@ -305,6 +305,16 @@ impl Cache {
         Some(reason)
     }
 
+    /// Forgets every remembered refusal: the engine connection dropped,
+    /// and the engine that answers next may be a restarted one with a
+    /// catalog that knows more (a type created after the old one
+    /// started, say), so each refused shape is asked about once more.
+    pub fn forget_refusals(&self) {
+        if let Some(refused) = &self.refused {
+            refused.invalidate_all();
+        }
+    }
+
     pub fn limits(&self) -> &Limits {
         &self.limits
     }

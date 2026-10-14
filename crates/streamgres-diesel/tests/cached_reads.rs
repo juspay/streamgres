@@ -10,7 +10,7 @@ use diesel::sql_types::{Integer, Text};
 use streamgres_diesel::cache::{Cache, Limits};
 use streamgres_diesel::key::QueryKey;
 use streamgres_diesel::subscriptions::{Outcome, Subscriptions, Verdict};
-use streamgres_diesel::{Consistency, Route, RouteDsl, SyncedConnection};
+use streamgres_diesel::{Consistency, Route, RouteDsl, Served, SyncedConnection};
 
 diesel::table! {
     sg_configs (id) {
@@ -218,6 +218,45 @@ fn a_repeated_read_is_served_from_the_cache() {
         w.engine.subscribed.lock().unwrap().len(),
         1,
         "subscribed once"
+    );
+}
+
+#[test]
+fn the_connection_says_where_each_read_was_served_from() {
+    let mut w = World::new("served");
+    assert_eq!(w.conn.last_served(), None, "nothing read yet");
+    w.put("k", "1");
+
+    assert_eq!(w.read("k").as_deref(), Some("1"));
+    assert_eq!(
+        w.conn.last_served(),
+        Some(Served::Postgres),
+        "the miss the engine accepted"
+    );
+    assert_eq!(w.read("k").as_deref(), Some("1"));
+    assert_eq!(w.conn.last_served(), Some(Served::Cache));
+
+    let key = w.key("k");
+    let value: Option<String> = sg_configs::table
+        .filter(sg_configs::key.eq(&key))
+        .select(sg_configs::value)
+        .via(Route::Postgres)
+        .first(&mut w.conn)
+        .optional()
+        .expect("read via");
+    assert_eq!(value.as_deref(), Some("1"));
+    assert_eq!(
+        w.conn.last_served(),
+        Some(Served::Postgres),
+        "the flag sent it live"
+    );
+
+    w.engine.refuse_all.store(true, Ordering::SeqCst);
+    assert_eq!(w.read("other").as_deref(), None);
+    assert_eq!(
+        w.conn.last_served(),
+        Some(Served::Postgres),
+        "refused, so live"
     );
 }
 

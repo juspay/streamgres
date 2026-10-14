@@ -15,7 +15,7 @@ use diesel::sql_types::Text;
 use streamgres_diesel::cache::Cache;
 use streamgres_diesel::engine::EngineClient;
 use streamgres_diesel::subscriptions::Subscriptions;
-use streamgres_diesel::{Consistency, SyncedConnection};
+use streamgres_diesel::{Consistency, Served, SyncedConnection};
 
 diesel::table! {
     sg_configs (id) {
@@ -384,12 +384,14 @@ fn rows_mode_reads_postgres_only_for_the_table_types() {
         1,
         "served from the engine's rows"
     );
+    assert_eq!(live.conn.last_served(), Some(Served::Engine));
     assert_eq!(
         sent.load(Ordering::SeqCst),
         1,
         "the only statement Postgres saw was the column-type lookup, not the rows"
     );
     assert_eq!(live.read("r").as_deref(), Some("1"));
+    assert_eq!(live.conn.last_served(), Some(Served::Cache));
 
     live.put("r", "2");
     let took = live
