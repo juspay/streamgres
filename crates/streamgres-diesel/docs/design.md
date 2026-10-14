@@ -6,9 +6,8 @@ projected column has a type the client can encode exactly, the result
 comes from the engine's rows and every change replaces the entry in
 place with no Postgres read. A (the engine invalidates, Postgres
 refills) is the fallback for a query that projects a column the engine
-cannot reproduce exactly: a `numeric` (held as a float), a timestamp
-finer than milliseconds (held as milliseconds), `bytea`, ranges,
-composites. `EngineClient::fallbacks()` says why a query fell back.
+cannot reproduce exactly: a `numeric` (held as a float), an `interval`,
+ranges, composites. `EngineClient::fallbacks()` says why a query fell back.
 
 ## Where the wrapper sits
 
@@ -88,8 +87,8 @@ reconnect logic carry over unchanged.
   `pg_attribute` through the connection the read came in on
   (`types.rs`), encodes each cell to Postgres's binary format
   (`encode.rs`: integers by width, floats, text-like, UUID, JSON and
-  JSONB, dates, timestamps declared at millisecond precision or
-  coarser, user enums, one-dimensional arrays of those), and keeps the
+  JSONB, dates, timestamps at Postgres's own microsecond precision,
+  `bytea`, user enums, one-dimensional arrays of those), and keeps the
   result by primary key (`materialized.rs`), ordering it as the query
   orders (Postgres defaults: ASC NULLs last, DESC NULLs first; strings
   bytewise) and cutting it to the limit on each rebuild.
@@ -119,11 +118,15 @@ reconnect logic carry over unchanged.
   straight to Postgres instead of asking the engine every time. A
   refusal from the client's own side (not connected, over the
   subscription cap, no answer in time) is not remembered.
+- Times: the engine keeps every `timestamp`, `timestamptz` and `date`
+  as microseconds since the epoch, Postgres's own precision, and ships
+  them so to S2S clients; the Zero protocol keeps seeing milliseconds
+  (scaled on its way in and out). So a `timestamp(6)` column, Postgres's
+  default and every `created_at` in Hyperswitch, is served exactly in
+  rows mode.
 - Known gaps: a column under a linguistic collation may order
-  differently from Postgres; the engine's timestamps are milliseconds,
-  so microsecond columns (`timestamp(6)`, Postgres's default, which is
-  every `created_at` in Hyperswitch) fall back to A until the engine
-  carries microseconds for S2S rows.
+  differently from Postgres; `numeric` (held as a float), `interval`,
+  ranges and composites fall back to A.
 
 ## Contract with the engine (implemented)
 

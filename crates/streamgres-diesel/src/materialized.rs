@@ -683,7 +683,7 @@ mod tests {
     fn an_unencodable_projected_column_refuses_rows_mode() {
         let mut t = types();
         let mut with_created = (*t["t"]).clone();
-        with_created.columns.push(base("created", 1114));
+        with_created.columns.push(base("created", 1186));
         t.insert("t".into(), Arc::new(with_created));
         let mut snap = snapshot(vec![], vec![], None);
         snap.columns = Some(vec![("t".into(), "id".into()), ("t".into(), "created".into())]);

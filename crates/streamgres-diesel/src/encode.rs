@@ -2,13 +2,13 @@
 //! decodes.
 //!
 //! The engine ships a row as JSON: strings, integers, floats, booleans,
-//! JSON documents, times as milliseconds since the Unix epoch, arrays.
+//! JSON documents, times as microseconds since the Unix epoch, arrays.
 //! Each cell is encoded for the column's exact Postgres type, so a cached
 //! row decodes through the same `FromSql` as a live one. A type whose
 //! value cannot be reproduced exactly from what the engine has is
 //! refused ([`Unsupported`]), and the query keeps refilling from Postgres
 //! instead: a `numeric` (the engine holds a float), a `timestamp` finer
-//! than milliseconds (the engine holds milliseconds), `bytea`, ranges,
+//! (the engine holds a float), ranges, intervals,
 //! composites.
 
 use std::num::NonZeroU32;
@@ -44,7 +44,7 @@ mod oid {
     pub const JSONB: u32 = 3802;
 }
 
-const PG_EPOCH_MILLIS: i64 = 946_684_800_000;
+const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 
 /// Whether every value of this column can be encoded exactly; checked
 /// once per query so an unsupported column refuses the whole query up
@@ -89,13 +89,14 @@ fn supports_scalar(type_oid: u32, typmod: i32, name: &str) -> Result<(), Unsuppo
         | oid::JSON
         | oid::JSONB
         | oid::BYTEA
-        | oid::DATE => Ok(()),
-        // The engine keeps a time as milliseconds; a column that may hold
-        // finer fractions would come back rounded.
-        oid::TIMESTAMP | oid::TIMESTAMPTZ if (0..=3).contains(&typmod) => Ok(()),
-        oid::TIMESTAMP | oid::TIMESTAMPTZ => Err(Unsupported(format!(
-            "column `{name}` is a timestamp finer than milliseconds"
-        ))),
+        | oid::DATE
+        // The engine keeps a time as microseconds, Postgres's own
+        // precision, so every declared precision comes back exact.
+        | oid::TIMESTAMP
+        | oid::TIMESTAMPTZ => {
+            let _ = typmod;
+            Ok(())
+        }
         1700 => Err(Unsupported(format!(
             "column `{name}` is a numeric, which the engine holds as a float"
         ))),
@@ -178,12 +179,12 @@ fn scalar(cell: &Json, type_oid: u32, name: &str) -> Result<Vec<u8>, Unsupported
             bytes
         }
         oid::TIMESTAMP | oid::TIMESTAMPTZ => {
-            let millis = integer(cell, name)?;
-            ((millis - PG_EPOCH_MILLIS) * 1000).to_be_bytes().to_vec()
+            let micros = integer(cell, name)?;
+            (micros - PG_EPOCH_MICROS).to_be_bytes().to_vec()
         }
         oid::DATE => {
-            let millis = integer(cell, name)?;
-            let days = (millis - PG_EPOCH_MILLIS).div_euclid(86_400_000);
+            let micros = integer(cell, name)?;
+            let days = (micros - PG_EPOCH_MICROS).div_euclid(86_400_000_000);
             i32::try_from(days)
                 .map_err(|_| mismatch(name, "a date"))?
                 .to_be_bytes()
@@ -280,13 +281,13 @@ mod tests {
         let jsonb = bytes(encode(&json!({"a": [1, null]}), &base(oid::JSONB)).unwrap());
         assert_eq!(jsonb[0], 1);
         assert_eq!(serde_json::from_slice::<Json>(&jsonb[1..]).unwrap(), json!({"a": [1, null]}));
-        let millis = PG_EPOCH_MILLIS + 1500;
+        let micros = PG_EPOCH_MICROS + 1_500_000;
         assert_eq!(
-            bytes(encode(&json!(millis), &base(oid::TIMESTAMPTZ)).unwrap()),
+            bytes(encode(&json!(micros), &base(oid::TIMESTAMPTZ)).unwrap()),
             1_500_000i64.to_be_bytes()
         );
         assert_eq!(
-            bytes(encode(&json!(PG_EPOCH_MILLIS + 2 * 86_400_000), &base(oid::DATE)).unwrap()),
+            bytes(encode(&json!(PG_EPOCH_MICROS + 2 * 86_400_000_000), &base(oid::DATE)).unwrap()),
             2i32.to_be_bytes()
         );
     }
@@ -308,10 +309,11 @@ mod tests {
 
     #[test]
     fn what_is_refused_up_front() {
-        assert!(supports(&base(oid::TIMESTAMP)).is_err(), "default precision is microseconds");
+        assert!(supports(&base(oid::TIMESTAMP)).is_ok(), "microseconds, Postgres's own precision");
         let mut ms = base(oid::TIMESTAMP);
         ms.typmod = 3;
         assert!(supports(&ms).is_ok());
+        assert!(supports(&base(1186)).is_err(), "interval");
         assert!(supports(&base(1700)).is_err(), "numeric");
         assert!(supports(&base(oid::BYTEA)).is_ok(), "bytea comes as hex text");
         assert!(supports(&base(3904)).is_err(), "an int4 range");

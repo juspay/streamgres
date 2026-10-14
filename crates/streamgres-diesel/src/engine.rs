@@ -19,7 +19,7 @@
 //! exactly, the result is kept as a [`Materialized`] store and the
 //! engine's `delta` frames replace the cache entry in place: Postgres is
 //! never read for that query. When a column cannot be encoded (a
-//! `numeric`, a microsecond timestamp) the subscription falls back to
+//! `numeric`, an interval, a range) the subscription falls back to
 //! touches: the cache reads Postgres and the engine's frames drop the
 //! entry. Which mode a key is in is the client's business; the cache sees
 //! `replace` or `touched`.

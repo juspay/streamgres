@@ -439,11 +439,12 @@ diesel::table! {
         tags -> Array<Text>,
         payload -> Jsonb,
         created -> Timestamptz,
+        lead -> Nullable<Interval>,
     }
 }
 
 #[test]
-fn a_microsecond_timestamp_column_falls_back_to_refills() {
+fn microsecond_timestamps_are_exact_and_an_interval_falls_back() {
     let Some(mut live) = Live::start("fallback") else {
         return;
     };
@@ -452,9 +453,12 @@ fn a_microsecond_timestamp_column_falls_back_to_refills() {
             "CREATE TABLE IF NOT EXISTS sg_items (
                 id serial PRIMARY KEY, name text NOT NULL, qty int NOT NULL, note text,
                 tags text[] NOT NULL DEFAULT '{}', payload jsonb NOT NULL DEFAULT '{}',
-                created timestamptz NOT NULL DEFAULT now())",
+                created timestamptz NOT NULL DEFAULT now());
+             ALTER TABLE sg_items ADD COLUMN IF NOT EXISTS lead interval",
         )
         .unwrap();
+    // The engine learns a new column from the DDL trigger; give it a moment.
+    std::thread::sleep(Duration::from_millis(500));
     let name = live.key("item");
     diesel::delete(sg_items::table.filter(sg_items::name.eq(&name)))
         .execute(&mut live.other)
@@ -465,14 +469,15 @@ fn a_microsecond_timestamp_column_falls_back_to_refills() {
             sg_items::qty.eq(1),
             sg_items::tags.eq(vec!["a", "b"]),
             sg_items::payload.eq(serde_json::json!({"k": [1, 2]})),
+            sg_items::lead.eq(diesel::data_types::PgInterval::from_microseconds(3_600_000_000)),
         ))
         .execute(&mut live.other)
         .unwrap();
     let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     live.conn.inner().set_instrumentation(CountQueries(sent.clone()));
 
-    // Projecting `created` (microsecond precision) cannot be served from
-    // engine rows: the read goes to Postgres and refills on touches.
+    // `created` is timestamptz(6): served from engine rows, to the
+    // microsecond.
     let with_created = |conn: &mut SyncedConnection<PgConnection>| -> (i32, chrono::DateTime<chrono::Utc>) {
         sg_items::table
             .filter(sg_items::name.eq(&name))
@@ -481,34 +486,39 @@ fn a_microsecond_timestamp_column_falls_back_to_refills() {
             .expect("with created")
     };
     let first = with_created(&mut live.conn);
-    assert_eq!(live.engine.materialized(), 0, "fell back to refills");
+    let from_postgres: (i32, chrono::DateTime<chrono::Utc>) = sg_items::table
+        .filter(sg_items::name.eq(&name))
+        .select((sg_items::qty, sg_items::created))
+        .first(&mut live.other)
+        .unwrap();
+    assert_eq!(first, from_postgres, "exact to the microsecond");
+    assert_eq!(live.engine.materialized(), 1, "rows mode: {:?}", live.engine.fallbacks());
+    assert_eq!(sent.load(Ordering::SeqCst), 1, "the type lookup only");
+    assert_eq!(with_created(&mut live.conn), first, "and cached");
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+
+    // An interval has no encoding here: the read goes to Postgres and
+    // refills on touches.
+    let with_lead = |conn: &mut SyncedConnection<PgConnection>| -> (i32, Option<diesel::data_types::PgInterval>) {
+        sg_items::table
+            .filter(sg_items::name.eq(&name))
+            .select((sg_items::qty, sg_items::lead))
+            .first(conn)
+            .expect("with lead")
+    };
+    let lead = with_lead(&mut live.conn);
+    assert_eq!(lead.1.map(|i| i.microseconds), Some(3_600_000_000));
+    assert_eq!(live.engine.materialized(), 1, "fell back to refills");
     assert!(
-        live.engine.fallbacks().last().is_some_and(|why| why.contains("finer than milliseconds")),
+        live.engine.fallbacks().last().is_some_and(|why| why.contains("oid 1186")),
         "{:?}",
         live.engine.fallbacks()
     );
-    assert_eq!(live.engine.subscribed(), 1);
-    assert_eq!(sent.load(Ordering::SeqCst), 2, "the type lookup and the row read");
-    // The insert committed just before the subscribe may be reported once
-    // more after the fill (the documented redundant touch), costing one
-    // refill; after that the entry holds.
-    assert_eq!(with_created(&mut live.conn), first, "and cached");
-    assert!(sent.load(Ordering::SeqCst) <= 3);
+    assert_eq!(live.engine.subscribed(), 2);
+    assert_eq!(sent.load(Ordering::SeqCst), 2, "the row read");
+    assert_eq!(with_lead(&mut live.conn), lead, "and cached");
+    assert!(sent.load(Ordering::SeqCst) <= 3, "at most one redundant refill");
     let settled = sent.load(Ordering::SeqCst);
-    assert_eq!(with_created(&mut live.conn), first);
-    assert_eq!(sent.load(Ordering::SeqCst), settled, "served from the cache");
-
-    // Not projecting it: arrays and jsonb are encodable, so engine rows.
-    let without = |conn: &mut SyncedConnection<PgConnection>| -> (i32, Vec<String>, serde_json::Value) {
-        sg_items::table
-            .filter(sg_items::name.eq(&name))
-            .select((sg_items::qty, sg_items::tags, sg_items::payload))
-            .first(conn)
-            .expect("without created")
-    };
-    assert_eq!(without(&mut live.conn), (1, vec!["a".into(), "b".into()], serde_json::json!({"k": [1, 2]})));
-    assert_eq!(live.engine.materialized(), 1);
-    assert_eq!(sent.load(Ordering::SeqCst), 2, "no Postgres read for the rows-mode query");
 
     diesel::update(sg_items::table.filter(sg_items::name.eq(&name)))
         .set((sg_items::qty.eq(2), sg_items::tags.eq(vec!["c"])))
@@ -517,15 +527,14 @@ fn a_microsecond_timestamp_column_falls_back_to_refills() {
     let started = Instant::now();
     loop {
         let a = with_created(&mut live.conn).0;
-        let b = without(&mut live.conn);
-        if a == 2 && b.0 == 2 {
-            assert_eq!(b.1, vec!["c".to_string()]);
+        let b = with_lead(&mut live.conn).0;
+        if a == 2 && b == 2 {
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(10), "the update never arrived: {a} {b:?}");
+        assert!(started.elapsed() < Duration::from_secs(10), "the update never arrived: {a} {b}");
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(sent.load(Ordering::SeqCst), 3, "one refill read for the fallback query, none for rows mode");
+    assert_eq!(sent.load(Ordering::SeqCst), settled + 1, "one refill read for the fallback query, none for rows mode");
     diesel::delete(sg_items::table.filter(sg_items::name.eq(&name)))
         .execute(&mut live.other)
         .unwrap();
