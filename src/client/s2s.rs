@@ -35,10 +35,11 @@
 //!   that moment every change to its rows is reported, so the backend
 //!   reads Postgres only after it. In rows mode the body also carries
 //!   the hydrated result: `"table"`, `"key"` (the primary-key columns),
-//!   `"columns"` (the projection, `null` for `*`), `"count"` (a
-//!   `COUNT(*)`), `"order"` (`[[column, "asc"|"desc"], ...]`), `"limit"`
-//!   (`null` for none) and `"rows"` (JSON objects keyed by column, every
-//!   column of the row).
+//!   `"columns"` (the projected columns, `null` for `*`), `"names"` (what
+//!   each comes out as: its alias or its own name; for a `COUNT(*)` the
+//!   one output name), `"count"` (a `COUNT(*)`), `"order"`
+//!   (`[[column, "asc"|"desc"], ...]`), `"limit"` (`null` for none) and
+//!   `"rows"` (JSON objects keyed by column, every column of the row).
 //! - `["refused", {"id": n, "reason": "..."}]` when the engine cannot
 //!   follow the query (outside the SQL subset, an unknown table, too many
 //!   rows). The backend serves that query live.
@@ -387,12 +388,18 @@ impl Task {
             .filter_map(|(_, row)| row)
             .map(|row| wire::row_json(&row, table))
             .collect();
-        let columns = match &shape.projection {
-            Projection::All => Json::Null,
-            Projection::Count => Json::Null,
-            Projection::Columns(columns) => {
-                Json::Array(columns.iter().map(|c| Json::from(c.as_str())).collect())
-            }
+        let (columns, names) = match &shape.projection {
+            Projection::All => (Json::Null, Json::Null),
+            Projection::Count { name } => (Json::Null, json!([name])),
+            Projection::Columns(columns) => (
+                Json::Array(
+                    columns
+                        .iter()
+                        .map(|p| Json::from(p.column.as_str()))
+                        .collect(),
+                ),
+                Json::Array(columns.iter().map(|p| Json::from(p.name.as_str())).collect()),
+            ),
         };
         let order: Vec<Json> = shape
             .order
@@ -415,7 +422,8 @@ impl Task {
                 "table": table.name.as_str(),
                 "key": table.pkey.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
                 "columns": columns,
-                "count": matches!(shape.projection, Projection::Count),
+                "names": names,
+                "count": matches!(shape.projection, Projection::Count { .. }),
                 "order": order,
                 "limit": limit,
                 "rows": rows,

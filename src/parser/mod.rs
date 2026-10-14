@@ -121,8 +121,17 @@ pub fn parse_read(sql: &str, catalog: &Catalog) -> Result<SingleTableReadQuery, 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Projection {
     All,
-    Count,
-    Columns(Vec<ColumnName>),
+    /// `COUNT(*)`, under the output name it was given (`count` when none).
+    Count { name: String },
+    Columns(Vec<Projected>),
+}
+
+/// One projected column and the name it comes out under: its alias, or
+/// the column's own name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Projected {
+    pub column: ColumnName,
+    pub name: String,
 }
 
 /// [`parse_read_with_binds`], also returning what the statement selects.
@@ -714,14 +723,17 @@ impl Parser<'_> {
             self.expect_sym("(")?;
             self.expect_sym("*")?;
             self.expect_sym(")")?;
-            self.alias()?;
+            let name = self.alias()?.unwrap_or_else(|| "count".to_string());
             self.expect_from()?;
-            return Ok(Projection::Count);
+            return Ok(Projection::Count { name });
         }
         let mut columns = Vec::new();
         loop {
-            columns.push(self.column_name(table)?);
-            self.alias()?;
+            let column = self.column_name(table)?;
+            let name = self
+                .alias()?
+                .unwrap_or_else(|| column.as_str().to_string());
+            columns.push(Projected { column, name });
             if !self.eat_sym(",") {
                 self.expect_from()?;
                 return Ok(Projection::Columns(columns));
@@ -730,15 +742,14 @@ impl Parser<'_> {
     }
 
     /// An optional `AS name` or bare `name` after a projected column.
-    fn alias(&mut self) -> Result<(), ParseError> {
+    fn alias(&mut self) -> Result<Option<String>, ParseError> {
         if self.eat_word("AS") {
-            self.ident()?;
-            return Ok(());
+            return self.ident().map(Some);
         }
         if !self.is_word("FROM") && matches!(self.peek(), Tok::Word(_) | Tok::Quoted(_)) {
-            self.bump();
+            return self.ident().map(Some);
         }
-        Ok(())
+        Ok(None)
     }
 
     fn expect_from(&mut self) -> Result<(), ParseError> {
@@ -1387,7 +1398,9 @@ mod tests {
         let (_, all) = parse_select("SELECT * FROM tickets", &[], &catalog()).unwrap();
         assert_eq!(all, Projection::All);
         let (_, count) = parse_select(r#"SELECT COUNT(*) FROM "tickets""#, &[], &catalog()).unwrap();
-        assert_eq!(count, Projection::Count);
+        assert_eq!(count, Projection::Count { name: "count".into() });
+        let (_, count) = parse_select(r#"SELECT COUNT(*) AS n FROM "tickets""#, &[], &catalog()).unwrap();
+        assert_eq!(count, Projection::Count { name: "n".into() });
         let (q, columns) = parse_select(
             r#"SELECT "tickets"."points" AS p, "tickets"."id" FROM "tickets" LIMIT $1"#,
             &[int8_bind(5)],
@@ -1396,7 +1409,16 @@ mod tests {
         .unwrap();
         assert_eq!(
             columns,
-            Projection::Columns(vec![ColumnName::from("points"), ColumnName::from("id")])
+            Projection::Columns(vec![
+                Projected {
+                    column: ColumnName::from("points"),
+                    name: "p".into()
+                },
+                Projected {
+                    column: ColumnName::from("id"),
+                    name: "id".into()
+                },
+            ])
         );
         assert_eq!(q.limit, 5);
         assert!(parse_select("UPDATE tickets SET status = 'x' WHERE id = 1", &[], &catalog()).is_err());
