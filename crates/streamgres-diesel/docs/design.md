@@ -192,6 +192,27 @@ its own keys.
   run it, then `tokio-console` (installed with `cargo install tokio-console`)
   attaches on `127.0.0.1:6669`; the S2S task is named `s2s`.
 
+## Cache limits
+
+`cache::Limits` bounds the cache three ways, each from the environment
+through `Limits::from_env` or set in code with `Cache::with_limits`:
+
+| variable                     | meaning                                      | default |
+|------------------------------|----------------------------------------------|---------|
+| `STREAMGRES_CACHE_MAX_BYTES` | rows and keys held                           | 256 MiB |
+| `STREAMGRES_CACHE_IDLE_MS`   | drop an entry unread for this long; 0 never  | 30 min  |
+| `STREAMGRES_CACHE_TTL_MS`    | drop an entry this old however read; 0 never | off     |
+
+Idle time makes the cache follow what the backend reads now: a query
+nobody asks for anymore loses its entry and its subscription. Time to
+live is a safety net: the entry is dropped on a timer however often it
+is read, and the next read resubscribes and refills from the engine. It
+is off by default because the engine keeps the entry fresh; an engine
+delta that replaces an entry restarts its clock. Both clocks, like the
+byte budget, end the subscription and bump the key's generation, so a
+fill in flight for an entry that just expired is dropped rather than
+kept without anything to update it.
+
 ## Routing: two flags, per query and per connection pool
 
 A read goes one of two ways, `Route::Streamgres` (the cache, kept fresh
@@ -226,8 +247,8 @@ names of the two routes.
 
 - id construct: subscription id = hash of SQL plus binds; client id per
   process; group id per application. Proposed, not agreed.
-- memory limit: entries and bytes, from an init config, with LRU and
-  unsubscribe on eviction.
+- memory limit: bytes, idle time and time to live from the environment
+  (see "Cache limits"), unsubscribe on eviction or expiry.
 - engine connections: a pool with a per-process cap, both from the
   environment (decided; see "The connection pool").
 - joins: the engine ships rows per table; for A this is invisible (the

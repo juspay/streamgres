@@ -7,7 +7,7 @@ use diesel::connection::{Instrumentation, InstrumentationEvent, SimpleConnection
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel::sql_types::{Integer, Text};
-use streamgres_diesel::cache::Cache;
+use streamgres_diesel::cache::{Cache, Limits};
 use streamgres_diesel::key::QueryKey;
 use streamgres_diesel::subscriptions::{Subscriptions, Verdict};
 use streamgres_diesel::{Consistency, Route, RouteDsl, SyncedConnection};
@@ -85,6 +85,16 @@ impl World {
     }
 
     fn with_budget(name: &str, max_bytes: u64) -> World {
+        Self::with_limits(
+            name,
+            Limits {
+                max_bytes,
+                ..Limits::default()
+            },
+        )
+    }
+
+    fn with_limits(name: &str, limits: Limits) -> World {
         static SCHEMA_READY: std::sync::Once = std::sync::Once::new();
         SCHEMA_READY.call_once(|| {
             let mut conn = PgConnection::establish(&url()).expect("connect");
@@ -95,7 +105,7 @@ impl World {
             .expect("schema");
         });
         let engine = Arc::new(FakeEngine::default());
-        let cache = Arc::new(Cache::new(max_bytes, engine.clone()));
+        let cache = Arc::new(Cache::with_limits(limits, engine.clone()));
         let mut inner = PgConnection::establish(&url()).expect("connect");
         let sent = Arc::new(AtomicUsize::new(0));
         inner.set_instrumentation(CountQueries(sent.clone()));
@@ -474,4 +484,58 @@ fn a_route_scope_covers_every_read_inside_it_and_the_query_flag_still_wins() {
     assert_eq!(scoped.as_deref(), Some("b"), "the scope routed to Postgres");
     assert_eq!(flagged.as_deref(), Some("a"), "the query flag beat the scope");
     assert_eq!(w.read("mode").as_deref(), Some("a"), "the scope ended");
+}
+
+#[test]
+fn an_entry_nobody_reads_expires_and_is_unsubscribed() {
+    let mut w = World::with_limits(
+        "idle",
+        Limits {
+            time_to_idle: Some(std::time::Duration::from_millis(80)),
+            ..Limits::default()
+        },
+    );
+    w.put("mode", "a");
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    // Reads keep it alive.
+    for _ in 0..4 {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert_eq!(w.read("mode").as_deref(), Some("a"));
+    }
+    assert_eq!(w.cache.len(), 1);
+    assert!(w.engine.unsubscribed.lock().unwrap().is_empty());
+
+    std::thread::sleep(std::time::Duration::from_millis(160));
+    assert_eq!(w.cache.len(), 0, "idle past the clock");
+    assert_eq!(w.engine.unsubscribed.lock().unwrap().len(), 1);
+    assert_eq!(w.cache.stats.expired.load(Ordering::Relaxed), 1);
+
+    // The next read subscribes again.
+    w.put("mode", "b");
+    assert_eq!(w.read("mode").as_deref(), Some("b"));
+    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn time_to_live_drops_an_entry_however_often_it_is_read() {
+    let mut w = World::with_limits(
+        "ttl",
+        Limits {
+            time_to_live: Some(std::time::Duration::from_millis(100)),
+            ..Limits::default()
+        },
+    );
+    w.put("mode", "a");
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_millis(80) {
+        assert_eq!(w.read("mode").as_deref(), Some("a"));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    w.cache.run_pending_tasks();
+    assert_eq!(w.engine.unsubscribed.lock().unwrap().len(), 1, "ended on the timer");
+    w.put("mode", "b");
+    assert_eq!(w.read("mode").as_deref(), Some("b"), "resubscribed and refilled");
+    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 2);
 }

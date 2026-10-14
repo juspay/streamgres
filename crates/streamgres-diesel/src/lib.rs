@@ -274,6 +274,10 @@ where
                 &entry.rows,
             ))));
         }
+        // The generation is taken before subscribing: a touch, or an
+        // expiry that ends the subscription, between here and the fill
+        // leaves nothing cached rather than something no one updates.
+        let generation = cache.reserve(&key);
         match cache.subscriptions().subscribe(&key, &mut self.inner) {
             Verdict::Refused(_) => {
                 cache.stats.refused.fetch_add(1, Ordering::Relaxed);
@@ -281,7 +285,7 @@ where
             }
             Verdict::Rows(rows) => {
                 // The engine's own rows: no Postgres read at all.
-                cache.replace(&key, Arc::clone(&rows));
+                cache.fill(key, generation, Arc::clone(&rows));
                 return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
             }
             Verdict::Accepted => {}
@@ -289,7 +293,6 @@ where
 
         // Subscribed: the engine reports every change from here on, so
         // what Postgres returns now is current until the first touch.
-        let generation = cache.reserve(&key);
         let live = LoadConnection::<DefaultLoadingMode>::load(&mut self.inner, source)?;
         let rows: Arc<[OwnedRow]> = Arc::from(capture_all(live)?);
         cache.fill(key, generation, Arc::clone(&rows));
