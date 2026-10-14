@@ -209,6 +209,11 @@ impl Cache {
         &*self.subscriptions
     }
 
+    /// The same, owned, for a subscribe on another thread.
+    pub fn shared_subscriptions(&self) -> Arc<dyn Subscriptions> {
+        Arc::clone(&self.subscriptions)
+    }
+
     /// The key's generation, taken before the read that will fill it.
     pub fn reserve(&self, key: &QueryKey) -> u64 {
         self.generation(key)

@@ -54,8 +54,8 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::cache::Cache;
 use crate::key::QueryKey;
 use crate::materialized::{Materialized, Snapshot};
-use crate::subscriptions::{Subscriptions, Verdict};
-use crate::types::{TableTypes, TypeLookup};
+use crate::subscriptions::{Outcome, Subscriptions, Verdict};
+use crate::types::TableTypes;
 
 /// How long a subscribe waits for the engine's verdict before the read is
 /// served live instead.
@@ -322,7 +322,7 @@ impl EngineClient {
 }
 
 impl Subscriptions for EngineClient {
-    fn subscribe(&self, key: &QueryKey, lookup: &mut dyn TypeLookup) -> Verdict {
+    fn subscribe(&self, key: &QueryKey) -> Outcome {
         let shared = &self.pool.shared;
         // Route: the worker already holding the key, else the least
         // loaded one, unless the cap is reached. The key is claimed in
@@ -334,20 +334,36 @@ impl Subscriptions for EngineClient {
                 Some(index) => Arc::clone(&self.pool.workers[*index]),
                 None => {
                     if by_key.len() >= shared.max_subscriptions {
-                        return Verdict::Refused(format!(
+                        return Outcome::Verdict(Verdict::Refused(format!(
                             "the subscription limit of {} is reached",
                             shared.max_subscriptions
-                        ));
+                        )));
                     }
                     let Some(worker) = self.least_loaded() else {
-                        return Verdict::Refused("the engine is not connected".to_string());
+                        return Outcome::Verdict(Verdict::Refused("the engine is not connected".to_string()));
                     };
                     by_key.insert(key.clone(), worker.index);
                     Arc::clone(worker)
                 }
             }
         };
-        worker.subscribe(key, lookup)
+        worker.subscribe(key)
+    }
+
+    fn materialize(&self, key: &QueryKey, snapshot: Snapshot, types: HashMap<String, Arc<TableTypes>>) -> Verdict {
+        self.pool.shared.types.lock().expect("types").extend(types);
+        let worker = self
+            .pool
+            .shared
+            .by_key
+            .lock()
+            .expect("by_key")
+            .get(key)
+            .map(|index| Arc::clone(&self.pool.workers[*index]));
+        match worker {
+            Some(worker) => worker.materialize_key(key, snapshot),
+            None => Verdict::Refused("the subscription ended before its rows were built".to_string()),
+        }
     }
 
     fn unsubscribe(&self, key: &QueryKey) {
@@ -397,7 +413,7 @@ impl Worker {
         worker
     }
 
-    fn subscribe(&self, key: &QueryKey, lookup: &mut dyn TypeLookup) -> Verdict {
+    fn subscribe(&self, key: &QueryKey) -> Outcome {
         let (reply, verdict) = std::sync::mpsc::sync_channel(1);
         let id = {
             let mut state = self.state.lock().expect("state");
@@ -405,15 +421,15 @@ impl Worker {
                 // Already subscribed (a refill after a touch, or a
                 // resubscribe the reader could not materialise without
                 // a connection): the rows if the store has them.
-                return match state.materialized.get(&id).map(Materialized::rows) {
+                return Outcome::Verdict(match state.materialized.get(&id).map(Materialized::rows) {
                     Some(Ok(rows)) => Verdict::Rows(rows),
                     _ => Verdict::Accepted,
-                };
+                });
             }
             if !self.connected.load(Ordering::Acquire) {
                 drop(state);
                 self.shared.release(key, self.index);
-                return Verdict::Refused("the engine is not connected".to_string());
+                return Outcome::Verdict(Verdict::Refused("the engine is not connected".to_string()));
             }
             let id = state.next_id;
             state.next_id += 1;
@@ -432,16 +448,40 @@ impl Worker {
             .is_err()
         {
             self.forget(id);
-            return Verdict::Refused("the engine client has stopped".to_string());
+            return Outcome::Verdict(Verdict::Refused("the engine client has stopped".to_string()));
         }
         match verdict.recv_timeout(self.verdict_timeout) {
-            Ok(Reply::Verdict(verdict)) => verdict,
-            Ok(Reply::Snapshot(snapshot)) => self.materialize(id, snapshot, Some(lookup)),
+            Ok(Reply::Verdict(verdict)) => Outcome::Verdict(verdict),
+            Ok(Reply::Snapshot(snapshot)) => {
+                let missing: Vec<String> = {
+                    let types = self.shared.types.lock().expect("types");
+                    snapshot
+                        .tables()
+                        .filter(|table| !types.contains_key(*table))
+                        .map(str::to_string)
+                        .collect()
+                };
+                if missing.is_empty() {
+                    Outcome::Verdict(self.materialize(id, snapshot))
+                } else {
+                    Outcome::NeedsTypes { snapshot, missing }
+                }
+            }
             Err(_) => {
                 self.forget(id);
                 let _ = self.outgoing.send(Outgoing::Unsubscribe { id });
-                Verdict::Refused("the engine did not answer in time".to_string())
+                Outcome::Verdict(Verdict::Refused("the engine did not answer in time".to_string()))
             }
+        }
+    }
+
+    /// The second step of a subscribe, once the caller has looked the
+    /// missing types up and put them in the shared map.
+    fn materialize_key(&self, key: &QueryKey, snapshot: Snapshot) -> Verdict {
+        let id = self.state.lock().expect("state").by_key.get(key).copied();
+        match id {
+            Some(id) => self.materialize(id, snapshot),
+            None => Verdict::Refused("the subscription ended before its rows were built".to_string()),
         }
     }
 
@@ -459,37 +499,28 @@ impl Worker {
         let _ = self.outgoing.send(Outgoing::Unsubscribe { id });
     }
 
-    /// Builds the store for an accepted subscription from its snapshot.
-    /// The tables' types come from `lookup`, or from what earlier
-    /// subscribes learnt when there is no connection at hand (a
-    /// resubscribe). Falls back to touches when the rows cannot be
-    /// encoded or a table's types are not known.
-    fn materialize(&self, id: u64, snapshot: Snapshot, mut lookup: Option<&mut dyn TypeLookup>) -> Verdict {
+    /// Builds the store for an accepted subscription from its snapshot
+    /// and the types already known. Falls back to touches when a
+    /// table's types are not known or the rows cannot be encoded.
+    fn materialize(&self, id: u64, snapshot: Snapshot) -> Verdict {
         let shared = &self.shared;
-        let mut types: HashMap<String, Arc<TableTypes>> = HashMap::new();
-        for table in snapshot.tables() {
-            let known = shared.types.lock().expect("types").get(table).cloned();
-            let table_types = match (known, lookup.as_deref_mut()) {
-                (Some(types), _) => types,
-                (None, Some(lookup)) => match lookup.table_types(table) {
-                    Ok(found) => {
-                        let found = Arc::new(found);
-                        shared
-                            .types
-                            .lock()
-                            .expect("types")
-                            .insert(table.to_string(), Arc::clone(&found));
-                        found
+        let types: HashMap<String, Arc<TableTypes>> = {
+            let known = shared.types.lock().expect("types");
+            let mut types = HashMap::new();
+            for table in snapshot.tables() {
+                match known.get(table) {
+                    Some(found) => {
+                        types.insert(table.to_string(), Arc::clone(found));
                     }
-                    Err(error) => {
-                        shared.fell_back(format!("types of `{table}` unavailable: {error}"));
+                    None => {
+                        drop(known);
+                        shared.fell_back(format!("types of `{table}` unavailable"));
                         return Verdict::Accepted;
                     }
-                },
-                (None, None) => return Verdict::Accepted,
-            };
-            types.insert(table.to_string(), table_types);
-        }
+                }
+            }
+            types
+        };
         match Materialized::new(snapshot, &types) {
             Ok(materialized) => match materialized.rows() {
                 Ok(rows) => {
@@ -654,7 +685,7 @@ fn inbound(worker: &Worker, text: &str) {
                     // A resubscribe after a reconnect: no caller waits, so
                     // the store is built from the types already known and
                     // the cache refilled without a read.
-                    if let Verdict::Rows(rows) = worker.materialize(id, snapshot, None) {
+                    if let Verdict::Rows(rows) = worker.materialize(id, snapshot) {
                         let key = worker.state.lock().expect("state").by_id.get(&id).cloned();
                         if let (Some(key), Some(cache)) = (key, shared.cache()) {
                             cache.replace(&key, rows);

@@ -7,14 +7,18 @@ use std::sync::Arc;
 use diesel::prelude::*;
 use streamgres_diesel::cache::Cache;
 use streamgres_diesel::key::QueryKey;
-use streamgres_diesel::subscriptions::{Subscriptions, Verdict};
-use streamgres_diesel::types::TypeLookup;
+use streamgres_diesel::materialized::Snapshot;
+use streamgres_diesel::subscriptions::{Outcome, Subscriptions, Verdict};
+use streamgres_diesel::types::TableTypes;
 use streamgres_diesel::{Attachment, Route, Settings, SyncedConnection, install};
 
 struct Unsynced;
 
 impl Subscriptions for Unsynced {
-    fn subscribe(&self, _: &QueryKey, _: &mut dyn TypeLookup) -> Verdict {
+    fn subscribe(&self, _: &QueryKey) -> Outcome {
+        Outcome::Verdict(Verdict::Refused("test".into()))
+    }
+    fn materialize(&self, _: &QueryKey, _: Snapshot, _: std::collections::HashMap<String, Arc<TableTypes>>) -> Verdict {
         Verdict::Refused("test".into())
     }
     fn unsubscribe(&self, _: &QueryKey) {}

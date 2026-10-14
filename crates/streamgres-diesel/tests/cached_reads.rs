@@ -9,7 +9,7 @@ use diesel::sql_query;
 use diesel::sql_types::{Integer, Text};
 use streamgres_diesel::cache::{Cache, Limits};
 use streamgres_diesel::key::QueryKey;
-use streamgres_diesel::subscriptions::{Subscriptions, Verdict};
+use streamgres_diesel::subscriptions::{Outcome, Subscriptions, Verdict};
 use streamgres_diesel::{Consistency, Route, RouteDsl, SyncedConnection};
 
 diesel::table! {
@@ -43,11 +43,20 @@ struct FakeEngine {
 }
 
 impl Subscriptions for FakeEngine {
-    fn subscribe(&self, key: &QueryKey, _: &mut dyn streamgres_diesel::types::TypeLookup) -> Verdict {
+    fn subscribe(&self, key: &QueryKey) -> Outcome {
         if self.refuse_all.load(Ordering::SeqCst) || !key.sql.contains("sg_configs") {
-            return Verdict::Refused("not a config read".into());
+            return Outcome::Verdict(Verdict::Refused("not a config read".into()));
         }
         self.subscribed.lock().unwrap().push(key.clone());
+        Outcome::Verdict(Verdict::Accepted)
+    }
+
+    fn materialize(
+        &self,
+        _: &QueryKey,
+        _: streamgres_diesel::materialized::Snapshot,
+        _: std::collections::HashMap<String, Arc<streamgres_diesel::types::TableTypes>>,
+    ) -> Verdict {
         Verdict::Accepted
     }
 

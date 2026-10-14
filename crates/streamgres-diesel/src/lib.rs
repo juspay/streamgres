@@ -42,6 +42,8 @@
 //! enable it, so this crate does too rather than reaching into Diesel's
 //! hidden derive re-exports.
 
+#[cfg(feature = "async")]
+pub mod asynchronous;
 pub mod cache;
 pub mod cursor;
 pub mod encode;
@@ -73,6 +75,8 @@ use crate::key::QueryKey;
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::Verdict;
 pub use crate::route::{Route, RouteDsl, Via};
+#[cfg(feature = "async")]
+pub use crate::asynchronous::AsyncSyncedConnection;
 
 /// The earlier name of [`Route`]: `Consistency::Eventual` is
 /// [`Route::Streamgres`], `Consistency::Strong` is [`Route::Postgres`].
@@ -380,7 +384,7 @@ where
         // expiry that ends the subscription, between here and the fill
         // leaves nothing cached rather than something no one updates.
         let generation = cache.reserve(&key);
-        match cache.subscriptions().subscribe(&key, &mut self.inner) {
+        match cache.subscriptions().subscribe_with(&key, &mut self.inner) {
             Verdict::Refused(_) => {
                 cache.stats.refused.fetch_add(1, Ordering::Relaxed);
                 return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);

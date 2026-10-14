@@ -36,6 +36,17 @@ streamgres_diesel::install(Settings::single(
 //   conn.with_route(Route::Streamgres, |c| configs::table.find(key).first(c))
 ```
 
+## diesel-async
+
+With the `async` feature, `AsyncSyncedConnection` wraps diesel-async's
+`AsyncPgConnection` the same way and pools through bb8 or deadpool:
+
+```rust
+let conn = AsyncSyncedConnection::establish(&url).await?;   // picks up the installed settings
+configs::table.find(key).first::<Config>(&mut conn).await?; // cached
+configs::table.find(key).via(Route::Postgres).first::<Config>(&mut conn).await?;
+```
+
 ## Live tests
 
 With an engine streaming the test database (see `docs/design.md` for a

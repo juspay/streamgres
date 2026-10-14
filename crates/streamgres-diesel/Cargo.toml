@@ -6,6 +6,11 @@ rust-version = "1.88"
 license = "Apache-2.0"
 description = "A Diesel connection wrapper serving reads from a cache the Streamgres engine keeps fresh"
 
+[features]
+# `AsyncSyncedConnection`, the same wrapper over diesel-async's
+# `AsyncPgConnection`.
+async = ["dep:diesel-async", "diesel-async/postgres", "diesel-async/pool"]
+
 [dependencies]
 base64 = "0.23.1"
 diesel = { version = "2.2.10", features = ["postgres", "r2d2", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
@@ -18,8 +23,6 @@ tokio-tungstenite = "0.30.0"
 
 [dev-dependencies]
 chrono = "0.4.45"
+scoped-futures = "0.1"
 diesel = { version = "2.2.10", features = ["chrono", "postgres", "r2d2", "serde_json"] }
 serde_json = "1.0.154"
-
-[features]
-diesel-async = ["dep:diesel-async"]

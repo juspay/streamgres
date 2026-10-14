@@ -74,49 +74,109 @@ struct Attribute {
     elemtyptype: Option<String>,
 }
 
+impl Attribute {
+    fn into_column(self) -> ColumnType {
+        let kind = match self.typtype.as_str() {
+            "b" if self.typelem != 0 && self.elemtyptype.is_some() => {
+                let element_kind = match self.elemtyptype.as_deref() {
+                    Some("b") => TypeKind::Base,
+                    Some("e") => TypeKind::Enum,
+                    _ => TypeKind::Other,
+                };
+                TypeKind::Array {
+                    element: self.typelem,
+                    element_kind: Box::new(element_kind),
+                }
+            }
+            "b" => TypeKind::Base,
+            "e" => TypeKind::Enum,
+            _ => TypeKind::Other,
+        };
+        ColumnType {
+            name: self.attname,
+            oid: self.atttypid,
+            typmod: self.atttypmod,
+            kind,
+        }
+    }
+}
+
+const ATTRIBUTE_COLUMNS: &str = "a.attname, a.atttypid, a.atttypmod, t.typtype::text AS typtype, \
+     t.typelem, et.typtype::text AS elemtyptype";
+
 impl<C> TypeLookup for C
 where
     C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
 {
     fn table_types(&mut self, table: &str) -> QueryResult<TableTypes> {
-        let attributes = sql_query(
-            "SELECT a.attname, a.atttypid, a.atttypmod, t.typtype::text AS typtype, \
-             t.typelem, et.typtype::text AS elemtyptype \
+        let attributes = sql_query(format!(
+            "SELECT {ATTRIBUTE_COLUMNS} \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
              LEFT JOIN pg_type et ON et.oid = t.typelem AND t.typelem <> 0 \
              WHERE a.attrelid = quote_ident($1)::regclass AND a.attnum > 0 AND NOT a.attisdropped \
-             ORDER BY a.attnum",
-        )
+             ORDER BY a.attnum"
+        ))
         .bind::<Text, _>(table)
         .load::<Attribute>(self)?;
-        let columns = attributes
-            .into_iter()
-            .map(|attribute| {
-                let kind = match attribute.typtype.as_str() {
-                    "b" if attribute.typelem != 0 && attribute.elemtyptype.is_some() => {
-                        let element_kind = match attribute.elemtyptype.as_deref() {
-                            Some("b") => TypeKind::Base,
-                            Some("e") => TypeKind::Enum,
-                            _ => TypeKind::Other,
-                        };
-                        TypeKind::Array {
-                            element: attribute.typelem,
-                            element_kind: Box::new(element_kind),
-                        }
-                    }
-                    "b" => TypeKind::Base,
-                    "e" => TypeKind::Enum,
-                    _ => TypeKind::Other,
-                };
-                ColumnType {
-                    name: attribute.attname,
-                    oid: attribute.atttypid,
-                    typmod: attribute.atttypmod,
-                    kind,
-                }
-            })
-            .collect();
-        Ok(TableTypes { columns })
+        Ok(TableTypes {
+            columns: attributes.into_iter().map(Attribute::into_column).collect(),
+        })
     }
+}
+
+/// One column of one table, from [`ALL_TABLES_SQL`]: how a connection
+/// that cannot run a query per table (an async one, whose futures are
+/// built before the engine names the tables) learns every table's types
+/// at once.
+#[derive(QueryableByName)]
+pub struct TableAttribute {
+    #[diesel(sql_type = Text)]
+    relname: String,
+    #[diesel(embed)]
+    attribute: Attribute,
+}
+
+/// Every column of every table in the search path, tables in no
+/// particular order, columns in declaration order. A table name present
+/// in several schemas resolves to the first in the search path, as a
+/// bare name does.
+pub const ALL_TABLES_SQL: &str = "SELECT c.relname, a.attname, a.atttypid, a.atttypmod, \
+     t.typtype::text AS typtype, t.typelem, et.typtype::text AS elemtyptype \
+     FROM pg_class c \
+     JOIN pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_attribute a ON a.attrelid = c.oid \
+     JOIN pg_type t ON t.oid = a.atttypid \
+     LEFT JOIN pg_type et ON et.oid = t.typelem AND t.typelem <> 0 \
+     WHERE c.relkind IN ('r', 'p', 'v', 'm') \
+       AND n.nspname = ANY(current_schemas(false)) \
+       AND a.attnum > 0 AND NOT a.attisdropped \
+     ORDER BY array_position(current_schemas(false), n.nspname), c.relname, a.attnum";
+
+/// Groups [`ALL_TABLES_SQL`]'s rows by table.
+pub fn all_table_types(rows: Vec<TableAttribute>) -> std::collections::HashMap<String, TableTypes> {
+    let mut tables: std::collections::HashMap<String, TableTypes> = std::collections::HashMap::new();
+    // Rows of one table are contiguous. A later run under a name already
+    // taken is the same name in a later schema, which a bare name does
+    // not mean, so it is skipped whole.
+    let mut current: Option<(String, bool)> = None;
+    for row in rows {
+        let skip = match &current {
+            Some((name, skip)) if *name == row.relname => *skip,
+            _ => {
+                let skip = tables.contains_key(&row.relname);
+                current = Some((row.relname.clone(), skip));
+                skip
+            }
+        };
+        if skip {
+            continue;
+        }
+        tables
+            .entry(row.relname)
+            .or_insert_with(|| TableTypes { columns: Vec::new() })
+            .columns
+            .push(row.attribute.into_column());
+    }
+    tables
 }

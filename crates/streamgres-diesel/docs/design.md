@@ -192,6 +192,37 @@ its own keys.
   run it, then `tokio-console` (installed with `cargo install tokio-console`)
   attaches on `127.0.0.1:6669`; the S2S task is named `s2s`.
 
+## diesel-async
+
+`AsyncSyncedConnection` (cargo feature `async`) is the same wrapper over
+diesel-async's `AsyncPgConnection`: it implements `AsyncConnection` and
+`PoolableConnection`, so an application on diesel-async with bb8 or
+deadpool swaps its connection type and nothing else changes. Routing,
+the cache, the read-your-writes window, the settings and the engine
+side are shared with the blocking wrapper.
+
+What differs is how a read reaches them. `AsyncConnection::load` must
+return a future that neither borrows the connection nor carries the
+query, so, as diesel-async itself does, everything that needs either
+happens synchronously inside `load`: the key is rendered, the route
+decided, the cache checked, and the futures the read may need are built
+up front: the inner connection's own load (polled only when the read
+goes to Postgres), and a lookup of every table's column types
+(`types::ALL_TABLES_SQL`, polled only the first time the engine ships
+rows for a table whose types are not known). A subscribe blocks on the
+engine, so it runs on a blocking thread. That split is also why
+`Subscriptions::subscribe` is two steps: it answers `NeedsTypes` with
+the tables it does not know, and `materialize` finishes the job once
+the caller, blocking or async, has looked them up.
+
+A bind of a user-defined type (an enum) needs its OID for the key. The
+blocking wrapper resolves it on the spot through the connection; the
+async one cannot, so the first read with such a bind goes to Postgres
+while the OID is resolved and remembered, and from the next read on the
+query is cached like any other. A table created after the one-shot type
+load falls its query back to refills, and the next miss loads the types
+again.
+
 ## Cache limits
 
 `cache::Limits` bounds the cache three ways, each from the environment

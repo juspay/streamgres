@@ -10,12 +10,23 @@
 //! before Postgres is read, so a change that lands after the read is
 //! reported, and one that lands between the two is reported redundantly,
 //! which costs one refill and never a stale row.
+//!
+//! Subscribing is two steps because the second may need the database.
+//! [`Subscriptions::subscribe`] sends the query and waits for the
+//! engine. When the engine ships rows for tables whose column types are
+//! not yet known, the answer is [`Outcome::NeedsTypes`], the caller
+//! looks the types up on whatever connection it has (blocking or async)
+//! and hands them to [`Subscriptions::materialize`], which builds the
+//! store and gives the verdict. [`Subscriptions::subscribe_with`] does
+//! both on a blocking connection.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::key::QueryKey;
+use crate::materialized::Snapshot;
 use crate::row::OwnedRow;
-use crate::types::TypeLookup;
+use crate::types::{TableTypes, TypeLookup};
 
 /// The engine's answer to a subscription.
 #[derive(Debug, Clone)]
@@ -31,16 +42,51 @@ pub enum Verdict {
     Refused(String),
 }
 
+/// The engine's answer to [`Subscriptions::subscribe`].
+pub enum Outcome {
+    Verdict(Verdict),
+    /// The engine ships rows, and `missing` are the tables whose column
+    /// types the engine side does not know yet. Look them up and call
+    /// [`Subscriptions::materialize`].
+    NeedsTypes { snapshot: Snapshot, missing: Vec<String> },
+}
+
 /// What the cache needs from the engine.
 pub trait Subscriptions: Send + Sync {
     /// Registers a query. Returns once the engine has it, since the cache
-    /// reads Postgres only after that. `lookup` is the connection the
-    /// read is on, for the table's column types when rows are served.
-    fn subscribe(&self, key: &QueryKey, lookup: &mut dyn TypeLookup) -> Verdict;
+    /// reads Postgres only after that. Blocks the calling thread for up
+    /// to the verdict timeout.
+    fn subscribe(&self, key: &QueryKey) -> Outcome;
 
-    /// The cache dropped the entry for good (evicted for size), so the
-    /// engine need not follow the query any more.
+    /// Finishes an [`Outcome::NeedsTypes`]: `types` are the column types
+    /// of the missing tables (a table left out falls the query back to
+    /// refills). Pure computation, no I/O.
+    fn materialize(&self, key: &QueryKey, snapshot: Snapshot, types: HashMap<String, Arc<TableTypes>>) -> Verdict;
+
+    /// The cache dropped the entry for good (evicted for size or age), so
+    /// the engine need not follow the query any more.
     fn unsubscribe(&self, key: &QueryKey);
+
+    /// Both steps on a blocking connection: `lookup` is the connection
+    /// the read is on.
+    fn subscribe_with(&self, key: &QueryKey, lookup: &mut dyn TypeLookup) -> Verdict {
+        match self.subscribe(key) {
+            Outcome::Verdict(verdict) => verdict,
+            Outcome::NeedsTypes { snapshot, missing } => {
+                let mut types = HashMap::new();
+                for table in missing {
+                    match lookup.table_types(&table) {
+                        Ok(found) => {
+                            types.insert(table, Arc::new(found));
+                        }
+                        // The engine side reports the fallback.
+                        Err(_) => break,
+                    }
+                }
+                self.materialize(key, snapshot, types)
+            }
+        }
+    }
 }
 
 /// No engine: refuses every query, so the connection is a plain
@@ -49,7 +95,11 @@ pub trait Subscriptions: Send + Sync {
 pub struct Unsynced;
 
 impl Subscriptions for Unsynced {
-    fn subscribe(&self, _: &QueryKey, _: &mut dyn TypeLookup) -> Verdict {
+    fn subscribe(&self, _: &QueryKey) -> Outcome {
+        Outcome::Verdict(Verdict::Refused("no engine".to_string()))
+    }
+
+    fn materialize(&self, _: &QueryKey, _: Snapshot, _: HashMap<String, Arc<TableTypes>>) -> Verdict {
         Verdict::Refused("no engine".to_string())
     }
 
