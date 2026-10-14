@@ -38,10 +38,10 @@ index f0c20a5..70afae2 100644
  pub type RawPgConnection = async_bb8_diesel::Connection<DejaPgConnection>;
 diff --git a/crates/diesel_models/tests/streamgres_live.rs b/crates/diesel_models/tests/streamgres_live.rs
 new file mode 100644
-index 0000000..acda19b
+index 0000000..26ef5fb
 --- /dev/null
 +++ b/crates/diesel_models/tests/streamgres_live.rs
-@@ -0,0 +1,107 @@
+@@ -0,0 +1,113 @@
 +//! Hyperswitch's own config lookups through the Streamgres-synced
 +//! connection, against a running engine.
 +//!
@@ -71,6 +71,12 @@ index 0000000..acda19b
 +        eprintln!("DATABASE_URL / STREAMGRES_S2S_URL not set; skipping");
 +        return;
 +    };
++
++    // The wrapper routes a connection's reads to Postgres for a second
++    // after it writes (read-your-writes). This test writes and reads on
++    // one connection on purpose, to watch the engine carry the change,
++    // so the window is off here.
++    std::env::set_var("STREAMGRES_READ_YOUR_WRITES_MS", "0");
 +
 +    // What a Hyperswitch binary would do at startup.
 +    let engine = EngineClient::connect(s2s);
