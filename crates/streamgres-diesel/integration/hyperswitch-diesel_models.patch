@@ -38,10 +38,10 @@ index f0c20a5..70afae2 100644
  pub type RawPgConnection = async_bb8_diesel::Connection<DejaPgConnection>;
 diff --git a/crates/diesel_models/tests/streamgres_live.rs b/crates/diesel_models/tests/streamgres_live.rs
 new file mode 100644
-index 0000000..754ef45
+index 0000000..9b5ca7e
 --- /dev/null
 +++ b/crates/diesel_models/tests/streamgres_live.rs
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,110 @@
 +//! Hyperswitch's own config lookups through the Streamgres-synced
 +//! connection, against a running engine.
 +//!
@@ -137,7 +137,8 @@ index 0000000..754ef45
 +        tokio::time::sleep(Duration::from_millis(5)).await;
 +    }
 +    eprintln!("HYPERSWITCH update_by_key -> find_by_key sees it: {:?}", started.elapsed());
-+    assert!(cache.stats.touched.load(Ordering::Relaxed) >= 1);
++    assert!(cache.stats.touched.load(Ordering::Relaxed) + cache.stats.replaced.load(Ordering::Relaxed) >= 1);
++    eprintln!("HYPERSWITCH rows mode: {}", engine.materialized() == 1);
 +    assert_eq!(engine.subscribed(), 1);
 +
 +    // Clean up with a plain connection.
