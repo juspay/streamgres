@@ -96,11 +96,23 @@ reconnect logic carry over unchanged.
 - `COUNT(*)` is one `int8` row computed from the kept rows.
 - A reconnect resubscribes and the engine's snapshot refills the entry
   with no Postgres read; the types are already known.
+- Joins, composed in the library as agreed: the engine parses Diesel's
+  `FROM ("a" INNER JOIN ("b" ...) ON (...))` into its tree (INNER and
+  LEFT edges on one column each side; `ON` conditions and `WHERE`
+  conjuncts to the one table they name; `ORDER BY` and `LIMIT` on the
+  root), plans it like a Zero query, and ships the hydrated rows per
+  table with each node's key and join columns, then per-table puts and
+  deletes. The client keeps rows per table by key and composes the
+  result on each rebuild: root rows in query order, a hash join down
+  each edge, inner edges dropping unmatched parents and left edges
+  null-extending, then the limit over joined rows, projection, count.
+  Refused by name: a table joined twice, RIGHT/FULL/CROSS, OR across
+  tables, WHERE on a LEFT-joined table, ORDER BY on a joined table,
+  compound keys.
 - Known gaps: a column under a linguistic collation may order
   differently from Postgres; the engine's timestamps are milliseconds,
   so microsecond columns fall back to A until the engine carries
-  microseconds for S2S rows; joins are not shipped yet (assembly will
-  live in the library, as agreed).
+  microseconds for S2S rows.
 
 ## Contract with the engine (implemented)
 

@@ -523,3 +523,140 @@ fn a_microsecond_timestamp_column_falls_back_to_refills() {
         .execute(&mut live.other)
         .unwrap();
 }
+
+diesel::table! {
+    sg_authors (id) {
+        id -> Int4,
+        name -> Text,
+    }
+}
+
+diesel::table! {
+    sg_books (id) {
+        id -> Int4,
+        author_id -> Int4,
+        title -> Text,
+    }
+}
+
+diesel::joinable!(sg_books -> sg_authors (author_id));
+diesel::allow_tables_to_appear_in_same_query!(sg_authors, sg_books);
+
+#[test]
+fn joins_are_composed_from_the_engines_rows() {
+    let Some(mut live) = Live::start("join") else {
+        return;
+    };
+    live.other
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS sg_authors (id serial PRIMARY KEY, name text NOT NULL);
+             CREATE TABLE IF NOT EXISTS sg_books (id serial PRIMARY KEY, author_id int NOT NULL REFERENCES sg_authors(id), title text NOT NULL)",
+        )
+        .unwrap();
+    let database = std::env::var("DATABASE_URL").unwrap();
+    let mut plain = PgConnection::establish(&database).unwrap();
+    let p = live.prefix.clone();
+    let names: Vec<String> = ["ann", "bob", "cy"].iter().map(|n| format!("{p}{n}")).collect();
+    // Clean, then seed: ann has two books, bob none, cy one.
+    diesel::delete(sg_books::table.filter(sg_books::title.like(format!("{p}%")))).execute(&mut plain).unwrap();
+    diesel::delete(sg_authors::table.filter(sg_authors::name.like(format!("{p}%")))).execute(&mut plain).unwrap();
+    let ids: Vec<i32> = diesel::insert_into(sg_authors::table)
+        .values(names.iter().map(|n| sg_authors::name.eq(n)).collect::<Vec<_>>())
+        .returning(sg_authors::id)
+        .get_results(&mut plain)
+        .unwrap();
+    diesel::insert_into(sg_books::table)
+        .values(vec![
+            (sg_books::author_id.eq(ids[0]), sg_books::title.eq(format!("{p}a1"))),
+            (sg_books::author_id.eq(ids[0]), sg_books::title.eq(format!("{p}a2"))),
+            (sg_books::author_id.eq(ids[2]), sg_books::title.eq(format!("{p}c1"))),
+        ])
+        .execute(&mut plain)
+        .unwrap();
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    live.conn.inner().set_instrumentation(CountQueries(sent.clone()));
+
+    // authors.inner_join(books), filtered by the authors in play, ordered.
+    type Pair = (String, String);
+    let inner = |conn: &mut PgConnection, names: &[String]| -> Vec<Pair> {
+        sg_authors::table
+            .inner_join(sg_books::table)
+            .filter(sg_authors::name.eq_any(names))
+            .order(sg_authors::id)
+            .select((sg_authors::name, sg_books::title))
+            .load(conn)
+            .unwrap()
+    };
+    let through = |conn: &mut SyncedConnection<PgConnection>, names: &[String]| -> Vec<Pair> {
+        sg_authors::table
+            .inner_join(sg_books::table)
+            .filter(sg_authors::name.eq_any(names))
+            .order(sg_authors::id)
+            .select((sg_authors::name, sg_books::title))
+            .load(conn)
+            .unwrap()
+    };
+    let expected = inner(&mut plain, &names);
+    assert_eq!(expected.len(), 3);
+    assert_eq!(through(&mut live.conn, &names), expected);
+    assert_eq!(live.engine.materialized(), 1, "{:?}", live.engine.fallbacks());
+    assert_eq!(sent.load(Ordering::SeqCst), 2, "two type lookups, no row read");
+    assert_eq!(through(&mut live.conn, &names), expected);
+    assert_eq!(sent.load(Ordering::SeqCst), 2);
+
+    // A book for bob appears; one of ann's goes; cy is renamed.
+    diesel::insert_into(sg_books::table)
+        .values((sg_books::author_id.eq(ids[1]), sg_books::title.eq(format!("{p}b1"))))
+        .execute(&mut plain)
+        .unwrap();
+    diesel::delete(sg_books::table.filter(sg_books::title.eq(format!("{p}a2")))).execute(&mut plain).unwrap();
+    diesel::update(sg_authors::table.filter(sg_authors::id.eq(ids[2])))
+        .set(sg_authors::name.eq(format!("{p}cyrus")))
+        .execute(&mut plain)
+        .unwrap();
+    // The cached query still filters on the old names, so the renamed
+    // author leaves it, as it leaves the same query on Postgres.
+    let expected = inner(&mut plain, &names);
+    assert_eq!(expected.len(), 2);
+    let started = Instant::now();
+    loop {
+        let now = through(&mut live.conn, &names);
+        if now == expected {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "join never caught up: {now:?} vs {expected:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(sent.load(Ordering::SeqCst), 2, "still no Postgres read");
+
+    // A left join shows authors without books, and a count counts joined rows.
+    let mut names_now = names.clone();
+    names_now[2] = format!("{p}cyrus");
+    type Left = (String, Option<String>);
+    let left: Vec<Left> = sg_authors::table
+        .left_join(sg_books::table)
+        .filter(sg_authors::name.eq_any(&names_now))
+        .order(sg_authors::id)
+        .select((sg_authors::name, sg_books::title.nullable()))
+        .load(&mut live.conn)
+        .unwrap();
+    let left_expected: Vec<Left> = sg_authors::table
+        .left_join(sg_books::table)
+        .filter(sg_authors::name.eq_any(&names_now))
+        .order(sg_authors::id)
+        .select((sg_authors::name, sg_books::title.nullable()))
+        .load(&mut plain)
+        .unwrap();
+    assert_eq!(left, left_expected);
+    let count: i64 = sg_authors::table
+        .inner_join(sg_books::table)
+        .filter(sg_authors::name.eq_any(&names_now))
+        .count()
+        .get_result(&mut live.conn)
+        .unwrap();
+    assert_eq!(count, 3);
+    assert_eq!(live.engine.materialized(), 3, "{:?}", live.engine.fallbacks());
+
+    diesel::delete(sg_books::table.filter(sg_books::title.like(format!("{p}%")))).execute(&mut plain).unwrap();
+    diesel::delete(sg_authors::table.filter(sg_authors::name.like(format!("{p}%")))).execute(&mut plain).unwrap();
+}

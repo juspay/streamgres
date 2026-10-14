@@ -249,40 +249,44 @@ impl Subscriptions for EngineClient {
 
 impl EngineClient {
     /// Builds the store for an accepted subscription from its snapshot.
-    /// The table's types come from `lookup`, or from what an earlier
-    /// subscribe learnt when there is no connection at hand (a
+    /// The tables' types come from `lookup`, or from what earlier
+    /// subscribes learnt when there is no connection at hand (a
     /// resubscribe). Falls back to touches when the rows cannot be
-    /// encoded or the types are not known.
-    fn materialize(&self, id: u64, snapshot: Snapshot, lookup: Option<&mut dyn TypeLookup>) -> Verdict {
-        let known = self
-            .inner
-            .state
-            .lock()
-            .expect("state")
-            .types
-            .get(&snapshot.table)
-            .cloned();
-        let types = match (known, lookup) {
-            (Some(types), _) => types,
-            (None, Some(lookup)) => match lookup.table_types(&snapshot.table) {
-                Ok(types) => {
-                    let types = Arc::new(types);
-                    self.inner
-                        .state
-                        .lock()
-                        .expect("state")
-                        .types
-                        .insert(snapshot.table.clone(), Arc::clone(&types));
-                    types
-                }
-                Err(error) => {
-                    self.fell_back(format!("types of `{}` unavailable: {error}", snapshot.table));
-                    return Verdict::Accepted;
-                }
-            },
-            (None, None) => return Verdict::Accepted,
-        };
-        match Materialized::new(snapshot, types) {
+    /// encoded or a table's types are not known.
+    fn materialize(&self, id: u64, snapshot: Snapshot, mut lookup: Option<&mut dyn TypeLookup>) -> Verdict {
+        let mut types: HashMap<String, Arc<TableTypes>> = HashMap::new();
+        for table in snapshot.tables() {
+            let known = self
+                .inner
+                .state
+                .lock()
+                .expect("state")
+                .types
+                .get(table)
+                .cloned();
+            let table_types = match (known, lookup.as_deref_mut()) {
+                (Some(types), _) => types,
+                (None, Some(lookup)) => match lookup.table_types(table) {
+                    Ok(found) => {
+                        let found = Arc::new(found);
+                        self.inner
+                            .state
+                            .lock()
+                            .expect("state")
+                            .types
+                            .insert(table.to_string(), Arc::clone(&found));
+                        found
+                    }
+                    Err(error) => {
+                        self.fell_back(format!("types of `{table}` unavailable: {error}"));
+                        return Verdict::Accepted;
+                    }
+                },
+                (None, None) => return Verdict::Accepted,
+            };
+            types.insert(table.to_string(), table_types);
+        }
+        match Materialized::new(snapshot, &types) {
             Ok(materialized) => match materialized.rows() {
                 Ok(rows) => {
                     self.inner
@@ -304,9 +308,7 @@ impl EngineClient {
             }
         }
     }
-}
 
-impl EngineClient {
     fn forget(&self, id: u64) {
         let mut state = self.inner.state.lock().expect("state");
         if let Some(key) = state.by_id.remove(&id) {
@@ -496,11 +498,16 @@ fn inbound(client: &EngineClient, text: &str) {
                 let key = state.by_id.get(&id).cloned();
                 match (key, state.materialized.get_mut(&id)) {
                     (Some(key), Some(materialized)) => {
-                        for row in body.get("del").and_then(Json::as_array).into_iter().flatten() {
-                            materialized.del(row);
-                        }
-                        for row in body.get("put").and_then(Json::as_array).into_iter().flatten() {
-                            materialized.put(row.clone());
+                        for change in body.get("changes").and_then(Json::as_array).into_iter().flatten() {
+                            let Some(table) = change.get("table").and_then(Json::as_str) else {
+                                continue;
+                            };
+                            for row in change.get("del").and_then(Json::as_array).into_iter().flatten() {
+                                materialized.del(table, row);
+                            }
+                            for row in change.get("put").and_then(Json::as_array).into_iter().flatten() {
+                                materialized.put(table, row.clone());
+                            }
                         }
                         Some((key, materialized.rows().ok()))
                     }
