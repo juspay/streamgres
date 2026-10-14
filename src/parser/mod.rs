@@ -1392,6 +1392,36 @@ mod tests {
     }
 
     #[test]
+    fn a_joined_tables_primary_key_may_order_it() {
+        // tickets.inner_join(comments).order((tickets::id, comments::id)):
+        // the backend composes comments under each ticket by their key,
+        // so the clause is met and dropped from the tree's order.
+        let sql = r#"SELECT "authors"."id", "books"."title" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) WHERE ("authors"."id" = $1) ORDER BY "authors"."id" ASC, "books"."id" ASC"#;
+        let select = parse_select(sql, &[int8_bind(1)], &join_catalog()).expect("ordered by the child's key");
+        let order: Vec<&str> = select.query.main_table.order_by.iter().map(|clause| clause.column.as_str()).collect();
+        assert_eq!(order, vec!["id"], "only the root's order reaches the tree");
+
+        // Only the key, only ascending, only after the root's columns.
+        for (sql, expect) in [
+            (
+                r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) ORDER BY "books"."title""#,
+                "primary key",
+            ),
+            (
+                r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) ORDER BY "books"."id" DESC"#,
+                "primary key",
+            ),
+            (
+                r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) ORDER BY "books"."id", "authors"."id""#,
+                "must come before",
+            ),
+        ] {
+            let error = parse_select(sql, &[], &join_catalog()).expect_err(sql);
+            assert!(error.message.contains(expect), "{}", error.message);
+        }
+    }
+
+    #[test]
     fn diesel_joins_become_the_engines_tree() {
         use crate::model::{Driver, Join};
         // authors.inner_join(books).filter(authors::name.eq("x")).order(authors::id.desc()).limit(5)

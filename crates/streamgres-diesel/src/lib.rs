@@ -326,7 +326,11 @@ where
     where
         T: QueryFragment<Pg> + QueryId,
     {
-        self.wrote();
+        // A pool verifies a connection on checkout with `SELECT 1`
+        // through this path; that is not a write.
+        if may_write(&rendered(source)) {
+            self.wrote();
+        }
         self.inner.execute_returning_count(source)
     }
 
@@ -436,17 +440,31 @@ where
     }
 }
 
-/// Whether raw SQL could change what a read sees: anything but the
-/// statements that only move a transaction along without committing it.
+/// The SQL a statement renders to, for [`may_write`]; a statement that
+/// cannot be rendered is taken for a write.
+pub(crate) fn rendered<T: QueryFragment<Pg>>(query: &T) -> String {
+    let mut builder = diesel::pg::PgQueryBuilder::default();
+    match query.to_sql(&mut builder, &Pg) {
+        Ok(()) => diesel::query_builder::QueryBuilder::finish(builder),
+        Err(_) => String::new(),
+    }
+}
+
+/// Whether raw SQL could change what a read sees: anything but a plain
+/// `SELECT` (a pool's `SELECT 1` on every checkout would otherwise keep
+/// the read-your-writes window open for good) and the statements that
+/// only move a transaction along without committing it.
 pub(crate) fn may_write(sql: &str) -> bool {
     let head = sql.trim_start().trim_start_matches('(');
     let word = head
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .next()
         .unwrap_or("");
-    !["BEGIN", "START", "SAVEPOINT", "RELEASE", "ROLLBACK", "SET", "RESET", "SHOW"]
-        .iter()
-        .any(|statement| word.eq_ignore_ascii_case(statement))
+    ![
+        "SELECT", "BEGIN", "START", "SAVEPOINT", "RELEASE", "ROLLBACK", "SET", "RESET", "SHOW",
+    ]
+    .iter()
+    .any(|statement| word.eq_ignore_ascii_case(statement))
 }
 
 /// Whether a transaction is open on the connection. Inside one, reads must

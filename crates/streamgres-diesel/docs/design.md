@@ -106,8 +106,10 @@ reconnect logic carry over unchanged.
   each edge, inner edges dropping unmatched parents and left edges
   null-extending, then the limit over joined rows, projection, count.
   Refused by name: a table joined twice, RIGHT/FULL/CROSS, OR across
-  tables, WHERE on a LEFT-joined table, ORDER BY on a joined table,
-  compound keys, `LIKE`, `DISTINCT`.
+  tables, WHERE on a LEFT-joined table, ORDER BY on a joined table
+  other than its primary key ascending after the root's columns (which
+  the composition yields anyway, by value: 9 before 10), compound keys,
+  `LIKE`, `DISTINCT`.
 - `OFFSET`: the engine keeps `limit + offset` rows and the client skips
   `offset` of them on each rebuild. `bytea`: the engine carries it as
   Postgres's hex text and the client turns it back into bytes. A bind of
@@ -373,7 +375,8 @@ read is a bypass, not a write-through: it does not refresh the entry.
 Where that bites is one flow that writes and then reads, usually on
 two connections of the same pool. So after any write through a cache
 (`execute`, raw SQL, `INSERT ... RETURNING`, a transaction's COMMIT;
-not BEGIN, ROLLBACK, SAVEPOINT or SET) every read through that cache
+not a plain SELECT, BEGIN, ROLLBACK, SAVEPOINT or SET) every read
+through that cache
 goes to Postgres for `STREAMGRES_READ_YOUR_WRITES_MS` (default 1000; 0
 turns it off; `set_read_your_writes` per connection sets the window,
 the clock is the cache's), counted in `Stats::after_write`. A read that must never be behind the database is

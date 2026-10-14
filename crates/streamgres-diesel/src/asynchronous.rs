@@ -74,7 +74,7 @@ use crate::route::Route;
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::{Outcome, Verdict};
 use crate::types::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
-use crate::{Attachment, SETTINGS, may_write, read_your_writes_from_env};
+use crate::{Attachment, SETTINGS, may_write, read_your_writes_from_env, rendered};
 
 /// diesel-async's Postgres row, which it does not export by name.
 pub type PgRow = <AsyncPgConnection as AsyncConnection>::Row<'static, 'static>;
@@ -502,12 +502,16 @@ impl AsyncConnection for AsyncSyncedConnection {
                                         .map_err(Error::DeserializationError)
                                 })
                                 .collect::<QueryResult<Vec<_>>>()?;
-                            let mut all = all_table_types(attributes);
-                            catalog_loaded.store(true, Ordering::Release);
-                            for table in missing {
-                                if let Some(found) = all.remove(&table) {
-                                    types.insert(table, Arc::new(found));
-                                }
+                            let all = all_table_types(attributes);
+                            // Every table's types, not only the missing
+                            // ones: the engine side keeps them, so the
+                            // next query on another table needs no
+                            // lookup at all. A table created since this
+                            // load is not among them; the next miss
+                            // loads the catalog again.
+                            catalog_loaded.store(missing.iter().all(|table| all.contains_key(table)), Ordering::Release);
+                            for (table, found) in all {
+                                types.insert(table, Arc::new(found));
                             }
                         }
                         // A table that was not there when the catalog was
@@ -545,8 +549,9 @@ impl AsyncConnection for AsyncSyncedConnection {
     where
         T: QueryFragment<Pg> + QueryId + 'query,
     {
+        let writes = may_write(&rendered(&source));
         let future = self.inner.execute_returning_count(source);
-        self.written(future)
+        if writes { self.written(future) } else { self.tracked(future) }
     }
 
     fn transaction_state(&mut self) -> &mut AnsiTransactionManager {

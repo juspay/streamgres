@@ -640,9 +640,14 @@ fn opening_and_abandoning_a_transaction_is_not_a_write() {
     w.conn.batch_execute("BEGIN").unwrap();
     w.conn.batch_execute("ROLLBACK").unwrap();
     w.conn.batch_execute("SET statement_timeout = 0").unwrap();
-    assert_eq!(w.read("mode").as_deref(), Some("a"), "still from the cache");
-    assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 0);
     w.conn.batch_execute("SELECT 1").unwrap();
+    diesel::select(diesel::dsl::sql::<Integer>("1")).execute(&mut w.conn).unwrap();
+    assert_eq!(w.read("mode").as_deref(), Some("a"), "still from the cache: a pool's checkout ping is not a write");
+    assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 0);
+    let key = w.key("other");
+    w.conn
+        .batch_execute(&format!("INSERT INTO sg_configs (key, value) VALUES ('{key}', 'x') ON CONFLICT (key) DO NOTHING"))
+        .unwrap();
     assert_eq!(w.read("mode").as_deref(), Some("b"), "any other raw SQL counts as a write");
     assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 1);
 }

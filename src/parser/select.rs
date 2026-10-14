@@ -91,30 +91,55 @@ impl Parser<'_> {
         let order_by = if self.eat_word("ORDER") {
             self.expect_word("BY")?;
             let mut clauses = Vec::new();
+            // Per joined node, how many of its primary-key columns the
+            // ORDER BY has named so far, in order.
+            let mut child_keys: Vec<usize> = vec![0; nodes.len()];
             loop {
                 let at = self.at();
                 let column = self.column_ref(&nodes, &(0..nodes.len()).collect::<Vec<_>>())?;
-                if column.node != 0 {
-                    return Err(ParseError {
-                        message: format!(
-                            "ORDER BY `{}` is on a joined table; only the first table's columns order",
-                            nodes[column.node].table.name
-                        ),
-                        position: at,
-                    });
-                }
                 let direction = if self.eat_word("DESC") {
                     Order::DESC
                 } else {
                     self.eat_word("ASC");
                     Order::ASC
                 };
-                clauses.push(OrderBy::new(column.column, direction));
+                if column.node != 0 {
+                    // The tree orders the root only; the backend composes
+                    // a joined table's rows under each parent in that
+                    // table's primary-key order, ascending. An ORDER BY
+                    // that asks for exactly that is already met, and
+                    // anything else on a joined table cannot be.
+                    let node = &nodes[column.node];
+                    let next = node.table.pkey.get(child_keys[column.node]);
+                    if direction == Order::ASC && next == Some(&column.column) {
+                        child_keys[column.node] += 1;
+                    } else {
+                        return Err(ParseError {
+                            message: format!(
+                                "ORDER BY `{}` is on a joined table; a joined table orders only by its primary key, ascending, after the first table's columns",
+                                node.table.name
+                            ),
+                            position: at,
+                        });
+                    }
+                } else {
+                    if child_keys.iter().any(|&named| named > 0) {
+                        return Err(ParseError {
+                            message: "ORDER BY: the first table's columns must come before a joined table's".to_string(),
+                            position: at,
+                        });
+                    }
+                    clauses.push(OrderBy::new(column.column, direction));
+                }
                 if !self.eat_sym(",") {
                     break;
                 }
             }
-            clauses
+            if clauses.is_empty() {
+                vec![default_order(nodes[0].table, self.at())?]
+            } else {
+                clauses
+            }
         } else {
             vec![default_order(nodes[0].table, self.at())?]
         };

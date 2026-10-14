@@ -16,8 +16,9 @@
 //! column under a linguistic collation may order differently here, so a
 //! query ordering by such a column should not be cached in rows mode.
 //! Rows that tie on the ordering, and the child rows under one parent,
-//! come out in primary-key order, which Postgres does not promise either
-//! way.
+//! come out in primary-key order by value (9 before 10), which is what
+//! `ORDER BY child.id` gives in Postgres; the engine accepts exactly
+//! that ordering on a joined table, since the composition yields it.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -430,8 +431,11 @@ impl Materialized {
             let mut index: HashMap<String, Vec<&Json>> = HashMap::new();
             if let Some(child_column) = node.child_column {
                 let name = &node.types.columns[child_column].name;
+                // Child rows under one parent come out in primary-key
+                // order, by value: `ORDER BY child.id` in Postgres puts
+                // 9 before 10, and so must this.
                 let mut keyed: Vec<(&String, &Json)> = node.rows.iter().collect();
-                keyed.sort_by(|(a, _), (b, _)| a.cmp(b));
+                keyed.sort_by(|(_, a), (_, b)| self.key_order(node, a, b));
                 for (_, row) in keyed {
                     match row.get(name) {
                         Some(value) if !value.is_null() => {
@@ -446,7 +450,7 @@ impl Materialized {
 
         let root = &self.nodes[0];
         let mut roots: Vec<(&String, &Json)> = root.rows.iter().collect();
-        roots.sort_by(|(key_a, a), (key_b, b)| {
+        roots.sort_by(|(_, a), (_, b)| {
             for &(index, ascending) in &self.order {
                 let name = &root.types.columns[index].name;
                 let ordering = compare(a.get(name), b.get(name), ascending);
@@ -454,7 +458,7 @@ impl Materialized {
                     return ordering;
                 }
             }
-            key_a.cmp(key_b)
+            self.key_order(root, a, b)
         });
 
         let mut out = Vec::new();
@@ -462,6 +466,19 @@ impl Materialized {
             self.combos(0, row, &by_value, &mut out);
         }
         out
+    }
+
+    /// Two rows of `node` by their primary key, column by column, as
+    /// Postgres orders them: numbers numerically, strings bytewise.
+    fn key_order(&self, node: &Node, a: &Json, b: &Json) -> Ordering {
+        for &index in &node.key {
+            let name = &node.types.columns[index].name;
+            let ordering = compare(a.get(name), b.get(name), true);
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        Ordering::Equal
     }
 
     /// Every result row the subtree under `node` makes with `row` as that
@@ -705,6 +722,32 @@ mod tests {
         assert!(one > 0);
         m.put("t", json!({"id": 2, "name": "a much longer name than before", "rank": 1}));
         assert!(m.byte_len() > one * 2 - 16, "a second, longer row weighs more");
+    }
+
+    #[test]
+    fn child_rows_come_out_in_numeric_key_order() {
+        let mut snap = snapshot(vec![json!({"id": 1, "name": "a", "rank": 1})], vec![("id", true)], None);
+        snap.nodes.push(NodeSnapshot {
+            table: "books".to_string(),
+            key: vec!["id".to_string()],
+            parent: Some("t".to_string()),
+            parent_column: Some("id".to_string()),
+            child_column: Some("author_id".to_string()),
+            inner: true,
+            rows: vec![
+                json!({"id": 10, "author_id": 1, "title": "ten"}),
+                json!({"id": 9, "author_id": 1, "title": "nine"}),
+                json!({"id": 100, "author_id": 1, "title": "hundred"}),
+            ],
+        });
+        snap.columns = Some(vec![("t".to_string(), "id".to_string()), ("books".to_string(), "title".to_string())]);
+        snap.names = None;
+        let m = Materialized::new(snap, &types()).unwrap();
+        assert_eq!(
+            decoded(&m.rows().unwrap()),
+            vec![(1, "nine".into()), (1, "ten".into()), (1, "hundred".into())],
+            "9, 10, 100: by value, not by text"
+        );
     }
 
     #[test]
