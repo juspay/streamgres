@@ -47,6 +47,10 @@
 //!   out as: its alias or its own name; for a `COUNT(*)` the one output
 //!   name), `"count"` (a `COUNT(*)`), `"order"` (`[[column, "asc"|"desc"],
 //!   ...]`, on the root table) and `"limit"` (`null` for none).
+//! - `["accepted", ...]` also carries `"offset"`: the engine keeps
+//!   `limit + offset` rows and the client skips `offset` of them. A
+//!   `bytea` column travels as Postgres's hex text; a bind of an enum
+//!   type is read as its label.
 //! - `["refused", {"id": n, "reason": "..."}]` when the engine cannot
 //!   follow the query (outside the SQL subset, an unknown table, too many
 //!   rows). The backend serves that query live.
@@ -157,7 +161,10 @@ pub struct Shape {
     nodes: Vec<NodeShape>,
     projection: Projection,
     order: Vec<OrderBy>,
+    /// The statement's own limit and offset; the tree holds `limit +
+    /// offset` rows and the client skips and cuts.
     limit: u32,
+    offset: u32,
 }
 
 /// One table of the query: how it joins its parent, and its hydrating
@@ -173,7 +180,7 @@ struct NodeShape {
 }
 
 impl Shape {
-    pub fn new(query: &MultiTableReadQuery, projection: Projection) -> Shape {
+    pub fn new(query: &MultiTableReadQuery, projection: Projection, offset: u32) -> Shape {
         let mut nodes = Vec::new();
         fn walk(query: &MultiTableReadQuery, parent: Option<usize>, edge: Option<(&str, &str, bool)>, nodes: &mut Vec<NodeShape>) {
             nodes.push(NodeShape {
@@ -203,7 +210,12 @@ impl Shape {
             nodes,
             projection,
             order: query.main_table.order_by.clone(),
-            limit: query.main_table.limit,
+            limit: if query.main_table.limit == u32::MAX {
+                u32::MAX
+            } else {
+                query.main_table.limit - offset
+            },
+            offset,
         }
     }
 
@@ -498,6 +510,7 @@ impl Task {
                 "count": matches!(shape.projection, Projection::Count { .. }),
                 "order": order,
                 "limit": limit,
+                "offset": shape.offset,
             }]),
         );
     }
@@ -695,7 +708,7 @@ async fn prepare(
 ) -> Result<Request, String> {
     let catalog = state.catalog.load();
     let select = parse_select(sql, binds, &catalog).map_err(|error| error.message)?;
-    let shape = rows.then(|| Shape::new(&select.query, select.projection));
+    let shape = rows.then(|| Shape::new(&select.query, select.projection, select.offset));
     let translated = Translated {
         query: select.query,
         hidden: HashSet::new(),

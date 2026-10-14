@@ -140,11 +140,28 @@ pub struct Projected {
 /// A `SELECT` over one table or joined tables, with `$n` placeholders
 /// standing for `binds`: the engine's query tree and the projection.
 pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result<Select, ParseError> {
+    // An enum label travels in the binary format as its text, under the
+    // enum's own OID; the catalog says which OIDs those are. Arrays of
+    // enums likewise, under the array's OID.
+    let binds: Vec<BindValue> = binds
+        .iter()
+        .map(|bind| match (catalog.is_enum_oid(bind.type_oid), bind.bytes.as_deref()) {
+            (true, Some(bytes)) if binds::looks_like_array(bytes) => BindValue {
+                type_oid: binds::oid::TEXT_ARRAY,
+                bytes: bind.bytes.clone(),
+            },
+            (true, _) => BindValue {
+                type_oid: binds::oid::TEXT,
+                bytes: bind.bytes.clone(),
+            },
+            (false, _) => bind.clone(),
+        })
+        .collect();
     let mut parser = Parser {
         tokens: lex(sql)?,
         pos: 0,
         depth: 0,
-        binds,
+        binds: &binds,
     };
     if !parser.is_word("SELECT") {
         return parser.err(format!("expected SELECT, found {}", parser.describe()));
@@ -585,6 +602,10 @@ impl Parser<'_> {
             let select = self.select(catalog)?;
             if !select.query.joins.is_empty() {
                 return self.err("a join parses through `parse_select`, not `parse`");
+            }
+            if select.offset > 0 {
+                // Only a server-to-server client skips rows itself.
+                return self.err("OFFSET is not supported");
             }
             Ok(ParsedQuery::Read(select.query.main_table))
         } else if self.is_word("INSERT") || self.is_word("UPDATE") || self.is_word("DELETE") {
@@ -1280,7 +1301,7 @@ mod tests {
         assert_eq!(count, Projection::Count { name: "count".into() });
         let count = parse_select(r#"SELECT COUNT(*) AS n FROM "tickets""#, &[], &catalog()).unwrap().projection;
         assert_eq!(count, Projection::Count { name: "n".into() });
-        let Select { query: q, projection: columns } = parse_select(
+        let Select { query: q, projection: columns, .. } = parse_select(
             r#"SELECT "tickets"."points" AS p, "tickets"."id" FROM "tickets" LIMIT $1"#,
             &[int8_bind(5)],
             &catalog(),
@@ -1593,7 +1614,7 @@ mod tests {
         assert!(unknown.message.contains("unknown column `owner`"), "{}", unknown.message);
 
         let offset = parse_read(r#"SELECT * FROM "tickets" LIMIT 10 OFFSET 5"#, &catalog())
-            .expect_err("offset");
+            .expect_err("offset on the single-table API");
         assert!(offset.message.contains("OFFSET"), "{}", offset.message);
 
         let unsupported = parse_read_with_binds(
@@ -1649,7 +1670,7 @@ mod tests {
     }
 
     /// A one-table catalog (`tickets`, pkey `id`) shared by most tests.
-    fn catalog() -> Catalog {
+    pub(super) fn catalog() -> Catalog {
         Catalog::new(vec![DbTable::new(
             "tickets",
             ["id"],
@@ -2098,5 +2119,92 @@ mod tests {
         let error = read_err("SELECT * FROM tickets LIMIT 1 garbage");
         assert!(error.message.contains("unexpected trailing input"));
         assert_eq!(error.position, 30);
+    }
+}
+
+#[cfg(test)]
+mod s2s_shapes {
+    use super::*;
+    use crate::model::Value;
+
+    fn catalog() -> Catalog {
+        super::tests::catalog()
+    }
+
+    #[test]
+    fn an_offset_widens_the_limit_and_travels_separately() {
+        let select = parse_select(
+            r#"SELECT "tickets"."id" FROM "tickets" ORDER BY "tickets"."id" ASC LIMIT $1 OFFSET $2"#,
+            &[
+                BindValue {
+                    type_oid: 20,
+                    bytes: Some(10i64.to_be_bytes().to_vec()),
+                },
+                BindValue {
+                    type_oid: 20,
+                    bytes: Some(5i64.to_be_bytes().to_vec()),
+                },
+            ],
+            &catalog(),
+        )
+        .expect("offset");
+        assert_eq!(select.query.main_table.limit, 15, "the engine keeps limit + offset rows");
+        assert_eq!(select.offset, 5);
+
+        let no_limit = parse_select(r#"SELECT * FROM "tickets" OFFSET 5"#, &[], &catalog()).expect("offset only");
+        assert_eq!(no_limit.query.main_table.limit, u32::MAX);
+        assert_eq!(no_limit.offset, 5);
+    }
+
+    #[test]
+    fn an_enum_bind_is_its_label() {
+        let catalog = catalog().with_enum_oids([777, 778]);
+        let select = parse_select(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = $1"#,
+            &[BindValue {
+                type_oid: 777,
+                bytes: Some(b"open".to_vec()),
+            }],
+            &catalog,
+        )
+        .expect("an enum bind");
+        let shown = format!("{:?}", select.query.main_table.filter);
+        assert!(shown.contains("open"), "{shown}");
+
+        // The same bind without the catalog knowing the OID is refused.
+        let unknown = parse_select(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = $1"#,
+            &[BindValue {
+                type_oid: 777,
+                bytes: Some(b"open".to_vec()),
+            }],
+            &super::tests::catalog(),
+        )
+        .expect_err("an unknown oid");
+        assert!(unknown.message.contains("oid 777"), "{}", unknown.message);
+
+        // An array of enum labels under the enum's array OID.
+        let mut bytes = Vec::new();
+        bytes.extend(1i32.to_be_bytes()); // one dimension
+        bytes.extend(0i32.to_be_bytes()); // no nulls
+        bytes.extend(25i32.to_be_bytes()); // element oid as text
+        bytes.extend(2i32.to_be_bytes()); // two elements
+        bytes.extend(1i32.to_be_bytes()); // lower bound
+        for label in ["open", "done"] {
+            bytes.extend((label.len() as i32).to_be_bytes());
+            bytes.extend(label.as_bytes());
+        }
+        let any = parse_select(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = ANY($1)"#,
+            &[BindValue {
+                type_oid: 778,
+                bytes: Some(bytes),
+            }],
+            &catalog,
+        )
+        .expect("an enum array bind");
+        let shown = format!("{:?}", any.query.main_table.filter);
+        assert!(shown.contains("open") && shown.contains("done"), "{shown}");
+        let _ = Value::Null;
     }
 }

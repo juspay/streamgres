@@ -22,7 +22,7 @@ pub struct BindValue {
 }
 
 /// Postgres's built-in type OIDs that a predicate can carry.
-mod oid {
+pub(crate) mod oid {
     pub const BOOL: u32 = 16;
     pub const BYTEA: u32 = 17;
     pub const CHAR: u32 = 18;
@@ -66,6 +66,15 @@ mod oid {
 const PG_EPOCH_MILLIS: i64 = 946_684_800_000;
 
 /// The value a bind stands for, or why it cannot stand for one.
+/// Whether an enum bind's bytes are an array rather than one label: an
+/// enum type's array OID is as much an enum OID as the scalar's, and the
+/// two are told apart by the bytes. A one-dimensional array header is
+/// 20 bytes with a dimension count of 0 or 1; a label is text, which
+/// never starts with three zero bytes.
+pub fn looks_like_array(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && bytes[..3] == [0, 0, 0] && bytes[3] <= 1
+}
+
 pub fn decode(bind: &BindValue) -> Result<Value, String> {
     let Some(bytes) = bind.bytes.as_deref() else {
         return Ok(Value::Null);

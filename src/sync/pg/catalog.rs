@@ -2,7 +2,9 @@
 //! schemas that has a primary key, its columns mapped onto the engine's
 //! value types the way the sync protocol maps them for its clients (times as epoch
 //! milliseconds, JSON and arrays as JSON, enums and uuids as strings,
-//! `bytea` left out), so a server needs no hand-written schema. Tables of
+//! `bytea` as Postgres's hex text), so a server needs no hand-written
+//! schema. It also notes which type OIDs are enums, so a bound parameter
+//! of an enum type can be read as the text it is. Tables of
 //! the `public` schema keep their bare names; any other table is named
 //! `schema.table`, which is also how the change feed matches it.
 
@@ -45,6 +47,18 @@ pub async fn load_catalog(
             &[&schemas],
         )
         .await?;
+    let enums = client
+        .query("SELECT oid, typarray FROM pg_type WHERE typtype = 'e'", &[])
+        .await?;
+    let enum_oids: Vec<u32> = enums
+        .iter()
+        .flat_map(|row| {
+            let oid: u32 = row.get(0);
+            let array: u32 = row.get(1);
+            [oid, array]
+        })
+        .filter(|oid| *oid != 0)
+        .collect();
     let mut pkeys: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for row in &keys {
         let schema: String = row.get(0);
@@ -92,7 +106,7 @@ pub async fn load_catalog(
             columns,
         ));
     }
-    Ok((Catalog::new(tables), notes))
+    Ok((Catalog::new(tables).with_enum_oids(enum_oids), notes))
 }
 
 /// The catalog name of a table: bare in `public`, schema-qualified
@@ -158,7 +172,10 @@ pub fn scalar_type(name: &str) -> Option<ValueType> {
         | "macaddr"
         | "xml"
         | "tsvector" => ValueType::String,
-        "bytea" => return None,
+        // The hex text Postgres renders (`\x` and two digits a byte): what
+        // the change feed carries, and what a server-to-server client
+        // turns back into bytes.
+        "bytea" => ValueType::String,
         _ => return None,
     })
 }
@@ -168,7 +185,7 @@ mod tests {
     use super::*;
 
     /// The mapping follows the protocol's: times are numbers, json and arrays are
-    /// json, enums are strings, bytea is left out.
+    /// json, enums and bytea are strings, ranges are left out.
     #[test]
     fn types_map_like_the_protocol() {
         assert_eq!(
@@ -187,7 +204,8 @@ mod tests {
         );
         assert_eq!(value_type("bigint", "int8"), Some(ValueType::Int));
         assert_eq!(value_type("numeric", "numeric"), Some(ValueType::Float));
-        assert_eq!(value_type("bytea", "bytea"), None);
+        assert_eq!(value_type("bytea", "bytea"), Some(ValueType::String));
+        assert_eq!(value_type("int4range", "int4range"), None);
         assert_eq!(table_name("public", "tickets"), "tickets");
         assert_eq!(table_name("xyne_0", "clients"), "xyne_0.clients");
     }

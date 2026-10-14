@@ -30,6 +30,10 @@ use crate::model::{
 pub struct Select {
     pub query: MultiTableReadQuery,
     pub projection: Projection,
+    /// Rows the statement skips (`OFFSET`). The tree's limit is the
+    /// statement's limit plus this, so the engine keeps enough rows for
+    /// the client to skip and cut.
+    pub offset: u32,
 }
 
 /// One table of the `FROM`, while the statement is read.
@@ -115,12 +119,15 @@ impl Parser<'_> {
             vec![default_order(nodes[0].table, self.at())?]
         };
         let limit = self.limit()?;
-        if self.is_word("OFFSET") {
-            return self.err("OFFSET is not supported");
-        }
+        let offset = self.offset()?;
+        let kept = if limit == u32::MAX { limit } else { limit.saturating_add(offset) };
 
-        let query = build(&nodes, 0, order_by, limit);
-        Ok(Select { query, projection })
+        let query = build(&nodes, 0, order_by, kept);
+        Ok(Select {
+            query,
+            projection,
+            offset,
+        })
     }
 
     /// `LIMIT n`, `LIMIT $k`, or nothing (`u32::MAX`).
@@ -128,12 +135,25 @@ impl Parser<'_> {
         if !self.eat_word("LIMIT") {
             return Ok(u32::MAX);
         }
+        self.count("limit")
+    }
+
+    /// `OFFSET n`, `OFFSET $k`, or nothing (0).
+    fn offset(&mut self) -> Result<u32, ParseError> {
+        if !self.eat_word("OFFSET") {
+            return Ok(0);
+        }
+        self.count("offset")
+    }
+
+    /// A non-negative integer, literal or bound.
+    fn count(&mut self, what: &str) -> Result<u32, ParseError> {
         let at = self.at();
         match self.peek().clone() {
             Tok::Num(number) => {
                 self.bump();
                 number.parse::<u32>().map_err(|_| ParseError {
-                    message: format!("`{number}` is not a valid limit"),
+                    message: format!("`{number}` is not a valid {what}"),
                     position: at,
                 })
             }
@@ -141,12 +161,12 @@ impl Parser<'_> {
                 Value::Int(limit) if limit >= 0 && limit <= i64::from(u32::MAX) => Ok(limit as u32),
                 other => Err(ParseError {
                     message: format!(
-                        "a limit parameter must be a non-negative integer, found {other:?}"
+                        "a {what} parameter must be a non-negative integer, found {other:?}"
                     ),
                     position: at,
                 }),
             },
-            _ => self.err(format!("expected a limit, found {}", self.describe())),
+            _ => self.err(format!("expected a {what}, found {}", self.describe())),
         }
     }
 

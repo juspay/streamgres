@@ -249,6 +249,9 @@ fn json_string(out: &mut Vec<u8>, text: &str) {
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     tables: HashMap<TableName, DbTable>,
+    /// Type OIDs of the database's enums and their array types: a bound
+    /// parameter of one of these carries its label as text.
+    enum_oids: std::collections::HashSet<u32>,
 }
 
 impl Catalog {
@@ -259,7 +262,21 @@ impl Catalog {
                 .into_iter()
                 .map(|table| (table.name.clone(), table))
                 .collect(),
+            enum_oids: std::collections::HashSet::new(),
         }
+    }
+
+    /// The same catalog knowing these type OIDs are enums (or arrays of
+    /// enums).
+    pub fn with_enum_oids(mut self, oids: impl IntoIterator<Item = u32>) -> Self {
+        self.enum_oids = oids.into_iter().collect();
+        self
+    }
+
+    /// Whether a bound parameter of type `oid` is an enum label or an
+    /// array of them, which the wire carries as text.
+    pub fn is_enum_oid(&self, oid: u32) -> bool {
+        self.enum_oids.contains(&oid)
     }
 
     /// The schema of table `name`, if the catalog contains it.
