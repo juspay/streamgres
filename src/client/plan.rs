@@ -146,6 +146,7 @@ struct PlanEdge {
     child: usize,
     position: usize,
     column: ColumnName,
+    composite: bool,
     driver: Driver,
     is_inner: bool,
     inner_index: Option<usize>,
@@ -436,6 +437,9 @@ impl Planner {
         let mut drivers = Vec::new();
         let mut required: Vec<(u64, usize)> = Vec::new();
         for &edge in &inner {
+            if self.edges[edge].composite && !self.requires(edge) {
+                continue;
+            }
             let bounded = plans[self.edges[edge].child].hold;
             match (self.requires(edge), bounded) {
                 (false, None) => return whole,
@@ -453,6 +457,11 @@ impl Planner {
         }
         required.sort();
         for &(cost, edge) in &required {
+            if self.edges[edge].composite
+                && drivers.iter().any(|&chosen| self.edges[chosen].composite)
+            {
+                continue;
+            }
             if cost <= hold {
                 drivers.push(edge);
                 hold += cost;
@@ -614,7 +623,8 @@ fn flatten(
             parent: index,
             child,
             position,
-            column: join.main_table_column.clone(),
+            column: join.on.first().main.clone(),
+            composite: join.on.is_composite(),
             driver: join.driver,
             is_inner: join.is_inner,
             inner_index,
@@ -644,8 +654,7 @@ fn same_skeleton(a: &MultiTableReadQuery, b: &MultiTableReadQuery) -> bool {
     a.main_table.table == b.main_table.table
         && a.joins.len() == b.joins.len()
         && a.joins.iter().zip(&b.joins).all(|(x, y)| {
-            x.main_table_column == y.main_table_column
-                && x.sub_table_column == y.sub_table_column
+            x.on == y.on
                 && x.is_inner == y.is_inner
                 && same_skeleton(&x.sub, &y.sub)
         })
