@@ -1,0 +1,84 @@
+# The whole thing on one machine: Postgres, the engine, the ticket desk.
+#
+#   docker compose -f demo/docker-compose.yml up --build
+#
+# Then http://localhost:8080 for the stats page, and demo/README.md for
+# the curl walk-through.
+services:
+  postgres:
+    image: postgres:16
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=16
+      - -c
+      - max_wal_senders=16
+    environment:
+      POSTGRES_USER: streamgres
+      POSTGRES_PASSWORD: streamgres
+      POSTGRES_DB: tickets
+    volumes:
+      # The publication the engine streams, then the schema-change
+      # trigger it requires (for app `xyne`, shard 0, the defaults).
+      - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-publication.sql:ro
+      - ../scripts/sql/ddl-triggers.sql:/docker-entrypoint-initdb.d/20-ddl-triggers.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U streamgres -d tickets"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # Creates the schema and loads the dataset, then exits. Runs before
+  # the engine so the tables are there when it takes its snapshot.
+  seed:
+    build:
+      context: ..
+      dockerfile: docker/example/Dockerfile
+    command: ["seed"]
+    environment:
+      DATABASE_URL: postgres://streamgres:streamgres@postgres:5432/tickets
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  engine:
+    build:
+      context: ..
+      dockerfile: docker/server/Dockerfile
+    environment:
+      STREAMGRES_PG_DSN: postgresql://streamgres:streamgres@postgres:5432/tickets
+      # The Zero side is not part of this demo; the endpoints are never
+      # called, but the server wants them set.
+      STREAMGRES_QUERY_URL: http://127.0.0.1:1/query
+      STREAMGRES_MUTATE_URL: http://127.0.0.1:1/mutate
+      STREAMGRES_ADDR: 0.0.0.0:4848
+    ports:
+      - "4848:4848"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:4848/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  example:
+    build:
+      context: ..
+      dockerfile: docker/example/Dockerfile
+    command: ["serve"]
+    environment:
+      DATABASE_URL: postgres://streamgres:streamgres@postgres:5432/tickets
+      STREAMGRES_S2S_URL: ws://engine:4848/zero/s2s/v1
+      EXAMPLE_ADDR: 0.0.0.0:8080
+      EXAMPLE_WRITER_MS: "1000"
+    ports:
+      - "8080:8080"
+    depends_on:
+      engine:
+        condition: service_healthy
