@@ -11,7 +11,9 @@ docker compose -f demo/docker-compose.yml up --build
 ```
 
 When the three services are up, open <http://localhost:8080> for the
-stats page, or walk through it with curl.
+stats page, or walk through it with curl. If a port is taken on your
+machine, override it: `EXAMPLE_PORT=8081 ENGINE_PORT=4850
+POSTGRES_PORT=5435 docker compose -f demo/docker-compose.yml up --build`.
 
 ## 1. A read, twice
 
