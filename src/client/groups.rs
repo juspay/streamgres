@@ -1718,7 +1718,7 @@ fn build_poke(
                 Patch::Del(table, key) => {
                     dels += 1;
                     let mut bytes = Vec::with_capacity(64);
-                    wire::write_del(&mut bytes, table.as_str(), key);
+                    wire::write_del(&mut bytes, table.as_str(), key, catalog.table(table.as_str()));
                     entries.push(Bytes::from(bytes));
                 }
             }

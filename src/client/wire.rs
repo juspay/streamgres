@@ -54,8 +54,10 @@ pub fn write_put(out: &mut Vec<u8>, table: &DbTable, row: &DataFrameRow) {
 }
 
 /// Append the `rowsPatch` entry deleting `key` from `table`:
-/// `{"op":"del","tableName":…,"id":{…}}`.
-pub fn write_del(out: &mut Vec<u8>, table: &str, key: &DataFrameKey) {
+/// `{"op":"del","tableName":…,"id":{…}}`. `declared` is the table's
+/// schema when the catalog has it, so a key column that is a time goes
+/// out in the protocol's milliseconds like every other cell.
+pub fn write_del(out: &mut Vec<u8>, table: &str, key: &DataFrameKey, declared: Option<&DbTable>) {
     out.extend_from_slice(b"{\"op\":\"del\",\"tableName\":");
     write_text(out, table);
     out.extend_from_slice(b",\"id\":{");
@@ -67,7 +69,10 @@ pub fn write_del(out: &mut Vec<u8>, table: &str, key: &DataFrameKey) {
         first = false;
         write_text(out, column.as_str());
         out.push(b':');
-        write_value(out, value, None);
+        let r#type = declared
+            .and_then(|table| table.column(column.as_str()))
+            .map(|column| &column.r#type);
+        write_value(out, value, r#type);
     }
     out.extend_from_slice(b"}}");
 }
@@ -371,8 +376,24 @@ mod tests {
             &mut bytes,
             "t",
             &DataFrameKey::new([("id", Value::from("a\"b"))]),
+            Some(&table),
         );
         let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(written["id"]["id"], "a\"b", "keys are escaped");
+
+        // A key column that is a time goes out in milliseconds too.
+        let timed = DbTable::new(
+            "timed",
+            ["at"],
+            vec![DbColumn::new("at", ValueType::Timestamp), DbColumn::new("v", ValueType::Int)],
+        );
+        let mut bytes = Vec::new();
+        write_del(&mut bytes, "timed", &DataFrameKey::new([("at", Value::Int(1_000))]), Some(&timed));
+        let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(written["id"]["at"], 1);
+        let mut bytes = Vec::new();
+        write_del(&mut bytes, "timed", &DataFrameKey::new([("at", Value::Int(1_000))]), None);
+        let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(written["id"]["at"], 1_000, "without the schema the number is left alone");
     }
 }
