@@ -26,9 +26,12 @@ let cache = Arc::new(Cache::new(256 * 1024 * 1024, Arc::new(engine.clone())));
 engine.attach(&cache);
 streamgres_diesel::install(Settings {
     cache,
-    consistency_for: Box::new(|url| if url.contains("replica") { Consistency::Eventual } else { Consistency::Strong }),
+    consistency_for: Box::new(|url| if url.contains("replica") { Route::Streamgres } else { Route::Postgres }),
 }).ok();
-// then use SyncedConnection<PgConnection> where PgConnection was, pools included
+// then use SyncedConnection<PgConnection> where PgConnection was, pools included.
+// One query can override its pool's route:
+//   configs::table.find(key).via(Route::Postgres).first(conn)
+//   conn.with_route(Route::Streamgres, |c| configs::table.find(key).first(c))
 ```
 
 ## Live tests

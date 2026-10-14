@@ -13,7 +13,9 @@
 //! always go to Postgres. A read is answered from the [`cache::Cache`]
 //! when all of these hold:
 //!
-//! - the connection is [`Consistency::Eventual`];
+//! - the read's route is [`Route::Streamgres`]: flagged so on the query
+//!   ([`RouteDsl::via`]), or in a [`SyncedConnection::with_route`] scope,
+//!   or by the connection's own route, in that order of precedence;
 //! - no transaction is open on it (inside one, the application must see
 //!   its own writes);
 //! - the statement is a `SELECT` (Diesel sends `INSERT ... RETURNING`
@@ -44,6 +46,7 @@ pub mod encode;
 pub mod engine;
 pub mod key;
 pub mod materialized;
+pub mod route;
 pub mod row;
 pub mod subscriptions;
 pub mod types;
@@ -66,25 +69,19 @@ use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::Verdict;
+pub use crate::route::{Route, RouteDsl, Via};
 
-/// How fresh a read on a connection must be.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Consistency {
-    /// Reads may come from the cache, which lags a commit by the engine's
-    /// propagation delay.
-    #[default]
-    Eventual,
-    /// Every read goes to Postgres.
-    Strong,
-}
+/// The earlier name of [`Route`]: `Consistency::Eventual` is
+/// [`Route::Streamgres`], `Consistency::Strong` is [`Route::Postgres`].
+pub type Consistency = Route;
 
 /// What a process shares between its connections: the cache and how to
 /// treat a connection by the URL it was established with.
 pub struct Settings {
     pub cache: Arc<Cache>,
-    /// The consistency for a connection established with this URL, so a
-    /// master pool can be strong and a replica pool eventual.
-    pub consistency_for: Box<dyn Fn(&str) -> Consistency + Send + Sync>,
+    /// The route for a connection established with this URL, so a master
+    /// pool can go to Postgres and a replica pool through Streamgres.
+    pub consistency_for: Box<dyn Fn(&str) -> Route + Send + Sync>,
 }
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
@@ -105,7 +102,9 @@ pub fn install(settings: Settings) -> Result<(), Settings> {
 pub struct SyncedConnection<C = diesel::PgConnection> {
     inner: C,
     cache: Option<Arc<Cache>>,
-    consistency: Consistency,
+    route: Route,
+    /// A [`SyncedConnection::with_route`] scope in progress.
+    scoped: Option<Route>,
 }
 
 impl<C> SyncedConnection<C> {
@@ -114,26 +113,50 @@ impl<C> SyncedConnection<C> {
         SyncedConnection {
             inner,
             cache: None,
-            consistency: Consistency::Strong,
+            route: Route::Postgres,
+            scoped: None,
         }
     }
 
-    /// Wraps a connection with a cache and a consistency.
-    pub fn with_cache(inner: C, cache: Arc<Cache>, consistency: Consistency) -> Self {
+    /// Wraps a connection with a cache and the route its reads take
+    /// unless a query or a scope says otherwise.
+    pub fn with_cache(inner: C, cache: Arc<Cache>, route: Route) -> Self {
         SyncedConnection {
             inner,
             cache: Some(cache),
-            consistency,
+            route,
+            scoped: None,
         }
     }
 
-    /// Changes how fresh this connection's reads must be.
-    pub fn set_consistency(&mut self, consistency: Consistency) {
-        self.consistency = consistency;
+    /// Changes the route this connection's reads take by default.
+    pub fn set_route(&mut self, route: Route) {
+        self.route = route;
     }
 
+    pub fn route(&self) -> Route {
+        self.route
+    }
+
+    /// The earlier name of [`SyncedConnection::set_route`].
+    pub fn set_consistency(&mut self, consistency: Consistency) {
+        self.set_route(consistency);
+    }
+
+    /// The earlier name of [`SyncedConnection::route`].
     pub fn consistency(&self) -> Consistency {
-        self.consistency
+        self.route()
+    }
+
+    /// Runs `f` with every read inside it routed `route`, whatever the
+    /// connection's own route; a flag on the query itself still wins.
+    /// For code that holds the connection anyway, such as a pool's
+    /// `interact` closure.
+    pub fn with_route<R>(&mut self, route: Route, f: impl FnOnce(&mut Self) -> R) -> R {
+        let outer = self.scoped.replace(route);
+        let result = f(self);
+        self.scoped = outer;
+        result
     }
 
     /// The cache this connection reads through, if any.
@@ -236,18 +259,14 @@ where
         T: Query + QueryFragment<Pg> + QueryId + 'query,
         Pg: QueryMetadata<T::SqlType>,
     {
-        let cache = match self.cache.as_ref() {
-            Some(cache)
-                if self.consistency == Consistency::Eventual
-                    && !in_transaction(&mut self.inner) =>
-            {
-                Arc::clone(cache)
-            }
-            _ => return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live),
+        let Some(cache) = self.cache.clone() else {
+            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         };
-
-        let key = QueryKey::of(&source, &mut self.inner)?;
-        if !key.is_select() {
+        // The key is rendered before the route is known: a flag on the
+        // query travels in its SQL, and is stripped from the key here.
+        let mut key = QueryKey::of(&source, &mut self.inner)?;
+        let route = key.take_route().or(self.scoped).unwrap_or(self.route);
+        if route == Route::Postgres || in_transaction(&mut self.inner) || !key.is_select() {
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
         if let Some(entry) = cache.get(&key) {

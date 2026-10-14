@@ -10,6 +10,8 @@ use diesel::pg::{Pg, PgMetadataLookup, PgQueryBuilder};
 use diesel::query_builder::{QueryBuilder, QueryFragment, bind_collector::RawBytesBindCollector};
 use diesel::QueryResult;
 
+use crate::route::Route;
+
 /// One bind parameter as the wire carries it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Bind {
@@ -51,6 +53,15 @@ impl QueryKey {
             })
             .collect();
         Ok(QueryKey { sql, binds })
+    }
+
+    /// Splits a leading route marker off the SQL, if the query was flagged
+    /// with [`crate::RouteDsl::via`]. The key, and what the engine sees,
+    /// is the SQL without it.
+    pub fn take_route(&mut self) -> Option<Route> {
+        let (route, rest) = Route::strip(&self.sql)?;
+        self.sql = rest.to_string();
+        Some(route)
     }
 
     /// Whether the statement reads rather than writes: a `SELECT`, possibly

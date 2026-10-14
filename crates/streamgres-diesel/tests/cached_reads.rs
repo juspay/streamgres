@@ -10,7 +10,7 @@ use diesel::sql_types::{Integer, Text};
 use streamgres_diesel::cache::Cache;
 use streamgres_diesel::key::QueryKey;
 use streamgres_diesel::subscriptions::{Subscriptions, Verdict};
-use streamgres_diesel::{Consistency, SyncedConnection};
+use streamgres_diesel::{Consistency, Route, RouteDsl, SyncedConnection};
 
 diesel::table! {
     sg_configs (id) {
@@ -154,6 +154,18 @@ impl World {
 
     fn sent(&self) -> usize {
         self.sent.load(Ordering::SeqCst)
+    }
+
+    /// `read(name)` with the query itself flagged `route`.
+    fn read_via(&mut self, name: &str, route: Route) -> Option<String> {
+        let key = self.key(name);
+        sg_configs::table
+            .filter(sg_configs::key.eq(key))
+            .select(sg_configs::value)
+            .via(route)
+            .first(&mut self.conn)
+            .optional()
+            .expect("read via")
     }
 }
 
@@ -389,4 +401,77 @@ fn clearing_the_cache_refills_everything() {
     w.put("x", "2");
     w.cache.clear();
     assert_eq!(w.read("x").as_deref(), Some("2"));
+}
+
+#[test]
+fn a_query_flagged_postgres_bypasses_the_cache_on_a_streamgres_connection() {
+    let mut w = World::new("via-pg");
+    w.put("mode", "a");
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    w.put("mode", "b");
+
+    // The flag wins over the connection: Postgres is read, the cached
+    // entry is neither used nor replaced, and nothing is subscribed.
+    let sent = w.sent();
+    let subscribed = w.engine.subscribed.lock().unwrap().len();
+    assert_eq!(w.read_via("mode", Route::Postgres).as_deref(), Some("b"));
+    assert_eq!(w.sent(), sent + 1);
+    assert_eq!(w.engine.subscribed.lock().unwrap().len(), subscribed);
+    assert_eq!(w.read("mode").as_deref(), Some("a"), "the entry is untouched");
+}
+
+#[test]
+fn a_query_flagged_streamgres_is_cached_on_a_postgres_connection() {
+    let mut w = World::new("via-sg");
+    w.conn.set_route(Route::Postgres);
+    w.put("mode", "a");
+    assert_eq!(w.read_via("mode", Route::Streamgres).as_deref(), Some("a"));
+    assert_eq!(w.cache.len(), 1, "subscribed and filled");
+    w.put("mode", "b");
+    assert_eq!(w.read_via("mode", Route::Streamgres).as_deref(), Some("a"), "served from the cache");
+    assert_eq!(w.read("mode").as_deref(), Some("b"), "the connection's own route is Postgres");
+}
+
+#[test]
+fn the_marker_is_not_part_of_the_key_or_what_the_engine_sees() {
+    let mut w = World::new("via-key");
+    w.put("mode", "a");
+    assert_eq!(w.read_via("mode", Route::Streamgres).as_deref(), Some("a"));
+    let subscribed = w.engine.subscribed.lock().unwrap().clone();
+    assert_eq!(subscribed.len(), 1);
+    assert!(!subscribed[0].sql.contains("/*"), "{}", subscribed[0].sql);
+    assert_eq!(subscribed[0], w.key_of("mode"), "flagged and unflagged reads share the entry");
+    let sent = w.sent();
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    assert_eq!(w.sent(), sent, "the unflagged read hit the flagged read's entry");
+}
+
+#[test]
+fn a_route_scope_covers_every_read_inside_it_and_the_query_flag_still_wins() {
+    let mut w = World::new("scope");
+    w.put("mode", "a");
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    w.put("mode", "b");
+
+    let World { conn, prefix, .. } = &mut w;
+    let key = format!("{prefix}mode");
+    let (scoped, flagged) = conn.with_route(Route::Postgres, |conn| {
+        let scoped: Option<String> = sg_configs::table
+            .filter(sg_configs::key.eq(&key))
+            .select(sg_configs::value)
+            .first(conn)
+            .optional()
+            .unwrap();
+        let flagged: Option<String> = sg_configs::table
+            .filter(sg_configs::key.eq(&key))
+            .select(sg_configs::value)
+            .via_streamgres()
+            .first(conn)
+            .optional()
+            .unwrap();
+        (scoped, flagged)
+    });
+    assert_eq!(scoped.as_deref(), Some("b"), "the scope routed to Postgres");
+    assert_eq!(flagged.as_deref(), Some("a"), "the query flag beat the scope");
+    assert_eq!(w.read("mode").as_deref(), Some("a"), "the scope ended");
 }

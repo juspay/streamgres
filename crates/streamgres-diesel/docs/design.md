@@ -192,14 +192,35 @@ its own keys.
   run it, then `tokio-console` (installed with `cargo install tokio-console`)
   attaches on `127.0.0.1:6669`; the S2S task is named `s2s`.
 
-## Consistency
+## Routing: two flags, per query and per connection pool
 
-- `Eventual` (default): cache first.
-- `Strong`: never the cache. Set per connection or per pool, so a master
-  pool is strong and a replica pool eventual, matching Hyperswitch's
-  split.
-- Inside a transaction, always Postgres: the ANSI manager's depth is on
-  the inner connection and is checked before the cache.
+A read goes one of two ways, `Route::Streamgres` (the cache, kept fresh
+by the engine) or `Route::Postgres` (live). The route is decided at
+three levels, the most specific winning:
+
+1. The query: `query.via(Route::Postgres).first(conn)` (or
+   `via_postgres()` / `via_streamgres()`, from `RouteDsl`). The marker
+   renders a leading SQL comment, `/*streamgres:postgres*/`, that the
+   wrapper reads and strips at the interception point; the cache key and
+   the SQL the engine sees are the plain query, so flagged and unflagged
+   reads share one entry. `conn.with_route(route, |c| ...)` is the same
+   flag for every read inside the closure, for code that holds the
+   connection anyway (a pool's `interact` block).
+2. The connection pool: every connection carries a route chosen by the
+   URL it was established with (`Settings`), so a master pool goes to
+   Postgres and a replica pool through Streamgres, matching
+   Hyperswitch's split. `set_route` changes it on one connection.
+3. The process default, Streamgres.
+
+Whatever the flags say, three reads go to Postgres: a statement that is
+not a `SELECT` (Diesel sends `INSERT ... RETURNING` through `load`), a
+read inside an open transaction (the ANSI manager's depth is on the
+inner connection and is checked before the cache), and a query the
+engine refuses. A query flagged Streamgres on a pool whose database no
+engine streams is therefore just a live read.
+
+`Consistency::Eventual` and `Consistency::Strong` remain as the earlier
+names of the two routes.
 
 ## Open points carried from the roadmap call
 
