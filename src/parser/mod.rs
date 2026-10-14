@@ -2207,7 +2207,7 @@ mod s2s_shapes {
         let mut bytes = Vec::new();
         bytes.extend(1i32.to_be_bytes()); // one dimension
         bytes.extend(0i32.to_be_bytes()); // no nulls
-        bytes.extend(25i32.to_be_bytes()); // element oid as text
+        bytes.extend(777i32.to_be_bytes()); // element oid: the enum's own, as Diesel sends it
         bytes.extend(2i32.to_be_bytes()); // two elements
         bytes.extend(1i32.to_be_bytes()); // lower bound
         for label in ["open", "done"] {
@@ -2226,5 +2226,46 @@ mod s2s_shapes {
         let shown = format!("{:?}", any.query.main_table.filter);
         assert!(shown.contains("open") && shown.contains("done"), "{shown}");
         let _ = Value::Null;
+    }
+
+    #[test]
+    fn an_infinite_time_bind_is_refused_not_wrapped() {
+        let catalog = catalog();
+        for (oid, bytes) in [
+            (binds::oid::TIMESTAMP, i64::MAX.to_be_bytes().to_vec()),
+            (binds::oid::TIMESTAMPTZ, i64::MIN.to_be_bytes().to_vec()),
+            (binds::oid::DATE, i32::MAX.to_be_bytes().to_vec()),
+        ] {
+            let error = parse_select(
+                r#"SELECT * FROM "tickets" WHERE "tickets"."points" < $1"#,
+                &[BindValue {
+                    type_oid: oid,
+                    bytes: Some(bytes),
+                }],
+                &catalog,
+            )
+            .expect_err("infinity has no microsecond value");
+            assert!(error.message.contains("infinite"), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn a_limit_and_offset_that_saturate_are_refused() {
+        let catalog = catalog();
+        let error = parse_select(
+            r#"SELECT * FROM "tickets" ORDER BY "tickets"."id" LIMIT 10 OFFSET 4294967290"#,
+            &[],
+            &catalog,
+        )
+        .expect_err("would register an unbounded query");
+        assert!(error.message.contains("more rows"), "{}", error.message);
+        let fine = parse_select(
+            r#"SELECT * FROM "tickets" ORDER BY "tickets"."id" LIMIT 10 OFFSET 5"#,
+            &[],
+            &catalog,
+        )
+        .expect("a sane pair");
+        assert_eq!(fine.query.main_table.limit, 15);
+        assert_eq!(fine.offset, 5);
     }
 }

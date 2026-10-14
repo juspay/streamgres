@@ -120,7 +120,21 @@ impl Parser<'_> {
         };
         let limit = self.limit()?;
         let offset = self.offset()?;
-        let kept = if limit == u32::MAX { limit } else { limit.saturating_add(offset) };
+        // The tree holds `limit + offset` rows; `u32::MAX` means no limit,
+        // so a sum that reaches it would register an unbounded query.
+        let kept = if limit == u32::MAX {
+            limit
+        } else {
+            match limit.checked_add(offset) {
+                Some(kept) if kept < u32::MAX => kept,
+                _ => {
+                    return Err(ParseError {
+                        message: "LIMIT plus OFFSET is more rows than the engine follows".to_string(),
+                        position: self.at(),
+                    });
+                }
+            }
+        };
 
         let query = build(&nodes, 0, order_by, kept);
         Ok(Select {

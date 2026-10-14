@@ -125,13 +125,26 @@ pub fn decode(bind: &BindValue) -> Result<Value, String> {
         }
         oid::TIMESTAMP | oid::TIMESTAMPTZ => {
             // Microseconds since 2000-01-01; the engine keeps microseconds
-            // since the Unix epoch.
+            // since the Unix epoch. `infinity` is i64::MAX, `-infinity`
+            // i64::MIN: neither fits the shift, and neither can be
+            // compared on by a cache.
             let micros = i64::from_be_bytes(bytes_of(8)?.try_into().unwrap());
-            Value::Int(micros + PG_EPOCH_MICROS)
+            if micros == i64::MAX || micros == i64::MIN {
+                return Err("an infinite time bind".to_string());
+            }
+            Value::Int(micros.checked_add(PG_EPOCH_MICROS).ok_or("a time bind out of range")?)
         }
         oid::DATE => {
             let days = i32::from_be_bytes(bytes_of(4)?.try_into().unwrap());
-            Value::Int(i64::from(days) * 86_400_000_000 + PG_EPOCH_MICROS)
+            if days == i32::MAX || days == i32::MIN {
+                return Err("an infinite date bind".to_string());
+            }
+            Value::Int(
+                i64::from(days)
+                    .checked_mul(86_400_000_000)
+                    .and_then(|micros| micros.checked_add(PG_EPOCH_MICROS))
+                    .ok_or("a date bind out of range")?,
+            )
         }
         oid::BYTEA => return Err("a bytea bind cannot be compared on".to_string()),
         oid::BOOL_ARRAY
@@ -148,16 +161,40 @@ pub fn decode(bind: &BindValue) -> Result<Value, String> {
         | oid::TIMESTAMP_ARRAY
         | oid::TIMESTAMPTZ_ARRAY
         | oid::UUID_ARRAY
-        | oid::JSONB_ARRAY => Value::List(array(bytes)?),
+        | oid::JSONB_ARRAY => Value::List(array(bytes, element_of(bind.type_oid))?),
         other => return Err(format!("a bind of type oid {other} is not supported")),
     })
+}
+
+/// The element type of an array type. The array's own header names an
+/// element type too, but that is what the client declared, which for
+/// an enum remapped to text is the enum's OID; the outer type decides.
+fn element_of(array_oid: u32) -> u32 {
+    match array_oid {
+        oid::BOOL_ARRAY => oid::BOOL,
+        oid::INT2_ARRAY => oid::INT2,
+        oid::INT4_ARRAY => oid::INT4,
+        oid::INT8_ARRAY => oid::INT8,
+        oid::TEXT_ARRAY => oid::TEXT,
+        oid::VARCHAR_ARRAY => oid::VARCHAR,
+        oid::BPCHAR_ARRAY => oid::BPCHAR,
+        oid::FLOAT4_ARRAY => oid::FLOAT4,
+        oid::FLOAT8_ARRAY => oid::FLOAT8,
+        oid::NUMERIC_ARRAY => oid::NUMERIC,
+        oid::DATE_ARRAY => oid::DATE,
+        oid::TIMESTAMP_ARRAY => oid::TIMESTAMP,
+        oid::TIMESTAMPTZ_ARRAY => oid::TIMESTAMPTZ,
+        oid::UUID_ARRAY => oid::UUID,
+        oid::JSONB_ARRAY => oid::JSONB,
+        other => other,
+    }
 }
 
 /// Postgres's binary array: dimensions, a has-nulls flag, the element
 /// type, then per dimension a length and lower bound, then each element
 /// as its length (`-1` for NULL) and bytes. Only one dimension is a list
-/// a predicate can use.
-fn array(bytes: &[u8]) -> Result<Vec<Value>, String> {
+/// a predicate can use. Elements are decoded as `element_oid`.
+fn array(bytes: &[u8], element_oid: u32) -> Result<Vec<Value>, String> {
     let word = |at: usize| -> Result<i32, String> {
         bytes
             .get(at..at + 4)
@@ -165,7 +202,6 @@ fn array(bytes: &[u8]) -> Result<Vec<Value>, String> {
             .ok_or_else(|| "an array bind ends inside its header".to_string())
     };
     let dimensions = word(0)?;
-    let element_oid = word(8)? as u32;
     if dimensions == 0 {
         return Ok(Vec::new());
     }
