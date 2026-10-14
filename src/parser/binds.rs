@@ -63,7 +63,7 @@ pub(crate) mod oid {
 }
 
 /// Milliseconds from the Unix epoch to Postgres's epoch (2000-01-01).
-const PG_EPOCH_MILLIS: i64 = 946_684_800_000;
+const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 
 /// The value a bind stands for, or why it cannot stand for one.
 /// Whether an enum bind's bytes are an array rather than one label: an
@@ -124,14 +124,14 @@ pub fn decode(bind: &BindValue) -> Result<Value, String> {
             ))
         }
         oid::TIMESTAMP | oid::TIMESTAMPTZ => {
-            // Microseconds since 2000-01-01; the engine keeps milliseconds
+            // Microseconds since 2000-01-01; the engine keeps microseconds
             // since the Unix epoch.
             let micros = i64::from_be_bytes(bytes_of(8)?.try_into().unwrap());
-            Value::Int(micros.div_euclid(1000) + PG_EPOCH_MILLIS)
+            Value::Int(micros + PG_EPOCH_MICROS)
         }
         oid::DATE => {
             let days = i32::from_be_bytes(bytes_of(4)?.try_into().unwrap());
-            Value::Int(i64::from(days) * 86_400_000 + PG_EPOCH_MILLIS)
+            Value::Int(i64::from(days) * 86_400_000_000 + PG_EPOCH_MICROS)
         }
         oid::BYTEA => return Err("a bytea bind cannot be compared on".to_string()),
         oid::BOOL_ARRAY
@@ -319,20 +319,20 @@ mod tests {
     }
 
     #[test]
-    fn times_become_unix_milliseconds() {
+    fn times_become_unix_microseconds() {
         // 2000-01-01 00:00:01.5 as Postgres micros.
         let micros = 1_500_000i64;
         assert_eq!(
             decode(&bind(oid::TIMESTAMPTZ, &micros.to_be_bytes())),
-            Ok(Value::Int(PG_EPOCH_MILLIS + 1500))
+            Ok(Value::Int(PG_EPOCH_MICROS + 1_500_000))
         );
         assert_eq!(
             decode(&bind(oid::TIMESTAMP, &(-1_000i64).to_be_bytes())),
-            Ok(Value::Int(PG_EPOCH_MILLIS - 1))
+            Ok(Value::Int(PG_EPOCH_MICROS - 1_000))
         );
         assert_eq!(
             decode(&bind(oid::DATE, &2i32.to_be_bytes())),
-            Ok(Value::Int(PG_EPOCH_MILLIS + 2 * 86_400_000))
+            Ok(Value::Int(PG_EPOCH_MICROS + 2 * 86_400_000_000))
         );
     }
 

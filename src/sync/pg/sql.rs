@@ -240,24 +240,24 @@ pub fn cast_of(declared: &ValueType) -> &'static str {
 }
 
 /// The SQL reading one column in the form the engine keeps it: a time
-/// column as epoch milliseconds, a JSON column as the text of its `jsonb`
+/// column as epoch microseconds, a JSON column as the text of its `jsonb`
 /// (the cast is nothing for a `jsonb` column, and gives a `json` column's
 /// stored text the one spelling `jsonb` has), an array or map column as
 /// JSON text, every other cast to its declared type's Postgres form.
 pub fn select_expr(column: &str, declared: &ValueType) -> String {
     let quoted = quote_ident(column);
     match declared {
-        ValueType::Timestamp => epoch_millis(&quoted),
+        ValueType::Timestamp => epoch_micros(&quoted),
         ValueType::Json => format!("{quoted}::jsonb::text"),
         ValueType::List(_) | ValueType::Map(_, _) => format!("to_json({quoted})::text"),
         other => format!("{quoted}::{}", cast_of(other)),
     }
 }
 
-/// `expr` as milliseconds since the epoch; `extract` is numeric, so the
-/// rounding to `int8` keeps the millisecond a `timestamp(3)` column has.
-fn epoch_millis(expr: &str) -> String {
-    format!("(extract(epoch from {expr}) * 1000)::int8")
+/// `expr` as microseconds since the epoch; `extract` is numeric with the
+/// column's full precision, so the rounding to `int8` is exact.
+fn epoch_micros(expr: &str) -> String {
+    format!("(extract(epoch from {expr}) * 1000000)::int8")
 }
 
 /// A column as the SQL its conditions compare it by: the bare column
@@ -275,7 +275,7 @@ fn column_expr(column: &str, scope: &Scope<'_>) -> String {
 }
 
 /// A literal compared against a column of `declared` type: the engine
-/// keeps a time as milliseconds since the epoch, so against a time
+/// keeps a time as microseconds since the epoch, so against a time
 /// column the number becomes the timestamp it names, and the column
 /// itself stays bare for the index; against a JSON column the text the
 /// engine holds is the `jsonb` it names.
@@ -283,12 +283,12 @@ fn literal_as(value: &Value, declared: Option<&ValueType>) -> String {
     if let (Value::String(text), Some(ValueType::Json)) = (value, declared) {
         return format!("{}::jsonb", quote_literal(text));
     }
-    let millis = match (value, declared) {
-        (Value::Int(millis), Some(ValueType::Timestamp)) => *millis,
-        (Value::Float(millis), Some(ValueType::Timestamp)) if millis.is_finite() => *millis as i64,
+    let micros = match (value, declared) {
+        (Value::Int(micros), Some(ValueType::Timestamp)) => *micros,
+        (Value::Float(micros), Some(ValueType::Timestamp)) if micros.is_finite() => *micros as i64,
         _ => return literal(value),
     };
-    format!("(TIMESTAMP 'epoch' + {millis} * INTERVAL '1 millisecond')")
+    format!("(TIMESTAMP 'epoch' + {micros} * INTERVAL '1 microsecond')")
 }
 
 /// A double-quoted identifier.
@@ -574,8 +574,8 @@ mod tests {
     }
 
     /// A time condition compares the bare column against the timestamp
-    /// the millisecond literal names, so an index on the column answers
-    /// it; the projection still returns milliseconds.
+    /// the microsecond literal names, so an index on the column answers
+    /// it; the projection still returns microseconds.
     #[test]
     fn a_time_condition_compares_the_column_itself() {
         let table = DbTable::new(
@@ -602,17 +602,17 @@ mod tests {
         let sql = select_sql(&query, &table);
         assert!(
             sql.contains(
-                "\"createdAt\" > (TIMESTAMP 'epoch' + 1750000000000 * INTERVAL '1 millisecond')"
+                "\"createdAt\" > (TIMESTAMP 'epoch' + 1750000000000 * INTERVAL '1 microsecond')"
             ),
             "{sql}"
         );
         assert!(
-            sql.contains("\"createdAt\" IN ((TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond'), (TIMESTAMP 'epoch' + 2000 * INTERVAL '1 millisecond'))"),
+            sql.contains("\"createdAt\" IN ((TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond'), (TIMESTAMP 'epoch' + 2000 * INTERVAL '1 microsecond'))"),
             "{sql}"
         );
         assert!(
-            sql.contains("(extract(epoch from \"createdAt\") * 1000)::int8"),
-            "the projection still reads milliseconds: {sql}"
+            sql.contains("(extract(epoch from \"createdAt\") * 1000000)::int8"),
+            "the projection still reads microseconds: {sql}"
         );
     }
 

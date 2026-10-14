@@ -1,7 +1,7 @@
 //! The catalog read from the database itself: every table of the chosen
 //! schemas that has a primary key, its columns mapped onto the engine's
 //! value types the way the sync protocol maps them for its clients (times as epoch
-//! milliseconds, JSON and arrays as JSON, enums and uuids as strings,
+//! microseconds, JSON and arrays as JSON, enums and uuids as strings,
 //! `bytea` as Postgres's hex text), so a server needs no hand-written
 //! schema. It also notes which type OIDs are enums, so a bound parameter
 //! of an enum type can be read as the text it is. Tables of

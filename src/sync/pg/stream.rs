@@ -1189,7 +1189,7 @@ fn convert(raw: &str, declared: &ValueType) -> Result<Value, StorageError> {
         ValueType::Json => Value::String(super::text::standard_json(raw).into_owned()),
         ValueType::String | ValueType::Map(_, _) => Value::String(raw.to_owned()),
         ValueType::List(inner) => super::text::array_literal(raw, inner),
-        ValueType::Timestamp => Value::Int(super::text::epoch_millis(raw).ok_or_else(unreadable)?),
+        ValueType::Timestamp => Value::Int(super::text::epoch_micros(raw).ok_or_else(unreadable)?),
         ValueType::Bool => Value::Bool(match raw {
             "true" | "t" => true,
             "false" | "f" => false,

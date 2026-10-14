@@ -894,7 +894,7 @@ fn decode_row(
 
 /// One column of a result row in its text form, decoded by the cast its
 /// declared type was read with ([`sql::select_expr`]): a time column
-/// arrives as its epoch milliseconds, a JSON column as the text of its
+/// arrives as its epoch microseconds, a JSON column as the text of its
 /// `jsonb` (kept in the standard form, [`text::standard_json`]), a list
 /// or map column as JSON text, the rest in Postgres's text form for the
 /// cast type.

@@ -50,7 +50,9 @@
 //! - `["accepted", ...]` also carries `"offset"`: the engine keeps
 //!   `limit + offset` rows and the client skips `offset` of them. A
 //!   `bytea` column travels as Postgres's hex text; a bind of an enum
-//!   type is read as its label.
+//!   type is read as its label; a time travels as microseconds since
+//!   the Unix epoch, Postgres's own precision (the Zero protocol sees
+//!   milliseconds), and a timestamp bind is read the same way.
 //! - `["refused", {"id": n, "reason": "..."}]` when the engine cannot
 //!   follow the query (outside the SQL subset, an unknown table, too many
 //!   rows). The backend serves that query live.

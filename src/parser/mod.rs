@@ -104,6 +104,7 @@ pub fn parse_with_binds(
         pos: 0,
         depth: 0,
         binds,
+        times: TimeUnit::Millis,
     };
     let parsed = parser.query(catalog)?;
     if !matches!(parser.peek(), Tok::Eof) {
@@ -162,6 +163,7 @@ pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result
         pos: 0,
         depth: 0,
         binds: &binds,
+        times: TimeUnit::Micros,
     };
     if !parser.is_word("SELECT") {
         return parser.err(format!("expected SELECT, found {}", parser.describe()));
@@ -449,6 +451,18 @@ struct Parser<'b> {
     pos: usize,
     depth: usize,
     binds: &'b [BindValue],
+    /// What a number compared with a time column means. A literal in
+    /// SQL written by hand or by the Zero side is milliseconds, the
+    /// protocol's unit; a bound parameter carries Postgres's own
+    /// microseconds, which is what the engine keeps.
+    times: TimeUnit,
+}
+
+/// The unit of a number standing for a time, see [`Parser::times`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeUnit {
+    Millis,
+    Micros,
 }
 
 impl Parser<'_> {
@@ -682,7 +696,7 @@ impl Parser<'_> {
                 let value_at = self.at();
                 let value = self.value()?;
                 values.push(match columns.get(values.len()) {
-                    Some(column) => coerce_to_column_type(value, table, column, value_at)?,
+                    Some(column) => coerce_to_column_type(value, table, column, value_at, self.times)?,
                     None => value,
                 });
                 if !self.eat_sym(",") {
@@ -728,7 +742,7 @@ impl Parser<'_> {
                 self.expect_sym("=")?;
                 let value_at = self.at();
                 let value = self.value()?;
-                let value = coerce_to_column_type(value, table, &column, value_at)?;
+                let value = coerce_to_column_type(value, table, &column, value_at, self.times)?;
                 assignments.push((column, value));
                 if !self.eat_sym(",") {
                     break;
@@ -824,7 +838,7 @@ impl Parser<'_> {
                     position: at,
                 });
             }
-            let value = coerce_to_column_type(value, table, &column, at)?;
+            let value = coerce_to_column_type(value, table, &column, at, self.times)?;
             if pkey_value.insert(column.clone(), value).is_some() {
                 return Err(ParseError {
                     message: format!("primary-key column `{column}` appears twice in WHERE"),
@@ -1154,12 +1168,13 @@ fn coerce_to_column_type(
     table: &DbTable,
     column: &ColumnName,
     at: usize,
+    times: TimeUnit,
 ) -> Result<Value, ParseError> {
     let declared = table
         .column(column.as_str())
         .map(|candidate| &candidate.r#type)
         .expect("column names are validated against the table before coercion");
-    coerce_to_type(value, declared, column.as_str(), at)
+    coerce_to_type(value, declared, column.as_str(), at, times)
 }
 
 /// Recursive worker for [`coerce_to_column_type`], matching a value (and
@@ -1171,6 +1186,7 @@ fn coerce_to_type(
     declared: &ValueType,
     column: &str,
     at: usize,
+    times: TimeUnit,
 ) -> Result<Value, ParseError> {
     Ok(match (value, declared) {
         (Value::Null, _) => Value::Null,
@@ -1178,7 +1194,11 @@ fn coerce_to_type(
         (value @ Value::Float(_), ValueType::Float) => value,
         (value @ Value::String(_), ValueType::String) => value,
         (value @ Value::Bool(_), ValueType::Bool) => value,
-        (value @ Value::Int(_), ValueType::Timestamp) => value,
+        // The engine keeps a time as microseconds.
+        (Value::Int(int), ValueType::Timestamp) => Value::Int(match times {
+            TimeUnit::Millis => int.saturating_mul(1000),
+            TimeUnit::Micros => int,
+        }),
         (value @ Value::String(_), ValueType::Json) => value,
         (Value::Int(int), ValueType::Float) => Value::Float(int as f64),
         (Value::Float(float), ValueType::Int)
@@ -1189,7 +1209,7 @@ fn coerce_to_type(
         (Value::List(items), ValueType::List(inner)) => Value::List(
             items
                 .into_iter()
-                .map(|item| coerce_to_type(item, inner, column, at))
+                .map(|item| coerce_to_type(item, inner, column, at, times))
                 .collect::<Result<_, _>>()?,
         ),
         (Value::String(_), ValueType::Date | ValueType::Datetime) => {

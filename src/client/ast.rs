@@ -525,6 +525,11 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
             Value::Float(number.as_f64().unwrap_or(f64::NAN))
         }
         (Json::Number(number), ValueType::String) => Value::String(number.to_string()),
+        // The protocol's milliseconds, kept as microseconds.
+        (Json::Number(number), ValueType::Timestamp) => match number.as_i64() {
+            Some(millis) => Value::Int(millis.saturating_mul(1000)),
+            None => Value::Float(number.as_f64().unwrap_or(f64::NAN) * 1000.0),
+        },
         (Json::Number(number), _) => match number.as_i64() {
             Some(int) => Value::Int(int),
             None => Value::Float(number.as_f64().unwrap_or(f64::NAN)),
@@ -532,7 +537,11 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
         (Json::String(text), _) if text.contains('\0') => {
             return Err("a text value contains a NUL byte".to_owned());
         }
-        (Json::String(text), ValueType::Int | ValueType::Timestamp) => text
+        (Json::String(text), ValueType::Timestamp) => text
+            .parse::<i64>()
+            .map(|millis| Value::Int(millis.saturating_mul(1000)))
+            .map_err(|_| format!("`{text}` is not a number"))?,
+        (Json::String(text), ValueType::Int) => text
             .parse::<i64>()
             .map(Value::Int)
             .map_err(|_| format!("`{text}` is not a number"))?,
@@ -891,7 +900,8 @@ mod tests {
         let translated = translate(&ast, &catalog()).unwrap();
         assert_eq!(
             translated.query.main_table.filter,
-            Where::condition("createdAt", LT, Value::Int(1000))
+            // The cursor's milliseconds, kept as microseconds.
+            Where::condition("createdAt", LT, Value::Int(1_000_000))
         );
         let empty: Ast = serde_json::from_str(r#"{"table": "messages", "orderBy": [["createdAt", "desc"]], "start": {"row": {"other": 1}, "exclusive": true}}"#).unwrap();
         assert!(

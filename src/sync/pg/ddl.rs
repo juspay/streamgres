@@ -284,7 +284,7 @@ fn typed(text: &str, declared: &ValueType) -> Option<Value> {
             "f" | "false" | "0" => false,
             _ => return None,
         }),
-        ValueType::Timestamp => Value::Int(text::epoch_millis(text)?),
+        ValueType::Timestamp => Value::Int(text::epoch_micros(text)?),
         ValueType::List(inner) => match text::array_literal(text, inner) {
             Value::List(items) => Value::List(items),
             _ => return None,
@@ -564,7 +564,7 @@ mod tests {
                 &ValueType::Timestamp
             ),
             Some(Value::Int(
-                text::epoch_millis("2026-01-02 03:04:05+00").unwrap()
+                text::epoch_micros("2026-01-02 03:04:05+00").unwrap()
             ))
         );
         for expression in [

@@ -1,5 +1,5 @@
 //! The text forms Postgres uses for the values the engine carries in a
-//! form of its own: the epoch-millisecond reading of a time, a JSON array
+//! form of its own: the epoch-microsecond reading of a time, a JSON array
 //! read from `to_json(column)`, and the `{a,b}` array literal the change
 //! feed delivers, each turned into the [`Value`] the column's declared
 //! type calls for; and the **standard form** of a JSON value, the one text
@@ -193,23 +193,23 @@ pub fn json_as_jsonb(text: &str) -> String {
     }
 }
 
-/// Milliseconds since the Unix epoch of a Postgres `timestamp`,
-/// `timestamptz` or `date` in its text form (`2026-09-15 10:00:00.123`,
+/// Microseconds since the Unix epoch of a Postgres `timestamp`,
+/// `timestamptz` or `date` in its text form (`2026-09-15 10:00:00.123456`,
 /// with an optional `+05:30` style offset, or `2026-09-15`); a timestamp
 /// without a zone is read as UTC, the protocol's convention. `None` when the text
 /// is not a time (`infinity` included).
-pub fn epoch_millis(text: &str) -> Option<i64> {
+pub fn epoch_micros(text: &str) -> Option<i64> {
     let text = text.trim();
     if text.len() == 10 {
         let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
-        return Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis());
+        return Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros());
     }
     let (naive, offset_seconds) = split_offset(text);
     let parsed = chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%d %H:%M:%S"))
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%dT%H:%M:%S%.f"))
         .ok()?;
-    Some(parsed.and_utc().timestamp_millis() - offset_seconds * 1000)
+    Some(parsed.and_utc().timestamp_micros() - offset_seconds * 1_000_000)
 }
 
 /// Split a trailing `+HH`, `+HH:MM` or `+HHMM` zone offset off a timestamp
@@ -355,12 +355,13 @@ mod tests {
     /// Timestamps without a zone read as UTC, with a zone are shifted, and
     /// dates land on UTC midnight.
     #[test]
-    fn times_read_as_epoch_milliseconds() {
-        assert_eq!(epoch_millis("1970-01-01 00:00:01.5"), Some(1_500));
-        assert_eq!(epoch_millis("1970-01-01 01:00:00+01"), Some(0));
-        assert_eq!(epoch_millis("1970-01-01 05:30:00.25+05:30"), Some(250));
-        assert_eq!(epoch_millis("1970-01-02"), Some(86_400_000));
-        assert_eq!(epoch_millis("infinity"), None);
+    fn times_read_as_epoch_microseconds() {
+        assert_eq!(epoch_micros("1970-01-01 00:00:01.5"), Some(1_500_000));
+        assert_eq!(epoch_micros("1970-01-01 00:00:00.123456"), Some(123_456));
+        assert_eq!(epoch_micros("1970-01-01 01:00:00+01"), Some(0));
+        assert_eq!(epoch_micros("1970-01-01 05:30:00.25+05:30"), Some(250_000));
+        assert_eq!(epoch_micros("1970-01-02"), Some(86_400_000_000));
+        assert_eq!(epoch_micros("infinity"), None);
     }
 
     /// Array literals split on unquoted commas, unquote, and read NULL.

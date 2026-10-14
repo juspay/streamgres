@@ -86,6 +86,11 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
             }
             _ => write_text(out, text),
         },
+        // A time is kept as microseconds; the protocol's unit is
+        // milliseconds.
+        Value::Int(int) if matches!(declared, Some(ValueType::Timestamp)) => {
+            let _ = write!(out, "{}", int.div_euclid(1000));
+        }
         Value::Int(int) => {
             let _ = write!(out, "{int}");
         }
@@ -156,7 +161,9 @@ pub fn key_json(key: &DataFrameKey) -> Json {
     Json::Object(object)
 }
 
-/// One cell as JSON, in the light of its declared type.
+/// One cell as JSON, in the light of its declared type, with a time as
+/// the microseconds the engine keeps (the server-to-server form; the
+/// Zero writer above scales to milliseconds).
 pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
     match value {
         Value::Null => Json::Null,
@@ -299,7 +306,9 @@ mod tests {
             );
             let written: Json = serde_json::from_slice(&fast).expect("valid JSON");
             assert_eq!(written["tableName"], "odd \"table\"");
-            assert_eq!(written["value"], row_json(&planned, &table));
+            let mut expected = row_json(&planned, &table);
+            expected["ts"] = Json::from(1_759_622_400_000i64 / 1000);
+            assert_eq!(written["value"], expected, "a time goes out in milliseconds");
         }
     }
 
@@ -346,7 +355,7 @@ mod tests {
         ]));
         let json = row_json(&row, &table);
         assert_eq!(json["meta"]["k"][1], 2);
-        assert_eq!(json["at"], 1_000);
+        assert_eq!(json["at"], 1_000, "the tree keeps the engine's microseconds");
         assert_eq!(json["extra"], 7, "every column the row carries is written");
 
         let mut bytes = Vec::new();
@@ -354,7 +363,9 @@ mod tests {
         let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(written["op"], "put");
         assert_eq!(written["tableName"], "t");
-        assert_eq!(written["value"], json, "the bytes say what the tree says");
+        let mut expected = json.clone();
+        expected["at"] = Json::from(1);
+        assert_eq!(written["value"], expected, "the bytes say what the tree says, times in milliseconds");
         let mut bytes = Vec::new();
         write_del(
             &mut bytes,
