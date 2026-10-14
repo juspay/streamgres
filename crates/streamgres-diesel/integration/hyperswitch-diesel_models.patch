@@ -39,10 +39,10 @@ index f0c20a5..70afae2 100644
  pub type RawPgConnection = async_bb8_diesel::Connection<DejaPgConnection>;
 diff --git a/crates/diesel_models/tests/streamgres_coverage.rs b/crates/diesel_models/tests/streamgres_coverage.rs
 new file mode 100644
-index 0000000..7a494d9
+index 0000000..5bf1937
 --- /dev/null
 +++ b/crates/diesel_models/tests/streamgres_coverage.rs
-@@ -0,0 +1,408 @@
+@@ -0,0 +1,431 @@
 +//! Hyperswitch's own model lookups, one table after another, through the
 +//! Streamgres-synced connection: what the engine does with each query
 +//! shape, whether the wrapper's answer equals Postgres's, and how long a
@@ -312,6 +312,29 @@ index 0000000..7a494d9
 +                })
 +            },
 +            change: "UPDATE unified_translations SET translation = translation || 'x' WHERE unified_code = 'sgcov_uc'",
++        },
++        Case {
++            name: "payment_attempt: get_total_count_of_attempts (enum array binds, COUNT)",
++            run: |c| {
++                Box::pin(async move {
++                    show(
++                        PaymentAttempt::get_total_count_of_attempts(
++                            c,
++                            &merchant(),
++                            &["sgcov_att".to_string()],
++                            None,
++                            None,
++                            None,
++                            Some(vec![diesel_models::enums::AuthenticationType::NoThreeDs]),
++                            None,
++                            None,
++                            None,
++                        )
++                        .await,
++                    )
++                })
++            },
++            change: "UPDATE payment_attempt SET authentication_type = 'no_three_ds' WHERE attempt_id = 'sgcov_att'",
 +        },
 +    ]
 +}

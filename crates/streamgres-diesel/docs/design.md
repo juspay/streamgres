@@ -149,7 +149,10 @@ Downstream:
   body is the result itself, otherwise the wrapper reads Postgres only
   after it, so every later change is reported.
 - `["delta", {"id", "put": [rows], "del": [keys]}]` per transaction for
-  a rows-mode subscription.
+  a rows-mode subscription. One entry per key: a row that changed is a
+  put of its new image, a row that came and went inside the transaction
+  is a delete, and no key is in both lists, so the order the client
+  applies them in does not matter.
 - `["refused", {"id", "reason"}]` for anything outside the subset (joins,
   `LIKE`, `OFFSET`, `DISTINCT`, unknown columns, too many rows); the read
   is served live. A refusal after acceptance means the engine stopped
@@ -248,22 +251,41 @@ the caller, blocking or async, has looked them up.
 A bind of a user-defined type (an enum) needs its OID for the key. The
 blocking wrapper resolves it on the spot through the connection; the
 async one cannot, so the first read with such a bind goes to Postgres
-while the OID is resolved and remembered, and from the next read on the
-query is cached like any other. A table created after the one-shot type
-load falls its query back to refills, and the next miss loads the types
-again.
+while the OID is resolved and remembered in the cache, for every
+connection sharing it, and from the next read on the query is cached
+like any other. An array of an enum (`eq_any`) cannot even be rendered
+until the OID is known, and takes the same path. A table created after
+the one-shot type load falls its query back to refills, and the next
+miss loads the types again.
+
+Two things the async world adds. diesel-async lets several futures
+from one connection be pending at once, and shares its transaction
+state with each of them; asking for that state while one is pending is
+a panic in diesel-async itself. The wrapper counts its own futures in
+flight and, while any is, sends a read to Postgres without asking: a
+read pipelined behind a write must see that write anyway. And a future
+can be dropped before it completes: a `with_route` scope restores the
+outer route on drop, and a read dropped after it subscribed ends the
+subscription it made rather than leaving one nobody fills.
 
 ## Cache limits
 
 `cache::Limits` bounds the cache three ways, each from the environment
 through `Limits::from_env` or set in code with `Cache::with_limits`:
 
-| variable                     | meaning                                      | default |
-|------------------------------|----------------------------------------------|---------|
-| `STREAMGRES_CACHE_MAX_BYTES` | rows and keys held                           | 256 MiB |
-| `STREAMGRES_CACHE_IDLE_MS`   | drop an entry unread for this long; 0 never  | 30 min  |
-| `STREAMGRES_CACHE_TTL_MS`    | drop an entry this old however read; 0 never | off     |
-| `STREAMGRES_REFUSED_TTL_MS`  | skip the engine for a refused query this long; 0 never | 30 s |
+| variable                           | meaning                                      | default |
+|------------------------------------|----------------------------------------------|---------|
+| `STREAMGRES_CACHE_MAX_BYTES`       | rows and keys held                           | 256 MiB |
+| `STREAMGRES_CACHE_MAX_ENTRY_BYTES` | the largest result kept; 0 no limit          | 16 MiB  |
+| `STREAMGRES_CACHE_IDLE_MS`         | drop an entry unread for this long; 0 never  | 30 min  |
+| `STREAMGRES_CACHE_TTL_MS`          | drop an entry this old however read; 0 never | off     |
+| `STREAMGRES_REFUSED_TTL_MS`        | skip the engine for a refused query this long; 0 never | 30 s |
+
+A rows-mode entry weighs its rows plus the store the engine side keeps
+for it, so the budget covers both. A result over the entry limit is
+served but not kept (`Stats::oversized`), and its subscription ends. A
+refusal is remembered by the query's shape, its SQL and bind types, not
+its bind values: what the engine refuses, it refuses for every value.
 
 Idle time makes the cache follow what the backend reads now: a query
 nobody asks for anymore loses its entry and its subscription. Time to
@@ -273,7 +295,16 @@ is off by default because the engine keeps the entry fresh; an engine
 delta that replaces an entry restarts its clock. Both clocks, like the
 byte budget, end the subscription and bump the key's generation, so a
 fill in flight for an entry that just expired is dropped rather than
-kept without anything to update it.
+kept without anything to update it. A generation exists only while a
+read holds a reservation on its key (`Cache::reserve` returns one, and
+`fill` consumes it); a touch on a key nobody is filling has nothing to
+invalidate but the entry, so the map holds the keys in flight, not
+every key ever seen.
+
+Three reads never cache whatever the flags say: `FOR UPDATE` and its
+variants (the lock is the point, `Stats::locking`), a `WITH` whose
+expressions modify data, and a read whose Postgres read fails after
+the engine accepted it, which ends the subscription with the error.
 
 ## Routing: two flags, per query and per connection pool
 
@@ -315,12 +346,13 @@ The two routes can disagree for a moment, by design: between a commit
 and the engine's delta, a Postgres read sees the new row and a
 Streamgres read of the same query still sees the old one. A Postgres
 read is a bypass, not a write-through: it does not refresh the entry.
-Where that bites is one flow that writes and then reads. So after any
-write on a connection (`execute`, raw SQL, `INSERT ... RETURNING`, a
-transaction's COMMIT) that connection's reads go to Postgres for
-`STREAMGRES_READ_YOUR_WRITES_MS` (default 1000; 0 turns it off;
-`set_read_your_writes` per connection), counted in
-`Stats::after_write`. A read that must never be behind the database is
+Where that bites is one flow that writes and then reads, usually on
+two connections of the same pool. So after any write through a cache
+(`execute`, raw SQL, `INSERT ... RETURNING`, a transaction's COMMIT;
+not BEGIN, ROLLBACK, SAVEPOINT or SET) every read through that cache
+goes to Postgres for `STREAMGRES_READ_YOUR_WRITES_MS` (default 1000; 0
+turns it off; `set_read_your_writes` per connection sets the window,
+the clock is the cache's), counted in `Stats::after_write`. A read that must never be behind the database is
 flagged Postgres; everything else accepts being the engine's
 propagation delay behind, a fraction of a millisecond locally and the
 WAL lag in production.
