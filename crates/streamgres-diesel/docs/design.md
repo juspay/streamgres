@@ -1,10 +1,14 @@
 # streamgres_diesel: design notes
 
-Status: option A below is chosen and implemented end to end: the wrapper
-side (`cache`, `key`, `cursor`, `subscriptions`, `engine` modules) and
-the engine's S2S endpoint (`src/client/s2s.rs` on the engine's
-`feat/s2s-endpoint` branch, with the parser widened to the SQL Diesel
-renders). Option B is the later step.
+Status: both models below are implemented end to end and the client
+picks per query. B (the engine is the source) is the default: when every
+projected column has a type the client can encode exactly, the result
+comes from the engine's rows and every change replaces the entry in
+place with no Postgres read. A (the engine invalidates, Postgres
+refills) is the fallback for a query that projects a column the engine
+cannot reproduce exactly: a `numeric` (held as a float), a timestamp
+finer than milliseconds (held as milliseconds), `bytea`, ranges,
+composites. `EngineClient::fallbacks()` says why a query fell back.
 
 ## Where the wrapper sits
 
@@ -73,6 +77,31 @@ A ships in weeks and is correct for all types. B removes the read on every
 change and is the end state; A's cache, keys, subscription bookkeeping and
 reconnect logic carry over unchanged.
 
+## Rows mode (B), as implemented
+
+- Every subscribe asks for rows. `accepted` carries the hydrated result
+  with the table, its key columns, the projected columns and their output
+  names, the order and limit, and the rows as JSON objects of every
+  column. Each later transaction sends `delta` with the rows that entered
+  or changed and the keys of rows that left.
+- The client learns a table's exact column types once from
+  `pg_attribute` through the connection the read came in on
+  (`types.rs`), encodes each cell to Postgres's binary format
+  (`encode.rs`: integers by width, floats, text-like, UUID, JSON and
+  JSONB, dates, timestamps declared at millisecond precision or
+  coarser, user enums, one-dimensional arrays of those), and keeps the
+  result by primary key (`materialized.rs`), ordering it as the query
+  orders (Postgres defaults: ASC NULLs last, DESC NULLs first; strings
+  bytewise) and cutting it to the limit on each rebuild.
+- `COUNT(*)` is one `int8` row computed from the kept rows.
+- A reconnect resubscribes and the engine's snapshot refills the entry
+  with no Postgres read; the types are already known.
+- Known gaps: a column under a linguistic collation may order
+  differently from Postgres; the engine's timestamps are milliseconds,
+  so microsecond columns fall back to A until the engine carries
+  microseconds for S2S rows; joins are not shipped yet (assembly will
+  live in the library, as agreed).
+
 ## Contract with the engine (implemented)
 
 WebSocket at `{base}/s2s/v1`, JSON `[tag, body]` frames.
@@ -89,9 +118,12 @@ Upstream:
 
 Downstream:
 - `["hello", {"protocol": 1}]`, `["pong"]`.
-- `["accepted", {"id"}]` once the engine's rows for the query are
-  hydrated; the wrapper reads Postgres only after it, so every later
-  change is reported.
+- `["accepted", {"id", "table", "key", "columns", "names", "count", "order", "limit", "rows"}]`
+  once the engine's rows for the query are hydrated; in rows mode the
+  body is the result itself, otherwise the wrapper reads Postgres only
+  after it, so every later change is reported.
+- `["delta", {"id", "put": [rows], "del": [keys]}]` per transaction for
+  a rows-mode subscription.
 - `["refused", {"id", "reason"}]` for anything outside the subset (joins,
   `LIKE`, `OFFSET`, `DISTINCT`, unknown columns, too many rows); the read
   is served live. A refusal after acceptance means the engine stopped

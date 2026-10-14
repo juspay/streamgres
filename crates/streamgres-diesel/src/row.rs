@@ -23,11 +23,30 @@ use diesel::row::{Field, PartialRow, Row, RowIndex, RowSealed};
 /// The column names of one result set, shared by all its rows.
 pub type Columns = Arc<[String]>;
 
-/// One non-NULL value as Postgres sent it.
+/// One non-NULL value as Postgres sent it, or as encoded to the same
+/// format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedValue {
     type_oid: NonZeroU32,
     bytes: Box<[u8]>,
+}
+
+impl OwnedValue {
+    /// A value from bytes already in Postgres's binary format for `type_oid`.
+    pub fn new(type_oid: NonZeroU32, bytes: Vec<u8>) -> OwnedValue {
+        OwnedValue {
+            type_oid,
+            bytes: bytes.into_boxed_slice(),
+        }
+    }
+
+    pub fn type_oid(&self) -> NonZeroU32 {
+        self.type_oid
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// A row that owns its bytes. Cloning shares them: a cached row is handed
@@ -40,6 +59,16 @@ pub struct OwnedRow {
 }
 
 impl OwnedRow {
+    /// A row from values already in Postgres's binary format, one per
+    /// column of `columns`.
+    pub fn new(columns: Columns, values: Vec<Option<OwnedValue>>) -> OwnedRow {
+        debug_assert_eq!(columns.len(), values.len());
+        OwnedRow {
+            columns,
+            values: Arc::from(values),
+        }
+    }
+
     /// Copies a live row. The column list is taken from `columns` when one
     /// is given, so the rows of one result set share it; otherwise it is
     /// read off the row.

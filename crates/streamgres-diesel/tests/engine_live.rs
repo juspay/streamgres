@@ -113,6 +113,12 @@ impl Live {
     }
 }
 
+/// Changes the engine reported: touches (refill mode) plus replacements
+/// (rows mode).
+fn changes(cache: &Cache) -> u64 {
+    cache.stats.touched.load(Ordering::Relaxed) + cache.stats.replaced.load(Ordering::Relaxed)
+}
+
 impl Drop for Live {
     fn drop(&mut self) {
         let _ = diesel::delete(
@@ -139,8 +145,8 @@ fn a_commit_the_engine_reports_refills_the_cache() {
         .read_until("rate", "2", Duration::from_secs(10))
         .expect("the change reached the cache through the engine");
     eprintln!("commit to refilled read: {took:?}");
-    assert!(live.cache.stats.touched.load(Ordering::Relaxed) >= 1);
-    assert_eq!(live.engine.subscribed(), 1, "a touch keeps the subscription");
+    assert!(changes(&live.cache) >= 1);
+    assert_eq!(live.engine.subscribed(), 1, "a change keeps the subscription");
 
     // A delete is a change too.
     diesel::delete(sg_configs::table.filter(sg_configs::key.eq(live.key("rate"))))
@@ -289,10 +295,16 @@ fn an_engine_restart_is_survived_without_a_stale_read() {
         assert!(Instant::now() < deadline, "the client did not reconnect");
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(live.read("v").as_deref(), Some("2"), "no stale read after the restart");
+    // The change made while the socket was down reaches the cache: in
+    // rows mode the entry is refilled from the engine's snapshot and then
+    // its deltas, so the read is eventual by the engine's propagation.
+    let took = live
+        .read_until("v", "2", Duration::from_secs(10))
+        .expect("the change made during the restart was seen");
+    eprintln!("after restart, change seen within: {took:?}");
     assert_eq!(live.engine.subscribed(), 1, "resubscribed under the same key");
-    assert_eq!(live.cache.len(), 1, "the read after the restart was cached again");
-    let touched_before = live.cache.stats.touched.load(Ordering::Relaxed);
+    assert_eq!(live.cache.len(), 1, "the entry is back");
+    let changes_before = changes(&live.cache);
     let hits_before = live.cache.stats.hits.load(Ordering::Relaxed);
     assert_eq!(live.read("v").as_deref(), Some("2"));
     assert_eq!(live.cache.stats.hits.load(Ordering::Relaxed), hits_before + 1, "served from the cache");
@@ -304,7 +316,210 @@ fn an_engine_restart_is_survived_without_a_stale_read() {
         .expect("the change reached the cache through the resubscribed engine");
     eprintln!("after restart, commit to refilled read: {took:?}");
     assert!(
-        live.cache.stats.touched.load(Ordering::Relaxed) > touched_before,
-        "the refill came from a touch, not from a missing entry"
+        changes(&live.cache) > changes_before,
+        "the refill came from the engine, not from a missing entry"
     );
+}
+
+struct CountQueries(Arc<std::sync::atomic::AtomicUsize>);
+
+impl diesel::connection::Instrumentation for CountQueries {
+    fn on_connection_event(&mut self, event: diesel::connection::InstrumentationEvent<'_>) {
+        if let diesel::connection::InstrumentationEvent::StartQuery { .. } = event {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+#[test]
+fn rows_mode_reads_postgres_only_for_the_table_types() {
+    let Some(mut live) = Live::start("rows") else {
+        return;
+    };
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    live.conn.inner().set_instrumentation(CountQueries(sent.clone()));
+    live.put("r", "1");
+
+    assert_eq!(live.read("r").as_deref(), Some("1"));
+    assert_eq!(live.engine.materialized(), 1, "served from the engine's rows");
+    assert_eq!(
+        sent.load(Ordering::SeqCst),
+        1,
+        "the only statement Postgres saw was the column-type lookup, not the rows"
+    );
+    assert_eq!(live.read("r").as_deref(), Some("1"));
+
+    live.put("r", "2");
+    let took = live
+        .read_until("r", "2", Duration::from_secs(10))
+        .expect("the change arrived as rows");
+    eprintln!("ROWS MODE commit to replaced entry: {took:?}");
+    assert_eq!(sent.load(Ordering::SeqCst), 1, "no Postgres read for the change");
+    assert!(live.cache.stats.replaced.load(Ordering::Relaxed) >= 2);
+    assert_eq!(live.cache.stats.touched.load(Ordering::Relaxed), 0);
+
+    // A second query on the same table reuses the types: no lookup.
+    live.put("r2", "x");
+    assert_eq!(live.read("r2").as_deref(), Some("x"));
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    assert_eq!(live.engine.materialized(), 2);
+}
+
+#[test]
+fn ordered_limited_and_counted_results_match_postgres() {
+    let Some(mut live) = Live::start("order") else {
+        return;
+    };
+    for (name, value) in [("k1", "m"), ("k2", "z"), ("k3", "a"), ("k4", "q")] {
+        live.put(name, value);
+    }
+    let keys: Vec<String> = ["k1", "k2", "k3", "k4"].iter().map(|k| live.key(k)).collect();
+    let database = std::env::var("DATABASE_URL").unwrap();
+    let mut plain = PgConnection::establish(&database).unwrap();
+
+    let top = |conn: &mut SyncedConnection<PgConnection>, keys: &[String]| -> Vec<Config> {
+        sg_configs::table
+            .filter(sg_configs::key.eq_any(keys))
+            .order(sg_configs::value.desc())
+            .limit(2)
+            .select(Config::as_select())
+            .load(conn)
+            .expect("top")
+    };
+    let expected: Vec<Config> = sg_configs::table
+        .filter(sg_configs::key.eq_any(&keys))
+        .order(sg_configs::value.desc())
+        .limit(2)
+        .select(Config::as_select())
+        .load(&mut plain)
+        .unwrap();
+    assert_eq!(top(&mut live.conn, &keys), expected);
+    assert_eq!(live.engine.materialized(), 1);
+    assert_eq!(expected.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(), ["z", "q"]);
+
+    // A change that reorders the window.
+    live.put("k3", "zz");
+    let started = Instant::now();
+    loop {
+        let now = top(&mut live.conn, &keys);
+        if now.iter().map(|c| c.value.as_str()).collect::<Vec<_>>() == ["zz", "z"] {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "window never reordered: {now:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // A count.
+    let count = |conn: &mut SyncedConnection<PgConnection>| -> i64 {
+        sg_configs::table
+            .filter(sg_configs::key.eq_any(&keys))
+            .count()
+            .get_result(conn)
+            .expect("count")
+    };
+    assert_eq!(count(&mut live.conn), 4);
+    assert_eq!(live.engine.materialized(), 2);
+    diesel::delete(sg_configs::table.filter(sg_configs::key.eq(live.key("k1"))))
+        .execute(&mut live.other)
+        .unwrap();
+    let started = Instant::now();
+    while count(&mut live.conn) != 3 {
+        assert!(started.elapsed() < Duration::from_secs(10), "count never dropped");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+diesel::table! {
+    sg_items (id) {
+        id -> Int4,
+        name -> Text,
+        qty -> Int4,
+        note -> Nullable<Text>,
+        tags -> Array<Text>,
+        payload -> Jsonb,
+        created -> Timestamptz,
+    }
+}
+
+#[test]
+fn a_microsecond_timestamp_column_falls_back_to_refills() {
+    let Some(mut live) = Live::start("fallback") else {
+        return;
+    };
+    live.other
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS sg_items (
+                id serial PRIMARY KEY, name text NOT NULL, qty int NOT NULL, note text,
+                tags text[] NOT NULL DEFAULT '{}', payload jsonb NOT NULL DEFAULT '{}',
+                created timestamptz NOT NULL DEFAULT now())",
+        )
+        .unwrap();
+    let name = live.key("item");
+    diesel::delete(sg_items::table.filter(sg_items::name.eq(&name)))
+        .execute(&mut live.other)
+        .unwrap();
+    diesel::insert_into(sg_items::table)
+        .values((
+            sg_items::name.eq(&name),
+            sg_items::qty.eq(1),
+            sg_items::tags.eq(vec!["a", "b"]),
+            sg_items::payload.eq(serde_json::json!({"k": [1, 2]})),
+        ))
+        .execute(&mut live.other)
+        .unwrap();
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    live.conn.inner().set_instrumentation(CountQueries(sent.clone()));
+
+    // Projecting `created` (microsecond precision) cannot be served from
+    // engine rows: the read goes to Postgres and refills on touches.
+    let with_created = |conn: &mut SyncedConnection<PgConnection>| -> (i32, chrono::DateTime<chrono::Utc>) {
+        sg_items::table
+            .filter(sg_items::name.eq(&name))
+            .select((sg_items::qty, sg_items::created))
+            .first(conn)
+            .expect("with created")
+    };
+    let first = with_created(&mut live.conn);
+    assert_eq!(live.engine.materialized(), 0, "fell back to refills");
+    assert!(
+        live.engine.fallbacks().last().is_some_and(|why| why.contains("finer than milliseconds")),
+        "{:?}",
+        live.engine.fallbacks()
+    );
+    assert_eq!(live.engine.subscribed(), 1);
+    assert_eq!(sent.load(Ordering::SeqCst), 2, "the type lookup and the row read");
+    assert_eq!(with_created(&mut live.conn), first, "and cached");
+    assert_eq!(sent.load(Ordering::SeqCst), 2);
+
+    // Not projecting it: arrays and jsonb are encodable, so engine rows.
+    let without = |conn: &mut SyncedConnection<PgConnection>| -> (i32, Vec<String>, serde_json::Value) {
+        sg_items::table
+            .filter(sg_items::name.eq(&name))
+            .select((sg_items::qty, sg_items::tags, sg_items::payload))
+            .first(conn)
+            .expect("without created")
+    };
+    assert_eq!(without(&mut live.conn), (1, vec!["a".into(), "b".into()], serde_json::json!({"k": [1, 2]})));
+    assert_eq!(live.engine.materialized(), 1);
+    assert_eq!(sent.load(Ordering::SeqCst), 2, "no Postgres read for the rows-mode query");
+
+    diesel::update(sg_items::table.filter(sg_items::name.eq(&name)))
+        .set((sg_items::qty.eq(2), sg_items::tags.eq(vec!["c"])))
+        .execute(&mut live.other)
+        .unwrap();
+    let started = Instant::now();
+    loop {
+        let a = with_created(&mut live.conn).0;
+        let b = without(&mut live.conn);
+        if a == 2 && b.0 == 2 {
+            assert_eq!(b.1, vec!["c".to_string()]);
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "the update never arrived: {a} {b:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(sent.load(Ordering::SeqCst), 3, "one refill read for the fallback query, none for rows mode");
+    diesel::delete(sg_items::table.filter(sg_items::name.eq(&name)))
+        .execute(&mut live.other)
+        .unwrap();
 }

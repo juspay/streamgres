@@ -7,12 +7,14 @@ before.
 
 Current state: works end to end against a running engine. A read on an
 eventual connection outside a transaction is keyed by its SQL and bind
-bytes, subscribed with the engine over its S2S endpoint, read from
-Postgres once, and kept byte for byte until the engine reports it
-touched; locally a commit reaches the cache in 20 to 30 ms. Strong
-connections, transactions, writes and queries the engine refuses go to
-Postgres as before. An engine restart clears the cache and resubscribes.
-See `docs/design.md`.
+bytes and subscribed with the engine over its S2S endpoint. When every
+projected column has a type the client can encode exactly, the engine
+serves the rows and every change replaces the entry in place: no
+Postgres read, a commit lands in the cache in about 0.3 ms locally.
+Otherwise the rows are read from Postgres once and refilled when the
+engine reports a change. Strong connections, transactions, writes and
+queries the engine refuses go to Postgres as before. An engine restart
+resubscribes and refills. See `docs/design.md`.
 
 ## Using it
 

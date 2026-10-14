@@ -53,6 +53,8 @@ pub struct Stats {
     pub evicted: AtomicU64,
     /// Fills dropped because the key was touched during the read.
     pub stale_fills: AtomicU64,
+    /// Entries the engine's own rows replaced (rows mode).
+    pub replaced: AtomicU64,
 }
 
 impl Stats {
@@ -127,6 +129,15 @@ impl Cache {
         let entry = Entry::new(rows, &key);
         self.entries.insert(key, Arc::new(entry));
         true
+    }
+
+    /// The engine served the rows itself: store them whatever the
+    /// generation. Used by rows-mode subscriptions, whose entries are
+    /// never filled from a Postgres read.
+    pub fn replace(&self, key: &QueryKey, rows: Arc<[OwnedRow]>) {
+        Stats::bump(&self.stats.replaced);
+        let entry = Entry::new(rows, key);
+        self.entries.insert(key.clone(), Arc::new(entry));
     }
 
     /// The engine reported a change to the query's rows: drop them, so the

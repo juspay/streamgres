@@ -21,10 +21,14 @@
 //! - the engine accepted a subscription for the query
 //!   ([`subscriptions::Subscriptions`]).
 //!
-//! On a miss the query is subscribed first, then read from Postgres, and
-//! the rows are kept byte for byte ([`row::OwnedRow`]). When the engine
-//! reports the query touched, the rows are dropped and the next read
-//! refills them. Every other read goes to Postgres as before.
+//! On a miss the query is subscribed first. When the engine can serve
+//! the rows itself (every projected column has a type the client encodes
+//! exactly, see [`encode`]), the result comes from the engine, is kept as
+//! Diesel rows ([`materialized`]), and every later change replaces it in
+//! place; Postgres is never read for that query. Otherwise the rows are
+//! read from Postgres once and kept byte for byte ([`row::OwnedRow`]),
+//! and when the engine reports the query touched they are dropped and the
+//! next read refills them. Every other read goes to Postgres as before.
 //!
 //! # Why the opt-in feature
 //!
@@ -36,10 +40,13 @@
 
 pub mod cache;
 pub mod cursor;
+pub mod encode;
 pub mod engine;
 pub mod key;
+pub mod materialized;
 pub mod row;
 pub mod subscriptions;
+pub mod types;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
@@ -248,9 +255,17 @@ where
                 &entry.rows,
             ))));
         }
-        if let Verdict::Refused(_) = cache.subscriptions().subscribe(&key) {
-            cache.stats.refused.fetch_add(1, Ordering::Relaxed);
-            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+        match cache.subscriptions().subscribe(&key, &mut self.inner) {
+            Verdict::Refused(_) => {
+                cache.stats.refused.fetch_add(1, Ordering::Relaxed);
+                return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+            }
+            Verdict::Rows(rows) => {
+                // The engine's own rows: no Postgres read at all.
+                cache.replace(&key, Arc::clone(&rows));
+                return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
+            }
+            Verdict::Accepted => {}
         }
 
         // Subscribed: the engine reports every change from here on, so

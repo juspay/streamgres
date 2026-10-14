@@ -5,6 +5,16 @@
 //! and bind bytes and waits for the engine's `accepted` or `refused`; the
 //! engine's `touched` frames are turned into [`Cache::touched`] calls.
 //!
+//! Every subscription asks for the rows. When the engine's `accepted`
+//! carries them and every projected column has a type the client encodes
+//! exactly, the result is kept as a [`Materialized`] store and the
+//! engine's `delta` frames replace the cache entry in place: Postgres is
+//! never read for that query. When a column cannot be encoded (a
+//! `numeric`, a microsecond timestamp) the subscription falls back to
+//! touches: the cache reads Postgres and the engine's frames drop the
+//! entry. Which mode a key is in is the client's business; the cache sees
+//! `replace` or `touched`.
+//!
 //! The connection lives on its own thread with its own runtime, so the
 //! wrapper never needs an async context: a subscribe blocks the calling
 //! thread on a channel until the reply lands or the wait runs out. When
@@ -32,7 +42,9 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::cache::Cache;
 use crate::key::QueryKey;
+use crate::materialized::{Materialized, Snapshot};
 use crate::subscriptions::{Subscriptions, Verdict};
+use crate::types::{TableTypes, TypeLookup};
 
 /// How long a subscribe waits for the engine's verdict before the read is
 /// served live instead.
@@ -53,12 +65,28 @@ enum Outgoing {
     },
 }
 
+/// What the reader hands a waiting subscribe.
+enum Reply {
+    Verdict(Verdict),
+    /// Accepted with rows: the caller, which has a connection, builds the
+    /// store.
+    Snapshot(Snapshot),
+}
+
 struct State {
     next_id: u64,
     by_key: HashMap<QueryKey, u64>,
     by_id: HashMap<u64, QueryKey>,
     /// Subscribes waiting for a verdict, with where to deliver it.
-    pending: HashMap<u64, std::sync::mpsc::SyncSender<Verdict>>,
+    pending: HashMap<u64, std::sync::mpsc::SyncSender<Reply>>,
+    /// Subscriptions served from the engine's rows.
+    materialized: HashMap<u64, Materialized>,
+    /// Column types by table, learnt on the first rows-mode subscribe of
+    /// a table and reused for every delta and resubscribe after.
+    types: HashMap<String, Arc<TableTypes>>,
+    /// Why the latest subscriptions fell back from rows to refills, most
+    /// recent last, at most a few.
+    fallbacks: Vec<String>,
     connected: bool,
 }
 
@@ -96,11 +124,15 @@ impl EngineClient {
                 by_key: HashMap::new(),
                 by_id: HashMap::new(),
                 pending: HashMap::new(),
+                materialized: HashMap::new(),
+                types: HashMap::new(),
+                fallbacks: Vec::new(),
                 connected: false,
             }),
             cache: Mutex::new(None),
         });
-        let task_inner = Arc::clone(&inner);
+        let client = EngineClient { inner };
+        let task_client = client.clone();
         std::thread::Builder::new()
             .name("streamgres-engine-client".to_owned())
             .spawn(move || {
@@ -108,10 +140,10 @@ impl EngineClient {
                     .enable_all()
                     .build()
                     .expect("engine client runtime");
-                runtime.block_on(connection_loop(task_inner, outgoing_rx));
+                runtime.block_on(connection_loop(task_client, outgoing_rx));
             })
             .expect("engine client thread");
-        EngineClient { inner }
+        client
     }
 
     /// The cache whose entries this client's `touched` frames drop. Set
@@ -130,21 +162,44 @@ impl EngineClient {
     pub fn subscribed(&self) -> usize {
         self.inner.state.lock().expect("state").by_key.len()
     }
+
+    /// How many of them are served from the engine's rows rather than
+    /// refilled from Postgres.
+    pub fn materialized(&self) -> usize {
+        self.inner.state.lock().expect("state").materialized.len()
+    }
+
+    /// Why recent subscriptions fell back from rows to refills, oldest
+    /// first; the last few only.
+    pub fn fallbacks(&self) -> Vec<String> {
+        self.inner.state.lock().expect("state").fallbacks.clone()
+    }
+
+    fn fell_back(&self, reason: String) {
+        let mut state = self.inner.state.lock().expect("state");
+        if state.fallbacks.len() >= 8 {
+            state.fallbacks.remove(0);
+        }
+        state.fallbacks.push(reason);
+    }
 }
 
 impl Subscriptions for EngineClient {
-    fn subscribe(&self, key: &QueryKey) -> Verdict {
+    fn subscribe(&self, key: &QueryKey, lookup: &mut dyn TypeLookup) -> Verdict {
         let (reply, verdict) = std::sync::mpsc::sync_channel(1);
         let id = {
             let mut state = self.inner.state.lock().expect("state");
             if !state.connected {
                 return Verdict::Refused("the engine is not connected".to_string());
             }
-            if let Some(id) = state.by_key.get(key) {
-                // Already subscribed (a refill after a touch): nothing to
-                // ask the engine.
-                let _ = id;
-                return Verdict::Accepted;
+            if let Some(id) = state.by_key.get(key).copied() {
+                // Already subscribed (a refill after a touch, or a
+                // resubscribe the reader could not materialise without
+                // a connection): the rows if the store has them.
+                return match state.materialized.get(&id).map(Materialized::rows) {
+                    Some(Ok(rows)) => Verdict::Rows(rows),
+                    _ => Verdict::Accepted,
+                };
             }
             let id = state.next_id;
             state.next_id += 1;
@@ -167,7 +222,8 @@ impl Subscriptions for EngineClient {
             return Verdict::Refused("the engine client has stopped".to_string());
         }
         match verdict.recv_timeout(self.inner.verdict_timeout) {
-            Ok(verdict) => verdict,
+            Ok(Reply::Verdict(verdict)) => verdict,
+            Ok(Reply::Snapshot(snapshot)) => self.materialize(id, snapshot, Some(lookup)),
             Err(_) => {
                 self.forget(id);
                 let _ = self.inner.outgoing.send(Outgoing::Unsubscribe { id });
@@ -184,9 +240,69 @@ impl Subscriptions for EngineClient {
             };
             state.by_id.remove(&id);
             state.pending.remove(&id);
+            state.materialized.remove(&id);
             id
         };
         let _ = self.inner.outgoing.send(Outgoing::Unsubscribe { id });
+    }
+}
+
+impl EngineClient {
+    /// Builds the store for an accepted subscription from its snapshot.
+    /// The table's types come from `lookup`, or from what an earlier
+    /// subscribe learnt when there is no connection at hand (a
+    /// resubscribe). Falls back to touches when the rows cannot be
+    /// encoded or the types are not known.
+    fn materialize(&self, id: u64, snapshot: Snapshot, lookup: Option<&mut dyn TypeLookup>) -> Verdict {
+        let known = self
+            .inner
+            .state
+            .lock()
+            .expect("state")
+            .types
+            .get(&snapshot.table)
+            .cloned();
+        let types = match (known, lookup) {
+            (Some(types), _) => types,
+            (None, Some(lookup)) => match lookup.table_types(&snapshot.table) {
+                Ok(types) => {
+                    let types = Arc::new(types);
+                    self.inner
+                        .state
+                        .lock()
+                        .expect("state")
+                        .types
+                        .insert(snapshot.table.clone(), Arc::clone(&types));
+                    types
+                }
+                Err(error) => {
+                    self.fell_back(format!("types of `{}` unavailable: {error}", snapshot.table));
+                    return Verdict::Accepted;
+                }
+            },
+            (None, None) => return Verdict::Accepted,
+        };
+        match Materialized::new(snapshot, types) {
+            Ok(materialized) => match materialized.rows() {
+                Ok(rows) => {
+                    self.inner
+                        .state
+                        .lock()
+                        .expect("state")
+                        .materialized
+                        .insert(id, materialized);
+                    Verdict::Rows(rows)
+                }
+                Err(error) => {
+                    self.fell_back(error.0);
+                    Verdict::Accepted
+                }
+            },
+            Err(error) => {
+                self.fell_back(error.0);
+                Verdict::Accepted
+            }
+        }
     }
 }
 
@@ -197,6 +313,7 @@ impl EngineClient {
             state.by_key.remove(&key);
         }
         state.pending.remove(&id);
+        state.materialized.remove(&id);
     }
 }
 
@@ -208,7 +325,8 @@ fn bind_json(bind: &crate::key::Bind) -> Json {
 }
 
 /// Connects, serves, reconnects, forever.
-async fn connection_loop(inner: Arc<Inner>, mut outgoing: mpsc::UnboundedReceiver<Outgoing>) {
+async fn connection_loop(client: EngineClient, mut outgoing: mpsc::UnboundedReceiver<Outgoing>) {
+    let inner = &client.inner;
     let mut first = true;
     loop {
         if !first {
@@ -233,7 +351,7 @@ async fn connection_loop(inner: Arc<Inner>, mut outgoing: mpsc::UnboundedReceive
                 .collect()
         };
         if !resubscribe.is_empty() {
-            if let Some(cache) = cache_of(&inner) {
+            if let Some(cache) = cache_of(inner) {
                 cache.clear();
             }
             for (id, key) in resubscribe {
@@ -247,7 +365,7 @@ async fn connection_loop(inner: Arc<Inner>, mut outgoing: mpsc::UnboundedReceive
         loop {
             tokio::select! {
                 frame = stream.next() => match frame {
-                    Some(Ok(Message::Text(text))) => inbound(&inner, &text),
+                    Some(Ok(Message::Text(text))) => inbound(&client, &text),
                     Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => {}
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                 },
@@ -270,22 +388,25 @@ async fn connection_loop(inner: Arc<Inner>, mut outgoing: mpsc::UnboundedReceive
 
         // Down: every wait ends refused, and nothing is trusted until the
         // engine is back.
-        let pending: Vec<std::sync::mpsc::SyncSender<Verdict>> = {
+        let pending: Vec<std::sync::mpsc::SyncSender<Reply>> = {
             let mut state = inner.state.lock().expect("state");
             state.connected = false;
+            state.materialized.clear();
             state.pending.drain().map(|(_, reply)| reply).collect()
         };
         for reply in pending {
-            let _ = reply.try_send(Verdict::Refused("the engine connection dropped".to_string()));
+            let _ = reply.try_send(Reply::Verdict(Verdict::Refused(
+                "the engine connection dropped".to_string(),
+            )));
         }
-        if let Some(cache) = cache_of(&inner) {
+        if let Some(cache) = cache_of(inner) {
             cache.clear();
         }
     }
 }
 
 fn subscribe_frame(id: u64, sql: &str, binds: &[Json]) -> String {
-    json!(["subscribe", {"id": id, "sql": sql, "binds": binds}]).to_string()
+    json!(["subscribe", {"id": id, "sql": sql, "binds": binds, "rows": true}]).to_string()
 }
 
 fn cache_of(inner: &Inner) -> Option<Arc<Cache>> {
@@ -293,7 +414,8 @@ fn cache_of(inner: &Inner) -> Option<Arc<Cache>> {
 }
 
 /// One frame from the engine.
-fn inbound(inner: &Inner, text: &str) {
+fn inbound(client: &EngineClient, text: &str) {
+    let inner = &client.inner;
     let Ok(frame) = serde_json::from_str::<Json>(text) else {
         return;
     };
@@ -303,39 +425,94 @@ fn inbound(inner: &Inner, text: &str) {
     let tag = array.first().and_then(Json::as_str).unwrap_or("");
     let body = array.get(1).cloned().unwrap_or(Json::Null);
     match tag {
-        "accepted" | "refused" => {
+        "accepted" => {
             let Some(id) = body.get("id").and_then(Json::as_u64) else {
                 return;
             };
-            let verdict = if tag == "accepted" {
-                Verdict::Accepted
-            } else {
-                Verdict::Refused(
-                    body.get("reason")
-                        .and_then(Json::as_str)
-                        .unwrap_or("refused by the engine")
-                        .to_string(),
-                )
+            let snapshot = Snapshot::from_json(&body);
+            if snapshot.is_none() && body.get("rows").is_some() {
+                client.fell_back("the accepted frame was not understood".to_string());
+            }
+            let reply = inner.state.lock().expect("state").pending.remove(&id);
+            match (reply, snapshot) {
+                (Some(reply), Some(snapshot)) => {
+                    let _ = reply.try_send(Reply::Snapshot(snapshot));
+                }
+                (Some(reply), None) => {
+                    let _ = reply.try_send(Reply::Verdict(Verdict::Accepted));
+                }
+                (None, Some(snapshot)) => {
+                    // A resubscribe after a reconnect: no caller waits, so
+                    // the store is built from the types already known and
+                    // the cache refilled without a read.
+                    if let Verdict::Rows(rows) = client.materialize(id, snapshot, None) {
+                        let key = inner.state.lock().expect("state").by_id.get(&id).cloned();
+                        if let (Some(key), Some(cache)) = (key, cache_of(inner)) {
+                            cache.replace(&key, rows);
+                        }
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        "refused" => {
+            let Some(id) = body.get("id").and_then(Json::as_u64) else {
+                return;
             };
-            let reply = {
+            let reason = body
+                .get("reason")
+                .and_then(Json::as_str)
+                .unwrap_or("refused by the engine")
+                .to_string();
+            let (reply, key) = {
                 let mut state = inner.state.lock().expect("state");
                 let reply = state.pending.remove(&id);
-                if let Verdict::Refused(_) = verdict
-                    && let Some(key) = state.by_id.remove(&id)
-                {
-                    state.by_key.remove(&key);
-                    // A refusal after acceptance (the engine stopped
-                    // following the query): the cache must not serve it.
-                    if reply.is_none()
-                        && let Some(cache) = cache_of(inner)
-                    {
+                state.materialized.remove(&id);
+                let key = state.by_id.remove(&id);
+                if let Some(key) = &key {
+                    state.by_key.remove(key);
+                }
+                (reply, key)
+            };
+            match reply {
+                Some(reply) => {
+                    let _ = reply.try_send(Reply::Verdict(Verdict::Refused(reason)));
+                }
+                // A refusal after acceptance (the engine stopped following
+                // the query): the cache must not serve it.
+                None => {
+                    if let (Some(key), Some(cache)) = (key, cache_of(inner)) {
                         cache.touched(&key);
                     }
                 }
-                reply
+            }
+        }
+        "delta" => {
+            let Some(id) = body.get("id").and_then(Json::as_u64) else {
+                return;
             };
-            if let Some(reply) = reply {
-                let _ = reply.try_send(verdict);
+            let outcome = {
+                let mut state = inner.state.lock().expect("state");
+                let key = state.by_id.get(&id).cloned();
+                match (key, state.materialized.get_mut(&id)) {
+                    (Some(key), Some(materialized)) => {
+                        for row in body.get("del").and_then(Json::as_array).into_iter().flatten() {
+                            materialized.del(row);
+                        }
+                        for row in body.get("put").and_then(Json::as_array).into_iter().flatten() {
+                            materialized.put(row.clone());
+                        }
+                        Some((key, materialized.rows().ok()))
+                    }
+                    (Some(key), None) => Some((key, None)),
+                    (None, _) => None,
+                }
+            };
+            if let (Some((key, rows)), Some(cache)) = (outcome, cache_of(inner)) {
+                match rows {
+                    Some(rows) => cache.replace(&key, rows),
+                    None => cache.touched(&key),
+                }
             }
         }
         "touched" => {

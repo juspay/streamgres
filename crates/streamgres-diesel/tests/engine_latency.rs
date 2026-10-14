@@ -130,6 +130,8 @@ fn commit_to_refilled_read_latency() {
         at(&with_write, 0.9),
         with_write[with_write.len() - 1],
     );
-    assert!(cache.stats.touched.load(Ordering::Relaxed) as usize >= samples);
+    let changes = cache.stats.touched.load(Ordering::Relaxed) + cache.stats.replaced.load(Ordering::Relaxed);
+    eprintln!("LATENCY mode: {}", if engine.materialized() == 1 { "rows (no Postgres read per change)" } else { "refill" });
+    assert!(changes as usize >= samples);
     assert_eq!(engine.subscribed(), 1);
 }

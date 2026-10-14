@@ -43,7 +43,7 @@ struct FakeEngine {
 }
 
 impl Subscriptions for FakeEngine {
-    fn subscribe(&self, key: &QueryKey) -> Verdict {
+    fn subscribe(&self, key: &QueryKey, _: &mut dyn streamgres_diesel::types::TypeLookup) -> Verdict {
         if self.refuse_all.load(Ordering::SeqCst) || !key.sql.contains("sg_configs") {
             return Verdict::Refused("not a config read".into());
         }
