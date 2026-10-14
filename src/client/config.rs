@@ -125,7 +125,7 @@ pub struct Config {
     /// accepted (16 MiB).
     pub max_message_bytes: usize,
     /// `STREAMGRES_BYTES_PER_PART`: how many bytes of serialized row
-    /// operations one poke part carries at most (51200, i.e. 50 KiB).
+    /// operations one poke part carries at most (768000, i.e. 750 KiB).
     pub bytes_per_part: usize,
     /// `STREAMGRES_ROW_LIMIT`: the most rows the server reads into memory
     /// at once (100000), one number for the planner and the storage: the
@@ -378,7 +378,7 @@ impl Config {
                 Some(text) => text.parse().map_err(|_| {
                     format!("STREAMGRES_BYTES_PER_PART must be a number of bytes, got `{text}`")
                 })?,
-                None => 50 * 1024,
+                None => 750 * 1024,
             },
             row_limit,
             join_preferred_side,
