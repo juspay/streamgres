@@ -82,10 +82,7 @@ impl Snapshot {
                 Some(NodeSnapshot {
                     table: node.get("table")?.as_str()?.to_owned(),
                     key: strings(node.get("key"))?,
-                    parent: node
-                        .get("parent")
-                        .and_then(Json::as_str)
-                        .map(str::to_owned),
+                    parent: node.get("parent").and_then(Json::as_str).map(str::to_owned),
                     parent_column: node
                         .get("parent_column")
                         .and_then(Json::as_str)
@@ -206,10 +203,9 @@ impl Materialized {
                 .ok_or_else(|| Unsupported(format!("`{table}` is not a table of the query")))
         };
         for node in &snapshot.nodes {
-            let node_types = types
-                .get(&node.table)
-                .cloned()
-                .ok_or_else(|| Unsupported(format!("the types of `{}` are not known", node.table)))?;
+            let node_types = types.get(&node.table).cloned().ok_or_else(|| {
+                Unsupported(format!("the types of `{}` are not known", node.table))
+            })?;
             let column = |name: &str| -> Result<usize, Unsupported> {
                 node_types
                     .column(name)
@@ -229,29 +225,34 @@ impl Materialized {
             if key.is_empty() {
                 return Err(Unsupported(format!("`{}` has no primary key", node.table)));
             }
-            let (parent, parent_column, child_column) = match (&node.parent, &node.parent_column, &node.child_column) {
-                (Some(parent), Some(parent_column), Some(child_column)) => {
-                    let parent = node_index(&nodes, parent)?;
-                    let parent_column = nodes[parent]
-                        .types
-                        .column(parent_column)
-                        .map(|(index, _)| index)
-                        .ok_or_else(|| {
-                            Unsupported(format!(
-                                "join column `{parent_column}` is not in the types of `{}`",
-                                nodes[parent].table
-                            ))
-                        })?;
-                    (Some(parent), Some(parent_column), Some(column(child_column)?))
-                }
-                (None, _, _) if nodes.is_empty() => (None, None, None),
-                _ => {
-                    return Err(Unsupported(format!(
-                        "`{}` has no join to a parent table",
-                        node.table
-                    )));
-                }
-            };
+            let (parent, parent_column, child_column) =
+                match (&node.parent, &node.parent_column, &node.child_column) {
+                    (Some(parent), Some(parent_column), Some(child_column)) => {
+                        let parent = node_index(&nodes, parent)?;
+                        let parent_column = nodes[parent]
+                            .types
+                            .column(parent_column)
+                            .map(|(index, _)| index)
+                            .ok_or_else(|| {
+                                Unsupported(format!(
+                                    "join column `{parent_column}` is not in the types of `{}`",
+                                    nodes[parent].table
+                                ))
+                            })?;
+                        (
+                            Some(parent),
+                            Some(parent_column),
+                            Some(column(child_column)?),
+                        )
+                    }
+                    (None, _, _) if nodes.is_empty() => (None, None, None),
+                    _ => {
+                        return Err(Unsupported(format!(
+                            "`{}` has no join to a parent table",
+                            node.table
+                        )));
+                    }
+                };
             let index = nodes.len();
             if let Some(parent) = parent {
                 nodes[parent].children.push(index);
@@ -276,7 +277,9 @@ impl Materialized {
                 root.types
                     .column(name)
                     .map(|(index, _)| (index, *ascending))
-                    .ok_or_else(|| Unsupported(format!("order column `{name}` is not in the root's types")))
+                    .ok_or_else(|| {
+                        Unsupported(format!("order column `{name}` is not in the root's types"))
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
 
@@ -298,7 +301,9 @@ impl Materialized {
                             .column(name)
                             .map(|(index, _)| index)
                             .ok_or_else(|| {
-                                Unsupported(format!("column `{name}` is not in the types of `{table}`"))
+                                Unsupported(format!(
+                                    "column `{name}` is not in the types of `{table}`"
+                                ))
                             })?;
                         Ok((node, column))
                     })
@@ -359,7 +364,12 @@ impl Materialized {
     pub fn byte_len(&self) -> usize {
         self.nodes
             .iter()
-            .map(|node| node.rows.iter().map(|(key, row)| key.len() + json_bytes(row)).sum::<usize>())
+            .map(|node| {
+                node.rows
+                    .iter()
+                    .map(|(key, row)| key.len() + json_bytes(row))
+                    .sum::<usize>()
+            })
             .sum()
     }
 
@@ -410,7 +420,9 @@ impl Materialized {
                     .map(|&(node, column)| {
                         let column = &self.nodes[node].types.columns[column];
                         match combo[node] {
-                            Some(row) => encode(row.get(&column.name).unwrap_or(&Json::Null), column),
+                            Some(row) => {
+                                encode(row.get(&column.name).unwrap_or(&Json::Null), column)
+                            }
                             None => Ok(None),
                         }
                     })
@@ -494,7 +506,9 @@ impl Materialized {
         partial[0][node] = Some(row);
         for &child in &self.nodes[node].children {
             let child_node = &self.nodes[child];
-            let parent_column = child_node.parent_column.expect("a child has a parent column");
+            let parent_column = child_node
+                .parent_column
+                .expect("a child has a parent column");
             let value = row.get(&self.nodes[node].types.columns[parent_column].name);
             let matches: &[&Json] = match value {
                 Some(value) if !value.is_null() => by_value[child]
@@ -540,7 +554,12 @@ fn json_bytes(value: &Json) -> usize {
         Json::Null | Json::Bool(_) | Json::Number(_) => NODE,
         Json::String(s) => NODE + s.len(),
         Json::Array(items) => NODE + items.iter().map(json_bytes).sum::<usize>(),
-        Json::Object(fields) => NODE + fields.iter().map(|(k, v)| k.len() + NODE + json_bytes(v)).sum::<usize>(),
+        Json::Object(fields) => {
+            NODE + fields
+                .iter()
+                .map(|(k, v)| k.len() + NODE + json_bytes(v))
+                .sum::<usize>()
+        }
     }
 }
 
@@ -555,10 +574,18 @@ fn compare(a: Option<&Json>, b: Option<&Json>, ascending: bool) -> Ordering {
         // NULLs last ascending, first descending: the reversal below
         // applies to them as it does to values.
         (None, Some(_)) => {
-            if ascending { Ordering::Greater } else { Ordering::Less }
+            if ascending {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
         }
         (Some(_), None) => {
-            if ascending { Ordering::Less } else { Ordering::Greater }
+            if ascending {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
         }
         (Some(a), Some(b)) => {
             let natural = match (a, b) {
@@ -573,7 +600,11 @@ fn compare(a: Option<&Json>, b: Option<&Json>, ascending: bool) -> Ordering {
                 (Json::Bool(x), Json::Bool(y)) => x.cmp(y),
                 (x, y) => x.to_string().cmp(&y.to_string()),
             };
-            if ascending { natural } else { natural.reverse() }
+            if ascending {
+                natural
+            } else {
+                natural.reverse()
+            }
         }
     }
 }
@@ -631,7 +662,14 @@ mod tests {
         }
     }
 
-    fn child(table: &str, parent: &str, parent_column: &str, child_column: &str, inner: bool, rows: Vec<Json>) -> NodeSnapshot {
+    fn child(
+        table: &str,
+        parent: &str,
+        parent_column: &str,
+        child_column: &str,
+        inner: bool,
+        rows: Vec<Json>,
+    ) -> NodeSnapshot {
         NodeSnapshot {
             table: table.into(),
             key: vec!["id".into()],
@@ -657,7 +695,9 @@ mod tests {
 
     fn decoded(rows: &Arc<[OwnedRow]>) -> Vec<(i32, String)> {
         rows.iter()
-            .map(|row| <(i32, String) as FromSqlRow<(Integer, Text), Pg>>::build_from_row(row).unwrap())
+            .map(|row| {
+                <(i32, String) as FromSqlRow<(Integer, Text), Pg>>::build_from_row(row).unwrap()
+            })
             .collect()
     }
 
@@ -676,7 +716,10 @@ mod tests {
         snap.offset = 1;
         let store = Materialized::new(snap, &types()).unwrap();
         let rows = store.rows().unwrap();
-        let ids: Vec<i32> = rows.iter().map(|row| i32::from_be_bytes(row.value(0).unwrap().bytes().try_into().unwrap())).collect();
+        let ids: Vec<i32> = rows
+            .iter()
+            .map(|row| i32::from_be_bytes(row.value(0).unwrap().bytes().try_into().unwrap()))
+            .collect();
         assert_eq!(ids, vec![2, 3], "skipped one, took two");
     }
 
@@ -692,7 +735,11 @@ mod tests {
             Some(2),
         );
         let m = Materialized::new(snap, &types()).unwrap();
-        assert_eq!(decoded(&m.rows().unwrap()), vec![(3, "c".into()), (1, "b".into())], "NULL rank last, cut to 2");
+        assert_eq!(
+            decoded(&m.rows().unwrap()),
+            vec![(3, "c".into()), (1, "b".into())],
+            "NULL rank last, cut to 2"
+        );
     }
 
     #[test]
@@ -720,13 +767,23 @@ mod tests {
         let mut m = Materialized::new(snap, &types()).unwrap();
         let one = m.byte_len();
         assert!(one > 0);
-        m.put("t", json!({"id": 2, "name": "a much longer name than before", "rank": 1}));
-        assert!(m.byte_len() > one * 2 - 16, "a second, longer row weighs more");
+        m.put(
+            "t",
+            json!({"id": 2, "name": "a much longer name than before", "rank": 1}),
+        );
+        assert!(
+            m.byte_len() > one * 2 - 16,
+            "a second, longer row weighs more"
+        );
     }
 
     #[test]
     fn child_rows_come_out_in_numeric_key_order() {
-        let mut snap = snapshot(vec![json!({"id": 1, "name": "a", "rank": 1})], vec![("id", true)], None);
+        let mut snap = snapshot(
+            vec![json!({"id": 1, "name": "a", "rank": 1})],
+            vec![("id", true)],
+            None,
+        );
         snap.nodes.push(NodeSnapshot {
             table: "books".to_string(),
             key: vec!["id".to_string()],
@@ -740,7 +797,10 @@ mod tests {
                 json!({"id": 100, "author_id": 1, "title": "hundred"}),
             ],
         });
-        snap.columns = Some(vec![("t".to_string(), "id".to_string()), ("books".to_string(), "title".to_string())]);
+        snap.columns = Some(vec![
+            ("t".to_string(), "id".to_string()),
+            ("books".to_string(), "title".to_string()),
+        ]);
         snap.names = None;
         let m = Materialized::new(snap, &types()).unwrap();
         assert_eq!(
@@ -753,16 +813,25 @@ mod tests {
     #[test]
     fn deltas_change_the_result() {
         let snap = snapshot(
-            vec![json!({"id": 1, "name": "b", "rank": 2}), json!({"id": 2, "name": "a", "rank": 1})],
+            vec![
+                json!({"id": 1, "name": "b", "rank": 2}),
+                json!({"id": 2, "name": "a", "rank": 1}),
+            ],
             vec![("name", false)],
             None,
         );
         let mut m = Materialized::new(snap, &types()).unwrap();
-        assert_eq!(decoded(&m.rows().unwrap()), vec![(1, "b".into()), (2, "a".into())]);
+        assert_eq!(
+            decoded(&m.rows().unwrap()),
+            vec![(1, "b".into()), (2, "a".into())]
+        );
         m.put("t", json!({"id": 1, "name": "z", "rank": 2}));
         m.put("t", json!({"id": 3, "name": "m", "rank": 0}));
         m.del("t", &json!({"id": 2}));
-        assert_eq!(decoded(&m.rows().unwrap()), vec![(1, "z".into()), (3, "m".into())]);
+        assert_eq!(
+            decoded(&m.rows().unwrap()),
+            vec![(1, "z".into()), (3, "m".into())]
+        );
         assert_eq!(m.len(), 2);
     }
 
@@ -784,10 +853,16 @@ mod tests {
         with_created.columns.push(base("created", 1186));
         t.insert("t".into(), Arc::new(with_created));
         let mut snap = snapshot(vec![], vec![], None);
-        snap.columns = Some(vec![("t".into(), "id".into()), ("t".into(), "created".into())]);
+        snap.columns = Some(vec![
+            ("t".into(), "id".into()),
+            ("t".into(), "created".into()),
+        ]);
         assert!(Materialized::new(snap.clone(), &t).is_err());
         snap.columns = Some(vec![("t".into(), "id".into())]);
-        assert!(Materialized::new(snap, &t).is_ok(), "unprojected columns do not matter");
+        assert!(
+            Materialized::new(snap, &t).is_ok(),
+            "unprojected columns do not matter"
+        );
     }
 
     #[test]
@@ -807,19 +882,37 @@ mod tests {
         };
         let m = Materialized::new(snap, &types()).unwrap();
         let rows = m.rows().unwrap();
-        assert_eq!(Named::build(&rows[0]).unwrap(), Named { n: "x".into(), i: 4 });
-        assert_eq!(rows[0].columns().iter().map(String::as_str).collect::<Vec<_>>(), ["n", "i"]);
+        assert_eq!(
+            Named::build(&rows[0]).unwrap(),
+            Named {
+                n: "x".into(),
+                i: 4
+            }
+        );
+        assert_eq!(
+            rows[0]
+                .columns()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["n", "i"]
+        );
     }
 
     #[test]
     fn a_nullable_projection_decodes() {
         let snap = Snapshot {
             columns: Some(vec![("t".into(), "rank".into())]),
-            ..snapshot(vec![json!({"id": 1, "name": "x", "rank": null})], vec![], None)
+            ..snapshot(
+                vec![json!({"id": 1, "name": "x", "rank": null})],
+                vec![],
+                None,
+            )
         };
         let m = Materialized::new(snap, &types()).unwrap();
         let rows = m.rows().unwrap();
-        let rank = <Option<i32> as FromSqlRow<Nullable<Integer>, Pg>>::build_from_row(&rows[0]).unwrap();
+        let rank =
+            <Option<i32> as FromSqlRow<Nullable<Integer>, Pg>>::build_from_row(&rows[0]).unwrap();
         assert_eq!(rank, None);
     }
 
@@ -853,7 +946,10 @@ mod tests {
                     ],
                 ),
             ],
-            columns: Some(vec![("t".into(), "name".into()), ("books".into(), "title".into())]),
+            columns: Some(vec![
+                ("t".into(), "name".into()),
+                ("books".into(), "title".into()),
+            ]),
             names: None,
             count: false,
             order: vec![("id".into(), true)],
@@ -904,7 +1000,11 @@ mod tests {
             ]
         );
         m.del("t", &json!({"id": 1}));
-        assert_eq!(joined(&m.rows().unwrap()).len(), 2, "the parent left, its books are orphans");
+        assert_eq!(
+            joined(&m.rows().unwrap()).len(),
+            2,
+            "the parent left, its books are orphans"
+        );
     }
 
     #[test]
@@ -922,20 +1022,32 @@ mod tests {
                 json!({"id": 102, "book_id": 12, "stars": 4}),
             ],
         ));
-        snap.columns = Some(vec![("t".into(), "name".into()), ("reviews".into(), "stars".into())]);
+        snap.columns = Some(vec![
+            ("t".into(), "name".into()),
+            ("reviews".into(), "stars".into()),
+        ]);
         let m = Materialized::new(snap.clone(), &types()).unwrap();
         let rows: Vec<(String, i32)> = m
             .rows()
             .unwrap()
             .iter()
-            .map(|row| <(String, i32) as FromSqlRow<(Text, Integer), Pg>>::build_from_row(row).unwrap())
+            .map(|row| {
+                <(String, i32) as FromSqlRow<(Text, Integer), Pg>>::build_from_row(row).unwrap()
+            })
             .collect();
-        assert_eq!(rows, vec![("ann".into(), 5), ("ann".into(), 3), ("cy".into(), 4)], "a2 has no reviews, so it is gone");
+        assert_eq!(
+            rows,
+            vec![("ann".into(), 5), ("ann".into(), 3), ("cy".into(), 4)],
+            "a2 has no reviews, so it is gone"
+        );
 
         snap.count = true;
         snap.columns = None;
         let m = Materialized::new(snap, &types()).unwrap();
         let rows = m.rows().unwrap();
-        assert_eq!(<i64 as FromSqlRow<BigInt, Pg>>::build_from_row(&rows[0]).unwrap(), 3);
+        assert_eq!(
+            <i64 as FromSqlRow<BigInt, Pg>>::build_from_row(&rows[0]).unwrap(),
+            3
+        );
     }
 }

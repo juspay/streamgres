@@ -65,24 +65,40 @@ impl Stack {
     /// come up in the background; reads before that go live.
     pub async fn connect(database_url: &str, s2s_url: &str) -> Result<Stack, String> {
         let engine = EngineClient::connect(s2s_url);
-        let cache = Arc::new(Cache::with_limits(Limits::from_env(), Arc::new(engine.clone())));
+        let cache = Arc::new(Cache::with_limits(
+            Limits::from_env(),
+            Arc::new(engine.clone()),
+        ));
         engine.attach(&cache);
         install_settings(&cache);
 
         let pool = |name: &str| {
-            let manager = AsyncDieselConnectionManager::<AsyncConn>::new(pool_url(database_url, name));
-            Pool::builder().max_size(16).connection_timeout(Duration::from_secs(10)).build(manager)
+            let manager =
+                AsyncDieselConnectionManager::<AsyncConn>::new(pool_url(database_url, name));
+            Pool::builder()
+                .max_size(16)
+                .connection_timeout(Duration::from_secs(10))
+                .build(manager)
         };
-        let main = pool("main").await.map_err(|error| format!("main pool: {error}"))?;
-        let reporting = pool("reporting").await.map_err(|error| format!("reporting pool: {error}"))?;
+        let main = pool("main")
+            .await
+            .map_err(|error| format!("main pool: {error}"))?;
+        let reporting = pool("reporting")
+            .await
+            .map_err(|error| format!("reporting pool: {error}"))?;
         let plain = Pool::builder()
             .max_size(4)
-            .build(AsyncDieselConnectionManager::<AsyncPgConnection>::new(pool_url(database_url, "plain")))
+            .build(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+                pool_url(database_url, "plain"),
+            ))
             .await
             .map_err(|error| format!("plain pool: {error}"))?;
         let sync = SyncPool::builder()
             .max_size(4)
-            .build(ConnectionManager::<SyncConn>::new(pool_url(database_url, "sync")))
+            .build(ConnectionManager::<SyncConn>::new(pool_url(
+                database_url,
+                "sync",
+            )))
             .map_err(|error| format!("sync pool: {error}"))?;
         Ok(Stack {
             cache,

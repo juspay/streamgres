@@ -38,7 +38,10 @@ pub enum Verdict {
     /// change will replace the cache's entry. No Postgres read.
     /// `store_bytes` is what the engine side keeps for the query, so
     /// the cache can weigh it.
-    Rows { rows: Arc<[OwnedRow]>, store_bytes: usize },
+    Rows {
+        rows: Arc<[OwnedRow]>,
+        store_bytes: usize,
+    },
     /// The engine cannot follow this query; the read goes to Postgres and
     /// is not cached. The reason is for logs and stats.
     Refused(String),
@@ -50,7 +53,10 @@ pub enum Outcome {
     /// The engine ships rows, and `missing` are the tables whose column
     /// types the engine side does not know yet. Look them up and call
     /// [`Subscriptions::materialize`].
-    NeedsTypes { snapshot: Snapshot, missing: Vec<String> },
+    NeedsTypes {
+        snapshot: Snapshot,
+        missing: Vec<String>,
+    },
 }
 
 /// What the cache needs from the engine.
@@ -63,7 +69,12 @@ pub trait Subscriptions: Send + Sync {
     /// Finishes an [`Outcome::NeedsTypes`]: `types` are the column types
     /// of the missing tables (a table left out falls the query back to
     /// refills). Pure computation, no I/O.
-    fn materialize(&self, key: &QueryKey, snapshot: Snapshot, types: HashMap<String, Arc<TableTypes>>) -> Verdict;
+    fn materialize(
+        &self,
+        key: &QueryKey,
+        snapshot: Snapshot,
+        types: HashMap<String, Arc<TableTypes>>,
+    ) -> Verdict;
 
     /// The cache dropped the entry for good (evicted for size or age), so
     /// the engine need not follow the query any more.
@@ -109,7 +120,12 @@ impl Subscriptions for Unsynced {
         Outcome::Verdict(Verdict::Refused("no engine".to_string()))
     }
 
-    fn materialize(&self, _: &QueryKey, _: Snapshot, _: HashMap<String, Arc<TableTypes>>) -> Verdict {
+    fn materialize(
+        &self,
+        _: &QueryKey,
+        _: Snapshot,
+        _: HashMap<String, Arc<TableTypes>>,
+    ) -> Verdict {
         Verdict::Refused("no engine".to_string())
     }
 

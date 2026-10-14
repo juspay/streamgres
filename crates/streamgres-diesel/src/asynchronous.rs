@@ -52,16 +52,18 @@ use diesel::QueryableByName;
 use diesel::connection::Instrumentation;
 use diesel::deserialize::FromSqlRow;
 use diesel::pg::{
-    FailedToLookupTypeError, Pg, PgMetadataCache, PgMetadataCacheKey, PgMetadataLookup, PgTypeMetadata,
+    FailedToLookupTypeError, Pg, PgMetadataCache, PgMetadataCacheKey, PgMetadataLookup,
+    PgTypeMetadata,
 };
 use diesel::query_builder::{AsQuery, QueryFragment, QueryId};
+use diesel::result::Error;
 use diesel::sql_query;
 use diesel::sql_types::{Oid, Text, Untyped};
-use diesel::result::Error;
 use diesel::{ConnectionResult, QueryResult};
 use diesel_async::pooled_connection::PoolableConnection;
 use diesel_async::{
-    AnsiTransactionManager, AsyncConnection, AsyncPgConnection, CacheSize, SimpleAsyncConnection, TransactionManager,
+    AnsiTransactionManager, AsyncConnection, AsyncPgConnection, CacheSize, SimpleAsyncConnection,
+    TransactionManager,
 };
 use futures_util::future::{BoxFuture, FutureExt, TryFutureExt};
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -192,7 +194,10 @@ impl AsyncSyncedConnection {
     /// Marks the write now, and again when `future` completes: a read
     /// issued after the write's future resolves is what the window is
     /// for, and the clock should start as late as the write did.
-    fn written<'a, T: Send + 'a>(&mut self, future: BoxFuture<'a, QueryResult<T>>) -> BoxFuture<'a, QueryResult<T>> {
+    fn written<'a, T: Send + 'a>(
+        &mut self,
+        future: BoxFuture<'a, QueryResult<T>>,
+    ) -> BoxFuture<'a, QueryResult<T>> {
         let cache = self.cache.clone();
         if let Some(cache) = &cache {
             cache.mark_write();
@@ -210,7 +215,10 @@ impl AsyncSyncedConnection {
     }
 
     /// A read future with the in-flight token attached.
-    fn tracked<'a, T: Send + 'a>(&self, future: BoxFuture<'a, QueryResult<T>>) -> BoxFuture<'a, QueryResult<T>> {
+    fn tracked<'a, T: Send + 'a>(
+        &self,
+        future: BoxFuture<'a, QueryResult<T>>,
+    ) -> BoxFuture<'a, QueryResult<T>> {
         let token = Arc::clone(&self.inflight);
         async move {
             let _pending = token;
@@ -236,7 +244,10 @@ impl AsyncSyncedConnection {
     /// whose OIDs are not known yet. A query that cannot be rendered
     /// until those are known (an array of an enum, whose element OID
     /// goes into the bind) has no key yet: `Ok((None, unknown))`.
-    fn key_of<T: QueryFragment<Pg>>(&mut self, query: &T) -> QueryResult<(Option<QueryKey>, Vec<TypeName>)> {
+    fn key_of<T: QueryFragment<Pg>>(
+        &mut self,
+        query: &T,
+    ) -> QueryResult<(Option<QueryKey>, Vec<TypeName>)> {
         let mut lookup = Lookup {
             cache: Arc::clone(&self.metadata),
             unknown: Vec::new(),
@@ -252,7 +263,9 @@ impl AsyncSyncedConnection {
         }
     }
 
-    fn live_stream<'a>(stream: BoxStream<'a, QueryResult<PgRow>>) -> BoxStream<'a, QueryResult<AsyncSyncedRow>> {
+    fn live_stream<'a>(
+        stream: BoxStream<'a, QueryResult<PgRow>>,
+    ) -> BoxStream<'a, QueryResult<AsyncSyncedRow>> {
         stream.map_ok(SyncedRow::Live).boxed()
     }
 
@@ -262,8 +275,15 @@ impl AsyncSyncedConnection {
 
     /// The live read, with every unknown type resolved first and
     /// remembered for the next read.
-    fn resolving<'query>(&mut self, unknown: Vec<TypeName>, live: LoadFuture<'query>) -> LoadFuture<'query> {
-        let resolvers: Vec<LoadFuture<'query>> = unknown.iter().map(|name| self.inner.load(type_oids_query(name))).collect();
+    fn resolving<'query>(
+        &mut self,
+        unknown: Vec<TypeName>,
+        live: LoadFuture<'query>,
+    ) -> LoadFuture<'query> {
+        let resolvers: Vec<LoadFuture<'query>> = unknown
+            .iter()
+            .map(|name| self.inner.load(type_oids_query(name)))
+            .collect();
         let metadata = Arc::clone(&self.metadata);
         async move {
             for (name, resolver) in unknown.into_iter().zip(resolvers) {
@@ -292,7 +312,10 @@ struct TypeName {
 
 impl TypeName {
     fn key(&self) -> PgMetadataCacheKey<'static> {
-        PgMetadataCacheKey::new(self.schema.clone().map(Cow::Owned), Cow::Owned(self.name.clone()))
+        PgMetadataCacheKey::new(
+            self.schema.clone().map(Cow::Owned),
+            Cow::Owned(self.name.clone()),
+        )
     }
 }
 
@@ -339,7 +362,9 @@ struct TypeOids {
 }
 
 /// Diesel's own resolution of a type name, as a query.
-fn type_oids_query(name: &TypeName) -> diesel::query_builder::BoxedSqlQuery<'static, Pg, diesel::query_builder::SqlQuery> {
+fn type_oids_query(
+    name: &TypeName,
+) -> diesel::query_builder::BoxedSqlQuery<'static, Pg, diesel::query_builder::SqlQuery> {
     match &name.schema {
         Some(schema) => sql_query(
             "SELECT t.oid, t.typarray FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
@@ -348,21 +373,29 @@ fn type_oids_query(name: &TypeName) -> diesel::query_builder::BoxedSqlQuery<'sta
         .into_boxed()
         .bind::<Text, _>(name.name.clone())
         .bind::<Text, _>(schema.clone()),
-        None => sql_query("SELECT oid, typarray FROM pg_type WHERE oid = quote_ident($1)::regtype::oid")
-            .into_boxed()
-            .bind::<Text, _>(name.name.clone()),
+        None => {
+            sql_query("SELECT oid, typarray FROM pg_type WHERE oid = quote_ident($1)::regtype::oid")
+                .into_boxed()
+                .bind::<Text, _>(name.name.clone())
+        }
     }
 }
 
 type LoadFuture<'query> = BoxFuture<'query, QueryResult<BoxStream<'static, QueryResult<PgRow>>>>;
 
-
 impl SimpleAsyncConnection for AsyncSyncedConnection {
-    fn batch_execute(&mut self, query: &str) -> impl std::future::Future<Output = QueryResult<()>> + Send {
+    fn batch_execute(
+        &mut self,
+        query: &str,
+    ) -> impl std::future::Future<Output = QueryResult<()>> + Send {
         // diesel-async's future borrows the connection, so it cannot be
         // pipelined and needs no in-flight token; the write is marked
         // now and again when it completes.
-        let cache = if may_write(query) { self.cache.clone() } else { None };
+        let cache = if may_write(query) {
+            self.cache.clone()
+        } else {
+            None
+        };
         if let Some(cache) = &cache {
             cache.mark_write();
         }
@@ -387,10 +420,15 @@ impl AsyncConnection for AsyncSyncedConnection {
 
     async fn establish(database_url: &str) -> ConnectionResult<Self> {
         let inner = AsyncPgConnection::establish(database_url).await?;
-        Ok(match SETTINGS.get().and_then(|settings| settings.attachment_for(database_url)) {
-            Some(Attachment { cache, route }) => Self::with_cache(inner, cache, route),
-            None => Self::new(inner),
-        })
+        Ok(
+            match SETTINGS
+                .get()
+                .and_then(|settings| settings.attachment_for(database_url))
+            {
+                Some(Attachment { cache, route }) => Self::with_cache(inner, cache, route),
+                None => Self::new(inner),
+            },
+        )
     }
 
     fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
@@ -411,7 +449,10 @@ impl AsyncConnection for AsyncSyncedConnection {
             // The query cannot even be keyed until its types are known:
             // live this time, resolved for the next.
             let live = self.inner.load(query);
-            let live = self.resolving(unknown, live).map_ok(Self::live_stream).boxed();
+            let live = self
+                .resolving(unknown, live)
+                .map_ok(Self::live_stream)
+                .boxed();
             return self.tracked(live);
         };
         let route = key.take_route().or(self.scoped).unwrap_or(self.route);
@@ -436,7 +477,10 @@ impl AsyncConnection for AsyncSyncedConnection {
         if !unknown.is_empty() {
             // Live this time; the OIDs are resolved for the next time.
             let live = self.inner.load(query);
-            let live = self.resolving(unknown, live).map_ok(Self::live_stream).boxed();
+            let live = self
+                .resolving(unknown, live)
+                .map_ok(Self::live_stream)
+                .boxed();
             return self.tracked(live);
         }
         if let Some(entry) = cache.get(&key) {
@@ -509,7 +553,10 @@ impl AsyncConnection for AsyncSyncedConnection {
                             // lookup at all. A table created since this
                             // load is not among them; the next miss
                             // loads the catalog again.
-                            catalog_loaded.store(missing.iter().all(|table| all.contains_key(table)), Ordering::Release);
+                            catalog_loaded.store(
+                                missing.iter().all(|table| all.contains_key(table)),
+                                Ordering::Release,
+                            );
                             for (table, found) in all {
                                 types.insert(table, Arc::new(found));
                             }
@@ -535,7 +582,8 @@ impl AsyncConnection for AsyncSyncedConnection {
                 }
                 Verdict::Accepted => {
                     let pg_rows: Vec<PgRow> = live.await?.try_collect().await?;
-                    let rows: Arc<[OwnedRow]> = Arc::from(capture_all(pg_rows.into_iter().map(Ok))?);
+                    let rows: Arc<[OwnedRow]> =
+                        Arc::from(capture_all(pg_rows.into_iter().map(Ok))?);
                     guard.disarm();
                     cache.fill(reservation, Arc::clone(&rows));
                     Ok(Self::cached_stream(rows))
@@ -545,13 +593,20 @@ impl AsyncConnection for AsyncSyncedConnection {
         .boxed()
     }
 
-    fn execute_returning_count<'conn, 'query, T>(&'conn mut self, source: T) -> Self::ExecuteFuture<'conn, 'query>
+    fn execute_returning_count<'conn, 'query, T>(
+        &'conn mut self,
+        source: T,
+    ) -> Self::ExecuteFuture<'conn, 'query>
     where
         T: QueryFragment<Pg> + QueryId + 'query,
     {
         let writes = may_write(&rendered(&source));
         let future = self.inner.execute_returning_count(source);
-        if writes { self.written(future) } else { self.tracked(future) }
+        if writes {
+            self.written(future)
+        } else {
+            self.tracked(future)
+        }
     }
 
     fn transaction_state(&mut self) -> &mut AnsiTransactionManager {

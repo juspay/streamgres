@@ -190,8 +190,10 @@ impl World {
 
 impl Drop for World {
     fn drop(&mut self) {
-        let _ = diesel::delete(sg_configs::table.filter(sg_configs::key.like(format!("{}%", self.prefix))))
-            .execute(&mut self.other);
+        let _ = diesel::delete(
+            sg_configs::table.filter(sg_configs::key.like(format!("{}%", self.prefix))),
+        )
+        .execute(&mut self.other);
     }
 }
 
@@ -205,10 +207,18 @@ fn a_repeated_read_is_served_from_the_cache() {
     assert_eq!(w.read("timeout").as_deref(), Some("30"));
     assert_eq!(w.read("timeout").as_deref(), Some("30"));
 
-    assert_eq!(w.sent(), after_first, "the second and third read sent nothing to Postgres");
+    assert_eq!(
+        w.sent(),
+        after_first,
+        "the second and third read sent nothing to Postgres"
+    );
     assert_eq!(w.cache.stats.hits.load(Ordering::Relaxed), 2);
     assert_eq!(w.cache.stats.misses.load(Ordering::Relaxed), 1);
-    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 1, "subscribed once");
+    assert_eq!(
+        w.engine.subscribed.lock().unwrap().len(),
+        1,
+        "subscribed once"
+    );
 }
 
 #[test]
@@ -247,7 +257,11 @@ fn a_touch_makes_the_next_read_refill_from_postgres() {
 
     // A change from elsewhere: the cache does not see it...
     w.put("limit", "20");
-    assert_eq!(w.read("limit").as_deref(), Some("10"), "stale until the engine says so");
+    assert_eq!(
+        w.read("limit").as_deref(),
+        Some("10"),
+        "stale until the engine says so"
+    );
 
     // ...until the engine reports the query touched.
     let key = w.key_of("limit");
@@ -257,7 +271,10 @@ fn a_touch_makes_the_next_read_refill_from_postgres() {
     assert_eq!(w.sent(), before + 1, "refilled with one read");
     assert_eq!(w.read("limit").as_deref(), Some("20"));
     assert_eq!(w.sent(), before + 1, "and cached again");
-    assert!(w.engine.unsubscribed.lock().unwrap().is_empty(), "a touch keeps the subscription");
+    assert!(
+        w.engine.unsubscribed.lock().unwrap().is_empty(),
+        "a touch keeps the subscription"
+    );
 }
 
 #[test]
@@ -272,11 +289,18 @@ fn a_touch_during_the_read_is_not_lost() {
     w.put("flag", "on");
     w.cache.touched(&key);
     let stale_rows: Arc<[streamgres_diesel::row::OwnedRow]> = Arc::from(Vec::new());
-    assert!(!w.cache.fill(reservation, stale_rows), "the fill is refused");
+    assert!(
+        !w.cache.fill(reservation, stale_rows),
+        "the fill is refused"
+    );
     assert_eq!(w.cache.stats.stale_fills.load(Ordering::Relaxed), 1);
     assert!(w.cache.is_empty());
 
-    assert_eq!(w.read("flag").as_deref(), Some("on"), "the next read sees the change");
+    assert_eq!(
+        w.read("flag").as_deref(),
+        Some("on"),
+        "the next read sees the change"
+    );
 }
 
 #[test]
@@ -289,7 +313,11 @@ fn a_strong_connection_never_reads_the_cache() {
     w.conn.set_consistency(Consistency::Strong);
     assert_eq!(w.read("mode").as_deref(), Some("b"));
     w.conn.set_consistency(Consistency::Eventual);
-    assert_eq!(w.read("mode").as_deref(), Some("a"), "the eventual entry is untouched");
+    assert_eq!(
+        w.read("mode").as_deref(),
+        Some("a"),
+        "the eventual entry is untouched"
+    );
 }
 
 #[test]
@@ -311,16 +339,31 @@ fn inside_a_transaction_reads_see_the_connections_own_writes() {
                 .first(c)
         })
         .expect("transaction");
-    assert_eq!(seen, "2", "the read inside the transaction went to Postgres");
-    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 1, "the transactional read did not subscribe");
+    assert_eq!(
+        seen, "2",
+        "the read inside the transaction went to Postgres"
+    );
+    assert_eq!(
+        w.engine.subscribed.lock().unwrap().len(),
+        1,
+        "the transactional read did not subscribe"
+    );
     // Right after the COMMIT the connection is in its read-your-writes
     // window and reads Postgres; the entry itself is untouched until the
     // engine says so.
     assert_eq!(w.read("count").as_deref(), Some("2"));
     let cache_key = w.key_of("count");
-    assert_eq!(w.cache.get(&cache_key).map(|entry| entry.rows.len()), Some(1), "the entry is still the old row");
+    assert_eq!(
+        w.cache.get(&cache_key).map(|entry| entry.rows.len()),
+        Some(1),
+        "the entry is still the old row"
+    );
     w.conn.set_read_your_writes(std::time::Duration::ZERO);
-    assert_eq!(w.read("count").as_deref(), Some("1"), "outside the window the cache still holds the old row until a touch");
+    assert_eq!(
+        w.read("count").as_deref(),
+        Some("1"),
+        "outside the window the cache still holds the old row until a touch"
+    );
 }
 
 #[test]
@@ -339,7 +382,11 @@ fn a_write_returning_rows_is_never_cached() {
     assert_eq!(updated.value, "y");
     assert!(w.cache.is_empty());
     assert!(w.engine.subscribed.lock().unwrap().is_empty());
-    assert_eq!(w.cache.stats.misses.load(Ordering::Relaxed), 0, "writes are not even looked up");
+    assert_eq!(
+        w.cache.stats.misses.load(Ordering::Relaxed),
+        0,
+        "writes are not even looked up"
+    );
 }
 
 #[test]
@@ -349,7 +396,11 @@ fn a_refused_query_is_read_live_every_time() {
     w.engine.refuse_all.store(true, Ordering::SeqCst);
     assert_eq!(w.read("k").as_deref(), Some("v"));
     w.put("k", "w");
-    assert_eq!(w.read("k").as_deref(), Some("w"), "live, so the change is seen");
+    assert_eq!(
+        w.read("k").as_deref(),
+        Some("w"),
+        "live, so the change is seen"
+    );
     // The engine was asked once; the refusal is remembered and the second
     // read went to Postgres without asking.
     assert_eq!(w.cache.stats.refused.load(Ordering::Relaxed), 1);
@@ -382,8 +433,15 @@ fn over_budget_entries_are_evicted_and_unsubscribed() {
     assert!(held < 20, "the budget holds fewer than all 20, held {held}");
     assert!(w.cache.weighted_size() <= 600);
     let unsubscribed = w.engine.unsubscribed.lock().unwrap().len();
-    assert_eq!(unsubscribed as u64, 20 - held, "every evicted entry ended its subscription");
-    assert_eq!(w.cache.stats.evicted.load(Ordering::Relaxed), unsubscribed as u64);
+    assert_eq!(
+        unsubscribed as u64,
+        20 - held,
+        "every evicted entry ended its subscription"
+    );
+    assert_eq!(
+        w.cache.stats.evicted.load(Ordering::Relaxed),
+        unsubscribed as u64
+    );
 }
 
 #[test]
@@ -393,16 +451,25 @@ fn cached_rows_decode_whole_structs_by_name_and_count() {
     w.put("q", "2");
     let like = format!("{}%", w.prefix);
 
-    let whole = || sg_configs::table
-        .filter(sg_configs::key.like(&like))
-        .order(sg_configs::key)
-        .select(Config::as_select());
+    let whole = || {
+        sg_configs::table
+            .filter(sg_configs::key.like(&like))
+            .order(sg_configs::key)
+            .select(Config::as_select())
+    };
     let first: Vec<Config> = whole().load(&mut w.conn).expect("load");
     let second: Vec<Config> = whole().load(&mut w.conn).expect("load again");
     assert_eq!(first, second);
-    assert_eq!(first.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(), ["1", "2"]);
+    assert_eq!(
+        first.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(),
+        ["1", "2"]
+    );
 
-    let count = || sg_configs::table.filter(sg_configs::key.like(&like)).count();
+    let count = || {
+        sg_configs::table
+            .filter(sg_configs::key.like(&like))
+            .count()
+    };
     let n: i64 = count().get_result(&mut w.conn).expect("count");
     let m: i64 = count().get_result(&mut w.conn).expect("count again");
     assert_eq!((n, m), (2, 2));
@@ -414,8 +481,10 @@ fn cached_rows_decode_whole_structs_by_name_and_count() {
         #[diesel(sql_type = Integer)]
         id: i32,
     }
-    let by_name = || sql_query("SELECT key, id FROM sg_configs WHERE key LIKE $1 ORDER BY key")
-        .bind::<Text, _>(&like);
+    let by_name = || {
+        sql_query("SELECT key, id FROM sg_configs WHERE key LIKE $1 ORDER BY key")
+            .bind::<Text, _>(&like)
+    };
     let a: Vec<Pair> = by_name().load(&mut w.conn).expect("by name");
     let b: Vec<Pair> = by_name().load(&mut w.conn).expect("by name again");
     assert_eq!(a, b);
@@ -447,7 +516,11 @@ fn a_query_flagged_postgres_bypasses_the_cache_on_a_streamgres_connection() {
     assert_eq!(w.read_via("mode", Route::Postgres).as_deref(), Some("b"));
     assert_eq!(w.sent(), sent + 1);
     assert_eq!(w.engine.subscribed.lock().unwrap().len(), subscribed);
-    assert_eq!(w.read("mode").as_deref(), Some("a"), "the entry is untouched");
+    assert_eq!(
+        w.read("mode").as_deref(),
+        Some("a"),
+        "the entry is untouched"
+    );
 }
 
 #[test]
@@ -458,8 +531,16 @@ fn a_query_flagged_streamgres_is_cached_on_a_postgres_connection() {
     assert_eq!(w.read_via("mode", Route::Streamgres).as_deref(), Some("a"));
     assert_eq!(w.cache.len(), 1, "subscribed and filled");
     w.put("mode", "b");
-    assert_eq!(w.read_via("mode", Route::Streamgres).as_deref(), Some("a"), "served from the cache");
-    assert_eq!(w.read("mode").as_deref(), Some("b"), "the connection's own route is Postgres");
+    assert_eq!(
+        w.read_via("mode", Route::Streamgres).as_deref(),
+        Some("a"),
+        "served from the cache"
+    );
+    assert_eq!(
+        w.read("mode").as_deref(),
+        Some("b"),
+        "the connection's own route is Postgres"
+    );
 }
 
 #[test]
@@ -470,10 +551,18 @@ fn the_marker_is_not_part_of_the_key_or_what_the_engine_sees() {
     let subscribed = w.engine.subscribed.lock().unwrap().clone();
     assert_eq!(subscribed.len(), 1);
     assert!(!subscribed[0].sql.contains("/*"), "{}", subscribed[0].sql);
-    assert_eq!(subscribed[0], w.key_of("mode"), "flagged and unflagged reads share the entry");
+    assert_eq!(
+        subscribed[0],
+        w.key_of("mode"),
+        "flagged and unflagged reads share the entry"
+    );
     let sent = w.sent();
     assert_eq!(w.read("mode").as_deref(), Some("a"));
-    assert_eq!(w.sent(), sent, "the unflagged read hit the flagged read's entry");
+    assert_eq!(
+        w.sent(),
+        sent,
+        "the unflagged read hit the flagged read's entry"
+    );
 }
 
 #[test]
@@ -502,7 +591,11 @@ fn a_route_scope_covers_every_read_inside_it_and_the_query_flag_still_wins() {
         (scoped, flagged)
     });
     assert_eq!(scoped.as_deref(), Some("b"), "the scope routed to Postgres");
-    assert_eq!(flagged.as_deref(), Some("a"), "the query flag beat the scope");
+    assert_eq!(
+        flagged.as_deref(),
+        Some("a"),
+        "the query flag beat the scope"
+    );
     assert_eq!(w.read("mode").as_deref(), Some("a"), "the scope ended");
 }
 
@@ -554,16 +647,25 @@ fn time_to_live_drops_an_entry_however_often_it_is_read() {
     }
     std::thread::sleep(std::time::Duration::from_millis(60));
     w.cache.run_pending_tasks();
-    assert_eq!(w.engine.unsubscribed.lock().unwrap().len(), 1, "ended on the timer");
+    assert_eq!(
+        w.engine.unsubscribed.lock().unwrap().len(),
+        1,
+        "ended on the timer"
+    );
     w.put("mode", "b");
-    assert_eq!(w.read("mode").as_deref(), Some("b"), "resubscribed and refilled");
+    assert_eq!(
+        w.read("mode").as_deref(),
+        Some("b"),
+        "resubscribed and refilled"
+    );
     assert_eq!(w.engine.subscribed.lock().unwrap().len(), 2);
 }
 
 #[test]
 fn after_a_write_the_connection_reads_postgres_for_a_window() {
     let mut w = World::new("ryw");
-    w.conn.set_read_your_writes(std::time::Duration::from_millis(150));
+    w.conn
+        .set_read_your_writes(std::time::Duration::from_millis(150));
     w.put("mode", "a");
     assert_eq!(w.read("mode").as_deref(), Some("a"));
 
@@ -574,7 +676,11 @@ fn after_a_write_the_connection_reads_postgres_for_a_window() {
         .execute(&mut w.conn)
         .unwrap();
     let sent = w.sent();
-    assert_eq!(w.read("mode").as_deref(), Some("b"), "its own write is seen at once");
+    assert_eq!(
+        w.read("mode").as_deref(),
+        Some("b"),
+        "its own write is seen at once"
+    );
     assert_eq!(w.sent(), sent + 1, "read from Postgres");
     assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 1);
 
@@ -614,7 +720,10 @@ fn a_locking_read_always_goes_to_postgres() {
     }
     assert_eq!(w.cache.stats.locking.load(Ordering::Relaxed), 2);
     assert!(w.cache.is_empty(), "nothing cached");
-    assert!(w.engine.subscribed.lock().unwrap().is_empty(), "nothing subscribed");
+    assert!(
+        w.engine.subscribed.lock().unwrap().is_empty(),
+        "nothing subscribed"
+    );
 }
 
 #[test]
@@ -624,16 +733,22 @@ fn a_route_scope_ends_when_the_closure_panics() {
     assert_eq!(w.read("mode").as_deref(), Some("a"));
     w.put("mode", "b");
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        w.conn.with_route(Route::Postgres, |_| panic!("inside the scope"));
+        w.conn
+            .with_route(Route::Postgres, |_| panic!("inside the scope"));
     }));
     assert!(outcome.is_err());
-    assert_eq!(w.read("mode").as_deref(), Some("a"), "the scope was restored, the cache answers");
+    assert_eq!(
+        w.read("mode").as_deref(),
+        Some("a"),
+        "the scope was restored, the cache answers"
+    );
 }
 
 #[test]
 fn opening_and_abandoning_a_transaction_is_not_a_write() {
     let mut w = World::new("txn-control");
-    w.conn.set_read_your_writes(std::time::Duration::from_secs(5));
+    w.conn
+        .set_read_your_writes(std::time::Duration::from_secs(5));
     w.put("mode", "a");
     assert_eq!(w.read("mode").as_deref(), Some("a"));
     w.put("mode", "b");
@@ -641,21 +756,34 @@ fn opening_and_abandoning_a_transaction_is_not_a_write() {
     w.conn.batch_execute("ROLLBACK").unwrap();
     w.conn.batch_execute("SET statement_timeout = 0").unwrap();
     w.conn.batch_execute("SELECT 1").unwrap();
-    diesel::select(diesel::dsl::sql::<Integer>("1")).execute(&mut w.conn).unwrap();
-    assert_eq!(w.read("mode").as_deref(), Some("a"), "still from the cache: a pool's checkout ping is not a write");
+    diesel::select(diesel::dsl::sql::<Integer>("1"))
+        .execute(&mut w.conn)
+        .unwrap();
+    assert_eq!(
+        w.read("mode").as_deref(),
+        Some("a"),
+        "still from the cache: a pool's checkout ping is not a write"
+    );
     assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 0);
     let key = w.key("other");
     w.conn
-        .batch_execute(&format!("INSERT INTO sg_configs (key, value) VALUES ('{key}', 'x') ON CONFLICT (key) DO NOTHING"))
+        .batch_execute(&format!(
+            "INSERT INTO sg_configs (key, value) VALUES ('{key}', 'x') ON CONFLICT (key) DO NOTHING"
+        ))
         .unwrap();
-    assert_eq!(w.read("mode").as_deref(), Some("b"), "any other raw SQL counts as a write");
+    assert_eq!(
+        w.read("mode").as_deref(),
+        Some("b"),
+        "any other raw SQL counts as a write"
+    );
     assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 1);
 }
 
 #[test]
 fn a_write_on_one_connection_is_seen_by_reads_on_another_of_the_same_cache() {
     let mut w = World::new("ryw-pool");
-    w.conn.set_read_your_writes(std::time::Duration::from_secs(5));
+    w.conn
+        .set_read_your_writes(std::time::Duration::from_secs(5));
     w.put("mode", "a");
     assert_eq!(w.read("mode").as_deref(), Some("a"));
 
@@ -670,18 +798,31 @@ fn a_write_on_one_connection_is_seen_by_reads_on_another_of_the_same_cache() {
         .set(sg_configs::value.eq("b"))
         .execute(&mut sibling)
         .unwrap();
-    assert_eq!(w.read("mode").as_deref(), Some("b"), "the first connection reads Postgres for the window");
+    assert_eq!(
+        w.read("mode").as_deref(),
+        Some("b"),
+        "the first connection reads Postgres for the window"
+    );
     assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 1);
 }
 
 #[test]
 fn a_read_that_fails_after_the_engine_accepted_ends_its_subscription() {
     let mut w = World::new("accepted-error");
-    let failing = sql_query("SELECT no_such_column FROM sg_configs WHERE key = $1").bind::<Text, _>(w.key("x"));
+    let failing = sql_query("SELECT no_such_column FROM sg_configs WHERE key = $1")
+        .bind::<Text, _>(w.key("x"));
     let outcome: Result<Vec<Config>, _> = failing.load(&mut w.conn);
     assert!(outcome.is_err());
-    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 1, "the engine accepted it");
-    assert_eq!(w.engine.unsubscribed.lock().unwrap().len(), 1, "and was told to drop it");
+    assert_eq!(
+        w.engine.subscribed.lock().unwrap().len(),
+        1,
+        "the engine accepted it"
+    );
+    assert_eq!(
+        w.engine.unsubscribed.lock().unwrap().len(),
+        1,
+        "and was told to drop it"
+    );
     assert!(w.cache.is_empty());
 }
 
@@ -694,7 +835,15 @@ fn a_refusal_is_remembered_for_the_shape_not_the_value() {
     assert_eq!(w.read("a").as_deref(), Some("1"));
     w.engine.refuse_all.store(false, Ordering::SeqCst);
     assert_eq!(w.read("b").as_deref(), Some("2"));
-    assert_eq!(w.cache.stats.refused.load(Ordering::Relaxed), 1, "asked once");
-    assert_eq!(w.cache.stats.refused_recently.load(Ordering::Relaxed), 1, "the other value skipped the ask");
+    assert_eq!(
+        w.cache.stats.refused.load(Ordering::Relaxed),
+        1,
+        "asked once"
+    );
+    assert_eq!(
+        w.cache.stats.refused_recently.load(Ordering::Relaxed),
+        1,
+        "the other value skipped the ask"
+    );
     assert!(w.engine.subscribed.lock().unwrap().is_empty());
 }

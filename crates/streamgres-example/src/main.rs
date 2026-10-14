@@ -22,7 +22,10 @@ use streamgres_example::queries::Lookup;
 use streamgres_example::{api, bench, seed, writer};
 
 #[derive(Parser)]
-#[command(name = "example", about = "A ticket desk on the Streamgres Diesel wrapper")]
+#[command(
+    name = "example",
+    about = "A ticket desk on the Streamgres Diesel wrapper"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -70,13 +73,18 @@ async fn run() -> Result<(), String> {
             let database_url = env("DATABASE_URL")?;
             let mut conn = Stack::plain_sync(&database_url).map_err(|error| error.to_string())?;
             seed::run(&mut conn).map_err(|error| error.to_string())?;
-            println!("seeded: 3 organizations, 12 agents, 180 tickets, 120 comments, 18 attachments");
+            println!(
+                "seeded: 3 organizations, 12 agents, 180 tickets, 120 comments, 18 attachments"
+            );
             Ok(())
         }
         Command::Serve => {
-            let stack = Arc::new(Stack::connect(&env("DATABASE_URL")?, &env("STREAMGRES_S2S_URL")?).await?);
+            let stack =
+                Arc::new(Stack::connect(&env("DATABASE_URL")?, &env("STREAMGRES_S2S_URL")?).await?);
             if !stack.wait_for_engine(Duration::from_secs(10)).await {
-                eprintln!("example: the engine is not reachable yet; reads go to Postgres until it is");
+                eprintln!(
+                    "example: the engine is not reachable yet; reads go to Postgres until it is"
+                );
             }
             let every = std::env::var("EXAMPLE_WRITER_MS")
                 .ok()
@@ -86,9 +94,13 @@ async fn run() -> Result<(), String> {
                 writer::spawn(stack.plain.clone(), Duration::from_millis(every));
             }
             let addr = std::env::var("EXAMPLE_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
-            let listener = tokio::net::TcpListener::bind(&addr).await.map_err(|error| format!("bind {addr}: {error}"))?;
+            let listener = tokio::net::TcpListener::bind(&addr)
+                .await
+                .map_err(|error| format!("bind {addr}: {error}"))?;
             println!("example: serving on http://{addr} (stats at /stats)");
-            axum::serve(listener, api::router(stack)).await.map_err(|error| error.to_string())
+            axum::serve(listener, api::router(stack))
+                .await
+                .map_err(|error| error.to_string())
         }
         Command::Bench {
             lookup,
@@ -103,7 +115,8 @@ async fn run() -> Result<(), String> {
                 }
                 return Ok(());
             }
-            let lookup = Lookup::named(&lookup).ok_or_else(|| format!("no lookup `{lookup}`; see --list"))?;
+            let lookup = Lookup::named(&lookup)
+                .ok_or_else(|| format!("no lookup `{lookup}`; see --list"))?;
             let stack = Stack::connect(&env("DATABASE_URL")?, &env("STREAMGRES_S2S_URL")?).await?;
             if !stack.wait_for_engine(Duration::from_secs(10)).await {
                 return Err("the engine is not reachable".to_string());
@@ -113,8 +126,15 @@ async fn run() -> Result<(), String> {
                 "postgres" => vec![Route::Postgres],
                 _ => vec![Route::Postgres, Route::Streamgres],
             };
-            println!("{} ({}), {concurrency} tasks, {requests} requests per route", lookup.name(), lookup.exercises());
-            println!("{:<12} {:>9} {:>9} {:>9} {:>9} {:>10}", "route", "p50", "p95", "p99", "max", "req/s");
+            println!(
+                "{} ({}), {concurrency} tasks, {requests} requests per route",
+                lookup.name(),
+                lookup.exercises()
+            );
+            println!(
+                "{:<12} {:>9} {:>9} {:>9} {:>9} {:>10}",
+                "route", "p50", "p95", "p99", "max", "req/s"
+            );
             for route in routes {
                 let report = bench::run(&stack, &lookup, route, concurrency, requests).await?;
                 println!(

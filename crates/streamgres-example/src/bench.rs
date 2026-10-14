@@ -29,7 +29,13 @@ impl Report {
     }
 }
 
-pub async fn run(stack: &Stack, lookup: &Lookup, route: Route, concurrency: usize, requests: usize) -> Result<Report, String> {
+pub async fn run(
+    stack: &Stack,
+    lookup: &Lookup,
+    route: Route,
+    concurrency: usize,
+    requests: usize,
+) -> Result<Report, String> {
     let per_task = requests.div_ceil(concurrency.max(1));
     // Warm: subscribe and fill once, so the measurement is of the steady
     // state on both routes.

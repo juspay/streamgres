@@ -16,9 +16,9 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use diesel::result::Error;
 use diesel::QueryResult;
 use diesel::pg::{Pg, PgValue};
+use diesel::result::Error;
 use diesel::row::{Field, PartialRow, Row, RowIndex, RowSealed};
 
 /// The column names of one result set, shared by all its rows.
@@ -202,10 +202,9 @@ where
     let mut columns: Option<Columns> = None;
     for row in cursor {
         let row = row?;
-        let owned = OwnedRow::capture(&row, columns.as_ref())
-            .ok_or(Error::DeserializationError(
-                "a result row without column names cannot be kept".into(),
-            ))?;
+        let owned = OwnedRow::capture(&row, columns.as_ref()).ok_or(
+            Error::DeserializationError("a result row without column names cannot be kept".into()),
+        )?;
         if columns.is_none() {
             columns = Some(Arc::clone(owned.columns()));
         }

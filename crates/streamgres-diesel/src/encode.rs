@@ -127,7 +127,9 @@ pub fn encode(cell: &Json, column: &ColumnType) -> Result<Option<OwnedValue>, Un
 
 fn scalar(cell: &Json, type_oid: u32, name: &str) -> Result<Vec<u8>, Unsupported> {
     Ok(match type_oid {
-        oid::BOOL => vec![u8::from(cell.as_bool().ok_or_else(|| mismatch(name, "a boolean"))?)],
+        oid::BOOL => vec![u8::from(
+            cell.as_bool().ok_or_else(|| mismatch(name, "a boolean"))?,
+        )],
         oid::INT2 => i16::try_from(integer(cell, name)?)
             .map_err(|_| mismatch(name, "a 16-bit integer"))?
             .to_be_bytes()
@@ -189,7 +191,12 @@ fn scalar(cell: &Json, type_oid: u32, name: &str) -> Result<Vec<u8>, Unsupported
 /// A one-dimensional array: the header (dimensions, a has-nulls flag,
 /// the element type), one dimension (length, lower bound 1), then each
 /// element as its length and bytes, `-1` for NULL.
-fn array(cell: &Json, element: u32, element_kind: &TypeKind, name: &str) -> Result<Vec<u8>, Unsupported> {
+fn array(
+    cell: &Json,
+    element: u32,
+    element_kind: &TypeKind,
+    name: &str,
+) -> Result<Vec<u8>, Unsupported> {
     let items = cell.as_array().ok_or_else(|| mismatch(name, "an array"))?;
     let mut out = Vec::new();
     let has_nulls = items.iter().any(Json::is_null);
@@ -272,17 +279,41 @@ mod tests {
 
     #[test]
     fn scalars_take_their_postgres_widths() {
-        assert_eq!(bytes(encode(&json!(7), &base(oid::INT4)).unwrap()), 7i32.to_be_bytes());
-        assert_eq!(bytes(encode(&json!(7), &base(oid::INT8)).unwrap()), 7i64.to_be_bytes());
-        assert_eq!(bytes(encode(&json!(-2), &base(oid::INT2)).unwrap()), (-2i16).to_be_bytes());
+        assert_eq!(
+            bytes(encode(&json!(7), &base(oid::INT4)).unwrap()),
+            7i32.to_be_bytes()
+        );
+        assert_eq!(
+            bytes(encode(&json!(7), &base(oid::INT8)).unwrap()),
+            7i64.to_be_bytes()
+        );
+        assert_eq!(
+            bytes(encode(&json!(-2), &base(oid::INT2)).unwrap()),
+            (-2i16).to_be_bytes()
+        );
         assert!(encode(&json!(70000), &base(oid::INT2)).is_err());
-        assert_eq!(bytes(encode(&json!(2.5), &base(oid::FLOAT8)).unwrap()), 2.5f64.to_be_bytes());
+        assert_eq!(
+            bytes(encode(&json!(2.5), &base(oid::FLOAT8)).unwrap()),
+            2.5f64.to_be_bytes()
+        );
         assert_eq!(bytes(encode(&json!(true), &base(oid::BOOL)).unwrap()), [1]);
-        assert_eq!(bytes(encode(&json!("hi"), &base(oid::TEXT)).unwrap()), b"hi");
+        assert_eq!(
+            bytes(encode(&json!("hi"), &base(oid::TEXT)).unwrap()),
+            b"hi"
+        );
         assert_eq!(encode(&Json::Null, &base(oid::TEXT)).unwrap(), None);
         assert_eq!(
-            bytes(encode(&json!("12345678-9abc-def0-1122-334455667788"), &base(oid::UUID)).unwrap()),
-            [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+            bytes(
+                encode(
+                    &json!("12345678-9abc-def0-1122-334455667788"),
+                    &base(oid::UUID)
+                )
+                .unwrap()
+            ),
+            [
+                0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+                0x77, 0x88
+            ]
         );
     }
 
@@ -290,14 +321,23 @@ mod tests {
     fn json_and_times() {
         let jsonb = bytes(encode(&json!({"a": [1, null]}), &base(oid::JSONB)).unwrap());
         assert_eq!(jsonb[0], 1);
-        assert_eq!(serde_json::from_slice::<Json>(&jsonb[1..]).unwrap(), json!({"a": [1, null]}));
+        assert_eq!(
+            serde_json::from_slice::<Json>(&jsonb[1..]).unwrap(),
+            json!({"a": [1, null]})
+        );
         let micros = PG_EPOCH_MICROS + 1_500_000;
         assert_eq!(
             bytes(encode(&json!(micros), &base(oid::TIMESTAMPTZ)).unwrap()),
             1_500_000i64.to_be_bytes()
         );
         assert_eq!(
-            bytes(encode(&json!(PG_EPOCH_MICROS + 2 * 86_400_000_000), &base(oid::DATE)).unwrap()),
+            bytes(
+                encode(
+                    &json!(PG_EPOCH_MICROS + 2 * 86_400_000_000),
+                    &base(oid::DATE)
+                )
+                .unwrap()
+            ),
             2i32.to_be_bytes()
         );
     }
@@ -309,7 +349,10 @@ mod tests {
         let uuid = base(oid::UUID);
         assert!(encode(&json!("é1234567-89ab-cdef-0123-456789abcdef"), &uuid).is_err());
         assert!(encode(&json!("ééééééééééééééééééééééééééééééé"), &uuid).is_err());
-        assert!(encode(&json!("12345678-89ab-cdef-0123-456789abcde"), &uuid).is_err(), "too short");
+        assert!(
+            encode(&json!("12345678-89ab-cdef-0123-456789abcde"), &uuid).is_err(),
+            "too short"
+        );
         let bytea = base(oid::BYTEA);
         assert!(encode(&json!("\\xé0"), &bytea).is_err());
         assert!(encode(&json!("\\xzz"), &bytea).is_err());
@@ -334,13 +377,19 @@ mod tests {
 
     #[test]
     fn what_is_refused_up_front() {
-        assert!(supports(&base(oid::TIMESTAMP)).is_ok(), "microseconds, Postgres's own precision");
+        assert!(
+            supports(&base(oid::TIMESTAMP)).is_ok(),
+            "microseconds, Postgres's own precision"
+        );
         let mut ms = base(oid::TIMESTAMP);
         ms.typmod = 3;
         assert!(supports(&ms).is_ok());
         assert!(supports(&base(1186)).is_err(), "interval");
         assert!(supports(&base(1700)).is_err(), "numeric");
-        assert!(supports(&base(oid::BYTEA)).is_ok(), "bytea comes as hex text");
+        assert!(
+            supports(&base(oid::BYTEA)).is_ok(),
+            "bytea comes as hex text"
+        );
         assert!(supports(&base(3904)).is_err(), "an int4 range");
         let text_array = ColumnType {
             name: "tags".into(),
@@ -354,7 +403,15 @@ mod tests {
         assert!(supports(&text_array).is_ok());
         let encoded = bytes(encode(&json!(["a", null, "c,d"]), &text_array).unwrap());
         // header: 1 dim, has nulls, text elements, length 3, lower bound 1
-        assert_eq!(&encoded[..20], &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 25, 0, 0, 0, 3, 0, 0, 0, 1]);
-        assert_eq!(&encoded[20..], &[0, 0, 0, 1, b'a', 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 3, b'c', b',', b'd']);
+        assert_eq!(
+            &encoded[..20],
+            &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 25, 0, 0, 0, 3, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            &encoded[20..],
+            &[
+                0, 0, 0, 1, b'a', 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 3, b'c', b',', b'd'
+            ]
+        );
     }
 }

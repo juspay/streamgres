@@ -45,7 +45,10 @@ enum Mood {
 }
 
 impl diesel::serialize::ToSql<SgMood, diesel::pg::Pg> for Mood {
-    fn to_sql<'b>(&'b self, out: &mut diesel::serialize::Output<'b, '_, diesel::pg::Pg>) -> diesel::serialize::Result {
+    fn to_sql<'b>(
+        &'b self,
+        out: &mut diesel::serialize::Output<'b, '_, diesel::pg::Pg>,
+    ) -> diesel::serialize::Result {
         use std::io::Write;
         out.write_all(match self {
             Mood::Happy => b"happy",
@@ -95,7 +98,12 @@ impl Subscriptions for FakeEngine {
         Outcome::Verdict(Verdict::Accepted)
     }
 
-    fn materialize(&self, _: &QueryKey, _: Snapshot, _: HashMap<String, Arc<TableTypes>>) -> Verdict {
+    fn materialize(
+        &self,
+        _: &QueryKey,
+        _: Snapshot,
+        _: HashMap<String, Arc<TableTypes>>,
+    ) -> Verdict {
         Verdict::Accepted
     }
 
@@ -205,9 +213,11 @@ impl World {
     }
 
     async fn clean(&mut self) {
-        let _ = diesel::delete(sg_configs::table.filter(sg_configs::key.like(format!("{}%", self.prefix))))
-            .execute(&mut self.other)
-            .await;
+        let _ = diesel::delete(
+            sg_configs::table.filter(sg_configs::key.like(format!("{}%", self.prefix))),
+        )
+        .execute(&mut self.other)
+        .await;
     }
 
     fn hits(&self) -> u64 {
@@ -220,7 +230,11 @@ async fn a_repeated_read_is_served_from_the_cache() {
     let mut w = World::new("async-hit").await;
     w.put("mode", "a").await;
     assert_eq!(w.read("mode").await.as_deref(), Some("a"));
-    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 1, "subscribed before the read");
+    assert_eq!(
+        w.engine.subscribed.lock().unwrap().len(),
+        1,
+        "subscribed before the read"
+    );
     assert_eq!(w.cache.len(), 1);
 
     let hits = w.hits();
@@ -241,9 +255,17 @@ async fn a_touch_makes_the_next_read_refill() {
     w.put("mode", "b").await;
     let key = w.key_of("mode");
     w.cache.touched(&key);
-    assert_eq!(w.read("mode").await.as_deref(), Some("b"), "refilled from Postgres");
+    assert_eq!(
+        w.read("mode").await.as_deref(),
+        Some("b"),
+        "refilled from Postgres"
+    );
     assert_eq!(w.cache.len(), 1);
-    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 2, "the refill subscribed again, the fake forgets");
+    assert_eq!(
+        w.engine.subscribed.lock().unwrap().len(),
+        2,
+        "the refill subscribed again, the fake forgets"
+    );
     w.clean().await;
 }
 
@@ -253,8 +275,16 @@ async fn the_query_flag_and_the_scope_route_a_read() {
     w.put("mode", "a").await;
     assert_eq!(w.read("mode").await.as_deref(), Some("a"));
     w.put("mode", "b").await;
-    assert_eq!(w.read_via("mode", Route::Postgres).await.as_deref(), Some("b"), "the flag bypassed the cache");
-    assert_eq!(w.read("mode").await.as_deref(), Some("a"), "the entry is untouched");
+    assert_eq!(
+        w.read_via("mode", Route::Postgres).await.as_deref(),
+        Some("b"),
+        "the flag bypassed the cache"
+    );
+    assert_eq!(
+        w.read("mode").await.as_deref(),
+        Some("a"),
+        "the entry is untouched"
+    );
 
     let key = w.key("mode");
     let scoped = w
@@ -273,7 +303,11 @@ async fn the_query_flag_and_the_scope_route_a_read() {
         })
         .await;
     assert_eq!(scoped.as_deref(), Some("b"));
-    assert_eq!(w.read("mode").await.as_deref(), Some("a"), "the scope ended");
+    assert_eq!(
+        w.read("mode").await.as_deref(),
+        Some("a"),
+        "the scope ended"
+    );
     w.clean().await;
 }
 
@@ -306,9 +340,20 @@ async fn inside_a_transaction_reads_see_the_connections_own_writes() {
         })
         .await
         .expect("transaction");
-    assert_eq!(seen, "2", "the read inside the transaction went to Postgres");
-    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 1, "the transactional read did not subscribe");
-    assert_eq!(w.read("count").await.as_deref(), Some("1"), "outside it the cache holds the old row until a touch");
+    assert_eq!(
+        seen, "2",
+        "the read inside the transaction went to Postgres"
+    );
+    assert_eq!(
+        w.engine.subscribed.lock().unwrap().len(),
+        1,
+        "the transactional read did not subscribe"
+    );
+    assert_eq!(
+        w.read("count").await.as_deref(),
+        Some("1"),
+        "outside it the cache holds the old row until a touch"
+    );
     w.clean().await;
 }
 
@@ -324,10 +369,18 @@ async fn after_a_write_the_connection_reads_postgres_for_a_window() {
         .execute(&mut w.conn)
         .await
         .unwrap();
-    assert_eq!(w.read("mode").await.as_deref(), Some("b"), "its own write is seen at once");
+    assert_eq!(
+        w.read("mode").await.as_deref(),
+        Some("b"),
+        "its own write is seen at once"
+    );
     assert_eq!(stat(&w.cache.stats.after_write), 1);
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(w.read("mode").await.as_deref(), Some("a"), "the window closed; the entry was not refreshed");
+    assert_eq!(
+        w.read("mode").await.as_deref(),
+        Some("a"),
+        "the window closed; the entry was not refreshed"
+    );
     w.clean().await;
 }
 
@@ -340,7 +393,11 @@ async fn a_query_the_engine_refuses_is_read_live() {
         .map(|c| c.n)
         .unwrap();
     assert!(count > 0);
-    assert_eq!(w.cache.len(), 0, "not a config read: the fake refused it, the read was live");
+    assert_eq!(
+        w.cache.len(),
+        0,
+        "not a config read: the fake refused it, the read was live"
+    );
     assert_eq!(stat(&w.cache.stats.refused), 1);
     w.clean().await;
 }
@@ -355,11 +412,13 @@ struct Count {
 async fn an_enum_array_bind_is_live_once_then_cached() {
     let mut w = World::new("async-enum-array").await;
     let key = w.key("m");
-    diesel::sql_query("INSERT INTO sg_moods (key, mood) VALUES ($1, 'happy') ON CONFLICT (key) DO NOTHING")
-        .bind::<diesel::sql_types::Text, _>(&key)
-        .execute(&mut w.other)
-        .await
-        .unwrap();
+    diesel::sql_query(
+        "INSERT INTO sg_moods (key, mood) VALUES ($1, 'happy') ON CONFLICT (key) DO NOTHING",
+    )
+    .bind::<diesel::sql_types::Text, _>(&key)
+    .execute(&mut w.other)
+    .await
+    .unwrap();
     async fn read(conn: &mut AsyncSyncedConnection, key: String) -> Option<Mood> {
         sg_moods::table
             .filter(sg_moods::key.eq(key))
@@ -373,17 +432,30 @@ async fn an_enum_array_bind_is_live_once_then_cached() {
     // The array's element OID is unknown: the query cannot be keyed, so
     // it goes live while the type is resolved.
     assert_eq!(read(&mut w.conn, key.clone()).await, Some(Mood::Happy));
-    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 0, "not subscribed the first time");
+    assert_eq!(
+        w.engine.subscribed.lock().unwrap().len(),
+        0,
+        "not subscribed the first time"
+    );
     assert_eq!(read(&mut w.conn, key.clone()).await, Some(Mood::Happy));
-    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 1, "keyed and subscribed the second time");
+    assert_eq!(
+        w.engine.subscribed.lock().unwrap().len(),
+        1,
+        "keyed and subscribed the second time"
+    );
     assert_eq!(read(&mut w.conn, key.clone()).await, Some(Mood::Happy));
     assert_eq!(w.hits(), 1, "cached the third time");
 
     // The OIDs live in the cache: a sibling connection knows them at once.
     let inner = AsyncPgConnection::establish(&url()).await.expect("connect");
-    let mut sibling = AsyncSyncedConnection::with_cache(inner, Arc::clone(&w.cache), Route::Streamgres);
+    let mut sibling =
+        AsyncSyncedConnection::with_cache(inner, Arc::clone(&w.cache), Route::Streamgres);
     assert_eq!(read(&mut sibling, key.clone()).await, Some(Mood::Happy));
-    assert_eq!(w.hits(), 2, "the sibling hit the same entry without a live read");
+    assert_eq!(
+        w.hits(),
+        2,
+        "the sibling hit the same entry without a live read"
+    );
     let _ = diesel::sql_query("DELETE FROM sg_moods WHERE key = $1")
         .bind::<diesel::sql_types::Text, _>(&key)
         .execute(&mut w.other)
@@ -411,17 +483,34 @@ async fn pipelined_reads_do_not_touch_the_transaction_state() {
     let (first, second) = futures_util::join!(first, second);
     let first: Vec<String> = first
         .unwrap()
-        .map(|row| row.and_then(|row| <String as FromSqlRow<diesel::sql_types::Text, diesel::pg::Pg>>::build_from_row(&row).map_err(diesel::result::Error::DeserializationError)))
+        .map(|row| {
+            row.and_then(|row| {
+                <String as FromSqlRow<diesel::sql_types::Text, diesel::pg::Pg>>::build_from_row(
+                    &row,
+                )
+                .map_err(diesel::result::Error::DeserializationError)
+            })
+        })
         .try_collect()
         .await
         .unwrap();
     let second: Vec<String> = second
         .unwrap()
-        .map(|row| row.and_then(|row| <String as FromSqlRow<diesel::sql_types::Text, diesel::pg::Pg>>::build_from_row(&row).map_err(diesel::result::Error::DeserializationError)))
+        .map(|row| {
+            row.and_then(|row| {
+                <String as FromSqlRow<diesel::sql_types::Text, diesel::pg::Pg>>::build_from_row(
+                    &row,
+                )
+                .map_err(diesel::result::Error::DeserializationError)
+            })
+        })
         .try_collect()
         .await
         .unwrap();
-    assert_eq!((first, second), (vec!["1".to_string()], vec!["2".to_string()]));
+    assert_eq!(
+        (first, second),
+        (vec!["1".to_string()], vec!["2".to_string()])
+    );
     w.clean().await;
 }
 
@@ -433,11 +522,16 @@ async fn a_route_scope_ends_when_its_future_is_dropped() {
     w.put("mode", "b").await;
     let dropped = tokio::time::timeout(
         Duration::from_millis(10),
-        w.conn.with_route(Route::Postgres, |_| std::future::pending::<()>().boxed()),
+        w.conn
+            .with_route(Route::Postgres, |_| std::future::pending::<()>().boxed()),
     )
     .await;
     assert!(dropped.is_err(), "the scope's future was dropped mid-way");
-    assert_eq!(w.read("mode").await.as_deref(), Some("a"), "the scope was restored: the cache answers");
+    assert_eq!(
+        w.read("mode").await.as_deref(),
+        Some("a"),
+        "the scope was restored: the cache answers"
+    );
     w.clean().await;
 }
 
@@ -453,7 +547,10 @@ async fn a_read_dropped_after_subscribing_ends_its_subscription() {
     // landed on its blocking thread by then, and the Postgres read has
     // at best been sent.
     let mut read = Box::pin(AsyncConnection::load(&mut w.conn, query));
-    assert!(futures_util::poll!(read.as_mut()).is_pending(), "a miss cannot complete in one poll");
+    assert!(
+        futures_util::poll!(read.as_mut()).is_pending(),
+        "a miss cannot complete in one poll"
+    );
     drop(read);
     // The drop ends the subscription at once (a no-op on the engine side
     // if the subscribe has not landed yet); the blocking thread's
@@ -471,7 +568,10 @@ async fn a_read_dropped_after_subscribing_ends_its_subscription() {
     assert_eq!(subscribed, 1, "the subscribe landed on its blocking thread");
     // The guard's drop and the blocking thread's check can both end it;
     // the second is a no-op on the engine side, so either count is right.
-    assert!((1..=2).contains(&unsubscribed), "the subscription the dropped read made was ended: {unsubscribed}");
+    assert!(
+        (1..=2).contains(&unsubscribed),
+        "the subscription the dropped read made was ended: {unsubscribed}"
+    );
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(w.cache.reservations(), 0, "and its reservation released");
     assert_eq!(w.cache.len(), 0);
@@ -485,14 +585,19 @@ async fn a_write_on_a_sibling_connection_is_seen_through_the_shared_cache() {
     w.put("mode", "a").await;
     assert_eq!(w.read("mode").await.as_deref(), Some("a"));
     let inner = AsyncPgConnection::establish(&url()).await.expect("connect");
-    let mut sibling = AsyncSyncedConnection::with_cache(inner, Arc::clone(&w.cache), Route::Streamgres);
+    let mut sibling =
+        AsyncSyncedConnection::with_cache(inner, Arc::clone(&w.cache), Route::Streamgres);
     let key = w.key("mode");
     diesel::update(sg_configs::table.filter(sg_configs::key.eq(&key)))
         .set(sg_configs::value.eq("b"))
         .execute(&mut sibling)
         .await
         .unwrap();
-    assert_eq!(w.read("mode").await.as_deref(), Some("b"), "the other connection reads Postgres for the window");
+    assert_eq!(
+        w.read("mode").await.as_deref(),
+        Some("b"),
+        "the other connection reads Postgres for the window"
+    );
     assert_eq!(stat(&w.cache.stats.after_write), 1);
     w.clean().await;
 }

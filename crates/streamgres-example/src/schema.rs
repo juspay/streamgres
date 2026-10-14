@@ -63,4 +63,10 @@ diesel::joinable!(agents -> organizations (org_id));
 diesel::joinable!(tickets -> organizations (org_id));
 diesel::joinable!(comments -> tickets (ticket_id));
 diesel::joinable!(attachments -> tickets (ticket_id));
-diesel::allow_tables_to_appear_in_same_query!(organizations, agents, tickets, comments, attachments);
+diesel::allow_tables_to_appear_in_same_query!(
+    organizations,
+    agents,
+    tickets,
+    comments,
+    attachments
+);

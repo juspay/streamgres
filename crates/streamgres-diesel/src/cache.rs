@@ -359,7 +359,12 @@ impl Cache {
     /// rows in, since nothing holds a lock across the insert (moka runs
     /// the eviction listener on the inserting thread, and the listener
     /// takes the generations lock).
-    pub fn fill_weighing(&self, reservation: Reservation, rows: Arc<[OwnedRow]>, store_bytes: usize) -> bool {
+    pub fn fill_weighing(
+        &self,
+        reservation: Reservation,
+        rows: Arc<[OwnedRow]>,
+        store_bytes: usize,
+    ) -> bool {
         if self.generation(&reservation.key) != reservation.generation {
             Stats::bump(&self.stats.stale_fills);
             return false;
@@ -454,7 +459,10 @@ impl Cache {
         match self.last_write.load(Ordering::Acquire) {
             0 => false,
             marked => {
-                let since = self.started.elapsed().saturating_sub(Duration::from_nanos(marked - 1));
+                let since = self
+                    .started
+                    .elapsed()
+                    .saturating_sub(Duration::from_nanos(marked - 1));
                 since < window
             }
         }
@@ -559,7 +567,12 @@ mod tests {
             Outcome::Verdict(Verdict::Accepted)
         }
 
-        fn materialize(&self, _: &QueryKey, _: Snapshot, _: HashMap<String, Arc<TableTypes>>) -> Verdict {
+        fn materialize(
+            &self,
+            _: &QueryKey,
+            _: Snapshot,
+            _: HashMap<String, Arc<TableTypes>>,
+        ) -> Verdict {
             Verdict::Accepted
         }
 
@@ -581,7 +594,10 @@ mod tests {
         drop(second);
         cache.abandon(&k);
         assert_eq!(engine.unsubscribed.lock().unwrap().len(), 1);
-        assert!(!cache.fill(first, no_rows()), "the first reader's fill is refused");
+        assert!(
+            !cache.fill(first, no_rows()),
+            "the first reader's fill is refused"
+        );
         assert!(cache.is_empty());
         assert_eq!(cache.reservations(), 0);
     }
@@ -597,8 +613,15 @@ mod tests {
         let newer: Arc<[OwnedRow]> = Arc::from(vec![OwnedRow::new(columns, vec![None])]);
         let engine_side = cache.reserve(&k);
         cache.replace(engine_side, Arc::clone(&newer), 0);
-        assert!(!cache.fill(reservation, no_rows()), "the snapshot's rows are older than the delta's");
-        assert_eq!(cache.get(&k).map(|entry| entry.rows.len()), Some(1), "the delta's rows stay");
+        assert!(
+            !cache.fill(reservation, no_rows()),
+            "the snapshot's rows are older than the delta's"
+        );
+        assert_eq!(
+            cache.get(&k).map(|entry| entry.rows.len()),
+            Some(1),
+            "the delta's rows stay"
+        );
         assert_eq!(cache.stats.stale_fills.load(Ordering::Relaxed), 1);
     }
 
@@ -612,7 +635,10 @@ mod tests {
         let engine_side = cache.reserve(&k);
         cache.abandon(&k);
         cache.replace(engine_side, no_rows(), 0);
-        assert!(cache.is_empty(), "rows built for a subscription that ended are not kept");
+        assert!(
+            cache.is_empty(),
+            "rows built for a subscription that ended are not kept"
+        );
     }
 
     #[test]
@@ -630,7 +656,10 @@ mod tests {
         let engine_side = cache.reserve(&k);
         cache.replace(engine_side, no_rows(), 0);
         assert_eq!(engine.unsubscribed.lock().unwrap().len(), 1);
-        assert!(!cache.fill(other, no_rows()), "the other reader's smaller fill cannot keep a key with no subscription");
+        assert!(
+            !cache.fill(other, no_rows()),
+            "the other reader's smaller fill cannot keep a key with no subscription"
+        );
     }
 
     #[test]
@@ -651,8 +680,15 @@ mod tests {
         let reservation = cache.reserve(&k);
         assert_eq!(cache.reservations(), 1);
         cache.touched(&k);
-        assert!(!cache.fill(reservation, no_rows()), "touched during the read");
-        assert_eq!(cache.reservations(), 0, "the reservation went with the fill");
+        assert!(
+            !cache.fill(reservation, no_rows()),
+            "touched during the read"
+        );
+        assert_eq!(
+            cache.reservations(),
+            0,
+            "the reservation went with the fill"
+        );
 
         // Touches, evictions and expiries of keys nobody is reading leave
         // nothing behind.
@@ -674,7 +710,10 @@ mod tests {
         let older = cache.reserve(&k);
         cache.touched(&k);
         let newer = cache.reserve(&k);
-        assert!(cache.fill(newer, no_rows()), "the newer read saw the change");
+        assert!(
+            cache.fill(newer, no_rows()),
+            "the newer read saw the change"
+        );
         assert!(!cache.fill(older, no_rows()), "the older read did not");
         assert_eq!(cache.reservations(), 0);
     }
@@ -695,7 +734,10 @@ mod tests {
         assert!(cache.is_empty());
         let engine_side = cache.reserve(&k);
         cache.replace(engine_side, no_rows(), 0);
-        assert!(cache.is_empty(), "the engine's rows are bounded the same way");
+        assert!(
+            cache.is_empty(),
+            "the engine's rows are bounded the same way"
+        );
     }
 
     #[test]

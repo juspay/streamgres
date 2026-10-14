@@ -60,8 +60,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use diesel::connection::{
-    AnsiTransactionManager, ConnectionSealed, DefaultLoadingMode, Instrumentation,
-    LoadConnection, SimpleConnection, TransactionManager,
+    AnsiTransactionManager, ConnectionSealed, DefaultLoadingMode, Instrumentation, LoadConnection,
+    SimpleConnection, TransactionManager,
 };
 use diesel::expression::QueryMetadata;
 use diesel::pg::{GetPgMetadataCache, Pg, PgMetadataCache};
@@ -69,14 +69,14 @@ use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::r2d2::R2D2Connection;
 use diesel::{Connection, ConnectionResult, QueryResult};
 
+#[cfg(feature = "async")]
+pub use crate::asynchronous::AsyncSyncedConnection;
 use crate::cache::Cache;
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
+pub use crate::route::{Route, RouteDsl, Via};
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::Verdict;
-pub use crate::route::{Route, RouteDsl, Via};
-#[cfg(feature = "async")]
-pub use crate::asynchronous::AsyncSyncedConnection;
 
 /// The earlier name of [`Route`]: `Consistency::Eventual` is
 /// [`Route::Streamgres`], `Consistency::Strong` is [`Route::Postgres`].
@@ -108,7 +108,10 @@ type AttachmentFor = dyn Fn(&str) -> Option<Attachment> + Send + Sync;
 
 impl Settings {
     /// One database: every connection shares `cache`, routed by its URL.
-    pub fn single(cache: Arc<Cache>, route_for: impl Fn(&str) -> Route + Send + Sync + 'static) -> Settings {
+    pub fn single(
+        cache: Arc<Cache>,
+        route_for: impl Fn(&str) -> Route + Send + Sync + 'static,
+    ) -> Settings {
         Settings::by_url(move |url| {
             Some(Attachment {
                 cache: Arc::clone(&cache),
@@ -119,7 +122,9 @@ impl Settings {
 
     /// A cache and a route per URL. A URL that yields `None` gets a
     /// passthrough connection: every read goes to Postgres.
-    pub fn by_url(for_url: impl Fn(&str) -> Option<Attachment> + Send + Sync + 'static) -> Settings {
+    pub fn by_url(
+        for_url: impl Fn(&str) -> Option<Attachment> + Send + Sync + 'static,
+    ) -> Settings {
         Settings {
             for_url: Box::new(for_url),
         }
@@ -312,10 +317,17 @@ where
 
     fn establish(database_url: &str) -> ConnectionResult<Self> {
         let inner = C::establish(database_url)?;
-        Ok(match SETTINGS.get().and_then(|settings| settings.attachment_for(database_url)) {
-            Some(Attachment { cache, route }) => SyncedConnection::with_cache(inner, cache, route),
-            None => SyncedConnection::new(inner),
-        })
+        Ok(
+            match SETTINGS
+                .get()
+                .and_then(|settings| settings.attachment_for(database_url))
+            {
+                Some(Attachment { cache, route }) => {
+                    SyncedConnection::with_cache(inner, cache, route)
+                }
+                None => SyncedConnection::new(inner),
+            },
+        )
     }
 
     fn begin_test_transaction(&mut self) -> QueryResult<()> {
@@ -461,7 +473,15 @@ pub(crate) fn may_write(sql: &str) -> bool {
         .next()
         .unwrap_or("");
     ![
-        "SELECT", "BEGIN", "START", "SAVEPOINT", "RELEASE", "ROLLBACK", "SET", "RESET", "SHOW",
+        "SELECT",
+        "BEGIN",
+        "START",
+        "SAVEPOINT",
+        "RELEASE",
+        "ROLLBACK",
+        "SET",
+        "RESET",
+        "SHOW",
     ]
     .iter()
     .any(|statement| word.eq_ignore_ascii_case(statement))

@@ -6,12 +6,12 @@
 //! and an `int8` eight. So the exact column types come from Postgres
 //! itself, once per table, through the connection the read came in on.
 
-use std::collections::HashMap;
 use diesel::connection::{DefaultLoadingMode, LoadConnection};
 use diesel::pg::Pg;
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel::sql_types::{Integer, Nullable, Oid, Text};
+use std::collections::HashMap;
 
 /// One column of a table as Postgres declares it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +32,10 @@ pub enum TypeKind {
     /// A user enum: its labels travel as text.
     Enum,
     /// A one-dimensional array of `element`, which is `Base` or `Enum`.
-    Array { element: u32, element_kind: Box<TypeKind> },
+    Array {
+        element: u32,
+        element_kind: Box<TypeKind>,
+    },
     /// Composite, range, domain, pseudo: not encoded.
     Other,
 }
@@ -175,7 +178,9 @@ pub fn all_table_types(rows: Vec<TableAttribute>) -> std::collections::HashMap<S
         }
         tables
             .entry(row.relname)
-            .or_insert_with(|| TableTypes { columns: Vec::new() })
+            .or_insert_with(|| TableTypes {
+                columns: Vec::new(),
+            })
             .columns
             .push(row.attribute.into_column());
     }

@@ -136,9 +136,17 @@ fn a_commit_the_engine_reports_refills_the_cache() {
     };
     live.put("rate", "1");
 
-    assert_eq!(live.read("rate").as_deref(), Some("1"), "first read, from Postgres");
+    assert_eq!(
+        live.read("rate").as_deref(),
+        Some("1"),
+        "first read, from Postgres"
+    );
     assert_eq!(live.engine.subscribed(), 1, "the engine accepted the query");
-    assert_eq!(live.read("rate").as_deref(), Some("1"), "second read, from the cache");
+    assert_eq!(
+        live.read("rate").as_deref(),
+        Some("1"),
+        "second read, from the cache"
+    );
     assert_eq!(live.cache.stats.hits.load(Ordering::Relaxed), 1);
 
     live.put("rate", "2");
@@ -147,7 +155,11 @@ fn a_commit_the_engine_reports_refills_the_cache() {
         .expect("the change reached the cache through the engine");
     eprintln!("commit to refilled read: {took:?}");
     assert!(changes(&live.cache) >= 1);
-    assert_eq!(live.engine.subscribed(), 1, "a change keeps the subscription");
+    assert_eq!(
+        live.engine.subscribed(),
+        1,
+        "a change keeps the subscription"
+    );
 
     // A delete is a change too.
     diesel::delete(sg_configs::table.filter(sg_configs::key.eq(live.key("rate"))))
@@ -155,7 +167,10 @@ fn a_commit_the_engine_reports_refills_the_cache() {
         .expect("delete");
     let started = Instant::now();
     while live.read("rate").is_some() {
-        assert!(started.elapsed() < Duration::from_secs(10), "the delete never reached the cache");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the delete never reached the cache"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -201,9 +216,17 @@ fn a_query_outside_the_engines_subset_is_served_live() {
             .expect("like")
     };
     assert_eq!(read(&mut live).len(), 1);
-    assert_eq!(live.cache.stats.refused.load(Ordering::Relaxed), 1, "LIKE is refused");
+    assert_eq!(
+        live.cache.stats.refused.load(Ordering::Relaxed),
+        1,
+        "LIKE is refused"
+    );
     live.put("y", "1");
-    assert_eq!(read(&mut live).len(), 2, "live, so the new row is seen at once");
+    assert_eq!(
+        read(&mut live).len(),
+        2,
+        "live, so the new row is seen at once"
+    );
     assert_eq!(live.engine.subscribed(), 0);
 
     // Raw SQL in the subset is accepted.
@@ -261,7 +284,11 @@ fn evicting_an_entry_unsubscribes_it_from_the_engine() {
     assert!(held < 6, "held {held}");
     let deadline = Instant::now() + Duration::from_secs(2);
     while engine.subscribed() != held {
-        assert!(Instant::now() < deadline, "subscribed {} held {held}", engine.subscribed());
+        assert!(
+            Instant::now() < deadline,
+            "subscribed {} held {held}",
+            engine.subscribed()
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -303,12 +330,20 @@ fn an_engine_restart_is_survived_without_a_stale_read() {
         .read_until("v", "2", Duration::from_secs(10))
         .expect("the change made during the restart was seen");
     eprintln!("after restart, change seen within: {took:?}");
-    assert_eq!(live.engine.subscribed(), 1, "resubscribed under the same key");
+    assert_eq!(
+        live.engine.subscribed(),
+        1,
+        "resubscribed under the same key"
+    );
     assert_eq!(live.cache.len(), 1, "the entry is back");
     let changes_before = changes(&live.cache);
     let hits_before = live.cache.stats.hits.load(Ordering::Relaxed);
     assert_eq!(live.read("v").as_deref(), Some("2"));
-    assert_eq!(live.cache.stats.hits.load(Ordering::Relaxed), hits_before + 1, "served from the cache");
+    assert_eq!(
+        live.cache.stats.hits.load(Ordering::Relaxed),
+        hits_before + 1,
+        "served from the cache"
+    );
 
     // And the resubscription is live: a further change is reported.
     live.put("v", "3");
@@ -338,11 +373,17 @@ fn rows_mode_reads_postgres_only_for_the_table_types() {
         return;
     };
     let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    live.conn.inner().set_instrumentation(CountQueries(sent.clone()));
+    live.conn
+        .inner()
+        .set_instrumentation(CountQueries(sent.clone()));
     live.put("r", "1");
 
     assert_eq!(live.read("r").as_deref(), Some("1"));
-    assert_eq!(live.engine.materialized(), 1, "served from the engine's rows");
+    assert_eq!(
+        live.engine.materialized(),
+        1,
+        "served from the engine's rows"
+    );
     assert_eq!(
         sent.load(Ordering::SeqCst),
         1,
@@ -355,8 +396,15 @@ fn rows_mode_reads_postgres_only_for_the_table_types() {
         .read_until("r", "2", Duration::from_secs(10))
         .expect("the change arrived as rows");
     eprintln!("ROWS MODE commit to replaced entry: {took:?}");
-    assert_eq!(sent.load(Ordering::SeqCst), 1, "no Postgres read for the change");
-    assert!(live.cache.stats.replaced.load(Ordering::Relaxed) >= 1, "the change replaced the entry");
+    assert_eq!(
+        sent.load(Ordering::SeqCst),
+        1,
+        "no Postgres read for the change"
+    );
+    assert!(
+        live.cache.stats.replaced.load(Ordering::Relaxed) >= 1,
+        "the change replaced the entry"
+    );
     assert_eq!(live.cache.stats.touched.load(Ordering::Relaxed), 0);
 
     // A second query on the same table reuses the types: no lookup.
@@ -374,7 +422,10 @@ fn ordered_limited_and_counted_results_match_postgres() {
     for (name, value) in [("k1", "m"), ("k2", "z"), ("k3", "a"), ("k4", "q")] {
         live.put(name, value);
     }
-    let keys: Vec<String> = ["k1", "k2", "k3", "k4"].iter().map(|k| live.key(k)).collect();
+    let keys: Vec<String> = ["k1", "k2", "k3", "k4"]
+        .iter()
+        .map(|k| live.key(k))
+        .collect();
     let database = std::env::var("DATABASE_URL").unwrap();
     let mut plain = PgConnection::establish(&database).unwrap();
 
@@ -396,7 +447,13 @@ fn ordered_limited_and_counted_results_match_postgres() {
         .unwrap();
     assert_eq!(top(&mut live.conn, &keys), expected);
     assert_eq!(live.engine.materialized(), 1);
-    assert_eq!(expected.iter().map(|c| c.value.as_str()).collect::<Vec<_>>(), ["z", "q"]);
+    assert_eq!(
+        expected
+            .iter()
+            .map(|c| c.value.as_str())
+            .collect::<Vec<_>>(),
+        ["z", "q"]
+    );
 
     // A change that reorders the window.
     live.put("k3", "zz");
@@ -406,7 +463,10 @@ fn ordered_limited_and_counted_results_match_postgres() {
         if now.iter().map(|c| c.value.as_str()).collect::<Vec<_>>() == ["zz", "z"] {
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(10), "window never reordered: {now:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "window never reordered: {now:?}"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 
@@ -425,7 +485,10 @@ fn ordered_limited_and_counted_results_match_postgres() {
         .unwrap();
     let started = Instant::now();
     while count(&mut live.conn) != 3 {
-        assert!(started.elapsed() < Duration::from_secs(10), "count never dropped");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "count never dropped"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -471,22 +534,27 @@ fn microsecond_timestamps_are_exact_and_an_interval_falls_back() {
             sg_items::qty.eq(1),
             sg_items::tags.eq(vec!["a", "b"]),
             sg_items::payload.eq(serde_json::json!({"k": [1, 2]})),
-            sg_items::lead.eq(diesel::data_types::PgInterval::from_microseconds(3_600_000_000)),
+            sg_items::lead.eq(diesel::data_types::PgInterval::from_microseconds(
+                3_600_000_000,
+            )),
         ))
         .execute(&mut live.other)
         .unwrap();
     let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    live.conn.inner().set_instrumentation(CountQueries(sent.clone()));
+    live.conn
+        .inner()
+        .set_instrumentation(CountQueries(sent.clone()));
 
     // `created` is timestamptz(6): served from engine rows, to the
     // microsecond.
-    let with_created = |conn: &mut SyncedConnection<PgConnection>| -> (i32, chrono::DateTime<chrono::Utc>) {
-        sg_items::table
-            .filter(sg_items::name.eq(&name))
-            .select((sg_items::qty, sg_items::created))
-            .first(conn)
-            .expect("with created")
-    };
+    let with_created =
+        |conn: &mut SyncedConnection<PgConnection>| -> (i32, chrono::DateTime<chrono::Utc>) {
+            sg_items::table
+                .filter(sg_items::name.eq(&name))
+                .select((sg_items::qty, sg_items::created))
+                .first(conn)
+                .expect("with created")
+        };
     let first = with_created(&mut live.conn);
     let from_postgres: (i32, chrono::DateTime<chrono::Utc>) = sg_items::table
         .filter(sg_items::name.eq(&name))
@@ -494,7 +562,12 @@ fn microsecond_timestamps_are_exact_and_an_interval_falls_back() {
         .first(&mut live.other)
         .unwrap();
     assert_eq!(first, from_postgres, "exact to the microsecond");
-    assert_eq!(live.engine.materialized(), 1, "rows mode: {:?}", live.engine.fallbacks());
+    assert_eq!(
+        live.engine.materialized(),
+        1,
+        "rows mode: {:?}",
+        live.engine.fallbacks()
+    );
     assert_eq!(sent.load(Ordering::SeqCst), 1, "the type lookup only");
     assert_eq!(with_created(&mut live.conn), first, "and cached");
     assert_eq!(sent.load(Ordering::SeqCst), 1);
@@ -512,14 +585,20 @@ fn microsecond_timestamps_are_exact_and_an_interval_falls_back() {
     assert_eq!(lead.1.map(|i| i.microseconds), Some(3_600_000_000));
     assert_eq!(live.engine.materialized(), 1, "fell back to refills");
     assert!(
-        live.engine.fallbacks().last().is_some_and(|why| why.contains("oid 1186")),
+        live.engine
+            .fallbacks()
+            .last()
+            .is_some_and(|why| why.contains("oid 1186")),
         "{:?}",
         live.engine.fallbacks()
     );
     assert_eq!(live.engine.subscribed(), 2);
     assert_eq!(sent.load(Ordering::SeqCst), 2, "the row read");
     assert_eq!(with_lead(&mut live.conn), lead, "and cached");
-    assert!(sent.load(Ordering::SeqCst) <= 3, "at most one redundant refill");
+    assert!(
+        sent.load(Ordering::SeqCst) <= 3,
+        "at most one redundant refill"
+    );
     let settled = sent.load(Ordering::SeqCst);
 
     diesel::update(sg_items::table.filter(sg_items::name.eq(&name)))
@@ -533,10 +612,17 @@ fn microsecond_timestamps_are_exact_and_an_interval_falls_back() {
         if a == 2 && b == 2 {
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(10), "the update never arrived: {a} {b}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the update never arrived: {a} {b}"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(sent.load(Ordering::SeqCst), settled + 1, "one refill read for the fallback query, none for rows mode");
+    assert_eq!(
+        sent.load(Ordering::SeqCst),
+        settled + 1,
+        "one refill read for the fallback query, none for rows mode"
+    );
     diesel::delete(sg_items::table.filter(sg_items::name.eq(&name)))
         .execute(&mut live.other)
         .unwrap();
@@ -574,25 +660,48 @@ fn joins_are_composed_from_the_engines_rows() {
     let database = std::env::var("DATABASE_URL").unwrap();
     let mut plain = PgConnection::establish(&database).unwrap();
     let p = live.prefix.clone();
-    let names: Vec<String> = ["ann", "bob", "cy"].iter().map(|n| format!("{p}{n}")).collect();
+    let names: Vec<String> = ["ann", "bob", "cy"]
+        .iter()
+        .map(|n| format!("{p}{n}"))
+        .collect();
     // Clean, then seed: ann has two books, bob none, cy one.
-    diesel::delete(sg_books::table.filter(sg_books::title.like(format!("{p}%")))).execute(&mut plain).unwrap();
-    diesel::delete(sg_authors::table.filter(sg_authors::name.like(format!("{p}%")))).execute(&mut plain).unwrap();
+    diesel::delete(sg_books::table.filter(sg_books::title.like(format!("{p}%"))))
+        .execute(&mut plain)
+        .unwrap();
+    diesel::delete(sg_authors::table.filter(sg_authors::name.like(format!("{p}%"))))
+        .execute(&mut plain)
+        .unwrap();
     let ids: Vec<i32> = diesel::insert_into(sg_authors::table)
-        .values(names.iter().map(|n| sg_authors::name.eq(n)).collect::<Vec<_>>())
+        .values(
+            names
+                .iter()
+                .map(|n| sg_authors::name.eq(n))
+                .collect::<Vec<_>>(),
+        )
         .returning(sg_authors::id)
         .get_results(&mut plain)
         .unwrap();
     diesel::insert_into(sg_books::table)
         .values(vec![
-            (sg_books::author_id.eq(ids[0]), sg_books::title.eq(format!("{p}a1"))),
-            (sg_books::author_id.eq(ids[0]), sg_books::title.eq(format!("{p}a2"))),
-            (sg_books::author_id.eq(ids[2]), sg_books::title.eq(format!("{p}c1"))),
+            (
+                sg_books::author_id.eq(ids[0]),
+                sg_books::title.eq(format!("{p}a1")),
+            ),
+            (
+                sg_books::author_id.eq(ids[0]),
+                sg_books::title.eq(format!("{p}a2")),
+            ),
+            (
+                sg_books::author_id.eq(ids[2]),
+                sg_books::title.eq(format!("{p}c1")),
+            ),
         ])
         .execute(&mut plain)
         .unwrap();
     let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    live.conn.inner().set_instrumentation(CountQueries(sent.clone()));
+    live.conn
+        .inner()
+        .set_instrumentation(CountQueries(sent.clone()));
 
     // authors.inner_join(books), filtered by the authors in play, ordered.
     type Pair = (String, String);
@@ -617,17 +726,31 @@ fn joins_are_composed_from_the_engines_rows() {
     let expected = inner(&mut plain, &names);
     assert_eq!(expected.len(), 3);
     assert_eq!(through(&mut live.conn, &names), expected);
-    assert_eq!(live.engine.materialized(), 1, "{:?}", live.engine.fallbacks());
-    assert_eq!(sent.load(Ordering::SeqCst), 2, "two type lookups, no row read");
+    assert_eq!(
+        live.engine.materialized(),
+        1,
+        "{:?}",
+        live.engine.fallbacks()
+    );
+    assert_eq!(
+        sent.load(Ordering::SeqCst),
+        2,
+        "two type lookups, no row read"
+    );
     assert_eq!(through(&mut live.conn, &names), expected);
     assert_eq!(sent.load(Ordering::SeqCst), 2);
 
     // A book for bob appears; one of ann's goes; cy is renamed.
     diesel::insert_into(sg_books::table)
-        .values((sg_books::author_id.eq(ids[1]), sg_books::title.eq(format!("{p}b1"))))
+        .values((
+            sg_books::author_id.eq(ids[1]),
+            sg_books::title.eq(format!("{p}b1")),
+        ))
         .execute(&mut plain)
         .unwrap();
-    diesel::delete(sg_books::table.filter(sg_books::title.eq(format!("{p}a2")))).execute(&mut plain).unwrap();
+    diesel::delete(sg_books::table.filter(sg_books::title.eq(format!("{p}a2"))))
+        .execute(&mut plain)
+        .unwrap();
     diesel::update(sg_authors::table.filter(sg_authors::id.eq(ids[2])))
         .set(sg_authors::name.eq(format!("{p}cyrus")))
         .execute(&mut plain)
@@ -642,7 +765,10 @@ fn joins_are_composed_from_the_engines_rows() {
         if now == expected {
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(10), "join never caught up: {now:?} vs {expected:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "join never caught up: {now:?} vs {expected:?}"
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(sent.load(Ordering::SeqCst), 2, "still no Postgres read");
@@ -673,10 +799,19 @@ fn joins_are_composed_from_the_engines_rows() {
         .get_result(&mut live.conn)
         .unwrap();
     assert_eq!(count, 3);
-    assert_eq!(live.engine.materialized(), 3, "{:?}", live.engine.fallbacks());
+    assert_eq!(
+        live.engine.materialized(),
+        3,
+        "{:?}",
+        live.engine.fallbacks()
+    );
 
-    diesel::delete(sg_books::table.filter(sg_books::title.like(format!("{p}%")))).execute(&mut plain).unwrap();
-    diesel::delete(sg_authors::table.filter(sg_authors::name.like(format!("{p}%")))).execute(&mut plain).unwrap();
+    diesel::delete(sg_books::table.filter(sg_books::title.like(format!("{p}%"))))
+        .execute(&mut plain)
+        .unwrap();
+    diesel::delete(sg_authors::table.filter(sg_authors::name.like(format!("{p}%"))))
+        .execute(&mut plain)
+        .unwrap();
 }
 
 /// A pool of sockets spreads the subscriptions across them, and a key
@@ -699,7 +834,11 @@ fn a_pool_spreads_subscriptions_across_its_sockets() {
     engine.attach(&cache);
     let deadline = Instant::now() + Duration::from_secs(5);
     while engine.connections() < 3 {
-        assert!(Instant::now() < deadline, "only {} sockets connected", engine.connections());
+        assert!(
+            Instant::now() < deadline,
+            "only {} sockets connected",
+            engine.connections()
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     let mut conn = SyncedConnection::with_cache(
@@ -719,7 +858,10 @@ fn a_pool_spreads_subscriptions_across_its_sockets() {
             .unwrap()
     };
     for i in 0..6 {
-        assert_eq!(read(&mut conn, live.key(&format!("p{i}"))).as_deref(), Some(format!("v{i}").as_str()));
+        assert_eq!(
+            read(&mut conn, live.key(&format!("p{i}"))).as_deref(),
+            Some(format!("v{i}").as_str())
+        );
     }
     assert_eq!(engine.subscribed(), 6);
     assert_eq!(engine.per_worker(), vec![2, 2, 2], "least-loaded routing");
@@ -733,11 +875,18 @@ fn a_pool_spreads_subscriptions_across_its_sockets() {
         if read(&mut conn, live.key("p4")).as_deref() == Some("v4b") {
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(10), "the change on a pooled key was not seen");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the change on a pooled key was not seen"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(changes(&cache) > before);
-    assert_eq!(engine.per_worker(), vec![2, 2, 2], "a change keeps the key where it was");
+    assert_eq!(
+        engine.per_worker(),
+        vec![2, 2, 2],
+        "a change keeps the key where it was"
+    );
     assert_eq!(engine.subscribed(), 6);
 
     // Dropping one subscription frees its slot on its socket only.
@@ -752,7 +901,10 @@ fn a_pool_spreads_subscriptions_across_its_sockets() {
 
 /// The cache key of the test's lookup: what `first` renders, bind values
 /// included.
-fn query_key(conn: &mut SyncedConnection<PgConnection>, key: String) -> streamgres_diesel::key::QueryKey {
+fn query_key(
+    conn: &mut SyncedConnection<PgConnection>,
+    key: String,
+) -> streamgres_diesel::key::QueryKey {
     let query = sg_configs::table
         .filter(sg_configs::key.eq(key))
         .select(sg_configs::value)
@@ -802,11 +954,18 @@ fn the_subscription_cap_serves_the_rest_live() {
             .unwrap()
     };
     for i in 0..3 {
-        assert_eq!(read(&mut conn, live.key(&format!("c{i}"))).as_deref(), Some(format!("v{i}").as_str()));
+        assert_eq!(
+            read(&mut conn, live.key(&format!("c{i}"))).as_deref(),
+            Some(format!("v{i}").as_str())
+        );
     }
     assert_eq!(engine.subscribed(), 2, "the cap holds");
     assert_eq!(cache.len(), 2);
-    assert_eq!(cache.stats.refused.load(Ordering::Relaxed), 1, "the third was refused by the client");
+    assert_eq!(
+        cache.stats.refused.load(Ordering::Relaxed),
+        1,
+        "the third was refused by the client"
+    );
 
     // The third key is live every time, so a change is seen at once;
     // the held keys are cached.
@@ -823,7 +982,11 @@ fn the_subscription_cap_serves_the_rest_live() {
     cache.touched(&key);
     assert_eq!(engine.subscribed(), 1);
     assert_eq!(read(&mut conn, live.key("c2")).as_deref(), Some("v2b"));
-    assert_eq!(engine.subscribed(), 2, "the freed slot went to the next miss");
+    assert_eq!(
+        engine.subscribed(),
+        2,
+        "the freed slot went to the next miss"
+    );
 }
 
 diesel::table! {
@@ -856,12 +1019,19 @@ fn bytea_and_offset_are_served_from_engine_rows() {
         .map(|i| {
             (
                 sg_blobs::name.eq(format!("{prefix}{i}")),
-                sg_blobs::data.eq(if i == 3 { None } else { Some(vec![i as u8, 0xff, 0x10]) }),
+                sg_blobs::data.eq(if i == 3 {
+                    None
+                } else {
+                    Some(vec![i as u8, 0xff, 0x10])
+                }),
                 sg_blobs::n.eq(i),
             )
         })
         .collect();
-    diesel::insert_into(sg_blobs::table).values(&rows).execute(&mut live.other).unwrap();
+    diesel::insert_into(sg_blobs::table)
+        .values(&rows)
+        .execute(&mut live.other)
+        .unwrap();
 
     let names: Vec<String> = (0..5).map(|i| format!("{prefix}{i}")).collect();
     let page = |conn: &mut SyncedConnection<PgConnection>| -> Vec<(i32, Option<Vec<u8>>)> {
@@ -877,10 +1047,18 @@ fn bytea_and_offset_are_served_from_engine_rows() {
     let got = page(&mut live.conn);
     assert_eq!(
         got,
-        vec![(1, Some(vec![1, 0xff, 0x10])), (2, Some(vec![2, 0xff, 0x10]))],
+        vec![
+            (1, Some(vec![1, 0xff, 0x10])),
+            (2, Some(vec![2, 0xff, 0x10]))
+        ],
         "skipped one, took two, bytes intact"
     );
-    assert_eq!(live.engine.materialized(), 1, "rows mode: {:?}", live.engine.fallbacks());
+    assert_eq!(
+        live.engine.materialized(),
+        1,
+        "rows mode: {:?}",
+        live.engine.fallbacks()
+    );
     assert_eq!(live.engine.subscribed(), 1);
 
     // A change inside the page arrives as a delta; the NULL row and the
@@ -895,7 +1073,10 @@ fn bytea_and_offset_are_served_from_engine_rows() {
         if got[1].1.as_deref() == Some(&[0xab][..]) {
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(10), "the delta did not arrive: {got:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the delta did not arrive: {got:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     let third: Vec<(i32, Option<Vec<u8>>)> = sg_blobs::table
@@ -907,8 +1088,14 @@ fn bytea_and_offset_are_served_from_engine_rows() {
         .load(&mut live.conn)
         .unwrap();
     assert_eq!(third, vec![(3, None)], "a NULL bytea stays NULL");
-    assert_eq!(live.engine.materialized(), 2, "{:?}", live.engine.fallbacks());
-    let _ = diesel::delete(sg_blobs::table.filter(sg_blobs::name.like(format!("{prefix}%")))).execute(&mut live.other);
+    assert_eq!(
+        live.engine.materialized(),
+        2,
+        "{:?}",
+        live.engine.fallbacks()
+    );
+    let _ = diesel::delete(sg_blobs::table.filter(sg_blobs::name.like(format!("{prefix}%"))))
+        .execute(&mut live.other);
 }
 
 #[test]
@@ -926,8 +1113,16 @@ fn a_row_inserted_and_deleted_in_one_transaction_is_not_kept() {
             .load(conn)
             .unwrap()
     };
-    assert_eq!(page(&mut live.conn), vec![(live.key("real"), "1".to_string())]);
-    assert_eq!(live.engine.materialized(), 1, "rows mode: {:?}", live.engine.fallbacks());
+    assert_eq!(
+        page(&mut live.conn),
+        vec![(live.key("real"), "1".to_string())]
+    );
+    assert_eq!(
+        live.engine.materialized(),
+        1,
+        "rows mode: {:?}",
+        live.engine.fallbacks()
+    );
 
     // One transaction: a matching row comes and goes, and another row
     // changes so the delta's arrival can be seen. The engine folds the
@@ -949,11 +1144,22 @@ fn a_row_inserted_and_deleted_in_one_transaction_is_not_kept() {
     loop {
         let got = page(&mut live.conn);
         if got.iter().any(|(_, value)| value == "2") {
-            assert_eq!(got, vec![(real.clone(), "2".to_string())], "the ghost row must not be in the result");
+            assert_eq!(
+                got,
+                vec![(real.clone(), "2".to_string())],
+                "the ghost row must not be in the result"
+            );
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(10), "the delta did not arrive: {got:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the delta did not arrive: {got:?}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(live.cache.stats.touched.load(Ordering::Relaxed), 0, "served from engine rows throughout");
+    assert_eq!(
+        live.cache.stats.touched.load(Ordering::Relaxed),
+        0,
+        "served from engine rows throughout"
+    );
 }

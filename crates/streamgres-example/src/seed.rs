@@ -8,8 +8,8 @@
 //! inserts rather than truncating, so an engine already following the
 //! tables sees ordinary changes.
 
-use diesel::connection::SimpleConnection;
 use diesel::QueryResult;
+use diesel::connection::SimpleConnection;
 
 /// Creates the types and tables if they do not exist.
 pub const SCHEMA: &str = "

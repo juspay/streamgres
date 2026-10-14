@@ -44,7 +44,10 @@ pub enum Lookup {
         page: i64,
     },
     /// How many tickets a queue has: a `COUNT(*)`.
-    QueueCount { org: i64, statuses: Vec<TicketStatus> },
+    QueueCount {
+        org: i64,
+        statuses: Vec<TicketStatus>,
+    },
     /// A ticket's comments with its title: an inner join, composed from
     /// the engine's rows per table.
     Comments { ticket: i64 },
@@ -128,19 +131,38 @@ impl Lookup {
 
     /// A demo lookup by name.
     pub fn named(name: &str) -> Option<Lookup> {
-        Self::demo().into_iter().find(|lookup| lookup.name() == name)
+        Self::demo()
+            .into_iter()
+            .find(|lookup| lookup.name() == name)
     }
 
     pub fn run_sync(&self, conn: &mut SyncConn) -> QueryResult<Value> {
         match self {
             Lookup::Ticket { id } => json(sync_load(ticket(*id), conn)?),
-            Lookup::Queue { org, statuses, page } => json(sync_load(queue(*org, statuses.clone(), *page), conn)?),
-            Lookup::QueueCount { org, statuses } => json(sync_load::<_, i64>(queue_count(*org, statuses.clone()), conn)?),
-            Lookup::Comments { ticket } => json(comments_of(sync_load::<_, CommentRow>(ticket_comments(*ticket), conn)?)),
+            Lookup::Queue {
+                org,
+                statuses,
+                page,
+            } => json(sync_load(queue(*org, statuses.clone(), *page), conn)?),
+            Lookup::QueueCount { org, statuses } => json(sync_load::<_, i64>(
+                queue_count(*org, statuses.clone()),
+                conn,
+            )?),
+            Lookup::Comments { ticket } => json(comments_of(sync_load::<_, CommentRow>(
+                ticket_comments(*ticket),
+                conn,
+            )?)),
             Lookup::Attachment { id } => json(sync_load(attachment(*id), conn)?),
             Lookup::Agents { org } => json(sync_load(org_agents(*org), conn)?),
-            Lookup::Sla { org } => json(sync_load(sla(*org), conn)?.into_iter().map(TicketSla::from_row).collect::<Vec<_>>()),
-            Lookup::Search { org, pattern } => json(sync_load(search(*org, pattern.clone()), conn)?),
+            Lookup::Sla { org } => json(
+                sync_load(sla(*org), conn)?
+                    .into_iter()
+                    .map(TicketSla::from_row)
+                    .collect::<Vec<_>>(),
+            ),
+            Lookup::Search { org, pattern } => {
+                json(sync_load(search(*org, pattern.clone()), conn)?)
+            }
             Lookup::Recent { org, limit } => json(sync_load(recent(*org, *limit), conn)?),
         }
     }
@@ -148,9 +170,17 @@ impl Lookup {
     pub async fn run_async(&self, conn: &mut AsyncConn) -> QueryResult<Value> {
         match self {
             Lookup::Ticket { id } => json(async_load(ticket(*id), conn).await?),
-            Lookup::Queue { org, statuses, page } => json(async_load(queue(*org, statuses.clone(), *page), conn).await?),
-            Lookup::QueueCount { org, statuses } => json(async_load::<_, i64>(queue_count(*org, statuses.clone()), conn).await?),
-            Lookup::Comments { ticket } => json(comments_of(async_load::<_, CommentRow>(ticket_comments(*ticket), conn).await?)),
+            Lookup::Queue {
+                org,
+                statuses,
+                page,
+            } => json(async_load(queue(*org, statuses.clone(), *page), conn).await?),
+            Lookup::QueueCount { org, statuses } => {
+                json(async_load::<_, i64>(queue_count(*org, statuses.clone()), conn).await?)
+            }
+            Lookup::Comments { ticket } => json(comments_of(
+                async_load::<_, CommentRow>(ticket_comments(*ticket), conn).await?,
+            )),
             Lookup::Attachment { id } => json(async_load(attachment(*id), conn).await?),
             Lookup::Agents { org } => json(async_load(org_agents(*org), conn).await?),
             Lookup::Sla { org } => json(
@@ -160,14 +190,17 @@ impl Lookup {
                     .map(TicketSla::from_row)
                     .collect::<Vec<_>>(),
             ),
-            Lookup::Search { org, pattern } => json(async_load(search(*org, pattern.clone()), conn).await?),
+            Lookup::Search { org, pattern } => {
+                json(async_load(search(*org, pattern.clone()), conn).await?)
+            }
             Lookup::Recent { org, limit } => json(async_load(recent(*org, *limit), conn).await?),
         }
     }
 }
 
 fn json<T: Serialize>(rows: T) -> QueryResult<Value> {
-    serde_json::to_value(rows).map_err(|error| diesel::result::Error::SerializationError(Box::new(error)))
+    serde_json::to_value(rows)
+        .map_err(|error| diesel::result::Error::SerializationError(Box::new(error)))
 }
 
 fn sync_load<Q, U>(query: Q, conn: &mut SyncConn) -> QueryResult<Vec<U>>
@@ -232,7 +265,13 @@ fn ticket_comments(ticket: i64) -> CommentsQuery {
         .inner_join(comments::table)
         .filter(tickets::id.eq(ticket))
         .order((tickets::id.asc(), comments::id.asc()))
-        .select((tickets::id, tickets::title, comments::id, comments::body, comments::created_at))
+        .select((
+            tickets::id,
+            tickets::title,
+            comments::id,
+            comments::body,
+            comments::created_at,
+        ))
         .into_boxed()
 }
 
@@ -284,12 +323,14 @@ pub type CommentRow = (i64, String, i64, String, DateTime<Utc>);
 /// The join's rows as the struct the API serves.
 pub fn comments_of(rows: Vec<CommentRow>) -> Vec<TicketComment> {
     rows.into_iter()
-        .map(|(ticket_id, title, comment_id, body, created_at)| TicketComment {
-            ticket_id,
-            title,
-            comment_id,
-            body,
-            created_at,
-        })
+        .map(
+            |(ticket_id, title, comment_id, body, created_at)| TicketComment {
+                ticket_id,
+                title,
+                comment_id,
+                body,
+                created_at,
+            },
+        )
         .collect()
 }

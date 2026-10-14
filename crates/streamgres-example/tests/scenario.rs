@@ -49,7 +49,9 @@ impl Live {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let main = AsyncSyncedConnection::with_cache(
-            AsyncPgConnection::establish(&database_url).await.expect("connect"),
+            AsyncPgConnection::establish(&database_url)
+                .await
+                .expect("connect"),
             Arc::clone(&cache),
             Route::Streamgres,
         );
@@ -58,7 +60,9 @@ impl Live {
             Arc::clone(&cache),
             Route::Streamgres,
         );
-        let plain = AsyncPgConnection::establish(&database_url).await.expect("connect");
+        let plain = AsyncPgConnection::establish(&database_url)
+            .await
+            .expect("connect");
         // The engine learns the tables from the seed's DDL; give the
         // trigger a moment on a fresh database.
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -78,16 +82,25 @@ impl Live {
 
     /// What Postgres says, through the blocking wrapper routed Postgres.
     fn truth(&mut self, lookup: &Lookup) -> Value {
-        self.sync.with_route(Route::Postgres, |conn| lookup.run_sync(conn).unwrap())
+        self.sync
+            .with_route(Route::Postgres, |conn| lookup.run_sync(conn).unwrap())
     }
 
     async fn change(&mut self, sql: &str) {
-        sql_query(sql).execute(&mut self.plain).await.expect("change");
+        sql_query(sql)
+            .execute(&mut self.plain)
+            .await
+            .expect("change");
     }
 
     /// Reads through the async wrapper until the result differs from
     /// `before` or the wait runs out.
-    async fn until_changed(&mut self, lookup: &Lookup, before: &Value, wait: Duration) -> Option<(Value, Duration)> {
+    async fn until_changed(
+        &mut self,
+        lookup: &Lookup,
+        before: &Value,
+        wait: Duration,
+    ) -> Option<(Value, Duration)> {
         let started = Instant::now();
         while started.elapsed() < wait {
             let now = lookup.run_async(&mut self.main).await.unwrap();
@@ -103,12 +116,22 @@ impl Live {
 /// A change that each lookup's result reflects.
 fn change_for(lookup: &Lookup) -> &'static str {
     match lookup {
-        Lookup::Ticket { .. } => "UPDATE tickets SET priority = 'high', updated_at = now() WHERE id = 1",
-        Lookup::Queue { .. } => "UPDATE tickets SET title = title || '!' WHERE id = (SELECT id FROM tickets WHERE org_id = 1 AND status IN ('open', 'pending') ORDER BY created_at DESC, id ASC OFFSET 10 LIMIT 1)",
+        Lookup::Ticket { .. } => {
+            "UPDATE tickets SET priority = 'high', updated_at = now() WHERE id = 1"
+        }
+        Lookup::Queue { .. } => {
+            "UPDATE tickets SET title = title || '!' WHERE id = (SELECT id FROM tickets WHERE org_id = 1 AND status IN ('open', 'pending') ORDER BY created_at DESC, id ASC OFFSET 10 LIMIT 1)"
+        }
         Lookup::QueueCount { .. } => "UPDATE tickets SET status = 'open' WHERE id = 2",
-        Lookup::Comments { .. } => "INSERT INTO comments (id, ticket_id, body) VALUES (99001, 1, 'scenario') ON CONFLICT (id) DO UPDATE SET body = comments.body || '!'",
-        Lookup::Attachment { .. } => "UPDATE attachments SET data = data || '\\x00'::bytea WHERE id = 1",
-        Lookup::Agents { .. } => "UPDATE agents SET skills = array_append(skills, 'scenario') WHERE id = 1",
+        Lookup::Comments { .. } => {
+            "INSERT INTO comments (id, ticket_id, body) VALUES (99001, 1, 'scenario') ON CONFLICT (id) DO UPDATE SET body = comments.body || '!'"
+        }
+        Lookup::Attachment { .. } => {
+            "UPDATE attachments SET data = data || '\\x00'::bytea WHERE id = 1"
+        }
+        Lookup::Agents { .. } => {
+            "UPDATE agents SET skills = array_append(skills, 'scenario') WHERE id = 1"
+        }
         Lookup::Sla { .. } => "UPDATE tickets SET sla = sla + interval '1 minute' WHERE id = 3",
         Lookup::Search { .. } => "UPDATE tickets SET title = title || '?' WHERE id = 1",
         Lookup::Recent { .. } => "UPDATE tickets SET updated_at = now() WHERE id = 7",
@@ -122,7 +145,10 @@ async fn every_lookup_is_served_correctly_through_both_wrappers() {
     };
     live.main.set_read_your_writes(Duration::ZERO);
     live.sync.set_read_your_writes(Duration::ZERO);
-    println!("{:<12} {:<9} {:<7} {:<9} {:>8}  exercises", "lookup", "mode", "hit", "sync", "seen in");
+    println!(
+        "{:<12} {:<9} {:<7} {:<9} {:>8}  exercises",
+        "lookup", "mode", "hit", "sync", "seen in"
+    );
     for lookup in Lookup::demo() {
         let hits_before = live.stat(&live.cache.stats.hits);
         let materialized_before = live.engine.materialized();
@@ -133,7 +159,12 @@ async fn every_lookup_is_served_correctly_through_both_wrappers() {
         let mut hit_on = None;
         for read in 1..=3 {
             let seen = lookup.run_async(&mut live.main).await.unwrap();
-            assert_eq!(seen, truth, "{}: read {read} matches Postgres", lookup.name());
+            assert_eq!(
+                seen,
+                truth,
+                "{}: read {read} matches Postgres",
+                lookup.name()
+            );
             if live.stat(&live.cache.stats.hits) > hits_before {
                 hit_on = Some(read);
                 break;
@@ -141,18 +172,43 @@ async fn every_lookup_is_served_correctly_through_both_wrappers() {
         }
         let hits_so_far = live.stat(&live.cache.stats.hits);
         let through_sync = lookup.run_sync(&mut live.sync).unwrap();
-        assert_eq!(through_sync, truth, "{}: the blocking wrapper agrees", lookup.name());
+        assert_eq!(
+            through_sync,
+            truth,
+            "{}: the blocking wrapper agrees",
+            lookup.name()
+        );
         let sync_hit = live.stat(&live.cache.stats.hits) > hits_so_far;
         let mode = if !lookup.is_cacheable() {
-            assert!(hit_on.is_none(), "{}: a refused shape never hits", lookup.name());
+            assert!(
+                hit_on.is_none(),
+                "{}: a refused shape never hits",
+                lookup.name()
+            );
             "live"
         } else {
-            assert!(hit_on.is_some(), "{}: no hit in three reads; refusals {:?}", lookup.name(), live.engine.refusals());
-            assert!(sync_hit, "{}: the blocking wrapper shares the entry", lookup.name());
-            if live.engine.materialized() > materialized_before { "rows" } else { "refill" }
+            assert!(
+                hit_on.is_some(),
+                "{}: no hit in three reads; refusals {:?}",
+                lookup.name(),
+                live.engine.refusals()
+            );
+            assert!(
+                sync_hit,
+                "{}: the blocking wrapper shares the entry",
+                lookup.name()
+            );
+            if live.engine.materialized() > materialized_before {
+                "rows"
+            } else {
+                "refill"
+            }
         };
         if matches!(lookup, Lookup::Sla { .. }) {
-            assert_eq!(mode, "refill", "an interval column cannot be shipped as rows");
+            assert_eq!(
+                mode, "refill",
+                "an interval column cannot be shipped as rows"
+            );
         }
 
         // A change from elsewhere: the cache must reflect it, and the
@@ -163,29 +219,51 @@ async fn every_lookup_is_served_correctly_through_both_wrappers() {
                 .until_changed(&lookup, &truth, Duration::from_secs(5))
                 .await
                 .unwrap_or_else(|| panic!("{}: the change was not seen", lookup.name()));
-            assert_eq!(after, live.truth(&lookup), "{}: after the change, the cache matches Postgres", lookup.name());
+            assert_eq!(
+                after,
+                live.truth(&lookup),
+                "{}: after the change, the cache matches Postgres",
+                lookup.name()
+            );
             seen_in
         } else {
             let after = lookup.run_async(&mut live.main).await.unwrap();
-            assert_eq!(after, live.truth(&lookup), "{}: live, so the change is seen at once", lookup.name());
+            assert_eq!(
+                after,
+                live.truth(&lookup),
+                "{}: live, so the change is seen at once",
+                lookup.name()
+            );
             Duration::ZERO
         };
         println!(
             "{:<12} {:<9} {:<7} {:<9} {:>6}ms  {}{}",
             lookup.name(),
             mode,
-            hit_on.map(|read| format!("read {read}")).unwrap_or_else(|| "-".to_string()),
+            hit_on
+                .map(|read| format!("read {read}"))
+                .unwrap_or_else(|| "-".to_string()),
             if sync_hit { "shared" } else { "-" },
             seen.as_millis(),
             lookup.exercises(),
             if mode == "refill" {
-                format!(" [{}]", live.engine.fallbacks().last().cloned().unwrap_or_default())
+                format!(
+                    " [{}]",
+                    live.engine.fallbacks().last().cloned().unwrap_or_default()
+                )
             } else {
                 String::new()
             }
         );
     }
-    assert!(live.engine.refusals().iter().any(|reason| reason.contains("LIKE") || reason.contains("ILIKE")), "{:?}", live.engine.refusals());
+    assert!(
+        live.engine
+            .refusals()
+            .iter()
+            .any(|reason| reason.contains("LIKE") || reason.contains("ILIKE")),
+        "{:?}",
+        live.engine.refusals()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -201,11 +279,14 @@ async fn a_write_on_one_connection_is_seen_by_the_pools_other_connections() {
     // The write goes through the async wrapper; the read right after,
     // through the blocking wrapper on the same cache, must see it
     // without waiting for the engine.
-    diesel::update(streamgres_example::schema::tickets::table.filter(streamgres_example::schema::tickets::id.eq(20)))
-        .set(streamgres_example::schema::tickets::title.eq("read your writes"))
-        .execute(&mut live.main)
-        .await
-        .unwrap();
+    diesel::update(
+        streamgres_example::schema::tickets::table
+            .filter(streamgres_example::schema::tickets::id.eq(20)),
+    )
+    .set(streamgres_example::schema::tickets::title.eq("read your writes"))
+    .execute(&mut live.main)
+    .await
+    .unwrap();
     let after = lookup.run_sync(&mut live.sync).unwrap();
     assert_ne!(after, before);
     assert_eq!(after[0]["title"].as_str(), Some("read your writes"));
@@ -230,13 +311,22 @@ async fn a_read_dropped_mid_flight_leaves_no_subscription_behind() {
     while live.engine.subscribed() != subscribed && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(live.engine.subscribed(), subscribed, "the subscription the dropped read made is gone");
+    assert_eq!(
+        live.engine.subscribed(),
+        subscribed,
+        "the subscription the dropped read made is gone"
+    );
     assert!(live.cache.is_empty());
     // And the same read completed afterwards is cached as usual (the
     // first completed read may only resolve the enum's OID).
     for _ in 0..3 {
         let _ = lookup.run_async(&mut live.main).await.unwrap();
     }
-    assert_eq!(live.engine.subscribed(), subscribed + 1, "refusals {:?}", live.engine.refusals());
+    assert_eq!(
+        live.engine.subscribed(),
+        subscribed + 1,
+        "refusals {:?}",
+        live.engine.refusals()
+    );
     let _ = &live.database_url;
 }

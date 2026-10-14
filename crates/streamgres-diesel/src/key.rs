@@ -6,9 +6,9 @@
 //! placeholders) and every bind as Postgres received it: its type OID and
 //! its bytes. Two reads with equal keys get equal rows.
 
+use diesel::QueryResult;
 use diesel::pg::{Pg, PgMetadataLookup, PgQueryBuilder};
 use diesel::query_builder::{QueryBuilder, QueryFragment, bind_collector::RawBytesBindCollector};
-use diesel::QueryResult;
 
 use crate::route::Route;
 
@@ -36,7 +36,8 @@ pub struct QueryShape {
 }
 
 fn starts_with_word(text: &str, word: &str) -> bool {
-    text.get(..word.len()).is_some_and(|head| head.eq_ignore_ascii_case(word))
+    text.get(..word.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(word))
         && text[word.len()..]
             .chars()
             .next()
@@ -52,10 +53,7 @@ fn has_word(sql: &str, word: &str) -> bool {
 impl QueryKey {
     /// Renders a query the way the connection is about to send it. The
     /// lookup resolves custom types' OIDs, so it is the connection itself.
-    pub fn of<T>(
-        query: &T,
-        lookup: &mut (dyn PgMetadataLookup + 'static),
-    ) -> QueryResult<QueryKey>
+    pub fn of<T>(query: &T, lookup: &mut (dyn PgMetadataLookup + 'static)) -> QueryResult<QueryKey>
     where
         T: QueryFragment<Pg>,
     {
@@ -91,18 +89,26 @@ impl QueryKey {
     /// modify data. Diesel sends `INSERT ... RETURNING` through the same
     /// `load` path as a `SELECT`, and those must never be cached.
     pub fn is_select(&self) -> bool {
-        let head = self.sql.trim_start_matches(|c: char| c.is_whitespace() || c == '(');
+        let head = self
+            .sql
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '(');
         if starts_with_word(head, "SELECT") {
             return true;
         }
-        starts_with_word(head, "WITH") && !["INSERT", "UPDATE", "DELETE", "MERGE"].iter().any(|word| has_word(&self.sql, word))
+        starts_with_word(head, "WITH")
+            && !["INSERT", "UPDATE", "DELETE", "MERGE"]
+                .iter()
+                .any(|word| has_word(&self.sql, word))
     }
 
     /// Whether the read takes row locks (`FOR UPDATE`, `FOR SHARE` and
     /// their variants). The lock is the point of such a read, and a cache
     /// cannot take one, so it always goes to Postgres.
     pub fn is_locking(&self) -> bool {
-        let mut words = self.sql.split_whitespace().map(|word| word.trim_end_matches(';'));
+        let mut words = self
+            .sql
+            .split_whitespace()
+            .map(|word| word.trim_end_matches(';'));
         while let Some(word) = words.next() {
             if word.eq_ignore_ascii_case("FOR")
                 && let Some(next) = words.next()
@@ -153,7 +159,10 @@ mod tests {
         assert!(key("SELECT 1").is_select());
         assert!(key("  (select 1)").is_select());
         assert!(key("WITH recent AS (SELECT * FROM t) SELECT * FROM recent").is_select());
-        assert!(key("with u as (select updated_at from t) select * from u").is_select(), "a column name is not a statement");
+        assert!(
+            key("with u as (select updated_at from t) select * from u").is_select(),
+            "a column name is not a statement"
+        );
         assert!(!key("WITH moved AS (DELETE FROM t RETURNING *) SELECT * FROM moved").is_select());
         assert!(!key("with x as (update t set a = 1 returning *) select 1").is_select());
         assert!(!key("INSERT INTO t VALUES (1) RETURNING id").is_select());

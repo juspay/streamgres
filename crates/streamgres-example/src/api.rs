@@ -133,7 +133,10 @@ async fn read(app: &Stack, params: &ReadParams, lookup: Lookup) -> Reply {
         Some("reporting") => &app.reporting,
         _ => &app.main,
     };
-    let mut conn = pool.get().await.map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+    let mut conn = pool
+        .get()
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
     let route = match params.route.as_deref() {
         Some("postgres") => Some(streamgres_diesel::Route::Postgres),
         Some("streamgres") => Some(streamgres_diesel::Route::Streamgres),
@@ -164,19 +167,35 @@ async fn read(app: &Stack, params: &ReadParams, lookup: Lookup) -> Reply {
     })))
 }
 
-async fn ticket(State(app): State<App>, Path(id): Path<i64>, Query(params): Query<ReadParams>) -> Reply {
+async fn ticket(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
     read(&app, &params, Lookup::Ticket { id }).await
 }
 
-async fn comments(State(app): State<App>, Path(id): Path<i64>, Query(params): Query<ReadParams>) -> Reply {
+async fn comments(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
     read(&app, &params, Lookup::Comments { ticket: id }).await
 }
 
-async fn attachment(State(app): State<App>, Path(id): Path<i64>, Query(params): Query<ReadParams>) -> Reply {
+async fn attachment(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
     read(&app, &params, Lookup::Attachment { id }).await
 }
 
-async fn queue(State(app): State<App>, Path(org): Path<i64>, Query(params): Query<ReadParams>) -> Reply {
+async fn queue(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
     let lookup = Lookup::Queue {
         org,
         statuses: params.statuses(),
@@ -185,7 +204,11 @@ async fn queue(State(app): State<App>, Path(org): Path<i64>, Query(params): Quer
     read(&app, &params, lookup).await
 }
 
-async fn queue_count(State(app): State<App>, Path(org): Path<i64>, Query(params): Query<ReadParams>) -> Reply {
+async fn queue_count(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
     let lookup = Lookup::QueueCount {
         org,
         statuses: params.statuses(),
@@ -193,20 +216,39 @@ async fn queue_count(State(app): State<App>, Path(org): Path<i64>, Query(params)
     read(&app, &params, lookup).await
 }
 
-async fn agents(State(app): State<App>, Path(org): Path<i64>, Query(params): Query<ReadParams>) -> Reply {
+async fn agents(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
     read(&app, &params, Lookup::Agents { org }).await
 }
 
-async fn sla(State(app): State<App>, Path(org): Path<i64>, Query(params): Query<ReadParams>) -> Reply {
+async fn sla(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
     read(&app, &params, Lookup::Sla { org }).await
 }
 
-async fn search(State(app): State<App>, Path(org): Path<i64>, Query(params): Query<ReadParams>) -> Reply {
-    let pattern = format!("%{}%", params.q.clone().unwrap_or_else(|| "login".to_string()));
+async fn search(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    let pattern = format!(
+        "%{}%",
+        params.q.clone().unwrap_or_else(|| "login".to_string())
+    );
     read(&app, &params, Lookup::Search { org, pattern }).await
 }
 
-async fn recent(State(app): State<App>, Path(org): Path<i64>, Query(params): Query<ReadParams>) -> Reply {
+async fn recent(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
     let lookup = Lookup::Recent {
         org,
         limit: params.limit.unwrap_or(5),
@@ -222,17 +264,30 @@ struct StatusChange {
 /// A write through the main pool: the cache marks it, and for the
 /// read-your-writes window every read through the cache goes to
 /// Postgres, so the caller sees its own change at once.
-async fn set_status(State(app): State<App>, Path(id): Path<i64>, Json(change): Json<StatusChange>) -> Reply {
-    let mut conn = app.main.get().await.map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+async fn set_status(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    Json(change): Json<StatusChange>,
+) -> Reply {
+    let mut conn = app
+        .main
+        .get()
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
     let changed = diesel::update(tickets::table.filter(tickets::id.eq(id)))
-        .set((tickets::status.eq(change.status), tickets::updated_at.eq(diesel::dsl::now)))
+        .set((
+            tickets::status.eq(change.status),
+            tickets::updated_at.eq(diesel::dsl::now),
+        ))
         .execute(&mut conn)
         .await
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     if changed == 0 {
         return Err((StatusCode::NOT_FOUND, format!("no ticket {id}")));
     }
-    Ok(Json(json!({"id": id, "status": change.status, "read_your_writes_ms": streamgres_diesel::read_your_writes_from_env().as_millis()})))
+    Ok(Json(
+        json!({"id": id, "status": change.status, "read_your_writes_ms": streamgres_diesel::read_your_writes_from_env().as_millis()}),
+    ))
 }
 
 /// For handlers that take a map of parameters rather than the struct.
