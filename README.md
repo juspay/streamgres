@@ -119,14 +119,16 @@ queries.
 
 ### Server-to-server clients
 
-A backend that caches what it reads (the `streamgres_diesel` wrapper, for
-one) does not speak the Zero protocol. It connects to
-`ws://<host>:4848/<base>/s2s/v1` and subscribes the SQL its ORM rendered,
-`$n` binds and all; the server answers `accepted` or `refused` and then
-sends `touched` with the ids of every subscription a committed transaction
-changed the rows of. No rows travel this way: the backend keeps reading
-Postgres and uses the touches to drop what is stale. The protocol is
-documented in `src/client/s2s.rs`.
+A backend that caches what it reads does not speak the Zero protocol. It
+connects to `ws://<host>:4848/<base>/s2s/v1` and subscribes the SQL its
+ORM rendered, `$n` binds and all; the server answers `accepted` with the
+hydrated rows (per table for a join) or `refused`, then sends `delta`
+with the rows each committed transaction put or deleted, so the backend
+never reads Postgres for a query it holds. The protocol is documented in
+`src/client/s2s.rs`. The Diesel wrapper that uses it lives in this
+repository as [`crates/streamgres-diesel`](crates/streamgres-diesel):
+a drop-in `PgConnection` replacement whose reads come from an in-memory
+cache the engine keeps fresh.
 
 Configuration uses `STREAMGRES_*` environment variables, each documented in
 [`.env.example`](.env.example). Existing `XYNE_SYNC_*` variables are still

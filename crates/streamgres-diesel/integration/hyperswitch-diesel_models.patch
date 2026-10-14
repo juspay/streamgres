@@ -10,7 +10,7 @@ index 4ed5a11..3d1a390 100644
  
  [dependencies]
  async-bb8-diesel = "0.2.1"
-+streamgres_diesel = { path = "/Users/kartik.parsoya/Documents/streamgres-diesel", optional = true }
++streamgres_diesel = { path = "/Users/kartik.parsoya/Documents/streamgres-s2s/crates/streamgres-diesel", optional = true }
  base64 = "0.22.1"
  bb8 = "0.8.6"
  diesel = { version = "2.2.10", features = ["postgres", "serde_json", "time", "128-column-tables", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
