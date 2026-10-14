@@ -231,6 +231,12 @@ three levels, the most specific winning:
    URL it was established with (`Settings`), so a master pool goes to
    Postgres and a replica pool through Streamgres, matching
    Hyperswitch's split. `set_route` changes it on one connection.
+   The same lookup picks the cache: one engine streams one database
+   and keeps one cache fresh, so pools against one database share a
+   cache (`Settings::single`) and pools against different databases
+   (Hyperswitch's main and accounts databases) each get their own,
+   attached to the engine streaming that database
+   (`Settings::by_url`). A URL with no cache is a passthrough.
 3. The process default, Streamgres.
 
 Whatever the flags say, three reads go to Postgres: a statement that is

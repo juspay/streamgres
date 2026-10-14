@@ -24,10 +24,12 @@ resubscribes and refills. See `docs/design.md`.
 let engine = EngineClient::connect("ws://engine:4848/zero/s2s/v1");
 let cache = Arc::new(Cache::new(256 * 1024 * 1024, Arc::new(engine.clone())));
 engine.attach(&cache);
-streamgres_diesel::install(Settings {
+// One cache per database (one engine streams one database), a route per pool.
+streamgres_diesel::install(Settings::single(
     cache,
-    consistency_for: Box::new(|url| if url.contains("replica") { Route::Streamgres } else { Route::Postgres }),
-}).ok();
+    |url| if url.contains("replica") { Route::Streamgres } else { Route::Postgres },
+)).ok();
+// Several databases: Settings::by_url(|url| Some(Attachment { cache: ..., route: ... }))
 // then use SyncedConnection<PgConnection> where PgConnection was, pools included.
 // One query can override its pool's route:
 //   configs::table.find(key).via(Route::Postgres).first(conn)

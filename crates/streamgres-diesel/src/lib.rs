@@ -75,13 +75,53 @@ pub use crate::route::{Route, RouteDsl, Via};
 /// [`Route::Streamgres`], `Consistency::Strong` is [`Route::Postgres`].
 pub type Consistency = Route;
 
-/// What a process shares between its connections: the cache and how to
-/// treat a connection by the URL it was established with.
-pub struct Settings {
+/// What a connection established with some URL gets: the cache its
+/// reads go through and the route they take by default.
+#[derive(Clone)]
+pub struct Attachment {
     pub cache: Arc<Cache>,
-    /// The route for a connection established with this URL, so a master
-    /// pool can go to Postgres and a replica pool through Streamgres.
-    pub consistency_for: Box<dyn Fn(&str) -> Route + Send + Sync>,
+    pub route: Route,
+}
+
+/// What a process shares between its connections, by the URL they are
+/// established with.
+///
+/// One engine streams one database, and a cache is kept fresh by one
+/// engine, so a cache is per database: pools against the same database
+/// (a master and its replicas) share one, pools against different
+/// databases (Hyperswitch's main and accounts databases) each get their
+/// own, attached to the engine streaming that database. The route is
+/// per pool: a master pool can go to Postgres while a replica pool goes
+/// through Streamgres.
+pub struct Settings {
+    for_url: Box<AttachmentFor>,
+}
+
+type AttachmentFor = dyn Fn(&str) -> Option<Attachment> + Send + Sync;
+
+impl Settings {
+    /// One database: every connection shares `cache`, routed by its URL.
+    pub fn single(cache: Arc<Cache>, route_for: impl Fn(&str) -> Route + Send + Sync + 'static) -> Settings {
+        Settings::by_url(move |url| {
+            Some(Attachment {
+                cache: Arc::clone(&cache),
+                route: route_for(url),
+            })
+        })
+    }
+
+    /// A cache and a route per URL. A URL that yields `None` gets a
+    /// passthrough connection: every read goes to Postgres.
+    pub fn by_url(for_url: impl Fn(&str) -> Option<Attachment> + Send + Sync + 'static) -> Settings {
+        Settings {
+            for_url: Box::new(for_url),
+        }
+    }
+
+    /// What a connection established with `url` gets.
+    pub fn attachment_for(&self, url: &str) -> Option<Attachment> {
+        (self.for_url)(url)
+    }
 }
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
@@ -200,12 +240,8 @@ where
 
     fn establish(database_url: &str) -> ConnectionResult<Self> {
         let inner = C::establish(database_url)?;
-        Ok(match SETTINGS.get() {
-            Some(settings) => SyncedConnection::with_cache(
-                inner,
-                Arc::clone(&settings.cache),
-                (settings.consistency_for)(database_url),
-            ),
+        Ok(match SETTINGS.get().and_then(|settings| settings.attachment_for(database_url)) {
+            Some(Attachment { cache, route }) => SyncedConnection::with_cache(inner, cache, route),
             None => SyncedConnection::new(inner),
         })
     }

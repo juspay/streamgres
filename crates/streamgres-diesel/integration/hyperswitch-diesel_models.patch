@@ -1,5 +1,5 @@
 diff --git a/crates/diesel_models/Cargo.toml b/crates/diesel_models/Cargo.toml
-index 4ed5a11..3d1a390 100644
+index 4ed5a11..ae48b5a 100644
 --- a/crates/diesel_models/Cargo.toml
 +++ b/crates/diesel_models/Cargo.toml
 @@ -14,9 +14,11 @@ v1 = ["common_utils/v1", "common_types/v1"]
@@ -38,10 +38,10 @@ index f0c20a5..70afae2 100644
  pub type RawPgConnection = async_bb8_diesel::Connection<DejaPgConnection>;
 diff --git a/crates/diesel_models/tests/streamgres_live.rs b/crates/diesel_models/tests/streamgres_live.rs
 new file mode 100644
-index 0000000..9b5ca7e
+index 0000000..acda19b
 --- /dev/null
 +++ b/crates/diesel_models/tests/streamgres_live.rs
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,107 @@
 +//! Hyperswitch's own config lookups through the Streamgres-synced
 +//! connection, against a running engine.
 +//!
@@ -60,7 +60,7 @@ index 0000000..9b5ca7e
 +    configs::{Config, ConfigNew, ConfigUpdate},
 +    DatabaseConnectionWithContext, DejaPgConnection,
 +};
-+use streamgres_diesel::{cache::Cache, engine::EngineClient, install, Consistency, Settings};
++use streamgres_diesel::{cache::Cache, engine::EngineClient, install, Route, Settings};
 +
 +#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 +async fn config_lookups_are_served_from_the_synced_cache() {
@@ -76,10 +76,7 @@ index 0000000..9b5ca7e
 +    let engine = EngineClient::connect(s2s);
 +    let cache = Arc::new(Cache::new(64 * 1024 * 1024, Arc::new(engine.clone())));
 +    engine.attach(&cache);
-+    let _ = install(Settings {
-+        cache: cache.clone(),
-+        consistency_for: Box::new(|_| Consistency::Eventual),
-+    });
++    let _ = install(Settings::single(cache.clone(), |_| Route::Streamgres));
 +    let deadline = Instant::now() + Duration::from_secs(10);
 +    while !engine.is_connected() {
 +        assert!(Instant::now() < deadline, "the engine did not connect");
