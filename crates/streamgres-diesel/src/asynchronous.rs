@@ -22,16 +22,31 @@
 //! ships rows for a table not yet known), and the cache. A subscribe
 //! blocks on the engine, so it runs on a blocking thread.
 //!
+//! One consequence: diesel-async records a query as started when its
+//! future is built, and as finished when the future completes, so a
+//! miss the engine then serves from its own rows leaves one started
+//! query in the instrumentation with no finish. A hit builds nothing.
+//!
+//! # Pipelining
+//!
+//! diesel-async lets several futures from one connection run at once.
+//! Its transaction state is shared with every such future, and asking
+//! for it while one is pending is a panic in diesel-async itself. The
+//! wrapper counts its own futures in flight and, while any is, sends a
+//! read to Postgres without asking: a read pipelined behind a write
+//! must see that write, which only Postgres can promise.
+//!
 //! A bind of a user-defined type needs its OID, which the blocking
 //! wrapper resolves on the spot through the connection. Here the first
 //! read with such a bind goes to Postgres while the OID is resolved and
-//! remembered; from the next read on the query is cached like any other.
+//! remembered in the cache, for every connection sharing it; from the
+//! next read on the query is cached like any other.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use diesel::QueryableByName;
 use diesel::connection::Instrumentation;
@@ -55,9 +70,9 @@ use crate::cursor::SyncedRow;
 use crate::key::QueryKey;
 use crate::route::Route;
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
-use crate::subscriptions::{Outcome, Verdict};
+use crate::subscriptions::{Outcome, Subscriptions, Verdict};
 use crate::types::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
-use crate::{Attachment, SETTINGS, read_your_writes_from_env};
+use crate::{Attachment, SETTINGS, may_write, read_your_writes_from_env};
 
 /// diesel-async's Postgres row, which it does not export by name.
 pub type PgRow = <AsyncPgConnection as AsyncConnection>::Row<'static, 'static>;
@@ -74,14 +89,18 @@ pub struct AsyncSyncedConnection {
     cache: Option<Arc<Cache>>,
     route: Route,
     scoped: Option<Route>,
-    wrote_at: Option<Instant>,
     read_your_writes: Duration,
-    /// OIDs of user-defined types seen in binds, for the cache key.
+    /// OIDs of user-defined types seen in binds, for the cache key:
+    /// the cache's, shared by every connection through it, or this
+    /// connection's own when it is a passthrough.
     metadata: Arc<Mutex<PgMetadataCache>>,
     /// Whether this connection has loaded every table's types for the
     /// engine side; false again when the engine named a table that was
     /// not among them.
     catalog_loaded: Arc<AtomicBool>,
+    /// Cloned into every future the wrapper hands out: while the count
+    /// is above one, a future is pending on this connection.
+    inflight: Arc<()>,
 }
 
 impl AsyncSyncedConnection {
@@ -92,10 +111,10 @@ impl AsyncSyncedConnection {
             cache: None,
             route: Route::Postgres,
             scoped: None,
-            wrote_at: None,
             read_your_writes: Duration::ZERO,
             metadata: Arc::new(Mutex::new(PgMetadataCache::new())),
             catalog_loaded: Arc::new(AtomicBool::new(false)),
+            inflight: Arc::new(()),
         }
     }
 
@@ -103,6 +122,7 @@ impl AsyncSyncedConnection {
     /// unless a query or a scope says otherwise.
     pub fn with_cache(inner: AsyncPgConnection, cache: Arc<Cache>, route: Route) -> Self {
         AsyncSyncedConnection {
+            metadata: Arc::clone(cache.type_metadata()),
             cache: Some(cache),
             route,
             read_your_writes: read_your_writes_from_env(),
@@ -118,6 +138,8 @@ impl AsyncSyncedConnection {
         self.route
     }
 
+    /// How long after a write reads through this connection's cache go
+    /// to Postgres; see [`crate::SyncedConnection::set_read_your_writes`].
     pub fn set_read_your_writes(&mut self, window: Duration) {
         self.read_your_writes = window;
     }
@@ -140,25 +162,65 @@ impl AsyncSyncedConnection {
 
     /// Runs `f` with every read inside it routed `route`; a flag on the
     /// query itself still wins. The closure gets the connection back.
+    /// The outer route is restored however the future ends: completed,
+    /// dropped before completion, or unwound.
     pub async fn with_route<R, F>(&mut self, route: Route, f: F) -> R
     where
         F: for<'a> FnOnce(&'a mut Self) -> BoxFuture<'a, R>,
     {
+        struct Restore<'a> {
+            conn: &'a mut AsyncSyncedConnection,
+            outer: Option<Route>,
+        }
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.conn.scoped = self.outer;
+            }
+        }
         let outer = self.scoped.replace(route);
-        let result = f(self).await;
-        self.scoped = outer;
-        result
+        let restore = Restore { conn: self, outer };
+        f(&mut *restore.conn).await
     }
 
-    fn wrote(&mut self) {
-        if !self.read_your_writes.is_zero() {
-            self.wrote_at = Some(Instant::now());
+    /// Whether a future this wrapper handed out is still pending.
+    fn pipelined(&self) -> bool {
+        Arc::strong_count(&self.inflight) > 1
+    }
+
+    /// Marks the write now, and again when `future` completes: a read
+    /// issued after the write's future resolves is what the window is
+    /// for, and the clock should start as late as the write did.
+    fn written<'a, T: Send + 'a>(&mut self, future: BoxFuture<'a, QueryResult<T>>) -> BoxFuture<'a, QueryResult<T>> {
+        let cache = self.cache.clone();
+        if let Some(cache) = &cache {
+            cache.mark_write();
         }
+        let token = Arc::clone(&self.inflight);
+        async move {
+            let _pending = token;
+            let result = future.await;
+            if let Some(cache) = cache {
+                cache.mark_write();
+            }
+            result
+        }
+        .boxed()
+    }
+
+    /// A read future with the in-flight token attached.
+    fn tracked<'a, T: Send + 'a>(&self, future: BoxFuture<'a, QueryResult<T>>) -> BoxFuture<'a, QueryResult<T>> {
+        let token = Arc::clone(&self.inflight);
+        async move {
+            let _pending = token;
+            future.await
+        }
+        .boxed()
     }
 
     fn within_write_window(&self) -> bool {
-        self.wrote_at
-            .is_some_and(|wrote_at| wrote_at.elapsed() < self.read_your_writes)
+        self.cache
+            .as_ref()
+            .is_some_and(|cache| cache.wrote_within(self.read_your_writes))
     }
 
     fn in_transaction(&mut self) -> bool {
@@ -169,15 +231,24 @@ impl AsyncSyncedConnection {
     }
 
     /// The key of a query, and the user-defined types its binds name
-    /// whose OIDs are not known yet.
-    fn key_of<T: QueryFragment<Pg>>(&mut self, query: &T) -> QueryResult<(QueryKey, Vec<PgMetadataCacheKey<'static>>)> {
+    /// whose OIDs are not known yet. A query that cannot be rendered
+    /// until those are known (an array of an enum, whose element OID
+    /// goes into the bind) has no key yet: `Ok((None, unknown))`.
+    fn key_of<T: QueryFragment<Pg>>(&mut self, query: &T) -> QueryResult<(Option<QueryKey>, Vec<TypeName>)> {
         let mut lookup = Lookup {
             cache: std::mem::replace(&mut *self.metadata.lock().expect("metadata"), PgMetadataCache::new()),
             unknown: Vec::new(),
         };
         let key = QueryKey::of(query, &mut lookup);
         *self.metadata.lock().expect("metadata") = lookup.cache;
-        Ok((key?, lookup.unknown))
+        match key {
+            Ok(key) => Ok((Some(key), lookup.unknown)),
+            Err(error) if !lookup.unknown.is_empty() => {
+                let _ = error;
+                Ok((None, lookup.unknown))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn live_stream<'a>(stream: BoxStream<'a, QueryResult<PgRow>>) -> BoxStream<'a, QueryResult<AsyncSyncedRow>> {
@@ -187,13 +258,48 @@ impl AsyncSyncedConnection {
     fn cached_stream(rows: Arc<[OwnedRow]>) -> BoxStream<'static, QueryResult<AsyncSyncedRow>> {
         stream::iter(OwnedCursor::new(rows).map(|row| row.map(SyncedRow::Cached))).boxed()
     }
+
+    /// The live read, with every unknown type resolved first and
+    /// remembered for the next read.
+    fn resolving<'query>(&mut self, unknown: Vec<TypeName>, live: LoadFuture<'query>) -> LoadFuture<'query> {
+        let resolvers: Vec<LoadFuture<'query>> = unknown.iter().map(|name| self.inner.load(type_oids_query(name))).collect();
+        let metadata = Arc::clone(&self.metadata);
+        async move {
+            for (name, resolver) in unknown.into_iter().zip(resolvers) {
+                let rows: Vec<PgRow> = resolver.await?.try_collect().await?;
+                if let Some(row) = rows.first() {
+                    let oids = <TypeOids as FromSqlRow<Untyped, Pg>>::build_from_row(row)
+                        .map_err(diesel::result::Error::DeserializationError)?;
+                    metadata
+                        .lock()
+                        .expect("metadata")
+                        .store_type(name.key(), (oids.oid, oids.typarray));
+                }
+            }
+            live.await
+        }
+        .boxed()
+    }
+}
+
+/// A user-defined type a bind named, as Diesel names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TypeName {
+    schema: Option<String>,
+    name: String,
+}
+
+impl TypeName {
+    fn key(&self) -> PgMetadataCacheKey<'static> {
+        PgMetadataCacheKey::new(self.schema.clone().map(Cow::Owned), Cow::Owned(self.name.clone()))
+    }
 }
 
 /// A type lookup over the OIDs already known, remembering what it did
 /// not know rather than asking the database (it cannot, synchronously).
 struct Lookup {
     cache: PgMetadataCache,
-    unknown: Vec<PgMetadataCacheKey<'static>>,
+    unknown: Vec<TypeName>,
 }
 
 impl PgMetadataLookup for Lookup {
@@ -202,11 +308,14 @@ impl PgMetadataLookup for Lookup {
         if let Some(metadata) = self.cache.lookup_type(&key) {
             return metadata;
         }
-        let key = key.into_owned();
-        if !self.unknown.contains(&key) {
-            self.unknown.push(key.clone());
+        let name = TypeName {
+            schema: schema.map(str::to_string),
+            name: type_name.to_string(),
+        };
+        if !self.unknown.contains(&name) {
+            self.unknown.push(name);
         }
-        PgTypeMetadata::from_result(Err(FailedToLookupTypeError::new(key)))
+        PgTypeMetadata::from_result(Err(FailedToLookupTypeError::new(key.into_owned())))
     }
 
     fn as_any<'a>(&mut self) -> &mut (dyn std::any::Any + 'a)
@@ -226,42 +335,54 @@ struct TypeOids {
 }
 
 /// Diesel's own resolution of a type name, as a query.
-fn type_oids_query(key: &PgMetadataCacheKey<'static>) -> diesel::query_builder::BoxedSqlQuery<'static, Pg, diesel::query_builder::SqlQuery> {
-    let (schema, name) = key_parts(key);
-    match schema {
+fn type_oids_query(name: &TypeName) -> diesel::query_builder::BoxedSqlQuery<'static, Pg, diesel::query_builder::SqlQuery> {
+    match &name.schema {
         Some(schema) => sql_query(
             "SELECT t.oid, t.typarray FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
              WHERE t.typname = $1 AND n.nspname = $2",
         )
         .into_boxed()
-        .bind::<Text, _>(name)
-        .bind::<Text, _>(schema),
+        .bind::<Text, _>(name.name.clone())
+        .bind::<Text, _>(schema.clone()),
         None => sql_query("SELECT oid, typarray FROM pg_type WHERE oid = quote_ident($1)::regtype::oid")
             .into_boxed()
-            .bind::<Text, _>(name),
+            .bind::<Text, _>(name.name.clone()),
     }
-}
-
-/// `PgMetadataCacheKey` keeps its parts private; its `Debug` output is
-/// the only way out without a Diesel change, and it is stable.
-fn key_parts(key: &PgMetadataCacheKey<'static>) -> (Option<String>, String) {
-    let text = format!("{key:?}");
-    let field = |name: &str| -> Option<String> {
-        let start = text.find(&format!("{name}: "))? + name.len() + 2;
-        let rest = &text[start..];
-        let rest = rest.strip_prefix("Some(")?.strip_prefix('"').or_else(|| rest.strip_prefix('"'))?;
-        let end = rest.find('"')?;
-        Some(rest[..end].to_string())
-    };
-    (field("schema"), field("type_name").unwrap_or_default())
 }
 
 type LoadFuture<'query> = BoxFuture<'query, QueryResult<BoxStream<'static, QueryResult<PgRow>>>>;
 
+/// Ends a subscription if the read that made it is dropped before the
+/// fill. The subscribe itself runs on a blocking thread and cannot be
+/// cancelled, so the flag is checked once it returns: a subscription
+/// made for a read nobody waits for is dropped at once.
+struct Cancelled {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for Cancelled {
+    fn drop(&mut self) {
+        self.flag.store(true, Ordering::Release);
+    }
+}
+
 impl SimpleAsyncConnection for AsyncSyncedConnection {
     fn batch_execute(&mut self, query: &str) -> impl std::future::Future<Output = QueryResult<()>> + Send {
-        self.wrote();
-        self.inner.batch_execute(query)
+        // diesel-async's future borrows the connection, so it cannot be
+        // pipelined and needs no in-flight token; the write is marked
+        // now and again when it completes.
+        let cache = if may_write(query) { self.cache.clone() } else { None };
+        if let Some(cache) = &cache {
+            cache.mark_write();
+        }
+        let future = self.inner.batch_execute(query);
+        async move {
+            let result = future.await;
+            if let Some(cache) = cache {
+                cache.mark_write();
+            }
+            result
+        }
     }
 }
 
@@ -288,50 +409,51 @@ impl AsyncConnection for AsyncSyncedConnection {
     {
         let query = source.as_query();
         let Some(cache) = self.cache.clone() else {
-            return self.inner.load(query).map_ok(Self::live_stream).boxed();
+            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            return self.tracked(live);
         };
-        let (mut key, unknown) = match self.key_of(&query) {
+        let (key, unknown) = match self.key_of(&query) {
             Ok(found) => found,
             Err(error) => return std::future::ready(Err(error)).boxed(),
         };
+        let Some(mut key) = key else {
+            // The query cannot even be keyed until its types are known:
+            // live this time, resolved for the next.
+            let live = self.inner.load(query);
+            let live = self.resolving(unknown, live).map_ok(Self::live_stream).boxed();
+            return self.tracked(live);
+        };
         let route = key.take_route().or(self.scoped).unwrap_or(self.route);
         if !key.is_select() {
-            self.wrote();
-            return self.inner.load(query).map_ok(Self::live_stream).boxed();
+            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            return self.written(live);
         }
-        if route == Route::Postgres || self.in_transaction() {
-            return self.inner.load(query).map_ok(Self::live_stream).boxed();
+        if route == Route::Postgres || self.pipelined() || self.in_transaction() {
+            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            return self.tracked(live);
+        }
+        if key.is_locking() {
+            cache.stats.locking.fetch_add(1, Ordering::Relaxed);
+            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            return self.tracked(live);
         }
         if self.within_write_window() {
             cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
-            return self.inner.load(query).map_ok(Self::live_stream).boxed();
+            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            return self.tracked(live);
         }
         if !unknown.is_empty() {
             // Live this time; the OIDs are resolved for the next time.
-            let resolvers: Vec<LoadFuture<'query>> = unknown.iter().map(|key| self.inner.load(type_oids_query(key))).collect();
             let live = self.inner.load(query);
-            let metadata = Arc::clone(&self.metadata);
-            return async move {
-                for (key, resolver) in unknown.into_iter().zip(resolvers) {
-                    let rows: Vec<PgRow> = resolver.await?.try_collect().await?;
-                    if let Some(row) = rows.first() {
-                        let oids = <TypeOids as FromSqlRow<Untyped, Pg>>::build_from_row(row)
-                            .map_err(diesel::result::Error::DeserializationError)?;
-                        metadata
-                            .lock()
-                            .expect("metadata")
-                            .store_type(key, (oids.oid, oids.typarray));
-                    }
-                }
-                live.await.map(Self::live_stream)
-            }
-            .boxed();
+            let live = self.resolving(unknown, live).map_ok(Self::live_stream).boxed();
+            return self.tracked(live);
         }
         if let Some(entry) = cache.get(&key) {
             return std::future::ready(Ok(Self::cached_stream(Arc::clone(&entry.rows)))).boxed();
         }
         if cache.refused_recently(&key).is_some() {
-            return self.inner.load(query).map_ok(Self::live_stream).boxed();
+            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            return self.tracked(live);
         }
 
         // A miss. The futures the read may need are built now; which
@@ -344,14 +466,36 @@ impl AsyncConnection for AsyncSyncedConnection {
         };
         let catalog_loaded = Arc::clone(&self.catalog_loaded);
         let subscriptions = cache.shared_subscriptions();
+        let token = Arc::clone(&self.inflight);
         async move {
-            let generation = cache.reserve(&key);
+            let _pending = token;
+            let reservation = cache.reserve(&key);
+            let cancelled = Arc::new(AtomicBool::new(false));
             let outcome = {
                 let subscriptions = Arc::clone(&subscriptions);
                 let key = key.clone();
-                tokio::task::spawn_blocking(move || subscriptions.subscribe(&key))
-                    .await
-                    .map_err(|error| diesel::result::Error::QueryBuilderError(Box::new(error)))?
+                let cancelled = Arc::clone(&cancelled);
+                let guard = Cancelled {
+                    flag: Arc::clone(&cancelled),
+                };
+                let outcome = tokio::task::spawn_blocking(move || {
+                    let outcome = subscriptions.subscribe(&key);
+                    if cancelled.load(Ordering::Acquire) {
+                        subscriptions.unsubscribe(&key);
+                    }
+                    outcome
+                })
+                .await
+                .map_err(|error| diesel::result::Error::QueryBuilderError(Box::new(error)))?;
+                std::mem::forget(guard);
+                outcome
+            };
+            // From here the future owns the subscription until the fill;
+            // dropped before that, it ends it.
+            let guard = Unfilled {
+                subscriptions: Arc::clone(&subscriptions),
+                key: key.clone(),
+                armed: true,
             };
             let verdict = match outcome {
                 Outcome::Verdict(verdict) => verdict,
@@ -385,17 +529,20 @@ impl AsyncConnection for AsyncSyncedConnection {
             };
             match verdict {
                 Verdict::Refused(reason) => {
+                    guard.disarm();
                     cache.refused(&key, &reason);
                     live.await.map(Self::live_stream)
                 }
-                Verdict::Rows(rows) => {
-                    cache.fill(key, generation, Arc::clone(&rows));
+                Verdict::Rows { rows, store_bytes } => {
+                    guard.disarm();
+                    cache.fill_weighing(reservation, Arc::clone(&rows), store_bytes);
                     Ok(Self::cached_stream(rows))
                 }
                 Verdict::Accepted => {
                     let pg_rows: Vec<PgRow> = live.await?.try_collect().await?;
                     let rows: Arc<[OwnedRow]> = Arc::from(capture_all(pg_rows.into_iter().map(Ok))?);
-                    cache.fill(key, generation, Arc::clone(&rows));
+                    guard.disarm();
+                    cache.fill(reservation, Arc::clone(&rows));
                     Ok(Self::cached_stream(rows))
                 }
             }
@@ -407,8 +554,8 @@ impl AsyncConnection for AsyncSyncedConnection {
     where
         T: QueryFragment<Pg> + QueryId + 'query,
     {
-        self.wrote();
-        self.inner.execute_returning_count(source)
+        let future = self.inner.execute_returning_count(source);
+        self.written(future)
     }
 
     fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
@@ -425,6 +572,29 @@ impl AsyncConnection for AsyncSyncedConnection {
 
     fn set_prepared_statement_cache_size(&mut self, size: CacheSize) {
         self.inner.set_prepared_statement_cache_size(size)
+    }
+}
+
+/// A subscription made for a read whose future may be dropped before
+/// the fill (the `Accepted` read of Postgres, the catalog lookup). Armed
+/// until the fill; dropped armed, it ends the subscription.
+struct Unfilled {
+    subscriptions: Arc<dyn Subscriptions>,
+    key: QueryKey,
+    armed: bool,
+}
+
+impl Unfilled {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Unfilled {
+    fn drop(&mut self) {
+        if self.armed {
+            self.subscriptions.unsubscribe(&self.key);
+        }
     }
 }
 

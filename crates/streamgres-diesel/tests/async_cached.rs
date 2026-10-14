@@ -31,6 +31,50 @@ diesel::table! {
     }
 }
 
+/// A user-defined type: Diesel must look its OIDs up, and an array of it
+/// cannot even be rendered until it has.
+#[derive(diesel::sql_types::SqlType, diesel::query_builder::QueryId)]
+#[diesel(postgres_type(name = "sg_mood"))]
+pub struct SgMood;
+
+#[derive(Debug, Clone, Copy, PartialEq, diesel::AsExpression, diesel::FromSqlRow)]
+#[diesel(sql_type = SgMood)]
+enum Mood {
+    Happy,
+    Sad,
+}
+
+impl diesel::serialize::ToSql<SgMood, diesel::pg::Pg> for Mood {
+    fn to_sql<'b>(&'b self, out: &mut diesel::serialize::Output<'b, '_, diesel::pg::Pg>) -> diesel::serialize::Result {
+        use std::io::Write;
+        out.write_all(match self {
+            Mood::Happy => b"happy",
+            Mood::Sad => b"sad",
+        })?;
+        Ok(diesel::serialize::IsNull::No)
+    }
+}
+
+impl diesel::deserialize::FromSql<SgMood, diesel::pg::Pg> for Mood {
+    fn from_sql(bytes: diesel::pg::PgValue<'_>) -> diesel::deserialize::Result<Self> {
+        match bytes.as_bytes() {
+            b"happy" => Ok(Mood::Happy),
+            b"sad" => Ok(Mood::Sad),
+            other => Err(format!("not a mood: {other:?}").into()),
+        }
+    }
+}
+
+diesel::table! {
+    use diesel::sql_types::*;
+    use super::SgMood;
+    sg_moods (id) {
+        id -> Int4,
+        key -> Text,
+        mood -> SgMood,
+    }
+}
+
 fn url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres:///streamgres_diesel_test?host=/tmp".to_string())
@@ -44,7 +88,7 @@ struct FakeEngine {
 
 impl Subscriptions for FakeEngine {
     fn subscribe(&self, key: &QueryKey) -> Outcome {
-        if !key.sql.contains("sg_configs") {
+        if !key.sql.contains("sg_") {
             return Outcome::Verdict(Verdict::Refused("not a config read".into()));
         }
         self.subscribed.lock().unwrap().push(key.clone());
@@ -73,8 +117,16 @@ impl World {
         let mut other = AsyncPgConnection::establish(&url()).await.expect("connect");
         other
             .batch_execute(
-                "CREATE TABLE IF NOT EXISTS sg_configs (
-                    id serial PRIMARY KEY, key text NOT NULL UNIQUE, value text NOT NULL)",
+                // The tests run in parallel; the lock serialises the DDL.
+                "BEGIN;
+                 SELECT pg_advisory_xact_lock(424242);
+                 CREATE TABLE IF NOT EXISTS sg_configs (
+                    id serial PRIMARY KEY, key text NOT NULL UNIQUE, value text NOT NULL);
+                 DO $$ BEGIN CREATE TYPE sg_mood AS ENUM ('happy', 'sad');
+                    EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$;
+                 CREATE TABLE IF NOT EXISTS sg_moods (
+                    id serial PRIMARY KEY, key text NOT NULL UNIQUE, mood sg_mood NOT NULL);
+                 COMMIT",
             )
             .await
             .expect("schema");
@@ -298,3 +350,139 @@ struct Count {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     n: i64,
 }
+
+#[tokio::test]
+async fn an_enum_array_bind_is_live_once_then_cached() {
+    let mut w = World::new("async-enum-array").await;
+    let key = w.key("m");
+    diesel::sql_query("INSERT INTO sg_moods (key, mood) VALUES ($1, 'happy') ON CONFLICT (key) DO NOTHING")
+        .bind::<diesel::sql_types::Text, _>(&key)
+        .execute(&mut w.other)
+        .await
+        .unwrap();
+    async fn read(conn: &mut AsyncSyncedConnection, key: String) -> Option<Mood> {
+        sg_moods::table
+            .filter(sg_moods::key.eq(key))
+            .filter(sg_moods::mood.eq_any(vec![Mood::Happy, Mood::Sad]))
+            .select(sg_moods::mood)
+            .first::<Mood>(conn)
+            .await
+            .optional()
+            .unwrap()
+    }
+    // The array's element OID is unknown: the query cannot be keyed, so
+    // it goes live while the type is resolved.
+    assert_eq!(read(&mut w.conn, key.clone()).await, Some(Mood::Happy));
+    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 0, "not subscribed the first time");
+    assert_eq!(read(&mut w.conn, key.clone()).await, Some(Mood::Happy));
+    assert_eq!(w.engine.subscribed.lock().unwrap().len(), 1, "keyed and subscribed the second time");
+    assert_eq!(read(&mut w.conn, key.clone()).await, Some(Mood::Happy));
+    assert_eq!(w.hits(), 1, "cached the third time");
+
+    // The OIDs live in the cache: a sibling connection knows them at once.
+    let inner = AsyncPgConnection::establish(&url()).await.expect("connect");
+    let mut sibling = AsyncSyncedConnection::with_cache(inner, Arc::clone(&w.cache), Route::Streamgres);
+    assert_eq!(read(&mut sibling, key.clone()).await, Some(Mood::Happy));
+    assert_eq!(w.hits(), 2, "the sibling hit the same entry without a live read");
+    let _ = diesel::sql_query("DELETE FROM sg_moods WHERE key = $1")
+        .bind::<diesel::sql_types::Text, _>(&key)
+        .execute(&mut w.other)
+        .await;
+    w.clean().await;
+}
+
+#[tokio::test]
+async fn pipelined_reads_do_not_touch_the_transaction_state() {
+    let mut w = World::new("async-pipeline").await;
+    w.put("a", "1").await;
+    w.put("b", "2").await;
+    let query = |key: String| {
+        sg_configs::table
+            .filter(sg_configs::key.eq(key))
+            .select(sg_configs::value)
+            .limit(1)
+    };
+    // Two futures from one connection, both pending at once: diesel-async
+    // shares its transaction state with each, and asking for it while
+    // the first is pending is a panic.
+    let (key_a, key_b) = (w.key("a"), w.key("b"));
+    let first = AsyncConnection::load(&mut w.conn, query(key_a));
+    let second = AsyncConnection::load(&mut w.conn, query(key_b));
+    let (first, second) = futures_util::join!(first, second);
+    let first: Vec<String> = first
+        .unwrap()
+        .map(|row| row.and_then(|row| <String as FromSqlRow<diesel::sql_types::Text, diesel::pg::Pg>>::build_from_row(&row).map_err(diesel::result::Error::DeserializationError)))
+        .try_collect()
+        .await
+        .unwrap();
+    let second: Vec<String> = second
+        .unwrap()
+        .map(|row| row.and_then(|row| <String as FromSqlRow<diesel::sql_types::Text, diesel::pg::Pg>>::build_from_row(&row).map_err(diesel::result::Error::DeserializationError)))
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!((first, second), (vec!["1".to_string()], vec!["2".to_string()]));
+    w.clean().await;
+}
+
+#[tokio::test]
+async fn a_route_scope_ends_when_its_future_is_dropped() {
+    let mut w = World::new("async-scope-drop").await;
+    w.put("mode", "a").await;
+    assert_eq!(w.read("mode").await.as_deref(), Some("a"));
+    w.put("mode", "b").await;
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(10),
+        w.conn.with_route(Route::Postgres, |_| std::future::pending::<()>().boxed()),
+    )
+    .await;
+    assert!(dropped.is_err(), "the scope's future was dropped mid-way");
+    assert_eq!(w.read("mode").await.as_deref(), Some("a"), "the scope was restored: the cache answers");
+    w.clean().await;
+}
+
+#[tokio::test]
+async fn a_read_dropped_after_subscribing_ends_its_subscription() {
+    let mut w = World::new("async-drop-read").await;
+    w.put("mode", "a").await;
+    let query = sg_configs::table
+        .filter(sg_configs::key.eq(w.key("mode")))
+        .select(sg_configs::value)
+        .limit(1);
+    let dropped = tokio::time::timeout(Duration::ZERO, AsyncConnection::load(&mut w.conn, query)).await;
+    assert!(dropped.is_err(), "polled once, then dropped");
+    for _ in 0..50 {
+        if !w.engine.unsubscribed.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let subscribed = w.engine.subscribed.lock().unwrap().len();
+    let unsubscribed = w.engine.unsubscribed.lock().unwrap().len();
+    assert_eq!((subscribed, unsubscribed), (1, 1), "the subscription the dropped read made was ended");
+    assert_eq!(w.cache.reservations(), 0, "and its reservation released");
+    assert_eq!(w.cache.len(), 0);
+    w.clean().await;
+}
+
+#[tokio::test]
+async fn a_write_on_a_sibling_connection_is_seen_through_the_shared_cache() {
+    let mut w = World::new("async-ryw-pool").await;
+    w.conn.set_read_your_writes(Duration::from_secs(5));
+    w.put("mode", "a").await;
+    assert_eq!(w.read("mode").await.as_deref(), Some("a"));
+    let inner = AsyncPgConnection::establish(&url()).await.expect("connect");
+    let mut sibling = AsyncSyncedConnection::with_cache(inner, Arc::clone(&w.cache), Route::Streamgres);
+    let key = w.key("mode");
+    diesel::update(sg_configs::table.filter(sg_configs::key.eq(&key)))
+        .set(sg_configs::value.eq("b"))
+        .execute(&mut sibling)
+        .await
+        .unwrap();
+    assert_eq!(w.read("mode").await.as_deref(), Some("b"), "the other connection reads Postgres for the window");
+    assert_eq!(stat(&w.cache.stats.after_write), 1);
+    w.clean().await;
+}
+
+use diesel::deserialize::FromSqlRow;
+use futures_util::{StreamExt, TryStreamExt};
