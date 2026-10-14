@@ -26,6 +26,9 @@
 //!   is the parameter's Postgres type OID and its binary bytes, `null`
 //!   for SQL `NULL`. `id` is the backend's own, unique per connection.
 //!   `rows` asks for the rows themselves (below) rather than touches.
+//!   The SQL may join tables (`FROM ("a" INNER JOIN "b" ON (...))`, as
+//!   Diesel renders it); the engine follows each table and the backend
+//!   composes the join from the rows it is sent.
 //! - `["unsubscribe", {"id": n}]`
 //! - `["ping"]`
 //!
@@ -34,22 +37,26 @@
 //! - `["accepted", {"id": n}]` once the engine follows the query; from
 //!   that moment every change to its rows is reported, so the backend
 //!   reads Postgres only after it. In rows mode the body also carries
-//!   the hydrated result: `"table"`, `"key"` (the primary-key columns),
-//!   `"columns"` (the projected columns, `null` for `*`), `"names"` (what
-//!   each comes out as: its alias or its own name; for a `COUNT(*)` the
-//!   one output name), `"count"` (a `COUNT(*)`), `"order"`
-//!   (`[[column, "asc"|"desc"], ...]`), `"limit"` (`null` for none) and
-//!   `"rows"` (JSON objects keyed by column, every column of the row).
+//!   the hydrated result: `"nodes"`, one per table of the query, root
+//!   first, each with `"table"`, `"key"` (its primary-key columns),
+//!   `"parent"` (the table it joins to, `null` for the root),
+//!   `"parent_column"` and `"child_column"` (the join equality),
+//!   `"inner"` (`false` for a LEFT join) and `"rows"` (JSON objects keyed
+//!   by column, every column of the row); then `"columns"` (the projected
+//!   `[table, column]` pairs, `null` for `*`), `"names"` (what each comes
+//!   out as: its alias or its own name; for a `COUNT(*)` the one output
+//!   name), `"count"` (a `COUNT(*)`), `"order"` (`[[column, "asc"|"desc"],
+//!   ...]`, on the root table) and `"limit"` (`null` for none).
 //! - `["refused", {"id": n, "reason": "..."}]` when the engine cannot
 //!   follow the query (outside the SQL subset, an unknown table, too many
 //!   rows). The backend serves that query live.
 //! - `["touched", {"ids": [n, ...]}]` per transaction that changed the
 //!   rows of those subscriptions, for subscriptions not in rows mode.
-//! - `["delta", {"id": n, "put": [row, ...], "del": [key, ...]}]` per
-//!   transaction, for one subscription in rows mode: rows that entered
-//!   or changed, and the keys of rows that left, in the order applied.
-//!   A changed row appears as a `del` of its key and a `put` of its new
-//!   image in the same frame.
+//! - `["delta", {"id": n, "changes": [{"table": t, "put": [row, ...], "del": [key, ...]}, ...]}]`
+//!   per transaction, for one subscription in rows mode: per table, the
+//!   rows that entered or changed and the keys of rows that left, in the
+//!   order applied. A changed row appears as a `del` of its key and a
+//!   `put` of its new image in the same frame.
 //! - `["pong"]`
 
 use std::collections::{HashMap, HashSet};
@@ -66,13 +73,14 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value as Json, json};
 use tokio::sync::{mpsc, watch};
 
+use super::ast::Translated;
 use super::connection::AppState;
-use super::wire;
+use super::{plan, wire};
 use crate::ivm::Delta;
 use crate::log::{log_debug, log_info, log_warn};
 use crate::model::{
-    DataFrameKey, DataFrameOperation, DataFrameRow, MultiTableReadQuery, Order, OrderBy,
-    SingleTableReadQuery, SubId, TableName,
+    DataFrameKey, DataFrameOperation, DataFrameRow, MultiTableReadQuery, Order, OrderBy, SubId,
+    TableName,
 };
 use crate::parser::{BindValue, Projection, parse_select};
 use crate::sync::{CatalogHandle, Command, Event};
@@ -90,13 +98,8 @@ pub enum Request {
         conn: u64,
         out: mpsc::UnboundedSender<String>,
     },
-    Subscribe {
-        conn: u64,
-        id: u64,
-        sql: String,
-        binds: Vec<BindValue>,
-        rows: bool,
-    },
+    /// A query parsed and planned by the connection's handler.
+    Subscribe(Box<Subscribe>),
     Unsubscribe {
         conn: u64,
         id: u64,
@@ -105,6 +108,19 @@ pub enum Request {
         conn: u64,
     },
 }
+
+/// A subscription ready to register.
+#[derive(Debug)]
+pub struct Subscribe {
+    conn: u64,
+    id: u64,
+    query: MultiTableReadQuery,
+    /// Present when the backend asked for rows.
+    shape: Option<Shape>,
+}
+
+/// Per table, the puts and deletes of one transaction.
+type Changes = Vec<(TableName, Vec<Json>, Vec<Json>)>;
 
 /// The handle connections talk to the task through.
 #[derive(Debug)]
@@ -134,36 +150,78 @@ struct Conn {
 }
 
 /// What a rows-mode subscription needs beyond its ids: the query's shape
-/// for the backend to order and project by, and the rows gathered while
-/// the engine hydrates it.
-struct Shape {
-    table: TableName,
+/// for the backend to compose, order and project by, and the rows
+/// gathered per table while the engine hydrates.
+#[derive(Debug)]
+pub struct Shape {
+    nodes: Vec<NodeShape>,
     projection: Projection,
     order: Vec<OrderBy>,
     limit: u32,
-    /// The hydrating result: a key's latest image, `None` once deleted.
+}
+
+/// One table of the query: how it joins its parent, and its hydrating
+/// rows (a key's latest image, `None` once deleted).
+#[derive(Debug)]
+struct NodeShape {
+    table: TableName,
+    parent: Option<usize>,
+    parent_column: Option<String>,
+    child_column: Option<String>,
+    inner: bool,
     snapshot: Vec<(DataFrameKey, Option<DataFrameRow>)>,
 }
 
 impl Shape {
-    fn new(query: &SingleTableReadQuery, projection: Projection) -> Shape {
+    pub fn new(query: &MultiTableReadQuery, projection: Projection) -> Shape {
+        let mut nodes = Vec::new();
+        fn walk(query: &MultiTableReadQuery, parent: Option<usize>, edge: Option<(&str, &str, bool)>, nodes: &mut Vec<NodeShape>) {
+            nodes.push(NodeShape {
+                table: query.main_table.table.clone(),
+                parent,
+                parent_column: edge.map(|(p, _, _)| p.to_string()),
+                child_column: edge.map(|(_, c, _)| c.to_string()),
+                inner: edge.is_none_or(|(_, _, inner)| inner),
+                snapshot: Vec::new(),
+            });
+            let index = nodes.len() - 1;
+            for join in &query.joins {
+                walk(
+                    &join.sub,
+                    Some(index),
+                    Some((
+                        join.main_table_column.as_str(),
+                        join.sub_table_column.as_str(),
+                        join.is_inner,
+                    )),
+                    nodes,
+                );
+            }
+        }
+        walk(query, None, None, &mut nodes);
         Shape {
-            table: query.table.clone(),
+            nodes,
             projection,
-            order: query.order_by.clone(),
-            limit: query.limit,
-            snapshot: Vec::new(),
+            order: query.main_table.order_by.clone(),
+            limit: query.main_table.limit,
         }
     }
 
-    fn absorb(&mut self, op: &DataFrameOperation) {
+    fn node_of(&mut self, table: &TableName) -> Option<&mut NodeShape> {
+        self.nodes.iter_mut().find(|node| &node.table == table)
+    }
+
+    fn absorb(&mut self, table: &TableName, op: &DataFrameOperation) {
+        let Some(node) = self.node_of(table) else {
+            return;
+        };
         let (key, row) = match op {
             DataFrameOperation::Add(key, row) => (key, Some(row.clone())),
             DataFrameOperation::Delete(key, _) => (key, None),
         };
-        match self.snapshot.iter_mut().find(|(k, _)| k == key) {
+        match node.snapshot.iter_mut().find(|(k, _)| k == key) {
             Some(slot) => slot.1 = row,
-            None => self.snapshot.push((key.clone(), row)),
+            None => node.snapshot.push((key.clone(), row)),
         }
     }
 }
@@ -242,13 +300,15 @@ impl Task {
                     },
                 );
             }
-            Request::Subscribe {
-                conn,
-                id,
-                sql,
-                binds,
-                rows,
-            } => self.subscribe(conn, id, &sql, &binds, rows).await,
+            Request::Subscribe(subscribe) => {
+                let Subscribe {
+                    conn,
+                    id,
+                    query,
+                    shape,
+                } = *subscribe;
+                self.subscribe(conn, id, query, shape).await
+            }
             Request::Unsubscribe { conn, id } => {
                 let sub = self
                     .conns
@@ -274,7 +334,13 @@ impl Task {
         }
     }
 
-    async fn subscribe(&mut self, conn: u64, id: u64, sql: &str, binds: &[BindValue], rows: bool) {
+    async fn subscribe(
+        &mut self,
+        conn: u64,
+        id: u64,
+        query: MultiTableReadQuery,
+        shape: Option<Shape>,
+    ) {
         let Some(connection) = self.conns.get(&conn) else {
             return;
         };
@@ -284,22 +350,12 @@ impl Task {
             send(&connection.out, refused(id, "that id is already subscribed"));
             return;
         }
-        let catalog = self.catalog.load();
-        let (query, projection) = match parse_select(sql, binds, &catalog) {
-            Ok(parsed) => parsed,
-            Err(error) => {
-                log_debug!("s2s connection {conn}: query {id} refused: {}", error.message);
-                send(&connection.out, refused(id, &error.message));
-                return;
-            }
-        };
-        let shape = rows.then(|| Shape::new(&query, projection));
         let token = self.next_token;
         self.next_token += 1;
         self.by_token.insert(token, (conn, id, shape));
         let command = Command::Register {
             sink: self.sink,
-            query: MultiTableReadQuery::single(query),
+            query,
             token,
         };
         if self.commands.send(command).await.is_err() {
@@ -332,7 +388,7 @@ impl Task {
                     // A twin's rows come with the registration.
                     for delta in &updates {
                         if delta.targets().any(|target| target.sub == sub) {
-                            shape.absorb(&delta.op);
+                            shape.absorb(&delta.table, &delta.op);
                         }
                     }
                     self.shapes.insert(sub, shape);
@@ -378,16 +434,33 @@ impl Task {
             return;
         };
         let catalog = self.catalog.load();
-        let Some(table) = catalog.table(shape.table.as_str()) else {
-            send(&connection.out, refused(id, "the table left the catalog"));
-            return;
-        };
-        let rows: Vec<Json> = shape
-            .snapshot
-            .drain(..)
-            .filter_map(|(_, row)| row)
-            .map(|row| wire::row_json(&row, table))
+        let table_names: Vec<String> = shape
+            .nodes
+            .iter()
+            .map(|node| node.table.as_str().to_owned())
             .collect();
+        let mut nodes = Vec::with_capacity(shape.nodes.len());
+        for node in shape.nodes.iter_mut() {
+            let Some(table) = catalog.table(node.table.as_str()) else {
+                send(&connection.out, refused(id, "a table left the catalog"));
+                return;
+            };
+            let rows: Vec<Json> = node
+                .snapshot
+                .drain(..)
+                .filter_map(|(_, row)| row)
+                .map(|row| wire::row_json(&row, table))
+                .collect();
+            nodes.push(json!({
+                "table": table.name.as_str(),
+                "key": table.pkey.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+                "parent": node.parent.map(|p| table_names[p].clone()),
+                "parent_column": node.parent_column,
+                "child_column": node.child_column,
+                "inner": node.inner,
+                "rows": rows,
+            }));
+        }
         let (columns, names) = match &shape.projection {
             Projection::All => (Json::Null, Json::Null),
             Projection::Count { name } => (Json::Null, json!([name])),
@@ -395,7 +468,7 @@ impl Task {
                 Json::Array(
                     columns
                         .iter()
-                        .map(|p| Json::from(p.column.as_str()))
+                        .map(|p| json!([p.table.as_str(), p.column.as_str()]))
                         .collect(),
                 ),
                 Json::Array(columns.iter().map(|p| Json::from(p.name.as_str())).collect()),
@@ -419,24 +492,23 @@ impl Task {
             &connection.out,
             json!(["accepted", {
                 "id": id,
-                "table": table.name.as_str(),
-                "key": table.pkey.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+                "nodes": nodes,
                 "columns": columns,
                 "names": names,
                 "count": matches!(shape.projection, Projection::Count { .. }),
                 "order": order,
                 "limit": limit,
-                "rows": rows,
             }]),
         );
     }
 
     /// Tells each connection what the deltas did to its subscriptions:
-    /// rows-mode ones get the rows, the rest a touch.
+    /// rows-mode ones get the rows per table, the rest a touch.
     fn changed(&mut self, updates: &[Delta]) {
         let mut touched: HashMap<u64, Vec<u64>> = HashMap::new();
-        // Per rows-mode subscription, the puts and deletes in order.
-        let mut deltas: HashMap<SubId, (Vec<Json>, Vec<Json>)> = HashMap::new();
+        // Per rows-mode subscription, per table in order of appearance,
+        // the puts and deletes in order.
+        let mut deltas: HashMap<SubId, Changes> = HashMap::new();
         let catalog = self.catalog.load();
         for delta in updates {
             let table = catalog.table(delta.table.as_str());
@@ -446,10 +518,18 @@ impl Task {
                 };
                 if let Some(shape) = self.shapes.get_mut(&target.sub) {
                     if self.hydrating.contains(&target.sub) {
-                        shape.absorb(&delta.op);
+                        shape.absorb(&delta.table, &delta.op);
                         continue;
                     }
-                    let (puts, dels) = deltas.entry(target.sub).or_default();
+                    let changes = deltas.entry(target.sub).or_default();
+                    let index = match changes.iter().position(|(t, _, _)| *t == delta.table) {
+                        Some(index) => index,
+                        None => {
+                            changes.push((delta.table.clone(), Vec::new(), Vec::new()));
+                            changes.len() - 1
+                        }
+                    };
+                    let (_, puts, dels) = &mut changes[index];
                     match (&delta.op, table) {
                         (DataFrameOperation::Add(_, row), Some(table)) => {
                             puts.push(wire::row_json(row, table));
@@ -469,11 +549,15 @@ impl Task {
                 }
             }
         }
-        for (sub, (put, del)) in deltas {
+        for (sub, changes) in deltas {
             if let Some((conn, id)) = self.by_sub.get(&sub)
                 && let Some(connection) = self.conns.get(conn)
             {
-                send(&connection.out, json!(["delta", {"id": id, "put": put, "del": del}]));
+                let changes: Vec<Json> = changes
+                    .into_iter()
+                    .map(|(table, put, del)| json!({"table": table.as_str(), "put": put, "del": del}))
+                    .collect();
+                send(&connection.out, json!(["delta", {"id": id, "changes": changes}]));
             }
         }
         for (conn, ids) in touched {
@@ -556,13 +640,36 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
             Ok(Message::Ping(_)) | Ok(Message::Pong(_)) | Ok(Message::Binary(_)) => continue,
             Ok(Message::Close(_)) | Err(_) => break,
         };
-        match upstream(conn, &text) {
-            Ok(Some(request)) => {
+        match upstream(&text) {
+            Ok(Frame::Ping) => send(&out, json!(["pong"])),
+            Ok(Frame::Unsubscribe { id }) => {
+                if handle
+                    .requests
+                    .send(Request::Unsubscribe { conn, id })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(Frame::Subscribe {
+                id,
+                sql,
+                binds,
+                rows,
+            }) => {
+                let request = match prepare(&state, conn, id, &sql, &binds, rows).await {
+                    Ok(request) => request,
+                    Err(reason) => {
+                        log_debug!("s2s connection {conn}: query {id} refused: {reason}");
+                        send(&out, refused(id, &reason));
+                        continue;
+                    }
+                };
                 if handle.requests.send(request).await.is_err() {
                     break;
                 }
             }
-            Ok(None) => send(&out, json!(["pong"])),
             Err(reason) => {
                 log_warn!("s2s connection {conn}: {reason}");
                 send(&out, json!(["error", {"reason": reason}]));
@@ -575,8 +682,56 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
     log_info!("s2s connection {conn} closed");
 }
 
-/// One upstream frame as a request; `None` for a ping.
-fn upstream(conn: u64, text: &str) -> Result<Option<Request>, String> {
+/// Parses the SQL against the catalog and plans the query the way a
+/// Zero query is planned (which side of each join is read whole, how a
+/// page is read), so the engine registers it ready to run.
+async fn prepare(
+    state: &AppState,
+    conn: u64,
+    id: u64,
+    sql: &str,
+    binds: &[BindValue],
+    rows: bool,
+) -> Result<Request, String> {
+    let catalog = state.catalog.load();
+    let select = parse_select(sql, binds, &catalog).map_err(|error| error.message)?;
+    let shape = rows.then(|| Shape::new(&select.query, select.projection));
+    let translated = Translated {
+        query: select.query,
+        hidden: HashSet::new(),
+    };
+    let planned = plan::plan(
+        sql,
+        translated,
+        state.config.policy(),
+        &state.plans,
+        &*state.storage,
+    )
+    .await?;
+    Ok(Request::Subscribe(Box::new(Subscribe {
+        conn,
+        id,
+        query: planned.query,
+        shape,
+    })))
+}
+
+/// One upstream frame.
+#[derive(Debug)]
+enum Frame {
+    Ping,
+    Subscribe {
+        id: u64,
+        sql: String,
+        binds: Vec<BindValue>,
+        rows: bool,
+    },
+    Unsubscribe {
+        id: u64,
+    },
+}
+
+fn upstream(text: &str) -> Result<Frame, String> {
     let frame: Json = serde_json::from_str(text).map_err(|error| format!("not JSON: {error}"))?;
     let (tag, body) = match frame.as_array().map(Vec::as_slice) {
         Some([Json::String(tag), body]) => (tag.as_str(), body),
@@ -589,7 +744,7 @@ fn upstream(conn: u64, text: &str) -> Result<Option<Request>, String> {
             .ok_or_else(|| "`id` must be a non-negative integer".to_string())
     };
     match tag {
-        "ping" => Ok(None),
+        "ping" => Ok(Frame::Ping),
         "subscribe" => {
             let id = id(body)?;
             let sql = body
@@ -605,15 +760,14 @@ fn upstream(conn: u64, text: &str) -> Result<Option<Request>, String> {
                 .transpose()?
                 .unwrap_or_default();
             let rows = body.get("rows").and_then(Json::as_bool).unwrap_or(false);
-            Ok(Some(Request::Subscribe {
-                conn,
+            Ok(Frame::Subscribe {
                 id,
                 sql,
                 binds,
                 rows,
-            }))
+            })
         }
-        "unsubscribe" => Ok(Some(Request::Unsubscribe { conn, id: id(body)? })),
+        "unsubscribe" => Ok(Frame::Unsubscribe { id: id(body)? }),
         other => Err(format!("unknown tag `{other}`")),
     }
 }
@@ -642,23 +796,20 @@ mod tests {
 
     #[test]
     fn frames_parse_into_requests() {
-        let request = upstream(
-            3,
-            r#"["subscribe", {"id": 7, "sql": "SELECT * FROM t WHERE a = $1", "binds": [{"oid": 25, "bytes": "T1BFTg=="}, {"oid": 20, "bytes": null}]}]"#,
+        let frame = upstream(
+            r#"["subscribe", {"id": 7, "sql": "SELECT * FROM t WHERE a = $1", "binds": [{"oid": 25, "bytes": "T1BFTg=="}, {"oid": 20, "bytes": null}], "rows": true}]"#,
         )
-        .expect("parses")
-        .expect("a request");
-        match request {
-            Request::Subscribe {
-                conn,
+        .expect("parses");
+        match frame {
+            Frame::Subscribe {
                 id,
                 sql,
                 binds,
                 rows,
             } => {
-                assert_eq!((conn, id), (3, 7));
-                assert!(!rows);
+                assert_eq!(id, 7);
                 assert_eq!(sql, "SELECT * FROM t WHERE a = $1");
+                assert!(rows);
                 assert_eq!(
                     binds,
                     vec![
@@ -676,13 +827,13 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            upstream(1, r#"["unsubscribe", {"id": 2}]"#),
-            Ok(Some(Request::Unsubscribe { conn: 1, id: 2 }))
+            upstream(r#"["unsubscribe", {"id": 2}]"#),
+            Ok(Frame::Unsubscribe { id: 2 })
         ));
-        assert!(matches!(upstream(1, r#"["ping"]"#), Ok(None)));
-        assert!(upstream(1, r#"["subscribe", {"id": -1}]"#).is_err());
-        assert!(upstream(1, r#"["nope", {}]"#).is_err());
-        assert!(upstream(1, "{}").is_err());
-        assert!(upstream(1, r#"["subscribe", {"id": 1, "sql": "x", "binds": [{"oid": 25, "bytes": "%%"}]}]"#).is_err());
+        assert!(matches!(upstream(r#"["ping"]"#), Ok(Frame::Ping)));
+        assert!(upstream(r#"["subscribe", {"id": -1}]"#).is_err());
+        assert!(upstream(r#"["nope", {}]"#).is_err());
+        assert!(upstream("{}").is_err());
+        assert!(upstream(r#"["subscribe", {"id": 1, "sql": "x", "binds": [{"oid": 25, "bytes": "%%"}]}]"#).is_err());
     }
 }
