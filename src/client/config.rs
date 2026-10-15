@@ -181,6 +181,10 @@ pub struct Config {
     /// `STREAMGRES_METRICS_PREFIX`: prefix of exported metric names
     /// the default preserves existing series names.
     pub metrics_prefix: String,
+    /// `STREAMGRES_ENABLE_ADMIN_ENDPOINTS`: whether `/stats` and `/metrics`
+    /// are served (false). Enable only for deployments that need the
+    /// endpoints on the public port; prefer pushing metrics over OTLP.
+    pub admin_endpoints: bool,
 }
 
 impl Config {
@@ -404,6 +408,18 @@ impl Config {
             slow_query: millis("STREAMGRES_SLOW_QUERY_MS", 1_000)?,
             metrics_interval: millis("STREAMGRES_METRICS_INTERVAL_MS", 10_000)?,
             metrics_prefix,
+            admin_endpoints: match first(&["STREAMGRES_ENABLE_ADMIN_ENDPOINTS"])
+                .as_deref()
+            {
+                None => false,
+                Some("true") | Some("yes") | Some("on") | Some("1") => true,
+                Some("false") | Some("no") | Some("off") | Some("0") => false,
+                Some(other) => {
+                    return Err(format!(
+                        "STREAMGRES_ENABLE_ADMIN_ENDPOINTS must be a boolean, got `{other}`"
+                    ));
+                }
+            },
         })
     }
 

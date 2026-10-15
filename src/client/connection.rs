@@ -148,10 +148,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/{probe}"), get(health))
             .route(&format!("/{probe}"), get(health));
     }
-    router
-        .route("/stats", get(stats))
-        .route("/metrics", get(metrics))
-        .with_state(state)
+    if state.config.admin_endpoints {
+        router = router
+            .route("/stats", get(stats))
+            .route("/metrics", get(metrics));
+    }
+    router.with_state(state)
 }
 
 /// The server's measurements in Prometheus exposition format.
