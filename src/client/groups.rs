@@ -948,7 +948,7 @@ impl Groups {
                 let (frames, puts, _) = build_poke(
                     &self.catalog.load(),
                     &self.stats,
-                    self.config.rows_per_part.max(1),
+                    self.config.bytes_per_part.max(1),
                     &poke_id,
                     None,
                     &protocol::cookie(group.version),
@@ -1547,7 +1547,7 @@ impl Groups {
         let (frames, puts, dels) = build_poke(
             &self.catalog.load(),
             &self.stats,
-            self.config.rows_per_part.max(1),
+            self.config.bytes_per_part.max(1),
             &poke_id,
             base.as_deref(),
             &cookie,
@@ -1683,48 +1683,72 @@ fn with_current(
 }
 
 /// One poke as its frames, from `base` to `cookie`: the start, the parts
-/// (`head` in the first, `per_part` row operations each, every put taken
-/// from the bytes kept on its image when the image was sent before), the
-/// end. Also how many puts and dels it carries.
+/// (`head` in the first, row operations accumulated until the full frame
+/// size reaches `bytes_per_part`, every put taken from the bytes kept on
+/// its image when the image was sent before), the end. Also how many puts
+/// and dels it carries.
+///
+/// The frame size counted against the limit is the complete wire frame:
+/// the fixed JSON framing (`["pokePart",{"pokeID":...,rowsPatch":[...]}]`),
+/// the head fields (`desiredQueriesPatches`, `lastMutationIDChanges`, etc.
+/// — present only in the first part), and each row entry plus its comma.
 #[allow(clippy::too_many_arguments)]
 fn build_poke(
     catalog: &Catalog,
     stats: &Stats,
-    per_part: usize,
+    bytes_per_part: usize,
     poke_id: &str,
     base: Option<&str>,
     cookie: &str,
     head: Vec<u8>,
     rows: &[Patch<'_>],
 ) -> (Arc<[Bytes]>, usize, usize) {
-    let mut frames: Vec<Bytes> = Vec::with_capacity(rows.len().div_ceil(per_part) + 3);
+    let mut frames: Vec<Bytes> = Vec::with_capacity(4);
     frames.push(Bytes::from(protocol::poke_start(poke_id, base)));
-    let mut head = Some(head);
-    if rows.is_empty() {
-        frames.push(part_frame(poke_id, head.take(), &[]));
-    }
+    // head_of returns an empty Vec when there is nothing to say; treat that
+    // as no head so the head-only flush below never emits a phantom part
+    // carrying nothing.
+    let mut head = (!head.is_empty()).then_some(head);
     let (mut puts, mut dels) = (0usize, 0usize);
-    for chunk in rows.chunks(per_part) {
-        let mut entries: Vec<Bytes> = Vec::with_capacity(chunk.len());
-        for op in chunk {
-            match op {
-                Patch::Put(table, row) => {
-                    let Some(fragment) = put_fragment(catalog, stats, table, row) else {
-                        continue;
-                    };
-                    puts += 1;
-                    entries.push(fragment);
-                }
-                Patch::Del(table, key) => {
-                    dels += 1;
-                    let mut bytes = Vec::with_capacity(64);
-                    wire::write_del(&mut bytes, table.as_str(), key);
-                    entries.push(Bytes::from(bytes));
-                }
+    let frame_overhead = PART_FRAMING + poke_id.len();
+    let mut entries: Vec<Bytes> = Vec::new();
+    // Seed with overhead + head size: head fields are only in the first part.
+    let mut current_bytes = frame_overhead + head.as_ref().map_or(0, Vec::len);
+    for op in rows {
+        let entry = match op {
+            Patch::Put(table, row) => {
+                let Some(fragment) = put_fragment(catalog, stats, table, row) else {
+                    continue;
+                };
+                puts += 1;
+                fragment
             }
+            Patch::Del(table, key) => {
+                dels += 1;
+                let mut bytes = Vec::with_capacity(64);
+                wire::write_del(&mut bytes, table.as_str(), key);
+                Bytes::from(bytes)
+            }
+        };
+        // Non-empty part: flush if adding this entry (plus its comma) would exceed
+        // the limit, then the entry opens a new headless part.
+        if !entries.is_empty() && current_bytes + 1 + entry.len() > bytes_per_part {
+            frames.push(part_frame(poke_id, head.take(), &entries));
+            entries.clear();
+            current_bytes = frame_overhead;
         }
-        frames.push(part_frame(poke_id, head.take(), &entries));
+        // Empty part with a pending head: if the head and this entry together exceed
+        // the limit, flush the head in its own empty-rowsPatch part first so the
+        // entry starts a headless part. A row or head that exceeds the limit on its
+        // own is unsplittable; it is emitted as-is and accepted as an overage.
+        if entries.is_empty() && head.is_some() && current_bytes + entry.len() > bytes_per_part {
+            frames.push(part_frame(poke_id, head.take(), &[]));
+            current_bytes = frame_overhead;
+        }
+        current_bytes += if entries.is_empty() { entry.len() } else { entry.len() + 1 };
+        entries.push(entry);
     }
+    frames.push(part_frame(poke_id, head.take(), &entries));
     frames.push(Bytes::from(protocol::poke_end(poke_id, cookie)));
     (frames.into(), puts, dels)
 }
@@ -1782,6 +1806,12 @@ fn part_frame(poke_id: &str, head: Option<Vec<u8>>, entries: &[Bytes]) -> Bytes 
     frame.extend_from_slice(b"]}]");
     Bytes::from(frame)
 }
+
+/// The bytes `part_frame` writes around a numeric poke id and the
+/// entries: `["pokePart",{"pokeID":"` .. `","rowsPatch":[` .. `]}]`.
+/// Poke ids are counters (`next_poke.to_string()`) and never need JSON
+/// escaping, so a frame's framing cost is `PART_FRAMING + poke_id.len()`.
+const PART_FRAMING: usize = br#"["pokePart",{"pokeID":"","rowsPatch":[]}]"#.len();
 
 /// Keep one operation per row, the last one, in first-seen order.
 fn coalesce(rows: Vec<RowOp>) -> Vec<RowOp> {
@@ -2826,6 +2856,21 @@ mod tests {
         let mut bytes = Vec::new();
         wire::write_put(&mut bytes, catalog.table("t").unwrap(), row);
         bytes
+    }
+
+    /// PART_FRAMING is the number of bytes `part_frame` writes around a
+    /// numeric poke id and its entries; it is derived from a copy of the
+    /// same literals, so this test keeps the constant and the code in step
+    /// (a change to part_frame breaks it).
+    #[test]
+    fn part_framing_matches_part_frame() {
+        for id in ["1", "42", "18446744073709551615"] {
+            assert_eq!(
+                part_frame(id, None, &[]).len(),
+                PART_FRAMING + id.len(),
+                "PART_FRAMING counts what part_frame writes for id {id}"
+            );
+        }
     }
 
     /// A row is serialized the first time it is sent and its bytes are
