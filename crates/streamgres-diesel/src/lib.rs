@@ -38,9 +38,8 @@
 //!
 //! Diesel seals `Connection` behind the cargo feature
 //! `i-implement-a-third-party-backend-and-opt-into-breaking-changes`.
-//! Consumers that already wrap their connection (Hyperswitch through Deja)
-//! enable it, so this crate does too rather than reaching into Diesel's
-//! hidden derive re-exports.
+//! Consumers that already wrap their connection enable it, so this crate
+//! does too rather than reaching into Diesel's hidden derive re-exports.
 
 #[cfg(feature = "async")]
 pub mod asynchronous;
@@ -96,8 +95,8 @@ pub struct Attachment {
 /// One engine streams one database, and a cache is kept fresh by one
 /// engine, so a cache is per database: pools against the same database
 /// (a master and its replicas) share one, pools against different
-/// databases (Hyperswitch's main and accounts databases) each get their
-/// own, attached to the engine streaming that database. The route is
+/// databases each get their own, attached to the engine streaming that
+/// database. The route is
 /// per pool: a master pool can go to Postgres while a replica pool goes
 /// through Streamgres.
 pub struct Settings {
@@ -530,7 +529,7 @@ where
 /// Lets the wrapper resolve Postgres type OIDs the way the inner connection
 /// does, which makes it a `PgMetadataLookup`. Diesel needs that whenever a
 /// query binds a custom type, and applications that collect binds themselves
-/// (Hyperswitch's KV path does) hand the connection in for the same reason.
+/// hand the connection in for the same reason.
 impl<C> GetPgMetadataCache for SyncedConnection<C>
 where
     C: GetPgMetadataCache,

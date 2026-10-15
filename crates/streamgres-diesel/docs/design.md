@@ -23,11 +23,10 @@ Diesel funnels every operation into three methods on the connection type:
 `PgConnection`. Transactions reuse Diesel's ANSI manager over the inner
 connection's state, so there is one transaction depth, not two.
 
-Hyperswitch already names its connection through one alias
-(`diesel_models::DejaPgConnection`), so adopting the wrapper there is a
-cargo feature and no code change. Its pools (`bb8` through
-`async-bb8-diesel`) run every Diesel call on a blocking thread, which is
-where a cache miss can safely wait on the engine.
+An application that names its connection type through one alias adopts
+the wrapper by changing that alias and nothing else. Pools built on
+`bb8` through `async-bb8-diesel` run every Diesel call on a blocking
+thread, which is where a cache miss can safely wait on the engine.
 
 ## What a read looks like at the interception point
 
@@ -57,8 +56,8 @@ SQL plus bind bytes is the cache key. Diesel's own statement-cache key
 - Cost: one Postgres read per change per affected query, which for config
   tables is close to none.
 
-This is Hyperswitch's existing moka cache with its Redis pub/sub replaced
-by the WAL: no `publish_and_redact` to remember, writes from outside the
+This is the usual in-process cache with its pub/sub invalidation
+replaced by the WAL: no publish call to remember, writes from outside the
 app invalidate too, no TTL staleness, no per-pod refill storm because the
 engine says exactly which keys moved.
 
@@ -127,8 +126,7 @@ reconnect logic carry over unchanged.
   as microseconds since the epoch, Postgres's own precision, and ships
   them so to S2S clients; the Zero protocol keeps seeing milliseconds
   (scaled on its way in and out). So a `timestamp(6)` column, Postgres's
-  default and every `created_at` in Hyperswitch, is served exactly in
-  rows mode.
+  default, is served exactly in rows mode.
 - Known gaps: a column under a linguistic collation may order
   differently from Postgres; `numeric` (held as a float), `interval`,
   ranges and composites fall back to A.
@@ -205,20 +203,17 @@ is, and `Stats::refused` counts it; a key freed by eviction or an
 engine refusal gives its slot back. One socket dropping affects only
 its own keys.
 
-## What Hyperswitch's queries do through it
+## What an application's queries do through it
 
-`integration/hyperswitch-diesel_models.patch` adds, besides the alias,
-a coverage test (`tests/streamgres_coverage.rs`) that drives 24 of
-Hyperswitch's own model lookups over 17 tables through the wrapper and
-a plain connection side by side: find-by-id, composite keys, `AND`/`OR`
-predicates, enum binds, `ORDER BY ... LIMIT`, `LIMIT OFFSET`, lists.
-Every answer equals Postgres's before and after a change, every lookup
-is subscribed and served from the cache, and a change reaches the cached
-answer in about 7 ms (5 ms of which is the test's polling). One query
-(`configs`) runs in rows mode; the other 23 run in refill mode because
-every Hyperswitch table has `timestamp(6)` columns. Three engine
-changes came out of the first run: `bytea` columns were unknown to the
-engine (Hyperswitch's encrypted fields), enum binds were not decoded,
+`tests/shape_coverage.rs` drives the shapes a model layer produces
+through the wrapper and a passthrough connection side by side: a primary
+key, a two-column key, `AND` and `OR` predicates, an enum bind, a list,
+`ORDER BY ... LIMIT`, `LIMIT OFFSET`, a `bytea`, a timestamp bind and a
+count. Every answer equals Postgres's before and after a change, every
+shape is served from the engine's rows, the repeat is a cache hit, and a
+change reaches the cached answer within milliseconds. The first run of
+this kind, against a production schema, turned up three engine changes:
+`bytea` columns were unknown to the engine, enum binds were not decoded,
 and `OFFSET` was refused.
 
 ## Running it locally
@@ -358,8 +353,8 @@ three levels, the most specific winning:
    connection anyway (a pool's `interact` block).
 2. The connection pool: every connection carries a route chosen by the
    URL it was established with (`Settings`), so a master pool goes to
-   Postgres and a replica pool through Streamgres, matching
-   Hyperswitch's split. `set_route` changes it on one connection.
+   Postgres and a replica pool through Streamgres, the usual split.
+   `set_route` changes it on one connection.
    `last_served()` says where the connection's last read came from
    (`Served::Cache`, `Engine` or `Postgres`), per connection, so a
    request handler can report it exactly where the cache's shared
@@ -367,8 +362,7 @@ three levels, the most specific winning:
    The same lookup picks the cache: one engine streams one database
    and keeps one cache fresh, so pools against one database share a
    cache (`Settings::single`) and pools against different databases
-   (Hyperswitch's main and accounts databases) each get their own,
-   attached to the engine streaming that database
+   each get their own, attached to the engine streaming that database
    (`Settings::by_url`). A URL with no cache is a passthrough.
 3. The process default, Streamgres.
 
