@@ -12,17 +12,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
-use tokio::task::{LocalSet, spawn_local};
-use tokio_postgres::{Client, NoTls};
+use streamgres::client::ddl_triggers::trigger_stack_sql;
 use streamgres::ivm::{Delta, Engine, Fetch, MultiTableIVM, QueryPart};
 use streamgres::model::*;
-use streamgres::client::ddl_triggers::trigger_stack_sql;
 use streamgres::sync::pg::ddl::DdlSource;
 use streamgres::sync::pg::{PgStorage, PgStream};
 use streamgres::sync::{
     CatalogHandle, Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
 };
+use tokio::sync::mpsc;
+use tokio::task::{LocalSet, spawn_local};
+use tokio_postgres::{Client, NoTls};
 
 /// The database under test, if any.
 fn dsn() -> Option<String> {
@@ -1541,5 +1541,98 @@ fn unchanged_out_of_line_values_are_never_lost() {
             "the held-open read completed the reply"
         );
         cleanup(&dsn, &client, &names).await;
+    });
+}
+
+/// A range on a `timestamptz` column is read right whatever zone the
+/// session would otherwise run in: the engine keeps times as UTC
+/// microseconds and spells a time in a filter as a zone-less timestamp,
+/// which PostgreSQL reads in the session's zone, so the storage pins the
+/// session to UTC after whatever the connection string asks for. A
+/// `timestamp` column, zone-less on both sides, reads the same either
+/// way. The desk's "created between" lookup missed every row on a
+/// server whose default zone was not UTC, until each row's next write.
+#[test]
+fn a_time_range_is_read_right_in_any_session_zone() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let table = "live_zone_events";
+        let slot = "xyne_sync_live_zone";
+        let publication = "xyne_sync_live_zone_pub";
+        let client = admin(&dsn).await;
+        PgStream::drop_slot(&dsn, slot, publication)
+            .await
+            .expect("drop slot");
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table};
+                 CREATE TABLE {table} (id int8 PRIMARY KEY, at timestamptz NOT NULL, naive timestamp NOT NULL);
+                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;
+                 INSERT INTO {table} VALUES
+                   (1, '2026-10-01 08:00:00+00', '2026-10-01 08:00:00'),
+                   (2, '2026-10-01 09:30:00+00', '2026-10-01 09:30:00'),
+                   (3, '2026-10-01 11:30:00+00', '2026-10-01 11:30:00'),
+                   (4, '2026-10-01 12:30:00+00', '2026-10-01 12:30:00');",
+            ))
+            .await
+            .expect("prepare");
+        let catalog = Arc::new(Catalog::new(vec![DbTable::new(
+            table,
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("at", ValueType::Timestamp),
+                DbColumn::new("naive", ValueType::Timestamp),
+            ],
+        )]));
+        let mut stream = PgStream::open(&dsn, slot, publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let mut config: tokio_postgres::Config = dsn.parse().expect("dsn");
+        config.options("-c TimeZone=Asia/Kolkata");
+        let storage = PgStorage::connect_configured(
+            config,
+            catalog.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+
+        let micros = |hour: i64| -> Value {
+            let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+            let at = day.and_hms_opt(hour as u32, 0, 0).unwrap().and_utc();
+            Value::Int(at.timestamp_micros())
+        };
+        for column in ["at", "naive"] {
+            let query = SingleTableReadQuery::new(
+                table,
+                Where::AND(vec![
+                    Where::condition(column, ComparisonOperator::GTE, micros(9)),
+                    Where::condition(column, ComparisonOperator::LT, micros(12)),
+                ]),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            );
+            let snapshot = storage.select(&query).await.expect("select");
+            let read: BTreeSet<i64> = snapshot
+                .rows
+                .iter()
+                .filter_map(|(key, _)| match key.pkey_value.get("id") {
+                    Some(Value::Int(id)) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                read,
+                BTreeSet::from([2, 3]),
+                "the rows between 09:00 and 12:00 UTC by `{column}`, in a session asked for Asia/Kolkata"
+            );
+        }
+        let _ = client
+            .batch_execute(&format!("DROP TABLE IF EXISTS {table};"))
+            .await;
+        let _ = PgStream::drop_slot(&dsn, slot, publication).await;
     });
 }

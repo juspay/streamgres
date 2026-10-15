@@ -110,11 +110,11 @@ pub fn read_row_limit() -> usize {
         "STREAMGRES_SYNC_JOIN_LIMIT",
         "XYNE_SYNC_JOIN_LIMIT",
     ]
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .and_then(|value| value.trim().parse().ok())
-        .filter(|limit| *limit > 0)
-        .unwrap_or(DEFAULT_READ_ROW_LIMIT)
+    .iter()
+    .find_map(|name| std::env::var(name).ok())
+    .and_then(|value| value.trim().parse().ok())
+    .filter(|limit| *limit > 0)
+    .unwrap_or(DEFAULT_READ_ROW_LIMIT)
 }
 
 /// How the kernel probes a connection to the database while it is silent,
@@ -426,7 +426,7 @@ impl PgStorage {
         catalog: Arc<Catalog>,
         runtime: Handle,
     ) -> Result<Self, StorageError> {
-        let client = open(&config, &runtime).await?;
+        let client = open(&session_config(&config, None), &runtime).await?;
         let pool = Arc::new(Pool {
             config,
             idle: Mutex::new(vec![client]),
@@ -701,22 +701,12 @@ impl Pool {
 
     /// How a read's connection is opened: `config` (which carries the
     /// [`Keepalive`] the storage was given, if any, so the kernel probes
-    /// the connection while it sits idle in the pool), and the read
-    /// timeout as both the time the connection may take to open and the
-    /// session's `statement_timeout`, after whatever options the
-    /// connection string already carries.
+    /// the connection while it sits idle in the pool), the session's
+    /// time zone ([`session_config`]), and the read timeout as both the
+    /// time the connection may take to open and the session's
+    /// `statement_timeout`.
     fn read_config(&self) -> Config {
-        let mut config = self.config.clone();
-        if let Some(limit) = self.timeout() {
-            config.connect_timeout(limit);
-            let ours = format!("-c statement_timeout={}", limit.as_millis());
-            let options = match config.get_options() {
-                Some(theirs) => format!("{theirs} {ours}"),
-                None => ours,
-            };
-            config.options(&options);
-        }
-        config
+        session_config(&self.config, self.timeout())
     }
 
     /// Run one simple-query batch on a pooled connection, within the read
@@ -780,6 +770,33 @@ impl Pool {
         batch.push_str("; COMMIT");
         self.run(what, &batch).await
     }
+}
+
+/// The session a storage connection runs in: `config` with the session's
+/// time zone pinned to UTC, and, under a read `timeout`, that long to
+/// open and as the session's `statement_timeout`; the settings follow
+/// whatever options the connection string already carries, so they win.
+///
+/// The zone matters: a time in a filter is spelled as a zone-less
+/// timestamp (`TIMESTAMP 'epoch' + N microseconds`, so an index on the
+/// column answers it), which PostgreSQL reads in the session's zone when
+/// the column is `timestamptz`. The engine keeps every time as UTC
+/// microseconds, so the session must read the literal as UTC too, or a
+/// range on such a column misses rows by the zone's offset on a server
+/// whose default zone is not UTC.
+pub(crate) fn session_config(config: &Config, timeout: Option<Duration>) -> Config {
+    let mut config = config.clone();
+    let mut ours = "-c TimeZone=UTC".to_string();
+    if let Some(limit) = timeout {
+        config.connect_timeout(limit);
+        ours.push_str(&format!(" -c statement_timeout={}", limit.as_millis()));
+    }
+    let options = match config.get_options() {
+        Some(theirs) => format!("{theirs} {ours}"),
+        None => ours,
+    };
+    config.options(&options);
+    config
 }
 
 /// Run `work` as a task of `runtime` and wait for its result here.
@@ -927,6 +944,29 @@ fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every storage session runs in UTC, after the connection string's
+    /// own options so the zone wins, with the statement timeout beside
+    /// it when a read timeout is set.
+    #[test]
+    fn a_storage_session_is_pinned_to_utc() {
+        let mut config = Config::new();
+        assert_eq!(
+            session_config(&config, None).get_options(),
+            Some("-c TimeZone=UTC")
+        );
+        config.options("-c TimeZone=Asia/Kolkata -c search_path=app");
+        assert_eq!(
+            session_config(&config, Some(Duration::from_millis(250))).get_options(),
+            Some(
+                "-c TimeZone=Asia/Kolkata -c search_path=app -c TimeZone=UTC -c statement_timeout=250"
+            )
+        );
+        assert_eq!(
+            session_config(&config, Some(Duration::from_millis(250))).get_connect_timeout(),
+            Some(&Duration::from_millis(250))
+        );
+    }
 
     #[test]
     fn base36_keeps_any_snapshot_count_within_thirteen_digits() {
