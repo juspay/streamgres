@@ -430,6 +430,9 @@ pub struct PgStream {
 pub struct Transport {
     feed: ReplicationClient,
     config: tokio_postgres::Config,
+    /// The TLS posture of the DSN the config parsed from, for the fresh
+    /// connections [`Transport::slot_is_held`] opens.
+    tls: super::tls::Tls,
     slot: String,
 }
 
@@ -483,9 +486,10 @@ impl Transport {
     /// change in between, so its absence is an error
     /// ([`Transport::slot_exists`] tells it apart).
     pub async fn open(dsn: &str, slot: &str, publication: &str) -> Result<Self, StorageError> {
+        let tls = super::tls::Tls::new();
         let config: tokio_postgres::Config = dsn.parse()?;
-        require_slot(&config, slot).await?;
-        Self::connect(config, slot, publication).await
+        require_slot(&config, &tls, slot).await?;
+        Self::connect(config, tls, slot, publication).await
     }
 
     /// [`Transport::open`], the slot first moved up to `start` when it is
@@ -499,10 +503,11 @@ impl Transport {
         publication: &str,
         start: Lsn,
     ) -> Result<Self, StorageError> {
+        let tls = super::tls::Tls::new();
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = require_slot(&config, slot).await?;
+        let client = require_slot(&config, &tls, slot).await?;
         advance_slot(&client, slot, start).await?;
-        Self::connect(config, slot, publication).await
+        Self::connect(config, tls, slot, publication).await
     }
 
     /// Check that the deployment-provided `publication` exists and create
@@ -511,8 +516,9 @@ impl Transport {
     /// point. The server never creates publications: that DDL belongs to
     /// deployment setup and must not race among pods at startup.
     pub async fn prepare(dsn: &str, slot: &str, publication: &str) -> Result<(), StorageError> {
+        let tls = super::tls::Tls::new();
         let config: tokio_postgres::Config = dsn.parse()?;
-        prepare_slot(&config, slot, publication).await.map(drop)
+        prepare_slot(&config, &tls, slot, publication).await.map(drop)
     }
 
     /// Drop only our own permanent slots that PostgreSQL has reported
@@ -524,7 +530,7 @@ impl Transport {
             return Ok(());
         }
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+        let client = super::open(&config, &super::tls::Tls::new(), &tokio::runtime::Handle::current()).await?;
         let version: i32 = client
             .query_one("SELECT current_setting('server_version_num')::int", &[])
             .await?
@@ -568,7 +574,7 @@ impl Transport {
     /// Whether `slot` exists at `dsn`.
     pub async fn slot_exists(dsn: &str, slot: &str) -> Result<bool, StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+        let client = super::open(&config, &super::tls::Tls::new(), &tokio::runtime::Handle::current()).await?;
         Ok(client
             .query_opt(
                 "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
@@ -582,7 +588,7 @@ impl Transport {
     /// retried while it lets go).
     pub async fn drop_slot_only(dsn: &str, slot: &str) -> Result<(), StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+        let client = super::open(&config, &super::tls::Tls::new(), &tokio::runtime::Handle::current()).await?;
         client
             .execute(
                 "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots WHERE slot_name = $1 AND active_pid IS NOT NULL",
@@ -612,15 +618,18 @@ impl Transport {
     /// The replication connection on `slot`, streaming `publication`.
     async fn connect(
         config: tokio_postgres::Config,
+        tls: super::tls::Tls,
         slot: &str,
         publication: &str,
     ) -> Result<Self, StorageError> {
-        let feed = ReplicationClient::connect(replication_config(&config, slot, publication))
-            .await
-            .map_err(|error| StorageError(format!("replication connection: {error}")))?;
+        let feed =
+            ReplicationClient::connect(replication_config(&config, &tls, slot, publication))
+                .await
+                .map_err(|error| StorageError(format!("replication connection: {error}")))?;
         Ok(Transport {
             feed,
             config,
+            tls,
             slot: slot.to_owned(),
         })
     }
@@ -632,7 +641,8 @@ impl Transport {
     /// counts as yes too, since it proves nothing.
     async fn slot_is_held(&self) -> bool {
         let asked = tokio::time::timeout(ASK_WAIT, async {
-            let client = super::open(&self.config, &tokio::runtime::Handle::current()).await?;
+            let client =
+                super::open(&self.config, &self.tls, &tokio::runtime::Handle::current()).await?;
             let row = client
                 .query_opt(
                     "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
@@ -769,10 +779,11 @@ impl Transport {
 /// [`Transport::prepare`]); the ordinary connection used.
 async fn prepare_slot(
     config: &tokio_postgres::Config,
+    tls: &super::tls::Tls,
     slot: &str,
     publication: &str,
 ) -> Result<Client, StorageError> {
-    let client = super::open(config, &tokio::runtime::Handle::current()).await?;
+    let client = super::open(config, tls, &tokio::runtime::Handle::current()).await?;
     let published = client
         .query_opt(
             "SELECT 1 FROM pg_publication WHERE pubname = $1",
@@ -805,8 +816,12 @@ async fn prepare_slot(
 
 /// An ordinary connection at `config`, once `slot` is known to exist
 /// there; an error naming it when it does not.
-async fn require_slot(config: &tokio_postgres::Config, slot: &str) -> Result<Client, StorageError> {
-    let client = super::open(config, &tokio::runtime::Handle::current()).await?;
+async fn require_slot(
+    config: &tokio_postgres::Config,
+    tls: &super::tls::Tls,
+    slot: &str,
+) -> Result<Client, StorageError> {
+    let client = super::open(config, tls, &tokio::runtime::Handle::current()).await?;
     let exists = client
         .query_opt(
             "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
@@ -943,8 +958,9 @@ impl PgStream {
     ) -> Result<Self, StorageError> {
         Transport::prepare(dsn, slot, publication).await?;
         let transport = Transport::open(dsn, slot, publication).await?;
+        let tls = super::tls::Tls::new();
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+        let client = super::open(&config, &tls, &tokio::runtime::Handle::current()).await?;
         Ok(PgStream {
             transport,
             feed: Feed::new(catalog),
@@ -963,8 +979,9 @@ impl PgStream {
     ) -> Result<Self, StorageError> {
         Transport::prepare(dsn, slot, publication).await?;
         let transport = Transport::open(dsn, slot, publication).await?;
+        let tls = super::tls::Tls::new();
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+        let client = super::open(&config, &tls, &tokio::runtime::Handle::current()).await?;
         Ok(PgStream {
             transport,
             feed: Feed::with_ddl(catalog, ddl),
@@ -980,8 +997,9 @@ impl PgStream {
     /// Drop `slot` and `publication`.
     pub async fn drop_slot(dsn: &str, slot: &str, publication: &str) -> Result<(), StorageError> {
         Transport::drop_slot_only(dsn, slot).await?;
+        let tls = super::tls::Tls::new();
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+        let client = super::open(&config, &tls, &tokio::runtime::Handle::current()).await?;
         client
             .batch_execute(&format!("DROP PUBLICATION IF EXISTS \"{publication}\""))
             .await?;
@@ -1079,10 +1097,13 @@ fn position(lsn: pgwire_replication::Lsn) -> Lsn {
 }
 
 /// The replication connection's settings, taken from the SQL connection's
-/// (`tokio-postgres` cannot open a replication connection itself). Plain
-/// TCP or a Unix socket, no TLS; standby feedback once a second.
+/// (`tokio-postgres` cannot open a replication connection itself). TLS as
+/// the DSN's `sslmode` asks ([`super::tls`]) — a Unix socket's plain, the
+/// mode's `disable` folding to it there — and standby feedback once a
+/// second.
 fn replication_config(
     config: &tokio_postgres::Config,
+    tls: &super::tls::Tls,
     slot: &str,
     publication: &str,
 ) -> ReplicationConfig {
@@ -1098,9 +1119,13 @@ fn replication_config(
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
         .unwrap_or_default();
     let database = config.get_dbname().unwrap_or(user);
+    let tls_config = match config.get_hosts().first() {
+        Some(Host::Unix(_)) => TlsConfig::disabled(),
+        _ => tls.for_feed(config),
+    };
     ReplicationConfig::new(host, user, password, database, slot, publication)
         .with_port(port)
-        .with_tls(TlsConfig::disabled())
+        .with_tls(tls_config)
         .with_status_interval(Duration::from_secs(1))
 }
 

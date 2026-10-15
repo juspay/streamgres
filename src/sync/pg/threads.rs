@@ -126,9 +126,15 @@ pub struct FeedHandle {
 /// keep listening.
 pub type ServiceTask = tokio::task::JoinHandle<Runtime<MultiTableIVM>>;
 
-/// Load the catalog of `schemas` over a connection of its own.
+/// Load the catalog of `schemas` over a connection of its own, encrypted
+/// as the DSN's `sslmode` asks ([`super::tls`]).
 pub async fn load_catalog_at(dsn: &str, schemas: &[String]) -> Result<Catalog, String> {
-    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+    let config: tokio_postgres::Config = dsn
+        .parse()
+        .map_err(|error| format!("connecting to the database: {error}"))?;
+    let tls = super::tls::Tls::new();
+    let (client, connection) = config
+        .connect(tls.for_queries())
         .await
         .map_err(|error| format!("connecting to the database: {error}"))?;
     let handle = tokio::spawn(async move {
@@ -160,7 +166,12 @@ pub async fn load_catalog_at(dsn: &str, schemas: &[String]) -> Result<Catalog, S
 /// that would not hear of them could go on serving rows in a shape the
 /// clients no longer expect.
 pub async fn require_ddl_trigger(dsn: &str, name: &str) -> Result<(), String> {
-    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+    let config: tokio_postgres::Config = dsn
+        .parse()
+        .map_err(|error| format!("connecting to the database: {error}"))?;
+    let tls = super::tls::Tls::new();
+    let (client, connection) = config
+        .connect(tls.for_queries())
         .await
         .map_err(|error| format!("connecting to the database: {error}"))?;
     let handle = tokio::spawn(async move {

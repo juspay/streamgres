@@ -5,12 +5,17 @@
 //! through the simple query protocol. `tokio-postgres` builds its startup
 //! message from a fixed set of parameters and cannot open such a
 //! connection, so the handful of messages involved are spoken directly
-//! with `postgres-protocol`. Plain TCP or Unix sockets, no TLS. Once a
-//! slot has exported its snapshot, anything sent on the connection discards
-//! the snapshot, so the connection is kept without a byte: the kernel
-//! probes it while silent ([`keep_alive`]), and the session is opened with
-//! PostgreSQL's idle timeout off and its end probing too
-//! ([`session_options`]).
+//! with `postgres-protocol`. A TCP connection is first offered TLS as the
+//! DSN's `sslmode` asks ([`super::tls`]): the SSL request goes out before
+//! anything else, an `S` answer upgrades the socket, and an `N` either
+//! ends the connection (`require` and above) or leaves it plain
+//! (`prefer`, `disable` skips the question). A cleartext password is only
+//! ever sent over a TLS or Unix connection: a plain TCP one would carry
+//! it readable by every hop on the path. Once a slot has exported its
+//! snapshot, anything sent on the connection discards the snapshot, so
+//! the connection is kept without a byte: the kernel probes it while
+//! silent ([`keep_alive`]), and the session is opened with PostgreSQL's
+//! idle timeout off and its end probing too ([`session_options`]).
 
 use std::io;
 use std::time::Duration;
@@ -25,13 +30,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio_postgres::Config;
 use tokio_postgres::config::Host;
+use tokio_rustls::client::TlsStream;
 
+use super::tls::{Minting, cleartext_password_refused, may_send_cleartext_password};
 use crate::sync::storage::StorageError;
 
-/// The socket underneath, either flavor; `Detached` is a connection that
-/// was never opened (a placeholder for tests of the alias bookkeeping).
+/// The socket underneath, one of three flavors; `Detached` is a
+/// connection that was never opened (a placeholder for tests of the
+/// alias bookkeeping).
 enum Socket {
     Tcp(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
     Unix(UnixStream),
     Detached,
 }
@@ -41,6 +50,7 @@ impl Socket {
     async fn read(&mut self, buffer: &mut BytesMut) -> io::Result<usize> {
         match self {
             Socket::Tcp(stream) => stream.read_buf(buffer).await,
+            Socket::Tls(stream) => stream.read_buf(buffer).await,
             Socket::Unix(stream) => stream.read_buf(buffer).await,
             Socket::Detached => Err(io::ErrorKind::NotConnected.into()),
         }
@@ -50,9 +60,20 @@ impl Socket {
     async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         match self {
             Socket::Tcp(stream) => stream.write_all(bytes).await,
+            Socket::Tls(stream) => stream.write_all(bytes).await,
             Socket::Unix(stream) => stream.write_all(bytes).await,
             Socket::Detached => Err(io::ErrorKind::NotConnected.into()),
         }
+    }
+
+    /// Whether the bytes crossing it are TLS-encrypted.
+    fn encrypted(&self) -> bool {
+        matches!(self, Socket::Tls(_))
+    }
+
+    /// Whether it is a Unix socket, whose bytes never leave the host.
+    fn unix(&self) -> bool {
+        matches!(self, Socket::Unix(_))
     }
 }
 
@@ -76,22 +97,24 @@ impl ReplicationConnection {
     }
 
     /// Connect with `config`'s first host, user, password and database in
-    /// replication mode and authenticate; a TCP connection is probed while
-    /// silent as `config` asks ([`keep_alive`]), and the session is opened
-    /// with the settings that let it stay silent ([`session_options`]).
-    pub async fn open(config: &Config) -> Result<Self, StorageError> {
+    /// replication mode and authenticate — over TLS where `tls` has the
+    /// DSN ask for it; a TCP connection is probed while silent as `config`
+    /// asks ([`keep_alive`]), and the session is opened with the settings
+    /// that let it stay silent ([`session_options`]).
+    pub async fn open(config: &Config, tls: &super::tls::Tls) -> Result<Self, StorageError> {
         let host = config
             .get_hosts()
             .first()
             .ok_or_else(|| StorageError("the connection string names no host".to_owned()))?;
         let port = config.get_ports().first().copied().unwrap_or(5432);
+        let minting = tls.for_minting(config);
         let socket = match host {
             Host::Tcp(host) => {
                 let stream = TcpStream::connect((host.as_str(), port))
                     .await
                     .map_err(io_error)?;
                 keep_alive(&stream, config).map_err(io_error)?;
-                Socket::Tcp(stream)
+                Self::maybe_tls(stream, &minting, host).await?
             }
             Host::Unix(dir) => {
                 let path = dir.join(format!(".s.PGSQL.{port}"));
@@ -124,6 +147,48 @@ impl ReplicationConnection {
             .await?;
         connection.until_ready().await?;
         Ok(connection)
+    }
+
+    /// Ask `stream`'s server for TLS as `minting`'s mode allows and,
+    /// granted, wrap the stream in it: the SSL request is the first
+    /// bytes that cross, an `S` answer has the handshake follow with the
+    /// DSN's verification, and an `N` leaves the stream plain — a fatal
+    /// answer only when the mode said TLS or nothing — while `disable`
+    /// never asks.
+    async fn maybe_tls(
+        stream: TcpStream,
+        minting: &Minting,
+        host: &str,
+    ) -> Result<Socket, StorageError> {
+        if minting.ssl_disabled() {
+            return Ok(Socket::Tcp(stream));
+        }
+        let mut stream = stream;
+        let mut out = BytesMut::new();
+        frontend::ssl_request(&mut out);
+        stream.write_all(&out).await.map_err(io_error)?;
+        let mut answer = [0u8; 1];
+        stream.read_exact(&mut answer).await.map_err(io_error)?;
+        match answer[0] {
+            b'S' => {
+                let name = rustls::pki_types::ServerName::try_from(host.to_owned())
+                    .map_err(|error| StorageError(format!("server name `{host}`: {error}")))?;
+                let connector = tokio_rustls::TlsConnector::from(minting.config.clone());
+                let stream = connector.connect(name, stream).await.map_err(|error| {
+                    StorageError(format!("TLS handshake with the server: {error}"))
+                })?;
+                Ok(Socket::Tls(Box::new(stream)))
+            }
+            b'N' if minting.refused_tls_is_fatal() => Err(StorageError(
+                "the server does not offer TLS, but the connection string asks for \
+                 sslmode=require or stronger"
+                    .to_owned(),
+            )),
+            b'N' => Ok(Socket::Tcp(stream)),
+            other => Err(StorageError(format!(
+                "unreadable answer to the TLS offer: {other:#x}"
+            ))),
+        }
     }
 
     /// Run one command and return its rows as text columns (`None` for
@@ -169,6 +234,9 @@ impl ReplicationConnection {
         match self.next_message().await? {
             Message::AuthenticationOk => return Ok(()),
             Message::AuthenticationCleartextPassword => {
+                if !may_send_cleartext_password(self.socket.encrypted(), self.socket.unix()) {
+                    return Err(cleartext_password_refused());
+                }
                 self.send_password(password.ok_or_else(missing)?).await?;
             }
             Message::AuthenticationMd5Password(body) => {
