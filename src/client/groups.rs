@@ -1707,10 +1707,16 @@ fn build_poke(
     frames.push(Bytes::from(protocol::poke_start(poke_id, base)));
     let mut head = Some(head);
     let (mut puts, mut dels) = (0usize, 0usize);
-    // Fixed framing bytes per part, derived from part_frame's structure:
-    // ["pokePart",{"pokeID": (22) + "poke_id" (poke_id.len() + 2 quotes)
-    // + ,"rowsPatch":[ (13) + ]}] (3) = 40 + poke_id.len()
-    let frame_overhead = 40 + poke_id.len();
+    // Derive the fixed per-part framing overhead from the same bytes
+    // part_frame writes, so any future format change or JSON-escaped poke
+    // ID is measured correctly rather than relying on a hardcoded constant.
+    let frame_overhead = {
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(b"[\"pokePart\",{\"pokeID\":");
+        let _ = serde_json::to_writer(&mut prefix, poke_id);
+        prefix.extend_from_slice(b",\"rowsPatch\":[");
+        prefix.len() + b"]}]".len()
+    };
     let mut entries: Vec<Bytes> = Vec::new();
     // Seed with overhead + head size: head fields are only in the first part.
     let mut current_bytes = frame_overhead + head.as_ref().map_or(0, Vec::len);
@@ -1730,11 +1736,19 @@ fn build_poke(
                 Bytes::from(bytes)
             }
         };
-        // Each entry after the first in a part costs one extra comma byte.
+        // Non-empty part: flush if adding this entry (plus its comma) would exceed
+        // the limit, then the entry opens a new headless part.
         if !entries.is_empty() && current_bytes + 1 + entry.len() > bytes_per_part {
             frames.push(part_frame(poke_id, head.take(), &entries));
             entries.clear();
-            // Subsequent parts carry no head; reset to framing overhead only.
+            current_bytes = frame_overhead;
+        }
+        // Empty part with a pending head: if the head and this entry together exceed
+        // the limit, flush the head in its own empty-rowsPatch part first so the
+        // entry starts a headless part. A row or head that exceeds the limit on its
+        // own is unsplittable; it is emitted as-is and accepted as an overage.
+        if entries.is_empty() && head.is_some() && current_bytes + entry.len() > bytes_per_part {
+            frames.push(part_frame(poke_id, head.take(), &[]));
             current_bytes = frame_overhead;
         }
         current_bytes += if entries.is_empty() { entry.len() } else { entry.len() + 1 };
