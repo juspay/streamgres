@@ -1705,18 +1705,12 @@ fn build_poke(
 ) -> (Arc<[Bytes]>, usize, usize) {
     let mut frames: Vec<Bytes> = Vec::with_capacity(4);
     frames.push(Bytes::from(protocol::poke_start(poke_id, base)));
-    let mut head = Some(head);
+    // head_of returns an empty Vec when there is nothing to say; treat that
+    // as no head so the head-only flush below never emits a phantom part
+    // carrying nothing.
+    let mut head = (!head.is_empty()).then_some(head);
     let (mut puts, mut dels) = (0usize, 0usize);
-    // Derive the fixed per-part framing overhead from the same bytes
-    // part_frame writes, so any future format change or JSON-escaped poke
-    // ID is measured correctly rather than relying on a hardcoded constant.
-    let frame_overhead = {
-        let mut prefix = Vec::new();
-        prefix.extend_from_slice(b"[\"pokePart\",{\"pokeID\":");
-        let _ = serde_json::to_writer(&mut prefix, poke_id);
-        prefix.extend_from_slice(b",\"rowsPatch\":[");
-        prefix.len() + b"]}]".len()
-    };
+    let frame_overhead = PART_FRAMING + poke_id.len();
     let mut entries: Vec<Bytes> = Vec::new();
     // Seed with overhead + head size: head fields are only in the first part.
     let mut current_bytes = frame_overhead + head.as_ref().map_or(0, Vec::len);
@@ -1812,6 +1806,12 @@ fn part_frame(poke_id: &str, head: Option<Vec<u8>>, entries: &[Bytes]) -> Bytes 
     frame.extend_from_slice(b"]}]");
     Bytes::from(frame)
 }
+
+/// The bytes `part_frame` writes around a numeric poke id and the
+/// entries: `["pokePart",{"pokeID":"` .. `","rowsPatch":[` .. `]}]`.
+/// Poke ids are counters (`next_poke.to_string()`) and never need JSON
+/// escaping, so a frame's framing cost is `PART_FRAMING + poke_id.len()`.
+const PART_FRAMING: usize = br#"["pokePart",{"pokeID":"","rowsPatch":[]}]"#.len();
 
 /// Keep one operation per row, the last one, in first-seen order.
 fn coalesce(rows: Vec<RowOp>) -> Vec<RowOp> {
@@ -2856,6 +2856,21 @@ mod tests {
         let mut bytes = Vec::new();
         wire::write_put(&mut bytes, catalog.table("t").unwrap(), row);
         bytes
+    }
+
+    /// PART_FRAMING is the number of bytes `part_frame` writes around a
+    /// numeric poke id and its entries; it is derived from a copy of the
+    /// same literals, so this test keeps the constant and the code in step
+    /// (a change to part_frame breaks it).
+    #[test]
+    fn part_framing_matches_part_frame() {
+        for id in ["1", "42", "18446744073709551615"] {
+            assert_eq!(
+                part_frame(id, None, &[]).len(),
+                PART_FRAMING + id.len(),
+                "PART_FRAMING counts what part_frame writes for id {id}"
+            );
+        }
     }
 
     /// A row is serialized the first time it is sent and its bytes are
