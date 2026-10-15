@@ -157,7 +157,9 @@ struct Shared {
     by_key: Mutex<HashMap<QueryKey, usize>>,
     max_subscriptions: usize,
     /// Column types by table, learnt on the first rows-mode subscribe of
-    /// a table and reused for every delta and resubscribe after.
+    /// a table and reused for every delta and resubscribe after; looked
+    /// up again when a snapshot names a column they lack, which is how a
+    /// column a migration added becomes known.
     types: Mutex<HashMap<String, Arc<TableTypes>>>,
     /// Why the latest subscriptions fell back from rows to refills, most
     /// recent last, at most a few.
@@ -185,7 +187,8 @@ impl Shared {
     }
 
     /// The reasons this client refuses on its own, all of which pass.
-    const TRANSIENT: [&'static str; 7] = [
+    const TRANSIENT: [&'static str; 8] = [
+        crate::subscriptions::STALE_TYPES,
         "the engine is not connected",
         "the engine client has stopped",
         "the engine did not answer in time",
@@ -631,7 +634,13 @@ impl Worker {
                     let types = self.shared.types.lock().expect("types");
                     snapshot
                         .tables()
-                        .filter(|table| !types.contains_key(*table))
+                        .filter(|table| {
+                            types.get(*table).is_none_or(|known| {
+                                snapshot
+                                    .columns_of(table)
+                                    .any(|column| known.column(column).is_none())
+                            })
+                        })
                         .map(str::to_string)
                         .collect()
                 };
@@ -1260,6 +1269,37 @@ mod tests {
             vec![(1, "a".into()), (2, "b".into())],
             "the store has the delta's row"
         );
+    }
+
+    /// Types learnt before a migration lack the column it added: a
+    /// snapshot naming that column asks for the table's types again,
+    /// and the fresh ones serve the rows.
+    #[test]
+    fn a_column_the_known_types_lack_asks_for_the_types_again() {
+        let (worker, _outgoing, shared) = worker();
+        let stale = Arc::new(TableTypes {
+            columns: vec![ColumnType {
+                name: "id".into(),
+                oid: 23,
+                typmod: -1,
+                kind: TypeKind::Base,
+            }],
+        });
+        shared.types.lock().unwrap().insert("t".to_string(), stale);
+        let handle = subscribing(&worker);
+        inbound(&worker, &accepted_with_rows(1));
+        let Outcome::NeedsTypes { snapshot, missing } = handle.join().unwrap() else {
+            panic!("stale types are looked up again");
+        };
+        assert_eq!(missing, vec!["t".to_string()]);
+        shared
+            .types
+            .lock()
+            .unwrap()
+            .insert("t".to_string(), t_types());
+        let Verdict::Rows { .. } = worker.materialize_key(&key(), snapshot) else {
+            panic!("rows mode with the fresh types");
+        };
     }
 
     #[test]

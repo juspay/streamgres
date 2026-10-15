@@ -156,6 +156,39 @@ impl Snapshot {
     pub fn tables(&self) -> impl Iterator<Item = &str> {
         self.nodes.iter().map(|node| node.table.as_str())
     }
+
+    /// Every column of `table` the snapshot names: its key, the columns
+    /// of its joins, the root's order, and the projection. The column
+    /// types known for the table must cover them, or they are stale.
+    pub fn columns_of<'a>(&'a self, table: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        let keys = self
+            .nodes
+            .iter()
+            .filter(move |node| node.table == table)
+            .flat_map(|node| {
+                node.key
+                    .iter()
+                    .map(String::as_str)
+                    .chain(node.child_column.as_deref())
+            });
+        let joins = self
+            .nodes
+            .iter()
+            .filter(move |node| node.parent.as_deref() == Some(table))
+            .filter_map(|node| node.parent_column.as_deref());
+        let order = self
+            .order
+            .iter()
+            .filter(move |_| self.nodes.first().is_some_and(|root| root.table == table))
+            .map(|(name, _)| name.as_str());
+        let projected = self
+            .columns
+            .iter()
+            .flatten()
+            .filter(move |(of, _)| of == table)
+            .map(|(_, name)| name.as_str());
+        keys.chain(joins).chain(order).chain(projected)
+    }
 }
 
 enum Projection {

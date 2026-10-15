@@ -205,6 +205,11 @@ its own keys.
 
 ## What an application's queries do through it
 
+The column types of a table are looked up on the first rows-mode
+subscribe of it and kept; a snapshot naming a column they lack (one a
+migration added) has them looked up again, and on the async wrapper
+that read goes live once while the catalog is reloaded.
+
 `tests/shape_coverage.rs` drives the shapes a model layer produces
 through the wrapper and a passthrough connection side by side: a primary
 key, a two-column key, `AND` and `OR` predicates, an enum bind, a list,

@@ -74,6 +74,7 @@ use crate::cursor::SyncedRow;
 use crate::key::QueryKey;
 use crate::route::{Route, Served};
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
+use crate::subscriptions::STALE_TYPES;
 use crate::subscriptions::{Outcome, Verdict};
 use crate::types::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
 use crate::{Attachment, SETTINGS, may_write, read_your_writes_from_env, rendered};
@@ -579,13 +580,14 @@ impl AsyncConnection for AsyncSyncedConnection {
                             for (table, found) in all {
                                 types.insert(table, Arc::new(found));
                             }
+                            subscriptions.materialize(&key, snapshot, types)
                         }
-                        // A table that was not there when the catalog was
-                        // loaded: this query falls back to refills, and
-                        // the next miss loads the catalog again.
-                        None => catalog_loaded.store(false, Ordering::Release),
+                        None => {
+                            catalog_loaded.store(false, Ordering::Release);
+                            subscriptions.unsubscribe(&key);
+                            Verdict::Refused(STALE_TYPES.to_string())
+                        }
                     }
-                    subscriptions.materialize(&key, snapshot, types)
                 }
             };
             match verdict {

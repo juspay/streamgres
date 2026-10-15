@@ -47,6 +47,13 @@ pub enum Verdict {
     Refused(String),
 }
 
+/// The refusal for a subscribe whose table's known column types lack a
+/// column the engine names, or whose table was not in the catalog when
+/// it was loaded: that read goes live, the catalog is loaded again on
+/// the next miss, and that subscribe is served from rows. Transient, so
+/// the cache does not remember it.
+pub const STALE_TYPES: &str = "the column types are being reloaded";
+
 /// The engine's answer to [`Subscriptions::subscribe`].
 pub enum Outcome {
     Verdict(Verdict),
