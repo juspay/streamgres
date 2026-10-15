@@ -510,6 +510,11 @@ pub struct MultiTableIVM {
     cause: Cause,
     landing: Option<SubId>,
     write_reads: HashSet<FetchId>,
+    /// The reads out across the windows of a node with one per parent
+    /// row ([`Self::lookup`]), by the node: such a read is issued on
+    /// behalf of one window and must land into the others even once that
+    /// window is gone.
+    lookups: HashMap<FetchId, (TreeId, QueryPart)>,
 }
 
 /// What a step's operations come from. A gate that opens under a
@@ -1002,6 +1007,7 @@ impl MultiTableIVM {
             cause: Cause::Page,
             landing: None,
             write_reads: HashSet::new(),
+            lookups: HashMap::new(),
         }
     }
 
@@ -1506,6 +1512,7 @@ impl MultiTableIVM {
         self.landing = (fetch.kind != FetchKind::Row).then_some(fetch.sub);
         let mut out = self.forward(applied);
         self.landing = None;
+        self.lookups.remove(&fetch.id);
         if fetch.kind == FetchKind::Lookup {
             self.recall_above(fetch.sub, rows, &mut out);
         }
@@ -1535,7 +1542,8 @@ impl MultiTableIVM {
     /// The rows of a lookup across a node's windows per parent row
     /// ([`Self::lookup`]), sorted into those windows by the row's fanning
     /// value (rows of a value no window is registered for are left out);
-    /// `None` for any other read.
+    /// `None` for any other read. The node is the one the read was
+    /// recorded against, or the issuing window's for a read of its own.
     fn fanned_lookup(
         &self,
         fetch: &Fetch,
@@ -1544,7 +1552,10 @@ impl MultiTableIVM {
         if fetch.kind != FetchKind::Lookup {
             return None;
         }
-        let (tree_id, part) = self.parts.get(&fetch.sub)?;
+        let (tree_id, part) = self
+            .lookups
+            .get(&fetch.id)
+            .or_else(|| self.parts.get(&fetch.sub))?;
         let tree = self.trees.get(tree_id)?;
         let node = &tree.nodes[part];
         let Parts::Fan(fan) = &node.parts else {
@@ -1687,6 +1698,7 @@ impl MultiTableIVM {
         let Some(tree) = self.trees.remove(&tree_id) else {
             return;
         };
+        self.lookups.retain(|_, (tree, _)| *tree != tree_id);
         self.by_spec.remove(&tree.spec);
         for node in tree.nodes.values() {
             for inner in node.inner_parts() {
@@ -2414,8 +2426,11 @@ impl MultiTableIVM {
     /// `value`, as one read: the part's own filter narrowed to the value
     /// (a node with a window per parent row is read across all its
     /// windows, the rows sorted into them as they land,
-    /// [`Self::land_read`]). The rows land as candidates, rows behind a
-    /// window's frontier not held.
+    /// [`Self::land_read`]). The read goes out on behalf of one of the
+    /// windows and is recorded against the node, so it lands into the
+    /// windows there are when it does, whether or not that window is
+    /// among them. The rows land as candidates, rows behind a window's
+    /// frontier not held.
     fn lookup(&mut self, tree_id: TreeId, part: &QueryPart, column: &ColumnName, value: &Value) {
         let (issuer, query) = {
             let tree = &self.trees[&tree_id];
@@ -2439,8 +2454,8 @@ impl MultiTableIVM {
                 },
             )
         };
-        if let Some(issuer) = issuer {
-            self.single.lookup_query(issuer, query);
+        if let Some(id) = issuer.and_then(|issuer| self.single.lookup_query(issuer, query)) {
+            self.lookups.insert(id, (tree_id, *part));
         }
     }
 

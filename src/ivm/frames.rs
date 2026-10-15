@@ -46,13 +46,14 @@ impl SingleTableIVM {
     /// join layer's read across the windows of a node with one per parent
     /// row, whose rows it sorts into the windows itself when they land
     /// ([`SingleTableIVM::land_lookup`]).
-    pub fn lookup_query(&mut self, sub: SubId, query: SingleTableReadQuery) {
+    pub fn lookup_query(&mut self, sub: SubId, query: SingleTableReadQuery) -> Option<FetchId> {
         if !self.select_queries.contains_key(&sub) {
-            return;
+            return None;
         }
         self.stats.page_lookups += 1;
-        self.issue(sub, query, FetchKind::Lookup);
+        let id = self.issue(sub, query, FetchKind::Lookup);
         self.sync_boundary(sub);
+        id
     }
 
     /// Record the narrowed read of `sub` to `column IN values`, of `kind`;

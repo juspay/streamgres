@@ -11,7 +11,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
-use streamgres::ivm::{Engine, Fetch, MultiTableIVM, QueryPart, SubId, evaluate_with, order_rows};
+use streamgres::ivm::{
+    Engine, Fetch, FetchKind, MultiTableIVM, QueryPart, SubId, evaluate_with, order_rows,
+};
 use streamgres::model::*;
 use streamgres::sync::{Local, Lsn, MemoryStorage, Runtime, Snapshot};
 
@@ -360,6 +362,128 @@ fn actual(
         child.push(index);
         actual(ivm, sub, &join.sub, child, out);
     }
+}
+
+/// A page per parent under a gate recalls a candidate it dropped with
+/// one read across its windows, issued on behalf of one of them; the read
+/// must land into the other windows even when the window it was issued
+/// for is gone by then. Tickets 13 and 14 are assigned to user 4 before
+/// user 4 exists, so the pages of teams 0 and 2 drop them; user 4
+/// arrives, the recall goes out, and the team whose window issued it is
+/// deleted before the read lands: the other team's ticket comes back.
+#[test]
+fn a_recall_lands_after_the_window_that_issued_it_is_gone() {
+    let storage = MemoryStorage::new();
+    let mut runtime = Runtime::new(MultiTableIVM::new());
+    let mut lsn = 0u64;
+    let key =
+        |id: i64| DataFrameKey::new(HashMap::from([(ColumnName::from("id"), Value::Int(id))]));
+    let insert = |table: &str, id: i64, pairs: &[(&str, i64)]| -> WriteQuery {
+        let mut data: HashMap<ColumnName, Value> = pairs
+            .iter()
+            .map(|(column, value)| ((*column).into(), Value::Int(*value)))
+            .collect();
+        data.insert("id".into(), Value::Int(id));
+        WriteQuery::INSERT(InsertQuery {
+            table: TableName::from(table),
+            pkey_value: key(id),
+            record: DataFrameRow::from(data),
+        })
+    };
+    let ticket = |id: i64, team: i64, assignee: i64| {
+        insert(
+            "tickets",
+            id,
+            &[
+                ("open", 1),
+                ("assignee", assignee),
+                ("project", 1),
+                ("team", team),
+            ],
+        )
+    };
+    for write in [
+        insert("teams", 0, &[("active", 1)]),
+        insert("teams", 2, &[("active", 1)]),
+        insert("users", 3, &[("rank", 1)]),
+        ticket(5, 0, 3),
+        ticket(6, 2, 3),
+    ] {
+        storage.apply(&write);
+        lsn += 1;
+    }
+    runtime.progress(Lsn(lsn));
+    let spec = specs()
+        .into_iter()
+        .find(|(name, _)| *name == "a page per parent under a gate")
+        .map(|(_, spec)| spec)
+        .expect("the shape");
+    let (sub, step) = runtime.register(spec.clone());
+    let mut out: Vec<Fetch> = step.selects;
+    let land_all = |runtime: &mut Runtime<MultiTableIVM>, out: &mut Vec<Fetch>, lsn: u64| {
+        while let Some(fetch) = out.pop() {
+            let snapshot = Snapshot {
+                rows: storage.rows(&fetch.query),
+                at: Lsn(lsn),
+            };
+            out.extend(runtime.fetched(fetch.id, snapshot).selects);
+        }
+    };
+    let shown = |runtime: &Runtime<MultiTableIVM>| {
+        let mut shown = BTreeMap::new();
+        actual(runtime.engine(), sub, &spec, Vec::new(), &mut shown);
+        shown
+    };
+    land_all(&mut runtime, &mut out, lsn);
+    assert_eq!(shown(&runtime), expected(&spec, &storage), "registered");
+
+    for write in [ticket(13, 0, 4), ticket(14, 2, 4)] {
+        storage.apply(&write);
+        lsn += 1;
+        out.extend(runtime.write(&write, Lsn(lsn)).selects);
+    }
+    land_all(&mut runtime, &mut out, lsn);
+    assert_eq!(
+        shown(&runtime),
+        expected(&spec, &storage),
+        "user 4 does not exist: 13 and 14 are not shown"
+    );
+
+    let arrives = insert("users", 4, &[("rank", 1)]);
+    storage.apply(&arrives);
+    lsn += 1;
+    let mut selects = runtime.write(&arrives, Lsn(lsn)).selects;
+    let recalled = selects
+        .iter()
+        .position(|fetch| fetch.kind == FetchKind::Lookup)
+        .expect("the pages recall the value they dropped");
+    let recall = selects.remove(recalled);
+    out.extend(selects);
+    let issuer_team = runtime
+        .engine()
+        .describe(sub)
+        .iter()
+        .find_map(|line| {
+            let rest = line.split(&format!("{:?} for Int(", recall.sub)).nth(1)?;
+            rest.split(')').next()?.parse::<i64>().ok()
+        })
+        .expect("the recall was issued on behalf of one team's window");
+    let gone = WriteQuery::DELETE(DeleteQuery {
+        table: TableName::from("teams"),
+        pkey_value: key(issuer_team),
+    });
+    storage.apply(&gone);
+    lsn += 1;
+    out.extend(runtime.write(&gone, Lsn(lsn)).selects);
+    land_all(&mut runtime, &mut out, lsn);
+    out.push(recall);
+    land_all(&mut runtime, &mut out, lsn);
+    assert_eq!(
+        shown(&runtime),
+        expected(&spec, &storage),
+        "the surviving team's ticket for user 4 is back: {:#?}",
+        runtime.engine().describe(sub)
+    );
 }
 
 /// A small deterministic generator.
