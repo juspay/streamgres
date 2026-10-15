@@ -587,19 +587,11 @@ struct Disagreements {
 }
 
 impl Disagreements {
-    /// Fails on a client-side disagreement, and on an engine-side one
-    /// when `STREAMGRES_STRICT` is set; otherwise engine-side ones are
-    /// reported, since they are the engine's to fix, not the wrapper's.
+    /// Fails on either kind, named, so the failure says whose answer
+    /// was wrong.
     fn assert_none(&self) {
         assert_eq!(self.client, 0, "pairs the cache got wrong: {self:?}");
-        if std::env::var("STREAMGRES_STRICT").is_ok() {
-            assert_eq!(self.engine, 0, "pairs the engine got wrong: {self:?}");
-        } else if self.engine > 0 {
-            eprintln!(
-                "ENGINE-SIDE: {} pair(s) the engine answered wrongly for longer than the settle time (set STREAMGRES_STRICT to fail on these)",
-                self.engine
-            );
-        }
+        assert_eq!(self.engine, 0, "pairs the engine got wrong: {self:?}");
     }
 }
 
@@ -675,12 +667,12 @@ async fn concurrent_readers_under_the_writer_never_see_a_wrong_row() {
 }
 
 /// The engine restarted in the middle of the same load: the readers go
-/// to Postgres while it is away, resubscribe when it is back, and the
-/// cache never disagrees with Postgres for long. Engine-side
-/// disagreements are reported (seen on main: after a restart under
-/// this load, a row updated a second or two before the restart is
-/// missing from the timestamp-range shape until its next write, in a
-/// fresh subscription too) and fail only under `STREAMGRES_STRICT`.
+/// to Postgres while it is away, resubscribe when it is back, and
+/// neither the cache nor the engine disagrees with Postgres for long.
+/// This is the test that found the engine reading a timestamp range in
+/// the server's own zone: after a restart, with no replay buffer to
+/// hide it, every row of the range shape was missing until its next
+/// write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_engine_restart_under_traffic_loses_no_correctness() {
     let Some(live) = Live::start().await else {

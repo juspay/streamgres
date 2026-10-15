@@ -96,9 +96,9 @@ wrapper promises:
   `STREAMGRES_RESTART_CMD`).
 
 The load tests tell a wrong answer in this process's cache from one in
-the engine, by reading the lookup again through a fresh subscription.
-The first fails the test; the second is reported, and fails only under
-`STREAMGRES_STRICT`, since it is the engine's to fix.
+the engine, by reading the lookup again through a fresh subscription,
+and fail on either, named. The restart test is the one that found the
+engine reading a timestamp range in the server's own time zone.
 
 The tests reseed the dataset, so run them against a database nobody is
 watching, one at a time:
