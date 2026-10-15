@@ -50,7 +50,9 @@ impl CatalogHandle {
     }
 }
 
-/// `catalog` with `table` in it, replacing a table of the same name.
+/// `catalog` with `table` in it, replacing a table of the same name,
+/// and knowing the same enum types: a bound enum label must stay
+/// readable after a migration.
 pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
     let name = table.name.clone();
     Catalog::new(
@@ -60,6 +62,7 @@ pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
             .cloned()
             .chain(std::iter::once(table)),
     )
+    .with_enum_oids(catalog.enum_oids())
 }
 
 /// `table` with `column` added: the same name and key, one column more.
@@ -114,6 +117,19 @@ mod tests {
         assert!(after.table("users").is_some());
         assert!(after.table("tickets").unwrap().column("owner").is_some());
         assert!(before.table("tickets").unwrap().column("owner").is_none());
+        assert_eq!(after.tables().count(), 2);
+    }
+
+    /// A migration absorbed at runtime must not make the server forget
+    /// which bind types are enums: every enum bind after it was refused.
+    #[test]
+    fn a_table_added_keeps_the_enum_types() {
+        let tickets = DbTable::new("tickets", ["id"], vec![DbColumn::new("id", ValueType::Int)]);
+        let before = Catalog::new(vec![tickets]).with_enum_oids([19098, 19099]);
+        let users = DbTable::new("users", ["id"], vec![DbColumn::new("id", ValueType::Int)]);
+        let after = with_table(&before, users);
+        assert!(after.is_enum_oid(19098) && after.is_enum_oid(19099));
+        assert!(!after.is_enum_oid(23));
         assert_eq!(after.tables().count(), 2);
     }
 }

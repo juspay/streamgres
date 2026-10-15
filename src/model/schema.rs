@@ -279,6 +279,12 @@ impl Catalog {
         self.enum_oids.contains(&oid)
     }
 
+    /// The enum type OIDs this catalog knows, for a catalog built from
+    /// this one to carry.
+    pub fn enum_oids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.enum_oids.iter().copied()
+    }
+
     /// The schema of table `name`, if the catalog contains it.
     pub fn table(&self, name: &str) -> Option<&DbTable> {
         self.tables.get(name)
@@ -307,7 +313,13 @@ impl std::fmt::Display for DbTable {
     /// name).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let key: Vec<&str> = self.pkey.iter().map(ColumnName::as_str).collect();
-        write!(f, "`{}` key ({}), {} columns:", self.name, key.join(", "), self.columns.len())?;
+        write!(
+            f,
+            "`{}` key ({}), {} columns:",
+            self.name,
+            key.join(", "),
+            self.columns.len()
+        )?;
         for name in self.row_schema.names() {
             match self.columns.get(name) {
                 Some(column) => write!(f, " {name} {:?}", column.r#type)?,
