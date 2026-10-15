@@ -14,14 +14,20 @@
 //! - [`seed`]: the deterministic dataset.
 //! - [`pools`]: the connections and how each is routed.
 //! - [`writer`]: the background changes that keep the demo moving.
-//! - [`api`]: the HTTP face, including `/stats`.
+//! - [`verify`]: the demo checking itself, every lookup on both routes.
+//! - [`migrate`]: the schema changes, one of each kind.
+//! - [`api`]: the HTTP face, including `/stats` and `/verify`.
 //! - [`bench`]: latency per route, in process.
+//! - [`lag`]: how long a commit takes to reach the cache, under load.
 
 pub mod api;
 pub mod bench;
+pub mod lag;
+pub mod migrate;
 pub mod models;
 pub mod pools;
 pub mod queries;
 pub mod schema;
 pub mod seed;
+pub mod verify;
 pub mod writer;

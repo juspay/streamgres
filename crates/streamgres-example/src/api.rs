@@ -12,11 +12,17 @@
 //!   which beats the pool's route.
 //! - `pool=reporting` uses the Postgres-routed pool instead of the main
 //!   one.
+//!
+//! `/verify` reads every lookup through both routes and reports the
+//! pairs that never agreed; `/stats` carries the verify loop's and the
+//! writer's counters next to the cache's and the engine's.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, TimeZone, Utc};
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -29,10 +35,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use streamgres_diesel::Served;
 
-use crate::models::TicketStatus;
+use crate::models::{TicketKind, TicketStatus};
 use crate::pools::Stack;
 use crate::queries::Lookup;
 use crate::schema::tickets;
+use crate::verify;
 
 pub type App = Arc<Stack>;
 
@@ -41,16 +48,32 @@ pub fn router(stack: App) -> Router {
         .route("/", get(index))
         .route("/stats", get(stats))
         .route("/lookups", get(lookups))
+        .route("/verify", get(verify_once))
+        .route("/tickets", get(many))
         .route("/tickets/{id}", get(ticket))
         .route("/tickets/{id}/comments", get(comments))
+        .route("/tickets/{id}/authors", get(comment_authors))
         .route("/tickets/{id}/status", post(set_status))
         .route("/attachments/{id}", get(attachment))
         .route("/orgs/{org}/queue", get(queue))
         .route("/orgs/{org}/queue/count", get(queue_count))
+        .route("/orgs/{org}/queue/end", get(queue_end))
         .route("/orgs/{org}/agents", get(agents))
         .route("/orgs/{org}/sla", get(sla))
         .route("/orgs/{org}/search", get(search))
         .route("/orgs/{org}/recent", get(recent))
+        .route("/orgs/{org}/tickets", get(all_tickets))
+        .route("/orgs/{org}/tickets/{id}", get(org_ticket))
+        .route("/orgs/{org}/unassigned", get(unassigned))
+        .route("/orgs/{org}/escalated", get(escalated))
+        .route("/orgs/{org}/open", get(open_except))
+        .route("/orgs/{org}/created", get(created_between))
+        .route("/orgs/{org}/nothing", get(nothing))
+        .route("/orgs/{org}/skilled", get(skilled))
+        .route("/orgs/{org}/statuses", get(statuses))
+        .route("/orgs/{org}/workload", get(workload))
+        .route("/orgs/{org}/activity", get(last_activity))
+        .route("/orgs/{org}/kind/{kind}", get(of_kind))
         .with_state(stack)
 }
 
@@ -58,9 +81,21 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("index.html"))
 }
 
-/// The counters: the cache's and the engine client's.
+/// The counters: the cache's, the engine client's, the writer's and
+/// the verify loop's.
 async fn stats(State(app): State<App>) -> Json<Value> {
     Json(stats_json(&app))
+}
+
+/// One pass of the verify loop, with every pair that never agreed.
+async fn verify_once(State(app): State<App>) -> Json<Value> {
+    let outcome = verify::once(&app, &Lookup::demo(), Duration::from_secs(1)).await;
+    Json(json!({
+        "compared": outcome.compared,
+        "lagged": outcome.lagged,
+        "mismatches": outcome.mismatches,
+        "totals": app.verify.json(),
+    }))
 }
 
 pub fn stats_json(app: &Stack) -> Value {
@@ -93,6 +128,8 @@ pub fn stats_json(app: &Stack) -> Value {
             "fallbacks": app.engine.fallbacks(),
             "refusals": app.engine.refusals(),
         },
+        "writer": app.writer.json(),
+        "verify": app.verify.json(),
     })
 }
 
@@ -114,6 +151,11 @@ struct ReadParams {
     page: Option<i64>,
     q: Option<String>,
     limit: Option<i64>,
+    except: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    ids: Option<String>,
+    skill: Option<String>,
 }
 
 impl ReadParams {
@@ -122,6 +164,23 @@ impl ReadParams {
             Some(list) => list.split(',').filter_map(TicketStatus::parse).collect(),
             None => vec![TicketStatus::Open, TicketStatus::Pending],
         }
+    }
+
+    /// A comma-separated list of ids, or `default`.
+    fn id_list(list: Option<&str>, default: Vec<i64>) -> Vec<i64> {
+        match list {
+            Some(list) => list
+                .split(',')
+                .filter_map(|id| id.trim().parse().ok())
+                .collect(),
+            None => default,
+        }
+    }
+
+    /// An RFC 3339 instant, or `default`.
+    fn instant(text: Option<&str>, default: DateTime<Utc>) -> DateTime<Utc> {
+        text.and_then(|text| text.parse::<DateTime<Utc>>().ok())
+            .unwrap_or(default)
     }
 }
 
@@ -260,6 +319,141 @@ async fn recent(
         limit: params.limit.unwrap_or(5),
     };
     read(&app, &params, lookup).await
+}
+
+async fn org_ticket(
+    State(app): State<App>,
+    Path((org, id)): Path<(i64, i64)>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    read(&app, &params, Lookup::OrgTicket { org, id }).await
+}
+
+async fn unassigned(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    read(&app, &params, Lookup::Unassigned { org }).await
+}
+
+async fn escalated(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    read(&app, &params, Lookup::Escalated { org }).await
+}
+
+async fn open_except(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    let except = ReadParams::id_list(params.except.as_deref(), vec![1, 2, 3]);
+    read(&app, &params, Lookup::OpenExcept { org, except }).await
+}
+
+async fn created_between(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    let lookup = Lookup::CreatedBetween {
+        org,
+        from: ReadParams::instant(
+            params.from.as_deref(),
+            Utc.with_ymd_and_hms(2026, 10, 1, 9, 0, 0).unwrap(),
+        ),
+        to: ReadParams::instant(
+            params.to.as_deref(),
+            Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap(),
+        ),
+    };
+    read(&app, &params, lookup).await
+}
+
+async fn many(State(app): State<App>, Query(params): Query<ReadParams>) -> Reply {
+    let ids = ReadParams::id_list(params.ids.as_deref(), (1..=100).collect());
+    read(&app, &params, Lookup::Many { ids }).await
+}
+
+async fn queue_end(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    read(&app, &params, Lookup::QueueEnd { org }).await
+}
+
+async fn nothing(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    read(&app, &params, Lookup::Nothing { org }).await
+}
+
+async fn all_tickets(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    read(&app, &params, Lookup::AllTickets { org }).await
+}
+
+async fn comment_authors(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    read(&app, &params, Lookup::CommentAuthors { ticket: id }).await
+}
+
+async fn skilled(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    let skill = params
+        .skill
+        .clone()
+        .unwrap_or_else(|| "billing".to_string());
+    read(&app, &params, Lookup::Skilled { org, skill }).await
+}
+
+async fn statuses(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    read(&app, &params, Lookup::Statuses { org }).await
+}
+
+async fn workload(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    read(&app, &params, Lookup::Workload { org }).await
+}
+
+async fn last_activity(
+    State(app): State<App>,
+    Path(org): Path<i64>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    read(&app, &params, Lookup::LastActivity { org }).await
+}
+
+async fn of_kind(
+    State(app): State<App>,
+    Path((org, kind)): Path<(i64, String)>,
+    Query(params): Query<ReadParams>,
+) -> Reply {
+    let kind = TicketKind::parse(&kind)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("no kind `{kind}`")))?;
+    read(&app, &params, Lookup::OfKind { org, kind }).await
 }
 
 #[derive(Deserialize)]

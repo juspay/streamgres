@@ -21,6 +21,14 @@ pub struct TicketStatusType;
 #[diesel(postgres_type(name = "ticket_priority"))]
 pub struct TicketPriorityType;
 
+/// The enum type a migration adds after the engine started
+/// (`example migrate new-type`): a bind of it is refused until the
+/// engine restarts, which is the one schema change the engine cannot
+/// absorb.
+#[derive(diesel::sql_types::SqlType, diesel::query_builder::QueryId)]
+#[diesel(postgres_type(name = "ticket_kind"))]
+pub struct TicketKindType;
+
 /// A Postgres enum as a Rust enum: its labels on the wire, lower case
 /// in JSON.
 macro_rules! pg_enum {
@@ -67,6 +75,7 @@ macro_rules! pg_enum {
 
 pg_enum!(TicketStatus, TicketStatusType, [Open => "open", Pending => "pending", Closed => "closed"]);
 pg_enum!(TicketPriority, TicketPriorityType, [Low => "low", Normal => "normal", High => "high"]);
+pg_enum!(TicketKind, TicketKindType, [Bug => "bug", Task => "task", Question => "question"]);
 
 impl TicketStatus {
     /// The next status the background writer moves a ticket to.
@@ -127,6 +136,34 @@ pub struct Attachment {
     pub name: String,
     #[serde(serialize_with = "hex")]
     pub data: Vec<u8>,
+}
+
+/// A ticket with the column `example migrate new-type` adds.
+#[derive(Queryable, Selectable, Serialize, Debug, Clone, PartialEq)]
+#[diesel(table_name = crate::schema::tickets_with_kind)]
+pub struct TicketOfKind {
+    pub id: i64,
+    pub org_id: i64,
+    pub kind: Option<TicketKind>,
+}
+
+/// A comment with the name of the agent who wrote it, `None` where
+/// nobody did: what the left join returns.
+#[derive(Queryable, Serialize, Debug, Clone, PartialEq)]
+pub struct CommentAuthor {
+    pub comment_id: i64,
+    pub body: String,
+    pub agent: Option<String>,
+}
+
+/// How many tickets each agent holds, `None` for the unassigned: the
+/// `GROUP BY` the engine refuses.
+#[derive(QueryableByName, Serialize, Debug, Clone, PartialEq)]
+pub struct Workload {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    pub agent_id: Option<i64>,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub tickets: i64,
 }
 
 /// A ticket's title and its comment, as the join returns them.

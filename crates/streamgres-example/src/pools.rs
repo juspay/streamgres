@@ -27,7 +27,10 @@ use streamgres_diesel::engine::EngineClient;
 use streamgres_diesel::{Attachment, Route, Settings, install};
 
 use crate::queries::{AsyncConn, SyncConn};
+use crate::{verify, writer};
 
+/// Everything a process holds: the cache, the engine client, the pools,
+/// and the counters of the writer and the verify loop.
 pub struct Stack {
     pub cache: Arc<Cache>,
     pub engine: EngineClient,
@@ -35,6 +38,8 @@ pub struct Stack {
     pub reporting: Pool<AsyncConn>,
     pub plain: Pool<AsyncPgConnection>,
     pub sync: SyncPool<ConnectionManager<SyncConn>>,
+    pub writer: Arc<writer::Counts>,
+    pub verify: Arc<verify::Counts>,
 }
 
 /// The URL a pool is established with decides its route; the settings
@@ -107,6 +112,8 @@ impl Stack {
             reporting,
             plain,
             sync,
+            writer: Arc::default(),
+            verify: Arc::default(),
         })
     }
 

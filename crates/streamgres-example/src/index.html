@@ -24,7 +24,7 @@
 </head>
 <body>
 <h1>Streamgres ticket desk</h1>
-<p class="sub">Reads go through the Diesel wrapper; the engine keeps the cache fresh. A background writer changes a ticket every second.</p>
+<p class="sub">Reads go through the Diesel wrapper; the engine keeps the cache fresh. A background writer makes a change every second; <a href="/verify">/verify</a> compares every read with Postgres.</p>
 
 <div class="grid" id="counters"></div>
 
@@ -40,14 +40,23 @@ const paths = {
   ticket: '/tickets/1', queue: '/orgs/1/queue?page=1', queue_count: '/orgs/1/queue/count?status=open',
   comments: '/tickets/1/comments', attachment: '/attachments/1', agents: '/orgs/1/agents',
   sla: '/orgs/1/sla', search: '/orgs/1/search?q=login', recent: '/orgs/1/recent?limit=5',
+  org_ticket: '/orgs/1/tickets/5', unassigned: '/orgs/1/unassigned', escalated: '/orgs/1/escalated',
+  open_except: '/orgs/1/open?except=1,2,3', created_between: '/orgs/1/created',
+  many: '/tickets?ids=' + Array.from({length: 100}, (_, i) => i + 1).join(','),
+  queue_end: '/orgs/1/queue/end', nothing: '/orgs/1/nothing', all_tickets: '/orgs/1/tickets',
+  comment_authors: '/tickets/1/authors', skilled: '/orgs/1/skilled?skill=billing',
+  statuses: '/orgs/1/statuses', workload: '/orgs/1/workload', last_activity: '/orgs/1/activity',
 };
 const last = {};
 async function refresh() {
   const s = await (await fetch('/stats')).json();
   const c = s.cache;
+  const v = s.verify, w = s.writer;
   const cards = [
     ['hits', c.hits], ['misses', c.misses], ['replaced', c.replaced], ['touched', c.touched],
     ['refused', c.refused], ['after write', c.after_write], ['entries', c.entries], ['bytes', c.bytes],
+    ['writes', Object.entries(w).filter(([k]) => k !== 'errors').reduce((n, [, x]) => n + x, 0)],
+    ['verified', v.compared], ['lagged', v.lagged], ['mismatches', v.mismatches],
   ];
   document.getElementById('counters').innerHTML = cards.map(([k, v]) => `<div class="card"><b>${v}</b><span>${k}</span></div>`).join('');
   const e = s.engine;
@@ -65,7 +74,7 @@ let lookups = [];
 function render() {
   document.getElementById('lookups').innerHTML = lookups.map(l => {
     const r = last[l.name];
-    return `<tr><td><code>${paths[l.name]}</code></td><td>${l.exercises}</td>` +
+    return `<tr><td><code>${(paths[l.name] || '').slice(0, 40)}</code></td><td>${l.exercises}</td>` +
       `<td>${r ? (Array.isArray(r.rows) ? r.rows.length + ' row(s)' : JSON.stringify(r.rows)) : ''}</td>` +
       `<td class="${r ? r.source : ''}">${r ? r.source : ''}</td><td>${r ? r.micros : ''}</td>` +
       `<td><button onclick="run('${l.name}')">read</button></td></tr>`;
