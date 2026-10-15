@@ -1683,10 +1683,15 @@ fn with_current(
 }
 
 /// One poke as its frames, from `base` to `cookie`: the start, the parts
-/// (`head` in the first, row operations accumulated until their serialized
+/// (`head` in the first, row operations accumulated until the full frame
 /// size reaches `bytes_per_part`, every put taken from the bytes kept on
 /// its image when the image was sent before), the end. Also how many puts
 /// and dels it carries.
+///
+/// The frame size counted against the limit is the complete wire frame:
+/// the fixed JSON framing (`["pokePart",{"pokeID":...,rowsPatch":[...]}]`),
+/// the head fields (`desiredQueriesPatches`, `lastMutationIDChanges`, etc.
+/// — present only in the first part), and each row entry plus its comma.
 #[allow(clippy::too_many_arguments)]
 fn build_poke(
     catalog: &Catalog,
@@ -1702,8 +1707,13 @@ fn build_poke(
     frames.push(Bytes::from(protocol::poke_start(poke_id, base)));
     let mut head = Some(head);
     let (mut puts, mut dels) = (0usize, 0usize);
+    // Fixed framing bytes per part, derived from part_frame's structure:
+    // ["pokePart",{"pokeID": (22) + "poke_id" (poke_id.len() + 2 quotes)
+    // + ,"rowsPatch":[ (13) + ]}] (3) = 40 + poke_id.len()
+    let frame_overhead = 40 + poke_id.len();
     let mut entries: Vec<Bytes> = Vec::new();
-    let mut current_bytes = 0usize;
+    // Seed with overhead + head size: head fields are only in the first part.
+    let mut current_bytes = frame_overhead + head.as_ref().map_or(0, Vec::len);
     for op in rows {
         let entry = match op {
             Patch::Put(table, row) => {
@@ -1720,12 +1730,14 @@ fn build_poke(
                 Bytes::from(bytes)
             }
         };
-        if !entries.is_empty() && current_bytes + entry.len() > bytes_per_part {
+        // Each entry after the first in a part costs one extra comma byte.
+        if !entries.is_empty() && current_bytes + 1 + entry.len() > bytes_per_part {
             frames.push(part_frame(poke_id, head.take(), &entries));
             entries.clear();
-            current_bytes = 0;
+            // Subsequent parts carry no head; reset to framing overhead only.
+            current_bytes = frame_overhead;
         }
-        current_bytes += entry.len();
+        current_bytes += if entries.is_empty() { entry.len() } else { entry.len() + 1 };
         entries.push(entry);
     }
     frames.push(part_frame(poke_id, head.take(), &entries));
