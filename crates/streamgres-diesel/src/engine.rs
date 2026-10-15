@@ -1164,6 +1164,13 @@ mod tests {
     /// fed to `inbound` directly, so the orderings the reader thread and
     /// the subscribing thread can take are forced rather than hoped for.
     fn worker() -> (Arc<Worker>, mpsc::UnboundedReceiver<Outgoing>, Arc<Shared>) {
+        worker_waiting(Duration::from_secs(5))
+    }
+
+    /// As [`worker`], giving a verdict `wait` to arrive.
+    fn worker_waiting(
+        wait: Duration,
+    ) -> (Arc<Worker>, mpsc::UnboundedReceiver<Outgoing>, Arc<Shared>) {
         let shared = Arc::new(Shared {
             by_key: Mutex::new(HashMap::new()),
             max_subscriptions: 100,
@@ -1176,7 +1183,7 @@ mod tests {
         let (worker, outgoing) = Worker::new(
             0,
             "ws://127.0.0.1:1/never".to_string(),
-            Duration::from_secs(5),
+            wait,
             Arc::clone(&shared),
         );
         worker.connected.store(true, Ordering::Release);
@@ -1392,6 +1399,39 @@ mod tests {
             worker.subscribe(&key()),
             Outcome::Verdict(Verdict::Accepted)
         ));
+    }
+
+    /// An engine that takes the subscribe and never answers: the wait
+    /// ends at the verdict timeout, refused for a reason that passes,
+    /// and the id is withdrawn, so a late `accepted` registers nothing.
+    #[test]
+    fn a_subscribe_nobody_answers_is_given_up_in_time() {
+        let (worker, mut outgoing, shared) = worker_waiting(Duration::from_millis(50));
+        let started = Instant::now();
+        let Outcome::Verdict(Verdict::Refused(reason)) = worker.subscribe(&key()) else {
+            panic!("refused");
+        };
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(reason, "the engine did not answer in time");
+        assert!(Shared::TRANSIENT.contains(&reason.as_str()));
+        assert!(matches!(
+            outgoing.try_recv(),
+            Ok(Outgoing::Subscribe { id: 1, .. })
+        ));
+        assert!(matches!(
+            outgoing.try_recv(),
+            Ok(Outgoing::Unsubscribe { id: 1 })
+        ));
+        let state = worker.state.lock().unwrap();
+        assert!(state.pending.is_empty(), "nothing waits");
+        assert!(
+            state.by_key.is_empty() && state.by_id.is_empty(),
+            "nothing is held"
+        );
+        assert!(
+            shared.by_key.lock().unwrap().is_empty(),
+            "the key is not counted against the cap"
+        );
     }
 
     #[test]

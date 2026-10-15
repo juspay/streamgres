@@ -886,3 +886,57 @@ fn a_refusal_is_remembered_for_the_shape_not_the_value() {
     );
     assert!(w.engine.subscribed.lock().unwrap().is_empty());
 }
+
+/// What a full cache keeps is decided by how often a key is asked for,
+/// not by its size or age: a key asked for again and again gets in,
+/// displacing an entry read once, and a run of keys each asked for
+/// once cannot displace it. (moka counts reads, misses included, once
+/// the cache is past half full; the pending work is run by hand so the
+/// counts are applied before each decision.)
+#[test]
+fn a_hot_entry_outlives_cold_ones_under_the_budget() {
+    let mut w = World::with_budget("hot", 2000);
+    for i in 0..8 {
+        w.put(&format!("p{i}"), &"x".repeat(100));
+        assert_eq!(w.read(&format!("p{i}")).unwrap().len(), 100);
+        w.cache.run_pending_tasks();
+    }
+    let full = w.cache.len();
+    assert!(
+        (2..8).contains(&full),
+        "the budget holds some, not all: {full}"
+    );
+    assert!(w.cache.weighted_size() > 1000, "past half full");
+
+    w.put("hot", &"h".repeat(100));
+    let mut admitted_after = None;
+    for read in 1..=8 {
+        assert_eq!(w.read("hot").unwrap().len(), 100);
+        w.cache.run_pending_tasks();
+        if w.conn.last_served() == Some(Served::Cache) {
+            admitted_after = Some(read);
+            break;
+        }
+    }
+    let admitted_after = admitted_after.expect("a key asked for repeatedly gets in");
+    assert!(
+        admitted_after > 1,
+        "not on its first miss, the cache being full"
+    );
+
+    for i in 0..20 {
+        w.put(&format!("c{i}"), &"x".repeat(100));
+        assert_eq!(w.read(&format!("c{i}")).unwrap().len(), 100);
+        w.cache.run_pending_tasks();
+    }
+    assert!(w.cache.len() <= full + 1, "the budget still holds");
+    let hits = w.cache.stats.hits.load(Ordering::Relaxed);
+    assert_eq!(w.read("hot").unwrap().len(), 100);
+    assert_eq!(
+        w.conn.last_served(),
+        Some(Served::Cache),
+        "the hot entry outlived the cold ones; held {}",
+        w.cache.len()
+    );
+    assert_eq!(w.cache.stats.hits.load(Ordering::Relaxed), hits + 1);
+}

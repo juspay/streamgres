@@ -824,3 +824,83 @@ async fn migrations_are_absorbed_refused_or_stop_the_engine() {
     }
     assert_eq!(live.main.last_served(), Some(Served::Cache), "cached again");
 }
+
+/// A column added while the engine is down. The wrapper learnt the
+/// table's column types before the outage; when the engine is back and
+/// serves a query that names the new column, those types lack it, so
+/// they are looked up again and the query is served from engine rows.
+#[tokio::test]
+async fn a_column_added_while_the_engine_was_down_is_served_when_it_returns() {
+    let Some(mut live) = Live::start().await else {
+        return;
+    };
+    if std::env::var("STREAMGRES_RESTART_CMD").is_err() {
+        eprintln!("STREAMGRES_RESTART_CMD not set; skipping");
+        return;
+    }
+    live.main.set_read_your_writes(Duration::ZERO);
+    let mut migrator = PgConnection::establish(&live.database_url).unwrap();
+    let ticket = Lookup::Ticket { id: 1 };
+    let truth = live.truth(&ticket);
+    assert_eq!(ticket.run_async(&mut live.main).await.unwrap(), truth);
+    assert_eq!(ticket.run_async(&mut live.main).await.unwrap(), truth);
+    assert_eq!(live.main.last_served(), Some(Served::Cache));
+
+    Step::Widen.run(&mut migrator).unwrap();
+    Step::Drop.run(&mut migrator).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while live.engine.is_connected() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !live.engine.is_connected(),
+        "the dropped column stopped the engine"
+    );
+
+    Step::NewType.run(&mut migrator).unwrap();
+    assert_eq!(ticket.run_async(&mut live.main).await.unwrap(), truth);
+    assert_eq!(
+        live.main.last_served(),
+        Some(Served::Postgres),
+        "served live while the engine is down"
+    );
+
+    assert!(live.restart_engine().await);
+    let of_kind = Lookup::OfKind {
+        org: 1,
+        kind: TicketKind::Bug,
+    };
+    let kinds = live.truth(&of_kind);
+    assert!(kinds.as_array().is_some_and(|rows| !rows.is_empty()));
+    let materialized = live.engine.materialized();
+    let mut served = Vec::new();
+    for _ in 1..=4 {
+        assert_eq!(of_kind.run_async(&mut live.main).await.unwrap(), kinds);
+        served.push(live.main.last_served());
+    }
+    assert_eq!(
+        served,
+        [
+            Some(Served::Postgres),
+            Some(Served::Postgres),
+            Some(Served::Engine),
+            Some(Served::Cache)
+        ],
+        "live while the new type's OID is resolved, live again while the table's types are fetched afresh, then engine rows, then the cache; refusals {:?}, fallbacks {:?}",
+        live.engine.refusals(),
+        live.engine.fallbacks()
+    );
+    assert_eq!(
+        live.engine.materialized(),
+        materialized + 1,
+        "from engine rows, with the types looked up again"
+    );
+    for _ in 1..=3 {
+        assert_eq!(ticket.run_async(&mut live.main).await.unwrap(), truth);
+    }
+    assert_eq!(
+        live.main.last_served(),
+        Some(Served::Cache),
+        "the old entry is back too"
+    );
+}

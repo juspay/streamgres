@@ -126,7 +126,8 @@ column of it, which the engine absorbs too, but a bind of the new type
 (`/orgs/1/kind/bug`) is refused and served live until the engine
 restarts. `migrate drop` removes both: the engine cannot follow a
 dropped column, so it stops, compose restarts it, and reads go to
-Postgres meanwhile.
+Postgres meanwhile. A `TRUNCATE` of a published table stops it the same
+way: the replication stream carries no rows for it to follow.
 
 ## 9. How stale is the cache?
 
