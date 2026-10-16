@@ -485,11 +485,15 @@ impl Transport {
     /// would come back at the server's current position and skip every
     /// change in between, so its absence is an error
     /// ([`Transport::slot_exists`] tells it apart).
-    pub async fn open(dsn: &str, slot: &str, publication: &str) -> Result<Self, StorageError> {
-        let tls = super::tls::Tls::new();
+    pub async fn open(
+        dsn: &str,
+        slot: &str,
+        publication: &str,
+        tls: &super::tls::Tls,
+    ) -> Result<Self, StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        require_slot(&config, &tls, slot).await?;
-        Self::connect(config, tls, slot, publication).await
+        require_slot(&config, tls, slot).await?;
+        Self::connect(config, tls.clone(), slot, publication).await
     }
 
     /// [`Transport::open`], the slot first moved up to `start` when it is
@@ -502,12 +506,12 @@ impl Transport {
         slot: &str,
         publication: &str,
         start: Lsn,
+        tls: &super::tls::Tls,
     ) -> Result<Self, StorageError> {
-        let tls = super::tls::Tls::new();
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = require_slot(&config, &tls, slot).await?;
+        let client = require_slot(&config, tls, slot).await?;
         advance_slot(&client, slot, start).await?;
-        Self::connect(config, tls, slot, publication).await
+        Self::connect(config, tls.clone(), slot, publication).await
     }
 
     /// Check that the deployment-provided `publication` exists and create
@@ -515,10 +519,14 @@ impl Transport {
     /// is minted, so that the slot holds the log from before that snapshot's
     /// point. The server never creates publications: that DDL belongs to
     /// deployment setup and must not race among pods at startup.
-    pub async fn prepare(dsn: &str, slot: &str, publication: &str) -> Result<(), StorageError> {
-        let tls = super::tls::Tls::new();
+    pub async fn prepare(
+        dsn: &str,
+        slot: &str,
+        publication: &str,
+        tls: &super::tls::Tls,
+    ) -> Result<(), StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        prepare_slot(&config, &tls, slot, publication).await.map(drop)
+        prepare_slot(&config, tls, slot, publication).await.map(drop)
     }
 
     /// Drop only our own permanent slots that PostgreSQL has reported
@@ -956,9 +964,9 @@ impl PgStream {
         publication: &str,
         catalog: Arc<Catalog>,
     ) -> Result<Self, StorageError> {
-        Transport::prepare(dsn, slot, publication).await?;
-        let transport = Transport::open(dsn, slot, publication).await?;
         let tls = super::tls::Tls::new();
+        Transport::prepare(dsn, slot, publication, &tls).await?;
+        let transport = Transport::open(dsn, slot, publication, &tls).await?;
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config, &tls, &tokio::runtime::Handle::current()).await?;
         Ok(PgStream {
@@ -977,9 +985,9 @@ impl PgStream {
         catalog: Arc<Catalog>,
         ddl: DdlSource,
     ) -> Result<Self, StorageError> {
-        Transport::prepare(dsn, slot, publication).await?;
-        let transport = Transport::open(dsn, slot, publication).await?;
         let tls = super::tls::Tls::new();
+        Transport::prepare(dsn, slot, publication, &tls).await?;
+        let transport = Transport::open(dsn, slot, publication, &tls).await?;
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config, &tls, &tokio::runtime::Handle::current()).await?;
         Ok(PgStream {
@@ -996,8 +1004,8 @@ impl PgStream {
 
     /// Drop `slot` and `publication`.
     pub async fn drop_slot(dsn: &str, slot: &str, publication: &str) -> Result<(), StorageError> {
-        Transport::drop_slot_only(dsn, slot).await?;
         let tls = super::tls::Tls::new();
+        Transport::drop_slot_only(dsn, slot).await?;
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config, &tls, &tokio::runtime::Handle::current()).await?;
         client

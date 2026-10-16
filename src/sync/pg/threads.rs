@@ -225,18 +225,21 @@ pub fn spawn_feed(
                 let mut start = Some(start);
                 let mut failures = 0u32;
                 loop {
+                    let tls = super::tls::Tls::new();
                     let opened = match start {
                         Some(from) => Transport::open_from(
                             &settings.dsn,
                             &settings.slot,
                             &settings.publication,
                             from,
+                            &tls,
                         )
                         .await,
                         None => Transport::open(
                             &settings.dsn,
                             &settings.slot,
                             &settings.publication,
+                            &tls,
                         )
                         .await,
                     };
@@ -359,9 +362,14 @@ pub async fn start(
     Transport::cleanup_inactive_slots(&settings.dsn, settings.slot_cleanup_age)
         .await
         .map_err(|error| format!("cleaning up inactive replication slots: {error}"))?;
-    Transport::prepare(&settings.dsn, &settings.slot, &settings.publication)
-        .await
-        .map_err(|error| format!("preparing the change feed: {error}"))?;
+    Transport::prepare(
+        &settings.dsn,
+        &settings.slot,
+        &settings.publication,
+        &super::tls::Tls::new(),
+    )
+    .await
+    .map_err(|error| format!("preparing the change feed: {error}"))?;
     let mut config: tokio_postgres::Config = settings
         .dsn
         .parse()

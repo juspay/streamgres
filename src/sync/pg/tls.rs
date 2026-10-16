@@ -117,10 +117,13 @@ pub(crate) struct Minting {
 }
 
 impl Minting {
-    /// Whether a server that cannot do TLS ends the connection: only
-    /// `require` forbids the fallback to plaintext.
+    /// Whether a server that cannot do TLS ends the connection: every
+    /// mode but `disable` and `prefer` forbids the fallback to
+    /// plaintext — phrased as the negation so a mode tokio-postgres
+    /// grows past the three read here fails safe, the way
+    /// [`Tls::for_feed`]'s catch-all maps it to `require`.
     pub(crate) fn refused_tls_is_fatal(&self) -> bool {
-        self.mode == SslMode::Require
+        !matches!(self.mode, SslMode::Disable | SslMode::Prefer)
     }
 
     /// Whether the DSN said `sslmode=disable`: the SSL request is not
