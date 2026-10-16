@@ -5,12 +5,17 @@
 //! through the simple query protocol. `tokio-postgres` builds its startup
 //! message from a fixed set of parameters and cannot open such a
 //! connection, so the handful of messages involved are spoken directly
-//! with `postgres-protocol`. Plain TCP or Unix sockets, no TLS. Once a
-//! slot has exported its snapshot, anything sent on the connection discards
-//! the snapshot, so the connection is kept without a byte: the kernel
-//! probes it while silent ([`keep_alive`]), and the session is opened with
-//! PostgreSQL's idle timeout off and its end probing too
-//! ([`session_options`]).
+//! with `postgres-protocol`. A TCP connection is first offered TLS as the
+//! DSN's `sslmode` asks ([`super::tls`]): the SSL request goes out before
+//! anything else, an `S` answer upgrades the socket, and an `N` either
+//! ends the connection (`require` and above) or leaves it plain
+//! (`prefer`, `disable` skips the question). A cleartext password is only
+//! ever sent over a TLS or Unix connection: a plain TCP one would carry
+//! it readable by every hop on the path. Once a slot has exported its
+//! snapshot, anything sent on the connection discards the snapshot, so
+//! the connection is kept without a byte: the kernel probes it while
+//! silent ([`keep_alive`]), and the session is opened with PostgreSQL's
+//! idle timeout off and its end probing too ([`session_options`]).
 
 use std::io;
 use std::time::Duration;
@@ -20,18 +25,23 @@ use fallible_iterator::FallibleIterator;
 use postgres_protocol::authentication::{self, sasl};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
+use sha2::Digest;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio_postgres::Config;
 use tokio_postgres::config::Host;
+use tokio_rustls::client::TlsStream;
 
+use super::tls::{Minting, cleartext_password_refused, may_send_cleartext_password};
 use crate::sync::storage::StorageError;
 
-/// The socket underneath, either flavor; `Detached` is a connection that
-/// was never opened (a placeholder for tests of the alias bookkeeping).
+/// The socket underneath, one of three flavors; `Detached` is a
+/// connection that was never opened (a placeholder for tests of the
+/// alias bookkeeping).
 enum Socket {
     Tcp(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
     Unix(UnixStream),
     Detached,
 }
@@ -41,6 +51,7 @@ impl Socket {
     async fn read(&mut self, buffer: &mut BytesMut) -> io::Result<usize> {
         match self {
             Socket::Tcp(stream) => stream.read_buf(buffer).await,
+            Socket::Tls(stream) => stream.read_buf(buffer).await,
             Socket::Unix(stream) => stream.read_buf(buffer).await,
             Socket::Detached => Err(io::ErrorKind::NotConnected.into()),
         }
@@ -50,8 +61,28 @@ impl Socket {
     async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
         match self {
             Socket::Tcp(stream) => stream.write_all(bytes).await,
+            Socket::Tls(stream) => stream.write_all(bytes).await,
             Socket::Unix(stream) => stream.write_all(bytes).await,
             Socket::Detached => Err(io::ErrorKind::NotConnected.into()),
+        }
+    }
+
+    /// Whether the bytes crossing it are TLS-encrypted.
+    fn encrypted(&self) -> bool {
+        matches!(self, Socket::Tls(_))
+    }
+
+    /// Whether it is a Unix socket, whose bytes never leave the host.
+    fn unix(&self) -> bool {
+        matches!(self, Socket::Unix(_))
+    }
+
+    /// The TLS session underneath a `Tls` socket, for SCRAM's channel
+    /// binding; none for a plain or Unix one.
+    fn tls_connection(&self) -> Option<&rustls::ClientConnection> {
+        match self {
+            Socket::Tls(stream) => Some(stream.get_ref().1),
+            _ => None,
         }
     }
 }
@@ -76,22 +107,24 @@ impl ReplicationConnection {
     }
 
     /// Connect with `config`'s first host, user, password and database in
-    /// replication mode and authenticate; a TCP connection is probed while
-    /// silent as `config` asks ([`keep_alive`]), and the session is opened
-    /// with the settings that let it stay silent ([`session_options`]).
-    pub async fn open(config: &Config) -> Result<Self, StorageError> {
+    /// replication mode and authenticate — over TLS where `tls` has the
+    /// DSN ask for it; a TCP connection is probed while silent as `config`
+    /// asks ([`keep_alive`]), and the session is opened with the settings
+    /// that let it stay silent ([`session_options`]).
+    pub async fn open(config: &Config, tls: &super::tls::Tls) -> Result<Self, StorageError> {
         let host = config
             .get_hosts()
             .first()
             .ok_or_else(|| StorageError("the connection string names no host".to_owned()))?;
         let port = config.get_ports().first().copied().unwrap_or(5432);
+        let minting = tls.for_minting(config);
         let socket = match host {
             Host::Tcp(host) => {
                 let stream = TcpStream::connect((host.as_str(), port))
                     .await
                     .map_err(io_error)?;
                 keep_alive(&stream, config).map_err(io_error)?;
-                Socket::Tcp(stream)
+                Self::maybe_tls(stream, &minting, host).await?
             }
             Host::Unix(dir) => {
                 let path = dir.join(format!(".s.PGSQL.{port}"));
@@ -124,6 +157,48 @@ impl ReplicationConnection {
             .await?;
         connection.until_ready().await?;
         Ok(connection)
+    }
+
+    /// Ask `stream`'s server for TLS as `minting`'s mode allows and,
+    /// granted, wrap the stream in it: the SSL request is the first
+    /// bytes that cross, an `S` answer has the handshake follow with the
+    /// DSN's verification, and an `N` leaves the stream plain — a fatal
+    /// answer only when the mode said TLS or nothing — while `disable`
+    /// never asks.
+    async fn maybe_tls(
+        stream: TcpStream,
+        minting: &Minting,
+        host: &str,
+    ) -> Result<Socket, StorageError> {
+        if minting.ssl_disabled() {
+            return Ok(Socket::Tcp(stream));
+        }
+        let mut stream = stream;
+        let mut out = BytesMut::new();
+        frontend::ssl_request(&mut out);
+        stream.write_all(&out).await.map_err(io_error)?;
+        let mut answer = [0u8; 1];
+        stream.read_exact(&mut answer).await.map_err(io_error)?;
+        match answer[0] {
+            b'S' => {
+                let name = rustls::pki_types::ServerName::try_from(host.to_owned())
+                    .map_err(|error| StorageError(format!("server name `{host}`: {error}")))?;
+                let connector = tokio_rustls::TlsConnector::from(minting.config.clone());
+                let stream = connector.connect(name, stream).await.map_err(|error| {
+                    StorageError(format!("TLS handshake with the server: {error}"))
+                })?;
+                Ok(Socket::Tls(Box::new(stream)))
+            }
+            b'N' if minting.refused_tls_is_fatal() => Err(StorageError(
+                "the server does not offer TLS, but the connection string asks for \
+                 sslmode=require or stronger"
+                    .to_owned(),
+            )),
+            b'N' => Ok(Socket::Tcp(stream)),
+            other => Err(StorageError(format!(
+                "unreadable answer to the TLS offer: {other:#x}"
+            ))),
+        }
     }
 
     /// Run one command and return its rows as text columns (`None` for
@@ -169,6 +244,9 @@ impl ReplicationConnection {
         match self.next_message().await? {
             Message::AuthenticationOk => return Ok(()),
             Message::AuthenticationCleartextPassword => {
+                if !may_send_cleartext_password(self.socket.encrypted(), self.socket.unix()) {
+                    return Err(cleartext_password_refused());
+                }
                 self.send_password(password.ok_or_else(missing)?).await?;
             }
             Message::AuthenticationMd5Password(body) => {
@@ -182,21 +260,44 @@ impl ReplicationConnection {
             Message::AuthenticationSasl(body) => {
                 let mut offered = body.mechanisms();
                 let mut scram = false;
+                let mut scram_plus = false;
                 while let Some(mechanism) = offered.next().map_err(io_error)? {
-                    scram |=
-                        mechanism == sasl::SCRAM_SHA_256 || mechanism == sasl::SCRAM_SHA_256_PLUS;
+                    scram |= mechanism == sasl::SCRAM_SHA_256;
+                    scram_plus |= mechanism == sasl::SCRAM_SHA_256_PLUS;
                 }
-                if !scram {
+                if !scram && !scram_plus {
                     return Err(StorageError(
                         "the server offers no SCRAM-SHA-256 authentication".to_owned(),
                     ));
                 }
-                let mut exchange = sasl::ScramSha256::new(
-                    password.ok_or_else(missing)?,
-                    sasl::ChannelBinding::unsupported(),
-                );
+                // Channel binding ties the password exchange to the TLS
+                // session: over TLS the certificate's tls-server-end-point
+                // goes into the proof and SCRAM-SHA-256-PLUS is named when
+                // the server offers it, as tokio-postgres does — the
+                // connection accepts any certificate, so the binding is
+                // what proves the relay that could sit between speaks for
+                // this session and no other. Below TLS, or when the server
+                // does not offer `-PLUS`, the plain mechanism speaks
+                // `unrequested`/`unsupported` as its rules ask.
+                let binding = self
+                    .socket
+                    .tls_connection()
+                    .and_then(tls_server_end_point)
+                    .map(sasl::ChannelBinding::tls_server_end_point);
+                let (binding, mechanism) = if scram_plus {
+                    match binding {
+                        Some(binding) => (binding, sasl::SCRAM_SHA_256_PLUS),
+                        None => (sasl::ChannelBinding::unsupported(), sasl::SCRAM_SHA_256),
+                    }
+                } else {
+                    match binding {
+                        Some(_) => (sasl::ChannelBinding::unrequested(), sasl::SCRAM_SHA_256),
+                        None => (sasl::ChannelBinding::unsupported(), sasl::SCRAM_SHA_256),
+                    }
+                };
+                let mut exchange = sasl::ScramSha256::new(password.ok_or_else(missing)?, binding);
                 let mut out = BytesMut::new();
-                frontend::sasl_initial_response(sasl::SCRAM_SHA_256, exchange.message(), &mut out)
+                frontend::sasl_initial_response(mechanism, exchange.message(), &mut out)
                     .map_err(io_error)?;
                 self.socket.write(&out).await.map_err(io_error)?;
                 match self.next_message().await? {
@@ -337,6 +438,37 @@ fn keep_alive(stream: &TcpStream, config: &Config) -> io::Result<()> {
         probing = probing.with_retries(retries);
     }
     SockRef::from(stream).set_tcp_keepalive(&probing)
+}
+
+/// The `tls-server-end-point` channel binding (RFC 5929 §4.1) for the
+/// connection's server certificate: hashed with the hash of the
+/// certificate's own signature algorithm (MD5 and SHA-1 read as SHA-256),
+/// the server's proof the session is the one it certified, and what
+/// SCRAM-SHA-256-PLUS mixes into the password proof — the same mapping
+/// tokio-postgres-rustls applies on the queries' connections
+/// ([`x509_cert::Certificate::signature_algorithm`]). `None` when the
+/// session holds no certificate — the plain SCRAM is spoken then.
+fn tls_server_end_point(connection: &rustls::ClientConnection) -> Option<Vec<u8>> {
+    use x509_cert::der::Decode;
+    use x509_cert::der::oid::db::rfc5912::{
+        ECDSA_WITH_SHA_256, ECDSA_WITH_SHA_384, ECDSA_WITH_SHA_512, ID_SHA_1, ID_SHA_256,
+        ID_SHA_384, ID_SHA_512, SHA_1_WITH_RSA_ENCRYPTION, SHA_256_WITH_RSA_ENCRYPTION,
+        SHA_384_WITH_RSA_ENCRYPTION, SHA_512_WITH_RSA_ENCRYPTION,
+    };
+    let certificate_der = connection.peer_certificates()?.first()?;
+    let certificate = x509_cert::Certificate::from_der(certificate_der).ok()?;
+    Some(match certificate.signature_algorithm.oid {
+        // RFC 5929 §4.1: MD5 and SHA-1 signature hashes are upgraded.
+        ID_SHA_1 | SHA_1_WITH_RSA_ENCRYPTION | ID_SHA_256 | SHA_256_WITH_RSA_ENCRYPTION
+        | ECDSA_WITH_SHA_256 => sha2::Sha256::digest(certificate_der).to_vec(),
+        ID_SHA_384 | SHA_384_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_384 => {
+            sha2::Sha384::digest(certificate_der).to_vec()
+        }
+        ID_SHA_512 | SHA_512_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_512 => {
+            sha2::Sha512::digest(certificate_der).to_vec()
+        }
+        _ => return None,
+    })
 }
 
 /// An I/O or protocol error as a storage error.

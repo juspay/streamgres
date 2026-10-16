@@ -10,6 +10,12 @@ license = "Apache-2.0"
 # and tree ids): one multiply per key instead of SipHash (see
 # `model::ids`). Keys that are user data keep the default hasher.
 rustc-hash = "2"
+# Hashing the server certificate into the SCRAM channel binding
+# (`tls-server-end-point`, RFC 5929) in `sync::pg::replication`.
+sha2 = "0.11"
+# Reading the signature algorithm of the same certificate to choose that
+# hash. `std` gives `der`'s OID constants their `ObjectIdentifier` backing.
+x509-cert = { version = "0.2", features = ["std"] }
 
 # The catalog behind one handle every thread reads and the feed replaces
 # whole when a migration adds a table or a column (see `sync::catalog`):
@@ -35,11 +41,20 @@ libc = "0.2"
 # The Postgres storage backend and change feed (`src/sync/pg`).
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 uuid = { version = "1", features = ["v4"] }
+# TLS on the connections to Postgres, governed by the DSN's `sslmode`
+# (`src/sync/pg/tls.rs`): tokio-postgres's own tls plumbing follows
+# `sslmode` as libpq's clients did, and the two replication connections
+# below follow the same settings. rustls over the `ring` provider the rest
+# of the tree already builds.
+tokio-postgres-rustls = { version = "0.14" }
+# The minting connection's handshake (`src/sync/pg/replication.rs`) —
+# the one connection that speaks the protocol itself, so the connector
+# is built here rather than by an adapter.
+tokio-rustls = { version = "0.26", default-features = false }
 # The change feed's transport (`src/sync/pg/stream.rs`): a replication
 # connection speaking START_REPLICATION with the `pgoutput` plugin, and the
-# row messages it carries, decoded. Apache-2.0 OR MIT and MIT respectively;
-# TLS is left off, as it is for tokio-postgres above.
-pgwire-replication = { version = "0.4", default-features = false, features = ["scram"] }
+# row messages it carries, decoded. Apache-2.0 OR MIT and MIT respectively.
+pgwire-replication = { version = "0.4", default-features = false, features = ["scram", "tls-rustls"] }
 pgoutput = "0.0.7"
 # The replication-protocol connection that mints exported snapshots
 # (`src/sync/pg/replication.rs`): tokio-postgres cannot open one, so the

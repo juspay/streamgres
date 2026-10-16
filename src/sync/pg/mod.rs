@@ -55,6 +55,7 @@ pub mod sql;
 pub mod stream;
 pub mod text;
 pub mod threads;
+pub mod tls;
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -64,7 +65,7 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore};
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow};
+use tokio_postgres::{Client, Config, SimpleQueryMessage, SimpleQueryRow};
 
 use super::storage::{Storage, StorageError};
 use crate::log::{log_info, log_warn};
@@ -73,6 +74,7 @@ use crate::model::{
     SingleTableReadQuery, Snapshot, Value, ValueType,
 };
 use replication::ReplicationConnection;
+use tls::Tls;
 
 pub use catalog::load_catalog;
 pub use stream::{Batch, Feed, PgStream, Transport};
@@ -204,8 +206,8 @@ fn snapshot_slot_name() -> String {
 /// transaction open at that moment to finish, so a long-running
 /// transaction delays the mint (never the reads, which keep the current
 /// alias).
-pub async fn mint(config: &Config) -> Result<Alias, StorageError> {
-    let mut minter = ReplicationConnection::open(config).await?;
+pub async fn mint(config: &Config, tls: &Tls) -> Result<Alias, StorageError> {
+    let mut minter = ReplicationConnection::open(config, tls).await?;
     let slot = snapshot_slot_name();
     let rows = minter
         .simple_query(&format!(
@@ -369,6 +371,9 @@ impl Aliases {
 /// - `runtime`: where the reads, the connections and the minter run.
 struct Pool {
     config: Config,
+    /// The TLS settings every connection the pool opens shares — the
+    /// reads' and the minting one alike ([`tls::Tls`]).
+    tls: Tls,
     idle: Mutex<Vec<Client>>,
     permits: Arc<Semaphore>,
     /// The most rows one read may return before it is refused.
@@ -420,15 +425,27 @@ impl PgStorage {
 
     /// Connect as [`PgStorage::connect_on`] does, from a `config` already
     /// parsed and, say, given a [`Keepalive`]: every connection the storage
-    /// opens, the reads' and the minters', is opened from it.
+    /// opens, the reads' and the minters', is opened from it — encrypted
+    /// as the config's `sslmode` asks ([`tls::Tls`]).
     pub async fn connect_configured(
         config: Config,
         catalog: Arc<Catalog>,
         runtime: Handle,
     ) -> Result<Self, StorageError> {
-        let client = open(&config, &runtime).await?;
+        Self::connect_tls(config, Tls::new(), catalog, runtime).await
+    }
+
+    /// The connection's own making, once the DSN's TLS posture is known.
+    async fn connect_tls(
+        config: Config,
+        tls: Tls,
+        catalog: Arc<Catalog>,
+        runtime: Handle,
+    ) -> Result<Self, StorageError> {
+        let client = open(&config, &tls, &runtime).await?;
         let pool = Arc::new(Pool {
             config,
+            tls,
             idle: Mutex::new(vec![client]),
             permits: Arc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
             row_limit: AtomicUsize::new(read_row_limit()),
@@ -440,7 +457,7 @@ impl PgStorage {
             alive: AtomicBool::new(true),
             runtime,
         });
-        let first = Arc::new(mint(&pool.config).await?);
+        let first = Arc::new(mint(&pool.config, &pool.tls).await?);
         pool.first.store(first.lsn.0, Ordering::Relaxed);
         pool.lock_aliases().waiting.push_back(first);
         rotate(pool.clone());
@@ -464,6 +481,7 @@ impl PgStorage {
     pub fn with_read_connections(self, limit: usize) -> Self {
         let pool = Arc::new(Pool {
             config: self.pool.config.clone(),
+            tls: self.pool.tls.clone(),
             idle: Mutex::new(std::mem::take(&mut *self.pool.lock_idle())),
             permits: Arc::new(Semaphore::new(limit.max(1))),
             row_limit: AtomicUsize::new(self.pool.row_limit.load(Ordering::Relaxed)),
@@ -686,7 +704,7 @@ impl Pool {
             match idle {
                 Some(client) if client.is_closed() => continue,
                 Some(client) => return Ok(client),
-                None => return open(&self.read_config(), &self.runtime).await,
+                None => return open(&self.read_config(), &self.tls, &self.runtime).await,
             }
         }
     }
@@ -837,7 +855,7 @@ fn rotate(pool: Arc<Pool>) {
             if !rung && pool.lock_aliases().waiting.len() >= WAITING_ALIASES {
                 continue;
             }
-            match mint(&pool.config).await {
+            match mint(&pool.config, &pool.tls).await {
                 Ok(fresh) => pool.lock_aliases().waiting.push_back(Arc::new(fresh)),
                 Err(error) => {
                     log_warn!("snapshot minting failed, keeping the current alias: {error}")
@@ -847,9 +865,10 @@ fn rotate(pool: Arc<Pool>) {
     });
 }
 
-/// Open one connection and drive it as a task of `runtime`.
-async fn open(config: &Config, runtime: &Handle) -> Result<Client, StorageError> {
-    let (client, connection) = config.connect(NoTls).await?;
+/// Open one connection and drive it as a task of `runtime`, encrypted
+/// as `tls` has the DSN ask.
+async fn open(config: &Config, tls: &Tls, runtime: &Handle) -> Result<Client, StorageError> {
+    let (client, connection) = config.connect(tls.for_queries()).await?;
     runtime.spawn(async move {
         if let Err(error) = connection.await {
             log_warn!("postgres connection ended: {error}");
