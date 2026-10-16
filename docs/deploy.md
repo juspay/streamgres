@@ -260,7 +260,7 @@ depend on what the defaults happen to be:
 | `STREAMGRES_PING_INTERVAL_MS`, `STREAMGRES_CLIENT_TIMEOUT_MS`, `STREAMGRES_PONG_INTERVAL_MS` | `30000`, `45000`, `3000` | connection liveness |
 | `STREAMGRES_GROUP_LOG_BYTES` | `262144` | recent updates kept per client group, so a briefly disconnected tab catches up instead of starting over. `0` keeps none |
 | `STREAMGRES_MAX_MESSAGE_BYTES` | `16777216` | largest message accepted from a client |
-| `STREAMGRES_ROWS_PER_PART` | `500` | row changes per message part |
+| `STREAMGRES_BYTES_PER_PART` | `768000` | bytes of serialized row changes per message part (750 KiB) |
 | `STREAMGRES_LOG` | `info` | `error`, `warn`, `info` or `debug`. `debug` costs throughput |
 | `STREAMGRES_SLOW_QUERY_MS` | `1000` | queries and pushes slower than this are logged at `warn` |
 | `STREAMGRES_METRICS_INTERVAL_MS` | `10000` | how often process metrics are sampled |

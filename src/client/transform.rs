@@ -166,17 +166,14 @@ impl TransformCache {
     }
 }
 
-/// The key of a transform: the request's credentials and endpoint, the
-/// query's name and its arguments, as one JSON text (the arguments'
-/// object keys in sorted order, as `serde_json` writes them).
+/// The key of a transform: the request's credentials, the query's name
+/// and its arguments, as one JSON text (the arguments' object keys in
+/// sorted order, as `serde_json` writes them).
 fn key_of(identity: &Identity, name: &str, args: &Json) -> String {
-    let headers: BTreeMap<&String, &String> = identity.query_headers.iter().collect();
     json!({
         "token": identity.token,
         "cookie": identity.cookie,
         "origin": identity.origin,
-        "url": identity.query_url,
-        "headers": headers,
         "name": name,
         "args": args,
     })
