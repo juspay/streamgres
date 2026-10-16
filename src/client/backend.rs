@@ -9,7 +9,6 @@
 //! failed and not made again, since a slow server is not helped by the
 //! same question asked three times.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -28,16 +27,14 @@ pub struct Backend {
     app_id: String,
 }
 
-/// What one connection carries along to the application server.
+/// What one connection carries along to the application server: its
+/// credentials and origin. The endpoints are the server's configuration,
+/// never the client's.
 #[derive(Debug, Clone, Default)]
 pub struct Identity {
     pub cookie: Option<String>,
     pub origin: Option<String>,
     pub token: Option<String>,
-    pub query_url: Option<String>,
-    pub query_headers: HashMap<String, String>,
-    pub mutate_url: Option<String>,
-    pub mutate_headers: HashMap<String, String>,
 }
 
 /// The query endpoint's answer.
@@ -106,15 +103,11 @@ impl Backend {
     /// objects. A 5xx or a network failure is retried a few times; a call
     /// that timed out is not.
     pub async fn transform(&self, identity: &Identity, requests: Vec<Json>) -> TransformOutcome {
-        let url = identity.query_url.as_deref().unwrap_or(&self.query_url);
         let body = json!(["transform", requests]);
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match self
-                .post(url, &identity.query_headers, identity, &body)
-                .await
-            {
+            match self.post(&self.query_url, identity, &body).await {
                 Ok((status, json)) if (200..300).contains(&status) => {
                     return match json {
                         Json::Object(object)
@@ -196,11 +189,7 @@ impl Backend {
 
     /// Forward one push body; never retried, the endpoint owns idempotency.
     pub async fn push(&self, identity: &Identity, body: &Json) -> PushOutcome {
-        let url = identity.mutate_url.as_deref().unwrap_or(&self.mutate_url);
-        match self
-            .post(url, &identity.mutate_headers, identity, body)
-            .await
-        {
+        match self.post(&self.mutate_url, identity, body).await {
             Ok((status, json)) if (200..300).contains(&status) => PushOutcome::Response(json),
             Ok((status, json)) => PushOutcome::Failed {
                 status: Some(status),
@@ -221,7 +210,6 @@ impl Backend {
     async fn post(
         &self,
         url: &str,
-        extra: &HashMap<String, String>,
         identity: &Identity,
         body: &Json,
     ) -> Result<(u16, Json), Unanswered> {
@@ -236,9 +224,6 @@ impl Backend {
             .http
             .post(url.clone())
             .header("Content-Type", "application/json");
-        for (name, value) in extra {
-            request = request.header(name, value);
-        }
         if let Some(token) = &identity.token {
             request = request.header("Authorization", format!("Bearer {token}"));
         }
