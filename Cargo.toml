@@ -10,6 +10,12 @@ license = "Apache-2.0"
 # and tree ids): one multiply per key instead of SipHash (see
 # `model::ids`). Keys that are user data keep the default hasher.
 rustc-hash = "2"
+# Hashing the server certificate into the SCRAM channel binding
+# (`tls-server-end-point`, RFC 5929) in `sync::pg::replication`.
+sha2 = "0.11"
+# Reading the signature algorithm of the same certificate to choose that
+# hash. `std` gives `der`'s OID constants their `ObjectIdentifier` backing.
+x509-cert = { version = "0.2", features = ["std"] }
 
 # The catalog behind one handle every thread reads and the feed replaces
 # whole when a migration adds a table or a column (see `sync::catalog`):

@@ -82,7 +82,11 @@ impl Tls {
 
     /// The TLS posture for the change feed: its transport does the SSL
     /// negotiation itself, asked to follow the same mode the config
-    /// carries.
+    /// carries. pgwire-replication's `TlsConfig` has no field for an
+    /// external `Arc<ClientConfig>` — it builds its own rustls config
+    /// internally (with its own accept-any verifier, the same posture
+    /// `AnyCertificate` holds below) — so the mode alone crosses; only a
+    /// forked `TlsConfig` could make the feed share `self.config`.
     pub(crate) fn for_feed(&self, config: &Config) -> pgwire_replication::TlsConfig {
         let mode = match config.get_ssl_mode() {
             SslMode::Disable => pgwire_replication::SslMode::Disable,

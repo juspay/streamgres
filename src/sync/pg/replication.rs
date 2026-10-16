@@ -25,6 +25,7 @@ use fallible_iterator::FallibleIterator;
 use postgres_protocol::authentication::{self, sasl};
 use postgres_protocol::message::backend::Message;
 use postgres_protocol::message::frontend;
+use sha2::Digest;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
@@ -74,6 +75,15 @@ impl Socket {
     /// Whether it is a Unix socket, whose bytes never leave the host.
     fn unix(&self) -> bool {
         matches!(self, Socket::Unix(_))
+    }
+
+    /// The TLS session underneath a `Tls` socket, for SCRAM's channel
+    /// binding; none for a plain or Unix one.
+    fn tls_connection(&self) -> Option<&rustls::ClientConnection> {
+        match self {
+            Socket::Tls(stream) => Some(stream.get_ref().1),
+            _ => None,
+        }
     }
 }
 
@@ -250,21 +260,44 @@ impl ReplicationConnection {
             Message::AuthenticationSasl(body) => {
                 let mut offered = body.mechanisms();
                 let mut scram = false;
+                let mut scram_plus = false;
                 while let Some(mechanism) = offered.next().map_err(io_error)? {
-                    scram |=
-                        mechanism == sasl::SCRAM_SHA_256 || mechanism == sasl::SCRAM_SHA_256_PLUS;
+                    scram |= mechanism == sasl::SCRAM_SHA_256;
+                    scram_plus |= mechanism == sasl::SCRAM_SHA_256_PLUS;
                 }
-                if !scram {
+                if !scram && !scram_plus {
                     return Err(StorageError(
                         "the server offers no SCRAM-SHA-256 authentication".to_owned(),
                     ));
                 }
-                let mut exchange = sasl::ScramSha256::new(
-                    password.ok_or_else(missing)?,
-                    sasl::ChannelBinding::unsupported(),
-                );
+                // Channel binding ties the password exchange to the TLS
+                // session: over TLS the certificate's tls-server-end-point
+                // goes into the proof and SCRAM-SHA-256-PLUS is named when
+                // the server offers it, as tokio-postgres does — the
+                // connection accepts any certificate, so the binding is
+                // what proves the relay that could sit between speaks for
+                // this session and no other. Below TLS, or when the server
+                // does not offer `-PLUS`, the plain mechanism speaks
+                // `unrequested`/`unsupported` as its rules ask.
+                let binding = self
+                    .socket
+                    .tls_connection()
+                    .and_then(tls_server_end_point)
+                    .map(sasl::ChannelBinding::tls_server_end_point);
+                let (binding, mechanism) = if scram_plus {
+                    match binding {
+                        Some(binding) => (binding, sasl::SCRAM_SHA_256_PLUS),
+                        None => (sasl::ChannelBinding::unsupported(), sasl::SCRAM_SHA_256),
+                    }
+                } else {
+                    match binding {
+                        Some(_) => (sasl::ChannelBinding::unrequested(), sasl::SCRAM_SHA_256),
+                        None => (sasl::ChannelBinding::unsupported(), sasl::SCRAM_SHA_256),
+                    }
+                };
+                let mut exchange = sasl::ScramSha256::new(password.ok_or_else(missing)?, binding);
                 let mut out = BytesMut::new();
-                frontend::sasl_initial_response(sasl::SCRAM_SHA_256, exchange.message(), &mut out)
+                frontend::sasl_initial_response(mechanism, exchange.message(), &mut out)
                     .map_err(io_error)?;
                 self.socket.write(&out).await.map_err(io_error)?;
                 match self.next_message().await? {
@@ -405,6 +438,37 @@ fn keep_alive(stream: &TcpStream, config: &Config) -> io::Result<()> {
         probing = probing.with_retries(retries);
     }
     SockRef::from(stream).set_tcp_keepalive(&probing)
+}
+
+/// The `tls-server-end-point` channel binding (RFC 5929 §4.1) for the
+/// connection's server certificate: hashed with the hash of the
+/// certificate's own signature algorithm (MD5 and SHA-1 read as SHA-256),
+/// the server's proof the session is the one it certified, and what
+/// SCRAM-SHA-256-PLUS mixes into the password proof — the same mapping
+/// tokio-postgres-rustls applies on the queries' connections
+/// ([`x509_cert::Certificate::signature_algorithm`]). `None` when the
+/// session holds no certificate — the plain SCRAM is spoken then.
+fn tls_server_end_point(connection: &rustls::ClientConnection) -> Option<Vec<u8>> {
+    use x509_cert::der::Decode;
+    use x509_cert::der::oid::db::rfc5912::{
+        ECDSA_WITH_SHA_256, ECDSA_WITH_SHA_384, ECDSA_WITH_SHA_512, ID_SHA_1, ID_SHA_256,
+        ID_SHA_384, ID_SHA_512, SHA_1_WITH_RSA_ENCRYPTION, SHA_256_WITH_RSA_ENCRYPTION,
+        SHA_384_WITH_RSA_ENCRYPTION, SHA_512_WITH_RSA_ENCRYPTION,
+    };
+    let certificate_der = connection.peer_certificates()?.first()?;
+    let certificate = x509_cert::Certificate::from_der(certificate_der).ok()?;
+    Some(match certificate.signature_algorithm.oid {
+        // RFC 5929 §4.1: MD5 and SHA-1 signature hashes are upgraded.
+        ID_SHA_1 | SHA_1_WITH_RSA_ENCRYPTION | ID_SHA_256 | SHA_256_WITH_RSA_ENCRYPTION
+        | ECDSA_WITH_SHA_256 => sha2::Sha256::digest(certificate_der).to_vec(),
+        ID_SHA_384 | SHA_384_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_384 => {
+            sha2::Sha384::digest(certificate_der).to_vec()
+        }
+        ID_SHA_512 | SHA_512_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_512 => {
+            sha2::Sha512::digest(certificate_der).to_vec()
+        }
+        _ => return None,
+    })
 }
 
 /// An I/O or protocol error as a storage error.
