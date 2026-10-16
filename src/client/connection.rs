@@ -469,7 +469,7 @@ async fn handle(
             Level::Info,
             "client told to start over",
             wsid = wsid,
-            group = group_id,
+            group = crate::log::group(&group_id),
             cookie = conn.params.base_cookie.as_deref().unwrap_or(""),
             reason = reason
         );
@@ -503,7 +503,7 @@ async fn handle(
             Level::Info,
             "connection opened",
             wsid = conn.params.wsid,
-            group = conn.params.group_id,
+            group = crate::log::group(&conn.params.group_id),
             client = conn.params.client_id,
             authenticated = conn.identity.token.is_some() || conn.identity.cookie.is_some(),
             origin = conn.identity.origin.as_deref().unwrap_or("")
@@ -523,7 +523,7 @@ async fn handle(
             Level::Info,
             "connection closed",
             wsid = conn.params.wsid,
-            group = conn.params.group_id,
+            group = crate::log::group(&conn.params.group_id),
             client = conn.params.client_id,
             reason = reason,
             seconds = format!("{:.1}", opened.elapsed().as_secs_f64())
@@ -562,7 +562,7 @@ fn admits(
         Level::Warn,
         "connection refused",
         wsid = params.wsid,
-        group = params.group_id,
+        group = crate::log::group(&params.group_id),
         client = params.client_id,
         kind = schema::KIND,
         mismatches = found.len(),
@@ -1003,7 +1003,7 @@ impl Conn {
                                 hash = hash,
                                 kind = kind,
                                 at = "plan",
-                                group = self.params.group_id,
+                                group = crate::log::group(&self.params.group_id),
                                 connection = self.params.wsid,
                                 reason = reason
                             );
@@ -1043,8 +1043,8 @@ impl Conn {
             log_warn!(
                 "connection {}: a push for client group {} on the connection of {}",
                 self.params.wsid,
-                push.client_group_id,
-                self.params.group_id
+                crate::log::group(&push.client_group_id),
+                crate::log::group(&self.params.group_id)
             );
         }
         for mutation in &push.mutation_ids {
@@ -1113,7 +1113,7 @@ async fn forward_push(
         },
         "push forwarded",
         wsid = params.wsid,
-        group = params.group_id,
+        group = crate::log::group(&params.group_id),
         mutations = push.mutation_ids.len(),
         ms = format!("{:.1}", elapsed.as_secs_f64() * 1000.0),
         failed = failed
@@ -1283,7 +1283,7 @@ impl MutationReader {
                     .map(|row| [row.get(0), row.get(1), row.get(2), row.get(3)]),
             ),
             Err(error) => {
-                log_warn!("reading the mutations of client group {group}: {error}");
+                log_warn!("reading the mutations of client group {}: {error}", crate::log::group(group));
                 (Vec::new(), Vec::new())
             }
         }

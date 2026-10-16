@@ -717,7 +717,7 @@ impl Groups {
                         log_event!(
                             if slow { Level::Warn } else { Level::Debug },
                             if slow { "slow query" } else { "query hydrated" },
-                            group = group_id,
+                            group = crate::log::group(&group_id),
                             name = state.name,
                             hash = hash,
                             kind = if state.cold { "cold" } else { "warm" },
@@ -864,7 +864,7 @@ impl Groups {
         if !self.groups.contains_key(group_id) {
             self.groups.insert(group_id.to_owned(), Group::new());
             self.stats.client_groups.fetch_add(1, Ordering::Relaxed);
-            log_info!("client group {group_id} opened");
+            log_info!("client group {} opened", crate::log::group(group_id));
         }
         self.next_generation += 1;
         let generation = self.next_generation;
@@ -888,7 +888,8 @@ impl Groups {
         }
         group.generation = generation;
         log_info!(
-            "connection {wsid} joined client group {group_id} as client {}",
+            "connection {wsid} joined client group {} as client {}",
+            crate::log::group(group_id),
             socket.client
         );
         let sent = Instant::now();
@@ -902,7 +903,7 @@ impl Groups {
                     Level::Info,
                     "connection caught up from the group's log",
                     wsid = wsid,
-                    group = group_id,
+                    group = crate::log::group(group_id),
                     from = protocol::cookie(offered),
                     to = protocol::cookie(group.version),
                     pokes = pokes.len()
@@ -959,7 +960,7 @@ impl Groups {
                     Level::Info,
                     "connection caught up from the group's state",
                     wsid = wsid,
-                    group = group_id,
+                    group = crate::log::group(group_id),
                     to = protocol::cookie(group.version),
                     rows = puts,
                     queries = got.len()
@@ -988,7 +989,10 @@ impl Groups {
         if group.sockets.remove(wsid).is_some() {
             self.stats.clients.fetch_sub(1, Ordering::Relaxed);
         }
-        log_info!("connection {wsid} left client group {group_id}");
+        log_info!(
+            "connection {wsid} left client group {}",
+            crate::log::group(group_id)
+        );
         if group.sockets.is_empty() {
             self.next_generation += 1;
             let generation = self.next_generation;
@@ -1016,7 +1020,10 @@ impl Groups {
             .get(group_id)
             .is_some_and(|group| group.sockets.is_empty() && group.generation == generation);
         if expired {
-            log_info!("client group {group_id} expired; its subscriptions are released");
+            log_info!(
+                "client group {} expired; its subscriptions are released",
+                crate::log::group(group_id)
+            );
             self.drop_group(group_id);
         }
     }
@@ -1043,7 +1050,10 @@ impl Groups {
     /// Apply a client's desired-query changes to its group.
     fn desired(&mut self, group_id: &str, client: &str, ops: Vec<DesiredOp>) {
         if !self.groups.contains_key(group_id) {
-            log_warn!("desired queries for an unknown client group {group_id}");
+            log_warn!(
+                "desired queries for an unknown client group {}",
+                crate::log::group(group_id)
+            );
             return;
         }
         for op in ops {
@@ -1157,7 +1167,7 @@ impl Groups {
             query: translated.query,
             token,
         });
-        log_debug!("group {group_id}: query {name} ({hash}) registering");
+        log_debug!("group {}: query {name} ({hash}) registering", crate::log::group(group_id));
     }
 
     /// The engine side registered a query (`reads` storage reads issued):
@@ -1183,7 +1193,7 @@ impl Groups {
             })
             .is_some();
         if adopted {
-            log_debug!("group {group_id}: query {hash} registered as {}", sub.0);
+            log_debug!("group {}: query {hash} registered as {}", crate::log::group(&group_id), sub.0);
             self.by_sub.insert(sub, (group_id, hash));
         } else {
             self.command(Command::Unregister(sub));
@@ -1209,7 +1219,7 @@ impl Groups {
             "page capped",
             name = name,
             hash = hash,
-            group = group_id,
+            group = crate::log::group(&group_id),
             reason = crate::stats::SHORT_PAGE
         );
     }
@@ -1237,7 +1247,7 @@ impl Groups {
             "heavy read",
             name = name,
             hash = hash,
-            group = group_id,
+            group = crate::log::group(&group_id),
             table = table,
             rows = rows,
             limit = self.stats.read_row_limit.load(Ordering::Relaxed),
@@ -1285,7 +1295,7 @@ impl Groups {
             hash = hash,
             kind = kind,
             at = "read",
-            group = group_id,
+            group = crate::log::group(&group_id),
             reason = reason
         );
     }
@@ -1402,7 +1412,7 @@ impl Groups {
         }
         self.by_sub.remove(&sub);
         self.command(Command::Unregister(sub));
-        log_debug!("group {group_id}: query {hash} unregistered ({})", sub.0);
+        log_debug!("group {}: query {hash} unregistered ({})", crate::log::group(group_id), sub.0);
     }
 
     /// A write to the mutation-id table: remember the change for the
@@ -1555,7 +1565,8 @@ impl Groups {
             &patches,
         );
         log_debug!(
-            "group {group_id}: poke {poke_id} {} -> {cookie}: {puts} puts, {dels} dels, {} got, {} lmids, {} results",
+            "group {}: poke {poke_id} {} -> {cookie}: {puts} puts, {dels} dels, {} got, {} lmids, {} results",
+            crate::log::group(group_id),
             base.as_deref().unwrap_or("null"),
             got.len(),
             lmids.len(),
