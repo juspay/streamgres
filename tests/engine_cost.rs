@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use streamgres::client::plan::{Planner, Policy, Side};
+use streamgres::client::plan::{Planner, Policy, Side, Sizes};
 use streamgres::ivm::MultiTableIVM;
 use streamgres::model::Order::DESC;
 use streamgres::model::{
@@ -128,6 +128,7 @@ fn planned(q: &Q, counts: &dyn Fn(&str, bool) -> u64) -> MultiTableReadQuery {
         Policy {
             limit: 100_000,
             preferred: Side::Parent,
+            sizes: Sizes::Count,
         },
     );
     let asked: Vec<(usize, bool)> = planner

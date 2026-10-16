@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::plan::{Policy, Side};
+use super::plan::{Policy, Side, Sizes};
 use crate::log::{Format, Level};
 use crate::model::TableName;
 use crate::sync::pg::{Keepalive, Settings, threads};
@@ -141,6 +141,15 @@ pub struct Config {
     /// default) or `child` (the subquery, Zero's `whereExists` as
     /// translated).
     pub join_preferred_side: Side,
+    /// `STREAMGRES_PLAN_SIZES`: how the planner learns the sizes of a
+    /// join's sides, `count` (the default: a capped `count(*)` each),
+    /// `estimate` (PostgreSQL's `EXPLAIN`s and statistics, nothing
+    /// executed, remembered per statement as `STREAMGRES_ESTIMATE_TTL_MS`
+    /// says; a side that cannot be estimated is counted; every tree
+    /// planned on its own arguments, the name cache unused) or `shadow`
+    /// (counted and decided on, estimated alongside, both decisions
+    /// logged).
+    pub plan_sizes: Sizes,
     /// `STREAMGRES_PLAN_TTL_MS`: how long a join plan is remembered before
     /// the query is counted again (600000).
     pub plan_ttl: Duration,
@@ -150,7 +159,7 @@ pub struct Config {
     /// `STREAMGRES_PLAN_QUERY_TTL_MS`: how long a plan made for a query is
     /// laid onto every later query of the same name (and join skeleton),
     /// whatever its arguments, before the name is counted again (86400000,
-    /// a day; 0 plans every tree on its own).
+    /// a day; 0 plans every tree on its own, as estimating always does).
     pub plan_query_ttl: Duration,
     /// `STREAMGRES_TRANSFORM_TTL_MS`: how long the application server's
     /// transform of a query is kept per identity (60000; zero-cache keeps
@@ -268,6 +277,16 @@ impl Config {
                 ));
             }
         };
+        let plan_sizes = match first(&["STREAMGRES_PLAN_SIZES"]).as_deref() {
+            None | Some("count") => Sizes::Count,
+            Some("estimate") => Sizes::Estimate,
+            Some("shadow") => Sizes::Shadow,
+            Some(other) => {
+                return Err(format!(
+                    "STREAMGRES_PLAN_SIZES must be count, estimate or shadow, got `{other}`"
+                ));
+            }
+        };
         let log = match first(&["STREAMGRES_LOG"]).as_deref() {
             None | Some("info") => Level::Info,
             Some("debug") => Level::Debug,
@@ -382,6 +401,7 @@ impl Config {
             },
             row_limit,
             join_preferred_side,
+            plan_sizes,
             plan_ttl: millis("STREAMGRES_PLAN_TTL_MS", 600_000)?,
             plan_cache: match first(&["STREAMGRES_PLAN_CACHE"]) {
                 Some(text) => text
@@ -421,6 +441,7 @@ impl Config {
         Policy {
             limit: self.row_limit,
             preferred: self.join_preferred_side,
+            sizes: self.plan_sizes,
         }
     }
 

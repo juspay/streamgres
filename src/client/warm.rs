@@ -340,6 +340,7 @@ mod tests {
         let policy = Policy {
             limit: 1000,
             preferred: super::super::plan::Side::Parent,
+            sizes: super::super::plan::Sizes::Count,
         };
         let raw = |ast: Json| RawValue::from_string(ast.to_string()).unwrap();
         let shapes = vec![

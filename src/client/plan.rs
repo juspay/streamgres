@@ -87,12 +87,23 @@
 //! (keyed as translated, the identity the engine's twin sharing uses, for
 //! `STREAMGRES_PLAN_TTL_MS`), so one argument's refusal never spreads to
 //! every other.
+//!
+//! **Estimated** (`STREAMGRES_PLAN_SIZES=estimate`), a query is planned
+//! per tree instead, on its own where clauses and literals: PostgreSQL's
+//! estimates cost an `EXPLAIN` the first time a statement is asked and a
+//! lookup after (the storage remembers each for a day, see
+//! `sync::pg::estimate_cache`), so no argument is planned on another's
+//! numbers. The name cache is neither read nor written; the tree's
+//! outcome is still remembered for `STREAMGRES_PLAN_TTL_MS`. A page is
+//! estimated without its cursor ([`Translated::uncursored`]) — the rows
+//! its filter holds from the first page on, no fewer than past the
+//! cursor — so a page turn asks nothing the first page did not.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use futures_util::future::join_all;
+use futures_util::future::{join, join_all};
 
 use super::ast::Translated;
 use crate::log::{Level, log_event};
@@ -100,7 +111,7 @@ use crate::model::{
     ColumnName, ComparisonOperator, Condition, Driver, Join, MultiTableReadQuery,
     SingleTableReadQuery, Value,
 };
-use crate::sync::Storage;
+use crate::sync::{Storage, StorageError};
 
 /// Which side of an inner edge drives when reading a node whole and
 /// having its subs drive it hold the same.
@@ -111,11 +122,32 @@ pub enum Side {
 }
 
 /// The planner's settings: the most rows a whole node may hold (the same
-/// number a storage read may return) and the side that breaks a tie.
+/// number a storage read may return), the side that breaks a tie, and how
+/// [`plan`] learns the sizes it decides on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
     pub limit: u64,
     pub preferred: Side,
+    pub sizes: Sizes,
+}
+
+/// How [`plan`] answers the planner's counts (`STREAMGRES_PLAN_SIZES`).
+///
+/// - `Count`: each counted on the storage ([`Storage::count`]), a capped
+///   `count(*)`.
+/// - `Estimate`: each estimated ([`Storage::estimate`]: PostgreSQL's
+///   `EXPLAIN`s and statistics, nothing executed), and counted only when it
+///   cannot be estimated.
+/// - `Shadow`: counted and decided on as `Count`, estimated alongside; the
+///   two decisions are logged side by side (`query sized`), so how often
+///   the estimates would have planned the same can be measured before
+///   they decide anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sizes {
+    #[default]
+    Count,
+    Estimate,
+    Shadow,
 }
 
 /// One node of the tree being planned.
@@ -384,6 +416,56 @@ impl Planner {
             }
         }
         Ok(self.query)
+    }
+
+    /// The rows `planned` holds on this planner's counts: `planned` is
+    /// this planner's tree with every inner edge's driver decided, by this
+    /// planner or by another on other numbers (a plan made on estimates,
+    /// measured on counts). Each node compared under it holds what
+    /// [`Planner::plan_of`] gives that choice of drivers — its alone count
+    /// when it drives every inner sub, else its narrowed count (a page's no
+    /// higher than its `LIMIT`) — plus the hold of every node compared
+    /// below it (the subs driving it, a RIGHT child); a node driven from
+    /// above holds nothing of its own. `None` when a node it reads is over
+    /// the limit or was not answered.
+    pub fn hold_of(&self, planned: &MultiTableReadQuery) -> Option<u64> {
+        self.hold_at(0, Mode::Compare, planned)
+    }
+
+    /// [`Planner::hold_of`] from the node `index`, decided in `mode`.
+    fn hold_at(&self, index: usize, mode: Mode, planned: &MultiTableReadQuery) -> Option<u64> {
+        let mode = self.mode_of(index, mode);
+        let node = &self.nodes[index];
+        let limit = self.policy.limit;
+        let drivers: Vec<usize> = match mode {
+            Mode::Driven => Vec::new(),
+            Mode::Compare => self
+                .inner_of(index)
+                .into_iter()
+                .filter(|&edge| {
+                    planned
+                        .node_at(&node.path)
+                        .and_then(|at| at.joins.get(self.edges[edge].position))
+                        .is_some_and(|join| join.driver == Driver::Sub)
+                })
+                .collect(),
+        };
+        let mut hold = match mode {
+            Mode::Driven => 0,
+            Mode::Compare if drivers.is_empty() => node.alone.filter(|&count| count <= limit)?,
+            Mode::Compare if node.query.limit != u32::MAX => node
+                .narrowed?
+                .min(u64::from(node.query.limit)),
+            Mode::Compare => node.narrowed.filter(|&count| count <= limit)?,
+        };
+        let children: Vec<usize> = self.edges_of(index).map(|(edge, _)| edge).collect();
+        for edge in children {
+            let below = self.mode_below(edge, &drivers);
+            if self.mode_of(self.edges[edge].child, below) == Mode::Compare {
+                hold += self.hold_at(self.edges[edge].child, below, planned)?;
+            }
+        }
+        Some(hold)
     }
 
     /// Every counted node's plan, subs before their parents (a sub's
@@ -827,13 +909,17 @@ impl PlanCache {
 
 /// Plan `translated`, the query `name`, under `policy`: the plan
 /// remembered for its name, laid onto it, when there is one for its join
-/// skeleton, else the outcome remembered for this very tree, else the
-/// counts on `storage` (concurrently) and the planner's decision —
-/// remembered by name when it is a plan, and by tree either way. A count that fails (the database
-/// was unreachable, the count ran past the read timeout) refuses the
-/// query, saying so, and is not remembered: it says nothing about the
-/// query, and the next asking counts again. The counts are logged at
-/// debug level, `table alone/narrowed` per node.
+/// skeleton (not when estimating: every tree is sized on its own), else
+/// the outcome remembered for this very tree, else the sizes on `storage`
+/// (concurrently; counted or estimated as `policy.sizes` says, an
+/// estimate of a page without its cursor) and the planner's decision —
+/// remembered by name when it is a plan made on counts, and by tree
+/// either way. A size that fails (the
+/// database was unreachable, the count ran past the read timeout) refuses
+/// the query, saying so, and is not remembered: it says nothing about the
+/// query, and the next asking sizes it again. The sizes are logged at
+/// debug level, `table alone/narrowed` per node; in shadow, the estimates
+/// and both decisions at info.
 pub async fn plan<S: Storage + ?Sized>(
     name: &str,
     translated: Translated,
@@ -841,28 +927,59 @@ pub async fn plan<S: Storage + ?Sized>(
     cache: &PlanCache,
     storage: &S,
 ) -> Result<Translated, String> {
-    let Translated { query, hidden } = translated;
-    if let Some(query) = cache.by_name(name, &query) {
-        return Ok(Translated { query, hidden });
+    let Translated {
+        query,
+        hidden,
+        uncursored,
+    } = translated;
+    let by_name = policy.sizes != Sizes::Estimate;
+    if by_name && let Some(query) = cache.by_name(name, &query) {
+        return Ok(Translated {
+            query,
+            hidden,
+            uncursored,
+        });
     }
     if let Some(outcome) = cache.get(&query) {
-        return outcome.map(|query| Translated { query, hidden });
+        return outcome.map(|query| Translated {
+            query,
+            hidden,
+            uncursored,
+        });
     }
     let mut planner = Planner::new(query.clone(), policy);
     let wanted = planner.counts();
-    let answers = join_all(wanted.iter().map(|count| async move {
-        let started = Instant::now();
-        let answer = storage.count(&count.query, count.cap).await;
-        if let Some(stats) = crate::stats::Stats::global() {
-            stats.count_io.record(started.elapsed());
+    let sized = uncursored
+        .as_ref()
+        .map(|plain| Planner::new(plain.clone(), policy).counts())
+        .filter(|plain| {
+            plain.len() == wanted.len()
+                && plain
+                    .iter()
+                    .zip(&wanted)
+                    .all(|(a, b)| a.node == b.node && a.narrowed == b.narrowed)
+        });
+    let to_estimate = sized.as_deref().unwrap_or(&wanted);
+    let (answers, shadow) = match policy.sizes {
+        Sizes::Count => (counted(storage, &wanted).await, None),
+        Sizes::Estimate => (estimated_else_counted(storage, &wanted, to_estimate).await, None),
+        Sizes::Shadow => {
+            let ((answers, counting), (estimates, estimating)) = join(
+                timed(counted(storage, &wanted)),
+                timed(estimated(storage, to_estimate)),
+            )
+            .await;
+            (answers, Some((estimates, counting, estimating)))
         }
-        answer
-    }))
-    .await;
+    };
     let mut failed = None;
+    let mut answered = Vec::with_capacity(wanted.len());
     for (count, answer) in wanted.iter().zip(answers) {
         match answer {
-            Ok(rows) => planner.answer(count.node, count.narrowed, rows),
+            Ok(rows) => {
+                planner.answer(count.node, count.narrowed, rows);
+                answered.push(rows);
+            }
             Err(error) => {
                 failed = Some(match error.refusal() {
                     Some(reason) => reason.to_owned(),
@@ -880,18 +997,148 @@ pub async fn plan<S: Storage + ?Sized>(
             Level::Debug,
             "query counted",
             table = query.main_table.table,
+            by = if policy.sizes == Sizes::Estimate {
+                "estimate"
+            } else {
+                "count"
+            },
             counts = planner.report()
         );
     }
+    let counts = shadow.as_ref().map(|_| planner.report());
     let outcome = match failed {
         Some(reason) => return Err(reason),
         None => planner.decide(),
     };
-    if let Ok(planned) = &outcome {
+    if let (Some((estimates, counting, estimating)), Some(counts)) = (shadow, counts) {
+        let mut estimator = Planner::new(query.clone(), policy);
+        let mut error = None;
+        for (count, estimate) in wanted.iter().zip(estimates) {
+            match estimate {
+                Ok(rows) => estimator.answer(count.node, count.narrowed, rows),
+                Err(failed) => error = Some(failed.to_string()),
+            }
+        }
+        let estimated = estimator.report();
+        let mut holds = String::new();
+        let same = match (&outcome, error.is_none().then(|| estimator.decide())) {
+            (_, None) => None,
+            (Ok(counted), Some(Ok(estimated))) => {
+                let mut judge = Planner::new(query.clone(), policy);
+                for (count, rows) in wanted.iter().zip(&answered) {
+                    judge.answer(count.node, count.narrowed, *rows);
+                }
+                let shown = |hold: Option<u64>| hold.map_or("over".to_owned(), |rows| rows.to_string());
+                holds = format!(
+                    "{}/{}",
+                    shown(judge.hold_of(counted)),
+                    shown(judge.hold_of(&estimated))
+                );
+                Some(counted == &estimated)
+            }
+            (Err(_), Some(Err(_))) => Some(true),
+            _ => Some(false),
+        };
+        log_event!(
+            Level::Info,
+            "query sized",
+            name = name,
+            table = query.main_table.table,
+            same = same.map_or("unknown", |same| if same { "yes" } else { "no" }),
+            holds = holds,
+            counts = counts,
+            estimates = estimated,
+            count_ms = format!("{:.2}", counting.as_secs_f64() * 1000.0),
+            estimate_ms = format!("{:.2}", estimating.as_secs_f64() * 1000.0),
+            error = error.unwrap_or_default()
+        );
+    }
+    if by_name && let Ok(planned) = &outcome {
         cache.remember(name, planned);
     }
     cache.put(query, outcome.clone());
-    outcome.map(|query| Translated { query, hidden })
+    outcome.map(|query| Translated {
+        query,
+        hidden,
+        uncursored,
+    })
+}
+
+/// The answers of `work` and how long they took.
+async fn timed<T>(work: impl std::future::Future<Output = T>) -> (T, Duration) {
+    let started = Instant::now();
+    let answers = work.await;
+    (answers, started.elapsed())
+}
+
+/// Every count of `wanted` on `storage`, concurrently, each timed as
+/// `count_io`.
+async fn counted<S: Storage + ?Sized>(
+    storage: &S,
+    wanted: &[Count],
+) -> Vec<Result<u64, StorageError>> {
+    join_all(wanted.iter().map(|count| count_one(storage, count))).await
+}
+
+/// One count on `storage`, timed as `count_io`.
+async fn count_one<S: Storage + ?Sized>(
+    storage: &S,
+    count: &Count,
+) -> Result<u64, StorageError> {
+    let started = Instant::now();
+    let answer = storage.count(&count.query, count.cap).await;
+    if let Some(stats) = crate::stats::Stats::global() {
+        stats.count_io.record(started.elapsed());
+    }
+    answer
+}
+
+/// Every count of `wanted` estimated on `storage`, concurrently, each
+/// timed as `estimate_io`.
+async fn estimated<S: Storage + ?Sized>(
+    storage: &S,
+    wanted: &[Count],
+) -> Vec<Result<u64, StorageError>> {
+    join_all(wanted.iter().map(|count| estimate_one(storage, count))).await
+}
+
+/// One estimate on `storage`, timed as `estimate_io`.
+async fn estimate_one<S: Storage + ?Sized>(
+    storage: &S,
+    count: &Count,
+) -> Result<u64, StorageError> {
+    let started = Instant::now();
+    let answer = storage.estimate(&count.query, count.cap).await;
+    if let Some(stats) = crate::stats::Stats::global() {
+        stats.estimate_io.record(started.elapsed());
+    }
+    answer
+}
+
+/// Every count of `wanted` estimated on `storage` as its counterpart in
+/// `estimating` (the same count, a page's cursor perhaps left out),
+/// concurrently, and counted instead where it cannot be estimated (logged
+/// at debug).
+async fn estimated_else_counted<S: Storage + ?Sized>(
+    storage: &S,
+    wanted: &[Count],
+    estimating: &[Count],
+) -> Vec<Result<u64, StorageError>> {
+    join_all(wanted.iter().zip(estimating).map(|(count, estimate)| async move {
+        match estimate_one(storage, estimate).await {
+            Ok(rows) => Ok(rows),
+            Err(error) => {
+                log_event!(
+                    Level::Debug,
+                    "query not estimated",
+                    table = count.query.main_table.table,
+                    error = error
+                );
+                count_one(storage, count).await
+            }
+        }
+    }))
+    .await
 }
 
 #[cfg(test)]
@@ -931,6 +1178,7 @@ mod tests {
         Translated {
             query,
             hidden: HashSet::from([QueryPart::join(0)]),
+            uncursored: None,
         }
     }
 
@@ -976,7 +1224,11 @@ mod tests {
 
     /// The policy with `limit`, preferring `preferred`.
     fn policy(limit: u64, preferred: Side) -> Policy {
-        Policy { limit, preferred }
+        Policy {
+            limit,
+            preferred,
+            sizes: Sizes::Count,
+        }
     }
 
     /// A node with inner subs is counted twice, alone (its `EXISTS`
@@ -1446,6 +1698,7 @@ mod tests {
         let sandbox = Policy {
             limit: 100_000,
             preferred: Side::Parent,
+            sizes: Sizes::Count,
         };
         let (_, outcome) = drive(
             Planner::new(query, sandbox),
@@ -1846,6 +2099,22 @@ mod tests {
     struct Counting {
         rows: u64,
         counts: std::cell::Cell<usize>,
+        estimate: Option<u64>,
+        estimates: std::cell::Cell<usize>,
+        estimated: std::cell::RefCell<Vec<MultiTableReadQuery>>,
+    }
+
+    impl Counting {
+        /// `rows` to every count, nothing estimated.
+        fn new(rows: u64) -> Self {
+            Counting {
+                rows,
+                counts: std::cell::Cell::new(0),
+                estimate: None,
+                estimates: std::cell::Cell::new(0),
+                estimated: std::cell::RefCell::new(Vec::new()),
+            }
+        }
     }
 
     impl Storage for Counting {
@@ -1870,6 +2139,19 @@ mod tests {
             Ok(self.rows.min(cap))
         }
 
+        /// `estimate`, or the error that there is none.
+        async fn estimate(
+            &self,
+            query: &MultiTableReadQuery,
+            cap: u64,
+        ) -> Result<u64, crate::sync::StorageError> {
+            self.estimates.set(self.estimates.get() + 1);
+            self.estimated.borrow_mut().push(query.clone());
+            self.estimate
+                .map(|rows| rows.min(cap))
+                .ok_or_else(|| crate::sync::StorageError("no estimate".to_owned()))
+        }
+
         /// Nothing to follow.
         fn advance(&self, _feed: crate::model::Lsn) {}
 
@@ -1886,6 +2168,141 @@ mod tests {
             .build()
             .expect("a runtime")
             .block_on(future)
+    }
+
+    /// A plan made on other numbers is held on this planner's counts: the
+    /// counts' own plan holds what the planner chose for it, and a plan
+    /// that read the messages whole (as an estimate of 20 of them would
+    /// have it) holds all 900 of them.
+    #[test]
+    fn a_plan_made_on_other_numbers_is_held_on_these_counts() {
+        let translated = messages_in_channel(u32::MAX);
+        let counted = |messages: u64| {
+            let mut planner = Planner::new(translated.query.clone(), policy(1000, Side::Parent));
+            for count in planner.counts() {
+                let rows = match (count.query.main_table.table.as_str(), count.narrowed) {
+                    ("messages", false) => messages,
+                    ("messages", true) => 50,
+                    _ => 3,
+                };
+                planner.answer(count.node, count.narrowed, rows);
+            }
+            planner
+        };
+        let judge = counted(900);
+        let by_counts = counted(900).decide().expect("planned");
+        assert_eq!(by_counts.joins[0].driver, Driver::Sub, "53 driven against 900 whole");
+        assert_eq!(judge.hold_of(&by_counts), Some(53));
+        let by_estimates = counted(20).decide().expect("planned");
+        assert_eq!(by_estimates.joins[0].driver, Driver::Main, "20 whole against 53 driven");
+        assert_eq!(judge.hold_of(&by_estimates), Some(900));
+        assert_eq!(counted(20).hold_of(&by_estimates), Some(20));
+    }
+
+    /// Estimating sizes asks the storage's estimates and counts nothing;
+    /// a size that cannot be estimated is counted; in shadow everything is
+    /// counted and decided on and estimated beside it.
+    #[test]
+    fn the_sizes_are_estimated_counted_or_both() {
+        run(async {
+            let sized = |sizes: Sizes, estimate: Option<u64>| async move {
+                let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
+                let storage = Counting {
+                    estimate,
+                    ..Counting::new(5)
+                };
+                let policy = Policy {
+                    sizes,
+                    ..policy(100, Side::Child)
+                };
+                let planned = plan("messagesIn", messages_in("c1", 50), policy, &cache, &storage)
+                    .await
+                    .expect("planned");
+                (storage.counts.get(), storage.estimates.get(), planned)
+            };
+            let (counts, estimates, _) = sized(Sizes::Count, Some(7)).await;
+            assert!(counts > 0);
+            assert_eq!(estimates, 0);
+            let (none, estimated, by_estimate) = sized(Sizes::Estimate, Some(7)).await;
+            assert_eq!((none, estimated), (0, counts), "every size estimated, none counted");
+            assert_eq!(by_estimate.query.joins[0].driver, Driver::Main);
+            let (fell_back, tried, _) = sized(Sizes::Estimate, None).await;
+            assert_eq!((fell_back, tried), (counts, counts), "no estimate: each counted");
+            let (both, beside, _) = sized(Sizes::Shadow, Some(7)).await;
+            assert_eq!((both, beside), (counts, counts), "shadow counts and estimates each");
+        });
+    }
+
+    /// Estimated, every tree is sized on its own where clauses: another
+    /// channel is estimated again, nothing is remembered by name, and the
+    /// same tree is answered from the tree's outcome.
+    #[test]
+    fn an_estimated_plan_is_made_per_tree_not_per_name() {
+        run(async {
+            let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
+            let storage = Counting {
+                estimate: Some(7),
+                ..Counting::new(5)
+            };
+            let policy = Policy {
+                sizes: Sizes::Estimate,
+                ..policy(100, Side::Child)
+            };
+            plan("q", messages_in("c1", 50), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            let first = storage.estimates.get();
+            assert!(first > 0);
+            plan("q", messages_in("c2", 50), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            assert_eq!(storage.estimates.get(), 2 * first, "another channel, estimated");
+            assert_eq!(cache.queries(), 0, "nothing remembered by name");
+            plan("q", messages_in("c1", 50), policy, &cache, &storage)
+                .await
+                .expect("planned");
+            assert_eq!(storage.estimates.get(), 2 * first, "the same tree, from its outcome");
+            assert_eq!(storage.counts.get(), 0);
+        });
+    }
+
+    /// A page with a cursor is estimated as its uncursored tree, and
+    /// counted as it is.
+    #[test]
+    fn a_page_is_estimated_without_its_cursor() {
+        run(async {
+            let cursor = Where::condition("id", ComparisonOperator::GT, "m9");
+            let mut turned = messages_in("c1", 50);
+            turned.uncursored = Some(turned.query.clone());
+            turned.query.main_table.filter =
+                Where::AND(vec![turned.query.main_table.filter.clone(), cursor.clone()]);
+            let has_cursor = |query: &MultiTableReadQuery| {
+                query.main_table.filter.leaf_conditions().into_iter().any(|leaf| {
+                    Where::Condition(leaf.clone()) == cursor
+                })
+            };
+            for sizes in [Sizes::Estimate, Sizes::Shadow] {
+                let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
+                let storage = Counting {
+                    estimate: Some(7),
+                    ..Counting::new(5)
+                };
+                let policy = Policy {
+                    sizes,
+                    ..policy(100, Side::Child)
+                };
+                let planned = plan("q", turned.clone(), policy, &cache, &storage)
+                    .await
+                    .expect("planned");
+                assert!(has_cursor(&planned.query), "the plan keeps its cursor");
+                let estimated = storage.estimated.borrow();
+                assert!(!estimated.is_empty());
+                assert!(
+                    estimated.iter().all(|query| !has_cursor(query)),
+                    "{sizes:?}: no estimate sees the cursor"
+                );
+            }
+        });
     }
 
     /// Two trees of one join skeleton — same tables and joins at every
@@ -1916,10 +2333,7 @@ mod tests {
     fn a_plan_is_counted_once_per_name_and_laid_onto_every_argument() {
         run(async {
             let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
-            let storage = Counting {
-                rows: 5,
-                counts: std::cell::Cell::new(0),
-            };
+            let storage = Counting::new(5);
             let policy = policy(100, Side::Child);
             let first = plan(
                 "messagesIn",
@@ -1981,10 +2395,7 @@ mod tests {
     fn a_name_is_planned_once_per_join_skeleton() {
         run(async {
             let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
-            let storage = Counting {
-                rows: 5,
-                counts: std::cell::Cell::new(0),
-            };
+            let storage = Counting::new(5);
             let policy = policy(100, Side::Child);
             plan("q", messages_in("c1", 50), policy, &cache, &storage)
                 .await
@@ -2017,10 +2428,7 @@ mod tests {
     fn a_refusal_is_not_laid_onto_other_arguments() {
         run(async {
             let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
-            let storage = Counting {
-                rows: 101,
-                counts: std::cell::Cell::new(0),
-            };
+            let storage = Counting::new(101);
             let policy = policy(100, Side::Child);
             let refused = |channel: &'static str| messages_in(channel, u32::MAX);
             assert!(
