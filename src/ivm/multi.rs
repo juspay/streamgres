@@ -20,12 +20,16 @@
 //! restriction lives inside the driven part's filter, writes on the driven
 //! table route natively through the single engine: a row matching the
 //! filter (restriction included) fires an `Add`, a held row moving out
-//! fires a `Delete` via membership, and an unreferenced row never fires at
-//! all. The join layer never inspects driven-side writes; it forwards them
+//! fires a `Delete` via membership, and a row without a referenced first
+//! column value never fires. The join layer forwards driven-side writes
 //! and keeps its counts. Everything the layer does follows from the edge's
 //! driver, its `is_inner`, the sub node's limit and, for a page, how the
 //! planner said to read it ([`MultiTableReadQuery::page`]); no planning
 //! happens here.
+//!
+//! A composite edge uses the complete ordered key for counts, gates, and
+//! visibility. When one side drives the other, each referenced key has a
+//! single-table part with equality conditions on every joined column.
 //!
 //! The restriction is exact only while the driver's set is complete: a
 //! driver read whole, or a page read whole (whose set keeps every value
@@ -144,8 +148,8 @@
 //! does in the client's `related`, the best *n* rows **per parent row**: the
 //! latest three messages of every conversation, not three messages in
 //! all. Such a node registers no single part. It is *fanned*: one inner
-//! part per referenced join value, `child WHERE own_filter AND column =
-//! value ORDER BY … LIMIT n`, so every value has a window of its own
+//! part per referenced join value, `child WHERE own_filter AND join columns =
+//! key ORDER BY … LIMIT n`, so every value has a window of its own
 //! maintained by the single engine like any other, refills included. A
 //! value entering the driver's set registers that value's part (its read
 //! lands like a registration's); a value leaving unregisters it, its held
@@ -249,8 +253,72 @@ pub struct MultiTableUpdate {
 /// intersection of their referenced values.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum LeafKey {
-    Shared(QueryPart, ColumnName),
+    Shared(QueryPart, JoinColumns),
     Own(usize),
+}
+
+/// The columns on one side of a join, in correlation order.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct JoinColumns {
+    first: ColumnName,
+    rest: Vec<ColumnName>,
+}
+
+impl JoinColumns {
+    fn new(first: ColumnName, rest: Vec<ColumnName>) -> Self {
+        Self { first, rest }
+    }
+
+    fn key(&self, row: &DataFrameRow) -> Value {
+        let values: Vec<Value> = std::iter::once(&self.first)
+            .chain(&self.rest)
+            .map(|column| {
+                row.data
+                    .get(column.as_str())
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            })
+            .collect();
+        if values.iter().any(Value::is_null) {
+            Value::Null
+        } else if self.rest.is_empty() {
+            values.into_iter().next().unwrap()
+        } else {
+            Value::List(
+                values
+                    .iter()
+                    .map(|value| value.equality_key().expect("non-null join component"))
+                    .collect(),
+            )
+        }
+    }
+
+    fn scalar<'a>(&self, value: &'a Value) -> &'a Value {
+        if self.rest.is_empty() {
+            value
+        } else if let Value::List(values) = value {
+            values.first().unwrap_or(&Value::Null)
+        } else {
+            &Value::Null
+        }
+    }
+
+    fn pairs<'a>(&'a self, value: &'a Value) -> Vec<(&'a ColumnName, &'a Value)> {
+        match value {
+            Value::List(values) if !self.rest.is_empty() => std::iter::once(&self.first)
+                .chain(&self.rest)
+                .zip(values)
+                .collect(),
+            _ => vec![(&self.first, value)],
+        }
+    }
+}
+
+impl std::ops::Deref for JoinColumns {
+    type Target = ColumnName;
+    fn deref(&self) -> &ColumnName {
+        &self.first
+    }
 }
 
 /// Per-edge counts by join value.
@@ -301,8 +369,8 @@ struct Edge {
     is_inner: bool,
     parent: QueryPart,
     child: QueryPart,
-    parent_column: ColumnName,
-    child_column: ColumnName,
+    parent_column: JoinColumns,
+    child_column: JoinColumns,
     leaf: LeafKey,
     bound: Option<Condition>,
     gate: Option<Condition>,
@@ -313,6 +381,10 @@ struct Edge {
 }
 
 impl Edge {
+    fn is_composite(&self) -> bool {
+        !self.parent_column.rest.is_empty()
+    }
+
     /// The part whose filter carries this edge's leaf.
     fn driven(&self) -> &QueryPart {
         match self.driver {
@@ -322,7 +394,7 @@ impl Edge {
     }
 
     /// The column the leaf is on.
-    fn driven_column(&self) -> &ColumnName {
+    fn driven_column(&self) -> &JoinColumns {
         match self.driver {
             Driver::Main => &self.child_column,
             Driver::Sub => &self.parent_column,
@@ -330,7 +402,7 @@ impl Edge {
     }
 
     /// The join column of `part`, which must be one end of the edge.
-    fn column_of(&self, part: &QueryPart) -> &ColumnName {
+    fn column_of(&self, part: &QueryPart) -> &JoinColumns {
         if *part == self.parent {
             &self.parent_column
         } else {
@@ -354,6 +426,9 @@ impl Edge {
     /// child drives, the matched count when the main does. What an
     /// `EXISTS` leaf reads.
     fn child_count(&self, value: &Value) -> u64 {
+        if value.is_null() {
+            return 0;
+        }
         let counts = match self.driver {
             Driver::Sub => &self.counts.left,
             Driver::Main => &self.counts.matched,
@@ -363,17 +438,13 @@ impl Edge {
 
     /// [`Edge::child_count`] for `row`'s value in `column`, the value
     /// borrowed from the row; a missing column joins like `NULL` (never).
-    fn child_count_of(&self, row: &DataFrameRow, column: &ColumnName) -> u64 {
-        match row.data.get(column.as_str()) {
-            Some(value) => self.child_count(value),
-            None => 0,
-        }
+    fn child_count_of(&self, row: &DataFrameRow, column: &JoinColumns) -> u64 {
+        self.child_count(&column.key(row))
     }
 }
 
 /// The inner parts behind one node: none until registration reaches it,
-/// one for an ordinary node, one per referenced join value for a driven
-/// window (see the module docs).
+/// one for an ordinary node, one per referenced join key for a fanned node.
 enum Parts {
     Unregistered,
     One(SubId),
@@ -381,7 +452,7 @@ enum Parts {
 }
 
 /// One node of a registered tree: its inner parts (once registered),
-/// whether it is a driven window (`fanned`), whether its rows have all
+/// whether it fans out by join key (`fanned`), whether its rows have all
 /// arrived (`live`), its place among the edges, the child edges that
 /// gate its own rows (`gates`, the inner edges it drives), how it is
 /// read when it is a page under a gate (`page`, `None` otherwise), and,
@@ -390,6 +461,7 @@ enum Parts {
 struct Node {
     parts: Parts,
     fanned: bool,
+    fan_edge: Option<usize>,
     live: bool,
     query: SingleTableReadQuery,
     parent: Option<usize>,
@@ -441,6 +513,9 @@ struct Tree {
     nodes: IdMap<QueryPart, Node>,
     edges: Vec<Edge>,
     leaves: HashMap<LeafKey, SharedSet>,
+    /// Number of complete composite keys in each leaf's intersection,
+    /// grouped by their first component.
+    coarse_counts: HashMap<LeafKey, HashMap<Value, u64>>,
     rank: IdMap<QueryPart, usize>,
     post_order: Vec<QueryPart>,
     pages: Vec<QueryPart>,
@@ -561,6 +636,24 @@ fn is_page(tree: &Tree, part: &QueryPart) -> bool {
     tree.nodes[part].page.is_some()
 }
 
+fn global_fan(tree: &Tree, part: &QueryPart) -> bool {
+    tree.nodes[part]
+        .fan_edge
+        .is_some_and(|edge| tree.edges[edge].driver == Driver::Sub)
+        && windowed_limit(tree.nodes[part].query.limit)
+}
+
+/// Whether a node's gate can change after its rows arrive. `gates` are
+/// main-driven inner edges; child-driven inner edges also gate the node's
+/// own `WHERE` through an `EXISTS` leaf.
+fn tracks_risen(tree: &Tree, node: &Node) -> bool {
+    !node.gates.is_empty()
+        || node.children.iter().any(|edge| {
+            let edge = &tree.edges[*edge];
+            edge.is_inner && edge.driver == Driver::Sub
+        })
+}
+
 /// The inner part of `part` that holds `row`: its one part, or the
 /// per-value part of a fanned node for the row's fanning value; `None`
 /// while registration has not reached it.
@@ -570,8 +663,8 @@ fn part_inner(tree: &Tree, part: &QueryPart, row: &DataFrameRow) -> Option<SubId
         Parts::Unregistered => None,
         Parts::One(inner) => Some(*inner),
         Parts::Fan(fan) => {
-            let edge = &tree.edges[node.parent?];
-            fan.get(&join_value(row, &edge.child_column)).copied()
+            let edge = &tree.edges[node.fan_edge?];
+            fan.get(&join_value(row, edge.column_of(part))).copied()
         }
     }
 }
@@ -581,9 +674,6 @@ fn part_inner(tree: &Tree, part: &QueryPart, row: &DataFrameRow) -> Option<SubId
 /// leaf read as "a held child row carries this row's join value on that
 /// edge", and the unnamed gating edges conjoined.
 fn gate_open(tree: &Tree, node: &Node, row: &DataFrameRow) -> bool {
-    if node.gates.is_empty() {
-        return true;
-    }
     let exists = |leaf: &Condition| -> bool {
         let Value::Int(index) = leaf.value else {
             return false;
@@ -602,18 +692,18 @@ fn gate_open(tree: &Tree, node: &Node, row: &DataFrameRow) -> bool {
     if !evaluate_with(&node.query.filter, &row.data, &mut 0, &exists) {
         return false;
     }
-    node.gates.iter().all(|edge| {
+    node.children.iter().all(|edge| {
         let edge = &tree.edges[*edge];
-        edge.gate.is_some() || edge.child_count_of(row, &edge.parent_column) > 0
+        !edge.is_inner
+            || edge.gate.is_some()
+            || edge.bound.is_some()
+            || edge.child_count_of(row, &edge.parent_column) > 0
     })
 }
 
 /// The row's value in `column`; a missing column joins like `NULL` (never).
-fn join_value(row: &DataFrameRow, column: &ColumnName) -> Value {
-    row.data
-        .get(column.as_str())
-        .cloned()
-        .unwrap_or(Value::Null)
+fn join_value(row: &DataFrameRow, column: &JoinColumns) -> Value {
+    column.key(row)
 }
 
 /// The leaf restricting a driven part to a shared set's members.
@@ -634,6 +724,7 @@ fn build_tree(spec: Rc<MultiTableReadQuery>) -> Tree {
         nodes: IdMap::default(),
         edges: Vec::new(),
         leaves: HashMap::new(),
+        coarse_counts: HashMap::new(),
         rank: IdMap::default(),
         post_order: Vec::new(),
         pages: Vec::new(),
@@ -683,7 +774,11 @@ fn build_tree(spec: Rc<MultiTableReadQuery>) -> Tree {
         .iter()
         .filter(|part| {
             let node = &tree.nodes[*part];
-            !node.gates.is_empty() && windowed_limit(node.query.limit)
+            (tracks_risen(&tree, node)
+                || node
+                    .fan_edge
+                    .is_some_and(|edge| tree.edges[edge].driver == Driver::Sub))
+                && windowed_limit(node.query.limit)
         })
         .copied()
         .collect();
@@ -699,7 +794,12 @@ fn add_node(tree: &mut Tree, spec: &MultiTableReadQuery, part: QueryPart, parent
     let mut node = Node {
         parts: Parts::Unregistered,
         fanned: parent.is_some_and(|edge| {
-            tree.edges[edge].driver == Driver::Main && spec.main_table.limit != u32::MAX
+            tree.edges[edge].driver == Driver::Main
+                && (spec.main_table.limit != u32::MAX || tree.edges[edge].is_composite())
+        }),
+        fan_edge: parent.filter(|edge| {
+            tree.edges[*edge].driver == Driver::Main
+                && (spec.main_table.limit != u32::MAX || tree.edges[*edge].is_composite())
         }),
         live: false,
         query: spec.main_table.clone(),
@@ -715,7 +815,7 @@ fn add_node(tree: &mut Tree, spec: &MultiTableReadQuery, part: QueryPart, parent
         let edge = tree.edges.len();
         let named = if join.is_inner {
             let leaf = Condition::new(
-                join.main_table_column.clone(),
+                join.on.first().main.clone(),
                 ComparisonOperator::EXISTS,
                 Value::Int(inner_index as i64),
             );
@@ -731,16 +831,34 @@ fn add_node(tree: &mut Tree, spec: &MultiTableReadQuery, part: QueryPart, parent
         let leaf = match (&bound, join.driver) {
             (Some(_), _) => LeafKey::Own(edge),
             (None, Driver::Main) if fanned_child(join) => LeafKey::Own(edge),
-            (None, Driver::Main) => LeafKey::Shared(child, join.sub_table_column.clone()),
-            (None, Driver::Sub) => LeafKey::Shared(part, join.main_table_column.clone()),
+            (None, Driver::Main) => LeafKey::Shared(
+                child,
+                JoinColumns::new(
+                    join.on.first().sub.clone(),
+                    join.on.sub_columns().skip(1).cloned().collect(),
+                ),
+            ),
+            (None, Driver::Sub) => LeafKey::Shared(
+                part,
+                JoinColumns::new(
+                    join.on.first().main.clone(),
+                    join.on.main_columns().skip(1).cloned().collect(),
+                ),
+            ),
         };
         tree.edges.push(Edge {
             driver: join.driver,
             is_inner: join.is_inner,
             parent: part,
             child,
-            parent_column: join.main_table_column.clone(),
-            child_column: join.sub_table_column.clone(),
+            parent_column: JoinColumns::new(
+                join.on.first().main.clone(),
+                join.on.main_columns().skip(1).cloned().collect(),
+            ),
+            child_column: JoinColumns::new(
+                join.on.first().sub.clone(),
+                join.on.sub_columns().skip(1).cloned().collect(),
+            ),
             leaf,
             bound,
             gate,
@@ -755,7 +873,27 @@ fn add_node(tree: &mut Tree, spec: &MultiTableReadQuery, part: QueryPart, parent
         }
         add_node(tree, &join.sub, child, Some(edge));
     }
-    if !node.gates.is_empty() && windowed_limit(node.query.limit) {
+    if node.fan_edge.is_none() {
+        node.fan_edge = node.children.iter().copied().find(|&index| {
+            let edge = &tree.edges[index];
+            edge.driver == Driver::Sub
+                && edge.is_composite()
+                && edge
+                    .bound
+                    .as_ref()
+                    .is_none_or(|leaf| node.query.filter.requires(leaf))
+        });
+        if let Some(edge) = node.fan_edge {
+            node.fanned = true;
+            tree.edges[edge].leaf = LeafKey::Own(edge);
+        }
+    }
+    if (tracks_risen(tree, &node)
+        || node
+            .fan_edge
+            .is_some_and(|edge| tree.edges[edge].driver == Driver::Sub))
+        && windowed_limit(node.query.limit)
+    {
         node.page = Some(spec.page);
     }
     tree.nodes.insert(part, node);
@@ -769,7 +907,8 @@ fn windowed_limit(limit: u32) -> bool {
 /// Whether `join`'s sub node is a driven window: the main drives it and
 /// it has a finite limit.
 fn fanned_child(join: &Join) -> bool {
-    join.driver == Driver::Main && join.sub.main_table.limit != u32::MAX
+    join.driver == Driver::Main
+        && (join.sub.main_table.limit != u32::MAX || join.on.is_composite())
 }
 
 /// Append the subtree at `part` in forwarding order: the subtrees this
@@ -824,7 +963,7 @@ fn referenced_by_all(tree: &Tree, edge: usize, value: &Value) -> bool {
 /// What `part` does on each edge it touches: `(edge, drives, column)`
 /// where `drives` says whether the part is the edge's driver and `column`
 /// is the part's own join column on that edge.
-fn edge_steps(tree: &Tree, part: &QueryPart) -> Vec<(usize, bool, ColumnName)> {
+fn edge_steps(tree: &Tree, part: &QueryPart) -> Vec<(usize, bool, JoinColumns)> {
     let node = &tree.nodes[part];
     node.children
         .iter()
@@ -869,7 +1008,7 @@ fn waiting_above(tree: &Tree, part: &QueryPart) -> Option<QueryPart> {
 }
 
 /// The edges `part` drives below it, with its own join column on each.
-fn downward_edges(tree: &Tree, part: &QueryPart) -> Vec<(usize, ColumnName)> {
+fn downward_edges(tree: &Tree, part: &QueryPart) -> Vec<(usize, JoinColumns)> {
     tree.nodes[part]
         .children
         .iter()
@@ -892,7 +1031,7 @@ fn acts_above(tree: &Tree, part: &QueryPart) -> bool {
 /// whose set its values fill) or gates the parent (an inner edge the main
 /// drives, whose `matched` count they feed). A LEFT edge the main drives
 /// is acted on from above only.
-fn upward_edge(tree: &Tree, part: &QueryPart) -> Option<(usize, ColumnName, bool)> {
+fn upward_edge(tree: &Tree, part: &QueryPart) -> Option<(usize, JoinColumns, bool)> {
     let index = tree.nodes[part].parent?;
     let edge = &tree.edges[index];
     if edge.driver == Driver::Sub {
@@ -909,8 +1048,8 @@ fn upward_edge(tree: &Tree, part: &QueryPart) -> Option<(usize, ColumnName, bool
 fn join_columns(tree: &Tree, part: &QueryPart) -> Vec<ColumnName> {
     let mut columns: Vec<ColumnName> = Vec::new();
     for (_, _, column) in edge_steps(tree, part) {
-        if !columns.contains(&column) {
-            columns.push(column);
+        if !columns.contains(&column.first) {
+            columns.push(column.first);
         }
     }
     columns
@@ -1075,7 +1214,7 @@ impl MultiTableIVM {
         &self,
         tree_id: TreeId,
         part: &QueryPart,
-        column: &ColumnName,
+        column: &JoinColumns,
         value: &Value,
         shown: bool,
     ) -> Vec<(SubId, DataFrameKey, DataFrameRow)> {
@@ -1086,8 +1225,8 @@ impl MultiTableIVM {
             Parts::One(inner) => vec![*inner],
             Parts::Fan(fan) => {
                 let fanning = node
-                    .parent
-                    .map(|edge| &tree.edges[edge].child_column)
+                    .fan_edge
+                    .map(|edge| tree.edges[edge].column_of(part))
                     .is_some_and(|fanning| fanning == column);
                 if fanning {
                     fan.get(value).copied().into_iter().collect()
@@ -1217,8 +1356,12 @@ impl MultiTableIVM {
                 .filter(|edge| edge.loose && *edge.driven() == part)
                 .map(|edge| {
                     (
-                        edge.driven_column().clone(),
-                        edge.counts.left.keys().cloned().collect(),
+                        edge.driven_column().first.clone(),
+                        edge.counts
+                            .left
+                            .keys()
+                            .map(|key| edge.driven_column().scalar(key).clone())
+                            .collect(),
                     )
                 })
                 .collect();
@@ -1244,8 +1387,8 @@ impl MultiTableIVM {
             let values = {
                 let tree = &self.trees[&tree_id];
                 let edge = tree.nodes[&part]
-                    .parent
-                    .expect("a fanned node has a parent");
+                    .fan_edge
+                    .expect("a fanned node has an edge");
                 tree.leaves[&tree.edges[edge].leaf].members()
             };
             if let Some(node) = self
@@ -1324,12 +1467,15 @@ impl MultiTableIVM {
         let (query, table, page) = {
             let tree = &self.trees[&tree_id];
             let node = &tree.nodes[part];
-            let edge = node.parent.expect("a fanned node has a parent");
-            let column = tree.edges[edge].child_column.clone();
-            let narrowed = Where::AND(vec![
-                self.restricted_filter(tree_id, part, Some(edge)),
-                Where::condition(column, ComparisonOperator::EQ, value.clone()),
-            ]);
+            let edge = node.fan_edge.expect("a fanned node has an edge");
+            let column = tree.edges[edge].driven_column().clone();
+            let narrowed = Where::AND(
+                std::iter::once(self.restricted_filter(tree_id, part, Some(edge)))
+                    .chain(column.pairs(&value).into_iter().map(|(column, value)| {
+                        Where::condition(column.clone(), ComparisonOperator::EQ, value.clone())
+                    }))
+                    .collect(),
+            );
             (
                 SingleTableReadQuery {
                     filter: narrowed,
@@ -1402,6 +1548,9 @@ impl MultiTableIVM {
         self.parts.remove(&inner);
         for (key, row) in rows {
             self.departed(tree_id, part, &key, &row, out);
+        }
+        if global_fan(&self.trees[&tree_id], part) {
+            self.mark_dirty(tree_id);
         }
         let waiting = self
             .trees
@@ -1550,7 +1699,7 @@ impl MultiTableIVM {
         let Parts::Fan(fan) = &node.parts else {
             return None;
         };
-        let fanning = &tree.edges[node.parent?].child_column;
+        let fanning = tree.edges[node.fan_edge?].column_of(part);
         let mut sorted: Sorted = Vec::new();
         for (key, row) in rows {
             let Some(&inner) = fan.get(&join_value(row, fanning)) else {
@@ -1630,6 +1779,11 @@ impl MultiTableIVM {
             .iter()
             .filter_map(|edge| tree.edges[*edge].gate.as_ref())
             .collect();
+        if let Some(edge) = skip
+            && let Some(bound) = tree.edges[edge].bound.as_ref()
+        {
+            true_leaves.push(bound);
+        }
         let mut false_leaves: Vec<&Condition> = Vec::new();
         let mut conjoined: Vec<LeafKey> = Vec::new();
         let mut parts = Vec::new();
@@ -1642,12 +1796,20 @@ impl MultiTableIVM {
             let absent = Some(index) == without;
             match (&edge.bound, edge.loose || absent) {
                 (Some(leaf), true) if absent => false_leaves.push(leaf),
+                // A page keeps the candidates that may enter its window
+                // when an inner edge's gate changes. The page decides that
+                // gate from `gate_open`; filtering by the edge's current
+                // shared set here would hide candidates outside the window.
+                (Some(leaf), false) if node.page.is_some() && edge.is_inner => {
+                    true_leaves.push(leaf)
+                }
                 (Some(leaf), true) => true_leaves.push(leaf),
                 (Some(unbound), false) => {
                     let bound = leaf_condition(edge.driven_column(), &tree.leaves[&edge.leaf]);
                     filter.replace_condition(unbound, &bound);
                 }
                 (None, true) if absent => parts.push(Where::OR(Vec::new())),
+                (None, false) if node.page.is_some() && edge.is_inner => {}
                 (None, true) => {}
                 (None, false) if conjoined.contains(&edge.leaf) => {}
                 (None, false) => {
@@ -1914,7 +2076,7 @@ impl MultiTableIVM {
                     .collect()
             };
             for (part, node) in tree.nodes.iter() {
-                if node.gates.is_empty() || upward_edge(tree, part).is_none() {
+                if !tracks_risen(tree, node) || upward_edge(tree, part).is_none() {
                     continue;
                 }
                 let open: HashSet<DataFrameKey> = held(part)
@@ -1974,7 +2136,7 @@ impl MultiTableIVM {
                         .get(&inner)
                         .map(|view| view.keys().cloned().collect())
                         .unwrap_or_default();
-                    if prefix != view {
+                    if !global_fan(tree, part) && prefix != view {
                         problems.push(format!(
                             "tree {tree_id:?} part {part:?} {inner:?}: view {view:?}, the page shows {prefix:?} ({state})"
                         ));
@@ -1982,10 +2144,13 @@ impl MultiTableIVM {
                 }
             }
             for (index, edge) in tree.edges.iter().enumerate() {
-                let tally = |rows: Vec<(DataFrameKey, DataFrameRow)>, column: &ColumnName| {
+                let tally = |rows: Vec<(DataFrameKey, DataFrameRow)>, column: &JoinColumns| {
                     let mut counts: HashMap<Value, u64> = HashMap::new();
                     for (_, row) in rows {
-                        *counts.entry(join_value(&row, column)).or_insert(0) += 1;
+                        let value = join_value(&row, column);
+                        if !value.is_null() {
+                            *counts.entry(value).or_insert(0) += 1;
+                        }
                     }
                     counts
                 };
@@ -1993,7 +2158,7 @@ impl MultiTableIVM {
                     let node = &tree.nodes[part];
                     held(part)
                         .into_iter()
-                        .filter(|(key, _)| node.gates.is_empty() || node.risen.contains(key))
+                        .filter(|(key, _)| !tracks_risen(tree, node) || node.risen.contains(key))
                         .collect()
                 };
                 let left = match edge.driver {
@@ -2026,6 +2191,38 @@ impl MultiTableIVM {
                         edge.counts.shown, shown
                     ));
                 }
+            }
+            let mut coarse = HashMap::<LeafKey, HashMap<Value, u64>>::new();
+            let mut visited = HashSet::new();
+            for (index, edge) in tree.edges.iter().enumerate() {
+                let driven = &tree.nodes[edge.driven()];
+                let fanned = driven.fan_edge == Some(index);
+                if fanned
+                    || edge.driven_column().rest.is_empty()
+                    || !visited.insert(edge.leaf.clone())
+                {
+                    continue;
+                }
+                for key in edge.counts.left.keys() {
+                    if referenced_by_all(tree, index, key) {
+                        *coarse
+                            .entry(edge.leaf.clone())
+                            .or_default()
+                            .entry(edge.driven_column().scalar(key).clone())
+                            .or_insert(0) += 1;
+                    }
+                }
+            }
+            let recorded: HashMap<_, _> = tree
+                .coarse_counts
+                .iter()
+                .filter(|(_, counts)| !counts.is_empty())
+                .map(|(leaf, counts)| (leaf.clone(), counts.clone()))
+                .collect();
+            if coarse != recorded {
+                problems.push(format!(
+                    "tree {tree_id:?}: coarse counts {recorded:?}, keys give {coarse:?}"
+                ));
             }
         }
         problems
@@ -2220,6 +2417,13 @@ impl MultiTableIVM {
             }
         }
         self.touch_page(tree_id, part);
+        for edge in self.trees[&tree_id].nodes[part].children.clone() {
+            let column = self.trees[&tree_id].edges[edge].parent_column.clone();
+            let old_value = join_value(old, &column);
+            if was && (!is || old_value != join_value(new, &column)) {
+                self.hide(tree_id, edge, &old_value, out);
+            }
+        }
         for (edge, column) in downward_edges(&self.trees[&tree_id], part) {
             let old_value = join_value(old, &column);
             let new_value = join_value(new, &column);
@@ -2254,9 +2458,6 @@ impl MultiTableIVM {
             }
             if is {
                 self.show(tree_id, edge, new_value, out);
-            }
-            if was {
-                self.hide(tree_id, edge, &old_value, out);
             }
         }
         if page {
@@ -2364,6 +2565,9 @@ impl MultiTableIVM {
         value: &Value,
         out: &mut Vec<MultiTableUpdate>,
     ) {
+        if value.is_null() {
+            return;
+        }
         let (column, driver, read, driver_parts) = {
             let tree = &self.trees[&tree_id];
             let e = &tree.edges[edge];
@@ -2377,8 +2581,9 @@ impl MultiTableIVM {
         };
         let held_by = |this: &Self, inner: SubId| -> Vec<DataFrameKey> {
             this.single
-                .rows_matching(inner, column.as_str(), value)
+                .rows_matching(inner, column.as_str(), column.scalar(value))
                 .into_iter()
+                .filter(|(_, row)| column.key(row) == *value)
                 .map(|(key, _)| key)
                 .collect()
         };
@@ -2396,14 +2601,26 @@ impl MultiTableIVM {
             }
             Some(PageRead::Batched) => {
                 if self.trees[&tree_id].edges[edge].dropped.contains(value) {
+                    for inner in driver_parts {
+                        let held = held_by(self, inner);
+                        if held.is_empty() {
+                            continue;
+                        }
+                        let ops = self.single.enroll_rows(inner, &held);
+                        let forwarded = self.forward(ops);
+                        out.extend(forwarded);
+                    }
                     self.lookup(tree_id, &driver, &column, value);
                 }
             }
             None => {
                 for inner in driver_parts {
                     if held_by(self, inner).is_empty() {
-                        self.single
-                            .lookup(inner, column.as_str(), std::slice::from_ref(value));
+                        self.single.lookup(
+                            inner,
+                            column.as_str(),
+                            std::slice::from_ref(column.scalar(value)),
+                        );
                     }
                 }
             }
@@ -2416,20 +2633,19 @@ impl MultiTableIVM {
     /// windows, the rows sorted into them as they land,
     /// [`Self::land_read`]). The rows land as candidates, rows behind a
     /// window's frontier not held.
-    fn lookup(&mut self, tree_id: TreeId, part: &QueryPart, column: &ColumnName, value: &Value) {
+    fn lookup(&mut self, tree_id: TreeId, part: &QueryPart, column: &JoinColumns, value: &Value) {
         let (issuer, query) = {
             let tree = &self.trees[&tree_id];
             let node = &tree.nodes[part];
             let issuer = node.inner_parts().first().copied();
-            let skip = if node.fanned { node.parent } else { None };
-            let filter = Where::AND(vec![
-                self.restricted_filter(tree_id, part, skip),
-                Where::condition(
-                    column.clone(),
-                    ComparisonOperator::IN,
-                    Value::List(vec![value.clone()]),
-                ),
-            ]);
+            let skip = node.fan_edge;
+            let filter = Where::AND(
+                std::iter::once(self.restricted_filter(tree_id, part, skip))
+                    .chain(column.pairs(value).into_iter().map(|(column, value)| {
+                        Where::condition(column.clone(), ComparisonOperator::EQ, value.clone())
+                    }))
+                    .collect(),
+            );
             (
                 issuer,
                 SingleTableReadQuery {
@@ -2498,12 +2714,42 @@ impl MultiTableIVM {
         for (part, table, inners) in pages {
             let mut left: Vec<(DataFrameKey, DataFrameRow)> = Vec::new();
             let mut entered: Vec<(DataFrameKey, DataFrameRow)> = Vec::new();
+            let global = global_fan(&self.trees[&tree_id], &part);
+            // Each key contributes at most L candidates; the global top L
+            // must be among those candidates.
+            let selected: HashSet<DataFrameKey> = if global {
+                let query = &self.trees[&tree_id].nodes[&part].query;
+                let mut candidates: Vec<(DataFrameKey, DataFrameRow)> = inners
+                    .iter()
+                    .flat_map(|inner| {
+                        self.single
+                            .client_prefix(*inner)
+                            .into_iter()
+                            .filter_map(|key| {
+                                self.single.row_image(*inner, &key).map(|row| (key, row))
+                            })
+                    })
+                    .collect();
+                candidates.sort_by(|a, b| super::order_rows(&query.order_by, &a.1, &b.1));
+                candidates
+                    .into_iter()
+                    .take(query.limit as usize)
+                    .map(|(key, _)| key)
+                    .collect()
+            } else {
+                HashSet::new()
+            };
             for inner in inners {
                 let version = self.single.window_version(inner);
-                if version.is_some() && version == self.synced.get(&inner).copied() {
+                if !global && version.is_some() && version == self.synced.get(&inner).copied() {
                     continue;
                 }
-                let now = self.single.client_prefix(inner);
+                let now: Vec<DataFrameKey> = self
+                    .single
+                    .client_prefix(inner)
+                    .into_iter()
+                    .filter(|key| !global || selected.contains(key))
+                    .collect();
                 let kept: HashSet<&DataFrameKey> = now.iter().collect();
                 if let Some(view) = self.views.get_mut(&inner) {
                     view.retain(|key, entry| {
@@ -2663,6 +2909,11 @@ impl MultiTableIVM {
                     if gate_open(tree, node, &row) {
                         open.push((inner, key));
                     } else {
+                        if let Some(edge) = node.parent.filter(|edge| {
+                            tree.edges[*edge].driver == Driver::Sub && tree.edges[*edge].is_inner
+                        }) {
+                            dropped.push((edge, join_value(&row, &tree.edges[edge].parent_column)));
+                        }
                         for &edge in &recalled {
                             dropped.push((edge, join_value(&row, &tree.edges[edge].parent_column)));
                         }
@@ -2709,10 +2960,11 @@ impl MultiTableIVM {
     }
 
     /// Whether `key` of `part` is counted on the edge above it: every held
-    /// row of a node without gates, the recorded ones of a gated node.
+    /// row of a node without a changing gate, the recorded ones otherwise.
     fn has_risen(&self, tree_id: TreeId, part: &QueryPart, key: &DataFrameKey) -> bool {
-        let node = &self.trees[&tree_id].nodes[part];
-        node.gates.is_empty() || node.risen.contains(key)
+        let tree = &self.trees[&tree_id];
+        let node = &tree.nodes[part];
+        !tracks_risen(tree, node) || node.risen.contains(key)
     }
 
     /// A held row of `part` whose gate is open starts acting on the edge
@@ -2730,11 +2982,15 @@ impl MultiTableIVM {
         if !acts_above(&self.trees[&tree_id], part) {
             return;
         }
+        let tracks = self
+            .trees
+            .get(&tree_id)
+            .is_some_and(|tree| tracks_risen(tree, &tree.nodes[part]));
         let recorded = self
             .trees
             .get_mut(&tree_id)
             .and_then(|tree| tree.nodes.get_mut(part))
-            .is_some_and(|node| node.gates.is_empty() || node.risen.insert(key.clone()));
+            .is_some_and(|node| !tracks || node.risen.insert(key.clone()));
         if recorded {
             self.rise_value(tree_id, part, row, out);
         }
@@ -2753,11 +3009,15 @@ impl MultiTableIVM {
         if !acts_above(&self.trees[&tree_id], part) {
             return;
         }
+        let tracks = self
+            .trees
+            .get(&tree_id)
+            .is_some_and(|tree| tracks_risen(tree, &tree.nodes[part]));
         let recorded = self
             .trees
             .get_mut(&tree_id)
             .and_then(|tree| tree.nodes.get_mut(part))
-            .is_some_and(|node| node.gates.is_empty() || node.risen.remove(key));
+            .is_some_and(|node| !tracks || node.risen.remove(key));
         if recorded {
             self.sink_value(tree_id, part, row, out);
         }
@@ -2839,6 +3099,9 @@ impl MultiTableIVM {
         value: Value,
         out: &mut Vec<MultiTableUpdate>,
     ) {
+        if value.is_null() {
+            return;
+        }
         let Some(counts) = self.counts_mut(tree_id, edge) else {
             return;
         };
@@ -2892,6 +3155,9 @@ impl MultiTableIVM {
         value: &Value,
         out: &mut Vec<MultiTableUpdate>,
     ) {
+        if value.is_null() {
+            return;
+        }
         let crossing = self
             .trees
             .get(&tree_id)
@@ -2951,6 +3217,9 @@ impl MultiTableIVM {
         value: Value,
         out: &mut Vec<MultiTableUpdate>,
     ) {
+        if value.is_null() {
+            return;
+        }
         let crossing = self
             .trees
             .get(&tree_id)
@@ -2985,6 +3254,9 @@ impl MultiTableIVM {
         value: &Value,
         out: &mut Vec<MultiTableUpdate>,
     ) {
+        if value.is_null() {
+            return;
+        }
         let crossing = self
             .trees
             .get(&tree_id)
@@ -3024,7 +3296,7 @@ impl MultiTableIVM {
         &mut self,
         tree_id: TreeId,
         part: &QueryPart,
-        column: &ColumnName,
+        column: &JoinColumns,
         value: &Value,
         out: &mut Vec<MultiTableUpdate>,
         change: impl FnOnce(&mut Self),
@@ -3106,10 +3378,27 @@ impl MultiTableIVM {
         value: Value,
         out: &mut Vec<MultiTableUpdate>,
     ) {
+        if value.is_null() {
+            return;
+        }
         let crossing = self.left_count(tree_id, edge, &value) == 0;
         let bump = |this: &mut Self| this.left_bump(tree_id, edge, value.clone());
         match self.gated_driven_parent(tree_id, edge).filter(|_| crossing) {
-            Some((parent, column)) => self.regate(tree_id, &parent, &column, &value, out, bump),
+            Some((parent, column)) => {
+                self.regate(tree_id, &parent, &column, &value, out, bump);
+                let page = self.trees[&tree_id].nodes[&parent].page;
+                if page.is_some() && self.recalls(tree_id, edge) {
+                    if page == Some(PageRead::Batched)
+                        && let Some(edge) = self
+                            .trees
+                            .get_mut(&tree_id)
+                            .and_then(|tree| tree.edges.get_mut(edge))
+                    {
+                        edge.dropped.insert(value.clone());
+                    }
+                    self.recall(tree_id, edge, &value, out);
+                }
+            }
             None => bump(self),
         }
         if !crossing {
@@ -3121,29 +3410,54 @@ impl MultiTableIVM {
         let (driven, column, key) = self.leaf_of(tree_id, edge);
         let (loose, kept) = self.restriction_of(tree_id, edge);
         let set = self.trees[&tree_id].leaves[&key].clone();
-        let node = &self.trees[&tree_id].nodes[&driven];
-        if !node.is_registered() {
+        let (fanned, registered, inners) = {
+            let node = &self.trees[&tree_id].nodes[&driven];
+            (
+                node.fan_edge == Some(edge),
+                node.is_registered(),
+                node.inner_parts(),
+            )
+        };
+        let filed_value = if fanned {
+            value.clone()
+        } else {
+            column.scalar(&value).clone()
+        };
+        if !fanned && !column.rest.is_empty() {
+            *self
+                .trees
+                .get_mut(&tree_id)
+                .expect("registered tree")
+                .coarse_counts
+                .entry(key.clone())
+                .or_default()
+                .entry(filed_value.clone())
+                .or_insert(0) += 1;
+        }
+        if !fanned && !loose && !kept && set.contains(&filed_value) {
+            return;
+        }
+        if !registered {
             if !loose {
-                set.insert(&value);
+                set.insert(&filed_value);
             }
             return;
         }
-        if node.fanned && node.parent == Some(edge) {
+        if fanned {
             if set.insert(&value) {
                 self.register_value(tree_id, &driven, value, out);
             }
             return;
         }
-        let inners = node.inner_parts();
         let Some(first) = inners.first().copied() else {
             if !loose {
-                set.insert(&value);
+                set.insert(&filed_value);
             }
             return;
         };
         let filed = self
             .single
-            .set_insert(first, &leaf_condition(&column, &set), &value);
+            .set_insert(first, &leaf_condition(&column, &set), &filed_value);
         if !filed && !loose && !kept {
             return;
         }
@@ -3151,12 +3465,12 @@ impl MultiTableIVM {
             match self
                 .wanted
                 .iter_mut()
-                .find(|(sub, wanted, _)| *sub == inner && *wanted == column)
+                .find(|(sub, wanted, _)| *sub == inner && *wanted == column.first)
             {
-                Some((_, _, values)) => values.push(value.clone()),
+                Some((_, _, values)) => values.push(filed_value.clone()),
                 None => self
                     .wanted
-                    .push((inner, column.clone(), vec![value.clone()])),
+                    .push((inner, column.first.clone(), vec![filed_value.clone()])),
             }
         }
     }
@@ -3195,7 +3509,15 @@ impl MultiTableIVM {
         value: &Value,
         out: &mut Vec<MultiTableUpdate>,
     ) {
+        if value.is_null() {
+            return;
+        }
         let crossing = self.left_count(tree_id, edge, value) == 1;
+        let was_complete = crossing && {
+            let tree = &self.trees[&tree_id];
+            !tree.edges[edge].driven_column().rest.is_empty()
+                && referenced_by_all(tree, edge, value)
+        };
         let drop = |this: &mut Self| this.left_drop(tree_id, edge, value);
         match self.gated_driven_parent(tree_id, edge).filter(|_| crossing) {
             Some((parent, column)) => self.regate(tree_id, &parent, &column, value, out, drop),
@@ -3205,23 +3527,49 @@ impl MultiTableIVM {
             return;
         }
         let (driven, column, key) = self.leaf_of(tree_id, edge);
+        let fanned = self.trees[&tree_id].nodes[&driven].fan_edge == Some(edge);
+        let filed_value = if fanned {
+            value.clone()
+        } else {
+            column.scalar(value).clone()
+        };
+        if was_complete && !fanned {
+            let counts = self
+                .trees
+                .get_mut(&tree_id)
+                .expect("registered tree")
+                .coarse_counts
+                .get_mut(&key)
+                .expect("complete key was counted");
+            Self::drop_in(Some(counts), &filed_value);
+        }
+        if !fanned
+            && !column.rest.is_empty()
+            && self.trees[&tree_id]
+                .coarse_counts
+                .get(&key)
+                .and_then(|counts| counts.get(&filed_value))
+                .is_some()
+        {
+            return;
+        }
         let unfiled = {
             let (loose, kept) = self.restriction_of(tree_id, edge);
             !loose && !kept
         };
         let set = self.trees[&tree_id].leaves[&key].clone();
-        if unfiled && !set.contains(value) {
+        if unfiled && !set.contains(&filed_value) {
             return;
         }
         let node = &self.trees[&tree_id].nodes[&driven];
         if !node.is_registered() {
             if unfiled {
-                set.remove(value);
+                set.remove(&filed_value);
             }
             return;
         }
-        if node.fanned && node.parent == Some(edge) {
-            set.remove(value);
+        if fanned {
+            set.remove(&filed_value);
             self.unregister_value(tree_id, &driven, value, out);
             return;
         }
@@ -3229,14 +3577,14 @@ impl MultiTableIVM {
         let table = node.query.table.clone();
         let Some(first) = inners.first().copied() else {
             if unfiled {
-                set.remove(value);
+                set.remove(&filed_value);
             }
             return;
         };
         let keeps = if unfiled {
             if !self
                 .single
-                .set_remove(first, &leaf_condition(&column, &set), value)
+                .set_remove(first, &leaf_condition(&column, &set), &filed_value)
             {
                 return;
             }
@@ -3249,12 +3597,14 @@ impl MultiTableIVM {
                 Some(keeps) => self.single.prune_rows_unless(
                     inner,
                     column.as_str(),
-                    std::slice::from_ref(value),
+                    std::slice::from_ref(&filed_value),
                     keeps,
                 ),
-                None => self
-                    .single
-                    .prune_rows(inner, column.as_str(), std::slice::from_ref(value)),
+                None => self.single.prune_rows(
+                    inner,
+                    column.as_str(),
+                    std::slice::from_ref(&filed_value),
+                ),
             };
             let pruned: Vec<SingleTableUpdate> = ops
                 .into_iter()
@@ -3272,16 +3622,19 @@ impl MultiTableIVM {
     /// When `edge` is an inner edge the sub drives into a parent that
     /// gates its own rows, that parent and its join column: the rows to
     /// re-evaluate when the edge's count crosses zero.
-    fn gated_driven_parent(&self, tree_id: TreeId, edge: usize) -> Option<(QueryPart, ColumnName)> {
+    fn gated_driven_parent(
+        &self,
+        tree_id: TreeId,
+        edge: usize,
+    ) -> Option<(QueryPart, JoinColumns)> {
         let tree = &self.trees[&tree_id];
         let e = &tree.edges[edge];
-        (e.driver == Driver::Sub && e.is_inner && !tree.nodes[&e.parent].gates.is_empty())
-            .then(|| (e.parent, e.parent_column.clone()))
+        (e.driver == Driver::Sub && e.is_inner).then(|| (e.parent, e.parent_column.clone()))
     }
 
     /// The driven part of `edge`, the column its leaf is on, and the set
     /// the leaf reads.
-    fn leaf_of(&self, tree_id: TreeId, edge: usize) -> (QueryPart, ColumnName, LeafKey) {
+    fn leaf_of(&self, tree_id: TreeId, edge: usize) -> (QueryPart, JoinColumns, LeafKey) {
         let edge = &self.trees[&tree_id].edges[edge];
         (
             *edge.driven(),
@@ -3299,7 +3652,7 @@ impl MultiTableIVM {
         &self,
         tree_id: TreeId,
         part: &QueryPart,
-        column: &ColumnName,
+        column: &JoinColumns,
         value: &Value,
     ) -> Vec<(DataFrameKey, DataFrameRow)> {
         let Some(tree) = self.trees.get(&tree_id) else {
@@ -3309,9 +3662,10 @@ impl MultiTableIVM {
             return Vec::new();
         };
         let arrived = |inner: SubId| -> Vec<(DataFrameKey, DataFrameRow)> {
-            let mut rows = self
-                .single
-                .visible_rows_matching(inner, column.as_str(), value);
+            let mut rows =
+                self.single
+                    .visible_rows_matching(inner, column.as_str(), column.scalar(value));
+            rows.retain(|(_, row)| column.key(row) == *value);
             if !self.in_flight.is_empty() {
                 rows.retain(|(key, _)| !self.in_flight.contains(&(inner, key.clone())));
             }
@@ -3322,8 +3676,8 @@ impl MultiTableIVM {
             Parts::One(inner) => arrived(*inner),
             Parts::Fan(fan) => {
                 let fanning = node
-                    .parent
-                    .map(|edge| &tree.edges[edge].child_column)
+                    .fan_edge
+                    .map(|edge| tree.edges[edge].column_of(part))
                     .is_some_and(|fanning| fanning == column);
                 if fanning {
                     fan.get(value)

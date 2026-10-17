@@ -189,14 +189,24 @@ impl<'a> Scope<'a> {
         let Some(sub) = Scope::counted(&join.sub, catalog, aliases) else {
             return "FALSE".to_owned();
         };
+        let equalities = join
+            .columns()
+            .map(|(main, child)| {
+                format!(
+                    "{}.{} = {}.{}",
+                    sub.alias,
+                    quote_ident(child.as_str()),
+                    self.alias,
+                    quote_ident(main.as_str())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
         format!(
-            "EXISTS (SELECT 1 FROM {} AS {} WHERE ({}.{} = {}.{} AND {}))",
+            "EXISTS (SELECT 1 FROM {} AS {} WHERE ({} AND {}))",
             quote_ident(join.sub.main_table.table.as_str()),
             sub.alias,
-            sub.alias,
-            quote_ident(join.sub_table_column.as_str()),
-            self.alias,
-            quote_ident(join.main_table_column.as_str()),
+            equalities,
             sub.render_node()
         )
     }

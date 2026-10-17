@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::columns::{ColumnIndex, CondRef};
-use super::predicate::evaluate;
+use super::predicate::{eval_condition, evaluate};
 use super::stats::IvmStats;
 use crate::model::{ColumnName, Condition, Disjunct, IdMap, RowData, SubId, Value, Where};
 
@@ -106,6 +106,26 @@ pub(super) struct TableIndex {
 }
 
 impl TableIndex {
+    /// A partial WAL image may omit an unchanged join column. Route every
+    /// disjunct still possible from its present columns to a full-row read.
+    pub(super) fn possible_partial(&self, row: &RowData) -> Vec<SubId> {
+        let mut subs = self.unconditional.clone();
+        subs.extend(self.by_subscriber.iter().filter_map(|(sub, clauses)| {
+            clauses
+                .iter()
+                .any(|clause| {
+                    clause.conditions.iter().all(|condition| {
+                        !row.contains_key(&condition.column)
+                            || eval_condition(condition, row, &mut 0)
+                    })
+                })
+                .then_some(*sub)
+        }));
+        subs.sort_unstable();
+        subs.dedup();
+        subs
+    }
+
     /// Index `subscriber`'s DNF disjuncts.
     ///
     /// An empty disjunct goes to `unconditional`; a disjunct already present

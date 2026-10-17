@@ -246,7 +246,7 @@ fn passing(
         .map(|join| {
             let values = passing(&join.sub, storage)
                 .iter()
-                .map(|(_, row)| value_of(row, &join.sub_table_column))
+                .map(|(_, row)| value_of(row, &join.on.first().sub))
                 .collect();
             (join, values)
         })
@@ -256,7 +256,7 @@ fn passing(
         .enumerate()
         .map(|(index, (join, _))| {
             spec.main_table.filter.contains(&Condition::new(
-                join.main_table_column.clone(),
+                join.on.first().main.clone(),
                 ComparisonOperator::EXISTS,
                 Value::Int(index as i64),
             ))
@@ -271,13 +271,13 @@ fn passing(
                     return false;
                 };
                 inner.get(index as usize).is_some_and(|(join, values)| {
-                    let value = value_of(row, &join.main_table_column);
+                    let value = value_of(row, &join.on.first().main);
                     !value.is_null() && values.contains(&value)
                 })
             };
             evaluate_with(&spec.main_table.filter, &row.data, &mut 0, &exists)
                 && inner.iter().zip(&named).all(|((join, values), named)| {
-                    *named || values.contains(&value_of(row, &join.main_table_column))
+                    *named || values.contains(&value_of(row, &join.on.first().main))
                 })
         })
         .collect()
@@ -324,7 +324,7 @@ fn descend(
         let candidates = passing(&join.sub, storage);
         let mut values: Vec<Value> = shown
             .iter()
-            .map(|(_, row)| value_of(row, &join.main_table_column))
+            .map(|(_, row)| value_of(row, &join.on.first().main))
             .filter(|value| !value.is_null())
             .collect();
         values.sort_by(streamgres::ivm::order_cmp);
@@ -333,7 +333,7 @@ fn descend(
         for value in values {
             let of_value: Vec<(DataFrameKey, DataFrameRow)> = candidates
                 .iter()
-                .filter(|(_, row)| value_of(row, &join.sub_table_column) == value)
+                .filter(|(_, row)| value_of(row, &join.on.first().sub) == value)
                 .cloned()
                 .collect();
             under.extend(page(of_value, &join.sub.main_table));

@@ -34,6 +34,7 @@ pub use ids::{IdMap, IdSet};
 pub use position::{Lsn, Snapshot};
 pub use query::{
     ComparisonOperator, Condition, DeleteQuery, Disjunct, Driver, InsertQuery, Join,
+    JoinColumnPair, JoinKey,
     MultiTableReadQuery, Order, OrderBy, PageRead, SingleTableReadQuery, SubId, UpdateQuery, Where,
     WriteQuery,
 };

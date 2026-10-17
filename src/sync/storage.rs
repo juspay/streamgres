@@ -132,12 +132,12 @@ pub trait Storage {
     fn mint_now(&self) {}
 }
 
-/// [`Storage::count`] done by reading: the rows of `query`'s main table
-/// (its filter as it stands, no `LIMIT`), kept when the filter holds with
-/// each `EXISTS` leaf answered from the join values the sub it names
-/// produces, the sub read the same way. Every node of the tree is read
-/// whole, which suits a source that holds its rows in memory; a source
-/// that would read many rows answers [`Storage::count`] itself.
+/// [`Storage::count`] done by reading: fetch candidate rows with each
+/// `EXISTS` leaf temporarily true, then keep only rows satisfying the
+/// original filter with each leaf answered by its matching child rows.
+/// Every node is read without a `LIMIT`; this suits a source that holds
+/// rows in memory. A source that would read many rows answers
+/// [`Storage::count`] itself.
 pub async fn count_by_select<S: Storage + ?Sized>(
     storage: &S,
     query: &MultiTableReadQuery,
@@ -163,6 +163,9 @@ fn matching_rows<'a, S: Storage + ?Sized>(
     Box::pin(async move {
         let unlimited = SingleTableReadQuery {
             limit: u32::MAX,
+            filter: node.main_table.filter.assuming_true(&|leaf| {
+                leaf.comparison_operator == ComparisonOperator::EXISTS
+            }),
             ..node.main_table.clone()
         };
         let snapshot = storage.select(&unlimited).await?;
@@ -171,10 +174,17 @@ fn matching_rows<'a, S: Storage + ?Sized>(
             let mut carried = HashSet::new();
             if join.is_inner {
                 for (_, row) in matching_rows(storage, &join.sub).await? {
-                    if let Some(value) = row.data.get(&join.sub_table_column)
-                        && !value.is_null()
-                    {
-                        carried.insert(value.clone());
+                    let key: Option<Vec<Value>> = join
+                        .columns()
+                        .map(|(_, child)| {
+                            row.data
+                                .get(child)
+                                .filter(|value| !value.is_null())
+                                .and_then(Value::equality_key)
+                        })
+                        .collect();
+                    if let Some(key) = key {
+                        carried.insert(Value::List(key));
                     }
                 }
             }
@@ -195,9 +205,16 @@ fn matching_rows<'a, S: Storage + ?Sized>(
             .filter(|(_, row)| {
                 let carries = |position: usize| {
                     let join = &node.joins[position];
-                    row.data
-                        .get(&join.main_table_column)
-                        .is_some_and(|value| values[position].contains(value))
+                    let key: Option<Vec<Value>> = join
+                        .columns()
+                        .map(|(main, _)| {
+                            row.data
+                                .get(main)
+                                .filter(|value| !value.is_null())
+                                .and_then(Value::equality_key)
+                        })
+                        .collect();
+                    key.is_some_and(|key| values[position].contains(&Value::List(key)))
                 };
                 let exists =
                     |leaf: &Condition| exists_position(&inner, &leaf.value).is_some_and(carries);

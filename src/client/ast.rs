@@ -21,7 +21,7 @@ use serde_json::Value as Json;
 use crate::ivm::QueryPart;
 use crate::model::ComparisonOperator::{EQ, GT, GTE, IN, LT, LTE, NEQ, NOT_IN};
 use crate::model::{
-    Catalog, ComparisonOperator, DbTable, Join, MultiTableReadQuery, Order, OrderBy,
+    Catalog, ComparisonOperator, DbTable, Driver, Join, MultiTableReadQuery, Order, OrderBy,
     SingleTableReadQuery, Value, ValueType, Where,
 };
 
@@ -89,7 +89,7 @@ pub enum Operand {
     },
 }
 
-/// A subquery joined to its parent on one column pair.
+/// A subquery joined to its parent on one or more column pairs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CorrelatedSubquery {
     pub correlation: Correlation,
@@ -108,9 +108,8 @@ pub struct Correlation {
     pub child_field: Vec<String>,
 }
 
-/// One to-one relationship an `EXISTS` tests, as [`merge_exists`] groups
-/// them: the parent column, the child column and the child table.
-type Relationship<'a> = (&'a str, &'a str, &'a str);
+/// The ordered correlation and child table of a to-one `EXISTS` test.
+type Relationship<'a> = (Vec<(&'a str, &'a str)>, &'a str);
 
 /// A translated query: the tree to register, and the parts whose rows
 /// stay on the server (permission subqueries).
@@ -199,21 +198,25 @@ fn node(
     for (index, sub) in ast.related.iter().enumerate() {
         let mut child_path = path.clone();
         child_path.push(index);
-        joins.push(edge(sub, child_path, concealed, false, catalog, hidden)?);
+        joins.push(edge(
+            sub, child_path, concealed, false, table, catalog, hidden,
+        )?);
     }
     for (offset, sub) in inner.iter().enumerate() {
         let mut child_path = path.clone();
         child_path.push(left_count + offset);
-        joins.push(edge(sub, child_path, concealed, true, catalog, hidden)?);
+        joins.push(edge(
+            sub, child_path, concealed, true, table, catalog, hidden,
+        )?);
     }
     Ok(MultiTableReadQuery::new(main_table, joins))
 }
 
 /// `condition` with the `EXISTS` tests that are direct children of its
 /// `AND` merged wherever two or more test the same to-one relationship:
-/// the same parent column, the same child table and the same child
-/// column, that column being the child table's single-column primary
-/// key. Each parent row reaches exactly one child row there, so "a
+/// the same correlation and child table, with the child columns covering
+/// the table's entire primary key. Each parent row reaches at most one
+/// child row there, so "a
 /// channel that is a DM exists" and "a channel I may see exists" are one
 /// test, "a channel that is a DM and I may see exists", whose count is
 /// what the two share rather than either alone, and whose rows the
@@ -232,8 +235,12 @@ fn merge_exists<'a>(condition: &'a Condition, catalog: &Catalog) -> Cow<'a, Cond
             continue;
         };
         let key = (
-            sub.correlation.parent_field[0].as_str(),
-            sub.correlation.child_field[0].as_str(),
+            sub.correlation
+                .parent_field
+                .iter()
+                .zip(&sub.correlation.child_field)
+                .map(|(parent, child)| (parent.as_str(), child.as_str()))
+                .collect(),
             sub.subquery.table.as_str(),
         );
         match groups.iter_mut().find(|(held, _)| *held == key) {
@@ -278,19 +285,23 @@ fn exists_of(condition: &Condition) -> Option<&CorrelatedSubquery> {
     }
 }
 
-/// Whether `sub` joins its parent to at most one row: one column pair,
-/// the child's column its table's single-column primary key, and the
+/// Whether `sub` joins its parent to at most one row: its child columns
+/// cover the child's entire primary key, and the
 /// subquery a plain test (no page, order or cursor, as an `EXISTS` never
 /// has).
 fn to_one(sub: &CorrelatedSubquery, catalog: &Catalog) -> bool {
     let (correlation, subquery) = (&sub.correlation, &sub.subquery);
-    correlation.parent_field.len() == 1
-        && correlation.child_field.len() == 1
+    !correlation.parent_field.is_empty()
+        && correlation.parent_field.len() == correlation.child_field.len()
         && subquery.limit.is_none()
         && subquery.order_by.is_empty()
         && subquery.start.is_none()
         && catalog.table(&subquery.table).is_some_and(|table| {
-            table.pkey.len() == 1 && table.pkey[0].as_str() == correlation.child_field[0]
+            table.pkey.len() == correlation.child_field.len()
+                && table
+                    .pkey
+                    .iter()
+                    .all(|key| correlation.child_field.iter().any(|child| child == key.as_str()))
         })
 }
 
@@ -378,25 +389,55 @@ fn edge(
     child_path: Vec<usize>,
     concealed_parent: bool,
     is_inner: bool,
+    parent_table: &DbTable,
     catalog: &Catalog,
     hidden: &mut HashSet<QueryPart>,
 ) -> Result<Join, String> {
-    let (Some(parent_column), Some(child_column)) = (
-        sub.correlation.parent_field.first(),
-        sub.correlation.child_field.first(),
-    ) else {
+    if sub.correlation.parent_field.is_empty() {
         return Err("a join without columns".to_owned());
-    };
-    if sub.correlation.parent_field.len() != 1 || sub.correlation.child_field.len() != 1 {
-        return Err("compound join keys are not supported".to_owned());
+    }
+    if sub.correlation.parent_field.len() != sub.correlation.child_field.len() {
+        return Err("a join must have the same number of parent and child columns".to_owned());
+    }
+    let child_table = catalog
+        .table(&sub.subquery.table)
+        .ok_or_else(|| format!("unknown table `{}`", sub.subquery.table))?;
+    for (parent, child) in sub
+        .correlation
+        .parent_field
+        .iter()
+        .zip(&sub.correlation.child_field)
+    {
+        let parent_type = &parent_table
+            .column(parent)
+            .ok_or_else(|| format!("unknown join column `{}.{parent}`", parent_table.name))?
+            .r#type;
+        let child_type = &child_table
+            .column(child)
+            .ok_or_else(|| format!("unknown join column `{}.{child}`", child_table.name))?
+            .r#type;
+        if parent_type != child_type {
+            return Err(format!(
+                "join columns `{}.{parent}` ({parent_type:?}) and `{}.{child}` ({child_type:?}) must have the same type",
+                parent_table.name, child_table.name
+            ));
+        }
     }
     let concealed = concealed_parent || sub.system.as_deref() == Some("permissions");
     let child = node(&sub.subquery, child_path, concealed, catalog, hidden)?;
-    Ok(if is_inner {
-        Join::inner(child, parent_column.as_str(), child_column.as_str())
-    } else {
-        Join::left(child, parent_column.as_str(), child_column.as_str())
-    })
+    let columns = sub
+        .correlation
+        .parent_field
+        .iter()
+        .zip(&sub.correlation.child_field)
+        .map(|(parent, child)| (parent.as_str().into(), child.as_str().into()));
+    Ok(Join::with_columns(
+        child,
+        columns,
+        if is_inner { Driver::Sub } else { Driver::Main },
+        is_inner,
+    )
+    .expect("nonempty correlation checked above"))
 }
 
 /// A predicate node as a `Where`; `EXISTS` subqueries are collected into

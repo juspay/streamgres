@@ -67,8 +67,8 @@ pub enum Driver {
 }
 
 /// One join edge of a [`MultiTableReadQuery`]: rows of `sub`'s main table
-/// attach to rows of the enclosing node where
-/// `sub.<sub_table_column> = enclosing.<main_table_column>`.
+/// attach to rows of the enclosing node where every column pair in `on`
+/// matches.
 ///
 /// `sub` is a full multi-table query, so a leaf is a node whose `joins`
 /// are empty and nesting costs nothing. Two flags spell the edge out:
@@ -102,10 +102,50 @@ pub enum Driver {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Join {
     pub sub: MultiTableReadQuery,
-    pub main_table_column: ColumnName,
-    pub sub_table_column: ColumnName,
+    pub on: JoinKey,
     pub driver: Driver,
     pub is_inner: bool,
+}
+
+/// One equality in a join correlation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JoinColumnPair {
+    pub main: ColumnName,
+    pub sub: ColumnName,
+}
+
+/// A nonempty conjunction of column equalities. The pairs remain in the
+/// correlation's order, so the same tuple is built on both sides.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct JoinKey {
+    pairs: Vec<JoinColumnPair>,
+}
+
+impl JoinKey {
+    pub fn new(pairs: impl IntoIterator<Item = JoinColumnPair>) -> Option<Self> {
+        let pairs: Vec<_> = pairs.into_iter().collect();
+        (!pairs.is_empty()).then_some(Self { pairs })
+    }
+
+    pub fn pairs(&self) -> &[JoinColumnPair] {
+        &self.pairs
+    }
+
+    pub fn first(&self) -> &JoinColumnPair {
+        &self.pairs[0]
+    }
+
+    pub fn is_composite(&self) -> bool {
+        self.pairs.len() > 1
+    }
+
+    pub fn main_columns(&self) -> impl Iterator<Item = &ColumnName> {
+        self.pairs.iter().map(|pair| &pair.main)
+    }
+
+    pub fn sub_columns(&self) -> impl Iterator<Item = &ColumnName> {
+        self.pairs.iter().map(|pair| &pair.sub)
+    }
 }
 
 impl Join {
@@ -121,11 +161,38 @@ impl Join {
     ) -> Self {
         Join {
             sub,
-            main_table_column: main_table_column.into(),
-            sub_table_column: sub_table_column.into(),
+            on: JoinKey::new([JoinColumnPair {
+                main: main_table_column.into(),
+                sub: sub_table_column.into(),
+            }])
+            .expect("one column pair"),
             driver,
             is_inner,
         }
+    }
+
+    /// Build a join from one or more ordered `(main, sub)` column pairs.
+    pub fn with_columns(
+        sub: MultiTableReadQuery,
+        columns: impl IntoIterator<Item = (ColumnName, ColumnName)>,
+        driver: Driver,
+        is_inner: bool,
+    ) -> Option<Self> {
+        let on = JoinKey::new(columns.into_iter().map(|(main, sub)| JoinColumnPair {
+            main,
+            sub,
+        }))?;
+        Some(Self {
+            sub,
+            on,
+            driver,
+            is_inner,
+        })
+    }
+
+    /// Every equality pair, in correlation order.
+    pub fn columns(&self) -> impl Iterator<Item = (&ColumnName, &ColumnName)> {
+        self.on.pairs().iter().map(|pair| (&pair.main, &pair.sub))
     }
 
     /// A LEFT edge: the main rows drive and stand on their own.
@@ -415,11 +482,11 @@ impl Disjunct {
 /// author wants it in the tree: `column EXISTS Int(i)` names the node's
 /// `i`-th inner edge (counting the edges with `is_inner` set, in the order
 /// of `joins`; the count is unchanged by which side drives), whose
-/// `main_table_column` must be `column`. At registration the join layer
-/// honors it by the edge's driver: bound in place into `column IN <set>`,
-/// the set of join values the sub currently produces, when the sub drives;
-/// evaluated as "a sub row matches this row" when the main drives. Unbound,
-/// or with any other operand, it is never true.
+/// the first parent column of the edge's correlation is used as `column`
+/// to identify the leaf. The join layer still tests every column pair:
+/// when the sub drives, it binds the complete key tuple; when the main
+/// drives, it checks for a sub row with the same complete key. Unbound,
+/// or with any other operand, the leaf is never true.
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ComparisonOperator {
