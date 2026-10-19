@@ -195,6 +195,7 @@ jobs:
             -e STREAMGRES_QUERY_URL=http://127.0.0.1:4849/query \
             -e STREAMGRES_MUTATE_URL=http://127.0.0.1:4849/push \
             -e STREAMGRES_ROW_LIMIT=600 \
+            -e STREAMGRES_ENABLE_ADMIN_ENDPOINTS=true \
             -e OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 \
             -e OTEL_EXPORTER_OTLP_PROTOCOL=http/json \
             -e OTEL_METRICS_EXPORTER=otlp \
