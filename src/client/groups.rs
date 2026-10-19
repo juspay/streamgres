@@ -72,6 +72,11 @@
 //!   every replayed poke gets the same current ids, in its last part.
 //! - **Anything else** (a cookie older than the log, or from a server
 //!   that is gone): the client is told to start over, and syncs afresh.
+//! - **Before any of that**, the identity claim: a live group answers only
+//!   the claim that claimed it ([`super::backend::Identity::stamp`]); a
+//!   connection whose claim is blank, or none, joins only unclaimed groups.
+//!   A refused join is told so with `Unauthorized` and is never sent the
+//!   group's state.
 //!
 //! The application's mutation ids arrive as writes to its clients table,
 //! which the engine side carries inside the transaction's own
@@ -191,9 +196,10 @@ pub enum Request {
         wsid: String,
         socket: Socket,
         base_cookie: Option<String>,
-        /// The connection's identity claim (token, or HTTP cookie when it
-        /// carries no token), used only to bind the group to its first
-        /// claimant — never forwarded.
+        /// The connection's identity claim, as [`super::backend::Identity::stamp`]
+        /// derives it (the auth token, or a digest of the cookie header when
+        /// there is no token): used only to bind the group to its first
+        /// claimant — never forwarded to the application server.
         stamp: Option<String>,
         lmids: Vec<(String, i64)>,
         results: Vec<MutationResult>,
@@ -848,9 +854,10 @@ impl Groups {
         // stranger holding the group id is refused before any of its
         // state is read. A connection with no claim at all joins only
         // unclaimed groups, which is what deployments without credentials
-        // (and the test benches) do everywhere. The binding is written
-        // only after every check below has passed, so a failed connect
-        // never claims a group id on its own.
+        // (and the test benches) do everywhere. A blank claim is no claim.
+        // The binding is written only after every check below has passed,
+        // so a failed connect never claims a group id on its own.
+        let stamp = stamp.filter(|claim| !claim.trim().is_empty());
         if let Some(bound) = self.bindings.get(group_id)
             && stamp.as_deref() != Some(bound.as_str())
         {
@@ -902,6 +909,7 @@ impl Groups {
         }
         // The group is live and this connection has passed every check:
         // claim it now, so a failed connect never binds a group id alone.
+        // A blank claim was dropped above and binds nothing.
         if let Some(stamp) = stamp {
             self.bindings.insert(group_id.to_owned(), stamp);
         }
@@ -2865,6 +2873,65 @@ mod tests {
                 connect(&mut bench, "alice", Some("token-alice"), None),
                 ConnectReply::Accepted
             ), "a failed connect must not claim a group id");
+        });
+    }
+
+    /// A blank claim is no claim: it neither claims a group on its own nor
+    /// is refused by one already claimed by a real identity — the
+    /// deployments without credentials (and the test benches) keep their
+    /// behavior whatever a client happens to send empty.
+    #[test]
+    fn a_blank_claim_is_no_claim() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let make_socket = |wsid: &str| {
+                let (sink, _frames) = mpsc::unbounded_channel();
+                Socket {
+                    client: format!("client-{wsid}"),
+                    sink,
+                }
+            };
+            let connect = |bench: &mut Bench, wsid: &str, stamp: Option<&str>| {
+                bench.core.connect(
+                    "g",
+                    wsid.to_owned(),
+                    make_socket(wsid),
+                    None,
+                    stamp.map(str::to_owned),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+
+            // A blank claim opens the group and leaves it unclaimed.
+            assert!(matches!(
+                connect(&mut bench, "blank", Some("   ")),
+                ConnectReply::Accepted
+            ));
+            assert!(
+                matches!(
+                    connect(&mut bench, "blank-token", Some("")),
+                    ConnectReply::Accepted
+                ),
+                "an empty stamp is no claim"
+            );
+
+            // A real identity still claims the unclaimed group, and a
+            // later blank is refused by it — not treated as its owner.
+            assert!(
+                matches!(
+                    connect(&mut bench, "alice", Some("token-alice")),
+                    ConnectReply::Accepted
+                ),
+                "an unclaimed group is still free to claim"
+            );
+            assert!(
+                matches!(
+                    connect(&mut bench, "blank-again", Some("")),
+                    ConnectReply::Refused { .. }
+                ),
+                "a blank claim can not join a claimed group"
+            );
         });
     }
 
