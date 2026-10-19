@@ -262,7 +262,8 @@ depend on what the defaults happen to be:
 | `STREAMGRES_MAX_MESSAGE_BYTES` | `16777216` | largest message accepted from a client |
 | `STREAMGRES_ROWS_PER_PART` | `500` | row changes per message part |
 | `STREAMGRES_S2S_TOKEN` | none | secret a backend must send as `Authorization: Bearer <token>` to open the S2S endpoint. Unset, the endpoint takes any connection |
-| `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` | `10000` | subscriptions one S2S connection may hold; past it a subscribe is refused. `0` lifts the limit |
+| `STREAMGRES_S2S_MAX_CONNECTIONS` | `64` | S2S connections open at once; past it an upgrade is answered `503`. Each backend process opens `STREAMGRES_S2S_CONNECTIONS` (2), so 64 serves 32 processes. `0` lifts the limit |
+| `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` | `10000` | subscriptions one S2S connection may hold; past it a subscribe is refused. The engine announces it, and the client stops short of it. `0` lifts the limit |
 | `STREAMGRES_LOG` | `info` | `error`, `warn`, `info` or `debug`. `debug` costs throughput |
 | `STREAMGRES_SLOW_QUERY_MS` | `1000` | queries and pushes slower than this are logged at `warn` |
 | `STREAMGRES_METRICS_INTERVAL_MS` | `10000` | how often process metrics are sampled |
@@ -279,7 +280,9 @@ depend on what the defaults happen to be:
 
   Keep `/metrics` and `/stats` private. Do the same for `/s2s/v1`, or set
   `STREAMGRES_S2S_TOKEN`. Anyone who can open it can subscribe to the
-  rows of every table the engine follows.
+  rows of every table the engine follows. The two S2S limits multiply:
+  at most `STREAMGRES_S2S_MAX_CONNECTIONS` ×
+  `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` subscriptions in all.
 - **Health.** `GET /health` (also `/healthz`, `/readyz`, and each of them
   under the base path) returns `503` until the server is ready. That means
   the change feed has passed the first read snapshot, and the warm start, if

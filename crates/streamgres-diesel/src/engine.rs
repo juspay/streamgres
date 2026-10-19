@@ -277,6 +277,11 @@ struct Worker {
     /// How many keys this worker holds, kept beside the state so the
     /// pool can pick the least loaded worker without locking each one.
     held: AtomicUsize,
+    /// The most subscriptions the engine takes on one connection, from
+    /// its `hello`; 0 when it named no limit.
+    room: AtomicUsize,
+    /// Why the latest attempt to connect failed, until one succeeds.
+    connect_error: Mutex<Option<String>>,
     state: Mutex<WorkerState>,
     shared: Arc<Shared>,
 }
@@ -450,13 +455,52 @@ impl EngineClient {
         self.pool.shared.refusals.lock().expect("refusals").clone()
     }
 
-    /// The connected worker carrying the fewest subscriptions.
-    fn least_loaded(&self) -> Option<&Arc<Worker>> {
+    /// The connected worker carrying the fewest subscriptions among those
+    /// the engine has room on; else why there is none.
+    fn least_loaded(&self) -> Result<&Arc<Worker>, String> {
+        let workers = &self.pool.workers;
+        let connected = || {
+            workers
+                .iter()
+                .filter(|worker| worker.connected.load(Ordering::Acquire))
+        };
+        if let Some(worker) = connected()
+            .filter(|worker| worker.has_room())
+            .min_by_key(|worker| worker.held.load(Ordering::Relaxed))
+        {
+            return Ok(worker);
+        }
+        match connected().next() {
+            Some(full) => Err(format!(
+                "the subscription limit of {} per connection is reached on every socket",
+                full.room.load(Ordering::Relaxed)
+            )),
+            None => Err(workers
+                .iter()
+                .find(|worker| {
+                    worker
+                        .connect_error
+                        .lock()
+                        .expect("connect_error")
+                        .is_some()
+                })
+                .or(workers.first())
+                .map_or_else(
+                    || "the engine is not connected".to_string(),
+                    |worker| worker.not_connected(),
+                )),
+        }
+    }
+
+    /// Why each socket that is down failed to connect, for those that
+    /// have tried and failed.
+    pub fn connect_errors(&self) -> Vec<String> {
         self.pool
             .workers
             .iter()
-            .filter(|worker| worker.connected.load(Ordering::Acquire))
-            .min_by_key(|worker| worker.held.load(Ordering::Relaxed))
+            .filter(|worker| !worker.connected.load(Ordering::Acquire))
+            .filter_map(|worker| worker.connect_error.lock().expect("connect_error").clone())
+            .collect()
     }
 }
 
@@ -478,10 +522,9 @@ impl Subscriptions for EngineClient {
                             shared.max_subscriptions
                         )));
                     }
-                    let Some(worker) = self.least_loaded() else {
-                        return Outcome::Verdict(
-                            shared.refused("the engine is not connected".to_string()),
-                        );
+                    let worker = match self.least_loaded() {
+                        Ok(worker) => worker,
+                        Err(reason) => return Outcome::Verdict(shared.refused(reason)),
                     };
                     by_key.insert(key.clone(), worker.index);
                     Arc::clone(worker)
@@ -550,6 +593,8 @@ impl Worker {
             outgoing,
             connected: AtomicBool::new(false),
             held: AtomicUsize::new(0),
+            room: AtomicUsize::new(0),
+            connect_error: Mutex::new(None),
             state: Mutex::new(WorkerState {
                 next_id: 1,
                 by_key: HashMap::new(),
@@ -596,10 +641,7 @@ impl Worker {
                 if held.is_none() {
                     self.shared.release(key, self.index);
                 }
-                return Outcome::Verdict(
-                    self.shared
-                        .refused("the engine is not connected".to_string()),
-                );
+                return Outcome::Verdict(self.shared.refused(self.not_connected()));
             }
             if let Some(id) = held {
                 if state.pending.contains_key(&id) {
@@ -821,6 +863,26 @@ impl Worker {
     fn note_held(&self, state: &WorkerState) {
         self.held.store(state.by_key.len(), Ordering::Relaxed);
     }
+
+    /// Whether the engine takes another subscription on this socket: it
+    /// counts the ones still registering too, as `held` does.
+    fn has_room(&self) -> bool {
+        let room = self.room.load(Ordering::Relaxed);
+        room == 0 || self.held.load(Ordering::Relaxed) < room
+    }
+
+    /// The refusal while this socket is down, with why it last failed to
+    /// connect when it has.
+    fn not_connected(&self) -> String {
+        match &*self.connect_error.lock().expect("connect_error") {
+            Some(error) => format!("the engine is not connected: {error}"),
+            None => "the engine is not connected".to_string(),
+        }
+    }
+
+    fn connect_failed(&self, error: Option<String>) {
+        *self.connect_error.lock().expect("connect_error") = error;
+    }
 }
 
 /// Applies one `delta` body to a store: every table's departures, then
@@ -863,15 +925,35 @@ fn bind_json(bind: &crate::key::Bind) -> Json {
 }
 
 /// The upgrade request for `url`, with the bearer token when there is
-/// one. `None` when either cannot go in a request; the worker then keeps
-/// retrying like any other failed connect, and every read is served live.
-fn upgrade_request(url: &str, token: Option<&str>) -> Option<Request> {
-    let mut request = url.into_client_request().ok()?;
+/// one; else why neither can go in a request. The worker then keeps
+/// retrying like any other failed connect, every read is served live,
+/// and the reason is in each refusal.
+fn upgrade_request(url: &str, token: Option<&str>) -> Result<Request, String> {
+    let mut request = url
+        .into_client_request()
+        .map_err(|error| format!("`{url}` is not an engine URL: {error}"))?;
     if let Some(token) = token {
-        let value = HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
+        let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
+            "STREAMGRES_S2S_TOKEN holds a character a header cannot carry".to_string()
+        })?;
         request.headers_mut().insert(AUTHORIZATION, value);
     }
-    Some(request)
+    Ok(request)
+}
+
+/// Why a connect failed, as a refusal names it.
+fn connect_failure(error: &tokio_tungstenite::tungstenite::Error) -> String {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Http(response) if response.status() == 401 => {
+            "the engine refused the token (check STREAMGRES_S2S_TOKEN)".to_string()
+        }
+        Error::Http(response) if response.status() == 503 => {
+            "the engine is not serving yet, or has no free connection".to_string()
+        }
+        Error::Http(response) => format!("the engine answered {}", response.status()),
+        other => other.to_string(),
+    }
 }
 
 /// Connects, serves, reconnects, forever: one worker's socket.
@@ -885,12 +967,22 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
         if worker.shared.stopped.load(Ordering::Acquire) {
             return;
         }
-        let Some(request) = upgrade_request(&worker.url, worker.shared.token.as_deref()) else {
-            continue;
+        let request = match upgrade_request(&worker.url, worker.shared.token.as_deref()) {
+            Ok(request) => request,
+            Err(error) => {
+                worker.connect_failed(Some(error));
+                continue;
+            }
         };
         let socket = match tokio_tungstenite::connect_async(request).await {
-            Ok((socket, _)) => socket,
-            Err(_) => continue,
+            Ok((socket, _)) => {
+                worker.connect_failed(None);
+                socket
+            }
+            Err(error) => {
+                worker.connect_failed(Some(connect_failure(&error)));
+                continue;
+            }
         };
         let (mut sink, mut stream) = socket.split();
 
@@ -1082,6 +1174,13 @@ fn inbound(worker: &Worker, text: &str) {
                 // read refills it.
                 (Some(None) | None, None) => {}
             }
+        }
+        "hello" => {
+            let room = body
+                .get("max_subscriptions")
+                .and_then(Json::as_u64)
+                .map_or(0, |room| usize::try_from(room).unwrap_or(usize::MAX));
+            worker.room.store(room, Ordering::Relaxed);
         }
         "refused" => {
             let Some(id) = body.get("id").and_then(Json::as_u64) else {
@@ -1529,13 +1628,90 @@ mod tests {
         assert!(plain.headers().get(AUTHORIZATION).is_none());
         let with = upgrade_request(url, Some("s3cret")).expect("a request");
         assert_eq!(with.headers()[AUTHORIZATION], "Bearer s3cret");
-        assert!(upgrade_request(url, Some("bad\nline")).is_none());
-        assert!(upgrade_request("not a url", None).is_none());
+        let bad = upgrade_request(url, Some("bad\nline")).expect_err("no header");
+        assert!(bad.contains("STREAMGRES_S2S_TOKEN"), "{bad}");
+        assert!(upgrade_request("not a url", None).is_err());
         let config = Config {
             token: Some("s3cret".into()),
             ..Config::default()
         };
         assert!(!format!("{config:?}").contains("s3cret"));
+    }
+
+    /// A pool over `workers`, as `with_config` would build it.
+    fn pool_of(workers: Vec<Arc<Worker>>, shared: Arc<Shared>) -> EngineClient {
+        EngineClient {
+            pool: Arc::new(Pool {
+                workers,
+                shared,
+                config: Config::default(),
+            }),
+        }
+    }
+
+    /// The engine's `hello` names its per-connection limit: a full socket
+    /// is passed over, and with every socket full the subscribe is
+    /// refused here, transiently, without asking the engine.
+    #[test]
+    fn a_socket_at_the_engine_limit_is_passed_over() {
+        let (worker, mut outgoing, shared) = worker();
+        assert!(worker.has_room(), "no limit until the engine names one");
+        inbound(
+            &worker,
+            r#"["hello", {"protocol": 1, "max_subscriptions": 1}]"#,
+        );
+        assert_eq!(worker.room.load(Ordering::Relaxed), 1);
+        let client = pool_of(vec![Arc::clone(&worker)], Arc::clone(&shared));
+        assert!(client.least_loaded().is_ok());
+
+        worker.held.store(1, Ordering::Relaxed);
+        let reason = client.least_loaded().err().expect("full");
+        assert!(
+            reason.starts_with("the subscription limit of 1 per connection"),
+            "{reason}"
+        );
+        assert!(!client.refusal_is_final(&reason));
+        match client.subscribe(&key()) {
+            Outcome::Verdict(Verdict::Refused(refused)) => assert_eq!(refused, reason),
+            _ => panic!("expected a refusal"),
+        }
+        assert!(outgoing.try_recv().is_err(), "the engine was not asked");
+
+        inbound(
+            &worker,
+            r#"["hello", {"protocol": 1, "max_subscriptions": null}]"#,
+        );
+        assert!(worker.has_room(), "a later hello with no limit lifts it");
+    }
+
+    /// While a socket is down, its refusals say why it last failed to
+    /// connect, and the client lists it; a success clears it.
+    #[test]
+    fn a_failed_connect_is_named_in_the_refusals() {
+        let (worker, _outgoing, shared) = worker();
+        worker.connected.store(false, Ordering::Release);
+        let client = pool_of(vec![Arc::clone(&worker)], Arc::clone(&shared));
+        assert_eq!(
+            client.least_loaded().err().as_deref(),
+            Some("the engine is not connected")
+        );
+
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(401)
+            .body(None)
+            .unwrap();
+        let error = tokio_tungstenite::tungstenite::Error::Http(Box::new(response));
+        worker.connect_failed(Some(connect_failure(&error)));
+        let reason = client.least_loaded().err().expect("down");
+        assert_eq!(
+            reason,
+            "the engine is not connected: the engine refused the token (check STREAMGRES_S2S_TOKEN)"
+        );
+        assert!(!client.refusal_is_final(&reason));
+        assert_eq!(client.connect_errors().len(), 1);
+
+        worker.connect_failed(None);
+        assert!(client.connect_errors().is_empty());
     }
 
     #[test]

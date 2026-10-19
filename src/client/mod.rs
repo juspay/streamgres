@@ -291,7 +291,7 @@ pub fn serve(config: Config) -> Result<(), String> {
     let warm_budget = config.warm_start;
     let metrics_interval = config.metrics_interval;
     let (warmed_tx, warmed) = tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
-    let (s2s, s2s_requests) = s2s::Handle::new();
+    let (s2s, s2s_requests) = s2s::Handle::new(config.s2s_max_connections);
     let s2s_task = s2s::run(
         catalog.clone(),
         shards,

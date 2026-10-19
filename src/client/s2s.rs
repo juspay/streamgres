@@ -18,12 +18,19 @@
 //! # Protocol
 //!
 //! JSON text frames, each a two-element array of a tag and a body, on a
-//! WebSocket at `{base}/s2s/v1`. With `STREAMGRES_S2S_TOKEN` set, the
-//! upgrade must carry `Authorization: Bearer <token>` and is answered
-//! 401 otherwise; unset, any connection is taken, so the port belongs on
-//! a trusted network. A connection holds at most
-//! `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` subscriptions; a subscribe
-//! past that is refused.
+//! WebSocket at `{base}/s2s/v1`.
+//!
+//! Admission:
+//! - With `STREAMGRES_S2S_TOKEN` set, the upgrade must carry
+//!   `Authorization: Bearer <token>` and is answered 401 otherwise.
+//!   Unset, any connection is taken, so the port belongs on a trusted
+//!   network.
+//! - At most `STREAMGRES_S2S_MAX_CONNECTIONS` connections are open at
+//!   once; past that the upgrade is answered 503.
+//! - A connection holds at most `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS`
+//!   subscriptions, those still registering included; a subscribe past
+//!   that is refused. The two limits together bound what one engine
+//!   follows for its backends.
 //!
 //! Upstream:
 //! - `["subscribe", {"id": n, "sql": "...", "binds": [{"oid": 25, "bytes": "<base64>"}, {"oid": 20, "bytes": null}], "rows": bool}]`
@@ -38,7 +45,9 @@
 //! - `["ping"]`
 //!
 //! Downstream:
-//! - `["hello", {"protocol": 1}]` first.
+//! - `["hello", {"protocol": 1, "max_subscriptions": n}]` first;
+//!   `max_subscriptions` is the per-connection limit, `null` for none, so
+//!   a client can stop short of it rather than be refused.
 //! - `["accepted", {"id": n}]` once the engine follows the query; from
 //!   that moment every change to its rows is reported, so the backend
 //!   reads Postgres only after it. In rows mode the body also carries
@@ -74,8 +83,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -148,23 +158,100 @@ pub struct Subscribe {
 /// in one transaction is a delete, not a put the client would keep.
 type Changes = Vec<(TableName, HashMap<DataFrameKey, Option<Json>>)>;
 
+/// How often a refused upgrade of one kind is logged at most; the ones
+/// in between are counted into the next line.
+const REFUSAL_LOG_EVERY: Duration = Duration::from_secs(60);
+
 /// The handle connections talk to the task through.
 #[derive(Debug)]
 pub struct Handle {
     requests: mpsc::Sender<Request>,
     next_conn: AtomicU64,
+    /// Connections open now, against `max_connections` (0: no limit).
+    open: Arc<AtomicUsize>,
+    max_connections: usize,
+    unauthorized: Throttle,
+    full: Throttle,
 }
 
 impl Handle {
-    pub fn new() -> (Handle, mpsc::Receiver<Request>) {
+    pub fn new(max_connections: usize) -> (Handle, mpsc::Receiver<Request>) {
         let (requests, requests_rx) = mpsc::channel(REQUEST_QUEUE);
         (
             Handle {
                 requests,
                 next_conn: AtomicU64::new(1),
+                open: Arc::new(AtomicUsize::new(0)),
+                max_connections,
+                unauthorized: Throttle::new(REFUSAL_LOG_EVERY),
+                full: Throttle::new(REFUSAL_LOG_EVERY),
             },
             requests_rx,
         )
+    }
+
+    /// A place among the open connections, if one is free; it is given
+    /// back when the [`Admitted`] drops.
+    fn admit(&self) -> Option<Admitted> {
+        let limit = self.max_connections;
+        self.open
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                (limit == 0 || open < limit).then_some(open + 1)
+            })
+            .ok()?;
+        Some(Admitted(Arc::clone(&self.open)))
+    }
+}
+
+/// One open connection's place, held for as long as the connection is.
+struct Admitted(Arc<AtomicUsize>);
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Lets a repeated warning through at most once per period. A backend
+/// with the wrong token retries every second, and so can anyone who
+/// reaches the port, so each refusal cannot be a log line.
+#[derive(Debug)]
+struct Throttle {
+    every: Duration,
+    next: Mutex<Option<Instant>>,
+    quiet: AtomicU64,
+}
+
+impl Throttle {
+    fn new(every: Duration) -> Throttle {
+        Throttle {
+            every,
+            next: Mutex::new(None),
+            quiet: AtomicU64::new(0),
+        }
+    }
+
+    /// At `now`: how many were held back since the last one let through,
+    /// when this one may be logged; `None` when it is counted instead.
+    fn pass(&self, now: Instant) -> Option<u64> {
+        let mut next = self.next.lock().expect("throttle");
+        if next.is_some_and(|next| now < next) {
+            self.quiet.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        *next = Some(now + self.every);
+        Some(self.quiet.swap(0, Ordering::Relaxed))
+    }
+}
+
+/// Logs a refused upgrade, throttled per kind.
+fn refusal(throttle: &Throttle, what: &str) {
+    if let Some(quiet) = throttle.pass(Instant::now()) {
+        if quiet == 0 {
+            log_warn!("s2s connection refused: {what}");
+        } else {
+            log_warn!("s2s connection refused: {what} ({quiet} more since the last warning)");
+        }
     }
 }
 
@@ -412,19 +499,19 @@ impl Task {
         let Some(connection) = self.conns.get_mut(&conn) else {
             return;
         };
-        let registering: Vec<u64> = self
-            .by_token
-            .values()
-            .filter(|(owner, _, _)| *owner == conn)
-            .map(|(_, own_id, _)| *own_id)
-            .collect();
-        if connection.subs.contains_key(&id) || registering.contains(&id) {
+        let mut taken = connection.subs.contains_key(&id);
+        let mut registering = 0;
+        for (owner, own_id, _) in self.by_token.values() {
+            if *owner == conn {
+                registering += 1;
+                taken |= *own_id == id;
+            }
+        }
+        if taken {
             connection.send(refused(id, "that id is already subscribed"));
             return;
         }
-        if self.per_connection > 0
-            && connection.subs.len() + registering.len() >= self.per_connection
-        {
+        if self.per_connection > 0 && connection.subs.len() + registering >= self.per_connection {
             let reason = format!(
                 "the subscription limit of {} per connection is reached",
                 self.per_connection
@@ -728,7 +815,7 @@ pub async fn connect(
     if let Some(token) = &state.config.s2s_token
         && !authorized(&headers, &token.0)
     {
-        log_warn!("s2s connection refused: no valid bearer token");
+        refusal(&state.s2s.unauthorized, "no valid bearer token");
         return (StatusCode::UNAUTHORIZED, "a bearer token is required").into_response();
     }
     if !*state.ready.borrow() {
@@ -738,8 +825,19 @@ pub async fn connect(
         )
             .into_response();
     }
+    let Some(admitted) = state.s2s.admit() else {
+        let what = format!(
+            "{} connections are open, the most allowed",
+            state.s2s.max_connections
+        );
+        refusal(&state.s2s.full, &what);
+        return (StatusCode::SERVICE_UNAVAILABLE, "too many S2S connections").into_response();
+    };
     let upgrade = upgrade.max_message_size(state.config.max_message_bytes);
-    upgrade.on_upgrade(move |socket| handle(socket, state))
+    upgrade.on_upgrade(move |socket| async move {
+        handle(socket, state).await;
+        drop(admitted);
+    })
 }
 
 /// Whether the request carries `Authorization: Bearer <token>`. The
@@ -749,7 +847,9 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
     let Some(presented) = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, presented)| presented.trim_start_matches(' '))
     else {
         return false;
     };
@@ -788,7 +888,14 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
     {
         return;
     }
-    send(&out, json!(["hello", {"protocol": PROTOCOL_VERSION}]));
+    let limit = state.config.s2s_connection_subscriptions;
+    send(
+        &out,
+        json!(["hello", {
+            "protocol": PROTOCOL_VERSION,
+            "max_subscriptions": (limit > 0).then_some(limit),
+        }]),
+    );
     log_info!("s2s connection {conn} open");
 
     // Whatever ends the session, a panic in a frame's handling included,
@@ -1169,6 +1276,39 @@ mod tests {
         assert_eq!(puts(&deltas[1]), vec![(1, "one".to_owned())]);
     }
 
+    /// Places are handed out up to the limit and come back when their
+    /// connections close; a zero limit hands them out without one.
+    #[test]
+    fn connections_are_admitted_up_to_the_limit() {
+        let (handle, _requests) = Handle::new(2);
+        let first = handle.admit().expect("a place");
+        let second = handle.admit().expect("a place");
+        assert!(handle.admit().is_none());
+        drop(first);
+        let third = handle.admit().expect("the freed place");
+        assert!(handle.admit().is_none());
+        drop((second, third));
+        assert_eq!(handle.open.load(Ordering::Acquire), 0);
+
+        let (open, _requests) = Handle::new(0);
+        let places: Vec<Admitted> = (0..100).map(|_| open.admit().expect("a place")).collect();
+        assert_eq!(open.open.load(Ordering::Acquire), places.len());
+    }
+
+    /// The first warning passes, the next ones within the period are
+    /// counted, and the first after it says how many were held back.
+    #[test]
+    fn a_throttled_warning_passes_once_per_period() {
+        let throttle = Throttle::new(Duration::from_secs(60));
+        let start = Instant::now();
+        assert_eq!(throttle.pass(start), Some(0));
+        assert_eq!(throttle.pass(start + Duration::from_secs(1)), None);
+        assert_eq!(throttle.pass(start + Duration::from_secs(59)), None);
+        assert_eq!(throttle.pass(start + Duration::from_secs(60)), Some(2));
+        assert_eq!(throttle.pass(start + Duration::from_secs(61)), None);
+        assert_eq!(throttle.pass(start + Duration::from_secs(200)), Some(1));
+    }
+
     /// Only the configured token, as a bearer, opens the endpoint.
     #[test]
     fn only_the_bearer_token_authorizes() {
@@ -1178,6 +1318,8 @@ mod tests {
             headers
         };
         assert!(authorized(&with("Bearer s3cret"), "s3cret"));
+        assert!(authorized(&with("bearer s3cret"), "s3cret"));
+        assert!(authorized(&with("BEARER  s3cret"), "s3cret"));
         assert!(!authorized(&with("Bearer s3cres"), "s3cret"));
         assert!(!authorized(&with("Bearer s3cret2"), "s3cret"));
         assert!(!authorized(&with("Bearer "), "s3cret"));

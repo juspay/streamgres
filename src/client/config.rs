@@ -139,6 +139,10 @@ pub struct Config {
     /// empty, the endpoint takes any connection, which only a trusted
     /// network should be given.
     pub s2s_token: Option<Secret>,
+    /// `STREAMGRES_S2S_MAX_CONNECTIONS`: how many S2S connections may be
+    /// open at once; past it an upgrade is answered 503 (64; 0 lifts the
+    /// limit). A backend process opens `STREAMGRES_S2S_CONNECTIONS` (2).
+    pub s2s_max_connections: usize,
     /// `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS`: how many subscriptions
     /// one S2S connection may hold, those still registering included; past
     /// it a subscribe is refused (10000; 0 lifts the limit).
@@ -394,6 +398,12 @@ impl Config {
                 None => 16 * 1024 * 1024,
             },
             s2s_token: first(&["STREAMGRES_S2S_TOKEN"]).map(Secret),
+            s2s_max_connections: match first(&["STREAMGRES_S2S_MAX_CONNECTIONS"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("STREAMGRES_S2S_MAX_CONNECTIONS must be a number, got `{text}`")
+                })?,
+                None => 64,
+            },
             s2s_connection_subscriptions: match first(&["STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS"])
             {
                 Some(text) => text.parse().map_err(|_| {
@@ -618,6 +628,15 @@ mod tests {
             Some("hunter2")
         );
         assert!(!format!("{config:?}").contains("hunter2"));
+    }
+
+    /// 64 S2S connections may be open unless told otherwise.
+    #[test]
+    fn the_s2s_connection_count_has_a_default() {
+        assert_eq!(config_with(&[]).s2s_max_connections, 64);
+        let limited = config_with(&[("STREAMGRES_S2S_MAX_CONNECTIONS", "0")]);
+        assert_eq!(limited.s2s_max_connections, 0);
+        assert!(config(&[("STREAMGRES_S2S_MAX_CONNECTIONS", "many")]).is_err());
     }
 
     /// One S2S connection holds 10000 subscriptions unless told otherwise.

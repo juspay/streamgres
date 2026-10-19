@@ -5,7 +5,10 @@
 //! the endpoint cannot read.
 //!
 //! Needs a running engine (`STREAMGRES_S2S_URL`) and the database it
-//! streams (`STREAMGRES_PG_DSN`); skips itself otherwise.
+//! streams (`STREAMGRES_PG_DSN`); skips itself otherwise. When the engine
+//! was started with `STREAMGRES_S2S_TOKEN`, give the test the same one:
+//! it then connects with it, and checks that a missing or wrong token is
+//! answered 401.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -16,7 +19,10 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio_postgres::{Client, NoTls};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+use tokio_tungstenite::tungstenite::{Error, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 const TABLE: &str = "live_s2s_items";
@@ -35,6 +41,23 @@ fn targets() -> Option<(String, String)> {
             None
         }
     }
+}
+
+/// The upgrade request for `url`, with `token` as a bearer when given.
+fn request(url: &str, token: Option<&str>) -> Request {
+    let mut request = url.into_client_request().expect("a WebSocket URL");
+    if let Some(token) = token {
+        let value = format!("Bearer {token}").parse().expect("a header value");
+        request.headers_mut().insert(AUTHORIZATION, value);
+    }
+    request
+}
+
+/// The token the engine was started with, if the test was given one.
+fn token() -> Option<String> {
+    std::env::var("STREAMGRES_S2S_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
 }
 
 /// Connects to the database on its own task.
@@ -164,11 +187,16 @@ async fn the_endpoint_speaks_its_protocol() {
     };
     let client = database(&dsn).await;
     seeded(&client).await;
-    let (mut socket, _) = tokio_tungstenite::connect_async(&url)
+    let (mut socket, _) = tokio_tungstenite::connect_async(request(&url, token().as_deref()))
         .await
         .expect("connect");
     let hello = expect(&mut socket, "hello").await;
-    assert_eq!(hello, json!(["hello", {"protocol": 1}]));
+    assert_eq!(tag(&hello), "hello");
+    assert_eq!(hello[1]["protocol"], 1);
+    assert!(
+        hello[1]["max_subscriptions"].is_u64() || hello[1]["max_subscriptions"].is_null(),
+        "{hello}"
+    );
 
     send(&mut socket, json!(["ping"])).await;
     assert_eq!(expect(&mut socket, "pong").await, json!(["pong"]));
@@ -298,4 +326,25 @@ async fn the_endpoint_speaks_its_protocol() {
         "nothing is subscribed"
     );
     socket.close(None).await.expect("close");
+}
+
+/// An engine started with a token answers 401 to an upgrade without it
+/// or with another one.
+#[tokio::test]
+async fn a_token_guards_the_endpoint() {
+    let Some((url, _)) = targets() else {
+        return;
+    };
+    let Some(token) = token() else {
+        eprintln!("STREAMGRES_S2S_TOKEN not set: the token check is skipped");
+        return;
+    };
+    let wrong = format!("{token}-not");
+    for presented in [None, Some(wrong.as_str())] {
+        match tokio_tungstenite::connect_async(request(&url, presented)).await {
+            Err(Error::Http(response)) => assert_eq!(response.status(), 401),
+            Err(other) => panic!("expected a 401, got {other}"),
+            Ok(_) => panic!("the endpoint took {presented:?}"),
+        }
+    }
 }
