@@ -133,7 +133,8 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
             out.push(b']');
         }
         Value::Map(_) | Value::Set(_) => {
-            if serde_json::to_writer(&mut *out, &value_json(value, declared)).is_err() {
+            let json = json_in(value, declared, Unit::Millis);
+            if serde_json::to_writer(&mut *out, &json).is_err() {
                 out.extend_from_slice(b"null");
             }
         }
@@ -170,6 +171,29 @@ pub fn key_json(key: &DataFrameKey) -> Json {
 /// the microseconds the engine keeps (the server-to-server form; the
 /// Zero writer above scales to milliseconds).
 pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
+    json_in(value, declared, Unit::Micros)
+}
+
+/// The unit a time goes out in: the engine's microseconds on the
+/// server-to-server path, milliseconds on Zero's.
+#[derive(Clone, Copy)]
+enum Unit {
+    Micros,
+    Millis,
+}
+
+impl Unit {
+    fn of(self, micros: i64) -> i64 {
+        match self {
+            Unit::Micros => micros,
+            Unit::Millis => micros.div_euclid(1000),
+        }
+    }
+}
+
+/// One cell as JSON, with every time in it, nested ones included, in
+/// `unit`.
+fn json_in(value: &Value, declared: Option<&ValueType>, unit: Unit) -> Json {
     match value {
         Value::Null => Json::Null,
         Value::String(text) => match declared {
@@ -178,22 +202,30 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
             }
             _ => Json::String(text.clone()),
         },
+        Value::Int(int) if matches!(declared, Some(ValueType::Timestamp)) => {
+            Json::from(unit.of(*int))
+        }
         Value::Int(int) => Json::from(*int),
         Value::Float(float) if whole(*float) => Json::from(*float as i64),
         Value::Float(float) => {
             serde_json::Number::from_f64(*float).map_or(Json::Null, Json::Number)
         }
         Value::Bool(flag) => Json::Bool(*flag),
-        Value::Date(date) => date
-            .and_hms_opt(0, 0, 0)
-            .map_or(Json::Null, |at| Json::from(at.and_utc().timestamp_micros())),
-        Value::Datetime(datetime) => Json::from(datetime.and_utc().timestamp_micros()),
+        Value::Date(date) => date.and_hms_opt(0, 0, 0).map_or(Json::Null, |at| {
+            Json::from(unit.of(at.and_utc().timestamp_micros()))
+        }),
+        Value::Datetime(datetime) => Json::from(unit.of(datetime.and_utc().timestamp_micros())),
         Value::List(items) => {
             let inner = match declared {
                 Some(ValueType::List(inner)) => Some(inner.as_ref()),
                 _ => None,
             };
-            Json::Array(items.iter().map(|item| value_json(item, inner)).collect())
+            Json::Array(
+                items
+                    .iter()
+                    .map(|item| json_in(item, inner, unit))
+                    .collect(),
+            )
         }
         Value::Map(entries) => {
             let mut object = Map::with_capacity(entries.len());
@@ -202,14 +234,14 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
                     Value::String(text) => text.clone(),
                     other => format!("{other:?}"),
                 };
-                object.insert(key, value_json(item, None));
+                object.insert(key, json_in(item, None, unit));
             }
             Json::Object(object)
         }
         Value::Set(set) => Json::Array(
             set.members()
                 .iter()
-                .map(|item| value_json(item, None))
+                .map(|item| json_in(item, None, unit))
                 .collect(),
         ),
     }
@@ -356,6 +388,9 @@ mod tests {
             zero(&Value::Date(at.date()), None),
             (midnight / 1000).to_string()
         );
+        let nested = Value::Map(HashMap::from([(Value::from("at"), Value::Datetime(at))]));
+        assert_eq!(value_json(&nested, None), serde_json::json!({"at": micros}));
+        assert_eq!(zero(&nested, None), format!(r#"{{"at":{millis}}}"#));
     }
 
     /// A whole-valued float is written as an integer on both paths, a
