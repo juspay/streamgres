@@ -415,6 +415,11 @@ impl Materialized {
         self.len() == 0
     }
 
+    /// The row's primary key as one string: each key column's JSON text,
+    /// each followed by U+001F. Two keys cannot run together into one,
+    /// because JSON text never holds a raw U+001F: inside a string
+    /// `serde_json` writes it as `\u001f`, and outside strings it is not
+    /// a JSON character at all.
     fn key_of(&self, node: usize, object: &Json) -> String {
         let node = &self.nodes[node];
         let mut key = String::new();
@@ -732,6 +737,13 @@ mod tests {
                 <(i32, String) as FromSqlRow<(Integer, Text), Pg>>::build_from_row(row).unwrap()
             })
             .collect()
+    }
+
+    /// `key_of` relies on this: a raw U+001F never appears in JSON
+    /// text, so it can end each key column without a collision.
+    #[test]
+    fn json_text_never_holds_the_key_separator() {
+        assert_eq!(Json::from("a\u{1f}b").to_string(), r#""a\u001fb""#);
     }
 
     #[test]

@@ -186,8 +186,8 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
         Value::Bool(flag) => Json::Bool(*flag),
         Value::Date(date) => date
             .and_hms_opt(0, 0, 0)
-            .map_or(Json::Null, |at| Json::from(at.and_utc().timestamp_millis())),
-        Value::Datetime(datetime) => Json::from(datetime.and_utc().timestamp_millis()),
+            .map_or(Json::Null, |at| Json::from(at.and_utc().timestamp_micros())),
+        Value::Datetime(datetime) => Json::from(datetime.and_utc().timestamp_micros()),
         Value::List(items) => {
             let inner = match declared {
                 Some(ValueType::List(inner)) => Some(inner.as_ref()),
@@ -312,9 +312,50 @@ mod tests {
             let written: Json = serde_json::from_slice(&fast).expect("valid JSON");
             assert_eq!(written["tableName"], "odd \"table\"");
             let mut expected = row_json(&planned, &table);
-            expected["ts"] = Json::from(1_759_622_400_000i64 / 1000);
-            assert_eq!(written["value"], expected, "a time goes out in milliseconds");
+            for time in ["ts", "day", "at"] {
+                expected[time] = Json::from(expected[time].as_i64().unwrap() / 1000);
+            }
+            assert_eq!(
+                written["value"], expected,
+                "a time goes out in milliseconds"
+            );
         }
+    }
+
+    /// Every form of a time goes out in one unit per path: microseconds
+    /// on the server-to-server one, milliseconds on Zero's.
+    #[test]
+    fn a_time_has_one_unit_per_path() {
+        let at = chrono::NaiveDate::from_ymd_opt(2026, 10, 19)
+            .unwrap()
+            .and_hms_micro_opt(1, 2, 3, 456_789)
+            .unwrap();
+        let micros = at.and_utc().timestamp_micros();
+        let midnight = at
+            .date()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        let stamp = Some(&ValueType::Timestamp);
+        assert_eq!(value_json(&Value::Int(micros), stamp), Json::from(micros));
+        assert_eq!(value_json(&Value::Datetime(at), None), Json::from(micros));
+        assert_eq!(
+            value_json(&Value::Date(at.date()), None),
+            Json::from(midnight)
+        );
+        let zero = |value: &Value, declared| {
+            let mut out = Vec::new();
+            write_value(&mut out, value, declared);
+            String::from_utf8(out).unwrap()
+        };
+        let millis = (micros / 1000).to_string();
+        assert_eq!(zero(&Value::Int(micros), stamp), millis);
+        assert_eq!(zero(&Value::Datetime(at), None), millis);
+        assert_eq!(
+            zero(&Value::Date(at.date()), None),
+            (midnight / 1000).to_string()
+        );
     }
 
     /// A whole-valued float is written as an integer on both paths, a
@@ -360,7 +401,10 @@ mod tests {
         ]));
         let json = row_json(&row, &table);
         assert_eq!(json["meta"]["k"][1], 2);
-        assert_eq!(json["at"], 1_000, "the tree keeps the engine's microseconds");
+        assert_eq!(
+            json["at"], 1_000,
+            "the tree keeps the engine's microseconds"
+        );
         assert_eq!(json["extra"], 7, "every column the row carries is written");
 
         let mut bytes = Vec::new();
@@ -370,7 +414,10 @@ mod tests {
         assert_eq!(written["tableName"], "t");
         let mut expected = json.clone();
         expected["at"] = Json::from(1);
-        assert_eq!(written["value"], expected, "the bytes say what the tree says, times in milliseconds");
+        assert_eq!(
+            written["value"], expected,
+            "the bytes say what the tree says, times in milliseconds"
+        );
         let mut bytes = Vec::new();
         write_del(
             &mut bytes,
@@ -385,15 +432,31 @@ mod tests {
         let timed = DbTable::new(
             "timed",
             ["at"],
-            vec![DbColumn::new("at", ValueType::Timestamp), DbColumn::new("v", ValueType::Int)],
+            vec![
+                DbColumn::new("at", ValueType::Timestamp),
+                DbColumn::new("v", ValueType::Int),
+            ],
         );
         let mut bytes = Vec::new();
-        write_del(&mut bytes, "timed", &DataFrameKey::new([("at", Value::Int(1_000))]), Some(&timed));
+        write_del(
+            &mut bytes,
+            "timed",
+            &DataFrameKey::new([("at", Value::Int(1_000))]),
+            Some(&timed),
+        );
         let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(written["id"]["at"], 1);
         let mut bytes = Vec::new();
-        write_del(&mut bytes, "timed", &DataFrameKey::new([("at", Value::Int(1_000))]), None);
+        write_del(
+            &mut bytes,
+            "timed",
+            &DataFrameKey::new([("at", Value::Int(1_000))]),
+            None,
+        );
         let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
-        assert_eq!(written["id"]["at"], 1_000, "without the schema the number is left alone");
+        assert_eq!(
+            written["id"]["at"], 1_000,
+            "without the schema the number is left alone"
+        );
     }
 }

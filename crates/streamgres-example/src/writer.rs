@@ -288,7 +288,7 @@ async fn step(
                 .await?;
                 state.toast = Some(row.id);
             }
-            Some(id) if state.tick % 5 == 0 => {
+            Some(id) if state.tick.is_multiple_of(5) => {
                 sql_query("DELETE FROM comments WHERE id = $1")
                     .bind::<BigInt, _>(id)
                     .execute(conn)

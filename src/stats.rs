@@ -1755,7 +1755,7 @@ mod tests {
         assert_eq!(bucket_of(5), 10);
         assert_eq!(bucket_of(7), 12);
         assert_eq!(bucket_of(8), 13);
-        let used = |index: usize| (index - 1) / 4 >= 2 || (index - 1) % 4 == 0;
+        let used = |index: usize| (index - 1) / 4 >= 2 || (index - 1).is_multiple_of(4);
         let mut previous = 0;
         for index in (1..BUCKETS).filter(|index| used(*index)) {
             assert!(lower_bound(index) > previous, "at {index}");

@@ -64,7 +64,9 @@ async fn rows_mode_through_the_async_wrapper() {
         assert!(Instant::now() < deadline, "the engine did not connect");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let mut other = AsyncPgConnection::establish(&database).await.expect("connect");
+    let mut other = AsyncPgConnection::establish(&database)
+        .await
+        .expect("connect");
     other
         .batch_execute(
             "CREATE TABLE IF NOT EXISTS sg_configs (
@@ -76,10 +78,17 @@ async fn rows_mode_through_the_async_wrapper() {
     let key = format!("{prefix}r");
     put(&mut other, &key, "1").await;
 
-    let inner = AsyncPgConnection::establish(&database).await.expect("connect");
+    let inner = AsyncPgConnection::establish(&database)
+        .await
+        .expect("connect");
     let mut conn = AsyncSyncedConnection::with_cache(inner, cache.clone(), Route::Streamgres);
     assert_eq!(read(&mut conn, &key).await.as_deref(), Some("1"));
-    assert_eq!(engine.materialized(), 1, "served from the engine's rows: {:?}", engine.fallbacks());
+    assert_eq!(
+        engine.materialized(),
+        1,
+        "served from the engine's rows: {:?}",
+        engine.fallbacks()
+    );
     assert_eq!(engine.subscribed(), 1);
     let hits = stat(&cache.stats.hits);
     assert_eq!(read(&mut conn, &key).await.as_deref(), Some("1"));
@@ -92,10 +101,16 @@ async fn rows_mode_through_the_async_wrapper() {
         if read(&mut conn, &key).await.as_deref() == Some("2") {
             break;
         }
-        assert!(started.elapsed() < Duration::from_secs(10), "the change did not arrive");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the change did not arrive"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    eprintln!("ASYNC rows mode commit to replaced entry: {:?}", started.elapsed());
+    eprintln!(
+        "ASYNC rows mode commit to replaced entry: {:?}",
+        started.elapsed()
+    );
     assert!(stat(&cache.stats.replaced) >= 1);
     assert_eq!(stat(&cache.stats.touched), 0);
 
