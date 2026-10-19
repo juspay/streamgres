@@ -269,7 +269,9 @@ impl ReplicationConnection {
 /// for this session, a setting every role may make for its own; and
 /// PostgreSQL's end of the connection is told to probe this one as this
 /// one probes it ([`keep_alive`]), so either side notices a dead peer in
-/// the same time instead of after the kernel's default hours.
+/// the same time instead of after the kernel's default hours. The zone
+/// is pinned to UTC as every storage session's is, for one rule across
+/// the sessions the engine opens; nothing here reads a time.
 fn session_options(config: &Config) -> String {
     let mut options = config.get_options().unwrap_or_default().to_owned();
     let mut set = |setting: &str, value: &str| {
@@ -279,6 +281,7 @@ fn session_options(config: &Config) -> String {
         options.push_str(&format!("-c {setting}={value}"));
     };
     set("idle_in_transaction_session_timeout", "0");
+    set("TimeZone", "UTC");
     if config.get_keepalives() {
         set(
             "tcp_keepalives_idle",
@@ -371,7 +374,7 @@ mod tests {
             .keepalives_retries(3);
         assert_eq!(
             session_options(&config),
-            "-c idle_in_transaction_session_timeout=0 -c tcp_keepalives_idle=30 \
+            "-c idle_in_transaction_session_timeout=0 -c TimeZone=UTC -c tcp_keepalives_idle=30 \
              -c tcp_keepalives_interval=10 -c tcp_keepalives_count=3"
         );
 
@@ -382,14 +385,14 @@ mod tests {
         config.keepalives(false);
         assert_eq!(
             session_options(&config),
-            "-c idle_in_transaction_session_timeout=0"
+            "-c idle_in_transaction_session_timeout=0 -c TimeZone=UTC"
         );
 
         let mut config = Config::new();
         config.keepalives_idle(Duration::from_millis(500));
         assert_eq!(
             session_options(&config),
-            "-c idle_in_transaction_session_timeout=0 -c tcp_keepalives_idle=1"
+            "-c idle_in_transaction_session_timeout=0 -c TimeZone=UTC -c tcp_keepalives_idle=1"
         );
     }
 
