@@ -191,6 +191,10 @@ pub enum Request {
         wsid: String,
         socket: Socket,
         base_cookie: Option<String>,
+        /// The connection's identity claim (token, or HTTP cookie when it
+        /// carries no token), used only to bind the group to its first
+        /// claimant — never forwarded.
+        stamp: Option<String>,
         lmids: Vec<(String, i64)>,
         results: Vec<MutationResult>,
         reply: oneshot::Sender<ConnectReply>,
@@ -246,6 +250,10 @@ pub enum ConnectReply {
     /// The client's cookie is not one this server holds; the client must
     /// start over.
     Reset {
+        reason: String,
+    },
+    /// The group is bound to a different identity; joining it is refused.
+    Refused {
         reason: String,
     },
 }
@@ -537,6 +545,10 @@ pub struct Groups {
     readiness: watch::Sender<bool>,
     backlog: Vec<Request>,
     groups: HashMap<String, Group>,
+    /// The identity stamp each live group is bound to: only a connection
+    /// carrying the same claim may join. Removed with the group, so a
+    /// group id holds no access once its group has expired.
+    bindings: HashMap<String, String>,
     by_sub: HashMap<SubId, (String, String)>,
     /// Registrations in flight, by the token they were sent with.
     awaiting: HashMap<u64, (String, String)>,
@@ -584,6 +596,7 @@ pub async fn run(
         readiness,
         backlog: Vec::new(),
         groups: HashMap::new(),
+        bindings: HashMap::new(),
         by_sub: HashMap::new(),
         awaiting: HashMap::new(),
         pending: HashMap::new(),
@@ -646,11 +659,12 @@ impl Groups {
                 wsid,
                 socket,
                 base_cookie,
+                stamp,
                 lmids,
                 results,
                 reply,
             } => {
-                let outcome = self.connect(&group, wsid, socket, base_cookie, lmids, results);
+                let outcome = self.connect(&group, wsid, socket, base_cookie, stamp, lmids, results);
                 let _ = reply.send(outcome);
             }
             Request::Disconnect { group, wsid } => self.disconnect(&group, &wsid),
@@ -819,15 +833,35 @@ impl Groups {
     /// whole state when it has none and the group is under way, the logged
     /// pokes after an older cookie. A client that cannot be caught up is
     /// told to start over; no other connection of the group is touched.
+    #[allow(clippy::too_many_arguments)]
     fn connect(
         &mut self,
         group_id: &str,
         wsid: String,
         socket: Socket,
         base_cookie: Option<String>,
+        stamp: Option<String>,
         lmids: Vec<(String, i64)>,
         results: Vec<MutationResult>,
     ) -> ConnectReply {
+        // A live group answers only the identity that claimed it: a
+        // stranger holding the group id is refused before any of its
+        // state is read. A connection with no claim at all joins only
+        // unclaimed groups, which is what deployments without credentials
+        // (and the test benches) do everywhere. The binding is written
+        // only after every check below has passed, so a failed connect
+        // never claims a group id on its own.
+        if let Some(bound) = self.bindings.get(group_id)
+            && stamp.as_deref() != Some(bound.as_str())
+        {
+            log_info!(
+                "connection {wsid} refused client group {}: the group is bound to another identity",
+                crate::log::group(group_id)
+            );
+            return ConnectReply::Refused {
+                reason: "this client group belongs to another identity".to_owned(),
+            };
+        }
         let offered = match base_cookie.as_deref().map(protocol::version_of) {
             None => 0,
             Some(Some(version)) => version,
@@ -865,6 +899,11 @@ impl Groups {
             self.groups.insert(group_id.to_owned(), Group::new());
             self.stats.client_groups.fetch_add(1, Ordering::Relaxed);
             log_info!("client group {group_id} opened");
+        }
+        // The group is live and this connection has passed every check:
+        // claim it now, so a failed connect never binds a group id alone.
+        if let Some(stamp) = stamp {
+            self.bindings.insert(group_id.to_owned(), stamp);
         }
         self.next_generation += 1;
         let generation = self.next_generation;
@@ -1021,8 +1060,10 @@ impl Groups {
         }
     }
 
-    /// Forget a group and every subscription it had.
+    /// Forget a group and every subscription it had. Its identity binding
+    /// goes with it: a stale group id claims nothing afterwards.
     fn drop_group(&mut self, group_id: &str) {
+        self.bindings.remove(group_id);
         if let Some(group) = self.groups.remove(group_id) {
             self.stats.client_groups.fetch_sub(1, Ordering::Relaxed);
             self.stats
@@ -1979,6 +2020,7 @@ mod tests {
                 readiness: watch::channel(true).0,
                 backlog: Vec::new(),
                 groups: HashMap::new(),
+                bindings: HashMap::new(),
                 by_sub: HashMap::new(),
                 awaiting: HashMap::new(),
                 pending: HashMap::new(),
@@ -2027,6 +2069,7 @@ mod tests {
                 wsid.to_owned(),
                 socket,
                 cookie.map(str::to_owned),
+                None,
                 lmids,
                 results,
             ) {
@@ -2034,7 +2077,7 @@ mod tests {
                     wsid: wsid.to_owned(),
                     frames,
                 }),
-                ConnectReply::Reset { reason } => Err(reason),
+                ConnectReply::Reset { reason } | ConnectReply::Refused { reason } => Err(reason),
             }
         }
 
@@ -2730,6 +2773,101 @@ mod tests {
         });
     }
 
+    /// A group is bound to the identity claim that claimed it: the same
+    /// claim joins again, a stranger's is refused, and once the group has
+    /// expired the id claims nothing — a fresh identity starts fresh.
+    #[test]
+    fn a_group_answers_only_the_identity_that_claimed_it() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let make_socket = |wsid: &str| {
+                let (sink, _frames) = mpsc::unbounded_channel();
+                Socket {
+                    client: format!("client-{wsid}"),
+                    sink,
+                }
+            };
+            let connect = |bench: &mut Bench, wsid: &str, stamp: Option<&str>| {
+                bench.core.connect(
+                    "g",
+                    wsid.to_owned(),
+                    make_socket(wsid),
+                    None,
+                    stamp.map(str::to_owned),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+
+            assert!(matches!(
+                connect(&mut bench, "owner-1", Some("token-alice")),
+                ConnectReply::Accepted
+            ));
+            assert!(matches!(
+                connect(&mut bench, "owner-2", Some("token-alice")),
+                ConnectReply::Accepted
+            ), "the same identity joins its own group again");
+            assert!(
+                matches!(
+                    connect(&mut bench, "stranger", Some("token-mallory")),
+                    ConnectReply::Refused { .. }
+                ),
+                "a stranger holding the group id is refused"
+            );
+            assert!(
+                matches!(connect(&mut bench, "anon", None), ConnectReply::Refused { .. }),
+                "an anonymous connection can not join a claimed group"
+            );
+
+            bench.core.drop_group("g");
+            assert!(matches!(
+                connect(&mut bench, "new-owner", Some("token-mallory")),
+                ConnectReply::Accepted
+            ), "an expired group id no longer claims anything");
+        });
+    }
+
+    /// A connection that claims a group id but fails validation (bad
+    /// cookie) must not leave the binding behind: the group id is still
+    /// free for the identity that is actually entitled to it.
+    #[test]
+    fn a_failed_connect_does_not_claim_a_group_id() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let make_socket = |wsid: &str| {
+                let (sink, _frames) = mpsc::unbounded_channel();
+                Socket {
+                    client: format!("client-{wsid}"),
+                    sink,
+                }
+            };
+            let connect = |bench: &mut Bench, wsid: &str, stamp: Option<&str>, cookie: Option<&str>| {
+                bench.core.connect(
+                    "g",
+                    wsid.to_owned(),
+                    make_socket(wsid),
+                    cookie.map(str::to_owned),
+                    stamp.map(str::to_owned),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+
+            // Mallory tries to claim the group with a bad cookie: rejected.
+            assert!(matches!(
+                connect(&mut bench, "mallory", Some("token-mallory"), Some("bogus")),
+                ConnectReply::Reset { .. }
+            ), "a bad cookie is rejected");
+
+            // Alice connects with a different identity: still accepted,
+            // because the failed connect left no binding behind.
+            assert!(matches!(
+                connect(&mut bench, "alice", Some("token-alice"), None),
+                ConnectReply::Accepted
+            ), "a failed connect must not claim a group id");
+        });
+    }
+
     /// The two ways of keeping what a client missed meet without a gap or
     /// an overlap. A socket dies unnoticed at cookie `c`: the pokes sent to
     /// it meanwhile are in the log. The server then learns of it and the
@@ -3367,6 +3505,7 @@ mod tests {
                 readiness: watch::channel(true).0,
                 backlog: Vec::new(),
                 groups: HashMap::new(),
+                bindings: HashMap::new(),
                 by_sub: HashMap::new(),
                 awaiting: HashMap::new(),
                 pending: HashMap::new(),
@@ -3410,6 +3549,7 @@ mod tests {
                             client: format!("client-{g}"),
                             sink,
                         },
+                        None,
                         None,
                         Vec::new(),
                         Vec::new(),
@@ -4024,6 +4164,7 @@ mod tests {
                     readiness: watch::channel(true).0,
                     backlog: Vec::new(),
                     groups: HashMap::new(),
+                    bindings: HashMap::new(),
                     by_sub: HashMap::new(),
                     awaiting: HashMap::new(),
                     pending: HashMap::new(),
@@ -4113,6 +4254,7 @@ mod tests {
                                         client: format!("client-{g}"),
                                         sink,
                                     },
+                                    None,
                                     None,
                                     Vec::new(),
                                     Vec::new(),

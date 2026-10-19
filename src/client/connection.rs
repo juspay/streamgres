@@ -452,6 +452,11 @@ async fn handle(
             sink: out.clone(),
         },
         base_cookie: conn.params.base_cookie.clone(),
+        stamp: conn
+            .identity
+            .token
+            .clone()
+            .or_else(|| conn.identity.cookie.clone()),
         lmids,
         results,
         reply: reply_tx,
@@ -459,28 +464,26 @@ async fn handle(
     let refusal = match requests.send(request).await {
         Ok(()) => match reply_rx.await {
             Ok(ConnectReply::Accepted) => None,
-            Ok(ConnectReply::Reset { reason }) => Some(reason),
-            Err(_) => Some("the group thread is gone".to_owned()),
+            Ok(ConnectReply::Reset { reason }) => {
+                Some(("InvalidConnectionRequestBaseCookie", reason))
+            }
+            Ok(ConnectReply::Refused { reason }) => Some(("Unauthorized", reason)),
+            Err(_) => Some(("InvalidConnectionRequest", "the group thread is gone".to_owned())),
         },
-        Err(_) => Some("the group thread is gone".to_owned()),
+        Err(_) => Some(("InvalidConnectionRequest", "the group thread is gone".to_owned())),
     };
     state.stats.connect_group.record(asked.elapsed());
-    if let Some(reason) = refusal {
+    if let Some((kind, reason)) = refusal {
         log_event!(
             Level::Info,
-            "client told to start over",
+            "connection refused",
             wsid = wsid,
-            group = group_id,
+            group = crate::log::group(&group_id),
             cookie = conn.params.base_cookie.as_deref().unwrap_or(""),
+            kind = kind,
             reason = reason
         );
-        send(
-            &out,
-            protocol::error(
-                "InvalidConnectionRequestBaseCookie",
-                &format!("{reason}; start a fresh sync"),
-            ),
-        );
+        send(&out, protocol::error(kind, &format!("{reason}; start a fresh sync")));
         let _ = out.send(Outbound::Close);
         let _ = writer.await;
         return;

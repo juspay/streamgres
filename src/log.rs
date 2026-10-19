@@ -117,6 +117,15 @@ pub fn queued() -> u64 {
     QUEUED.load(Ordering::Relaxed)
 }
 
+/// A client group id as it goes into a log line: a hash, so the logs
+/// still correlate the lines of one group without carrying the id itself.
+pub fn group(group_id: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    group_id.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 /// Write one line at `level`, formatted like `println!`.
 pub fn log(level: Level, message: std::fmt::Arguments<'_>) {
     if !enabled(level) {
