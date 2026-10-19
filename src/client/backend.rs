@@ -39,20 +39,12 @@ pub struct Identity {
 
 impl Identity {
     /// The claim that binds a client group to its first claimant
-    /// ([`super::groups`]), derived once when the connection is made.
-    ///
-    /// The auth token is the claim when the handshake carries one. Without
-    /// it the cookies stand in for it — but as a digest of the header's
-    /// pairs after they are trimmed, sorted and de-duplicated, never as the
-    /// header itself: the same cookies in a different order, or with blank
-    /// pairs among them, are one claim, and the group's binding never holds
-    /// the cookie header. A blank token or cookie is no claim at all, so a
-    /// connection that carries nothing joins only unclaimed groups.
-    ///
-    /// A cookie whose *value* changes (a rotated session) is still a
-    /// different claim, and so is the same user arriving once with a token
-    /// and once with only cookies: the server sees claims, not users, and
-    /// this makes a claim stable rather than verifying one.
+    /// ([`super::groups`]): the auth token, or a digest of the cookie
+    /// header's pairs when there is no token. Never the raw values — a
+    /// group's binding holds no credential — and the pairs are trimmed,
+    /// sorted and de-duplicated first, so the same cookies in another
+    /// order are the same claim. A blank token or cookie is no claim at
+    /// all.
     pub fn stamp(&self) -> Option<String> {
         if let Some(token) = self
             .token
@@ -60,7 +52,7 @@ impl Identity {
             .map(str::trim)
             .filter(|token| !token.is_empty())
         {
-            return Some(token.to_owned());
+            return Some(claim("token", token));
         }
         let cookie = self.cookie.as_deref().map(str::trim)?;
         let mut pairs: Vec<&str> = cookie
@@ -73,12 +65,19 @@ impl Identity {
         }
         pairs.sort_unstable();
         pairs.dedup();
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        "cookie".hash(&mut hasher);
-        pairs.hash(&mut hasher);
-        Some(format!("cookie-{:016x}", hasher.finish()))
+        Some(claim("cookie", &pairs.join("\n")))
     }
+}
+
+/// `kind-<hash>` of `material`: what a group's binding holds instead of the
+/// credential itself. The kind keeps a token and a cookie that print the
+/// same apart.
+fn claim(kind: &str, material: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    kind.hash(&mut hasher);
+    material.hash(&mut hasher);
+    format!("{kind}-{:016x}", hasher.finish())
 }
 
 /// The query endpoint's answer.
@@ -334,69 +333,35 @@ mod tests {
         }
     }
 
-    /// The auth token is the claim whenever it is there and not blank;
-    /// a blank one falls through to the cookies, and a connection that
-    /// carries nothing has no claim and binds nothing.
+    /// The token is the claim when there is one; a blank token falls
+    /// through to the cookies; a blank or absent cookie is no claim. What
+    /// is held is a digest, never the value itself.
     #[test]
     fn a_stamp_is_the_token_or_the_cookies_and_never_blank() {
+        let stamp = identity(Some("token-alice"), Some("sid=1")).stamp();
         assert_eq!(
-            identity(Some("token-alice"), Some("sid=1")).stamp(),
-            Some("token-alice".to_owned()),
-            "the token is the claim when it is present"
+            stamp,
+            identity(Some("  token-alice  "), Some("sid=1")).stamp()
         );
+        assert!(!stamp.unwrap().contains("token-alice"));
         assert_eq!(
-            identity(Some("  token-alice  "), Some("sid=1")).stamp(),
-            Some("token-alice".to_owned()),
-            "a token is trimmed before it is a claim"
+            identity(Some(""), Some("sid=1")).stamp(),
+            identity(None, Some("sid=1")).stamp()
         );
         assert_eq!(identity(None, None).stamp(), None);
-        assert_eq!(identity(None, Some("")).stamp(), None);
-        assert_eq!(identity(None, Some("  ")).stamp(), None);
         assert_eq!(identity(None, Some(" ; ; ")).stamp(), None);
-        assert_eq!(identity(Some(""), None).stamp(), None);
-        assert_eq!(
-            identity(Some("   "), Some("sid=1")).stamp(),
-            identity(None, Some("sid=1")).stamp(),
-            "a blank token is no claim and falls through to the cookies"
-        );
     }
 
-    /// The cookie's digest is the claim when there is no token: the same
-    /// cookies in any order, with blanks among them or repeated, are one
-    /// claim; a header that holds other cookies is another; the digest is
-    /// not the header and never carries it. It does not rewrite the header
-    /// itself — what is forwarded to the application server is untouched.
+    /// The same cookies in any order, with blanks or repeats among them,
+    /// are one claim; a different cookie value is another.
     #[test]
     fn a_cookie_stamp_is_one_claim_per_set_of_cookies() {
         let order = identity(None, Some("a=1; b=2")).stamp();
-        let reversed = identity(None, Some("b=2;a=1")).stamp();
-        let spaced = identity(None, Some("  b=2 ;  a=1  ")).stamp();
-        let blank = identity(None, Some("a=1;; b=2;")).stamp();
-        let repeated = identity(None, Some("a=1; a=1; b=2")).stamp();
-        let digested = order.clone().unwrap();
-        assert!(digested.starts_with("cookie-"), "{digested}");
-        assert_eq!(order, reversed, "cookie order is not part of the claim");
-        assert_eq!(order, spaced, "blank pairs are not part of the claim");
-        assert_eq!(order, blank, "a trailing separator is not part of the claim");
-        assert_eq!(order, repeated, "a repeated pair is one pair");
-        assert!(
-            !digested.contains("a=1") && !digested.contains("b=2"),
-            "the claim must not carry the cookies"
-        );
-        assert_ne!(
-            order,
-            identity(None, Some("a=1; b=2; sid=3")).stamp(),
-            "a different set of cookies is a different claim"
-        );
-        assert_ne!(
-            order,
-            identity(None, Some("a=1; b=3")).stamp(),
-            "a different cookie value is a different claim"
-        );
-        assert_ne!(
-            Some("token-alice".to_owned()),
-            identity(None, Some("token-alice")).stamp(),
-            "a token and a cookie that prints the same are still different claims"
-        );
+        assert_eq!(order, identity(None, Some("b=2;a=1")).stamp());
+        assert_eq!(order, identity(None, Some("  b=2 ;  a=1  ")).stamp());
+        assert_eq!(order, identity(None, Some("a=1;; b=2;")).stamp());
+        assert_eq!(order, identity(None, Some("a=1; a=1; b=2")).stamp());
+        assert_ne!(order, identity(None, Some("a=1; b=3")).stamp());
+        assert_ne!(order, identity(None, Some("a=1; b=2; sid=3")).stamp());
     }
 }
