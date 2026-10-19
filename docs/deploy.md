@@ -261,6 +261,8 @@ depend on what the defaults happen to be:
 | `STREAMGRES_GROUP_LOG_BYTES` | `262144` | recent updates kept per client group, so a briefly disconnected tab catches up instead of starting over. `0` keeps none |
 | `STREAMGRES_MAX_MESSAGE_BYTES` | `16777216` | largest message accepted from a client |
 | `STREAMGRES_ROWS_PER_PART` | `500` | row changes per message part |
+| `STREAMGRES_S2S_TOKEN` | none | secret a backend must send as `Authorization: Bearer <token>` to open the S2S endpoint. Unset, the endpoint takes any connection |
+| `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` | `10000` | subscriptions one S2S connection may hold; past it a subscribe is refused. `0` lifts the limit |
 | `STREAMGRES_LOG` | `info` | `error`, `warn`, `info` or `debug`. `debug` costs throughput |
 | `STREAMGRES_SLOW_QUERY_MS` | `1000` | queries and pushes slower than this are logged at `warn` |
 | `STREAMGRES_METRICS_INTERVAL_MS` | `10000` | how often process metrics are sampled |
@@ -271,9 +273,13 @@ depend on what the defaults happen to be:
 
 - **One port, 4848.** It serves:
   - the WebSocket at `<base path>/sync/v51/connect`
+  - the server-to-server WebSocket at `<base path>/s2s/v1`, for backends
+    that cache their own reads
   - `/health`, `/metrics` and `/stats`
 
-  Keep `/metrics` and `/stats` private.
+  Keep `/metrics` and `/stats` private. Do the same for `/s2s/v1`, or set
+  `STREAMGRES_S2S_TOKEN`. Anyone who can open it can subscribe to the
+  rows of every table the engine follows.
 - **Health.** `GET /health` (also `/healthz`, `/readyz`, and each of them
   under the base path) returns `503` until the server is ready. That means
   the change feed has passed the first read snapshot, and the warm start, if

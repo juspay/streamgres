@@ -299,6 +299,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         s2s_events,
         s2s_requests,
         ready.clone(),
+        config.s2s_connection_subscriptions,
     );
     // Named for `tokio-console` when the runtime is built with
     // `--cfg tokio_unstable`; a plain spawn otherwise.

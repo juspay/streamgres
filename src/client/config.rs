@@ -13,6 +13,16 @@ use crate::log::{Format, Level};
 use crate::model::TableName;
 use crate::sync::pg::{Keepalive, Settings, threads};
 
+/// A setting that must not reach a log: its `Debug` shows no value.
+#[derive(Clone)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
 /// Everything the server reads from the environment.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -124,6 +134,15 @@ pub struct Config {
     /// `STREAMGRES_MAX_MESSAGE_BYTES`: the largest inbound WebSocket message
     /// accepted (16 MiB).
     pub max_message_bytes: usize,
+    /// `STREAMGRES_S2S_TOKEN`: the secret a backend must present as
+    /// `Authorization: Bearer <token>` to open the S2S endpoint. Unset or
+    /// empty, the endpoint takes any connection, which only a trusted
+    /// network should be given.
+    pub s2s_token: Option<Secret>,
+    /// `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS`: how many subscriptions
+    /// one S2S connection may hold, those still registering included; past
+    /// it a subscribe is refused (10000; 0 lifts the limit).
+    pub s2s_connection_subscriptions: usize,
     /// `STREAMGRES_ROWS_PER_PART`: how many row operations one poke part
     /// carries at most (500).
     pub rows_per_part: usize,
@@ -374,6 +393,16 @@ impl Config {
                 })?,
                 None => 16 * 1024 * 1024,
             },
+            s2s_token: first(&["STREAMGRES_S2S_TOKEN"]).map(Secret),
+            s2s_connection_subscriptions: match first(&["STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS"])
+            {
+                Some(text) => text.parse().map_err(|_| {
+                    format!(
+                        "STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS must be a number, got `{text}`"
+                    )
+                })?,
+                None => 10_000,
+            },
             rows_per_part: match first(&["STREAMGRES_ROWS_PER_PART"]) {
                 Some(text) => text.parse().map_err(|_| {
                     format!("STREAMGRES_ROWS_PER_PART must be a number, got `{text}`")
@@ -571,6 +600,33 @@ mod tests {
         assert_eq!(config.ddl_trigger, "my_trigger");
         assert_eq!(config.ddl_prefix, "mine/ddl");
         assert_eq!(config.engine_settings().ddl_trigger, "my_trigger");
+    }
+
+    /// The S2S endpoint takes any connection unless a token is set, and
+    /// the token never shows in the configuration's `Debug`.
+    #[test]
+    fn the_s2s_token_is_optional_and_kept_out_of_logs() {
+        assert!(config_with(&[]).s2s_token.is_none());
+        assert!(
+            config_with(&[("STREAMGRES_S2S_TOKEN", "")])
+                .s2s_token
+                .is_none()
+        );
+        let config = config_with(&[("STREAMGRES_S2S_TOKEN", "hunter2")]);
+        assert_eq!(
+            config.s2s_token.as_ref().map(|token| token.0.as_str()),
+            Some("hunter2")
+        );
+        assert!(!format!("{config:?}").contains("hunter2"));
+    }
+
+    /// One S2S connection holds 10000 subscriptions unless told otherwise.
+    #[test]
+    fn the_s2s_connection_limit_has_a_default() {
+        assert_eq!(config_with(&[]).s2s_connection_subscriptions, 10_000);
+        let limited = config_with(&[("STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS", "3")]);
+        assert_eq!(limited.s2s_connection_subscriptions, 3);
+        assert!(config(&[("STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS", "x")]).is_err());
     }
 
     /// [`config`], expected to parse.

@@ -18,7 +18,12 @@
 //! # Protocol
 //!
 //! JSON text frames, each a two-element array of a tag and a body, on a
-//! WebSocket at `{base}/s2s/v1`.
+//! WebSocket at `{base}/s2s/v1`. With `STREAMGRES_S2S_TOKEN` set, the
+//! upgrade must carry `Authorization: Bearer <token>` and is answered
+//! 401 otherwise; unset, any connection is taken, so the port belongs on
+//! a trusted network. A connection holds at most
+//! `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` subscriptions; a subscribe
+//! past that is refused.
 //!
 //! Upstream:
 //! - `["subscribe", {"id": n, "sql": "...", "binds": [{"oid": 25, "bytes": "<base64>"}, {"oid": 20, "bytes": null}], "rows": bool}]`
@@ -74,7 +79,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -216,7 +222,12 @@ struct NodeShape {
 impl Shape {
     pub fn new(query: &MultiTableReadQuery, projection: Projection, offset: u32) -> Shape {
         let mut nodes = Vec::new();
-        fn walk(query: &MultiTableReadQuery, parent: Option<usize>, edge: Option<(&str, &str, bool)>, nodes: &mut Vec<NodeShape>) {
+        fn walk(
+            query: &MultiTableReadQuery,
+            parent: Option<usize>,
+            edge: Option<(&str, &str, bool)>,
+            nodes: &mut Vec<NodeShape>,
+        ) {
             nodes.push(NodeShape {
                 table: query.main_table.table.clone(),
                 parent,
@@ -244,6 +255,9 @@ impl Shape {
             nodes,
             projection,
             order: query.main_table.order_by.clone(),
+            // The tree's limit is `limit + offset`, so it is never below
+            // the offset: `parse_select` refuses a sum that would pass
+            // `u32::MAX`, which also keeps it clear of the no-limit value.
             limit: if query.main_table.limit == u32::MAX {
                 u32::MAX
             } else {
@@ -285,6 +299,9 @@ struct Task {
     /// so the backend's first read lands after the engine's.
     hydrating: HashSet<SubId>,
     next_token: u64,
+    /// How many subscriptions one connection may hold, registering ones
+    /// included (0: no limit).
+    per_connection: usize,
 }
 
 /// Runs the task: the engine's events on one side, the connections'
@@ -296,6 +313,7 @@ pub async fn run(
     mut events: mpsc::UnboundedReceiver<Event>,
     mut requests: mpsc::Receiver<Request>,
     mut ready: watch::Receiver<bool>,
+    per_connection: usize,
 ) {
     // Queries are registered only once the engine's position covers the
     // storage; until then a registration would read a snapshot the feed
@@ -316,6 +334,7 @@ pub async fn run(
         shapes: HashMap::new(),
         hydrating: HashSet::new(),
         next_token: 1,
+        per_connection,
     };
     loop {
         tokio::select! {
@@ -365,7 +384,8 @@ impl Task {
                 // A registration still in flight for the id is not wanted
                 // either: `Registered` then finds no owner and unregisters
                 // it, and the id is free to subscribe again.
-                self.by_token.retain(|_, (owner, own_id, _)| !(*owner == conn && *own_id == id));
+                self.by_token
+                    .retain(|_, (owner, own_id, _)| !(*owner == conn && *own_id == id));
             }
             Request::Disconnected { conn } => {
                 if let Some(gone) = self.conns.remove(&conn) {
@@ -392,10 +412,24 @@ impl Task {
         let Some(connection) = self.conns.get_mut(&conn) else {
             return;
         };
-        if connection.subs.contains_key(&id)
-            || self.by_token.values().any(|(c, i, _)| *c == conn && *i == id)
-        {
+        let registering: Vec<u64> = self
+            .by_token
+            .values()
+            .filter(|(owner, _, _)| *owner == conn)
+            .map(|(_, own_id, _)| *own_id)
+            .collect();
+        if connection.subs.contains_key(&id) || registering.contains(&id) {
             connection.send(refused(id, "that id is already subscribed"));
+            return;
+        }
+        if self.per_connection > 0
+            && connection.subs.len() + registering.len() >= self.per_connection
+        {
+            let reason = format!(
+                "the subscription limit of {} per connection is reached",
+                self.per_connection
+            );
+            connection.send(refused(id, &reason));
             return;
         }
         let token = self.next_token;
@@ -459,14 +493,13 @@ impl Task {
             }
             Event::Refused { sub, reason } => self.drop_sub(sub, &reason).await,
             Event::Capped { sub } => {
-                self.drop_sub(sub, "the query has more rows than the engine follows").await;
+                self.drop_sub(sub, "the query has more rows than the engine follows")
+                    .await;
             }
             Event::Committed { updates, .. } | Event::Landed { updates } => self.changed(&updates),
             Event::Heavy { sub, table, rows } => {
                 if let Some((conn, id)) = self.by_sub.get(&sub) {
-                    log_warn!(
-                        "s2s connection {conn}: query {id} holds {rows} rows of {table}"
-                    );
+                    log_warn!("s2s connection {conn}: query {id} holds {rows} rows of {table}");
                 }
             }
         }
@@ -524,7 +557,12 @@ impl Task {
                         .map(|p| json!([p.table.as_str(), p.column.as_str()]))
                         .collect(),
                 ),
-                Json::Array(columns.iter().map(|p| Json::from(p.name.as_str())).collect()),
+                Json::Array(
+                    columns
+                        .iter()
+                        .map(|p| Json::from(p.name.as_str()))
+                        .collect(),
+                ),
             ),
         };
         let order: Vec<Json> = shape
@@ -541,18 +579,16 @@ impl Task {
             })
             .collect();
         let limit = (shape.limit != u32::MAX).then_some(shape.limit);
-        connection.send(
-            json!(["accepted", {
-                "id": id,
-                "nodes": nodes,
-                "columns": columns,
-                "names": names,
-                "count": matches!(shape.projection, Projection::Count { .. }),
-                "order": order,
-                "limit": limit,
-                "offset": shape.offset,
-            }]),
-        );
+        connection.send(json!(["accepted", {
+            "id": id,
+            "nodes": nodes,
+            "columns": columns,
+            "names": names,
+            "count": matches!(shape.projection, Projection::Count { .. }),
+            "order": order,
+            "limit": limit,
+            "offset": shape.offset,
+        }]));
     }
 
     /// Tells each connection what the deltas did to its subscriptions:
@@ -565,6 +601,9 @@ impl Task {
         let catalog = self.catalog.load();
         for delta in updates {
             let table = catalog.table(delta.table.as_str());
+            // The row as JSON, built for the first rows-mode subscription
+            // it reaches and cloned for the rest.
+            let mut image: Option<Json> = None;
             for target in delta.targets() {
                 let Some((conn, id)) = self.by_sub.get(&target.sub) else {
                     continue;
@@ -593,7 +632,8 @@ impl Task {
                     // a delete, and no key is in both lists.
                     match (&delta.op, table) {
                         (DataFrameOperation::Add(key, row), Some(table)) => {
-                            keys.insert(key.clone(), Some(wire::row_json(row, table)));
+                            let image = image.get_or_insert_with(|| wire::row_json(row, table));
+                            keys.insert(key.clone(), Some(image.clone()));
                         }
                         (DataFrameOperation::Delete(key, _), _) => {
                             keys.insert(key.clone(), None);
@@ -680,12 +720,46 @@ fn send(out: &mpsc::Sender<String>, message: Json) {
 }
 
 /// The route handler: upgrades the socket once the engine is serving.
-pub async fn connect(State(state): State<Arc<AppState>>, upgrade: WebSocketUpgrade) -> Response {
+pub async fn connect(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    if let Some(token) = &state.config.s2s_token
+        && !authorized(&headers, &token.0)
+    {
+        log_warn!("s2s connection refused: no valid bearer token");
+        return (StatusCode::UNAUTHORIZED, "a bearer token is required").into_response();
+    }
     if !*state.ready.borrow() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "the engine is not serving yet").into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the engine is not serving yet",
+        )
+            .into_response();
     }
     let upgrade = upgrade.max_message_size(state.config.max_message_bytes);
     upgrade.on_upgrade(move |socket| handle(socket, state))
+}
+
+/// Whether the request carries `Authorization: Bearer <token>`. The
+/// comparison takes as long for a near miss as for a far one, so the
+/// token cannot be guessed a byte at a time.
+fn authorized(headers: &HeaderMap, token: &str) -> bool {
+    let Some(presented) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return false;
+    };
+    let (presented, token) = (presented.as_bytes(), token.as_bytes());
+    presented.len() == token.len()
+        && presented
+            .iter()
+            .zip(token)
+            .fold(0u8, |differ, (a, b)| differ | (a ^ b))
+            == 0
 }
 
 async fn handle(socket: WebSocket, state: Arc<AppState>) {
@@ -752,7 +826,9 @@ async fn serve(
         };
         let text = match frame {
             Some(Ok(Message::Text(text))) => text,
-            Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) => continue,
+            Some(Ok(Message::Ping(_)))
+            | Some(Ok(Message::Pong(_)))
+            | Some(Ok(Message::Binary(_))) => continue,
             Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
         };
         match upstream(&text) {
@@ -904,6 +980,211 @@ fn bind(value: &Json) -> Result<BindValue, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ivm::{Audience, QueryPart, Subs};
+    use crate::model::{Catalog, ColumnName, DbColumn, DbTable, Value, ValueType};
+
+    /// A task over one table, `notes (id, name)`, with connection 1 open:
+    /// the task, the engine's commands, and connection 1's frames.
+    fn task(
+        per_connection: usize,
+    ) -> (
+        Task,
+        mpsc::Receiver<Command<MultiTableReadQuery>>,
+        mpsc::Receiver<String>,
+    ) {
+        let catalog = Catalog::new([DbTable::new(
+            "notes",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("name", ValueType::String),
+            ],
+        )]);
+        let (commands, commands_rx) = mpsc::channel(64);
+        let mut task = Task {
+            catalog: Arc::new(CatalogHandle::new(catalog)),
+            sink: 0,
+            commands,
+            conns: HashMap::new(),
+            by_token: HashMap::new(),
+            by_sub: HashMap::new(),
+            shapes: HashMap::new(),
+            hydrating: HashSet::new(),
+            next_token: 1,
+            per_connection,
+        };
+        let (out, frames) = mpsc::channel(64);
+        connect(&mut task, 1, out);
+        (task, commands_rx, frames)
+    }
+
+    fn connect(task: &mut Task, conn: u64, out: mpsc::Sender<String>) {
+        let (close, _closed) = oneshot::channel();
+        task.conns.insert(
+            conn,
+            Conn {
+                out,
+                close: Some(close),
+                subs: HashMap::new(),
+            },
+        );
+    }
+
+    /// Connection `conn` subscribes `SELECT * FROM notes` under `id`.
+    async fn subscribe(task: &mut Task, conn: u64, id: u64, rows: bool) {
+        let select =
+            parse_select("SELECT * FROM notes", &[], &task.catalog.load()).expect("parses");
+        let shape = rows.then(|| Shape::new(&select.query, select.projection, select.offset));
+        task.subscribe(conn, id, select.query, shape).await;
+    }
+
+    /// The tokens of the registrations sent to the engine so far.
+    fn registered(commands: &mut mpsc::Receiver<Command<MultiTableReadQuery>>) -> Vec<u64> {
+        let mut tokens = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            if let Command::Register { token, .. } = command {
+                tokens.push(token);
+            }
+        }
+        tokens
+    }
+
+    /// The frames sent to a connection so far.
+    fn frames(out: &mut mpsc::Receiver<String>) -> Vec<Json> {
+        let mut frames = Vec::new();
+        while let Ok(text) = out.try_recv() {
+            frames.push(serde_json::from_str(&text).expect("json"));
+        }
+        frames
+    }
+
+    /// The engine registered the subscription of `token` as `sub`, with
+    /// nothing to read.
+    async fn register(task: &mut Task, token: u64, sub: u64) {
+        task.event(Event::Registered {
+            token,
+            sub: SubId(sub),
+            updates: Vec::new(),
+            reads: 0,
+        })
+        .await;
+    }
+
+    fn put(subs: &[u64], id: i64, name: &str) -> Delta {
+        let key = DataFrameKey::from(HashMap::from([(ColumnName::from("id"), Value::Int(id))]));
+        let row = DataFrameRow::from(HashMap::from([
+            (ColumnName::from("id"), Value::Int(id)),
+            (ColumnName::from("name"), Value::from(name)),
+        ]));
+        Delta {
+            table: TableName::from("notes"),
+            op: DataFrameOperation::Add(key, row),
+            audiences: vec![Audience {
+                part: QueryPart::main(),
+                subs: Subs::Many(subs.iter().map(|sub| SubId(*sub)).collect()),
+            }],
+        }
+    }
+
+    /// A connection holds as many subscriptions as it is allowed, those
+    /// the engine is still registering counted, and one more is refused
+    /// until one goes; other connections have their own allowance.
+    #[tokio::test]
+    async fn a_connection_holds_at_most_its_subscription_limit() {
+        let (mut task, mut commands, mut out) = task(2);
+        subscribe(&mut task, 1, 1, false).await;
+        subscribe(&mut task, 1, 2, false).await;
+        subscribe(&mut task, 1, 3, false).await;
+        assert_eq!(registered(&mut commands), vec![1, 2]);
+        assert_eq!(
+            frames(&mut out),
+            vec![
+                json!(["refused", {"id": 3, "reason": "the subscription limit of 2 per connection is reached"}])
+            ]
+        );
+
+        register(&mut task, 1, 10).await;
+        subscribe(&mut task, 1, 4, false).await;
+        assert!(
+            registered(&mut commands).is_empty(),
+            "a registered one still counts"
+        );
+
+        task.request(Request::Unsubscribe { conn: 1, id: 1 }).await;
+        subscribe(&mut task, 1, 5, false).await;
+        assert_eq!(registered(&mut commands), vec![3]);
+
+        let (other, mut other_out) = mpsc::channel(64);
+        connect(&mut task, 2, other);
+        subscribe(&mut task, 2, 1, false).await;
+        assert_eq!(registered(&mut commands), vec![4]);
+        assert!(frames(&mut other_out).is_empty());
+    }
+
+    /// With the limit at zero a connection subscribes without one.
+    #[tokio::test]
+    async fn a_zero_limit_lifts_it() {
+        let (mut task, mut commands, mut out) = task(0);
+        for id in 1..=5 {
+            subscribe(&mut task, 1, id, false).await;
+        }
+        assert_eq!(registered(&mut commands).len(), 5);
+        assert!(frames(&mut out).is_empty());
+    }
+
+    /// A row two rows-mode subscriptions share reaches both, and a row
+    /// of one transaction never stands in for another's.
+    #[tokio::test]
+    async fn each_subscription_gets_the_rows_of_its_own_deltas() {
+        let (mut task, _commands, mut out) = task(0);
+        subscribe(&mut task, 1, 1, true).await;
+        subscribe(&mut task, 1, 2, true).await;
+        register(&mut task, 1, 10).await;
+        register(&mut task, 2, 20).await;
+        frames(&mut out);
+
+        task.changed(&[put(&[10, 20], 1, "one"), put(&[10], 2, "two")]);
+        let mut deltas: Vec<Json> = frames(&mut out);
+        deltas.sort_by_key(|frame| frame[1]["id"].as_u64());
+        let puts = |frame: &Json| -> Vec<(i64, String)> {
+            let mut rows: Vec<(i64, String)> = frame[1]["changes"][0]["put"]
+                .as_array()
+                .expect("puts")
+                .iter()
+                .map(|row| {
+                    (
+                        row["id"].as_i64().unwrap(),
+                        row["name"].as_str().unwrap().to_owned(),
+                    )
+                })
+                .collect();
+            rows.sort();
+            rows
+        };
+        assert_eq!(deltas.len(), 2, "{deltas:?}");
+        assert_eq!(
+            puts(&deltas[0]),
+            vec![(1, "one".to_owned()), (2, "two".to_owned())]
+        );
+        assert_eq!(puts(&deltas[1]), vec![(1, "one".to_owned())]);
+    }
+
+    /// Only the configured token, as a bearer, opens the endpoint.
+    #[test]
+    fn only_the_bearer_token_authorizes() {
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, value.parse().unwrap());
+            headers
+        };
+        assert!(authorized(&with("Bearer s3cret"), "s3cret"));
+        assert!(!authorized(&with("Bearer s3cres"), "s3cret"));
+        assert!(!authorized(&with("Bearer s3cret2"), "s3cret"));
+        assert!(!authorized(&with("Bearer "), "s3cret"));
+        assert!(!authorized(&with("Basic s3cret"), "s3cret"));
+        assert!(!authorized(&with("s3cret"), "s3cret"));
+        assert!(!authorized(&HeaderMap::new(), "s3cret"));
+    }
 
     #[test]
     fn frames_parse_into_requests() {
@@ -945,6 +1226,11 @@ mod tests {
         assert!(upstream(r#"["subscribe", {"id": -1}]"#).is_err());
         assert!(upstream(r#"["nope", {}]"#).is_err());
         assert!(upstream("{}").is_err());
-        assert!(upstream(r#"["subscribe", {"id": 1, "sql": "x", "binds": [{"oid": 25, "bytes": "%%"}]}]"#).is_err());
+        assert!(
+            upstream(
+                r#"["subscribe", {"id": 1, "sql": "x", "binds": [{"oid": 25, "bytes": "%%"}]}]"#
+            )
+            .is_err()
+        );
     }
 }

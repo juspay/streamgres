@@ -21,7 +21,8 @@ resubscribes and refills, and asks again about what was refused. See
 
 ```rust
 // Pool size and subscription cap from STREAMGRES_S2S_CONNECTIONS and
-// STREAMGRES_S2S_MAX_SUBSCRIPTIONS (defaults 2 and 10000).
+// STREAMGRES_S2S_MAX_SUBSCRIPTIONS (defaults 2 and 10000); the bearer
+// token from STREAMGRES_S2S_TOKEN when the engine asks for one.
 let engine = EngineClient::connect("ws://engine:4848/zero/s2s/v1");
 let cache = Arc::new(Cache::new(256 * 1024 * 1024, Arc::new(engine.clone())));
 engine.attach(&cache);

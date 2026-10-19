@@ -53,6 +53,10 @@ use serde_json::{Value as Json, json};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Request;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
 use crate::cache::Cache;
 use crate::key::QueryKey;
@@ -86,13 +90,29 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// | `STREAMGRES_S2S_CONNECTIONS`        | sockets to the engine              | 2       |
 /// | `STREAMGRES_S2S_MAX_SUBSCRIPTIONS`  | subscriptions held, all sockets    | 10000   |
 /// | `STREAMGRES_S2S_VERDICT_TIMEOUT_MS` | wait for `accepted` or `refused`   | 5000    |
+/// | `STREAMGRES_S2S_TOKEN`              | bearer token the engine asks for   | none    |
 ///
-/// A value that is missing, not a number, or zero leaves the default.
-#[derive(Clone, Debug)]
+/// A number that is missing, not a number, or zero leaves the default;
+/// an empty token is no token.
+#[derive(Clone)]
 pub struct Config {
     pub connections: usize,
     pub max_subscriptions: usize,
     pub verdict_timeout: Duration,
+    /// Sent as `Authorization: Bearer <token>` when each socket opens,
+    /// for an engine started with `STREAMGRES_S2S_TOKEN`.
+    pub token: Option<String>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("connections", &self.connections)
+            .field("max_subscriptions", &self.max_subscriptions)
+            .field("verdict_timeout", &self.verdict_timeout)
+            .field("token", &self.token.as_ref().map(|_| ".."))
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -101,6 +121,7 @@ impl Default for Config {
             connections: DEFAULT_CONNECTIONS,
             max_subscriptions: DEFAULT_MAX_SUBSCRIPTIONS,
             verdict_timeout: DEFAULT_VERDICT_TIMEOUT,
+            token: None,
         }
     }
 }
@@ -115,6 +136,9 @@ impl Config {
             verdict_timeout: env_number("STREAMGRES_S2S_VERDICT_TIMEOUT_MS")
                 .map(|millis| Duration::from_millis(millis as u64))
                 .unwrap_or(defaults.verdict_timeout),
+            token: std::env::var("STREAMGRES_S2S_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty()),
         }
     }
 }
@@ -156,6 +180,8 @@ struct Shared {
     /// Which worker holds each key. Also the count against the cap.
     by_key: Mutex<HashMap<QueryKey, usize>>,
     max_subscriptions: usize,
+    /// The bearer token each socket opens with, if the engine asks for one.
+    token: Option<String>,
     /// Column types by table, learnt on the first rows-mode subscribe of
     /// a table and reused for every delta and resubscribe after; looked
     /// up again when a snapshot names a column they lack, which is how a
@@ -305,6 +331,7 @@ impl EngineClient {
         let shared = Arc::new(Shared {
             by_key: Mutex::new(HashMap::new()),
             max_subscriptions: config.max_subscriptions,
+            token: config.token.clone(),
             types: Mutex::new(HashMap::new()),
             fallbacks: Mutex::new(Vec::new()),
             refusals: Mutex::new(Vec::new()),
@@ -835,6 +862,18 @@ fn bind_json(bind: &crate::key::Bind) -> Json {
     })
 }
 
+/// The upgrade request for `url`, with the bearer token when there is
+/// one. `None` when either cannot go in a request; the worker then keeps
+/// retrying like any other failed connect, and every read is served live.
+fn upgrade_request(url: &str, token: Option<&str>) -> Option<Request> {
+    let mut request = url.into_client_request().ok()?;
+    if let Some(token) = token {
+        let value = HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
+        request.headers_mut().insert(AUTHORIZATION, value);
+    }
+    Some(request)
+}
+
 /// Connects, serves, reconnects, forever: one worker's socket.
 async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedReceiver<Outgoing>) {
     let mut first = true;
@@ -846,7 +885,10 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
         if worker.shared.stopped.load(Ordering::Acquire) {
             return;
         }
-        let socket = match tokio_tungstenite::connect_async(&worker.url).await {
+        let Some(request) = upgrade_request(&worker.url, worker.shared.token.as_deref()) else {
+            continue;
+        };
+        let socket = match tokio_tungstenite::connect_async(request).await {
             Ok((socket, _)) => socket,
             Err(_) => continue,
         };
@@ -1174,6 +1216,7 @@ mod tests {
         let shared = Arc::new(Shared {
             by_key: Mutex::new(HashMap::new()),
             max_subscriptions: 100,
+            token: None,
             types: Mutex::new(HashMap::new()),
             fallbacks: Mutex::new(Vec::new()),
             refusals: Mutex::new(Vec::new()),
@@ -1475,6 +1518,24 @@ mod tests {
         assert_eq!(defaults.max_subscriptions, DEFAULT_MAX_SUBSCRIPTIONS);
         assert_eq!(defaults.verdict_timeout, DEFAULT_VERDICT_TIMEOUT);
         assert_eq!(env_number("STREAMGRES_S2S_TEST_UNSET_VARIABLE"), None);
+    }
+
+    /// The token goes out as a bearer, and only when there is one; it
+    /// never shows in the configuration's `Debug`.
+    #[test]
+    fn the_token_goes_out_as_a_bearer() {
+        let url = "ws://127.0.0.1:4848/zero/s2s/v1";
+        let plain = upgrade_request(url, None).expect("a request");
+        assert!(plain.headers().get(AUTHORIZATION).is_none());
+        let with = upgrade_request(url, Some("s3cret")).expect("a request");
+        assert_eq!(with.headers()[AUTHORIZATION], "Bearer s3cret");
+        assert!(upgrade_request(url, Some("bad\nline")).is_none());
+        assert!(upgrade_request("not a url", None).is_none());
+        let config = Config {
+            token: Some("s3cret".into()),
+            ..Config::default()
+        };
+        assert!(!format!("{config:?}").contains("s3cret"));
     }
 
     #[test]
