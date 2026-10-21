@@ -183,10 +183,13 @@ struct Engine {
     footprint: Footprint,
 }
 
-/// A push awaiting the `lastMutationIDChanges` that acknowledges it.
+/// A push awaiting backend acceptance and the `lastMutationIDChanges` poke.
 struct PendingPush {
+    token: u64,
     mutation: i64,
     at: Instant,
+    acknowledged_at: Option<Instant>,
+    backend_accepted: bool,
 }
 
 /// What only sampling or the group threads can report.
@@ -261,6 +264,7 @@ static GLOBAL: OnceLock<Arc<Stats>> = OnceLock::new();
 pub struct Stats {
     started: Instant,
     metric_prefix: String,
+    next_push_token: AtomicU64,
     pub feed_decode: Histogram,
     pub feed_lag: Histogram,
     pub feed_to_engine: Histogram,
@@ -436,6 +440,7 @@ impl Stats {
         Stats {
             started: Instant::now(),
             metric_prefix: prefix,
+            next_push_token: AtomicU64::new(1),
             feed_decode: Histogram::new(),
             feed_lag: Histogram::new(),
             feed_to_engine: Histogram::new(),
@@ -556,15 +561,62 @@ impl Stats {
         }
     }
 
-    /// Note a push of `mutation` by `client`, awaiting its acknowledgement.
-    pub fn push_sent(&self, client: &str, mutation: i64) {
+    /// Note a push of `mutation` by `client`, awaiting backend acceptance
+    /// and its acknowledgement poke.
+    pub fn push_sent(&self, client: &str, mutation: i64) -> u64 {
+        let token = self.next_push_token.fetch_add(1, Ordering::Relaxed);
+        let at = Instant::now();
         if let Ok(mut pushes) = self.pushes.lock() {
             let pending = pushes.entry(client.to_owned()).or_default();
             pending.retain(|push| push.at.elapsed() < Duration::from_secs(120));
             pending.push(PendingPush {
+                token,
                 mutation,
-                at: Instant::now(),
+                at,
+                acknowledged_at: None,
+                backend_accepted: false,
             });
+        }
+        token
+    }
+
+    /// The mutate endpoint accepted this attempt as a new mutation. If its
+    /// LMID poke arrived first, record the original push-to-poke duration now.
+    pub fn push_backend_accepted(&self, client: &str, mutation: i64, token: u64) {
+        if let Ok(mut pushes) = self.pushes.lock() {
+            let Some(pending) = pushes.get_mut(client) else {
+                return;
+            };
+            let Some(index) = pending
+                .iter()
+                .position(|push| push.mutation == mutation && push.token == token)
+            else {
+                return;
+            };
+            if let Some(acknowledged_at) = pending[index].acknowledged_at {
+                self.mutation_ack
+                    .record(acknowledged_at.duration_since(pending[index].at));
+                pending.remove(index);
+            } else {
+                pending[index].backend_accepted = true;
+            }
+            if pending.is_empty() {
+                pushes.remove(client);
+            }
+        }
+    }
+
+    /// Forget one push attempt that will not produce a new LMID poke.
+    /// Other attempts for the same mutation still wait for their own poke.
+    pub fn push_no_poke(&self, client: &str, mutation: i64, token: u64) {
+        if let Ok(mut pushes) = self.pushes.lock() {
+            let Some(pending) = pushes.get_mut(client) else {
+                return;
+            };
+            pending.retain(|push| push.mutation != mutation || push.token != token);
+            if pending.is_empty() {
+                pushes.remove(client);
+            }
         }
     }
 
@@ -576,10 +628,15 @@ impl Stats {
                 return;
             };
             let now = Instant::now();
-            pending.retain(|push| {
+            pending.retain_mut(|push| {
                 if push.mutation <= lmid {
-                    self.mutation_ack.record(now.duration_since(push.at));
-                    false
+                    if push.backend_accepted {
+                        self.mutation_ack.record(now.duration_since(push.at));
+                        false
+                    } else {
+                        push.acknowledged_at.get_or_insert(now);
+                        true
+                    }
                 } else {
                     true
                 }
@@ -1900,9 +1957,12 @@ mod tests {
     #[test]
     fn a_push_is_acknowledged_by_the_mutation_id_that_covers_it() {
         let stats = Stats::new();
-        stats.push_sent("c1", 3);
-        stats.push_sent("c1", 4);
-        stats.push_sent("c2", 1);
+        let c1m3 = stats.push_sent("c1", 3);
+        let c1m4 = stats.push_sent("c1", 4);
+        let c2m1 = stats.push_sent("c2", 1);
+        stats.push_backend_accepted("c1", 3, c1m3);
+        stats.push_backend_accepted("c1", 4, c1m4);
+        stats.push_backend_accepted("c2", 1, c2m1);
         stats.lmid_seen("c1", 3);
         assert_eq!(
             stats.mutation_ack.summary().count,
