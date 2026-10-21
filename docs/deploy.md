@@ -291,6 +291,27 @@ depend on what the defaults happen to be:
     headers;
   - should not close idle WebSockets in under 60 s.
 
+### Authentication
+
+**The server has no built-in client authentication.** It accepts every
+WebSocket connection regardless of whether the client supplies an auth token or
+a cookie. The application server's query endpoint is the authentication
+boundary: it receives the connection's credentials (the HTTP `Cookie` header
+and the `authToken` from the handshake) on every `transform` call, and must
+verify them and return an AST only for queries the caller is allowed to see.
+If the application server does not enforce authentication on its transform
+endpoint, any client that can reach port 4848 can subscribe to queries and
+receive rows.
+
+**Port 4848 must not be publicly reachable.** The server listens on
+`0.0.0.0:4848` by default, which binds every interface. Put an authenticating
+reverse proxy in front and restrict access to port 4848:
+
+- Set `STREAMGRES_ADDR=127.0.0.1:4848` when the proxy runs on the same host,
+  so port 4848 is not reachable from outside the machine.
+- In a container environment, use a network policy to limit port 4848 to
+  traffic from the proxy's subnet only.
+
 ## 7. Routing traffic
 
 Clients connect to `<scheme>://<host>/<base path>`.
