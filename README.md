@@ -123,7 +123,7 @@ queries.
 ticket-desk backend built on the Diesel wrapper, with a background writer
 keeping the data moving; `demo/README.md` walks through it with curl, and
 <http://localhost:8080> shows the cache's counters live. The backend is
-`crates/streamgres-example`, which is also the wrapper's test bed.
+`crates/streamgres-demo`, which is also the wrapper's test bed.
 
 ### Server-to-server clients
 
@@ -135,7 +135,7 @@ for the client to apply) or `refused`, then sends `delta`
 with the rows each committed transaction put or deleted, so the backend
 never reads Postgres for a query it holds. The protocol is documented in
 `src/client/s2s.rs`. The Diesel wrapper that uses it lives in this
-repository as [`crates/streamgres-diesel`](crates/streamgres-diesel):
+repository as [`crates/diesel-streamgres`](crates/diesel-streamgres):
 a drop-in `PgConnection` replacement whose reads come from an in-memory
 cache the engine keeps fresh.
 

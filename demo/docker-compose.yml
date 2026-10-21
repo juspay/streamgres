@@ -39,11 +39,11 @@ services:
   seed:
     build:
       context: ..
-      dockerfile: docker/example/Dockerfile
+      dockerfile: docker/demo/Dockerfile
     command: ["seed"]
     environment:
       DATABASE_URL: postgres://streamgres:streamgres@postgres:5432/tickets
-      EXAMPLE_SCALE: "${EXAMPLE_SCALE:-1}"
+      DEMO_SCALE: "${DEMO_SCALE:-1}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -63,7 +63,7 @@ services:
       STREAMGRES_ADDR: 0.0.0.0:4848
     ports:
       - "${ENGINE_PORT:-4848}:4848"
-    # A migration the engine cannot follow (`example migrate drop`)
+    # A migration the engine cannot follow (`demo migrate drop`)
     # stops it on purpose; restarted, it serves the schema as it is.
     restart: on-failure
     depends_on:
@@ -75,21 +75,21 @@ services:
       timeout: 2s
       retries: 60
 
-  example:
+  demo:
     build:
       context: ..
-      dockerfile: docker/example/Dockerfile
+      dockerfile: docker/demo/Dockerfile
     command: ["serve"]
     environment:
       DATABASE_URL: postgres://streamgres:streamgres@postgres:5432/tickets
       STREAMGRES_S2S_URL: ws://engine:4848/zero/s2s/v1
-      EXAMPLE_ADDR: 0.0.0.0:8080
-      EXAMPLE_WRITER_MS: "${EXAMPLE_WRITER_MS:-1000}"
-      EXAMPLE_WRITER_MIX: "${EXAMPLE_WRITER_MIX:-}"
-      EXAMPLE_VERIFY_MS: "${EXAMPLE_VERIFY_MS:-0}"
-      EXAMPLE_SCALE: "${EXAMPLE_SCALE:-1}"
+      DEMO_ADDR: 0.0.0.0:8080
+      DEMO_WRITER_MS: "${DEMO_WRITER_MS:-1000}"
+      DEMO_WRITER_MIX: "${DEMO_WRITER_MIX:-}"
+      DEMO_VERIFY_MS: "${DEMO_VERIFY_MS:-0}"
+      DEMO_SCALE: "${DEMO_SCALE:-1}"
     ports:
-      - "${EXAMPLE_PORT:-8080}:8080"
+      - "${DEMO_PORT:-8080}:8080"
     depends_on:
       engine:
         condition: service_healthy

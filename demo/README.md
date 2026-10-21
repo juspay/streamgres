@@ -12,7 +12,7 @@ docker compose -f demo/docker-compose.yml up --build
 
 When the three services are up, open <http://localhost:8080> for the
 stats page, or walk through it with curl. If a port is taken on your
-machine, override it: `EXAMPLE_PORT=8081 ENGINE_PORT=4850
+machine, override it: `DEMO_PORT=8081 ENGINE_PORT=4850
 POSTGRES_PORT=5435 docker compose -f demo/docker-compose.yml up --build`.
 
 ## 1. A read, twice
@@ -54,7 +54,7 @@ results, an `interval` column the engine cannot ship (so that query is
 refilled from Postgres on each change instead), and the shapes the
 engine refuses and serves live: `ILIKE`, `DISTINCT`, `GROUP BY`, `MAX`
 and the array operator `@>`. The stats page has a button per shape;
-`crates/streamgres-example/README.md` lists them with their paths.
+`crates/streamgres-demo/README.md` lists them with their paths.
 
 ## 4. Routing
 
@@ -105,18 +105,18 @@ Every lookup is read through the cache and through Postgres and
 compared. A pair that differs is read again for up to a second, since
 the cache may lag a commit by the engine's propagation delay; one that
 never agrees is a mismatch, returned with both answers. With
-`EXAMPLE_VERIFY_MS=500` the backend runs this pass every half second
+`DEMO_VERIFY_MS=500` the backend runs this pass every half second
 in the background, under the writer, and `/stats` carries the totals.
 The writer's mix covers inserts, deletes, moves between organizations,
 renames under the joins, assignees flipped to `NULL` and back,
 multi-row transactions, rollbacks and oversized comment bodies
-(`EXAMPLE_WRITER_MIX` narrows it), so the stack is a continuous
+(`DEMO_WRITER_MIX` narrows it), so the stack is a continuous
 correctness test of the wrapper, not only a demo.
 
 ## 8. Schema changes
 
 ```bash
-docker compose -f demo/docker-compose.yml exec example /app/example migrate widen
+docker compose -f demo/docker-compose.yml exec demo /app/demo migrate widen
 curl -s localhost:8080/tickets/1 | jq '{source}'
 ```
 
@@ -132,7 +132,7 @@ way: the replication stream carries no rows for it to follow.
 ## 9. How stale is the cache?
 
 ```bash
-docker compose -f demo/docker-compose.yml exec example /app/example lag --rate 20 --for 10
+docker compose -f demo/docker-compose.yml exec demo /app/demo lag --rate 20 --for 10
 ```
 
 prints how long a commit takes to reach the cached answer, as p50, p95,
@@ -144,8 +144,8 @@ second.
 Without the compose stack in the way, against the same services:
 
 ```bash
-docker compose -f demo/docker-compose.yml exec example \
-  /app/example bench --lookup queue --concurrency 16 --requests 5000
+docker compose -f demo/docker-compose.yml exec demo \
+  /app/demo bench --lookup queue --concurrency 16 --requests 5000
 ```
 
 prints p50, p95, p99 and throughput for the Postgres route and the
@@ -153,10 +153,10 @@ Streamgres route side by side.
 
 ## Running it against your own Postgres
 
-The backend is `crates/streamgres-example`; `example seed`, `example
-serve` and `example bench` take `DATABASE_URL` and
-`STREAMGRES_S2S_URL`; `example verify` and `example migrate` too.
-`EXAMPLE_SCALE=10` seeds ten times the tickets, so pages run deep and
+The backend is `crates/streamgres-demo`; `demo seed`, `demo
+serve` and `demo bench` take `DATABASE_URL` and
+`STREAMGRES_S2S_URL`; `demo verify` and `demo migrate` too.
+`DEMO_SCALE=10` seeds ten times the tickets, so pages run deep and
 the cache's byte limits matter. Postgres needs `wal_level = logical`,
 the publication and the schema-change trigger (`demo/postgres-init.sql`
 and `scripts/sql/ddl-triggers.sql`); see `docs/deploy.md`.

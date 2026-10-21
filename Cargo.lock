@@ -624,6 +624,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "diesel-streamgres"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "chrono",
+ "diesel",
+ "diesel-async",
+ "futures-util",
+ "moka",
+ "scoped-futures",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+]
+
+[[package]]
 name = "diesel_derives"
 version = "2.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2724,23 +2740,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "streamgres_diesel"
-version = "0.1.0"
-dependencies = [
- "base64 0.23.1",
- "chrono",
- "diesel",
- "diesel-async",
- "futures-util",
- "moka",
- "scoped-futures",
- "serde_json",
- "tokio",
- "tokio-tungstenite 0.30.0",
-]
-
-[[package]]
-name = "streamgres_example"
+name = "streamgres-demo"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -2748,11 +2748,11 @@ dependencies = [
  "clap",
  "diesel",
  "diesel-async",
+ "diesel-streamgres",
  "futures-util",
  "rand 0.9.5",
  "serde",
  "serde_json",
- "streamgres_diesel",
  "tokio",
 ]
 
