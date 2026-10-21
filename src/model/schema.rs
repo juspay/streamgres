@@ -7,12 +7,13 @@
 //! cannot leave two halves of the engine disagreeing about what a table
 //! looks like.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::row::RowSchema;
+use super::row::{RowData, RowSchema};
 
-use super::value::ValueType;
+use super::value::{Value, ValueType};
 
 /// The name of a table, as its own type so it can never be confused with
 /// the other strings the engine passes around (subscription ids, column
@@ -85,13 +86,91 @@ impl std::fmt::Display for TableName {
 /// literals. The name is shared, so a row image (a map keyed by column
 /// name) is cloned without allocating a name per column, and decoders take
 /// their names from the catalog instead of allocating one per row.
+///
+/// # Composite names
+///
+/// A join on several columns at once — `(org_id, ticket_id)` on one side
+/// against `(org_id, id)` on the other — is keyed by a **composite** name
+/// ([`ColumnName::composite`]): one name standing for the list of
+/// columns, so every structure keyed by a column name (an edge's
+/// columns, a restriction leaf, a value index, a routing index) carries
+/// a composite key without knowing it. A row has no column of that
+/// name; the key's value is computed from the row where a column's value
+/// would be read ([`ColumnName::of`]): the component values as one
+/// [`Value::List`], the way a hash join hashes its key columns together
+/// and a composite index concatenates them, and never stored in the row.
+/// The name is a `NUL` followed by the parts joined by `NUL`s — a byte no
+/// PostgreSQL identifier can contain — so a composite name never collides
+/// with a column, survives every round trip through a `&str`, and is
+/// told from a column by its first byte. It renders as `(a,b)`.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ColumnName(Arc<str>);
+
+/// What marks a composite name and joins its parts: a byte no identifier
+/// holds.
+const PART_SEPARATOR: char = '\0';
 
 impl ColumnName {
     /// The name as a borrowed string slice.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The name standing for `parts` joined on together; the one part's
+    /// own name when there is only one, so a single-column key is the
+    /// column itself and costs nothing new. The parser never asks for an
+    /// empty key (a join without columns is refused there); asked for
+    /// one, this returns the empty plain name, which matches no column.
+    pub fn composite<I>(parts: I) -> ColumnName
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let parts: Vec<I::Item> = parts.into_iter().collect();
+        debug_assert!(
+            !parts.is_empty(),
+            "a composite key needs at least one column"
+        );
+        if parts.len() == 1 {
+            return ColumnName::from(parts[0].as_ref());
+        }
+        let mut name = String::new();
+        for part in &parts {
+            name.push(PART_SEPARATOR);
+            name.push_str(part.as_ref());
+        }
+        ColumnName(Arc::from(name))
+    }
+
+    /// Whether the name stands for several columns.
+    pub fn is_composite(&self) -> bool {
+        self.0.starts_with(PART_SEPARATOR)
+    }
+
+    /// The columns the name stands for: the name itself for a plain
+    /// column, the parts in order for a composite.
+    pub fn parts(&self) -> impl Iterator<Item = &str> {
+        self.0
+            .strip_prefix(PART_SEPARATOR)
+            .unwrap_or(&self.0)
+            .split(PART_SEPARATOR)
+    }
+
+    /// The row's value under this name: the column's value, borrowed, for
+    /// a plain column (`None` when the row lacks the column); for a
+    /// composite, the components as one [`Value::List`], each folded to
+    /// its equality key so `(1, 'a')` and `(1.0, 'a')` are one key, and
+    /// `None` when any component is `NULL` or missing — a key with a
+    /// `NULL` in it joins nothing, as PostgreSQL's does.
+    pub fn of<'r>(&self, row: &'r RowData) -> Option<Cow<'r, Value>> {
+        if !self.is_composite() {
+            return row.get(self).map(Cow::Borrowed);
+        }
+        let mut components = Vec::with_capacity(2);
+        for part in self.parts() {
+            components.push(row.get(part)?.equality_key()?);
+        }
+        Some(Cow::Owned(Value::List(components)))
     }
 }
 
@@ -138,8 +217,13 @@ impl PartialEq<&str> for ColumnName {
 }
 
 impl std::fmt::Display for ColumnName {
-    /// Renders as the bare name, honoring width/alignment format flags.
+    /// Renders as the bare name, honoring width/alignment format flags; a
+    /// composite as its parts in parentheses, `(a,b)`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_composite() {
+            let parts: Vec<&str> = self.parts().collect();
+            return f.pad(&format!("({})", parts.join(",")));
+        }
         f.pad(&self.0)
     }
 }
@@ -480,5 +564,74 @@ mod tests {
     #[should_panic(expected = "not in the column list")]
     fn pkey_must_reference_a_declared_column() {
         DbTable::new("t", ["ghost"], vec![DbColumn::new("a", ValueType::Int)]);
+    }
+
+    /// A row image from `(column, value)` pairs.
+    fn row(pairs: &[(&str, Value)]) -> RowData {
+        RowData::from(
+            pairs
+                .iter()
+                .map(|(column, value)| (ColumnName::from(*column), value.clone()))
+                .collect::<HashMap<ColumnName, Value>>(),
+        )
+    }
+
+    /// A composite name is one name for its parts, never equal to a
+    /// column, and prints as the parts in parentheses; one part alone is
+    /// the column itself.
+    #[test]
+    fn a_composite_name_stands_for_its_parts() {
+        let key = ColumnName::composite(["org_id", "ticket_id"]);
+        assert!(key.is_composite());
+        assert_eq!(key.parts().collect::<Vec<_>>(), ["org_id", "ticket_id"]);
+        assert_eq!(key.to_string(), "(org_id,ticket_id)");
+        assert_ne!(key, ColumnName::from("org_id"));
+        assert_eq!(
+            ColumnName::from(key.as_str()),
+            key,
+            "survives a &str round trip"
+        );
+        let lone = ColumnName::composite(["org_id"]);
+        assert!(!lone.is_composite());
+        assert_eq!(lone, ColumnName::from("org_id"));
+        assert_eq!(lone.to_string(), "org_id");
+    }
+
+    /// A composite's value is the components as one list, each folded to
+    /// its equality key; a plain column's value is the column's, borrowed,
+    /// `NULL` included.
+    #[test]
+    fn a_composite_value_is_the_folded_components() {
+        let key = ColumnName::composite(["org_id", "ticket_id"]);
+        let image = row(&[
+            ("org_id", Value::Float(7.0)),
+            ("ticket_id", Value::Int(42)),
+            ("title", Value::Null),
+        ]);
+        assert_eq!(
+            key.of(&image).as_deref(),
+            Some(&Value::List(vec![Value::Int(7), Value::Int(42)]))
+        );
+        assert_eq!(
+            ColumnName::from("org_id").of(&image).as_deref(),
+            Some(&Value::Float(7.0)),
+            "a plain column is not folded: the engine folds where it compares"
+        );
+        assert_eq!(
+            ColumnName::from("title").of(&image).as_deref(),
+            Some(&Value::Null)
+        );
+        assert_eq!(ColumnName::from("ghost").of(&image), None);
+    }
+
+    /// A composite with a `NULL` or a missing component has no value at
+    /// all: such a key joins nothing.
+    #[test]
+    fn a_composite_with_a_null_or_missing_component_has_no_value() {
+        let key = ColumnName::composite(["org_id", "ticket_id"]);
+        let null_part = row(&[("org_id", Value::Int(7)), ("ticket_id", Value::Null)]);
+        assert_eq!(key.of(&null_part), None);
+        let missing_part = row(&[("org_id", Value::Int(7))]);
+        assert_eq!(key.of(&missing_part), None);
     }
 }

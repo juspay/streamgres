@@ -206,9 +206,11 @@ for one subscriber or ten thousand.
 
 ### Limitations
 
-- **No `LIKE` / `ILIKE`, `NOT EXISTS`, compound join keys, or JSON
-  operators.** Such a query is refused with an error naming the reason; other
-  queries on the connection are unaffected.
+- **No `LIKE` / `ILIKE`, `NOT EXISTS`, or JSON operators.** Such a query is
+  refused with an error naming the reason; other queries on the connection
+  are unaffected. A join on several columns (a compound `related` or
+  `whereExists`) is supported; the child table needs an index on its join
+  columns together, as a single-column join needs one on its column.
 - **No history across server restarts.** A client that reconnects after
   missing changes starts a fresh sync, which drops its unsent mutations.
 - **No projections.** Every subscription holds full rows.
@@ -255,8 +257,9 @@ STREAMGRES_PG_DSN=postgresql://postgres@localhost:5432/streamgres cargo test --t
 
 `scripts/` holds the end-to-end checks:
 
-- `smoke.mjs` drives the server with a scripted client, with no application
-  server needed. CI runs it against the built image.
+- `smoke.mjs` drives the server with a scripted client and stands in for the
+  application server's query endpoint, so nothing else is needed. CI runs it
+  against the built image.
 - `load-protocol.mjs` and `load-smoke.mjs` are load generators.
 
 ### Using the engine as a library

@@ -994,14 +994,147 @@ fn a_json_column_is_filtered_by_value() {
     });
 }
 
+/// A compound join served by PostgreSQL itself: a composite key's `IN` is
+/// a row constructor at every length, so each `unknown` literal takes its
+/// column's type and a `uuid` component compares (a `VALUES` would have
+/// typed it `text`); `<>` on the key is never true of a row with a `NULL`
+/// component, as in the engine; and the parser's own shape, an `EXISTS`
+/// leaf on the key, counts through the edge's semi-join.
+#[test]
+fn a_compound_key_is_served_by_postgres() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let parents = "live_compound_parents";
+        let children = "live_compound_children";
+        let slot = "xyne_sync_live_compound";
+        let publication = "xyne_sync_live_compound_pub";
+        let client = admin(&dsn).await;
+        PgStream::drop_slot(&dsn, slot, publication)
+            .await
+            .expect("drop slot");
+        let org = |id: i64| format!("00000000-0000-0000-0000-{:012}", id % 2 + 1);
+        let mut parent_rows: Vec<String> = (1..=40)
+            .map(|id| format!("({id}, '{}', {id})", org(id)))
+            .collect();
+        parent_rows.push("(41, NULL, 41)".to_owned());
+        let child_rows: Vec<String> = (1..=40)
+            .filter(|id| id % 2 == 0)
+            .map(|id| format!("({}, '{}', {id})", 100 + id, org(id)))
+            .collect();
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {parents}; DROP TABLE IF EXISTS {children};
+                 CREATE TABLE {parents} (id int8 PRIMARY KEY, org uuid, ticket int8);
+                 CREATE TABLE {children} (id int8 PRIMARY KEY, org uuid, ticket int8);
+                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;
+                 INSERT INTO {parents} VALUES {};
+                 INSERT INTO {children} VALUES {};",
+                parent_rows.join(", "),
+                child_rows.join(", ")
+            ))
+            .await
+            .expect("prepare");
+        let columns = || {
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("org", ValueType::String),
+                DbColumn::new("ticket", ValueType::Int),
+            ]
+        };
+        let catalog = Arc::new(Catalog::new(vec![
+            DbTable::new(parents, ["id"], columns()),
+            DbTable::new(children, ["id"], columns()),
+        ]));
+        let mut stream = PgStream::open(&dsn, slot, publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+
+        let key = ColumnName::composite(["org", "ticket"]);
+        let pair = |id: i64| Value::List(vec![Value::from(org(id).as_str()), Value::Int(id)]);
+        let select = |filter: Where| {
+            SingleTableReadQuery::new(parents, filter, OrderBy::new("id", Order::ASC), u32::MAX)
+        };
+        let ids = |snapshot: &streamgres::model::Snapshot| -> Vec<i64> {
+            snapshot
+                .rows
+                .iter()
+                .filter_map(
+                    |(key, _)| match key.pkey_value.get(&ColumnName::from("id")) {
+                        Some(Value::Int(id)) => Some(*id),
+                        _ => None,
+                    },
+                )
+                .collect()
+        };
+
+        let wanted: Vec<i64> = (1..=40).filter(|id| id % 2 == 0).collect();
+        let members = Value::List(wanted.iter().map(|id| pair(*id)).collect());
+        let read = storage
+            .select(&select(Where::Condition(Condition::new(
+                key.clone(),
+                ComparisonOperator::IN,
+                members,
+            ))))
+            .await
+            .expect("twenty uuid pairs compare in a row constructor");
+        assert_eq!(ids(&read), wanted);
+
+        let read = storage
+            .select(&select(Where::Condition(Condition::new(
+                key.clone(),
+                ComparisonOperator::NEQ,
+                pair(3),
+            ))))
+            .await
+            .expect("served");
+        assert_eq!(
+            ids(&read),
+            (1..=40).filter(|id| *id != 3).collect::<Vec<_>>(),
+            "the row with a NULL component is `<>` nothing"
+        );
+
+        let with_children = MultiTableReadQuery::new(
+            select(Where::exists(key.clone(), 0)),
+            vec![Join::inner(
+                MultiTableReadQuery::single(SingleTableReadQuery::new(
+                    children,
+                    Where::AND(Vec::new()),
+                    OrderBy::new("id", Order::ASC),
+                    u32::MAX,
+                )),
+                key.clone(),
+                key,
+            )],
+        );
+        assert_eq!(
+            storage.count(&with_children, 100).await.expect("count"),
+            20,
+            "the EXISTS leaf on the key counts through the semi-join"
+        );
+
+        let _ = client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {parents}; DROP TABLE IF EXISTS {children};"
+            ))
+            .await;
+        let _ = PgStream::drop_slot(&dsn, slot, publication).await;
+    });
+}
+
 /// A read is given the read timeout and no more: one that PostgreSQL is
 /// still working on when the time is up is cancelled there and refused
-/// here, naming the table, well before it would have finished; the
-/// connection settings that carry the limit leave an ordinary read
-/// alone, and a count is held to the same time.
+/// here, naming the table, well before it would have finished; an
+/// ordinary read and a count remain usable. When STREAMGRES_READ_PG_DSN
+/// is set, the same test sends its reads through that endpoint.
 #[test]
 fn a_read_past_its_time_is_refused() {
     let Some(dsn) = dsn() else { return };
+    let read_dsn = std::env::var("STREAMGRES_READ_PG_DSN").unwrap_or_else(|_| dsn.clone());
     block_on(async {
         let names = Names::new("timeout");
         let client = prepare(&dsn, &names).await;
@@ -1009,15 +1142,25 @@ fn a_read_past_its_time_is_refused() {
         let mut stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
             .await
             .expect("open stream");
-        let slow = PgStorage::connect(&dsn, catalog.clone())
-            .await
-            .expect("connect")
-            .with_read_timeout(Duration::from_millis(400))
-            .with_read_delay(Duration::from_secs(5));
-        let quick = PgStorage::connect(&dsn, catalog.clone())
-            .await
-            .expect("connect")
-            .with_read_timeout(Duration::from_millis(400));
+        let slow = PgStorage::connect_configured_with_read_config(
+            dsn.parse().expect("direct DSN"),
+            read_dsn.parse().expect("read DSN"),
+            catalog.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .expect("connect")
+        .with_read_timeout(Duration::from_millis(400))
+        .with_read_delay(Duration::from_secs(5));
+        let quick = PgStorage::connect_configured_with_read_config(
+            dsn.parse().expect("direct DSN"),
+            read_dsn.parse().expect("read DSN"),
+            catalog.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .expect("connect")
+        .with_read_timeout(Duration::from_millis(400));
         let mut runtime = Runtime::new(MultiTableIVM::new());
         catch_up(&mut runtime, &mut stream, &[&slow, &quick]).await;
         let whole = SingleTableReadQuery::new(
@@ -1043,6 +1186,14 @@ fn a_read_past_its_time_is_refused() {
             .await
             .expect("an ordinary read is served");
         assert!(!served.rows.is_empty());
+        assert_eq!(
+            quick
+                .simple_query("SELECT 1")
+                .await
+                .expect("a plain read is served")[0]
+                .get(0),
+            Some("1")
+        );
         let alone = MultiTableReadQuery::single(whole.clone());
         assert!(quick.count(&alone, 10).await.expect("an ordinary count") > 0);
         let again = slow.select(&whole).await.expect_err("and again");

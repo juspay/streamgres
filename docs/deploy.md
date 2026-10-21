@@ -71,11 +71,14 @@ branch name and the short commit SHA.
   `max_replication_slots` and `max_wal_senders`. Each server uses one slot
   for its change feed, `xyne_sync_slot_<uuid>`, plus short-lived ones,
   `xyne_sync_snap_*`, behind its read snapshots.
-- **Spare connections.** Allow about 40 connections:
-  `STREAMGRES_READ_CONNECTIONS`, plus the feed, plus a few more.
+- **Spare connections.** Without PgBouncer, allow about
+  `STREAMGRES_READ_CONNECTIONS` direct read connections, plus the feed and a
+  few snapshot-minting connections. With PgBouncer, size PostgreSQL's read
+  connection budget for PgBouncer's server pool instead.
 - **A role** with `REPLICATION` and `SELECT` on the served schemas.
-- **A direct connection, not PgBouncer.** Logical replication does not pass
-  through PgBouncer.
+- **A direct connection for replication.** `STREAMGRES_PG_DSN` connects
+  directly to PostgreSQL for the logical feed and snapshot minting.
+  Replication must not use the read pool.
 
 **The server writes nothing to the database it follows.** It reads rows and
 the replication stream. Its position in the stream comes from each commit and
@@ -85,6 +88,18 @@ at:
 - a logical replica, or
 - a physical standby (PostgreSQL 16 or later, the first version that can do
   logical decoding on a standby).
+
+Ordinary SQL reads can optionally use a separate endpoint:
+`STREAMGRES_READ_PG_DSN` may point to PgBouncer configured for transaction
+pooling. It defaults to `STREAMGRES_PG_DSN`, preserving direct reads when
+unset. The PgBouncer database must resolve to the same PostgreSQL database
+and server as the direct DSN: each read imports a snapshot minted over the
+direct connection. Reads run in one `BEGIN`/`COMMIT` transaction, so the
+PgBouncer backend remains assigned through snapshot import and query. Keep
+the feed and snapshot minting on the direct DSN. `STREAMGRES_READ_CONNECTIONS`
+limits concurrent reads sent toward PgBouncer; `STREAMGRES_READ_IDLE_CONNECTIONS`
+limits how many Streamgres-to-PgBouncer client connections remain open while
+idle. PgBouncer's own pool settings control the PostgreSQL backend connections.
 
 ### One-time setup
 
@@ -209,9 +224,12 @@ directory is read first, and variables already set take precedence.
 
 | variable | meaning |
 |---|---|
-| `STREAMGRES_PG_DSN` | the PostgreSQL to follow, reached directly (section 3) |
+| `STREAMGRES_PG_DSN` | direct PostgreSQL endpoint for catalog, feed and snapshot minting (section 3) |
 | `STREAMGRES_QUERY_URL` | the application server's query endpoint |
 | `STREAMGRES_MUTATE_URL` | the application server's mutate endpoint |
+
+`STREAMGRES_READ_PG_DSN` is optional. Set it to the PgBouncer endpoint for
+reads; when unset, reads use `STREAMGRES_PG_DSN` directly.
 
 ### Set explicitly
 
@@ -231,7 +249,8 @@ depend on what the defaults happen to be:
 | `STREAMGRES_GROUP_TTL_MS` | `3600000` | `60000` | how long a disconnected client group's state is kept. A client back within it resumes instead of re-downloading everything |
 | `STREAMGRES_GROUP_THREADS` | `2` | `1` | threads that build and send updates to clients |
 | `STREAMGRES_READ_THREADS` | `4` | `2` | threads that run and decode database reads |
-| `STREAMGRES_READ_CONNECTIONS` | `32` | `16` | database connections for reads |
+| `STREAMGRES_READ_CONNECTIONS` | `32` | `16` | maximum concurrent storage reads; limits how many requests Streamgres can send to PostgreSQL/PgBouncer at once |
+| `STREAMGRES_READ_IDLE_CONNECTIONS` | `16` | `16` | maximum read connections Streamgres keeps idle for reuse; `0` closes them after use. With transaction pooling these are idle PgBouncer client connections, not PostgreSQL backends |
 | `STREAMGRES_ROW_LIMIT` | sized to your data | `100000` | the most rows read into memory at once. A larger read is refused, and the query named in logs and metrics |
 | `STREAMGRES_PLAN_FILE` | `/var/lib/streamgres/plans.json` | unset | query shapes seen so far, planned again at startup, so the first clients after a restart are fast. Needs a writable volume |
 | `STREAMGRES_LOG_FORMAT` | `json` | `text` | already set in the image |
@@ -260,7 +279,7 @@ depend on what the defaults happen to be:
 | `STREAMGRES_PING_INTERVAL_MS`, `STREAMGRES_CLIENT_TIMEOUT_MS`, `STREAMGRES_PONG_INTERVAL_MS` | `30000`, `45000`, `3000` | connection liveness |
 | `STREAMGRES_GROUP_LOG_BYTES` | `262144` | recent updates kept per client group, so a briefly disconnected tab catches up instead of starting over. `0` keeps none |
 | `STREAMGRES_MAX_MESSAGE_BYTES` | `16777216` | largest message accepted from a client |
-| `STREAMGRES_ROWS_PER_PART` | `500` | row changes per message part |
+| `STREAMGRES_BYTES_PER_PART` | `768000` | bytes of serialized row changes per message part (750 KiB) |
 | `STREAMGRES_S2S_TOKEN` | none | secret a backend must send as `Authorization: Bearer <token>` to open the S2S endpoint. Unset, the endpoint takes any connection |
 | `STREAMGRES_S2S_MAX_CONNECTIONS` | `64` | S2S connections open at once; past it an upgrade is answered `503`. Each backend process opens `STREAMGRES_S2S_CONNECTIONS` (2), so 64 serves 32 processes. `0` lifts the limit |
 | `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` | `10000` | subscriptions one S2S connection may hold; past it a subscribe is refused. The engine announces it, and the client stops short of it. `0` lifts the limit |
@@ -347,7 +366,7 @@ though nothing is wrong.
 ## 9. Known limits
 
 - **Unsupported queries are refused, not run.** This covers `LIKE`/`ILIKE`,
-  `NOT EXISTS`, compound join keys, and any read over `STREAMGRES_ROW_LIMIT`.
+  `NOT EXISTS`, and any read over `STREAMGRES_ROW_LIMIT`.
   Each one is refused by name, in `/stats.refused_queries` and in the
   `query refused` log event. The client sees that one query fail; the rest of
   the app is unaffected.

@@ -112,6 +112,7 @@ struct QueuedPush {
 enum PushWork {
     Mutations {
         push: protocol::Push,
+        ack_attempts: Vec<(protocol::MutationId, u64)>,
         identity: Identity,
     },
     Cleanup {
@@ -152,10 +153,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             .route(&format!("{base}/{probe}"), get(health))
             .route(&format!("/{probe}"), get(health));
     }
-    router
-        .route("/stats", get(stats))
-        .route("/metrics", get(metrics))
-        .with_state(state)
+    if state.config.admin_endpoints {
+        router = router
+            .route("/stats", get(stats))
+            .route("/metrics", get(metrics));
+    }
+    router.with_state(state)
 }
 
 /// The server's measurements in Prometheus exposition format.
@@ -422,7 +425,6 @@ async fn handle(
             cookie,
             origin,
             token: handshake.auth_token.clone(),
-            ..Identity::default()
         },
         state: state.clone(),
         params,
@@ -785,18 +787,6 @@ impl Conn {
         {
             return false;
         }
-        if let Some(url) = init.user_query_url {
-            self.identity.query_url = Some(url);
-        }
-        if let Some(headers) = init.user_query_headers {
-            self.identity.query_headers = headers;
-        }
-        if let Some(url) = init.user_push_url {
-            self.identity.mutate_url = Some(url);
-        }
-        if let Some(headers) = init.user_push_headers {
-            self.identity.mutate_headers = headers;
-        }
         if let Some(deleted) = &init.deleted {
             self.delete_clients(deleted).await;
         }
@@ -862,12 +852,12 @@ impl Conn {
         ready.wait_for(|ready| *ready).await.is_ok()
     }
 
-    /// Desired-query changes: custom queries go to the application server
-    /// for their ASTs, every AST is translated and planned here, and
-    /// everything goes to the group thread in the order the client sent
-    /// it. A query that cannot be translated or planned is refused to the
-    /// client from here and passed on as such, so the group still knows
-    /// the hash.
+    /// Desired-query changes: every query goes to the application server
+    /// for its AST (the transform cache first), every AST is translated and
+    /// planned here, and everything goes to the group thread in the order
+    /// the client sent it. A query that cannot be translated or planned is
+    /// refused to the client from here and passed on as such, so the group
+    /// still knows the hash.
     async fn desired(&mut self, ops: Vec<QueryPatchOp>) -> bool {
         if !self.await_ready().await {
             return false;
@@ -883,31 +873,28 @@ impl Conn {
                     ttl,
                     name,
                     args,
-                    ast,
                 } => {
                     let name = name.unwrap_or_else(|| "query".to_owned());
-                    let mut ast = ast;
-                    if ast.is_none() {
-                        let args = Json::Array(args.unwrap_or_default());
-                        match self.state.transforms.lookup(&self.identity, &name, &args) {
-                            Some(cached) => {
-                                self.state
-                                    .stats
-                                    .transform_hits
-                                    .fetch_add(1, Ordering::Relaxed);
-                                ast = Some(cached);
-                            }
-                            None => {
-                                self.state
-                                    .stats
-                                    .transform_misses
-                                    .fetch_add(1, Ordering::Relaxed);
-                                positions.insert(hash.clone(), pending.len());
-                                requests.push(json!({"id": hash, "name": name, "args": args}));
-                                asked.insert(hash.clone(), (name.clone(), args));
-                            }
+                    let args = Json::Array(args.unwrap_or_default());
+                    let ast = match self.state.transforms.lookup(&self.identity, &name, &args) {
+                        Some(cached) => {
+                            self.state
+                                .stats
+                                .transform_hits
+                                .fetch_add(1, Ordering::Relaxed);
+                            Some(cached)
                         }
-                    }
+                        None => {
+                            self.state
+                                .stats
+                                .transform_misses
+                                .fetch_add(1, Ordering::Relaxed);
+                            positions.insert(hash.clone(), pending.len());
+                            requests.push(json!({"id": hash, "name": name, "args": args}));
+                            asked.insert(hash.clone(), (name.clone(), args));
+                            None
+                        }
+                    };
                     pending.push(Pending::Put {
                         hash,
                         name,
@@ -1050,12 +1037,21 @@ impl Conn {
                 push.client_group_id,
                 self.params.group_id
             );
+            return;
         }
-        for mutation in &push.mutation_ids {
-            self.state.stats.push_sent(&mutation.client_id, mutation.id);
-        }
+        let ack_attempts = push
+            .mutation_ids
+            .iter()
+            .map(|mutation| {
+                (
+                    mutation.clone(),
+                    self.state.stats.push_sent(&mutation.client_id, mutation.id),
+                )
+            })
+            .collect();
         self.queue_push(PushWork::Mutations {
             push,
+            ack_attempts,
             identity: self.identity.clone(),
         })
         .await;
@@ -1077,8 +1073,12 @@ async fn push_loop(
     while let Some(QueuedPush { queued, work }) = pushes.recv().await {
         state.stats.push_queue.record(queued.elapsed());
         match work {
-            PushWork::Mutations { push, identity } => {
-                forward_push(&state, &params, &out, &identity, push).await;
+            PushWork::Mutations {
+                push,
+                ack_attempts,
+                identity,
+            } => {
+                forward_push(&state, &params, &out, &identity, push, ack_attempts).await;
             }
             PushWork::Cleanup { body, identity } => {
                 clean_up_results(&state, &params.wsid, &identity, body).await;
@@ -1098,6 +1098,7 @@ async fn forward_push(
     out: &mpsc::UnboundedSender<Outbound>,
     identity: &Identity,
     push: protocol::Push,
+    ack_attempts: Vec<(protocol::MutationId, u64)>,
 ) {
     let started = Instant::now();
     let outcome = state.backend.push(identity, &push.body).await;
@@ -1124,7 +1125,20 @@ async fn forward_push(
     );
     match outcome {
         PushOutcome::Response(json) => {
-            if let Some(reply) = direct_push_reply(&json, &push.mutation_ids) {
+            let reply = direct_push_reply(&json, &push.mutation_ids);
+            let accepted = accepted_push_attempts(&json, &ack_attempts);
+            for ((mutation, token), accepted) in ack_attempts.iter().zip(accepted) {
+                if accepted {
+                    state
+                        .stats
+                        .push_backend_accepted(&mutation.client_id, mutation.id, *token);
+                } else {
+                    state
+                        .stats
+                        .push_no_poke(&mutation.client_id, mutation.id, *token);
+                }
+            }
+            if let Some(reply) = reply {
                 if json.get("mutations").and_then(Json::as_array).is_none()
                     && json.get("kind").and_then(Json::as_str) != Some("PushFailed")
                 {
@@ -1144,12 +1158,85 @@ async fn forward_push(
             preview,
             message,
         } => {
+            for (mutation, token) in &ack_attempts {
+                state
+                    .stats
+                    .push_no_poke(&mutation.client_id, mutation.id, *token);
+            }
             send(
                 out,
                 protocol::push_failed(&push.mutation_ids, status, preview.as_deref(), &message),
             );
         }
     }
+}
+
+/// Which attempts the backend accepted far enough to expect an LMID poke.
+/// Unknown results are conservative: discard their timers rather than risk
+/// recording a push-to-poke duration for an attempt that was never processed.
+fn accepted_push_attempts(response: &Json, attempts: &[(protocol::MutationId, u64)]) -> Vec<bool> {
+    let rejected = || vec![false; attempts.len()];
+
+    if response.get("kind").and_then(Json::as_str) == Some("PushFailed") {
+        let Some(unprocessed) = response
+            .get("mutationIDs")
+            .and_then(Json::as_array)
+            .filter(|ids| !ids.is_empty())
+            .and_then(|ids| {
+                ids.iter()
+                    .map(parse_mutation_id)
+                    .collect::<Option<Vec<_>>>()
+            })
+        else {
+            return rejected();
+        };
+
+        // PushFailed lists the unprocessed suffix. Only trust it when it
+        // exactly matches this push; otherwise the processed prefix is unknown.
+        if unprocessed.len() > attempts.len()
+            || !attempts[attempts.len() - unprocessed.len()..]
+                .iter()
+                .map(|(mutation, _)| mutation)
+                .eq(unprocessed.iter())
+        {
+            return rejected();
+        }
+
+        let accepted_count = attempts.len() - unprocessed.len();
+        return (0..attempts.len())
+            .map(|index| index < accepted_count)
+            .collect();
+    }
+
+    let Some(mutations) = response.get("mutations").and_then(Json::as_array) else {
+        return rejected();
+    };
+
+    attempts
+        .iter()
+        .map(|(attempt, _)| {
+            let Some(mutation) = mutations.iter().find(|mutation| {
+                mutation.get("id").and_then(parse_mutation_id).as_ref() == Some(attempt)
+            }) else {
+                return false;
+            };
+            match mutation.get("result").and_then(Json::as_object) {
+                Some(result) => match result.get("error") {
+                    None => true,
+                    Some(Json::String(error)) => error == "app",
+                    Some(_) => false,
+                },
+                None => false,
+            }
+        })
+        .collect()
+}
+
+fn parse_mutation_id(value: &Json) -> Option<protocol::MutationId> {
+    Some(protocol::MutationId {
+        client_id: value.get("clientID")?.as_str()?.to_owned(),
+        id: value.get("id")?.as_i64()?,
+    })
 }
 
 /// Send one cleanup push; its answer matters only to the counters and
@@ -1433,4 +1520,5 @@ mod tests {
             assert_eq!(reply[1]["kind"], "PushFailed", "{response}");
         }
     }
+
 }

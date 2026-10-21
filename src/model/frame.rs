@@ -401,8 +401,8 @@ impl TableFrame {
         }
         let mut by_value: HashMap<Value, IdSet<RowId>> = HashMap::new();
         for (id, row) in &self.rows {
-            if let Some(value) = row.data.data.get(column) {
-                by_value.entry(value.clone()).or_default().insert(*id);
+            if let Some(value) = column.of(&row.data.data) {
+                by_value.entry(value.into_owned()).or_default().insert(*id);
             }
         }
         self.indexes.insert(column.clone(), by_value);
@@ -420,11 +420,12 @@ impl TableFrame {
         )
     }
 
-    /// File `id` under `data`'s value in every indexed column.
+    /// File `id` under `data`'s value in every indexed column (a
+    /// composite key's value computed from the row, [`ColumnName::of`]).
     fn index_row(&mut self, id: RowId, data: &DataFrameRow) {
         for (column, by_value) in self.indexes.iter_mut() {
-            if let Some(value) = data.data.get(column) {
-                by_value.entry(value.clone()).or_default().insert(id);
+            if let Some(value) = column.of(&data.data) {
+                by_value.entry(value.into_owned()).or_default().insert(id);
             }
         }
     }
@@ -432,13 +433,13 @@ impl TableFrame {
     /// Unfile `id` from `data`'s value in every indexed column.
     fn unindex_row(&mut self, id: RowId, data: &DataFrameRow) {
         for (column, by_value) in self.indexes.iter_mut() {
-            let Some(value) = data.data.get(column) else {
+            let Some(value) = column.of(&data.data) else {
                 continue;
             };
-            if let Some(ids) = by_value.get_mut(value) {
+            if let Some(ids) = by_value.get_mut(&*value) {
                 ids.remove(&id);
                 if ids.is_empty() {
-                    by_value.remove(value);
+                    by_value.remove(&*value);
                 }
             }
         }
