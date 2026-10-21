@@ -82,7 +82,7 @@ JSON field names are unchanged by this setting.
 | `xyne_sync_transforms_total{result=hit,miss,error}` | queries answered from the transform cache, sent to the application server, errored there |
 | `xyne_sync_plan_seconds` | translating and planning one query (a cache hit is microseconds) |
 | `xyne_sync_count_seconds` | one planner count on PostgreSQL (IO) |
-| `xyne_sync_estimate_seconds` | one planner estimate on PostgreSQL: the `EXPLAIN`s of a tree and its join columns' statistics in one round trip (IO; `STREAMGRES_PLAN_SIZES=estimate` or `shadow`; an estimate answered from the cache is microseconds) |
+| `xyne_sync_estimate_seconds` | one planner estimate on PostgreSQL: the `EXPLAIN`s of a tree and its join columns' statistics in one round trip (IO; an estimate answered from the cache is microseconds) |
 | `xyne_sync_estimate_statements_total{result=hit,shared,miss}` | the estimates' statements (`EXPLAIN`s and join columns' statistics): answered from the estimate cache, waited for while another plan asked them, asked of PostgreSQL |
 | `xyne_sync_hydrate_seconds{kind=cold,warm}` | registration sent → rows present, per query; cold read storage, warm was served from held frames |
 | `xyne_sync_engine_step_seconds{step=register,land,unregister}` | the engine's own compute per step |

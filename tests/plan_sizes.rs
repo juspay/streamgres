@@ -11,10 +11,8 @@
 //! on each and the two plans are compared. Printed: per query the times,
 //! the two decisions' agreement and both sizes per node; then the totals.
 //!
-//! [`a_plan_laid_on_other_arguments`] measures what planning by name
-//! costs the arguments it was not made for, and
 //! [`planning_every_argument`] plans every query for every argument the
-//! way the server does, counted by name against estimated per tree.
+//! way the server does, estimated per tree, against counting every tree.
 //!
 //! Ignored by default (it needs a database with data, and is read-only on
 //! it); run with
@@ -35,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 use streamgres::client::ast::Translated;
-use streamgres::client::plan::{Count, PlanCache, Planner, Policy, Side, Sizes, plan};
+use streamgres::client::plan::{Count, PlanCache, Planner, Policy, Side, plan};
 use streamgres::model::ComparisonOperator::{GT, IN};
 use streamgres::model::Order::DESC;
 use streamgres::model::{Catalog, Lsn, MultiTableReadQuery};
@@ -58,8 +56,15 @@ fn policy() -> Policy {
     Policy {
         limit: 100_000,
         preferred: Side::Parent,
-        sizes: Sizes::Count,
     }
+}
+
+/// How a tree is sized: counted (the truth the estimates are measured
+/// on) or estimated (as the server sizes it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sizes {
+    Count,
+    Estimate,
 }
 
 /// The queries the planner decides, by registry name, for `p`.
@@ -216,7 +221,7 @@ async fn size(storage: &PgStorage, wanted: &[Count], sizes: Sizes) -> Result<Siz
     let started = Instant::now();
     let answers = join_all(wanted.iter().map(|count| async move {
         match sizes {
-            Sizes::Count | Sizes::Shadow => storage.count(&count.query, count.cap).await.map(|n| (n, false)),
+            Sizes::Count => storage.count(&count.query, count.cap).await.map(|n| (n, false)),
             Sizes::Estimate => match storage.estimate(&count.query, count.cap).await {
                 Ok(rows) => Ok((rows, false)),
                 Err(_) => storage.count(&count.query, count.cap).await.map(|n| (n, true)),
@@ -494,7 +499,7 @@ fn counted_against_estimated() {
 }
 
 /// The quantiles a reader, channel and desk are picked at for
-/// [`a_plan_laid_on_other_arguments`], the busiest first.
+/// [`planning_every_argument`], the busiest first.
 const SPREAD: [(&str, f64); 10] = [
     ("p0", 0.0),
     ("p0.1", 0.001),
@@ -508,170 +513,14 @@ const SPREAD: [(&str, f64); 10] = [
     ("p100", 1.0),
 ];
 
-/// What the name cache costs: each query planned on its true counts for
-/// readers, channels and desks across [`SPREAD`], then every argument's
-/// plan laid (as [`PlanCache::by_name`] lays it) onto every other
-/// argument's tree and held on that tree's counts, against the plan the
-/// tree's own counts make. Printed per query: how many of the laid plans
-/// differ from the tree's own, the rows held when a uniformly drawn
-/// argument asks first against the rows the trees' own plans hold, and
-/// the worst first asker.
-#[test]
-#[ignore = "needs STREAMGRES_PLAN_BENCH_DSN, a database with data"]
-fn a_plan_laid_on_other_arguments() {
-    let Ok(dsn) = std::env::var("STREAMGRES_PLAN_BENCH_DSN") else {
-        eprintln!("STREAMGRES_PLAN_BENCH_DSN not set: skipped");
-        return;
-    };
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .expect("runtime");
-    runtime.block_on(async {
-        let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-            .await
-            .expect("connect");
-        tokio::spawn(connection);
-        let (catalog, _) = load_catalog(&client, &["public".to_owned()])
-            .await
-            .expect("catalog");
-        let workspace = one(&client, r#"SELECT "workspaceId" FROM channels LIMIT 1"#).await;
-        let catalog: Arc<Catalog> = Arc::new(catalog);
-        let storage = PgStorage::connect(&dsn, catalog.clone())
-            .await
-            .expect("storage")
-            .with_read_connections(64);
-        storage.advance(Lsn(u64::MAX));
-        let mut spread = Vec::new();
-        for (label, at) in SPREAD {
-            spread.push(Params {
-                label,
-                me: one(&client, &user_at(at)).await,
-                channel: one(&client, &channel_at(at)).await,
-                desk: one(&client, &desk_at(at)).await,
-            });
-        }
-        for p in &spread {
-            println!("{:<5} reader {} · channel {} · desk {}", p.label, p.me, p.channel, p.desk);
-        }
-        let names: Vec<&str> = queries(&spread[0]).into_iter().map(|(name, _)| name).collect();
-        let over = |hold: Option<u64>| hold.unwrap_or(u64::MAX);
-        let (mut own_total, mut laid_total) = (0u64, 0u64);
-        let (mut pairs, mut differ, mut worse, mut over_limit) = (0, 0, 0, 0);
-        println!(
-            "\n{:<44} {:>8} {:>8} {:>12} {:>14} {:>14}  own holds by argument; worst first asker",
-            "query", "plans", "differ", "worse", "own rows", "laid rows"
-        );
-        for (at, name) in names.iter().enumerate() {
-            // Per argument: its tree, the planner on its true counts, its own plan.
-            let mut trees = Vec::new();
-            for p in &spread {
-                let (_, q) = queries(p).swap_remove(at);
-                let q = if catalog
-                    .table(q.table())
-                    .is_some_and(|table| table.column("workspaceId").is_some())
-                {
-                    q.eq("workspaceId", workspace.as_str())
-                } else {
-                    q
-                };
-                let (spec, _) = q.build();
-                storage.advance(Lsn(u64::MAX));
-                let wanted = Planner::new(spec.clone(), policy()).counts();
-                let counted = size(&storage, &wanted, Sizes::Count).await.expect("count");
-                let judge = answered(&spec, &wanted, &counted.answers);
-                let (own, _) = decide(&spec, &wanted, &counted.answers);
-                trees.push((spec, judge, own));
-            }
-            if trees.iter().all(|(spec, ..)| Planner::new(spec.clone(), policy()).counts().is_empty()) {
-                println!("{name:<44} nothing to size");
-                continue;
-            }
-            let own_holds: Vec<Option<u64>> = trees
-                .iter()
-                .map(|(_, judge, own)| own.as_ref().ok().and_then(|own| judge.hold_of(own)))
-                .collect();
-            // The distinct plans: one is another when laid onto its tree it is that tree's plan.
-            let lay = |known: &MultiTableReadQuery, spec: &MultiTableReadQuery| {
-                let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
-                cache.remember(name, known);
-                cache.by_name(name, spec)
-            };
-            let mut distinct: Vec<MultiTableReadQuery> = Vec::new();
-            for (spec, _, own) in &trees {
-                if let Ok(own) = own
-                    && !distinct.iter().any(|known| lay(known, spec).as_ref() == Some(own))
-                {
-                    distinct.push(own.clone());
-                }
-            }
-            let (mut name_differ, mut name_worse, mut name_over) = (0, 0, 0);
-            let mut by_first = Vec::new();
-            for (first, (_, _, planned)) in trees.iter().enumerate() {
-                let Ok(planned) = planned else {
-                    continue;
-                };
-                let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
-                cache.remember(name, planned);
-                let mut held = 0u64;
-                for (later, (spec, judge, own)) in trees.iter().enumerate() {
-                    let laid = cache.by_name(name, spec).expect("same skeleton");
-                    let hold = judge.hold_of(&laid);
-                    let mine = own_holds[later];
-                    pairs += 1;
-                    if own.as_ref().ok() != Some(&laid) {
-                        name_differ += 1;
-                    }
-                    if over(hold) > over(mine) {
-                        name_worse += 1;
-                    }
-                    if hold.is_none() && mine.is_some() {
-                        name_over += 1;
-                    }
-                    held = held.saturating_add(over(hold));
-                }
-                by_first.push((spread[first].label, held));
-            }
-            let own_rows: u64 = own_holds.iter().map(|&hold| over(hold)).fold(0, u64::saturating_add);
-            let laid_mean = if by_first.is_empty() {
-                0
-            } else {
-                by_first.iter().map(|(_, held)| *held).fold(0, u64::saturating_add) / by_first.len() as u64
-            };
-            let worst = by_first.iter().max_by_key(|(_, held)| *held).copied();
-            own_total = own_total.saturating_add(own_rows);
-            laid_total = laid_total.saturating_add(laid_mean);
-            differ += name_differ;
-            worse += name_worse;
-            over_limit += name_over;
-            let shown_rows = |rows: u64| if rows == u64::MAX { "over".to_owned() } else { rows.to_string() };
-            println!(
-                "{name:<44} {:>8} {:>8} {:>12} {:>14} {:>14}  [{}]; {}",
-                distinct.len(),
-                format!("{name_differ}/{}", by_first.len() * trees.len()),
-                format!("{name_worse} ({name_over} over)"),
-                shown_rows(own_rows),
-                shown_rows(laid_mean),
-                own_holds.iter().map(|&hold| shown(hold)).collect::<Vec<_>>().join(" "),
-                worst.map_or(String::new(), |(label, held)| format!("{label} {}", shown_rows(held))),
-            );
-        }
-        println!("\n== {pairs} (first asker, later asker) pairs over {} arguments", spread.len());
-        println!("laid plan differs from the tree's own: {differ}; holds more: {worse}; over the limit where its own is not: {over_limit}");
-        println!("rows held: {own_total} by every tree's own plan, {laid_total} by the name cache (mean over first askers)");
-    });
-}
-
 /// Every query planned for every argument of [`SPREAD`] the way the
-/// server plans them ([`plan`]), arguments arriving busiest first and
-/// then quietest first: counted and remembered by name (the server's
-/// default), against estimated per tree, first with the estimate cache
-/// empty and then again from it. Printed per way: the wall time of all
-/// the plans, the slowest plan, the statements run on PostgreSQL for
-/// sizes (counts, or `EXPLAIN`s and column statistics newly remembered),
-/// and the rows the plans hold measured on the true counts, against the
-/// rows every tree's own counted plan holds.
+/// server plans them ([`plan`]): estimated per tree, first with the
+/// estimate cache empty and then again from it, against every tree
+/// counted. Printed per way: the wall time of all the plans, the slowest
+/// plan, the statements run on PostgreSQL for sizes (counts, or
+/// `EXPLAIN`s and column statistics newly remembered), and the rows the
+/// plans hold measured on the true counts, against the rows every tree's
+/// own counted plan holds.
 #[test]
 #[ignore = "needs STREAMGRES_PLAN_BENCH_DSN, a database with data"]
 fn planning_every_argument() {
@@ -711,6 +560,7 @@ fn planning_every_argument() {
         // Every (name, tree), busiest arguments first, each with its judge
         // (the planner on its true counts) and what its own plan holds.
         let mut trees = Vec::new();
+        let (mut counting, mut slowest_count, mut counts) = (Duration::ZERO, Duration::ZERO, 0usize);
         for p in &spread {
             for (name, q) in queries(p) {
                 let q = if catalog
@@ -727,6 +577,9 @@ fn planning_every_argument() {
                     continue;
                 }
                 let counted = size(&storage, &wanted, Sizes::Count).await.expect("count");
+                counting += counted.wall;
+                slowest_count = slowest_count.max(counted.wall);
+                counts += wanted.len();
                 let judge = answered(&spec, &wanted, &counted.answers);
                 let own = decide(&spec, &wanted, &counted.answers)
                     .0
@@ -742,31 +595,27 @@ fn planning_every_argument() {
             "\n{:<36} {:>10} {:>10} {:>12} {:>12}",
             "way", "total ms", "max ms", "statements", "rows held"
         );
-        let by_order = |reverse: bool| {
-            let mut order: Vec<usize> = (0..trees.len()).collect();
-            if reverse {
-                order.reverse();
-            }
-            order
-        };
-        for (way, sizes, reverse, fresh) in [
-            ("counted, by name, busiest first", Sizes::Count, false, true),
-            ("counted, by name, quietest first", Sizes::Count, true, true),
-            ("estimated per tree, cache empty", Sizes::Estimate, false, true),
-            ("estimated per tree, from the cache", Sizes::Estimate, false, false),
+        println!(
+            "{:<36} {:>10.1} {:>10.2} {:>12} {:>12}",
+            "counted per tree",
+            counting.as_secs_f64() * 1000.0,
+            slowest_count.as_secs_f64() * 1000.0,
+            counts,
+            shown(own)
+        );
+        for (way, fresh) in [
+            ("estimated per tree, cache empty", true),
+            ("estimated per tree, from the cache", false),
         ] {
             if fresh {
                 storage.estimate_cache().clear();
             }
-            let cache = PlanCache::new(Duration::from_secs(600), 10_000, Duration::from_secs(86_400));
-            let policy = Policy { sizes, ..policy() };
+            let cache = PlanCache::new(Duration::from_secs(600), 10_000);
+            let policy = policy();
             let (mut total, mut slowest, mut held) = (Duration::ZERO, Duration::ZERO, 0u64);
             let mut statements = 0usize;
-            for at in by_order(reverse) {
-                let (name, spec, judge, _) = &trees[at];
+            for (name, spec, judge, _) in &trees {
                 let before = storage.estimate_cache().len();
-                let asked = Planner::new(spec.clone(), policy).counts().len();
-                let named = cache.queries();
                 let started = Instant::now();
                 let planned = plan(
                     name,
@@ -783,10 +632,7 @@ fn planning_every_argument() {
                 let took = started.elapsed();
                 total += took;
                 slowest = slowest.max(took);
-                statements += match sizes {
-                    Sizes::Estimate => storage.estimate_cache().len().saturating_sub(before),
-                    _ => usize::from(cache.queries() != named) * asked,
-                };
+                statements += storage.estimate_cache().len().saturating_sub(before);
                 held = held.saturating_add(
                     planned
                         .ok()

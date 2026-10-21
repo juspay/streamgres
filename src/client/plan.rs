@@ -51,9 +51,9 @@
 //! everything from the row outwards: alone it is one row, and no sub
 //! costs less than that.
 //!
-//! **A main with a page** is counted like any other node, on its own
-//! filter with its cursor and its `LIMIT` ignored, so a new cursor is a
-//! new plan and a page turn costs its counts on the root. Driven by its
+//! **A main with a page** is sized like any other node, on its own
+//! filter with its `LIMIT` ignored and without its cursor (see below).
+//! Driven by its
 //! subs it holds its window at most, so its narrowed count is taken no
 //! higher than its `LIMIT`, and a page whose counts are both over the
 //! limit is still served: driven by its bounded subs, else driving them
@@ -71,30 +71,14 @@
 //! The planner does no I/O: it hands out the counts it wants and takes
 //! the answers back, so the caller runs them wherever it can and the
 //! decision stays a pure function that tests drive with numbers. [`plan`]
-//! is that caller for the server, and it plans a query once per **name**
-//! rather than once per set of arguments: the plan (every edge's driver,
-//! every page's read) is remembered by the query's name for
-//! `STREAMGRES_PLAN_QUERY_TTL_MS` (a day) and laid onto every later tree
-//! of that name, whoever asks and with whatever arguments — ids, lists,
-//! page sizes, cursors — so the counts run a few dozen times a day, not
-//! once per user, channel or cursor. A plan is about the join tree, not
-//! the filters, so it lays onto any tree of the same join skeleton; a name
-//! whose arguments add or drop a join (an optional `whereExists`) is
-//! planned once per skeleton. So a plan is made on the numbers of the
-//! first arguments that ask, and a later argument the plan does not suit
-//! is bounded by the read limit like any read. Only a plan that was made
-//! is remembered by name; a refusal is remembered for its own tree only
-//! (keyed as translated, the identity the engine's twin sharing uses, for
-//! `STREAMGRES_PLAN_TTL_MS`), so one argument's refusal never spreads to
-//! every other.
-//!
-//! **Estimated** (`STREAMGRES_PLAN_SIZES=estimate`), a query is planned
-//! per tree instead, on its own where clauses and literals: PostgreSQL's
-//! estimates cost an `EXPLAIN` the first time a statement is asked and a
-//! lookup after (the storage remembers each for a day, see
-//! `sync::pg::estimate_cache`), so no argument is planned on another's
-//! numbers. The name cache is neither read nor written; the tree's
-//! outcome is still remembered for `STREAMGRES_PLAN_TTL_MS`. A page is
+//! is that caller for the server, and it sizes every tree on its own
+//! where clauses and literals from PostgreSQL's estimates: an `EXPLAIN`
+//! the first time a statement is asked and a lookup after (the storage
+//! remembers each for a day, see `sync::pg::estimate_cache`), so no
+//! argument is planned on another's numbers, and a side that cannot be
+//! estimated is counted. The tree's outcome, a plan or a refusal, is
+//! remembered for that tree (keyed as translated, the identity the
+//! engine's twin sharing uses, for `STREAMGRES_PLAN_TTL_MS`). A page is
 //! estimated without its cursor ([`Translated::uncursored`]) — the rows
 //! its filter holds from the first page on, no fewer than past the
 //! cursor — so a page turn asks nothing the first page did not.
@@ -103,7 +87,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use futures_util::future::{join, join_all};
+use futures_util::future::join_all;
 
 use super::ast::Translated;
 use crate::log::{Level, log_event};
@@ -122,32 +106,11 @@ pub enum Side {
 }
 
 /// The planner's settings: the most rows a whole node may hold (the same
-/// number a storage read may return), the side that breaks a tie, and how
-/// [`plan`] learns the sizes it decides on.
+/// number a storage read may return) and the side that breaks a tie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
     pub limit: u64,
     pub preferred: Side,
-    pub sizes: Sizes,
-}
-
-/// How [`plan`] answers the planner's counts (`STREAMGRES_PLAN_SIZES`).
-///
-/// - `Count`: each counted on the storage ([`Storage::count`]), a capped
-///   `count(*)`.
-/// - `Estimate`: each estimated ([`Storage::estimate`]: PostgreSQL's
-///   `EXPLAIN`s and statistics, nothing executed), and counted only when it
-///   cannot be estimated.
-/// - `Shadow`: counted and decided on as `Count`, estimated alongside; the
-///   two decisions are logged side by side (`query sized`), so how often
-///   the estimates would have planned the same can be measured before
-///   they decide anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Sizes {
-    #[default]
-    Count,
-    Estimate,
-    Shadow,
 }
 
 /// One node of the tree being planned.
@@ -718,31 +681,6 @@ fn join_at<'a>(
     node.joins.get_mut(position)
 }
 
-/// Whether `a` and `b` have one join skeleton: at every position the same
-/// table, and under it the same joins — the same columns, inner or outer,
-/// in the same order, down to the leaves. Filters, cursors, limits and
-/// literals may differ; a plan made for one lays onto the other.
-fn same_skeleton(a: &MultiTableReadQuery, b: &MultiTableReadQuery) -> bool {
-    a.main_table.table == b.main_table.table
-        && a.joins.len() == b.joins.len()
-        && a.joins.iter().zip(&b.joins).all(|(x, y)| {
-            x.main_table_column == y.main_table_column
-                && x.sub_table_column == y.sub_table_column
-                && x.is_inner == y.is_inner
-                && same_skeleton(&x.sub, &y.sub)
-        })
-}
-
-/// Lay the plan of `planned` onto `query`, a tree of the same skeleton:
-/// every edge's driver and every node's page read.
-fn copy_plan(planned: &MultiTableReadQuery, query: &mut MultiTableReadQuery) {
-    query.page = planned.page;
-    for (from, to) in planned.joins.iter().zip(query.joins.iter_mut()) {
-        to.driver = from.driver;
-        copy_plan(&from.sub, &mut to.sub);
-    }
-}
-
 /// One remembered decision.
 struct Entry {
     outcome: Result<MultiTableReadQuery, String>,
@@ -759,86 +697,24 @@ struct CacheState {
     tick: u64,
 }
 
-/// The plans made per query name, each tree planned with when it was
-/// made: one per join skeleton the name's arguments give it.
-type ByName = HashMap<String, Vec<(MultiTableReadQuery, Instant)>>;
-
-/// Remembered plans, two ways: by **query name**, the plans that were made,
-/// laid onto every later tree of the name with the same join skeleton for
-/// `name_ttl`; and by the tree as translated, every outcome, refusals
-/// included, for `ttl` (a table that grew past the limit is re-counted
-/// eventually). Each way holds at most `capacity` entries: the least
-/// recently used tree leaves, and the oldest query name.
+/// Remembered outcomes, by the tree as translated, refusals included,
+/// for `ttl` (a table that grew past the limit is sized again
+/// eventually), at most `capacity` of them: the least recently used tree
+/// leaves.
 pub struct PlanCache {
     state: Mutex<CacheState>,
-    names: Mutex<ByName>,
     ttl: Duration,
-    name_ttl: Duration,
     capacity: usize,
 }
 
 impl PlanCache {
-    /// A cache keeping each tree's outcome for `ttl` and each query name's
-    /// plans for `name_ttl` (zero keeps none), at most `capacity` of each.
-    pub fn new(ttl: Duration, capacity: usize, name_ttl: Duration) -> Self {
+    /// A cache keeping each tree's outcome for `ttl`, at most `capacity`.
+    pub fn new(ttl: Duration, capacity: usize) -> Self {
         PlanCache {
             state: Mutex::new(CacheState::default()),
-            names: Mutex::new(HashMap::new()),
             ttl,
-            name_ttl,
             capacity: capacity.max(1),
         }
-    }
-
-    /// `query` planned as the plan remembered for `name` says, when the
-    /// name has one younger than its TTL made for a tree of the same
-    /// join skeleton.
-    pub fn by_name(&self, name: &str, query: &MultiTableReadQuery) -> Option<MultiTableReadQuery> {
-        let mut names = self.lock_names();
-        let plans = names.get_mut(name)?;
-        plans.retain(|(_, at)| at.elapsed() <= self.name_ttl);
-        let planned = plans
-            .iter()
-            .find(|(planned, _)| same_skeleton(planned, query))
-            .map(|(planned, _)| planned);
-        let mut laid = query.clone();
-        copy_plan(planned?, &mut laid);
-        Some(laid)
-    }
-
-    /// Remember `planned`, the plan made for a query `name`, for every
-    /// later tree of the name with its join skeleton (in place of an
-    /// earlier plan of that skeleton); the oldest name leaves when the
-    /// cache is full.
-    pub fn remember(&self, name: &str, planned: &MultiTableReadQuery) {
-        if self.name_ttl.is_zero() {
-            return;
-        }
-        let mut names = self.lock_names();
-        if !names.contains_key(name) && names.len() >= self.capacity {
-            let oldest = names
-                .iter()
-                .min_by_key(|(_, plans)| plans.iter().map(|(_, at)| *at).max())
-                .map(|(name, _)| name.clone());
-            if let Some(oldest) = oldest {
-                names.remove(&oldest);
-            }
-        }
-        let plans = names.entry(name.to_owned()).or_default();
-        plans.retain(|(known, _)| !same_skeleton(known, planned));
-        plans.push((planned.clone(), Instant::now()));
-    }
-
-    /// How many query names have a plan remembered.
-    pub fn queries(&self) -> usize {
-        self.lock_names().len()
-    }
-
-    /// The plans by name, read through a poisoned lock.
-    fn lock_names(&self) -> std::sync::MutexGuard<'_, ByName> {
-        self.names
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// The remembered decision for `query`, if it has one that has not
@@ -907,19 +783,15 @@ impl PlanCache {
     }
 }
 
-/// Plan `translated`, the query `name`, under `policy`: the plan
-/// remembered for its name, laid onto it, when there is one for its join
-/// skeleton (not when estimating: every tree is sized on its own), else
-/// the outcome remembered for this very tree, else the sizes on `storage`
-/// (concurrently; counted or estimated as `policy.sizes` says, an
-/// estimate of a page without its cursor) and the planner's decision —
-/// remembered by name when it is a plan made on counts, and by tree
-/// either way. A size that fails (the
-/// database was unreachable, the count ran past the read timeout) refuses
-/// the query, saying so, and is not remembered: it says nothing about the
-/// query, and the next asking sizes it again. The sizes are logged at
-/// debug level, `table alone/narrowed` per node; in shadow, the estimates
-/// and both decisions at info.
+/// Plan `translated`, the query `name`, under `policy`: the outcome
+/// remembered for this very tree, else the sizes estimated on `storage`
+/// (concurrently, a page without its cursor, a size that cannot be
+/// estimated counted) and the planner's decision, remembered for the
+/// tree. A size that fails (the database was unreachable, the count ran
+/// past the read timeout) refuses the query, saying so, and is not
+/// remembered: it says nothing about the query, and the next asking sizes
+/// it again. The sizes are logged at debug level (`query counted`: the
+/// name and `table alone/narrowed` per node).
 pub async fn plan<S: Storage + ?Sized>(
     name: &str,
     translated: Translated,
@@ -932,14 +804,6 @@ pub async fn plan<S: Storage + ?Sized>(
         hidden,
         uncursored,
     } = translated;
-    let by_name = policy.sizes != Sizes::Estimate;
-    if by_name && let Some(query) = cache.by_name(name, &query) {
-        return Ok(Translated {
-            query,
-            hidden,
-            uncursored,
-        });
-    }
     if let Some(outcome) = cache.get(&query) {
         return outcome.map(|query| Translated {
             query,
@@ -960,26 +824,11 @@ pub async fn plan<S: Storage + ?Sized>(
                     .all(|(a, b)| a.node == b.node && a.narrowed == b.narrowed)
         });
     let to_estimate = sized.as_deref().unwrap_or(&wanted);
-    let (answers, shadow) = match policy.sizes {
-        Sizes::Count => (counted(storage, &wanted).await, None),
-        Sizes::Estimate => (estimated_else_counted(storage, &wanted, to_estimate).await, None),
-        Sizes::Shadow => {
-            let ((answers, counting), (estimates, estimating)) = join(
-                timed(counted(storage, &wanted)),
-                timed(estimated(storage, to_estimate)),
-            )
-            .await;
-            (answers, Some((estimates, counting, estimating)))
-        }
-    };
+    let answers = estimated_else_counted(storage, &wanted, to_estimate).await;
     let mut failed = None;
-    let mut answered = Vec::with_capacity(wanted.len());
     for (count, answer) in wanted.iter().zip(answers) {
         match answer {
-            Ok(rows) => {
-                planner.answer(count.node, count.narrowed, rows);
-                answered.push(rows);
-            }
+            Ok(rows) => planner.answer(count.node, count.narrowed, rows),
             Err(error) => {
                 failed = Some(match error.refusal() {
                     Some(reason) => reason.to_owned(),
@@ -996,88 +845,21 @@ pub async fn plan<S: Storage + ?Sized>(
         log_event!(
             Level::Debug,
             "query counted",
+            name = name,
             table = query.main_table.table,
-            by = if policy.sizes == Sizes::Estimate {
-                "estimate"
-            } else {
-                "count"
-            },
             counts = planner.report()
         );
     }
-    let counts = shadow.as_ref().map(|_| planner.report());
     let outcome = match failed {
         Some(reason) => return Err(reason),
         None => planner.decide(),
     };
-    if let (Some((estimates, counting, estimating)), Some(counts)) = (shadow, counts) {
-        let mut estimator = Planner::new(query.clone(), policy);
-        let mut error = None;
-        for (count, estimate) in wanted.iter().zip(estimates) {
-            match estimate {
-                Ok(rows) => estimator.answer(count.node, count.narrowed, rows),
-                Err(failed) => error = Some(failed.to_string()),
-            }
-        }
-        let estimated = estimator.report();
-        let mut holds = String::new();
-        let same = match (&outcome, error.is_none().then(|| estimator.decide())) {
-            (_, None) => None,
-            (Ok(counted), Some(Ok(estimated))) => {
-                let mut judge = Planner::new(query.clone(), policy);
-                for (count, rows) in wanted.iter().zip(&answered) {
-                    judge.answer(count.node, count.narrowed, *rows);
-                }
-                let shown = |hold: Option<u64>| hold.map_or("over".to_owned(), |rows| rows.to_string());
-                holds = format!(
-                    "{}/{}",
-                    shown(judge.hold_of(counted)),
-                    shown(judge.hold_of(&estimated))
-                );
-                Some(counted == &estimated)
-            }
-            (Err(_), Some(Err(_))) => Some(true),
-            _ => Some(false),
-        };
-        log_event!(
-            Level::Info,
-            "query sized",
-            name = name,
-            table = query.main_table.table,
-            same = same.map_or("unknown", |same| if same { "yes" } else { "no" }),
-            holds = holds,
-            counts = counts,
-            estimates = estimated,
-            count_ms = format!("{:.2}", counting.as_secs_f64() * 1000.0),
-            estimate_ms = format!("{:.2}", estimating.as_secs_f64() * 1000.0),
-            error = error.unwrap_or_default()
-        );
-    }
-    if by_name && let Ok(planned) = &outcome {
-        cache.remember(name, planned);
-    }
     cache.put(query, outcome.clone());
     outcome.map(|query| Translated {
         query,
         hidden,
         uncursored,
     })
-}
-
-/// The answers of `work` and how long they took.
-async fn timed<T>(work: impl std::future::Future<Output = T>) -> (T, Duration) {
-    let started = Instant::now();
-    let answers = work.await;
-    (answers, started.elapsed())
-}
-
-/// Every count of `wanted` on `storage`, concurrently, each timed as
-/// `count_io`.
-async fn counted<S: Storage + ?Sized>(
-    storage: &S,
-    wanted: &[Count],
-) -> Vec<Result<u64, StorageError>> {
-    join_all(wanted.iter().map(|count| count_one(storage, count))).await
 }
 
 /// One count on `storage`, timed as `count_io`.
@@ -1091,15 +873,6 @@ async fn count_one<S: Storage + ?Sized>(
         stats.count_io.record(started.elapsed());
     }
     answer
-}
-
-/// Every count of `wanted` estimated on `storage`, concurrently, each
-/// timed as `estimate_io`.
-async fn estimated<S: Storage + ?Sized>(
-    storage: &S,
-    wanted: &[Count],
-) -> Vec<Result<u64, StorageError>> {
-    join_all(wanted.iter().map(|count| estimate_one(storage, count))).await
 }
 
 /// One estimate on `storage`, timed as `estimate_io`.
@@ -1224,11 +997,7 @@ mod tests {
 
     /// The policy with `limit`, preferring `preferred`.
     fn policy(limit: u64, preferred: Side) -> Policy {
-        Policy {
-            limit,
-            preferred,
-            sizes: Sizes::Count,
-        }
+        Policy { limit, preferred }
     }
 
     /// A node with inner subs is counted twice, alone (its `EXISTS`
@@ -1698,7 +1467,6 @@ mod tests {
         let sandbox = Policy {
             limit: 100_000,
             preferred: Side::Parent,
-            sizes: Sizes::Count,
         };
         let (_, outcome) = drive(
             Planner::new(query, sandbox),
@@ -2073,7 +1841,7 @@ mod tests {
     /// used decision at capacity.
     #[test]
     fn the_cache_remembers_decisions() {
-        let cache = PlanCache::new(Duration::from_secs(60), 2, Duration::from_secs(60));
+        let cache = PlanCache::new(Duration::from_secs(60), 2);
         let first = messages_in_channel(u32::MAX).query;
         let second = messages_in_channel(50).query;
         let third = messages_in_channel(7).query;
@@ -2088,7 +1856,7 @@ mod tests {
         assert!(cache.get(&first).is_some(), "recently used, kept");
         assert!(cache.get(&second).is_none(), "least recently used, evicted");
 
-        let brief = PlanCache::new(Duration::from_millis(0), 10, Duration::from_secs(60));
+        let brief = PlanCache::new(Duration::from_millis(0), 10);
         brief.put(first.clone(), Ok(first.clone()));
         std::thread::sleep(Duration::from_millis(2));
         assert!(brief.get(&first).is_none(), "expired");
@@ -2199,55 +1967,49 @@ mod tests {
         assert_eq!(counted(20).hold_of(&by_estimates), Some(20));
     }
 
-    /// Estimating sizes asks the storage's estimates and counts nothing;
-    /// a size that cannot be estimated is counted; in shadow everything is
-    /// counted and decided on and estimated beside it.
+    /// A size is asked of the storage's estimates and counted only when
+    /// it cannot be estimated.
     #[test]
-    fn the_sizes_are_estimated_counted_or_both() {
+    fn a_size_is_estimated_else_counted() {
         run(async {
-            let sized = |sizes: Sizes, estimate: Option<u64>| async move {
-                let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
+            let sized = |estimate: Option<u64>| async move {
+                let cache = PlanCache::new(Duration::from_secs(60), 10);
                 let storage = Counting {
                     estimate,
                     ..Counting::new(5)
                 };
-                let policy = Policy {
-                    sizes,
-                    ..policy(100, Side::Child)
-                };
-                let planned = plan("messagesIn", messages_in("c1", 50), policy, &cache, &storage)
-                    .await
-                    .expect("planned");
+                let planned = plan(
+                    "messagesIn",
+                    messages_in("c1", 50),
+                    policy(100, Side::Child),
+                    &cache,
+                    &storage,
+                )
+                .await
+                .expect("planned");
                 (storage.counts.get(), storage.estimates.get(), planned)
             };
-            let (counts, estimates, _) = sized(Sizes::Count, Some(7)).await;
-            assert!(counts > 0);
-            assert_eq!(estimates, 0);
-            let (none, estimated, by_estimate) = sized(Sizes::Estimate, Some(7)).await;
-            assert_eq!((none, estimated), (0, counts), "every size estimated, none counted");
+            let (none, estimated, by_estimate) = sized(Some(7)).await;
+            assert!(estimated > 0);
+            assert_eq!(none, 0, "every size estimated, none counted");
             assert_eq!(by_estimate.query.joins[0].driver, Driver::Main);
-            let (fell_back, tried, _) = sized(Sizes::Estimate, None).await;
-            assert_eq!((fell_back, tried), (counts, counts), "no estimate: each counted");
-            let (both, beside, _) = sized(Sizes::Shadow, Some(7)).await;
-            assert_eq!((both, beside), (counts, counts), "shadow counts and estimates each");
+            let (fell_back, tried, _) = sized(None).await;
+            assert_eq!((fell_back, tried), (estimated, estimated), "no estimate: each counted");
         });
     }
 
-    /// Estimated, every tree is sized on its own where clauses: another
-    /// channel is estimated again, nothing is remembered by name, and the
-    /// same tree is answered from the tree's outcome.
+    /// Every tree is sized on its own where clauses: another channel of
+    /// the same query is estimated again, and the same tree is answered
+    /// from the tree's outcome.
     #[test]
-    fn an_estimated_plan_is_made_per_tree_not_per_name() {
+    fn a_plan_is_made_per_tree_not_per_name() {
         run(async {
-            let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
+            let cache = PlanCache::new(Duration::from_secs(60), 10);
             let storage = Counting {
                 estimate: Some(7),
                 ..Counting::new(5)
             };
-            let policy = Policy {
-                sizes: Sizes::Estimate,
-                ..policy(100, Side::Child)
-            };
+            let policy = policy(100, Side::Child);
             plan("q", messages_in("c1", 50), policy, &cache, &storage)
                 .await
                 .expect("planned");
@@ -2257,7 +2019,6 @@ mod tests {
                 .await
                 .expect("planned");
             assert_eq!(storage.estimates.get(), 2 * first, "another channel, estimated");
-            assert_eq!(cache.queries(), 0, "nothing remembered by name");
             plan("q", messages_in("c1", 50), policy, &cache, &storage)
                 .await
                 .expect("planned");
@@ -2267,7 +2028,7 @@ mod tests {
     }
 
     /// A page with a cursor is estimated as its uncursored tree, and
-    /// counted as it is.
+    /// planned as it is.
     #[test]
     fn a_page_is_estimated_without_its_cursor() {
         run(async {
@@ -2281,153 +2042,31 @@ mod tests {
                     Where::Condition(leaf.clone()) == cursor
                 })
             };
-            for sizes in [Sizes::Estimate, Sizes::Shadow] {
-                let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
-                let storage = Counting {
-                    estimate: Some(7),
-                    ..Counting::new(5)
-                };
-                let policy = Policy {
-                    sizes,
-                    ..policy(100, Side::Child)
-                };
-                let planned = plan("q", turned.clone(), policy, &cache, &storage)
-                    .await
-                    .expect("planned");
-                assert!(has_cursor(&planned.query), "the plan keeps its cursor");
-                let estimated = storage.estimated.borrow();
-                assert!(!estimated.is_empty());
-                assert!(
-                    estimated.iter().all(|query| !has_cursor(query)),
-                    "{sizes:?}: no estimate sees the cursor"
-                );
-            }
-        });
-    }
-
-    /// Two trees of one join skeleton — same tables and joins at every
-    /// position — whatever their filters, cursors, limits and literals;
-    /// a join more or less, or another table, is another skeleton.
-    #[test]
-    fn a_join_skeleton_is_the_tree_without_its_filters() {
-        let one = messages_in("c1", 50).query;
-        assert!(same_skeleton(&one, &messages_in("c2", 20).query));
-        assert!(same_skeleton(&one, &messages_in("c1", u32::MAX).query));
-        let mut cursor = messages_in("c1", 50).query;
-        cursor.main_table.filter = Where::AND(vec![
-            cursor.main_table.filter.clone(),
-            Where::condition("id", ComparisonOperator::GT, "m9"),
-        ]);
-        assert!(same_skeleton(&one, &cursor), "a cursor adds no join");
-        let alone = MultiTableReadQuery::single(one.main_table.clone());
-        assert!(!same_skeleton(&one, &alone), "a join less");
-        let mut elsewhere = messages_in("c1", 50).query;
-        elsewhere.joins[0].sub.main_table.table = "threads".into();
-        assert!(!same_skeleton(&one, &elsewhere), "another table");
-    }
-
-    /// A query is counted once per name: the plan made for one channel is
-    /// laid onto another channel with another page size without a count,
-    /// its own arguments kept; another query name is planned on its own.
-    #[test]
-    fn a_plan_is_counted_once_per_name_and_laid_onto_every_argument() {
-        run(async {
-            let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
-            let storage = Counting::new(5);
-            let policy = policy(100, Side::Child);
-            let first = plan(
-                "messagesIn",
-                messages_in("c1", 50),
-                policy,
-                &cache,
-                &storage,
-            )
-            .await
-            .expect("planned");
-            let asked = storage.counts.get();
-            assert!(asked > 0, "the first asking is counted");
-            assert_eq!(
-                first.query.joins[0].driver,
-                Driver::Main,
-                "five messages drive their five conversations"
-            );
-            assert_eq!(cache.queries(), 1);
-
-            let second = plan(
-                "messagesIn",
-                messages_in("c2", 20),
-                policy,
-                &cache,
-                &storage,
-            )
-            .await
-            .expect("planned");
-            assert_eq!(storage.counts.get(), asked, "no count for other arguments");
-            let mut expected = messages_in("c2", 20).query;
-            expected.joins[0].driver = Driver::Main;
-            assert_eq!(
-                second.query, expected,
-                "the name's plan, its own arguments kept"
-            );
-            assert_eq!(second.hidden, messages_in("c2", 20).hidden);
-
-            plan(
-                "messagesElsewhere",
-                messages_in("c3", 20),
-                policy,
-                &cache,
-                &storage,
-            )
-            .await
-            .expect("planned");
+            let cache = PlanCache::new(Duration::from_secs(60), 10);
+            let storage = Counting {
+                estimate: Some(7),
+                ..Counting::new(5)
+            };
+            let planned = plan("q", turned, policy(100, Side::Child), &cache, &storage)
+                .await
+                .expect("planned");
+            assert!(has_cursor(&planned.query), "the plan keeps its cursor");
+            let estimated = storage.estimated.borrow();
+            assert!(!estimated.is_empty());
             assert!(
-                storage.counts.get() > asked,
-                "another name is planned on its own"
+                estimated.iter().all(|query| !has_cursor(query)),
+                "no estimate sees the cursor"
             );
-            assert_eq!(cache.queries(), 2);
-        });
-    }
-
-    /// A name whose arguments give it another join skeleton is planned
-    /// for that skeleton too, and both plans stay: neither is laid onto
-    /// the other's tree.
-    #[test]
-    fn a_name_is_planned_once_per_join_skeleton() {
-        run(async {
-            let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
-            let storage = Counting::new(5);
-            let policy = policy(100, Side::Child);
-            plan("q", messages_in("c1", 50), policy, &cache, &storage)
-                .await
-                .expect("planned");
-            let asked = storage.counts.get();
-            let mut other = messages_in("c1", 50);
-            other.query.joins[0].sub.main_table.table = "threads".into();
-            plan("q", other.clone(), policy, &cache, &storage)
-                .await
-                .expect("planned");
-            let both = storage.counts.get();
-            assert!(both > asked, "another skeleton is counted");
-            other.query.joins[0].sub.main_table.filter =
-                Where::condition("channelId", ComparisonOperator::EQ, "c9");
-            plan("q", other, policy, &cache, &storage)
-                .await
-                .expect("planned");
-            plan("q", messages_in("c7", 50), policy, &cache, &storage)
-                .await
-                .expect("planned");
-            assert_eq!(storage.counts.get(), both, "each skeleton's plan kept");
-            assert_eq!(cache.queries(), 1);
         });
     }
 
     /// A refusal is remembered for its own tree only: other arguments of
-    /// the name are counted again, not refused on the first one's numbers;
+    /// the name are sized again, not refused on the first one's numbers;
     /// the refused tree itself is answered from the cache.
     #[test]
     fn a_refusal_is_not_laid_onto_other_arguments() {
         run(async {
-            let cache = PlanCache::new(Duration::from_secs(60), 10, Duration::from_secs(60));
+            let cache = PlanCache::new(Duration::from_secs(60), 10);
             let storage = Counting::new(101);
             let policy = policy(100, Side::Child);
             let refused = |channel: &'static str| messages_in(channel, u32::MAX);
@@ -2442,8 +2081,7 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert!(storage.counts.get() > asked, "counted again");
-            assert_eq!(cache.queries(), 0, "no plan to lay onto others");
+            assert!(storage.counts.get() > asked, "sized again");
             let again = storage.counts.get();
             assert!(
                 plan("q", refused("c2"), policy, &cache, &storage)
@@ -2452,33 +2090,5 @@ mod tests {
             );
             assert_eq!(storage.counts.get(), again, "the same tree: from the cache");
         });
-    }
-
-    /// A name's plan lasts its TTL (none at zero), and when the cache is
-    /// full the name planned longest ago leaves.
-    #[test]
-    fn a_name_plan_expires_and_the_oldest_leaves() {
-        let translated = messages_in("c1", 50).query;
-        let mut planned = translated.clone();
-        planned.joins[0].driver = Driver::Main;
-
-        let none = PlanCache::new(Duration::from_secs(60), 10, Duration::ZERO);
-        none.remember("q", &planned);
-        assert_eq!(none.queries(), 0);
-        assert!(none.by_name("q", &translated).is_none());
-
-        let brief = PlanCache::new(Duration::from_secs(60), 10, Duration::from_millis(1));
-        brief.remember("q", &planned);
-        std::thread::sleep(Duration::from_millis(3));
-        assert!(brief.by_name("q", &translated).is_none(), "expired");
-
-        let small = PlanCache::new(Duration::from_secs(60), 1, Duration::from_secs(60));
-        small.remember("a", &planned);
-        std::thread::sleep(Duration::from_millis(1));
-        small.remember("b", &planned);
-        assert_eq!(small.queries(), 1);
-        assert!(small.by_name("a", &translated).is_none(), "the oldest left");
-        let laid = small.by_name("b", &translated).expect("kept");
-        assert_eq!(laid.joins[0].driver, Driver::Main);
     }
 }
