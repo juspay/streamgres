@@ -34,11 +34,11 @@
 //! A read is given [`PgStorage::with_read_timeout`] to finish, counted
 //! from the moment it holds a connection permit (the wait for a permit is
 //! the server's own queue, not PostgreSQL's time). Two clocks run: the
-//! connections the pool opens carry the limit as their session's
-//! `statement_timeout`, so PostgreSQL stops working on a statement it has
-//! been running that long, and the pool stops waiting after the same
-//! time, which covers what PostgreSQL cannot cancel (a connection that
-//! will not open, a network that went silent). Either way the read is
+//! read transaction sets a local `statement_timeout`, so PostgreSQL stops
+//! working on a statement it has been running that long, and the pool
+//! stops waiting after the same time, which covers what PostgreSQL cannot
+//! cancel (a connection that will not open, a network that went silent).
+//! Either way the read is
 //! **refused**, naming the table: reading it again would load a database
 //! that is already slow, so the query that needed it is told, by name,
 //! and asked for again later by the client. The connection is dropped.
@@ -86,6 +86,7 @@ const WAITING_ALIASES: usize = 2;
 /// [`PgStorage::with_read_connections`] says otherwise; further reads wait
 /// their turn instead of opening connections the server would refuse.
 const DEFAULT_READ_CONNECTIONS: usize = 16;
+const DEFAULT_READ_IDLE_CONNECTIONS: usize = 16;
 
 /// The most rows one read may bring back before it is refused, unless
 /// `STREAMGRES_ROW_LIMIT` says otherwise. Older `STREAMGRES_READ_ROW_LIMIT`,
@@ -350,11 +351,14 @@ impl Aliases {
 /// What every read shares: the connection settings, the pooled idle
 /// connections, the permits, the aliases and the runtime the work runs on.
 ///
-/// - `config`: how to connect; one connection is opened per read in
-///   flight and kept for reuse in `idle`, since each read is its own
-///   transaction.
+/// - `config`: the direct PostgreSQL endpoint used to mint snapshots.
+/// - `read_config`: where ordinary SQL reads connect; this can be PgBouncer.
+///   One client connection is opened per read in flight and kept for reuse
+///   in `idle`, since each read is its own transaction.
 /// - `permits`: how many reads may be in flight at once; the rest queue
 ///   here rather than at the server's connection limit.
+/// - `idle_limit`: the most read connections kept open for reuse when no
+///   read is using them.
 /// - `aliases`: the current alias and the ones waiting to become it, and
 ///   the catalog (the tables' declared columns, which the `SELECT` casts
 ///   to and the rows decode by) in force on the current one; a read
@@ -369,8 +373,10 @@ impl Aliases {
 /// - `runtime`: where the reads, the connections and the minter run.
 struct Pool {
     config: Config,
+    read_config: Config,
     idle: Mutex<Vec<Client>>,
     permits: Arc<Semaphore>,
+    idle_limit: AtomicUsize,
     /// The most rows one read may return before it is refused.
     row_limit: AtomicUsize,
     aliases: Mutex<Aliases>,
@@ -409,7 +415,7 @@ impl PgStorage {
     /// first read; mint the first alias (it becomes current with the first
     /// [`Storage::advance`] past its point) and keep minting one every
     /// [`PgStorage::with_rotation`] interval (250 ms by default). Every
-    /// read, connection and mint from then on runs as a task of `runtime`.
+    /// read and mint from then on runs as a task of `runtime`.
     pub async fn connect_on(
         dsn: &str,
         catalog: Arc<Catalog>,
@@ -419,18 +425,32 @@ impl PgStorage {
     }
 
     /// Connect as [`PgStorage::connect_on`] does, from a `config` already
-    /// parsed and, say, given a [`Keepalive`]: every connection the storage
-    /// opens, the reads' and the minters', is opened from it.
+    /// parsed and, say, given a [`Keepalive`]. Reads and snapshot minting
+    /// both use this endpoint.
     pub async fn connect_configured(
         config: Config,
         catalog: Arc<Catalog>,
         runtime: Handle,
     ) -> Result<Self, StorageError> {
-        let client = open(&config, &runtime).await?;
+        Self::connect_configured_with_read_config(config.clone(), config, catalog, runtime).await
+    }
+
+    /// Connect the read pool through `read_config`, while minting exported
+    /// snapshots through the direct PostgreSQL `config`. The read endpoint
+    /// must reach the same database as the snapshot exporter.
+    pub async fn connect_configured_with_read_config(
+        config: Config,
+        read_config: Config,
+        catalog: Arc<Catalog>,
+        runtime: Handle,
+    ) -> Result<Self, StorageError> {
+        let client = open(&read_config, &runtime).await?;
         let pool = Arc::new(Pool {
             config,
+            read_config,
             idle: Mutex::new(vec![client]),
             permits: Arc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
+            idle_limit: AtomicUsize::new(DEFAULT_READ_IDLE_CONNECTIONS),
             row_limit: AtomicUsize::new(read_row_limit()),
             aliases: Mutex::new(Aliases::new(catalog)),
             rotation: AtomicU64::new(250),
@@ -464,8 +484,10 @@ impl PgStorage {
     pub fn with_read_connections(self, limit: usize) -> Self {
         let pool = Arc::new(Pool {
             config: self.pool.config.clone(),
+            read_config: self.pool.read_config.clone(),
             idle: Mutex::new(std::mem::take(&mut *self.pool.lock_idle())),
             permits: Arc::new(Semaphore::new(limit.max(1))),
+            idle_limit: AtomicUsize::new(self.pool.idle_limit.load(Ordering::Relaxed)),
             row_limit: AtomicUsize::new(self.pool.row_limit.load(Ordering::Relaxed)),
             aliases: Mutex::new(self.pool.lock_aliases().take()),
             rotation: AtomicU64::new(self.pool.rotation.load(Ordering::Relaxed)),
@@ -481,13 +503,19 @@ impl PgStorage {
         PgStorage { pool, delay }
     }
 
+    /// Keep at most `limit` read connections idle for reuse; excess idle
+    /// connections are closed. Zero closes every connection after its read.
+    pub fn with_read_idle_connections(self, limit: usize) -> Self {
+        self.pool.idle_limit.store(limit, Ordering::Relaxed);
+        self.pool.lock_idle().truncate(limit);
+        self
+    }
+
     /// Give a read `timeout` to finish before it is refused (zero: as
-    /// long as it takes). The connections opened so far carry no limit of
-    /// their own, so they are let go and the next reads open theirs.
+    /// long as it takes). Each read sets the limit in its own transaction.
     pub fn with_read_timeout(self, timeout: Duration) -> Self {
         let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
         self.pool.timeout.store(millis, Ordering::Relaxed);
-        self.pool.lock_idle().clear();
         self
     }
 
@@ -521,14 +549,22 @@ impl PgStorage {
             .map(|alias| alias.lsn)
     }
 
-    /// Run one plain statement (no snapshot, autocommit) on a pooled
-    /// connection and return its rows as text; for the few reads that are
-    /// not the engine's (a client's mutation ids at connect time).
+    /// Run one plain read (no snapshot) on a pooled connection and return
+    /// its rows as text; for the few reads that are not the engine's (a
+    /// client's mutation ids at connect time). With a timeout, use a
+    /// transaction so the server-side limit ends with this read.
     pub async fn simple_query(&self, sql: &str) -> Result<Vec<SimpleQueryRow>, StorageError> {
         let pool = self.pool.clone();
         let sql = sql.to_owned();
         run_on(&self.pool.runtime, async move {
-            pool.run("a statement", &sql).await
+            let batch = match pool.timeout() {
+                Some(limit) => format!(
+                    "BEGIN READ ONLY; SET LOCAL statement_timeout = {}; {sql}; COMMIT",
+                    limit.as_millis()
+                ),
+                None => sql,
+            };
+            pool.run("a statement", &batch).await
         })
         .await
     }
@@ -701,20 +737,12 @@ impl Pool {
 
     /// How a read's connection is opened: `config` (which carries the
     /// [`Keepalive`] the storage was given, if any, so the kernel probes
-    /// the connection while it sits idle in the pool), and the read
-    /// timeout as both the time the connection may take to open and the
-    /// session's `statement_timeout`, after whatever options the
-    /// connection string already carries.
+    /// the connection while it sits idle in the pool), with the read
+    /// timeout also limiting how long a new connection may take to open.
     fn read_config(&self) -> Config {
-        let mut config = self.config.clone();
+        let mut config = self.read_config.clone();
         if let Some(limit) = self.timeout() {
             config.connect_timeout(limit);
-            let ours = format!("-c statement_timeout={}", limit.as_millis());
-            let options = match config.get_options() {
-                Some(theirs) => format!("{theirs} {ours}"),
-                None => ours,
-            };
-            config.options(&options);
         }
         config
     }
@@ -753,7 +781,10 @@ impl Pool {
     /// Return a connection after a successful statement; a failed one's
     /// connection is dropped instead, in case it is broken or mid-abort.
     fn release(&self, client: Client) {
-        self.lock_idle().push(client);
+        let mut idle = self.lock_idle();
+        if idle.len() < self.idle_limit.load(Ordering::Relaxed) {
+            idle.push(client);
+        }
     }
 
     /// Run one positioned statement as a single simple-query batch: the
@@ -772,6 +803,12 @@ impl Pool {
             "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '{}';",
             alias.snapshot.replace('\'', "''")
         );
+        if let Some(limit) = self.timeout() {
+            batch.push_str(&format!(
+                " SET LOCAL statement_timeout = {};",
+                limit.as_millis()
+            ));
+        }
         if let Some(delay) = delay {
             batch.push_str(&format!(" SELECT pg_sleep({});", delay.as_secs_f64()));
         }
