@@ -996,12 +996,13 @@ fn a_json_column_is_filtered_by_value() {
 
 /// A read is given the read timeout and no more: one that PostgreSQL is
 /// still working on when the time is up is cancelled there and refused
-/// here, naming the table, well before it would have finished; the
-/// connection settings that carry the limit leave an ordinary read
-/// alone, and a count is held to the same time.
+/// here, naming the table, well before it would have finished; an
+/// ordinary read and a count remain usable. When STREAMGRES_READ_PG_DSN
+/// is set, the same test sends its reads through that endpoint.
 #[test]
 fn a_read_past_its_time_is_refused() {
     let Some(dsn) = dsn() else { return };
+    let read_dsn = std::env::var("STREAMGRES_READ_PG_DSN").unwrap_or_else(|_| dsn.clone());
     block_on(async {
         let names = Names::new("timeout");
         let client = prepare(&dsn, &names).await;
@@ -1009,15 +1010,25 @@ fn a_read_past_its_time_is_refused() {
         let mut stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
             .await
             .expect("open stream");
-        let slow = PgStorage::connect(&dsn, catalog.clone())
-            .await
-            .expect("connect")
-            .with_read_timeout(Duration::from_millis(400))
-            .with_read_delay(Duration::from_secs(5));
-        let quick = PgStorage::connect(&dsn, catalog.clone())
-            .await
-            .expect("connect")
-            .with_read_timeout(Duration::from_millis(400));
+        let slow = PgStorage::connect_configured_with_read_config(
+            dsn.parse().expect("direct DSN"),
+            read_dsn.parse().expect("read DSN"),
+            catalog.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .expect("connect")
+        .with_read_timeout(Duration::from_millis(400))
+        .with_read_delay(Duration::from_secs(5));
+        let quick = PgStorage::connect_configured_with_read_config(
+            dsn.parse().expect("direct DSN"),
+            read_dsn.parse().expect("read DSN"),
+            catalog.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .expect("connect")
+        .with_read_timeout(Duration::from_millis(400));
         let mut runtime = Runtime::new(MultiTableIVM::new());
         catch_up(&mut runtime, &mut stream, &[&slow, &quick]).await;
         let whole = SingleTableReadQuery::new(
@@ -1043,6 +1054,14 @@ fn a_read_past_its_time_is_refused() {
             .await
             .expect("an ordinary read is served");
         assert!(!served.rows.is_empty());
+        assert_eq!(
+            quick
+                .simple_query("SELECT 1")
+                .await
+                .expect("a plain read is served")[0]
+                .get(0),
+            Some("1")
+        );
         let alone = MultiTableReadQuery::single(whole.clone());
         assert!(quick.count(&alone, 10).await.expect("an ordinary count") > 0);
         let again = slow.select(&whole).await.expect_err("and again");
