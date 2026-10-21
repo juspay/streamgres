@@ -99,6 +99,10 @@ struct Linked {
 pub(super) struct TableIndex {
     by_condition: HashMap<Condition, Linked>,
     columns: HashMap<ColumnName, ColumnIndex>,
+    /// The composite keys among `columns`: a row has no column of such a
+    /// name, so a probe computes their values from the row
+    /// ([`ColumnName::of`]) after the row's own columns are probed.
+    composite: Vec<ColumnName>,
     by_disjunct: HashMap<Disjunct, SharedCounter>,
     unconditional: Vec<SubId>,
     boundaries: IdMap<SubId, Where>,
@@ -161,10 +165,7 @@ impl TableIndex {
         for condition in &disjunct.conditions {
             if !self.by_condition.contains_key(condition) {
                 let handle = CondRef(Rc::new(condition.clone()));
-                self.columns
-                    .entry(condition.column.clone())
-                    .or_default()
-                    .file(&handle);
+                self.column_index(&condition.column).file(&handle);
                 self.by_condition.insert(
                     condition.clone(),
                     Linked {
@@ -201,8 +202,18 @@ impl TableIndex {
             column.unfile(&linked.handle);
             if column.is_empty() {
                 self.columns.remove(&condition.column);
+                self.composite.retain(|key| *key != condition.column);
             }
         }
+    }
+
+    /// The index of `column`'s conditions, made when first needed; a
+    /// composite key is noted for probing.
+    fn column_index(&mut self, column: &ColumnName) -> &mut ColumnIndex {
+        if column.is_composite() && !self.columns.contains_key(column) {
+            self.composite.push(column.clone());
+        }
+        self.columns.entry(column.clone()).or_default()
     }
 
     /// Detach `subscriber` from one disjunct, dropping the counter and its
@@ -283,10 +294,9 @@ impl TableIndex {
     /// it.
     pub(super) fn set_insert(&mut self, condition: &Condition, value: &Value) {
         if let Some(linked) = self.by_condition.get(condition) {
-            self.columns
-                .entry(condition.column.clone())
-                .or_default()
-                .file_key(&linked.handle, value);
+            let handle = linked.handle.clone();
+            self.column_index(&condition.column)
+                .file_key(&handle, value);
         }
     }
 
@@ -350,9 +360,10 @@ impl TableIndex {
     /// The subscriptions whose filters the row image satisfies **and**
     /// whose admission boundary (if any) it passes, sorted, each once.
     ///
-    /// Looks each column value of the row up in that column's index, which
-    /// yields exactly the conditions the value satisfies (each at most
-    /// once); every one bumps the shared counters of the disjuncts
+    /// Looks each column value of the row up in that column's index (and
+    /// each composite key's value, computed from the row, up in the
+    /// key's), which yields exactly the conditions the value satisfies
+    /// (each at most once); every one bumps the shared counters of the disjuncts
     /// containing it, and a counter reaching its size fires all of its
     /// subscribers. `epoch` must be a
     /// fresh, monotonically increased write number — it is what lazily
@@ -374,6 +385,12 @@ impl TableIndex {
             if let Some(index) = self.columns.get(column.as_str()) {
                 stats.columns_probed += 1;
                 index.candidates(value, &mut candidates);
+            }
+        }
+        for key in &self.composite {
+            if let (Some(index), Some(value)) = (self.columns.get(key), key.of(row)) {
+                stats.columns_probed += 1;
+                index.candidates(&value, &mut candidates);
             }
         }
         for candidate in candidates {
