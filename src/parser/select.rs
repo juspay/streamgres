@@ -11,17 +11,30 @@
 //! they name. `WHERE` is split into its top-level conjuncts and each goes
 //! to the one table it names. `ORDER BY` and `LIMIT` belong to the root.
 //!
+//! The backend composes the join under each root row, the joined tables
+//! depth first, each in its primary-key order. An `ORDER BY` naming a
+//! joined table is accepted when it asks for exactly that: the root's
+//! clauses first, covering its whole primary key (so each root row's
+//! result rows come out together, as Postgres orders them), then the
+//! joined tables' key columns, ascending, in that same order. A
+//! `COUNT(*)` counts every row; its `LIMIT` and `OFFSET` apply to the
+//! one row it returns.
+//!
 //! What is refused, by name: a table appearing twice, `RIGHT`/`FULL`/
 //! `CROSS` joins, a condition naming two tables (other than the edge's
-//! equality), an `OR` across tables, a `WHERE` condition on a
-//! `LEFT`-joined table (it would turn the join inner), an `ORDER BY` on a
-//! joined table, an unqualified column in a join (Diesel always
-//! qualifies), compound join keys.
+//! equality), an `OR` across tables, a `WHERE` condition on a table
+//! under a `LEFT` join (it would turn the join inner), an `INNER JOIN`
+//! onto a table under a `LEFT` join written after it rather than inside
+//! it (Postgres then drops the rows the `LEFT JOIN` keeps), any other
+//! `ORDER BY` on a joined table, an unqualified column in a join (Diesel
+//! always qualifies), compound join keys.
 
-use super::{ParseError, Parser, Projected, Projection, Tok, collapse, default_order};
+use super::{
+    ParseError, Parser, Projected, Projection, Tok, collapse, default_order, differs_from_all,
+};
 use crate::model::{
     Catalog, ColumnName, ComparisonOperator, Condition, DbTable, Join, MultiTableReadQuery,
-    Order, OrderBy, SingleTableReadQuery, Value, Where,
+    Order, OrderBy, SingleTableReadQuery, TableName, Value, Where,
 };
 
 /// A parsed `SELECT`: the engine's query tree and what the statement
@@ -30,10 +43,15 @@ use crate::model::{
 pub struct Select {
     pub query: MultiTableReadQuery,
     pub projection: Projection,
+    /// The statement's own `LIMIT` (`u32::MAX` for none).
+    pub limit: u32,
     /// Rows the statement skips (`OFFSET`). The tree's limit is the
     /// statement's limit plus this, so the engine keeps enough rows for
-    /// the client to skip and cut.
+    /// the client to skip and cut; under a `COUNT(*)` both apply to the
+    /// one counted row and the tree has no limit.
     pub offset: u32,
+    /// Every column the `ORDER BY` names, with where it was named.
+    pub ordered_by: Vec<(TableName, ColumnName, usize)>,
 }
 
 /// One table of the `FROM`, while the statement is read.
@@ -43,8 +61,9 @@ struct Node<'c> {
     conjuncts: Vec<Where>,
     /// Edges to child nodes: (child, parent column, child column, inner).
     edges: Vec<(usize, ColumnName, ColumnName, bool)>,
-    /// Whether this node is the child of a `LEFT` edge, which forbids a
-    /// `WHERE` condition on it.
+    /// Whether this node is under a `LEFT` edge (its child, or below
+    /// one), which forbids a `WHERE` condition on it and an `INNER JOIN`
+    /// onto it written after the `LEFT JOIN`.
     left_joined: bool,
 }
 
@@ -88,67 +107,17 @@ impl Parser<'_> {
             }
         }
 
+        let mut ordered_by = Vec::new();
         let order_by = if self.eat_word("ORDER") {
             self.expect_word("BY")?;
-            let mut clauses = Vec::new();
-            // Per joined node, how many of its primary-key columns the
-            // ORDER BY has named so far, in order.
-            let mut child_keys: Vec<usize> = vec![0; nodes.len()];
-            loop {
-                let at = self.at();
-                let column = self.column_ref(&nodes, &(0..nodes.len()).collect::<Vec<_>>())?;
-                let direction = if self.eat_word("DESC") {
-                    Order::DESC
-                } else {
-                    self.eat_word("ASC");
-                    Order::ASC
-                };
-                if column.node != 0 {
-                    // The tree orders the root only; the backend composes
-                    // a joined table's rows under each parent in that
-                    // table's primary-key order, ascending. An ORDER BY
-                    // that asks for exactly that is already met, and
-                    // anything else on a joined table cannot be.
-                    let node = &nodes[column.node];
-                    let next = node.table.pkey.get(child_keys[column.node]);
-                    if direction == Order::ASC && next == Some(&column.column) {
-                        child_keys[column.node] += 1;
-                    } else {
-                        return Err(ParseError {
-                            message: format!(
-                                "ORDER BY `{}` is on a joined table; a joined table orders only by its primary key, ascending, after the first table's columns",
-                                node.table.name
-                            ),
-                            position: at,
-                        });
-                    }
-                } else {
-                    if child_keys.iter().any(|&named| named > 0) {
-                        return Err(ParseError {
-                            message: "ORDER BY: the first table's columns must come before a joined table's".to_string(),
-                            position: at,
-                        });
-                    }
-                    clauses.push(OrderBy::new(column.column, direction));
-                }
-                if !self.eat_sym(",") {
-                    break;
-                }
-            }
-            if clauses.is_empty() {
-                vec![default_order(nodes[0].table, self.at())?]
-            } else {
-                clauses
-            }
+            self.order_by(&nodes, &mut ordered_by)?
         } else {
             vec![default_order(nodes[0].table, self.at())?]
         };
         let limit = self.limit()?;
         let offset = self.offset()?;
-        // The tree holds `limit + offset` rows; `u32::MAX` means no limit,
-        // so a sum that reaches it would register an unbounded query.
-        let kept = if limit == u32::MAX {
-            limit
+        let kept = if matches!(projection, Projection::Count { .. }) || limit == u32::MAX {
+            u32::MAX
         } else {
             match limit.checked_add(offset) {
                 Some(kept) if kept < u32::MAX => kept,
@@ -165,8 +134,79 @@ impl Parser<'_> {
         Ok(Select {
             query,
             projection,
+            limit,
             offset,
+            ordered_by,
         })
+    }
+
+    /// The clauses after `ORDER BY`, as the root's order. A joined
+    /// table's clause is accepted only where the composition already
+    /// yields it (see the module's notes): the root's clauses first,
+    /// naming its whole key, then the joined tables' key columns in
+    /// composition order, ascending. Every column named is noted in
+    /// `named`.
+    fn order_by(
+        &mut self,
+        nodes: &[Node<'_>],
+        named: &mut Vec<(TableName, ColumnName, usize)>,
+    ) -> Result<Vec<OrderBy>, ParseError> {
+        let composed = composition(nodes);
+        let everywhere: Vec<usize> = (0..nodes.len()).collect();
+        let mut clauses = Vec::new();
+        let mut joined = 0;
+        loop {
+            let at = self.at();
+            let column = self.column_ref(nodes, &everywhere)?;
+            let direction = if self.eat_word("DESC") {
+                Order::DESC
+            } else {
+                self.eat_word("ASC");
+                Order::ASC
+            };
+            named.push((nodes[column.node].table.name.clone(), column.column.clone(), at));
+            if column.node == 0 {
+                if joined > 0 {
+                    return Err(ParseError {
+                        message: "ORDER BY: the first table's columns must come before a joined table's".to_string(),
+                        position: at,
+                    });
+                }
+                clauses.push(OrderBy::new(column.column, direction));
+            } else if direction == Order::ASC
+                && composed.get(joined) == Some(&(column.node, &column.column))
+            {
+                joined += 1;
+            } else {
+                return Err(ParseError {
+                    message: format!(
+                        "ORDER BY `{}` is on a joined table; a joined table orders only by its primary key, ascending, in the order the tables are joined",
+                        nodes[column.node].table.name
+                    ),
+                    position: at,
+                });
+            }
+            if !self.eat_sym(",") {
+                break;
+            }
+        }
+        let root = nodes[0].table;
+        if joined > 0
+            && !root
+                .pkey
+                .iter()
+                .all(|key| clauses.iter().any(|clause| clause.column == *key))
+        {
+            return self.err(format!(
+                "ORDER BY on a joined table needs `{}`'s whole primary key ordered first",
+                root.name
+            ));
+        }
+        if clauses.is_empty() {
+            Ok(vec![default_order(root, self.at())?])
+        } else {
+            Ok(clauses)
+        }
     }
 
     /// `LIMIT n`, `LIMIT $k`, or nothing (`u32::MAX`).
@@ -285,11 +325,22 @@ impl Parser<'_> {
                     position: at,
                 });
             };
+            if inner && nodes[parent].left_joined {
+                return Err(ParseError {
+                    message: format!(
+                        "an INNER JOIN onto `{}`, which is under a LEFT JOIN, drops the rows the LEFT JOIN keeps; write it inside the LEFT JOIN's parentheses",
+                        nodes[parent].table.name
+                    ),
+                    position: at,
+                });
+            }
             nodes[parent]
                 .edges
                 .push((right_root, parent_column, child_column, inner));
             if !inner {
-                nodes[right_root].left_joined = true;
+                for node in &right {
+                    nodes[*node].left_joined = true;
+                }
             }
         }
     }
@@ -485,11 +536,7 @@ impl Parser<'_> {
             ComparisonOperator::EQ
         } else if self.eat_sym("!=") {
             if self.eat_word("ALL") {
-                return Ok(Where::Condition(Condition {
-                    column,
-                    comparison_operator: ComparisonOperator::NOT_IN,
-                    value: self.quantified_list("ALL")?,
-                }));
+                return Ok(differs_from_all(column, self.quantified_list("ALL")?));
             }
             ComparisonOperator::NEQ
         } else if self.eat_sym(">=") {
@@ -652,6 +699,22 @@ fn build(nodes: &[Node<'_>], index: usize, order_by: Vec<OrderBy>, limit: u32) -
     MultiTableReadQuery::new(main, joins)
 }
 
+/// The joined tables' key columns in the order the composition yields
+/// them: the tables depth first from the root, as the tree's joins are
+/// built, each table's key columns in turn.
+fn composition<'n>(nodes: &'n [Node<'_>]) -> Vec<(usize, &'n ColumnName)> {
+    fn walk<'n>(nodes: &'n [Node<'_>], index: usize, out: &mut Vec<(usize, &'n ColumnName)>) {
+        for (child, _, _, _) in &nodes[index].edges {
+            out.extend(nodes[*child].table.pkey.iter().map(|key| (*child, key)));
+            walk(nodes, *child, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(nodes, 0, &mut out);
+    out
+}
+
+/// A node's conjuncts as one filter: `AND` of them, no filter for none.
 fn collapse_conjuncts(conjuncts: Vec<Where>) -> Where {
     match conjuncts.len() {
         0 => Where::AND(Vec::new()),

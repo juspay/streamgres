@@ -27,14 +27,6 @@ pub struct QueryKey {
     pub binds: Vec<Bind>,
 }
 
-/// A read's SQL and bind types, without the bind values: what the engine
-/// parses, so what a refusal is about.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct QueryShape {
-    pub sql: String,
-    pub type_oids: Vec<u32>,
-}
-
 fn starts_with_word(text: &str, word: &str) -> bool {
     text.get(..word.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(word))
@@ -123,15 +115,6 @@ impl QueryKey {
         false
     }
 
-    /// What a refusal depends on: the SQL and the types of the binds, not
-    /// their values. A refused shape is refused for every value.
-    pub fn shape(&self) -> QueryShape {
-        QueryShape {
-            sql: self.sql.clone(),
-            type_oids: self.binds.iter().map(|bind| bind.type_oid).collect(),
-        }
-    }
-
     /// The bytes the binds hold, for a size-bounded cache.
     pub fn byte_len(&self) -> usize {
         self.sql.len()
@@ -178,21 +161,5 @@ mod tests {
         assert!(key("SELECT * FROM t FOR KEY SHARE;").is_locking());
         assert!(!key("SELECT * FROM t ORDER BY id").is_locking());
         assert!(!key("SELECT * FROM forecasts").is_locking());
-    }
-
-    #[test]
-    fn the_shape_drops_bind_values() {
-        let mut a = key("SELECT $1");
-        a.binds.push(Bind {
-            type_oid: 25,
-            bytes: Some(b"x".to_vec()),
-        });
-        let mut b = a.clone();
-        b.binds[0].bytes = Some(b"y".to_vec());
-        assert_ne!(a, b);
-        assert_eq!(a.shape(), b.shape());
-        let mut c = a.clone();
-        c.binds[0].type_oid = 1043;
-        assert_ne!(a.shape(), c.shape());
     }
 }

@@ -7,9 +7,10 @@
 //! row decodes through the same `FromSql` as a live one. A type whose
 //! value cannot be reproduced exactly from what the engine has is
 //! refused ([`Unsupported`]), and the query keeps refilling from Postgres
-//! instead: a `numeric` (the engine holds a float), a `timestamp` finer
-//! (the engine holds a float), ranges, intervals,
-//! composites.
+//! instead: a `numeric` (the engine holds a float), ranges, intervals,
+//! composites. A time comes back exact at any declared precision, since
+//! the engine keeps Postgres's own microseconds; a float's `NaN` and
+//! infinities come as the names Postgres gives them.
 
 use std::num::NonZeroU32;
 
@@ -90,8 +91,6 @@ fn supports_scalar(type_oid: u32, typmod: i32, name: &str) -> Result<(), Unsuppo
         | oid::JSONB
         | oid::BYTEA
         | oid::DATE
-        // The engine keeps a time as microseconds, Postgres's own
-        // precision, so every declared precision comes back exact.
         | oid::TIMESTAMP
         | oid::TIMESTAMPTZ => {
             let _ = typmod;
@@ -226,8 +225,18 @@ fn integer(cell: &Json, name: &str) -> Result<i64, Unsupported> {
         .ok_or_else(|| mismatch(name, "an integer"))
 }
 
+/// A float cell: a number, or the name of a value JSON has no number
+/// for (`NaN`, `Infinity`, `-Infinity`), as the engine sends them.
 fn float(cell: &Json, name: &str) -> Result<f64, Unsupported> {
-    cell.as_f64().ok_or_else(|| mismatch(name, "a number"))
+    match cell {
+        Json::String(text) => match text.as_str() {
+            "NaN" => Ok(f64::NAN),
+            "Infinity" => Ok(f64::INFINITY),
+            "-Infinity" => Ok(f64::NEG_INFINITY),
+            _ => Err(mismatch(name, "a number")),
+        },
+        other => other.as_f64().ok_or_else(|| mismatch(name, "a number")),
+    }
 }
 
 /// Decodes hex digits, two per byte. `None` for an odd length or
@@ -296,6 +305,13 @@ mod tests {
             bytes(encode(&json!(2.5), &base(oid::FLOAT8)).unwrap()),
             2.5f64.to_be_bytes()
         );
+        assert_eq!(
+            bytes(encode(&json!("Infinity"), &base(oid::FLOAT8)).unwrap()),
+            f64::INFINITY.to_be_bytes()
+        );
+        let nan = bytes(encode(&json!("NaN"), &base(oid::FLOAT8)).unwrap());
+        assert!(f64::from_be_bytes(nan.try_into().unwrap()).is_nan());
+        assert!(encode(&json!("lots"), &base(oid::FLOAT8)).is_err());
         assert_eq!(bytes(encode(&json!(true), &base(oid::BOOL)).unwrap()), [1]);
         assert_eq!(
             bytes(encode(&json!("hi"), &base(oid::TEXT)).unwrap()),

@@ -54,10 +54,10 @@ pub enum Route {
 }
 
 impl Route {
-    /// The earlier name of [`Route::Streamgres`].
+    /// Another name for [`Route::Streamgres`], under [`crate::Consistency`].
     #[allow(non_upper_case_globals)]
     pub const Eventual: Route = Route::Streamgres;
-    /// The earlier name of [`Route::Postgres`].
+    /// Another name for [`Route::Postgres`], under [`crate::Consistency`].
     #[allow(non_upper_case_globals)]
     pub const Strong: Route = Route::Postgres;
 

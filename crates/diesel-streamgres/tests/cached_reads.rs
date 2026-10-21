@@ -333,7 +333,7 @@ fn a_touch_during_the_read_is_not_lost() {
         "the fill is refused"
     );
     assert_eq!(w.cache.stats.stale_fills.load(Ordering::Relaxed), 1);
-    assert!(w.cache.is_empty());
+    assert!(w.cache.get(&key).is_none(), "the key is stale, nothing is served");
 
     assert_eq!(
         w.read("flag").as_deref(),
@@ -393,7 +393,7 @@ fn inside_a_transaction_reads_see_the_connections_own_writes() {
     assert_eq!(w.read("count").as_deref(), Some("2"));
     let cache_key = w.key_of("count");
     assert_eq!(
-        w.cache.get(&cache_key).map(|entry| entry.rows.len()),
+        w.cache.get(&cache_key).map(|rows| rows.len()),
         Some(1),
         "the entry is still the old row"
     );
@@ -845,6 +845,29 @@ fn a_write_on_one_connection_is_seen_by_reads_on_another_of_the_same_cache() {
     assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 1);
 }
 
+/// The window runs from a write's end, not its start: a write that takes
+/// longer than the window still sends the next read to Postgres. A
+/// batch that starts with a `SELECT` writes all the same.
+#[test]
+fn a_slow_write_opens_the_window_as_it_ends() {
+    let mut w = World::new("ryw-slow");
+    w.conn
+        .set_read_your_writes(std::time::Duration::from_millis(300));
+    w.put("mode", "a");
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    let key = w.key("mode");
+    w.conn
+        .batch_execute(&format!(
+            "SELECT pg_sleep(0.5); UPDATE sg_configs SET value = 'b' WHERE key = '{key}'"
+        ))
+        .unwrap();
+    assert_eq!(
+        w.read("mode").as_deref(),
+        Some("b"),
+        "read from Postgres: the write ended inside the window"
+    );
+}
+
 #[test]
 fn a_read_that_fails_after_the_engine_accepted_ends_its_subscription() {
     let mut w = World::new("accepted-error");
@@ -865,26 +888,34 @@ fn a_read_that_fails_after_the_engine_accepted_ends_its_subscription() {
     assert!(w.cache.is_empty());
 }
 
+/// A refusal is remembered for the query with the values it was for:
+/// the engine refuses on values too (a time at infinity, more rows than
+/// it follows), so another value is asked about afresh.
 #[test]
-fn a_refusal_is_remembered_for_the_shape_not_the_value() {
-    let mut w = World::new("refused-shape");
+fn a_refusal_is_remembered_for_its_values_not_the_shape() {
+    let mut w = World::new("refused-values");
     w.put("a", "1");
     w.put("b", "2");
     w.engine.refuse_all.store(true, Ordering::SeqCst);
     assert_eq!(w.read("a").as_deref(), Some("1"));
     w.engine.refuse_all.store(false, Ordering::SeqCst);
+    assert_eq!(w.read("a").as_deref(), Some("1"));
     assert_eq!(w.read("b").as_deref(), Some("2"));
     assert_eq!(
         w.cache.stats.refused.load(Ordering::Relaxed),
         1,
-        "asked once"
+        "asked once about `a`"
     );
     assert_eq!(
         w.cache.stats.refused_recently.load(Ordering::Relaxed),
         1,
-        "the other value skipped the ask"
+        "`a` again skipped the ask"
     );
-    assert!(w.engine.subscribed.lock().unwrap().is_empty());
+    assert_eq!(
+        w.engine.subscribed.lock().unwrap().len(),
+        1,
+        "`b` was asked about, and accepted"
+    );
 }
 
 /// What a full cache keeps is decided by how often a key is asked for,

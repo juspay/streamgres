@@ -77,7 +77,7 @@ pub use crate::route::{Route, RouteDsl, Served, Via};
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::Verdict;
 
-/// The earlier name of [`Route`]: `Consistency::Eventual` is
+/// [`Route`] under another name: `Consistency::Eventual` is
 /// [`Route::Streamgres`], `Consistency::Strong` is [`Route::Postgres`].
 pub type Consistency = Route;
 
@@ -221,12 +221,12 @@ impl<C> SyncedConnection<C> {
         self.route
     }
 
-    /// The earlier name of [`SyncedConnection::set_route`].
+    /// [`SyncedConnection::set_route`] under another name.
     pub fn set_consistency(&mut self, consistency: Consistency) {
         self.set_route(consistency);
     }
 
-    /// The earlier name of [`SyncedConnection::route`].
+    /// [`SyncedConnection::route`] under another name.
     pub fn consistency(&self) -> Consistency {
         self.route()
     }
@@ -246,6 +246,10 @@ impl<C> SyncedConnection<C> {
         self.read_your_writes
     }
 
+    /// Marks a write on the cache's clock. A write is marked as it
+    /// starts and again as it ends, so the read-your-writes window runs
+    /// from its end however long it took: a read after it on any
+    /// connection of the cache goes to Postgres for the whole window.
     fn wrote(&mut self) {
         if let Some(cache) = &self.cache {
             cache.mark_write();
@@ -298,15 +302,20 @@ impl<C> SimpleConnection for SyncedConnection<C>
 where
     C: SimpleConnection,
 {
+    /// Raw SQL may write; so does the ANSI manager's `COMMIT`, which is
+    /// when a transaction's writes become what the next read expects.
+    /// Opening, naming a point in, or abandoning a transaction writes
+    /// nothing.
     fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
-        // Raw SQL may write; so does the ANSI manager's COMMIT, which is
-        // when a transaction's writes become what the next read expects.
-        // Opening, naming a point in, or abandoning a transaction writes
-        // nothing.
-        if may_write(query) {
+        let writes = may_write(query);
+        if writes {
             self.wrote();
         }
-        self.inner.batch_execute(query)
+        let done = self.inner.batch_execute(query);
+        if writes {
+            self.wrote();
+        }
+        done
     }
 }
 
@@ -343,16 +352,21 @@ where
         self.inner.begin_test_transaction()
     }
 
+    /// A pool verifies a connection on checkout with `SELECT 1` through
+    /// this path; that is not a write.
     fn execute_returning_count<T>(&mut self, source: &T) -> QueryResult<usize>
     where
         T: QueryFragment<Pg> + QueryId,
     {
-        // A pool verifies a connection on checkout with `SELECT 1`
-        // through this path; that is not a write.
-        if may_write(&rendered(source)) {
+        let writes = may_write(&rendered(source));
+        if writes {
             self.wrote();
         }
-        self.inner.execute_returning_count(source)
+        let done = self.inner.execute_returning_count(source);
+        if writes {
+            self.wrote();
+        }
+        done
     }
 
     fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
@@ -402,9 +416,13 @@ where
         let mut key = QueryKey::of(&source, &mut self.inner)?;
         let route = key.take_route().or(self.scoped).unwrap_or(self.route);
         if !key.is_select() {
-            // `INSERT ... RETURNING` and friends come through `load`.
+            let cache = self.cache.clone();
             self.wrote();
-            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+            let done = LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+            if let Some(cache) = cache {
+                cache.mark_write();
+            }
+            return done;
         }
         if route == Route::Postgres || in_transaction(&mut self.inner) {
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
@@ -419,11 +437,9 @@ where
             cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
-        if let Some(entry) = cache.get(&key) {
+        if let Some(rows) = cache.get(&key) {
             self.served = Some(Served::Cache);
-            return Ok(SyncedCursor::Cached(OwnedCursor::new(Arc::clone(
-                &entry.rows,
-            ))));
+            return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
         }
         if cache.refused_recently(&key).is_some() {
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
@@ -437,9 +453,8 @@ where
                 cache.refused(&key, &reason);
                 return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
             }
-            Verdict::Rows { rows, store_bytes } => {
-                // The engine's own rows: no Postgres read at all.
-                cache.fill_weighing(reservation, Arc::clone(&rows), store_bytes);
+            Verdict::Rows { rows, live } => {
+                cache.fill_live(reservation, live, &rows);
                 self.served = Some(Served::Engine);
                 return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
             }
@@ -474,17 +489,29 @@ pub(crate) fn rendered<T: QueryFragment<Pg>>(query: &T) -> String {
     }
 }
 
-/// Whether raw SQL could change what a read sees: anything but a plain
-/// `SELECT` (a pool's `SELECT 1` on every checkout would otherwise keep
-/// the read-your-writes window open for good) and the statements that
-/// only move a transaction along without committing it.
+/// Whether raw SQL could change what a read sees: any statement of it
+/// but a plain `SELECT` (a pool's `SELECT 1` on every checkout would
+/// otherwise keep the read-your-writes window open for good) and the
+/// statements that only move a transaction along without committing it.
+/// A batch is split on every `;`, one inside a string literal included:
+/// a piece that then starts oddly counts as a write, which only sends a
+/// few more reads to Postgres.
 pub(crate) fn may_write(sql: &str) -> bool {
-    let head = sql.trim_start().trim_start_matches('(');
+    sql.split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .any(|statement| !reads_only(statement))
+}
+
+/// Whether one statement is a plain read or only moves a transaction
+/// along.
+fn reads_only(statement: &str) -> bool {
+    let head = statement.trim_start_matches('(');
     let word = head
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .next()
         .unwrap_or("");
-    ![
+    [
         "SELECT",
         "BEGIN",
         "START",

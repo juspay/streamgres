@@ -129,8 +129,8 @@ pub enum Lookup {
     LastActivity { org: i64 },
     /// Tickets of a kind, through the column and enum type `demo
     /// migrate new-type` adds: before the migration the read fails
-    /// (no such column); after it the bind is refused until the engine
-    /// restarts, then served from rows. Not in the demo list.
+    /// (no such column); after it the engine learns the type on the
+    /// first bind and serves it from rows. Not in the demo list.
     OfKind { org: i64, kind: TicketKind },
 }
 

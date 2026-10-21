@@ -48,11 +48,19 @@ impl CatalogHandle {
     pub fn swap(&self, catalog: Arc<Catalog>) {
         self.current.store(catalog);
     }
+
+    /// Replace the catalog with `change` of it, retried on whatever a
+    /// concurrent swap put in, so neither change is lost to the other.
+    pub fn update(&self, change: impl Fn(&Catalog) -> Catalog) {
+        self.current.rcu(|current| Arc::new(change(current)));
+    }
 }
 
 /// `catalog` with `table` in it, replacing a table of the same name,
-/// and knowing the same enum types: a bound enum label must stay
-/// readable after a migration.
+/// and knowing the same enum types and text orderings: a bound enum
+/// label must stay readable after a migration, and a column's ordering
+/// does not change with it. A column the migration adds is not known to
+/// order as text, so an ordering on it is refused rather than guessed.
 pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
     let name = table.name.clone();
     Catalog::new(
@@ -63,6 +71,15 @@ pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
             .chain(std::iter::once(table)),
     )
     .with_enum_oids(catalog.enum_oids())
+    .with_ordered_as_text(catalog.ordered_as_text().cloned())
+}
+
+/// `catalog` knowing `oids` are enum types too, as a type created after
+/// the catalog was loaded is learned.
+pub fn with_enums(catalog: &Catalog, oids: impl IntoIterator<Item = u32>) -> Catalog {
+    catalog
+        .clone()
+        .with_enum_oids(catalog.enum_oids().chain(oids))
 }
 
 /// `table` with `column` added: the same name and key, one column more.

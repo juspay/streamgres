@@ -3,7 +3,9 @@
 #   docker compose -f demo/docker-compose.yml up --build
 #
 # Then http://localhost:8080 for the stats page, and demo/README.md for
-# the curl walk-through.
+# the curl walk-through. Every port is published on this machine only,
+# and the engine's S2S endpoint asks for a token: the stack holds a
+# well-known database password and is for a laptop, not a network.
 services:
   postgres:
     image: postgres:16
@@ -21,13 +23,13 @@ services:
       POSTGRES_DB: tickets
     volumes:
       # The publication the engine streams, then the schema-change
-      # trigger it requires (for app `xyne`, shard 0, the defaults).
+      # trigger stack it requires, both for app `demo`, shard 0.
       - ./postgres-init.sql:/docker-entrypoint-initdb.d/10-publication.sql:ro
-      - ../scripts/sql/ddl-triggers.sql:/docker-entrypoint-initdb.d/20-ddl-triggers.sql:ro
+      - ./ddl-triggers.sql:/docker-entrypoint-initdb.d/20-ddl-triggers.sql:ro
     ports:
       # Host ports are overridable, for a machine that already has one
       # of these services on the default port.
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U streamgres -d tickets"]
       interval: 2s
@@ -54,15 +56,17 @@ services:
       dockerfile: docker/server/Dockerfile
     environment:
       STREAMGRES_PG_DSN: postgresql://streamgres:streamgres@postgres:5432/tickets
-      # The checked-in trigger script and publication are for app `xyne`.
-      STREAMGRES_APP_ID: xyne
+      # The app the trigger stack and the publication are made for.
+      STREAMGRES_APP_ID: demo
+      STREAMGRES_PUBLICATION: demo_pub
+      STREAMGRES_S2S_TOKEN: "${STREAMGRES_S2S_TOKEN:-demo-token}"
       # The Zero side is not part of this demo; the endpoints are never
       # called, but the server wants them set.
       STREAMGRES_QUERY_URL: http://127.0.0.1:1/query
       STREAMGRES_MUTATE_URL: http://127.0.0.1:1/mutate
       STREAMGRES_ADDR: 0.0.0.0:4848
     ports:
-      - "${ENGINE_PORT:-4848}:4848"
+      - "127.0.0.1:${ENGINE_PORT:-4848}:4848"
     # A migration the engine cannot follow (`demo migrate drop`)
     # stops it on purpose; restarted, it serves the schema as it is.
     restart: on-failure
@@ -83,13 +87,14 @@ services:
     environment:
       DATABASE_URL: postgres://streamgres:streamgres@postgres:5432/tickets
       STREAMGRES_S2S_URL: ws://engine:4848/zero/s2s/v1
+      STREAMGRES_S2S_TOKEN: "${STREAMGRES_S2S_TOKEN:-demo-token}"
       DEMO_ADDR: 0.0.0.0:8080
       DEMO_WRITER_MS: "${DEMO_WRITER_MS:-1000}"
       DEMO_WRITER_MIX: "${DEMO_WRITER_MIX:-}"
       DEMO_VERIFY_MS: "${DEMO_VERIFY_MS:-0}"
       DEMO_SCALE: "${DEMO_SCALE:-1}"
     ports:
-      - "${DEMO_PORT:-8080}:8080"
+      - "127.0.0.1:${DEMO_PORT:-8080}:8080"
     depends_on:
       engine:
         condition: service_healthy

@@ -17,7 +17,7 @@ and changes nothing else.
      +-- cacheable read
             |
             v
-         Cache (moka, keyed by SQL + bind bytes) <---- replace / touched
+         Cache (moka, keyed by SQL + bind bytes) <---- delta / touched
             | miss                                          ^
             v                                               |
          EngineClient (pool of WebSockets) --- subscribe ---> Streamgres engine
@@ -35,8 +35,8 @@ and changes nothing else.
 | `lib.rs` | `SyncedConnection`, `Settings`, `install`, the interception of Diesel's three connection methods |
 | `asynchronous.rs` | `AsyncSyncedConnection`, the same wrapper over diesel-async (feature `async`) |
 | `route.rs` | `Route`, `RouteDsl`, `Via`, `Served`: where a read goes and where it came from |
-| `key.rs` | `QueryKey` and `QueryShape`: what identifies a read and what identifies a refusal |
-| `cache.rs` | `Cache`, `Limits`, `Stats`, reservations and generations |
+| `key.rs` | `QueryKey`: what identifies a read, and a refusal |
+| `cache.rs` | `Cache`, `Limits`, `Stats`, the `Live` trait, reservations and generations |
 | `subscriptions.rs` | the `Subscriptions` trait between the cache and the engine side |
 | `engine.rs` | `EngineClient`: the pool of sockets to the engine, `Config` |
 | `materialized.rs` | a query's result kept from the engine's rows; joins composed here |
@@ -58,9 +58,9 @@ Diesel funnels every operation into three methods on the connection type:
 `SyncedConnection<C>` implements all three and delegates to the inner
 connection `C`, normally `PgConnection`. Transactions use Diesel's ANSI
 manager over the inner connection's state, so there is one transaction
-depth. Writes always go to Postgres. Pools (`r2d2`, `bb8` through
-`async-bb8-diesel`) and `#[derive(Queryable)]` work unchanged, because
-the wrapper is just another connection type.
+depth. Writes always go to Postgres. Pools (`r2d2`, and `bb8` or
+`deadpool` through diesel-async) and `#[derive(Queryable)]` work
+unchanged, because the wrapper is just another connection type.
 
 Diesel seals `Connection` behind the cargo feature
 `i-implement-a-third-party-backend-and-opt-into-breaking-changes`; the
@@ -80,9 +80,11 @@ carries one. Then:
    `SELECT` (Diesel sends `INSERT ... RETURNING` through `load`), a read
    inside an open transaction, a read inside the read-your-writes window,
    `FOR UPDATE` and its variants, a `WITH` whose expressions modify data.
-3. **Refused recently.** A query whose shape the engine refused within
-   `STREAMGRES_REFUSED_TTL_MS` goes live without asking again.
-4. **Hit.** The entry under the key is served.
+3. **Refused recently.** A query the engine refused, with the same
+   values, within `STREAMGRES_REFUSED_TTL_MS` goes live without asking
+   again.
+4. **Hit.** The entry under the key is served; in rows mode the result
+   is built from the engine's rows if a change came since it last was.
 5. **Miss.** The key is reserved and the query subscribed. Rows mode
    builds the entry from the engine's rows; refill mode reads Postgres
    and keeps what it returned; a refusal goes live.
@@ -97,8 +99,9 @@ and bytes. Two reads with equal keys get equal rows. (Diesel's own
 statement-cache key is the `TypeId` of the query shape, which ignores
 argument values.)
 
-A refusal is keyed by the query's shape, its SQL and bind types without
-the values: what the engine refuses, it refuses for every value.
+A refusal is remembered under the same key, values and all: the engine
+refuses on values too (a time at infinity, more rows than it follows for
+one user), so a refusal for one value says nothing of another.
 
 ## Two ways an entry is kept fresh
 
@@ -109,7 +112,7 @@ is decided by its projected columns:
 |---|---|---|
 | when | every projected column has a type the client encodes exactly | a projected column cannot be reproduced exactly from the engine's values |
 | miss | built from the engine's `accepted` rows; Postgres is not read | Postgres is read once; rows kept byte for byte |
-| change | the engine's `delta` replaces the entry in place | the engine's `touched` drops the entry; the next read refills |
+| change | the engine's `delta` updates the store in place; the next read builds the result | the engine's `touched` marks the entry stale; the next read refills |
 | reconnect | rebuilt from the engine's snapshot | refilled on next read |
 
 `EngineClient::fallbacks()` lists the queries in refill mode and why;
@@ -147,29 +150,40 @@ unencodable column puts the whole query in refill mode up front.
 
 Values on the wire: times are microseconds since the Unix epoch,
 Postgres's own precision; `bytea` is Postgres's hex text; an enum is its
-label.
+label; a float's `NaN` and infinities are the strings `"NaN"`,
+`"Infinity"` and `"-Infinity"`.
 
-**The materialized store** keeps the rows by primary key per table and
-produces the result on demand:
+**The materialized store** keeps the rows by primary key per table. The
+cache entry holds the store itself (`cache::Live`): a delta moves rows
+in and out of it on the socket's thread, and the next read builds the
+result from it, on the reading thread, and keeps it until the next
+change. A burst of deltas costs one build, and none if nobody reads in
+between. The build:
 
 1. The root table's rows in query order. `ASC` puts NULLs last, `DESC`
-   first, as Postgres does by default. Strings compare bytewise, which
-   is Postgres's `C` collation. Rows that tie, and child rows under one
-   parent, come out in primary-key order by value (9 before 10).
-2. A hash join down each edge. An inner edge drops a parent with no
-   match; a left edge extends it with NULLs.
+   first, as Postgres does by default. Strings compare bytewise; the
+   engine only accepts an `ORDER BY` on a column Postgres orders the
+   same way (see below). Rows that tie, and child rows under one parent,
+   come out in primary-key order by value (9 before 10).
+2. A hash join down each edge, the joined tables depth first. An inner
+   edge drops a parent with no match; a left edge extends it with NULLs.
 3. `OFFSET` rows skipped, then `LIMIT` applied over the joined rows. The
    engine keeps `limit + offset` root rows so there is enough to skip.
 4. Projection to the selected columns and names, each cell encoded. A
-   `COUNT(*)` is one `int8` row computed from the kept rows.
+   `COUNT(*)` counts every joined row (the engine keeps every row for
+   it), and its `LIMIT` and `OFFSET` cut the one `int8` row it is, as
+   Postgres applies them after counting.
+
+A value that cannot be encoded after all (a delta brings one) falls the
+query back to refill mode at the read that meets it.
 
 ### Refill mode
 
 On a miss the client subscribes first, then reads Postgres through the
 inner connection and keeps each row's OID and raw bytes (`OwnedRow`). A
 cached row is byte-identical to the one Postgres sent, so any column
-type works. On `touched` the entry is dropped and the next read refills.
-The cost is one Postgres read per change per affected query.
+type works. On `touched` the entry is marked stale and the next read
+refills. The cost is one Postgres read per change per affected query.
 
 ## What the engine follows
 
@@ -179,12 +193,12 @@ identifiers, a column list, `*` or `COUNT(*)`, `$n` placeholders.
 | accepted | refused, with a reason |
 |---|---|
 | `=`, `<>`/`!=`, `<`, `<=`, `>`, `>=`, `[NOT] IN`, `IS [NOT] NULL`, `AND`, `OR`, parentheses | `DISTINCT`, `GROUP BY`, aggregates other than `COUNT(*)` |
-| `= ANY($n)` with an array bind (`eq_any`), read as `IN` | `LIKE`, `ILIKE`, array operators such as `@>` |
-| `ORDER BY` on the root table, `LIMIT`, `OFFSET` | table aliases, unknown tables or columns |
-| `INNER` and `LEFT [OUTER]` joins on a one-column equality each side | a table joined twice; `RIGHT`, `FULL`, `CROSS`; compound join keys |
-| `ON` conditions and `WHERE` conjuncts that name one table | an `OR` across tables; a `WHERE` on a `LEFT`-joined table |
-| a joined table ordered by its primary key ascending, after the root's columns | any other `ORDER BY` on a joined table; an unqualified column in a join |
-| binds of integers, floats, numerics, booleans, text-like types, UUIDs, JSON, timestamps, dates, enums | any other bind type; a result over the engine's row limit |
+| `= ANY($n)` with an array bind (`eq_any`), read as `IN`; `!= ALL($n)` (`ne_all`), read as `NOT IN`, an empty array being no condition | `LIKE`, `ILIKE`, array operators such as `@>` |
+| `ORDER BY` on the root table by a column Postgres orders as the engine does: numbers, booleans, times, `uuid`, `bytea`, `name`, `time`, and strings under the `C` collation; `LIMIT`, `OFFSET` | an `ORDER BY` on an enum, on a string under any other collation, on JSON; table aliases, unknown tables or columns |
+| `INNER` and `LEFT [OUTER]` joins on a one-column equality each side; an `INNER JOIN` inside a `LEFT JOIN`'s parentheses | a table joined twice; `RIGHT`, `FULL`, `CROSS`; compound join keys; an `INNER JOIN` onto a table under a `LEFT JOIN`, written after it |
+| `ON` conditions and `WHERE` conjuncts that name one table | an `OR` across tables; a `WHERE` on any table under a `LEFT JOIN` |
+| joined tables ordered by their primary keys ascending, depth first, after root columns that cover the root's whole key | any other `ORDER BY` on a joined table; an unqualified column in a join |
+| binds of integers, floats, numerics, booleans, text-like types, UUIDs, JSON, timestamps, dates, enums (one created after the engine started is learnt on its first bind) | any other bind type; a time or date at infinity; a result over the engine's row limit |
 
 In a join, Diesel's `FROM ("a" INNER JOIN ("b" ...) ON (...))` becomes a
 tree: each `JOIN` is an edge from the table on its left (the parent) to
@@ -202,7 +216,7 @@ Client to engine:
 |---|---|
 | `["subscribe", {"id", "sql", "binds": [{"oid", "bytes": base64 or null}], "rows": true}]` | follow this query; `id` is the client's own, per socket |
 | `["unsubscribe", {"id"}]` | the cache dropped the key |
-| `["ping"]` | keepalive |
+| `["ping"]` | keepalive; the client sends one while the socket is quiet |
 
 Engine to client:
 
@@ -214,13 +228,20 @@ Engine to client:
 | `["touched", {"ids"}]` | one transaction changed these refill-mode subscriptions |
 | `["refused", {"id", "reason"}]` | the engine cannot follow the query; after an `accepted`, it stopped following it |
 | `["pong"]` | reply to `ping` |
+| `["error", {"reason"}]` | a frame that could not be read and names no id; a `subscribe` whose id reads is answered `refused` instead |
+
+An id is never reused on a socket: frames queued for an unsubscribed id
+may still arrive after the `unsubscribe`.
 
 On the engine, one task owns every S2S subscription. It consumes the
 same engine events as the Zero client groups, with its own index of
 subscriptions, and maps the engine's ids back to the socket and the
-client's id. Each socket has a request queue of 1,024 frames and an
-outgoing queue of 4,096; a client that stops reading is closed when its
-outgoing queue fills rather than buffered for.
+client's id. A row a transaction changed is serialized once and spliced
+into every `delta` that carries it. Each socket has a request queue of
+1,024 frames and an outgoing queue of 4,096 frames and 64 MiB; a client
+that stops reading is closed when its outgoing queue fills rather than
+buffered for, and its socket is cut off 5 seconds later if its writer
+still cannot flush.
 
 ## Correctness rules
 
@@ -233,16 +254,22 @@ fill; `Cache::fill` stores the rows only if nothing bumped it since. A
 touch, a delta and every path that ends a subscription bump it. The map
 holds generations only for keys with a reservation in flight.
 
-The engine side follows the same rule. A delta or snapshot reserves the
-key before building rows; `replace` bumps the generation, so a slower
-Postgres fill with older rows loses, and checks it again after the
-insert. Every path that ends a subscription (dropped read, failed read,
+The engine side follows the same rule. A snapshot for a resubscribe
+reserves the key before building its store; `Cache::live` bumps the
+generation, so a slower Postgres fill with older rows loses, and checks
+it again after the insert. A delta only changes the store the entry
+already holds, and stores it again only when its weight drifted. Every path that ends a subscription (dropped read, failed read,
 oversized result, eviction, expiry) bumps the generation as it drops the
 key, under the worker's lock, so rows built for a key unsubscribed
 meanwhile are dropped. The wrapper never unsubscribes directly;
 `Cache::abandon` does it in that order. No lock is held across a moka
 insert, because the eviction listener runs on the inserting thread; a
 fill checks the generation before and after instead.
+
+**Stale, not gone.** A touch, a lost fill and a dropped socket leave the
+key marked stale rather than removed: the mark weighs only the key and
+keeps the entry's clocks, so the subscription of a query nobody reads
+again still ends when its idle time runs out.
 
 **The `Building` store.** When `accepted` arrives, the reader thread
 puts an empty `Building` store in place under the lock that ends the
@@ -263,6 +290,7 @@ the environment (`Config::from_env`) or explicitly
 | `STREAMGRES_S2S_CONNECTIONS`        | sockets to the engine, each on its thread | 2       |
 | `STREAMGRES_S2S_MAX_SUBSCRIPTIONS`  | subscriptions held across all sockets     | 10000   |
 | `STREAMGRES_S2S_VERDICT_TIMEOUT_MS` | wait for `accepted` or `refused`          | 5000    |
+| `STREAMGRES_S2S_SILENCE_MS`         | a socket silent this long is taken for dead | 30000 |
 | `STREAMGRES_S2S_TOKEN`              | bearer token sent when a socket opens     | none    |
 
 The token goes out as `Authorization: Bearer <token>` on each socket's
@@ -270,7 +298,10 @@ upgrade, for an engine started with the same `STREAMGRES_S2S_TOKEN`. An
 engine that wants a token and is not given the right one answers 401.
 The worker then retries like any failed connect, so every read goes to
 Postgres until the two agree. The token never appears in `Config`'s
-`Debug` output.
+`Debug` output. Over `ws://` the token crosses the network in plain
+text; `wss://` connects with TLS (rustls, the system's root
+certificates), and `EngineClient::warnings` names a token sent over
+`ws://` to another machine, for the application to log.
 
 **Connect failures.** A worker keeps why its latest connect failed: a
 401 (the token), a 503 (the engine not serving yet, or out of
@@ -302,19 +333,23 @@ context.
 |---|---|---|
 | verdict timeout | 5 s, configurable | the read goes live; the id is withdrawn |
 | send timeout | 10 s | the socket is given up on, so an engine that stops reading cannot block the worker |
+| ping | a third of the silence window | a quiet socket is pinged |
+| silence | 30 s, configurable | nothing heard: the socket is taken for dead (an engine killed without a close, a network gone without a reset), and its keys go stale |
 | reconnect delay | 1 s | a lost socket is retried every second |
 
-**Refusals.** A refusal from the engine is remembered for
-`STREAMGRES_REFUSED_TTL_MS`. Some refusals are not remembered:
+**Refusals.** A refusal from the engine is remembered for the query and
+its values for `STREAMGRES_REFUSED_TTL_MS`. Some refusals are not remembered:
 - those from the client's own side (not connected, over the cap, no
   answer in time);
 - the engine's per-connection limit (`the subscription limit of ...`),
   which frees up as other keys go. All
 remembered refusals are forgotten when a socket drops, since the engine
-that comes back may know types the old one did not.
+that comes back may know types the old one did not; so are the column
+types learnt, since a migration may have changed one.
 
 **Reconnect.** A dropped socket refuses the subscribes waiting on it,
-drops the cache entries of its keys, which go live until it is back, and
+marks the cache entries of its keys stale, which go live until it is
+back, and
 on reconnect resubscribes every key it holds under the same ids.
 Rows-mode keys rebuild from the snapshot with no Postgres read;
 refill-mode keys refill on their next read; keys now refused are
@@ -336,8 +371,11 @@ outage costs the application its cache and nothing else.
 | `STREAMGRES_CACHE_TTL_MS`          | drop an entry this old however read; 0 never | off     |
 | `STREAMGRES_REFUSED_TTL_MS`        | skip the engine for a refused query this long; 0 always ask | 30 s |
 
-A rows-mode entry weighs its rows plus its materialized store. A result
-over the entry limit is served but not kept, and its subscription ends.
+A rows-mode entry weighs its store twice, for the rows and for the
+result built from them, and is weighed again when the store drifts by a
+quarter (64 KiB at least). A refill-mode entry weighs its rows; a stale
+mark its key. A result over the entry limit is served but not kept, and
+its subscription ends.
 
 When the cache is full, what stays is decided by how often a key is
 asked for, not by size or age (moka's frequency-based admission): a key
@@ -345,10 +383,10 @@ read again and again displaces an entry read once, and a run of keys
 each read once cannot displace it. Reads are counted, misses included,
 once the cache is past half its budget.
 
-Idle time makes the cache follow what the backend reads now. Time to
-live drops an entry on a timer regardless of reads; it is off by default
-because the engine keeps entries fresh, and a delta that replaces an
-entry restarts its clock. The byte budget and both clocks end the
+Idle time makes the cache follow what the backend reads now; the engine
+changing a query's rows is not a read. Time to live drops an entry on a
+timer regardless of reads; it is off by default because the engine
+keeps entries fresh. The byte budget and both clocks end the
 subscription and bump the generation.
 
 `cache::Stats` counts: `hits`, `misses`, `refused`, `refused_recently`,
@@ -379,12 +417,14 @@ routes.
 
 **Read your writes.** Between a commit and the engine's delta, a
 Postgres read sees the new row and a cache read the old one. So after a
-write through a cache (`execute`, raw SQL, `INSERT ... RETURNING`, a
-`COMMIT`; not `SELECT`, `BEGIN`, `ROLLBACK`, `SAVEPOINT` or `SET`), every
-read through that cache goes live for `STREAMGRES_READ_YOUR_WRITES_MS`
-(default 1000, 0 off; `set_read_your_writes` per connection). The clock
-lives on the cache, so a write on one pooled connection covers reads on
-the others. A Postgres read never writes into the cache.
+write through a cache (`execute`, raw SQL with any statement but
+`SELECT`, `BEGIN`, `ROLLBACK`, `SAVEPOINT` or `SET`, `INSERT ...
+RETURNING`, a `COMMIT`), every read through that cache goes live for
+`STREAMGRES_READ_YOUR_WRITES_MS` (default 1000, 0 off;
+`set_read_your_writes` per connection), counted from when the write
+ends, however long it took. The clock lives on the cache, so a write on
+one pooled connection covers reads on the others. A Postgres read never
+writes into the cache.
 
 ## diesel-async
 
@@ -420,8 +460,8 @@ subscription, and a dropped `with_route` scope restores the outer route.
 
 - **Catalog.** The engine loads its catalog at start and follows schema
   changes through the DDL event trigger. An added column is absorbed;
-  new tables keep the known enum types; a new enum type is unknown until
-  the engine restarts, so its binds are refused and go live. A dropped
+  new tables keep the known enum types; a new enum type is learnt the
+  first time a subscribe binds it. A dropped
   column or a `TRUNCATE` of a published table stops the engine; it
   restarts and serves the schema as it is, and the client reconnects.
 - **Times.** The engine keeps every time in UTC microseconds, and every
@@ -457,9 +497,10 @@ engine under docker compose.
   `postgresql@16` on its own port works: `initdb`, set
   `wal_level = logical` and a short `unix_socket_directories`, `pg_ctl
   start`.
-- In the database: `CREATE PUBLICATION xyne_sync_pub FOR ALL TABLES;`
-  and `psql -f scripts/sql/ddl-triggers.sql` from the engine repo.
-- The engine: `STREAMGRES_APP_ID=xyne STREAMGRES_PG_DSN=... STREAMGRES_QUERY_URL=http://127.0.0.1:1/q STREAMGRES_MUTATE_URL=http://127.0.0.1:1/m cargo run --release --bin server`.
+- In the database: the demo's publication and schema-change trigger
+  stack, both for app `demo`: `psql -f demo/postgres-init.sql` and
+  `psql -f demo/ddl-triggers.sql`.
+- The engine: `STREAMGRES_APP_ID=demo STREAMGRES_PUBLICATION=demo_pub STREAMGRES_PG_DSN=... STREAMGRES_QUERY_URL=http://127.0.0.1:1/q STREAMGRES_MUTATE_URL=http://127.0.0.1:1/m cargo run --release --bin server`.
   The query and mutate URLs are required by the config and unused on
   the S2S path.
 - Or everything at once: `docker compose -f demo/docker-compose.yml up --build`.

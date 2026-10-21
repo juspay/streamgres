@@ -1,13 +1,15 @@
 //! The server-to-server endpoint: a backend subscribes the SQL its ORM
-//! renders and is told when a transaction touched a subscribed query.
+//! renders and is kept current on it.
 //!
 //! A backend keeps its own copy of what it reads (a Diesel wrapper serves
-//! repeated reads from a local cache). It does not want the rows from
-//! here, Postgres has those; it wants to know *when* a cached result is
-//! no longer current. So the contract is small: `subscribe` a query, get
-//! `accepted` or `refused`, then a `touched` naming every subscription a
-//! committed transaction changed the rows of, and `unsubscribe` when the
-//! backend drops it.
+//! repeated reads from a local cache). In rows mode the engine ships the
+//! query's rows on `accepted` and each committed transaction's changes
+//! to them as a `delta`, so the backend keeps the result without reading
+//! Postgres. Otherwise it is sent a `touched` naming every subscription a
+//! committed transaction changed the rows of, and reads Postgres again.
+//! A query outside what the engine follows is `refused`, and the backend
+//! serves it live. The endpoint carries no user: it serves whatever the
+//! SQL names, so it belongs to trusted backends, behind its token.
 //!
 //! One task ([`run`]) owns every S2S subscription: it is one more
 //! consumer of the engine's events beside the group threads, with its own
@@ -62,7 +64,9 @@
 //!   name), `"count"` (a `COUNT(*)`), `"order"` (`[[column, "asc"|"desc"],
 //!   ...]`, on the root table) and `"limit"` (`null` for none).
 //! - `["accepted", ...]` also carries `"offset"`: the engine keeps
-//!   `limit + offset` rows and the client skips `offset` of them. A
+//!   `limit + offset` rows and the client skips `offset` of them. Under
+//!   a `COUNT(*)` the engine keeps every row, and `limit` and `offset`
+//!   apply to the one row the count is. A
 //!   `bytea` column travels as Postgres's hex text; a bind of an enum
 //!   type is read as its label; a time travels as microseconds since
 //!   the Unix epoch, Postgres's own precision (the Zero protocol sees
@@ -78,8 +82,17 @@
 //!   entry per key, its last state in the transaction: a changed row is
 //!   a `put` of its new image, a row that came and went is a `del`, and
 //!   no key is in both lists. A backend that stops reading its frames
-//!   is closed once its queue is full rather than buffered for.
+//!   is closed once its queue is full rather than buffered for: more
+//!   than 4096 frames, or more than 64 MiB of them, waiting.
 //! - `["pong"]`
+//! - `["error", {"reason": "..."}]` for a frame that is not one of the
+//!   above (not JSON, an unknown tag, no usable `id`). A `subscribe`
+//!   whose `id` reads but whose body does not is answered `refused` with
+//!   that id instead, so no subscription is left waiting.
+//!
+//! An `id` is never reused on a connection: frames already queued for an
+//! unsubscribed id may still arrive after the `unsubscribe`, and would
+//! otherwise be taken for the new subscription's.
 
 use std::collections::{HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
@@ -96,6 +109,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures_util::stream::SplitStream;
 use futures_util::{FutureExt, SinkExt, StreamExt};
+use serde::Serialize;
+use serde_json::value::RawValue;
 use serde_json::{Value as Json, json};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -109,7 +124,9 @@ use crate::model::{
     DataFrameKey, DataFrameOperation, DataFrameRow, MultiTableReadQuery, Order, OrderBy, SubId,
     TableName,
 };
+use crate::parser::binds::decodes;
 use crate::parser::{BindValue, Projection, parse_select};
+use crate::sync::catalog::with_enums;
 use crate::sync::{CatalogHandle, Command, Event};
 
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -123,14 +140,73 @@ const REQUEST_QUEUE: usize = 1024;
 /// for it without limit; past this the connection is closed instead.
 const OUTGOING_QUEUE: usize = 4096;
 
+/// How many bytes of frames may wait for a connection's writer: a
+/// rows-mode `accepted` can be megabytes, so a count of frames alone
+/// does not bound what a backend that stops reading pins. A frame is
+/// always let onto an empty queue, so one large result still goes out.
+const OUTGOING_BYTES: usize = 64 * 1024 * 1024;
+
+/// How long a closing connection's writer may take to flush what is
+/// queued. A backend that stopped reading never lets it finish, and
+/// waiting for it would hold the connection's place and socket forever.
+const WRITER_DRAIN: Duration = Duration::from_secs(5);
+
+/// A connection's outgoing frames, bounded in frames and in bytes, with
+/// the bytes still waiting for its writer.
+#[derive(Debug, Clone)]
+pub struct Outgoing {
+    frames: mpsc::Sender<String>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Outgoing {
+    /// A queue and the receiving end its writer drains.
+    fn new() -> (Outgoing, mpsc::Receiver<String>) {
+        let (frames, receiver) = mpsc::channel(OUTGOING_QUEUE);
+        let queued = Arc::new(AtomicUsize::new(0));
+        (Outgoing { frames, queued }, receiver)
+    }
+
+    /// Queues `text` for the writer. `false` when the backend is not
+    /// keeping up (the queue is full in frames or in bytes) and the
+    /// connection must be closed; a writer already gone is not that.
+    fn push(&self, text: String) -> bool {
+        let len = text.len();
+        let before = self.queued.fetch_add(len, Ordering::AcqRel);
+        if before > 0 && before + len > OUTGOING_BYTES {
+            self.queued.fetch_sub(len, Ordering::AcqRel);
+            return false;
+        }
+        match self.frames.try_send(text) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                self.queued.fetch_sub(len, Ordering::AcqRel);
+                false
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.queued.fetch_sub(len, Ordering::AcqRel);
+                true
+            }
+        }
+    }
+
+    /// The writer sent a frame of `len` bytes.
+    fn sent(&self, len: usize) {
+        self.queued.fetch_sub(len, Ordering::AcqRel);
+    }
+}
+
 /// What a connection asks of the task.
 #[derive(Debug)]
 pub enum Request {
     Connected {
         conn: u64,
-        out: mpsc::Sender<String>,
+        out: Outgoing,
         /// Fired by the task to close the connection, with the reason.
         close: oneshot::Sender<&'static str>,
+        /// How many subscriptions the connection holds, registering ones
+        /// included, kept by the task for the connection's handler.
+        held: Arc<AtomicUsize>,
     },
     /// A query parsed and planned by the connection's handler.
     Subscribe(Box<Subscribe>),
@@ -153,10 +229,26 @@ pub struct Subscribe {
     shape: Option<Shape>,
 }
 
-/// Per table, what one transaction did to each key: its new image, or
-/// `None` once deleted. One entry per key, so a row admitted and evicted
-/// in one transaction is a delete, not a put the client would keep.
-type Changes = Vec<(TableName, HashMap<DataFrameKey, Option<Json>>)>;
+/// Per table, what one transaction did to each key: its new image (an
+/// index into the transaction's serialized rows), or `None` once
+/// deleted. One entry per key, so a row admitted and evicted in one
+/// transaction is a delete, not a put the client would keep.
+type Changes = Vec<(TableName, HashMap<DataFrameKey, Option<usize>>)>;
+
+/// A `delta` frame's body, its rows spliced in as they were serialized.
+#[derive(Serialize)]
+struct DeltaBody<'a> {
+    id: u64,
+    changes: Vec<TableChanges<'a>>,
+}
+
+/// One table's part of a `delta`.
+#[derive(Serialize)]
+struct TableChanges<'a> {
+    table: &'a str,
+    put: Vec<&'a RawValue>,
+    del: Vec<Json>,
+}
 
 /// How often a refused upgrade of one kind is logged at most; the ones
 /// in between are counted into the next line.
@@ -175,6 +267,8 @@ pub struct Handle {
 }
 
 impl Handle {
+    /// A handle admitting at most `max_connections` at once (0: no
+    /// limit), and the requests its connections send the task.
     pub fn new(max_connections: usize) -> (Handle, mpsc::Receiver<Request>) {
         let (requests, requests_rx) = mpsc::channel(REQUEST_QUEUE);
         (
@@ -257,26 +351,53 @@ fn refusal(throttle: &Throttle, what: &str) {
 
 /// One backend connection as the task sees it.
 struct Conn {
-    out: mpsc::Sender<String>,
+    out: Outgoing,
     /// Closes the connection; taken once used.
     close: Option<oneshot::Sender<&'static str>>,
     /// The backend's ids and the engine's subscriptions they became.
     subs: HashMap<u64, SubId>,
+    /// The backend's ids still registering, and their tokens.
+    registering: HashMap<u64, u64>,
+    /// `subs` and `registering` together, for the connection's handler.
+    held: Arc<AtomicUsize>,
 }
 
 impl Conn {
-    /// Queues a frame for the writer. A full queue means the backend is
-    /// not reading: the connection is closed rather than buffered for.
-    fn send(&mut self, message: Json) {
-        match self.out.try_send(message.to_string()) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                if let Some(close) = self.close.take() {
-                    let _ = close.send("the backend is not reading its frames");
-                }
-            }
-            Err(TrySendError::Closed(_)) => {}
+    /// A connection holding nothing yet.
+    fn new(out: Outgoing, close: oneshot::Sender<&'static str>, held: Arc<AtomicUsize>) -> Conn {
+        Conn {
+            out,
+            close: Some(close),
+            subs: HashMap::new(),
+            registering: HashMap::new(),
+            held,
         }
+    }
+
+    /// Queues a frame for the writer.
+    fn send(&mut self, message: Json) {
+        self.send_text(message.to_string());
+    }
+
+    /// Queues frame text for the writer. A full queue means the backend
+    /// is not reading: the connection is closed rather than buffered for.
+    fn send_text(&mut self, text: String) {
+        if !self.out.push(text)
+            && let Some(close) = self.close.take()
+        {
+            let _ = close.send("the backend is not reading its frames");
+        }
+    }
+
+    /// How many subscriptions the connection holds, registering ones
+    /// included.
+    fn holds(&self) -> usize {
+        self.subs.len() + self.registering.len()
+    }
+
+    /// Publishes [`Conn::holds`] to the connection's handler.
+    fn note_held(&self) {
+        self.held.store(self.holds(), Ordering::Release);
     }
 }
 
@@ -289,7 +410,8 @@ pub struct Shape {
     projection: Projection,
     order: Vec<OrderBy>,
     /// The statement's own limit and offset; the tree holds `limit +
-    /// offset` rows and the client skips and cuts.
+    /// offset` rows and the client skips and cuts (under a `COUNT(*)`,
+    /// the one counted row).
     limit: u32,
     offset: u32,
 }
@@ -307,7 +429,14 @@ struct NodeShape {
 }
 
 impl Shape {
-    pub fn new(query: &MultiTableReadQuery, projection: Projection, offset: u32) -> Shape {
+    /// The shape of `query` for a backend that asked for rows, the
+    /// statement's own `limit` and `offset` beside it.
+    pub fn new(
+        query: &MultiTableReadQuery,
+        projection: Projection,
+        limit: u32,
+        offset: u32,
+    ) -> Shape {
         let mut nodes = Vec::new();
         fn walk(
             query: &MultiTableReadQuery,
@@ -342,22 +471,18 @@ impl Shape {
             nodes,
             projection,
             order: query.main_table.order_by.clone(),
-            // The tree's limit is `limit + offset`, so it is never below
-            // the offset: `parse_select` refuses a sum that would pass
-            // `u32::MAX`, which also keeps it clear of the no-limit value.
-            limit: if query.main_table.limit == u32::MAX {
-                u32::MAX
-            } else {
-                query.main_table.limit - offset
-            },
+            limit,
             offset,
         }
     }
 
+    /// The node of `table`.
     fn node_of(&mut self, table: &TableName) -> Option<&mut NodeShape> {
         self.nodes.iter_mut().find(|node| &node.table == table)
     }
 
+    /// Folds a hydrating change into its node's snapshot: the key's
+    /// latest image, or `None` once deleted.
     fn absorb(&mut self, table: &TableName, op: &DataFrameOperation) {
         let Some(node) = self.node_of(table) else {
             return;
@@ -370,6 +495,8 @@ impl Shape {
     }
 }
 
+/// The S2S task's state: every connection, registration and
+/// subscription, and the engine's side of them.
 struct Task {
     catalog: Arc<CatalogHandle>,
     sink: usize,
@@ -438,17 +565,16 @@ pub async fn run(
 }
 
 impl Task {
+    /// Handles one connection's request.
     async fn request(&mut self, request: Request) {
         match request {
-            Request::Connected { conn, out, close } => {
-                self.conns.insert(
-                    conn,
-                    Conn {
-                        out,
-                        close: Some(close),
-                        subs: HashMap::new(),
-                    },
-                );
+            Request::Connected {
+                conn,
+                out,
+                close,
+                held,
+            } => {
+                self.conns.insert(conn, Conn::new(out, close, held));
             }
             Request::Subscribe(subscribe) => {
                 let Subscribe {
@@ -460,10 +586,12 @@ impl Task {
                 self.subscribe(conn, id, query, shape).await
             }
             Request::Unsubscribe { conn, id } => {
-                let sub = self
-                    .conns
-                    .get_mut(&conn)
-                    .and_then(|conn| conn.subs.remove(&id));
+                let Some(connection) = self.conns.get_mut(&conn) else {
+                    return;
+                };
+                let sub = connection.subs.remove(&id);
+                let registering = connection.registering.remove(&id);
+                connection.note_held();
                 if let Some(sub) = sub {
                     self.forget(sub);
                     let _ = self.commands.send(Command::Unregister(sub)).await;
@@ -471,8 +599,9 @@ impl Task {
                 // A registration still in flight for the id is not wanted
                 // either: `Registered` then finds no owner and unregisters
                 // it, and the id is free to subscribe again.
-                self.by_token
-                    .retain(|_, (owner, own_id, _)| !(*owner == conn && *own_id == id));
+                if let Some(token) = registering {
+                    self.by_token.remove(&token);
+                }
             }
             Request::Disconnected { conn } => {
                 if let Some(gone) = self.conns.remove(&conn) {
@@ -480,7 +609,9 @@ impl Task {
                     for sub in &subs {
                         self.forget(*sub);
                     }
-                    self.by_token.retain(|_, (owner, _, _)| *owner != conn);
+                    for token in gone.registering.values() {
+                        self.by_token.remove(token);
+                    }
                     if !subs.is_empty() {
                         let _ = self.commands.send(Command::UnregisterAll(subs)).await;
                     }
@@ -489,6 +620,8 @@ impl Task {
         }
     }
 
+    /// Registers a connection's query with the engine, unless the id is
+    /// taken or the connection holds its limit.
     async fn subscribe(
         &mut self,
         conn: u64,
@@ -499,19 +632,11 @@ impl Task {
         let Some(connection) = self.conns.get_mut(&conn) else {
             return;
         };
-        let mut taken = connection.subs.contains_key(&id);
-        let mut registering = 0;
-        for (owner, own_id, _) in self.by_token.values() {
-            if *owner == conn {
-                registering += 1;
-                taken |= *own_id == id;
-            }
-        }
-        if taken {
+        if connection.subs.contains_key(&id) || connection.registering.contains_key(&id) {
             connection.send(refused(id, "that id is already subscribed"));
             return;
         }
-        if self.per_connection > 0 && connection.subs.len() + registering >= self.per_connection {
+        if self.per_connection > 0 && connection.holds() >= self.per_connection {
             let reason = format!(
                 "the subscription limit of {} per connection is reached",
                 self.per_connection
@@ -521,6 +646,8 @@ impl Task {
         }
         let token = self.next_token;
         self.next_token += 1;
+        connection.registering.insert(id, token);
+        connection.note_held();
         self.by_token.insert(token, (conn, id, shape));
         let command = Command::Register {
             sink: self.sink,
@@ -530,11 +657,14 @@ impl Task {
         if self.commands.send(command).await.is_err() {
             self.by_token.remove(&token);
             if let Some(connection) = self.conns.get_mut(&conn) {
+                connection.registering.remove(&id);
+                connection.note_held();
                 connection.send(refused(id, "the engine is shutting down"));
             }
         }
     }
 
+    /// Handles one engine event.
     async fn event(&mut self, event: Event) {
         match event {
             Event::Registered {
@@ -554,7 +684,9 @@ impl Task {
                     let _ = self.commands.send(Command::Unregister(sub)).await;
                     return;
                 };
+                connection.registering.remove(&id);
                 connection.subs.insert(id, sub);
+                connection.note_held();
                 self.by_sub.insert(sub, (conn, id));
                 if let Some(mut shape) = shape {
                     // A twin's rows come with the registration.
@@ -680,17 +812,19 @@ impl Task {
 
     /// Tells each connection what the deltas did to its subscriptions:
     /// rows-mode ones get the rows per table, the rest a touch.
+    /// Every row is serialized once, for the first rows-mode
+    /// subscription it reaches, and spliced into every frame that
+    /// carries it.
     fn changed(&mut self, updates: &[Delta]) {
-        let mut touched: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut touched: HashMap<u64, HashSet<u64>> = HashMap::new();
         // Per rows-mode subscription, per table in order of appearance,
         // each key's last state in the transaction.
         let mut deltas: HashMap<SubId, Changes> = HashMap::new();
+        let mut images: Vec<Box<RawValue>> = Vec::new();
         let catalog = self.catalog.load();
         for delta in updates {
             let table = catalog.table(delta.table.as_str());
-            // The row as JSON, built for the first rows-mode subscription
-            // it reaches and cloned for the rest.
-            let mut image: Option<Json> = None;
+            let mut image: Option<Option<usize>> = None;
             for target in delta.targets() {
                 let Some((conn, id)) = self.by_sub.get(&target.sub) else {
                     continue;
@@ -719,8 +853,13 @@ impl Task {
                     // a delete, and no key is in both lists.
                     match (&delta.op, table) {
                         (DataFrameOperation::Add(key, row), Some(table)) => {
-                            let image = image.get_or_insert_with(|| wire::row_json(row, table));
-                            keys.insert(key.clone(), Some(image.clone()));
+                            let image = *image.get_or_insert_with(|| {
+                                serialized(&wire::row_json(row, table)).map(|raw| {
+                                    images.push(raw);
+                                    images.len() - 1
+                                })
+                            });
+                            keys.insert(key.clone(), image);
                         }
                         (DataFrameOperation::Delete(key, _), _) => {
                             keys.insert(key.clone(), None);
@@ -732,10 +871,7 @@ impl Task {
                         }
                     }
                 } else {
-                    let ids = touched.entry(*conn).or_default();
-                    if !ids.contains(id) {
-                        ids.push(*id);
-                    }
+                    touched.entry(*conn).or_default().insert(*id);
                 }
             }
         }
@@ -743,25 +879,33 @@ impl Task {
             if let Some((conn, id)) = self.by_sub.get(&sub)
                 && let Some(connection) = self.conns.get_mut(conn)
             {
-                let changes: Vec<Json> = changes
-                    .into_iter()
+                let changes: Vec<TableChanges> = changes
+                    .iter()
                     .map(|(table, keys)| {
                         let mut put = Vec::new();
                         let mut del = Vec::new();
                         for (key, row) in keys {
                             match row {
-                                Some(row) => put.push(row),
-                                None => del.push(wire::key_json(&key)),
+                                Some(index) => put.push(&*images[*index]),
+                                None => del.push(wire::key_json(key)),
                             }
                         }
-                        json!({"table": table.as_str(), "put": put, "del": del})
+                        TableChanges {
+                            table: table.as_str(),
+                            put,
+                            del,
+                        }
                     })
                     .collect();
-                connection.send(json!(["delta", {"id": id, "changes": changes}]));
+                let body = DeltaBody { id: *id, changes };
+                if let Ok(text) = serde_json::to_string(&("delta", body)) {
+                    connection.send_text(text);
+                }
             }
         }
         for (conn, ids) in touched {
             if let Some(connection) = self.conns.get_mut(&conn) {
+                let ids: Vec<u64> = ids.into_iter().collect();
                 connection.send(json!(["touched", {"ids": ids}]));
             }
         }
@@ -778,12 +922,14 @@ impl Task {
             && let Some(connection) = self.conns.get_mut(&conn)
         {
             connection.subs.remove(&id);
+            connection.note_held();
             connection.send(refused(id, reason));
         }
         self.forget(sub);
         let _ = self.commands.send(Command::Unregister(sub)).await;
     }
 
+    /// Drops the task's own records of `sub`.
     fn forget(&mut self, sub: SubId) {
         self.by_sub.remove(&sub);
         self.shapes.remove(&sub);
@@ -791,19 +937,29 @@ impl Task {
     }
 }
 
+/// A row image as JSON text, written once and spliced into every frame
+/// that carries it. A JSON value always serializes; a row that somehow
+/// did not would be sent as a delete, which the backend refills.
+fn serialized(image: &Json) -> Option<Box<RawValue>> {
+    serde_json::value::to_raw_value(image).ok()
+}
+
+/// An `accepted` with no rows.
 fn accepted(id: u64) -> Json {
     json!(["accepted", {"id": id}])
 }
 
+/// A `refused` for the backend's `id`.
 fn refused(id: u64, reason: &str) -> Json {
     json!(["refused", {"id": id, "reason": reason}])
 }
 
-/// A frame from the connection's own handler, which never floods its
-/// own writer: a full queue only means the backend is not reading, and
-/// the task closes the connection for that.
-fn send(out: &mpsc::Sender<String>, message: Json) {
-    let _ = out.try_send(message.to_string());
+/// A frame from the connection's own handler. `false` when the queue is
+/// full, which means the backend is not reading: the handler then ends
+/// the connection, as the task would, rather than drop the frame and
+/// leave a subscription unanswered.
+fn send(out: &Outgoing, message: Json) -> bool {
+    out.push(message.to_string())
 }
 
 /// The route handler: upgrades the socket once the engine is serving.
@@ -841,8 +997,8 @@ pub async fn connect(
 }
 
 /// Whether the request carries `Authorization: Bearer <token>`. The
-/// comparison takes as long for a near miss as for a far one, so the
-/// token cannot be guessed a byte at a time.
+/// comparison walks the whole token whatever was presented, so neither
+/// a near miss nor a presented length says anything about the token.
 fn authorized(headers: &HeaderMap, token: &str) -> bool {
     let Some(presented) = headers
         .get(AUTHORIZATION)
@@ -854,23 +1010,33 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
         return false;
     };
     let (presented, token) = (presented.as_bytes(), token.as_bytes());
-    presented.len() == token.len()
-        && presented
-            .iter()
-            .zip(token)
-            .fold(0u8, |differ, (a, b)| differ | (a ^ b))
-            == 0
+    let lengths = u8::from(presented.len() != token.len());
+    token
+        .iter()
+        .enumerate()
+        .fold(lengths, |differ, (at, byte)| {
+            differ | (presented.get(at).copied().unwrap_or(0) ^ byte)
+        })
+        == 0
 }
 
+/// One upgraded connection, from `hello` to close. Its writer gets
+/// [`WRITER_DRAIN`] to flush once the session ends and is then cut off,
+/// so a backend that stopped reading cannot hold the connection open.
 async fn handle(socket: WebSocket, state: Arc<AppState>) {
     let handle = &state.s2s;
     let conn = handle.next_conn.fetch_add(1, Ordering::Relaxed);
     let (mut sink, stream) = socket.split();
-    let (out, mut out_rx) = mpsc::channel::<String>(OUTGOING_QUEUE);
+    let (out, mut out_rx) = Outgoing::new();
     let (close, closed) = oneshot::channel::<&'static str>();
-    let writer = tokio::spawn(async move {
+    let held = Arc::new(AtomicUsize::new(0));
+    let drained = out.clone();
+    let mut writer = tokio::spawn(async move {
         while let Some(text) = out_rx.recv().await {
-            if sink.send(Message::Text(text.into())).await.is_err() {
+            let len = text.len();
+            let sent = sink.send(Message::Text(text.into())).await;
+            drained.sent(len);
+            if sent.is_err() {
                 break;
             }
         }
@@ -882,10 +1048,12 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
             conn,
             out: out.clone(),
             close,
+            held: Arc::clone(&held),
         })
         .await
         .is_err()
     {
+        writer.abort();
         return;
     }
     let limit = state.config.s2s_connection_subscriptions;
@@ -901,13 +1069,16 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
     // Whatever ends the session, a panic in a frame's handling included,
     // the task hears the connection is gone, or its subscriptions would
     // outlive it.
-    let session = serve(conn, stream, closed, &out, &state);
+    let session = serve(conn, stream, closed, &out, &held, &state);
     if AssertUnwindSafe(session).catch_unwind().await.is_err() {
         log_warn!("s2s connection {conn}: a frame's handling panicked");
     }
     let _ = handle.requests.send(Request::Disconnected { conn }).await;
     drop(out);
-    let _ = writer.await;
+    if tokio::time::timeout(WRITER_DRAIN, &mut writer).await.is_err() {
+        writer.abort();
+        log_warn!("s2s connection {conn}: its frames were not read in time, cut off");
+    }
     log_info!("s2s connection {conn} closed");
 }
 
@@ -917,10 +1088,13 @@ async fn serve(
     conn: u64,
     mut stream: SplitStream<WebSocket>,
     mut closed: oneshot::Receiver<&'static str>,
-    out: &mpsc::Sender<String>,
+    out: &Outgoing,
+    held: &AtomicUsize,
     state: &Arc<AppState>,
 ) {
     let handle = &state.s2s;
+    let limit = state.config.s2s_connection_subscriptions;
+    let unread = || log_warn!("s2s connection {conn} closed: the backend is not reading its frames");
     loop {
         let frame = tokio::select! {
             frame = stream.next() => frame,
@@ -939,7 +1113,12 @@ async fn serve(
             Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
         };
         match upstream(&text) {
-            Ok(Frame::Ping) => send(out, json!(["pong"])),
+            Ok(Frame::Ping) => {
+                if !send(out, json!(["pong"])) {
+                    unread();
+                    return;
+                }
+            }
             Ok(Frame::Unsubscribe { id }) => {
                 if handle
                     .requests
@@ -956,11 +1135,24 @@ async fn serve(
                 binds,
                 rows,
             }) => {
-                let request = match prepare(state, conn, id, &sql, &binds, rows).await {
+                // The task enforces the limit; checking it here too keeps
+                // a connection at its limit from having more queries
+                // planned, which reads Postgres, only to be refused.
+                let prepared = if limit > 0 && held.load(Ordering::Acquire) >= limit {
+                    Err(format!(
+                        "the subscription limit of {limit} per connection is reached"
+                    ))
+                } else {
+                    prepare(state, conn, id, &sql, &binds, rows).await
+                };
+                let request = match prepared {
                     Ok(request) => request,
                     Err(reason) => {
                         log_debug!("s2s connection {conn}: query {id} refused: {reason}");
-                        send(out, refused(id, &reason));
+                        if !send(out, refused(id, &reason)) {
+                            unread();
+                            return;
+                        }
                         continue;
                     }
                 };
@@ -968,9 +1160,19 @@ async fn serve(
                     return;
                 }
             }
-            Err(reason) => {
+            Err(Rejected { id: Some(id), reason }) => {
+                log_warn!("s2s connection {conn}: query {id} refused: {reason}");
+                if !send(out, refused(id, &reason)) {
+                    unread();
+                    return;
+                }
+            }
+            Err(Rejected { id: None, reason }) => {
                 log_warn!("s2s connection {conn}: {reason}");
-                send(out, json!(["error", {"reason": reason}]));
+                if !send(out, json!(["error", {"reason": reason}])) {
+                    unread();
+                    return;
+                }
             }
         }
     }
@@ -978,7 +1180,9 @@ async fn serve(
 
 /// Parses the SQL against the catalog and plans the query the way a
 /// Zero query is planned (which side of each join is read whole, how a
-/// page is read), so the engine registers it ready to run.
+/// page is read), so the engine registers it ready to run. A bind of a
+/// type the catalog has not seen may be an enum created since it was
+/// loaded: those are looked up first ([`learn_enums`]).
 async fn prepare(
     state: &AppState,
     conn: u64,
@@ -987,9 +1191,17 @@ async fn prepare(
     binds: &[BindValue],
     rows: bool,
 ) -> Result<Request, String> {
-    let catalog = state.catalog.load();
+    let mut catalog = state.catalog.load();
+    let unknown: Vec<u32> = binds
+        .iter()
+        .map(|bind| bind.type_oid)
+        .filter(|oid| !decodes(*oid) && !catalog.is_enum_oid(*oid))
+        .collect();
+    if !unknown.is_empty() && learn_enums(state, &unknown).await {
+        catalog = state.catalog.load();
+    }
     let select = parse_select(sql, binds, &catalog).map_err(|error| error.message)?;
-    let shape = rows.then(|| Shape::new(&select.query, select.projection, select.offset));
+    let shape = rows.then(|| Shape::new(&select.query, select.projection, select.limit, select.offset));
     let translated = Translated {
         query: select.query,
         hidden: HashSet::new(),
@@ -1010,6 +1222,36 @@ async fn prepare(
     })))
 }
 
+/// Looks `oids` up among the database's enum types and teaches the
+/// catalog the ones that are (with their array types), so a bind of an
+/// enum created after the catalog was loaded reads as its label. Whether
+/// any was learned; a failed lookup learns nothing, and the bind is then
+/// refused as a type the engine does not carry.
+async fn learn_enums(state: &AppState, oids: &[u32]) -> bool {
+    let list: Vec<String> = oids.iter().map(u32::to_string).collect();
+    let list = list.join(", ");
+    let sql = format!(
+        "SELECT oid::text, typarray::text FROM pg_type WHERE typtype = 'e' AND (oid IN ({list}) OR typarray IN ({list}))"
+    );
+    let Ok(rows) = state.storage.simple_query(&sql).await else {
+        return false;
+    };
+    let learned: Vec<u32> = rows
+        .iter()
+        .flat_map(|row| [row.get(0), row.get(1)])
+        .flatten()
+        .filter_map(|text| text.parse::<u32>().ok())
+        .filter(|oid| *oid != 0)
+        .collect();
+    if learned.is_empty() {
+        return false;
+    }
+    state
+        .catalog
+        .update(|catalog| with_enums(catalog, learned.iter().copied()));
+    true
+}
+
 /// One upstream frame.
 #[derive(Debug)]
 enum Frame {
@@ -1025,47 +1267,79 @@ enum Frame {
     },
 }
 
-fn upstream(text: &str) -> Result<Frame, String> {
-    let frame: Json = serde_json::from_str(text).map_err(|error| format!("not JSON: {error}"))?;
+/// An upstream frame that could not be read: the `id` it carried, when
+/// one could be read, and why.
+#[derive(Debug)]
+struct Rejected {
+    id: Option<u64>,
+    reason: String,
+}
+
+impl Rejected {
+    /// A rejection that names no subscription.
+    fn frame(reason: impl Into<String>) -> Rejected {
+        Rejected {
+            id: None,
+            reason: reason.into(),
+        }
+    }
+}
+
+/// Reads one upstream frame.
+fn upstream(text: &str) -> Result<Frame, Rejected> {
+    let frame: Json = serde_json::from_str(text)
+        .map_err(|error| Rejected::frame(format!("not JSON: {error}")))?;
     let (tag, body) = match frame.as_array().map(Vec::as_slice) {
         Some([Json::String(tag), body]) => (tag.as_str(), body),
         Some([Json::String(tag)]) => (tag.as_str(), &Json::Null),
-        _ => return Err("a frame is a [tag, body] array".to_string()),
+        _ => return Err(Rejected::frame("a frame is a [tag, body] array")),
     };
     let id = |body: &Json| {
         body.get("id")
             .and_then(Json::as_u64)
-            .ok_or_else(|| "`id` must be a non-negative integer".to_string())
+            .ok_or_else(|| Rejected::frame("`id` must be a non-negative integer"))
     };
     match tag {
         "ping" => Ok(Frame::Ping),
         "subscribe" => {
             let id = id(body)?;
-            let sql = body
-                .get("sql")
-                .and_then(Json::as_str)
-                .ok_or("`sql` must be a string")?
-                .to_string();
-            let binds = body
-                .get("binds")
-                .map(|binds| binds.as_array().ok_or("`binds` must be an array"))
-                .transpose()?
-                .map(|binds| binds.iter().map(bind).collect::<Result<Vec<_>, _>>())
-                .transpose()?
-                .unwrap_or_default();
-            let rows = body.get("rows").and_then(Json::as_bool).unwrap_or(false);
-            Ok(Frame::Subscribe {
-                id,
-                sql,
-                binds,
-                rows,
-            })
+            subscription(body)
+                .map(|(sql, binds, rows)| Frame::Subscribe {
+                    id,
+                    sql,
+                    binds,
+                    rows,
+                })
+                .map_err(|reason| Rejected {
+                    id: Some(id),
+                    reason,
+                })
         }
         "unsubscribe" => Ok(Frame::Unsubscribe { id: id(body)? }),
-        other => Err(format!("unknown tag `{other}`")),
+        other => Err(Rejected::frame(format!("unknown tag `{other}`"))),
     }
 }
 
+/// A `subscribe` body past its `id`: the SQL, the binds, and whether
+/// rows were asked for.
+fn subscription(body: &Json) -> Result<(String, Vec<BindValue>, bool), String> {
+    let sql = body
+        .get("sql")
+        .and_then(Json::as_str)
+        .ok_or("`sql` must be a string")?
+        .to_string();
+    let binds = body
+        .get("binds")
+        .map(|binds| binds.as_array().ok_or("`binds` must be an array"))
+        .transpose()?
+        .map(|binds| binds.iter().map(bind).collect::<Result<Vec<_>, _>>())
+        .transpose()?
+        .unwrap_or_default();
+    let rows = body.get("rows").and_then(Json::as_bool).unwrap_or(false);
+    Ok((sql, binds, rows))
+}
+
+/// One bind: its type OID and its base64 bytes, `null` for `NULL`.
 fn bind(value: &Json) -> Result<BindValue, String> {
     let type_oid = value
         .get("oid")
@@ -1120,28 +1394,24 @@ mod tests {
             next_token: 1,
             per_connection,
         };
-        let (out, frames) = mpsc::channel(64);
-        connect(&mut task, 1, out);
+        let frames = connect(&mut task, 1);
         (task, commands_rx, frames)
     }
 
-    fn connect(task: &mut Task, conn: u64, out: mpsc::Sender<String>) {
+    /// Opens connection `conn` on the task: its frames.
+    fn connect(task: &mut Task, conn: u64) -> mpsc::Receiver<String> {
         let (close, _closed) = oneshot::channel();
-        task.conns.insert(
-            conn,
-            Conn {
-                out,
-                close: Some(close),
-                subs: HashMap::new(),
-            },
-        );
+        let (out, frames) = Outgoing::new();
+        task.conns
+            .insert(conn, Conn::new(out, close, Arc::new(AtomicUsize::new(0))));
+        frames
     }
 
     /// Connection `conn` subscribes `SELECT * FROM notes` under `id`.
     async fn subscribe(task: &mut Task, conn: u64, id: u64, rows: bool) {
         let select =
             parse_select("SELECT * FROM notes", &[], &task.catalog.load()).expect("parses");
-        let shape = rows.then(|| Shape::new(&select.query, select.projection, select.offset));
+        let shape = rows.then(|| Shape::new(&select.query, select.projection, select.limit, select.offset));
         task.subscribe(conn, id, select.query, shape).await;
     }
 
@@ -1221,8 +1491,7 @@ mod tests {
         subscribe(&mut task, 1, 5, false).await;
         assert_eq!(registered(&mut commands), vec![3]);
 
-        let (other, mut other_out) = mpsc::channel(64);
-        connect(&mut task, 2, other);
+        let mut other_out = connect(&mut task, 2);
         subscribe(&mut task, 2, 1, false).await;
         assert_eq!(registered(&mut commands), vec![4]);
         assert!(frames(&mut other_out).is_empty());
@@ -1276,6 +1545,55 @@ mod tests {
         assert_eq!(puts(&deltas[1]), vec![(1, "one".to_owned())]);
     }
 
+    /// A queue takes frames until either bound is reached, always takes
+    /// one frame when empty however large, and frees a frame's bytes
+    /// once the writer has sent it.
+    #[test]
+    fn the_outgoing_queue_is_bounded_in_bytes() {
+        let (out, mut frames) = Outgoing::new();
+        let big = "x".repeat(OUTGOING_BYTES + 1);
+        assert!(out.push(big.clone()), "an empty queue takes any frame");
+        assert!(!out.push("y".to_owned()), "past the byte bound");
+        let sent = frames.try_recv().expect("the big frame");
+        out.sent(sent.len());
+        assert!(out.push("y".to_owned()), "room again once it went out");
+        assert_eq!(out.queued.load(Ordering::Acquire), 1);
+    }
+
+    /// A subscription touched by several deltas of one transaction is
+    /// named once, and the connection's handler sees what it holds.
+    #[tokio::test]
+    async fn a_touch_names_each_subscription_once() {
+        let (mut task, _commands, mut out) = task(0);
+        subscribe(&mut task, 1, 1, false).await;
+        assert_eq!(task.conns[&1].held.load(Ordering::Acquire), 1);
+        register(&mut task, 1, 10).await;
+        assert_eq!(task.conns[&1].held.load(Ordering::Acquire), 1);
+        frames(&mut out);
+        task.changed(&[put(&[10], 1, "one"), put(&[10], 2, "two"), put(&[10], 3, "three")]);
+        assert_eq!(frames(&mut out), vec![json!(["touched", {"ids": [1]}])]);
+        task.request(Request::Unsubscribe { conn: 1, id: 1 }).await;
+        assert_eq!(task.conns[&1].held.load(Ordering::Acquire), 0);
+    }
+
+    /// An id unsubscribed while still registering frees its place at
+    /// once, and its late registration is unregistered.
+    #[tokio::test]
+    async fn an_id_unsubscribed_while_registering_is_let_go() {
+        let (mut task, mut commands, _out) = task(1);
+        subscribe(&mut task, 1, 1, false).await;
+        assert_eq!(registered(&mut commands), vec![1]);
+        task.request(Request::Unsubscribe { conn: 1, id: 1 }).await;
+        subscribe(&mut task, 1, 2, false).await;
+        assert_eq!(registered(&mut commands), vec![2], "the place came back");
+        register(&mut task, 1, 10).await;
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(Command::Unregister(SubId(10)))
+        ));
+        assert!(task.by_sub.is_empty());
+    }
+
     /// Places are handed out up to the limit and come back when their
     /// connections close; a zero limit hands them out without one.
     #[test]
@@ -1322,12 +1640,15 @@ mod tests {
         assert!(authorized(&with("BEARER  s3cret"), "s3cret"));
         assert!(!authorized(&with("Bearer s3cres"), "s3cret"));
         assert!(!authorized(&with("Bearer s3cret2"), "s3cret"));
+        assert!(!authorized(&with("Bearer s3cre"), "s3cret"));
         assert!(!authorized(&with("Bearer "), "s3cret"));
         assert!(!authorized(&with("Basic s3cret"), "s3cret"));
         assert!(!authorized(&with("s3cret"), "s3cret"));
         assert!(!authorized(&HeaderMap::new(), "s3cret"));
     }
 
+    /// Frames read into requests, and a bad one says which id it was for
+    /// when it can.
     #[test]
     fn frames_parse_into_requests() {
         let frame = upstream(
@@ -1368,11 +1689,19 @@ mod tests {
         assert!(upstream(r#"["subscribe", {"id": -1}]"#).is_err());
         assert!(upstream(r#"["nope", {}]"#).is_err());
         assert!(upstream("{}").is_err());
-        assert!(
+        assert!(matches!(
             upstream(
                 r#"["subscribe", {"id": 1, "sql": "x", "binds": [{"oid": 25, "bytes": "%%"}]}]"#
-            )
-            .is_err()
-        );
+            ),
+            Err(Rejected { id: Some(1), .. })
+        ));
+        assert!(matches!(
+            upstream(r#"["subscribe", {"id": 7, "sql": 5}]"#),
+            Err(Rejected { id: Some(7), .. })
+        ));
+        assert!(matches!(
+            upstream(r#"["subscribe", {"sql": "x"}]"#),
+            Err(Rejected { id: None, .. })
+        ));
     }
 }

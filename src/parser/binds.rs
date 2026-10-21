@@ -2,7 +2,7 @@
 //!
 //! An ORM renders a query with `$n` placeholders and ships each parameter
 //! in Postgres's binary format with its type OID. The engine's parser
-//! accepts those placeholders ([`super::parse_read_with_binds`]) and reads
+//! accepts those placeholders ([`super::parse_select`]) and reads
 //! the parameter here, by OID, into the [`Value`] the literal would have
 //! parsed to; the column's declared type then coerces it the way it
 //! coerces a literal, so `$1` and `'OPEN'` take the same path.
@@ -62,10 +62,9 @@ pub(crate) mod oid {
     pub const JSONB_ARRAY: u32 = 3807;
 }
 
-/// Milliseconds from the Unix epoch to Postgres's epoch (2000-01-01).
+/// Microseconds from the Unix epoch to Postgres's epoch (2000-01-01).
 const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 
-/// The value a bind stands for, or why it cannot stand for one.
 /// Whether an enum bind's bytes are an array rather than one label: an
 /// enum type's array OID is as much an enum OID as the scalar's, and the
 /// two are told apart by the bytes. A one-dimensional array header is
@@ -75,6 +74,7 @@ pub fn looks_like_array(bytes: &[u8]) -> bool {
     bytes.len() >= 12 && bytes[..3] == [0, 0, 0] && bytes[3] <= 1
 }
 
+/// The value a bind stands for, or why it cannot stand for one.
 pub fn decode(bind: &BindValue) -> Result<Value, String> {
     let Some(bytes) = bind.bytes.as_deref() else {
         return Ok(Value::Null);
@@ -91,9 +91,8 @@ pub fn decode(bind: &BindValue) -> Result<Value, String> {
     Ok(match bind.type_oid {
         oid::BOOL => Value::Bool(bytes_of(1)?[0] != 0),
         oid::INT2 => Value::Int(i16::from_be_bytes(bytes_of(2)?.try_into().unwrap()).into()),
-        oid::INT4 | oid::OID => {
-            Value::Int(i32::from_be_bytes(bytes_of(4)?.try_into().unwrap()).into())
-        }
+        oid::INT4 => Value::Int(i32::from_be_bytes(bytes_of(4)?.try_into().unwrap()).into()),
+        oid::OID => Value::Int(u32::from_be_bytes(bytes_of(4)?.try_into().unwrap()).into()),
         oid::INT8 => Value::Int(i64::from_be_bytes(bytes_of(8)?.try_into().unwrap())),
         oid::FLOAT4 => Value::Float(f32::from_be_bytes(bytes_of(4)?.try_into().unwrap()).into()),
         oid::FLOAT8 => Value::Float(f64::from_be_bytes(bytes_of(8)?.try_into().unwrap())),
@@ -166,6 +165,50 @@ pub fn decode(bind: &BindValue) -> Result<Value, String> {
     })
 }
 
+/// Whether [`decode`] knows type `oid`: a built-in it reads or refuses
+/// by name. Any other OID is an enum, or a type the engine does not
+/// carry.
+pub fn decodes(type_oid: u32) -> bool {
+    use oid::*;
+    matches!(
+        type_oid,
+        BOOL | BYTEA
+            | CHAR
+            | NAME
+            | INT8
+            | INT2
+            | INT4
+            | TEXT
+            | OID
+            | JSON
+            | FLOAT4
+            | FLOAT8
+            | BPCHAR
+            | VARCHAR
+            | DATE
+            | TIMESTAMP
+            | TIMESTAMPTZ
+            | NUMERIC
+            | UUID
+            | JSONB
+            | BOOL_ARRAY
+            | INT2_ARRAY
+            | INT4_ARRAY
+            | INT8_ARRAY
+            | TEXT_ARRAY
+            | VARCHAR_ARRAY
+            | BPCHAR_ARRAY
+            | FLOAT4_ARRAY
+            | FLOAT8_ARRAY
+            | NUMERIC_ARRAY
+            | DATE_ARRAY
+            | TIMESTAMP_ARRAY
+            | TIMESTAMPTZ_ARRAY
+            | UUID_ARRAY
+            | JSONB_ARRAY
+    )
+}
+
 /// The element type of an array type. The array's own header names an
 /// element type too, but that is what the client declared, which for
 /// an enum remapped to text is the enum's OID; the outer type decides.
@@ -193,7 +236,10 @@ fn element_of(array_oid: u32) -> u32 {
 /// Postgres's binary array: dimensions, a has-nulls flag, the element
 /// type, then per dimension a length and lower bound, then each element
 /// as its length (`-1` for NULL) and bytes. Only one dimension is a list
-/// a predicate can use. Elements are decoded as `element_oid`.
+/// a predicate can use. Elements are decoded as `element_oid`. The
+/// declared length is the client's word, so the list grows with the
+/// elements actually present (each takes at least its four-byte length)
+/// rather than being sized from it up front.
 fn array(bytes: &[u8], element_oid: u32) -> Result<Vec<Value>, String> {
     let word = |at: usize| -> Result<i32, String> {
         bytes
@@ -210,7 +256,7 @@ fn array(bytes: &[u8], element_oid: u32) -> Result<Vec<Value>, String> {
     }
     let length = usize::try_from(word(12)?).map_err(|_| "an array bind has a negative length")?;
     let mut at = 20;
-    let mut items = Vec::with_capacity(length);
+    let mut items = Vec::with_capacity(length.min(bytes.len().saturating_sub(20) / 4));
     for _ in 0..length {
         let size = word(at)?;
         at += 4;
@@ -434,6 +480,30 @@ mod tests {
         }
         assert_eq!(decode(&bind(oid::TEXT_ARRAY, &bytes)), Ok(Value::List(vec![])));
         assert!(decode(&bind(oid::TEXT_ARRAY, &[0, 0, 0, 2])).is_err());
+    }
+
+    /// An array header is the client's word: one claiming two billion
+    /// elements in twenty bytes is refused without sizing anything from
+    /// the claim.
+    #[test]
+    fn a_huge_declared_length_is_refused_not_allocated() {
+        let mut bytes = Vec::new();
+        for word in [1i32, 0, 20, i32::MAX, 1] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        assert_eq!(
+            decode(&bind(oid::INT8_ARRAY, &bytes)),
+            Err("an array bind ends inside its header".to_string())
+        );
+    }
+
+    /// An `oid` is unsigned: one past `i32::MAX` stays positive.
+    #[test]
+    fn an_oid_is_unsigned() {
+        assert_eq!(
+            decode(&bind(oid::OID, &3_000_000_000u32.to_be_bytes())),
+            Ok(Value::Int(3_000_000_000))
+        );
     }
 
     #[test]

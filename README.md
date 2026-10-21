@@ -128,12 +128,14 @@ keeping the data moving; `demo/README.md` walks through it with curl, and
 ### Server-to-server clients
 
 A backend that caches what it reads does not speak the Zero protocol. It
-connects to `ws://<host>:4848/<base>/s2s/v1` and subscribes the SQL its
-ORM rendered, `$n` binds and all; the server answers `accepted` with the
-hydrated rows (per table for a join; `bytea` as hex text, `OFFSET` left
-for the client to apply) or `refused`, then sends `delta`
-with the rows each committed transaction put or deleted, so the backend
-never reads Postgres for a query it holds. The protocol is documented in
+connects to `ws://<host>:4848/<base>/s2s/v1` (with the bearer token in
+`STREAMGRES_S2S_TOKEN`, through TLS in front of the server off a private
+network) and subscribes the SQL its ORM rendered, `$n` binds and all;
+the server answers `accepted` with the hydrated rows (per table for a
+join; `bytea` as hex text, `OFFSET` left for the client to apply) or
+`refused`, then sends `delta` with the rows each committed transaction
+put or deleted, so the backend never reads Postgres for a query it
+holds. The protocol is documented in
 `src/client/s2s.rs`. The Diesel wrapper that uses it lives in this
 repository as [`crates/diesel-streamgres`](crates/diesel-streamgres):
 a drop-in `PgConnection` replacement whose reads come from an in-memory

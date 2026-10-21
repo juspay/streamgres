@@ -174,8 +174,8 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
     json_in(value, declared, Unit::Micros)
 }
 
-/// The unit a time goes out in: the engine's microseconds on the
-/// server-to-server path, milliseconds on Zero's.
+/// The path a cell goes out on, which decides its unit: the engine's
+/// microseconds on the server-to-server path, milliseconds on Zero's.
 #[derive(Clone, Copy)]
 enum Unit {
     Micros,
@@ -183,10 +183,24 @@ enum Unit {
 }
 
 impl Unit {
+    /// A time the engine keeps in microseconds, in this unit.
     fn of(self, micros: i64) -> i64 {
         match self {
             Unit::Micros => micros,
             Unit::Millis => micros.div_euclid(1000),
+        }
+    }
+
+    /// A float JSON has no number for (`NaN`, `±Infinity`). The
+    /// server-to-server path names it, as Postgres spells it, so the
+    /// backend gets the value back; Zero's protocol has always sent
+    /// `null`.
+    fn non_finite(self, float: f64) -> Json {
+        match self {
+            Unit::Millis => Json::Null,
+            Unit::Micros if float.is_nan() => Json::from("NaN"),
+            Unit::Micros if float > 0.0 => Json::from("Infinity"),
+            Unit::Micros => Json::from("-Infinity"),
         }
     }
 }
@@ -207,9 +221,10 @@ fn json_in(value: &Value, declared: Option<&ValueType>, unit: Unit) -> Json {
         }
         Value::Int(int) => Json::from(*int),
         Value::Float(float) if whole(*float) => Json::from(*float as i64),
-        Value::Float(float) => {
-            serde_json::Number::from_f64(*float).map_or(Json::Null, Json::Number)
-        }
+        Value::Float(float) => match serde_json::Number::from_f64(*float) {
+            Some(number) => Json::Number(number),
+            None => unit.non_finite(*float),
+        },
         Value::Bool(flag) => Json::Bool(*flag),
         Value::Date(date) => date.and_hms_opt(0, 0, 0).map_or(Json::Null, |at| {
             Json::from(unit.of(at.and_utc().timestamp_micros()))
@@ -347,9 +362,10 @@ mod tests {
             for time in ["ts", "day", "at"] {
                 expected[time] = Json::from(expected[time].as_i64().unwrap() / 1000);
             }
+            expected["nan"] = Json::Null;
             assert_eq!(
                 written["value"], expected,
-                "a time goes out in milliseconds"
+                "a time goes out in milliseconds, a NaN as null"
             );
         }
     }
@@ -394,7 +410,8 @@ mod tests {
     }
 
     /// A whole-valued float is written as an integer on both paths, a
-    /// fractional one as it is, and a NaN as null.
+    /// fractional one as it is; a NaN or an infinity is `null` to Zero
+    /// and named to a server-to-server backend.
     #[test]
     fn whole_floats_are_written_as_integers() {
         let mut out = Vec::new();
@@ -412,6 +429,12 @@ mod tests {
         assert_eq!(value_json(&Value::Float(1.0), None), serde_json::json!(1));
         assert_eq!(value_json(&Value::Float(1.5), None), serde_json::json!(1.5));
         assert!(!whole(1e17), "beyond 2^53 a float is left as it is");
+        assert_eq!(value_json(&Value::Float(f64::NAN), None), serde_json::json!("NaN"));
+        assert_eq!(value_json(&Value::Float(f64::INFINITY), None), serde_json::json!("Infinity"));
+        assert_eq!(
+            value_json(&Value::Float(f64::NEG_INFINITY), None),
+            serde_json::json!("-Infinity")
+        );
     }
 
     /// JSON columns are embedded, times are numbers, and the client's

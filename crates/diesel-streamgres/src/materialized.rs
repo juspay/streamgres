@@ -65,8 +65,9 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Reads an `accepted` body; `None` when it carries no rows.
-    pub fn from_json(body: &Json) -> Option<Snapshot> {
+    /// Reads an `accepted` body, its rows moved out of it; `None` when it
+    /// carries no rows.
+    pub fn from_json(body: &mut Json) -> Option<Snapshot> {
         let strings = |value: Option<&Json>| -> Option<Vec<String>> {
             value?
                 .as_array()?
@@ -75,10 +76,14 @@ impl Snapshot {
                 .collect()
         };
         let nodes = body
-            .get("nodes")?
-            .as_array()?
-            .iter()
+            .get_mut("nodes")?
+            .as_array_mut()?
+            .iter_mut()
             .map(|node| {
+                let rows = match node.get_mut("rows").map(Json::take) {
+                    Some(Json::Array(rows)) => rows,
+                    _ => return None,
+                };
                 Some(NodeSnapshot {
                     table: node.get("table")?.as_str()?.to_owned(),
                     key: strings(node.get("key"))?,
@@ -92,7 +97,7 @@ impl Snapshot {
                         .and_then(Json::as_str)
                         .map(str::to_owned),
                     inner: node.get("inner").and_then(Json::as_bool).unwrap_or(true),
-                    rows: node.get("rows")?.as_array()?.clone(),
+                    rows,
                 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -210,7 +215,9 @@ struct Node {
     rows: HashMap<String, Json>,
 }
 
-/// One query's rows and how to present them.
+/// One query's rows and how to present them. The result is built from
+/// the rows when it is asked for and kept until the next change, so a
+/// burst of deltas costs one build, by whichever read comes next.
 pub struct Materialized {
     nodes: Vec<Node>,
     projection: Projection,
@@ -218,6 +225,11 @@ pub struct Materialized {
     limit: Option<usize>,
     offset: usize,
     columns: Columns,
+    /// What the held rows weigh ([`Materialized::byte_len`]), kept as
+    /// they come and go.
+    bytes: usize,
+    /// The result as last built, until a change.
+    built: Option<Arc<[OwnedRow]>>,
 }
 
 impl Materialized {
@@ -368,6 +380,8 @@ impl Materialized {
             limit: snapshot.limit,
             offset: snapshot.offset,
             columns,
+            bytes: 0,
+            built: None,
         };
         for node in snapshot.nodes {
             for row in node.rows {
@@ -381,7 +395,14 @@ impl Materialized {
     pub fn put(&mut self, table: &str, row: Json) {
         if let Some(index) = self.nodes.iter().position(|node| node.table == table) {
             let key = self.key_of(index, &row);
-            self.nodes[index].rows.insert(key, row);
+            let (key_bytes, row_bytes) = (key.len(), json_bytes(&row));
+            match self.nodes[index].rows.insert(key, row) {
+                Some(old) => {
+                    self.bytes = (self.bytes + row_bytes).saturating_sub(json_bytes(&old));
+                }
+                None => self.bytes += key_bytes + row_bytes,
+            }
+            self.built = None;
         }
     }
 
@@ -389,28 +410,25 @@ impl Materialized {
     pub fn del(&mut self, table: &str, key: &Json) {
         if let Some(index) = self.nodes.iter().position(|node| node.table == table) {
             let key = self.key_of(index, key);
-            self.nodes[index].rows.remove(&key);
+            if let Some(old) = self.nodes[index].rows.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(key.len() + json_bytes(&old));
+            }
+            self.built = None;
         }
     }
 
     /// What the store weighs, roughly: every row's JSON as it is held.
     pub fn byte_len(&self) -> usize {
-        self.nodes
-            .iter()
-            .map(|node| {
-                node.rows
-                    .iter()
-                    .map(|(key, row)| key.len() + json_bytes(row))
-                    .sum::<usize>()
-            })
-            .sum()
+        self.bytes
     }
+
 
     /// How many rows are held, over every table.
     pub fn len(&self) -> usize {
         self.nodes.iter().map(|node| node.rows.len()).sum()
     }
 
+    /// Whether no row is held.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -431,23 +449,37 @@ impl Materialized {
         key
     }
 
-    /// The result as Diesel rows.
-    pub fn rows(&self) -> Result<Arc<[OwnedRow]>, Unsupported> {
-        let combos = self.assemble();
-        if let Projection::Count = self.projection {
-            let count = OwnedValue::new(
-                std::num::NonZeroU32::new(20).expect("int8"),
-                (combos.len() as i64).to_be_bytes().to_vec(),
-            );
-            return Ok(Arc::from(vec![OwnedRow::new(
-                Arc::clone(&self.columns),
-                vec![Some(count)],
-            )]));
+    /// The result as Diesel rows, built if a change came since it last
+    /// was. A count's `LIMIT` and `OFFSET` cut the one row it is, as
+    /// Postgres applies them after counting.
+    pub fn rows(&mut self) -> Result<Arc<[OwnedRow]>, Unsupported> {
+        if let Some(built) = &self.built {
+            return Ok(Arc::clone(built));
         }
-        let Projection::Columns(pairs) = &self.projection else {
-            unreachable!()
-        };
+        let built = self.build()?;
+        self.built = Some(Arc::clone(&built));
+        Ok(built)
+    }
+
+    /// The result built from the rows held now.
+    fn build(&self) -> Result<Arc<[OwnedRow]>, Unsupported> {
+        let combos = self.assemble();
         let limit = self.limit.unwrap_or(usize::MAX);
+        let pairs = match &self.projection {
+            Projection::Count => {
+                let count = OwnedValue::new(
+                    std::num::NonZeroU32::new(20).expect("int8"),
+                    (combos.len() as i64).to_be_bytes().to_vec(),
+                );
+                let row = OwnedRow::new(Arc::clone(&self.columns), vec![Some(count)]);
+                return Ok(std::iter::once(row)
+                    .skip(self.offset)
+                    .take(limit)
+                    .collect::<Vec<_>>()
+                    .into());
+            }
+            Projection::Columns(pairs) => pairs,
+        };
         combos
             .into_iter()
             .skip(self.offset)
@@ -759,7 +791,7 @@ mod tests {
             Some(2),
         );
         snap.offset = 1;
-        let store = Materialized::new(snap, &types()).unwrap();
+        let mut store = Materialized::new(snap, &types()).unwrap();
         let rows = store.rows().unwrap();
         let ids: Vec<i32> = rows
             .iter()
@@ -779,7 +811,7 @@ mod tests {
             vec![("rank", true), ("id", true)],
             Some(2),
         );
-        let m = Materialized::new(snap, &types()).unwrap();
+        let mut m = Materialized::new(snap, &types()).unwrap();
         assert_eq!(
             decoded(&m.rows().unwrap()),
             vec![(3, "c".into()), (1, "b".into())],
@@ -798,7 +830,7 @@ mod tests {
             vec![("rank", false), ("id", true)],
             None,
         );
-        let m = Materialized::new(snap, &types()).unwrap();
+        let mut m = Materialized::new(snap, &types()).unwrap();
         assert_eq!(
             decoded(&m.rows().unwrap()),
             vec![(2, "a".into()), (1, "b".into()), (3, "c".into())],
@@ -847,7 +879,7 @@ mod tests {
             ("books".to_string(), "title".to_string()),
         ]);
         snap.names = None;
-        let m = Materialized::new(snap, &types()).unwrap();
+        let mut m = Materialized::new(snap, &types()).unwrap();
         assert_eq!(
             decoded(&m.rows().unwrap()),
             vec![(1, "nine".into()), (1, "ten".into()), (1, "hundred".into())],
@@ -885,10 +917,51 @@ mod tests {
         let mut snap = snapshot(vec![json!({"id": 1}), json!({"id": 2})], vec![], Some(1));
         snap.count = true;
         snap.columns = None;
-        let m = Materialized::new(snap, &types()).unwrap();
+        let mut m = Materialized::new(snap, &types()).unwrap();
         let rows = m.rows().unwrap();
         let count = <i64 as FromSqlRow<BigInt, Pg>>::build_from_row(&rows[0]).unwrap();
         assert_eq!(count, 2, "a count ignores the limit");
+    }
+
+    /// A count's LIMIT and OFFSET cut the one row it is, as Postgres
+    /// applies them after counting: an OFFSET past it, or a LIMIT of
+    /// zero, leaves no row.
+    #[test]
+    fn a_count_is_cut_by_its_limit_and_offset() {
+        let counted = |limit: Option<usize>, offset: usize| {
+            let mut snap = snapshot(vec![json!({"id": 1}), json!({"id": 2})], vec![], limit);
+            snap.count = true;
+            snap.columns = None;
+            snap.offset = offset;
+            Materialized::new(snap, &types()).unwrap().rows().unwrap().len()
+        };
+        assert_eq!(counted(Some(1), 0), 1);
+        assert_eq!(counted(None, 1), 0);
+        assert_eq!(counted(Some(0), 0), 0);
+    }
+
+    /// The result is built once per change: read again unchanged it is
+    /// the same rows; a put or a delete builds it afresh; the weight
+    /// follows the rows held.
+    #[test]
+    fn the_result_is_built_once_per_change() {
+        let mut m = Materialized::new(
+            snapshot(vec![json!({"id": 1, "name": "a"})], vec![("id", true)], None),
+            &types(),
+        )
+        .unwrap();
+        let first = m.rows().unwrap();
+        assert!(Arc::ptr_eq(&first, &m.rows().unwrap()), "kept while unchanged");
+        let one_row = m.byte_len();
+        m.put("t", json!({"id": 2, "name": "b"}));
+        let second = m.rows().unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(decoded(&second), vec![(1, "a".into()), (2, "b".into())]);
+        assert!(m.byte_len() > one_row);
+        m.put("t", json!({"id": 2, "name": "bee"}));
+        m.del("t", &json!({"id": 2}));
+        assert_eq!(decoded(&m.rows().unwrap()), vec![(1, "a".into())]);
+        assert_eq!(m.byte_len(), one_row, "a row that came and went weighs nothing");
     }
 
     #[test]
@@ -925,7 +998,7 @@ mod tests {
             names: Some(vec!["n".into(), "i".into()]),
             ..snapshot(vec![json!({"id": 4, "name": "x", "rank": 1})], vec![], None)
         };
-        let m = Materialized::new(snap, &types()).unwrap();
+        let mut m = Materialized::new(snap, &types()).unwrap();
         let rows = m.rows().unwrap();
         assert_eq!(
             Named::build(&rows[0]).unwrap(),
@@ -954,7 +1027,7 @@ mod tests {
                 None,
             )
         };
-        let m = Materialized::new(snap, &types()).unwrap();
+        let mut m = Materialized::new(snap, &types()).unwrap();
         let rows = m.rows().unwrap();
         let rank =
             <Option<i32> as FromSqlRow<Nullable<Integer>, Pg>>::build_from_row(&rows[0]).unwrap();
@@ -1005,7 +1078,7 @@ mod tests {
 
     #[test]
     fn an_inner_join_drops_parents_without_a_match() {
-        let m = Materialized::new(authors_books(true, None), &types()).unwrap();
+        let mut m = Materialized::new(authors_books(true, None), &types()).unwrap();
         assert_eq!(
             joined(&m.rows().unwrap()),
             vec![
@@ -1018,7 +1091,7 @@ mod tests {
 
     #[test]
     fn a_left_join_null_extends_and_the_limit_cuts_joined_rows() {
-        let m = Materialized::new(authors_books(false, Some(3)), &types()).unwrap();
+        let mut m = Materialized::new(authors_books(false, Some(3)), &types()).unwrap();
         assert_eq!(
             joined(&m.rows().unwrap()),
             vec![
@@ -1071,7 +1144,7 @@ mod tests {
             ("t".into(), "name".into()),
             ("reviews".into(), "stars".into()),
         ]);
-        let m = Materialized::new(snap.clone(), &types()).unwrap();
+        let mut m = Materialized::new(snap.clone(), &types()).unwrap();
         let rows: Vec<(String, i32)> = m
             .rows()
             .unwrap()
@@ -1088,7 +1161,7 @@ mod tests {
 
         snap.count = true;
         snap.columns = None;
-        let m = Materialized::new(snap, &types()).unwrap();
+        let mut m = Materialized::new(snap, &types()).unwrap();
         let rows = m.rows().unwrap();
         assert_eq!(
             <i64 as FromSqlRow<BigInt, Pg>>::build_from_row(&rows[0]).unwrap(),

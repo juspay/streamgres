@@ -131,6 +131,9 @@ async fn run() -> Result<(), String> {
         Command::Serve => {
             let stack =
                 Arc::new(Stack::connect(&env("DATABASE_URL")?, &env("STREAMGRES_S2S_URL")?).await?);
+            for warning in stack.engine.warnings() {
+                eprintln!("demo: {warning}");
+            }
             if !stack.wait_for_engine(Duration::from_secs(10)).await {
                 eprintln!(
                     "demo: the engine is not reachable yet; reads go to Postgres until it is"

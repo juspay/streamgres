@@ -501,9 +501,9 @@ impl AsyncConnection for AsyncSyncedConnection {
                 .boxed();
             return self.tracked(live);
         }
-        if let Some(entry) = cache.get(&key) {
+        if let Some(rows) = cache.get(&key) {
             self.served.store(1, Ordering::Release);
-            return std::future::ready(Ok(Self::cached_stream(Arc::clone(&entry.rows)))).boxed();
+            return std::future::ready(Ok(Self::cached_stream(rows))).boxed();
         }
         if cache.refused_recently(&key).is_some() {
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
@@ -596,9 +596,9 @@ impl AsyncConnection for AsyncSyncedConnection {
                     cache.refused(&key, &reason);
                     live.await.map(Self::live_stream)
                 }
-                Verdict::Rows { rows, store_bytes } => {
+                Verdict::Rows { rows, live: store } => {
                     guard.disarm();
-                    cache.fill_weighing(reservation, Arc::clone(&rows), store_bytes);
+                    cache.fill_live(reservation, store, &rows);
                     served.store(2, Ordering::Release);
                     Ok(Self::cached_stream(rows))
                 }

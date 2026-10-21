@@ -335,7 +335,9 @@ fn render_where(filter: &Where, scope: &Scope<'_>) -> String {
     }
 }
 
-/// One leaf, with the engine's `NULL` and list semantics made explicit.
+/// One leaf, with the engine's `NULL` and list semantics made explicit:
+/// a `NOT IN` of no values holds for every row with a value, as the
+/// engine evaluates it, so a read and the routing agree on `NULL`.
 fn render_condition(condition: &Condition, scope: &Scope<'_>) -> String {
     use ComparisonOperator::*;
     if condition.column.is_composite() && condition.comparison_operator != EXISTS {
@@ -359,7 +361,11 @@ fn render_condition(condition: &Condition, scope: &Scope<'_>) -> String {
                 .map(|value| literal_as(value, declared))
                 .collect();
             if literals.is_empty() {
-                return if negated { "TRUE" } else { "FALSE" }.to_owned();
+                return if negated {
+                    format!("{column} IS NOT NULL")
+                } else {
+                    "FALSE".to_owned()
+                };
             }
             let keyword = if negated { "NOT IN" } else { "IN" };
             format!("{column} {keyword} ({})", literals.join(", "))
@@ -525,6 +531,21 @@ mod tests {
         );
         let sql = select_sql(&query, &comments());
         sql[sql.find(" WHERE ").expect("a WHERE") + 7..].to_owned()
+    }
+
+    /// A `NOT IN` of no values keeps every row with a value and none
+    /// without, as the engine's routing does; an `IN` of none keeps none.
+    #[test]
+    fn an_empty_list_renders_as_the_engine_evaluates_it() {
+        let empty = || Value::List(Vec::new());
+        assert_eq!(
+            comments_where(Condition::new("body", ComparisonOperator::NOT_IN, empty())),
+            "\"body\" IS NOT NULL"
+        );
+        assert_eq!(
+            comments_where(Condition::new("body", ComparisonOperator::IN, empty())),
+            "FALSE"
+        );
     }
 
     /// A composite key renders as a row constructor compared whole: its

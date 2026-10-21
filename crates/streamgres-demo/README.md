@@ -40,7 +40,7 @@ on each change, or refused and served live.
 | `statuses`        | `DISTINCT`                                                  | live    |
 | `workload`        | `GROUP BY`                                                  | live    |
 | `last_activity`   | `MAX`                                                       | live    |
-| `of_kind`         | an enum type added by `demo migrate new-type`; not in the demo list | rows after a restart |
+| `of_kind`         | an enum type added by `demo migrate new-type`; not in the demo list | rows    |
 
 A shape that starts to matter to the wrapper goes in this list, so it
 is exercised the day it changes.
@@ -90,8 +90,8 @@ wrapper promises:
 - the same under an engine restart in the middle (needs
   `STREAMGRES_RESTART_CMD`);
 - the three kinds of schema change: a widened table is absorbed and
-  the cache keeps serving, a new enum type is absorbed but a bind of it
-  is refused until the engine restarts, and a dropped column stops the
+  the cache keeps serving, a new enum type is absorbed and learnt on
+  its first bind, and a dropped column stops the
   engine, which restarted serves the schema as it is (needs
   `STREAMGRES_RESTART_CMD`).
 

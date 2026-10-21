@@ -16,13 +16,23 @@
 //!
 //! Every subscription asks for the rows. When the engine's `accepted`
 //! carries them and every projected column has a type the client encodes
-//! exactly, the result is kept as a [`Materialized`] store and the
-//! engine's `delta` frames replace the cache entry in place: Postgres is
-//! never read for that query. When a column cannot be encoded (a
-//! `numeric`, an interval, a range) the subscription falls back to
-//! touches: the cache reads Postgres and the engine's frames drop the
-//! entry. Which mode a key is in is the client's business; the cache sees
-//! `replace` or `touched`.
+//! exactly, the rows are kept as a [`Materialized`] store that the cache
+//! entry holds ([`crate::cache::Live`]): the engine's `delta` frames
+//! update the store in place, and the next read builds the result from
+//! it. Postgres is never read for that query, and the socket's thread
+//! only moves rows in and out, never builds a result. When a column
+//! cannot be encoded (a `numeric`, an interval, a range) the
+//! subscription falls back to touches: the cache reads Postgres and the
+//! engine's frames mark the entry stale.
+//!
+//! The engine is pinged while the socket is quiet; a socket that stays
+//! silent past [`Config::silence`] is taken for dead (an engine killed without a
+//! close, a network gone without a reset), so its keys go stale rather
+//! than being served from rows nobody updates any more.
+//!
+//! The token travels in the upgrade request. Over `ws://` that is plain
+//! text: use `wss://` (TLS, with the system's roots) or a TLS-terminating
+//! proxy for anything but a loopback or a private network.
 //!
 //! The wrapper never needs an async context: a subscribe blocks the
 //! calling thread on a channel until the reply lands or the wait runs
@@ -42,9 +52,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -52,14 +62,16 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value as Json, json};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
-use crate::cache::Cache;
+use crate::cache::{Cache, Live};
 use crate::key::QueryKey;
+use crate::row::OwnedRow;
 use crate::materialized::{Materialized, Snapshot};
 use crate::subscriptions::{Outcome, Subscriptions, Verdict};
 use crate::types::TableTypes;
@@ -83,6 +95,16 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// otherwise block the worker, and its thread, for good.
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a socket may stay silent, pings unanswered, before it is
+/// taken for dead and its keys go stale, when the environment says
+/// nothing. A quiet socket is pinged three times in that time.
+pub const DEFAULT_SILENCE: Duration = Duration::from_secs(30);
+
+/// How far a store's weight may drift from what its cache entry was
+/// weighed at, as a share of it (a quarter) and at least this many
+/// bytes, before the entry is weighed again.
+const REWEIGH_BYTES: usize = 64 * 1024;
+
 /// The pool's shape. [`Config::from_env`] reads it from the environment:
 ///
 /// | variable                            | meaning                            | default |
@@ -90,6 +112,7 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// | `STREAMGRES_S2S_CONNECTIONS`        | sockets to the engine              | 2       |
 /// | `STREAMGRES_S2S_MAX_SUBSCRIPTIONS`  | subscriptions held, all sockets    | 10000   |
 /// | `STREAMGRES_S2S_VERDICT_TIMEOUT_MS` | wait for `accepted` or `refused`   | 5000    |
+/// | `STREAMGRES_S2S_SILENCE_MS`         | a silent socket is taken for dead  | 30000   |
 /// | `STREAMGRES_S2S_TOKEN`              | bearer token the engine asks for   | none    |
 ///
 /// A number that is missing, not a number, or zero leaves the default;
@@ -99,6 +122,8 @@ pub struct Config {
     pub connections: usize,
     pub max_subscriptions: usize,
     pub verdict_timeout: Duration,
+    /// How long a socket may stay silent before it is taken for dead.
+    pub silence: Duration,
     /// Sent as `Authorization: Bearer <token>` when each socket opens,
     /// for an engine started with `STREAMGRES_S2S_TOKEN`.
     pub token: Option<String>,
@@ -110,6 +135,7 @@ impl std::fmt::Debug for Config {
             .field("connections", &self.connections)
             .field("max_subscriptions", &self.max_subscriptions)
             .field("verdict_timeout", &self.verdict_timeout)
+            .field("silence", &self.silence)
             .field("token", &self.token.as_ref().map(|_| ".."))
             .finish()
     }
@@ -121,12 +147,14 @@ impl Default for Config {
             connections: DEFAULT_CONNECTIONS,
             max_subscriptions: DEFAULT_MAX_SUBSCRIPTIONS,
             verdict_timeout: DEFAULT_VERDICT_TIMEOUT,
+            silence: DEFAULT_SILENCE,
             token: None,
         }
     }
 }
 
 impl Config {
+    /// The pool's shape from the environment (see [`Config`]).
     pub fn from_env() -> Config {
         let defaults = Config::default();
         Config {
@@ -136,6 +164,9 @@ impl Config {
             verdict_timeout: env_number("STREAMGRES_S2S_VERDICT_TIMEOUT_MS")
                 .map(|millis| Duration::from_millis(millis as u64))
                 .unwrap_or(defaults.verdict_timeout),
+            silence: env_number("STREAMGRES_S2S_SILENCE_MS")
+                .map(|millis| Duration::from_millis(millis as u64))
+                .unwrap_or(defaults.silence),
             token: std::env::var("STREAMGRES_S2S_TOKEN")
                 .ok()
                 .filter(|token| !token.is_empty()),
@@ -143,6 +174,7 @@ impl Config {
     }
 }
 
+/// A positive number from the environment.
 fn env_number(name: &str) -> Option<usize> {
     std::env::var(name)
         .ok()?
@@ -182,6 +214,8 @@ struct Shared {
     max_subscriptions: usize,
     /// The bearer token each socket opens with, if the engine asks for one.
     token: Option<String>,
+    /// How long a socket may stay silent before it is taken for dead.
+    silence: Duration,
     /// Column types by table, learnt on the first rows-mode subscribe of
     /// a table and reused for every delta and resubscribe after; looked
     /// up again when a snapshot names a column they lack, which is how a
@@ -254,7 +288,7 @@ struct WorkerState {
     pending: HashMap<u64, Option<SyncSender<Reply>>>,
     /// Subscriptions served from the engine's rows, each behind its own
     /// lock so a delta to one is applied without holding up the rest.
-    materialized: HashMap<u64, Arc<Mutex<Store>>>,
+    materialized: HashMap<u64, Arc<LiveStore>>,
 }
 
 /// A rows-mode subscription's store, from the moment the engine's
@@ -267,9 +301,83 @@ enum Store {
     Ready(Materialized),
 }
 
+/// A rows-mode subscription's store as the worker and the cache entry
+/// share it: the worker applies the engine's deltas, a read builds the
+/// result.
+struct LiveStore {
+    id: u64,
+    key: QueryKey,
+    store: Mutex<Store>,
+    worker: Weak<Worker>,
+    /// What the store weighed when its cache entry was last weighed.
+    weighed: AtomicUsize,
+}
+
+impl LiveStore {
+    /// An empty store for subscription `id`, waiting for its snapshot.
+    fn building(id: u64, key: QueryKey, worker: Weak<Worker>) -> Arc<LiveStore> {
+        Arc::new(LiveStore {
+            id,
+            key,
+            store: Mutex::new(Store::Building(Vec::new())),
+            worker,
+            weighed: AtomicUsize::new(0),
+        })
+    }
+
+    /// Whether the store, now `bytes`, has drifted from what its entry
+    /// was weighed at by more than [`REWEIGH_BYTES`] allows; if so it
+    /// counts as weighed at `bytes` from here.
+    fn drifted(&self, bytes: usize) -> bool {
+        let weighed = self.weighed.load(Ordering::Relaxed);
+        if bytes.abs_diff(weighed) > (weighed / 4).max(REWEIGH_BYTES) {
+            self.weighed.store(bytes, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl std::fmt::Debug for LiveStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveStore").field("id", &self.id).finish()
+    }
+}
+
+impl Live for LiveStore {
+    /// Built under the store's lock, which the socket's thread waits on
+    /// for at most this one build. A value that cannot be encoded falls
+    /// the query back to refills, once the lock is let go.
+    fn rows(&self) -> Option<Arc<[OwnedRow]>> {
+        let built = match &mut *self.store.lock().expect("store") {
+            Store::Ready(materialized) => materialized.rows(),
+            Store::Building(_) => return None,
+        };
+        match built {
+            Ok(rows) => Some(rows),
+            Err(error) => {
+                if let Some(worker) = self.worker.upgrade() {
+                    worker.fall_back(self.id, &self.key, error.0);
+                }
+                None
+            }
+        }
+    }
+
+    fn bytes(&self) -> usize {
+        match &*self.store.lock().expect("store") {
+            Store::Ready(materialized) => materialized.byte_len(),
+            Store::Building(_) => 0,
+        }
+    }
+}
+
 /// One socket to the engine and the subscriptions it carries.
 struct Worker {
     index: usize,
+    /// The worker itself, for the stores it hands the cache.
+    this: Weak<Worker>,
     url: String,
     verdict_timeout: Duration,
     outgoing: mpsc::UnboundedSender<Outgoing>,
@@ -337,6 +445,7 @@ impl EngineClient {
             by_key: Mutex::new(HashMap::new()),
             max_subscriptions: config.max_subscriptions,
             token: config.token.clone(),
+            silence: config.silence,
             types: Mutex::new(HashMap::new()),
             fallbacks: Mutex::new(Vec::new()),
             refusals: Mutex::new(Vec::new()),
@@ -408,7 +517,7 @@ impl EngineClient {
             .workers
             .iter()
             .map(|worker| {
-                let stores: Vec<Arc<Mutex<Store>>> = worker
+                let stores: Vec<Arc<LiveStore>> = worker
                     .state
                     .lock()
                     .expect("state")
@@ -416,13 +525,7 @@ impl EngineClient {
                     .values()
                     .cloned()
                     .collect();
-                stores
-                    .iter()
-                    .map(|store| match &*store.lock().expect("store") {
-                        Store::Ready(materialized) => materialized.byte_len(),
-                        Store::Building(_) => 0,
-                    })
-                    .sum::<usize>()
+                stores.iter().map(|store| store.bytes()).sum::<usize>()
             })
             .sum()
     }
@@ -435,6 +538,19 @@ impl EngineClient {
             .iter()
             .map(|worker| worker.state.lock().expect("state").materialized.len())
             .sum()
+    }
+
+    /// What the application should know about how the client is set
+    /// up, for its log: a bearer token that would cross the network in
+    /// plain text, over `ws://` to another host.
+    pub fn warnings(&self) -> Vec<String> {
+        let url = self.pool.workers.first().map(|worker| worker.url.as_str());
+        match (url, &self.pool.shared.token) {
+            (Some(url), Some(_)) if token_in_clear(url) => vec![format!(
+                "STREAMGRES_S2S_TOKEN goes to `{url}` in plain text; use wss:// or a TLS-terminating proxy"
+            )],
+            _ => Vec::new(),
+        }
     }
 
     /// Why recent subscriptions fell back from rows to refills, oldest
@@ -586,8 +702,9 @@ impl Worker {
         shared: Arc<Shared>,
     ) -> (Arc<Worker>, mpsc::UnboundedReceiver<Outgoing>) {
         let (outgoing, outgoing_rx) = mpsc::unbounded_channel();
-        let worker = Arc::new(Worker {
+        let worker = Arc::new_cyclic(|this| Worker {
             index,
+            this: this.clone(),
             url,
             verdict_timeout,
             outgoing,
@@ -660,15 +777,12 @@ impl Worker {
                 let store = state.materialized.get(&id).cloned();
                 drop(state);
                 return Outcome::Verdict(match store {
-                    Some(store) => match &*store.lock().expect("store") {
-                        Store::Ready(materialized) => match materialized.rows() {
-                            Ok(rows) => Verdict::Rows {
-                                rows,
-                                store_bytes: materialized.byte_len(),
-                            },
-                            Err(_) => Verdict::Accepted,
+                    Some(store) => match store.rows() {
+                        Some(rows) => Verdict::Rows {
+                            rows,
+                            live: store,
                         },
-                        Store::Building(_) => Verdict::Accepted,
+                        None => Verdict::Accepted,
                     },
                     None => Verdict::Accepted,
                 });
@@ -819,25 +933,32 @@ impl Worker {
                 "the subscription ended before its rows were built".to_string(),
             );
         }
-        let store = Arc::clone(
+        let Some(key) = state.by_id.get(&id).cloned() else {
+            return Verdict::Refused(
+                "the subscription ended before its rows were built".to_string(),
+            );
+        };
+        let live = Arc::clone(
             state
                 .materialized
                 .entry(id)
-                .or_insert_with(|| Arc::new(Mutex::new(Store::Building(Vec::new())))),
+                .or_insert_with(|| LiveStore::building(id, key, self.this.clone())),
         );
-        let mut store = store.lock().expect("store");
+        let mut store = live.store.lock().expect("store");
         let queued = match &mut *store {
             Store::Building(queued) => std::mem::take(queued),
             Store::Ready(_) => Vec::new(),
         };
-        for body in &queued {
+        for body in queued {
             apply_delta(&mut materialized, body);
         }
         match materialized.rows() {
             Ok(rows) => {
-                let store_bytes = materialized.byte_len();
+                live.weighed
+                    .store(materialized.byte_len(), Ordering::Relaxed);
                 *store = Store::Ready(materialized);
-                Verdict::Rows { rows, store_bytes }
+                drop(store);
+                Verdict::Rows { rows, live }
             }
             Err(error) => {
                 drop(store);
@@ -860,6 +981,19 @@ impl Worker {
         }
     }
 
+    /// A rows-mode subscription's rows can no longer be served (a value
+    /// arrived that cannot be encoded): its store goes, and its key is
+    /// stale, so the next read refills from Postgres and the engine's
+    /// frames touch it from then on.
+    fn fall_back(&self, id: u64, key: &QueryKey, reason: String) {
+        self.state.lock().expect("state").materialized.remove(&id);
+        self.shared.fell_back(reason);
+        if let Some(cache) = self.shared.cache() {
+            cache.touched(key);
+        }
+    }
+
+    /// Publishes how many keys this worker holds, for the pool's choice.
     fn note_held(&self, state: &WorkerState) {
         self.held.store(state.by_key.len(), Ordering::Relaxed);
     }
@@ -880,43 +1014,38 @@ impl Worker {
         }
     }
 
+    /// Records why the latest connect failed, or that one succeeded.
     fn connect_failed(&self, error: Option<String>) {
         *self.connect_error.lock().expect("connect_error") = error;
     }
 }
 
 /// Applies one `delta` body to a store: every table's departures, then
-/// its arrivals. The engine coalesces a frame per key, so no key is in
-/// both lists and the order between them does not matter.
-fn apply_delta(materialized: &mut Materialized, body: &Json) {
-    for change in body
-        .get("changes")
-        .and_then(Json::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(table) = change.get("table").and_then(Json::as_str) else {
+/// its arrivals, the rows moved in rather than copied. The engine
+/// coalesces a frame per key, so no key is in both lists and the order
+/// between them does not matter.
+fn apply_delta(materialized: &mut Materialized, mut body: Json) {
+    let Some(Json::Array(changes)) = body.get_mut("changes").map(Json::take) else {
+        return;
+    };
+    for mut change in changes {
+        let Some(table) = change.get("table").and_then(Json::as_str).map(str::to_owned) else {
             continue;
         };
-        for row in change
-            .get("del")
-            .and_then(Json::as_array)
-            .into_iter()
-            .flatten()
-        {
-            materialized.del(table, row);
+        if let Some(Json::Array(keys)) = change.get_mut("del").map(Json::take) {
+            for key in &keys {
+                materialized.del(&table, key);
+            }
         }
-        for row in change
-            .get("put")
-            .and_then(Json::as_array)
-            .into_iter()
-            .flatten()
-        {
-            materialized.put(table, row.clone());
+        if let Some(Json::Array(rows)) = change.get_mut("put").map(Json::take) {
+            for row in rows {
+                materialized.put(&table, row);
+            }
         }
     }
 }
 
+/// The bind as the subscribe frame carries it.
 fn bind_json(bind: &crate::key::Bind) -> Json {
     json!({
         "oid": bind.type_oid,
@@ -939,6 +1068,46 @@ fn upgrade_request(url: &str, token: Option<&str>) -> Result<Request, String> {
         request.headers_mut().insert(AUTHORIZATION, value);
     }
     Ok(request)
+}
+
+/// The TLS a `wss://` socket opens with: rustls with the ring provider
+/// and the system's root certificates, built once and given to each
+/// socket rather than installed for the whole process, which belongs to
+/// the application. `None` when the roots cannot be loaded; a `wss://`
+/// connect then fails, and says so in the refusals. A `ws://` socket
+/// ignores it.
+fn tls() -> Option<Connector> {
+    static CONFIG: OnceLock<Option<Arc<rustls::ClientConfig>>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            for certificate in rustls_native_certs::load_native_certs().certs {
+                let _ = roots.add(certificate);
+            }
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let config = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .ok()?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            Some(Arc::new(config))
+        })
+        .clone()
+        .map(Connector::Rustls)
+}
+
+/// Whether a bearer token sent to `url` would cross the network in plain
+/// text: a `ws://` URL whose host is not this machine.
+fn token_in_clear(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("ws://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = match authority.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => host,
+        _ => authority,
+    };
+    !matches!(host, "localhost" | "127.0.0.1" | "[::1]")
 }
 
 /// Why a connect failed, as a refusal names it.
@@ -974,7 +1143,14 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
                 continue;
             }
         };
-        let socket = match tokio_tungstenite::connect_async(request).await {
+        let socket = match tokio_tungstenite::connect_async_tls_with_config(
+            request,
+            None,
+            false,
+            tls(),
+        )
+        .await
+        {
             Ok((socket, _)) => {
                 worker.connect_failed(None);
                 socket
@@ -985,6 +1161,11 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
             }
         };
         let (mut sink, mut stream) = socket.split();
+        let mut heard = Instant::now();
+        let silence = worker.shared.silence;
+        let every = silence / 3;
+        let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // Up: a reconnect resubscribes what this worker still holds,
         // under the same ids. Their cache entries went when the socket
@@ -1019,13 +1200,20 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
         // Serve until the socket breaks either way.
         while up {
             up = tokio::select! {
-                frame = stream.next() => match frame {
-                    Some(Ok(Message::Text(text))) => {
-                        inbound(&worker, &text);
-                        true
+                frame = stream.next() => {
+                    heard = Instant::now();
+                    match frame {
+                        Some(Ok(Message::Text(text))) => {
+                            inbound(&worker, &text);
+                            true
+                        }
+                        Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => true,
+                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => false,
                     }
-                    Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => true,
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => false,
+                },
+                _ = ping.tick() => {
+                    heard.elapsed() < silence
+                        && send_frame(&mut sink, json!(["ping"]).to_string()).await
                 },
                 message = outgoing.recv() => match message {
                     Some(Outgoing::Subscribe { id, sql, binds }) => {
@@ -1062,7 +1250,9 @@ where
 /// register it twice. The stores go, the keys the engine had accepted
 /// stay held, pending again, and leave the cache until the engine is
 /// back. The other workers' keys are untouched. The cache's memory of
-/// refusals goes too: the engine coming back may be a restarted one.
+/// refusals goes too, and the column types learnt: the engine coming
+/// back may be a restarted one, after a migration that changed a
+/// column's type to one of the same width.
 fn disconnected(worker: &Worker) {
     let (waiting, released, keys) = {
         let mut state = worker.state.lock().expect("state");
@@ -1101,8 +1291,10 @@ fn disconnected(worker: &Worker) {
         }
         cache.forget_refusals();
     }
+    worker.shared.types.lock().expect("types").clear();
 }
 
+/// A subscribe frame asking for the rows.
 fn subscribe_frame(id: u64, sql: &str, binds: &[Json]) -> String {
     json!(["subscribe", {"id": id, "sql": sql, "binds": binds, "rows": true}]).to_string()
 }
@@ -1110,21 +1302,23 @@ fn subscribe_frame(id: u64, sql: &str, binds: &[Json]) -> String {
 /// One frame from the engine, on one worker's socket.
 fn inbound(worker: &Worker, text: &str) {
     let shared = &worker.shared;
-    let Ok(frame) = serde_json::from_str::<Json>(text) else {
+    let Ok(Json::Array(mut array)) = serde_json::from_str::<Json>(text) else {
         return;
     };
-    let Some(array) = frame.as_array() else {
-        return;
+    let mut body = if array.len() > 1 {
+        array.swap_remove(1)
+    } else {
+        Json::Null
     };
     let tag = array.first().and_then(Json::as_str).unwrap_or("");
-    let body = array.get(1).cloned().unwrap_or(Json::Null);
     match tag {
         "accepted" => {
             let Some(id) = body.get("id").and_then(Json::as_u64) else {
                 return;
             };
-            let snapshot = Snapshot::from_json(&body);
-            if snapshot.is_none() && body.get("rows").is_some() {
+            let carried_rows = body.get("nodes").is_some();
+            let snapshot = Snapshot::from_json(&mut body);
+            if snapshot.is_none() && carried_rows {
                 shared.fell_back("the accepted frame was not understood".to_string());
             }
             // Under one lock: the wait ends, and for a rows-mode
@@ -1135,11 +1329,13 @@ fn inbound(worker: &Worker, text: &str) {
                 let mut state = worker.state.lock().expect("state");
                 let waiter = state.pending.remove(&id);
                 let key = state.by_id.get(&id).cloned();
-                if key.is_some() && snapshot.is_some() {
+                if let Some(key) = &key
+                    && snapshot.is_some()
+                {
                     state
                         .materialized
                         .entry(id)
-                        .or_insert_with(|| Arc::new(Mutex::new(Store::Building(Vec::new()))));
+                        .or_insert_with(|| LiveStore::building(id, key.clone(), worker.this.clone()));
                 }
                 (waiter, key)
             };
@@ -1164,10 +1360,10 @@ fn inbound(worker: &Worker, text: &str) {
                     // reserved before the rows are built, as a Postgres
                     // read reserves it.
                     let reservation = shared.cache().map(|cache| cache.reserve(&key));
-                    if let Verdict::Rows { rows, store_bytes } = worker.materialize(id, snapshot)
+                    if let Verdict::Rows { live, .. } = worker.materialize(id, snapshot)
                         && let (Some(cache), Some(reservation)) = (shared.cache(), reservation)
                     {
-                        cache.replace(reservation, rows, store_bytes);
+                        cache.live(reservation, live);
                     }
                 }
                 // A resubscribe in touch mode: accepted, and the next
@@ -1218,54 +1414,47 @@ fn inbound(worker: &Worker, text: &str) {
             let Some(id) = body.get("id").and_then(Json::as_u64) else {
                 return;
             };
-            // The worker's lock is held only to find the store; the
-            // delta is applied under the store's own. The key is
-            // reserved before the store is read, and the store looked
-            // up again after, so a subscription ended in between (which
-            // bumps the generation as it goes) fails the replace.
-            let key = worker.state.lock().expect("state").by_id.get(&id).cloned();
-            let Some(key) = key else {
+            let (key, live) = {
+                let state = worker.state.lock().expect("state");
+                let Some(key) = state.by_id.get(&id).cloned() else {
+                    return;
+                };
+                (key, state.materialized.get(&id).cloned())
+            };
+            let Some(live) = live else {
+                if let Some(cache) = shared.cache() {
+                    cache.touched(&key);
+                }
                 return;
             };
-            let reservation = shared.cache().map(|cache| cache.reserve(&key));
-            let store = {
-                let state = worker.state.lock().expect("state");
-                if !state.by_id.contains_key(&id) {
-                    return;
-                }
-                state.materialized.get(&id).cloned()
-            };
-            let rows = match store {
-                Some(store) => {
-                    let mut store = store.lock().expect("store");
-                    match &mut *store {
-                        Store::Building(queued) => {
-                            queued.push(body);
-                            return;
-                        }
-                        Store::Ready(materialized) => {
-                            apply_delta(materialized, &body);
-                            match materialized.rows() {
-                                Ok(rows) => Some((rows, materialized.byte_len())),
-                                Err(error) => {
-                                    // A value the client cannot encode
-                                    // arrived: from here on the query is
-                                    // refilled from Postgres.
-                                    drop(store);
-                                    worker.state.lock().expect("state").materialized.remove(&id);
-                                    shared.fell_back(error.0);
-                                    None
-                                }
-                            }
-                        }
+            let reweigh = {
+                let mut store = live.store.lock().expect("store");
+                match &mut *store {
+                    Store::Building(queued) => {
+                        queued.push(body);
+                        return;
+                    }
+                    Store::Ready(materialized) => {
+                        apply_delta(materialized, body);
+                        live.drifted(materialized.byte_len())
                     }
                 }
-                None => None,
             };
-            if let (Some(cache), Some(reservation)) = (shared.cache(), reservation) {
-                match rows {
-                    Some((rows, store_bytes)) => cache.replace(reservation, rows, store_bytes),
-                    None => cache.touched(&key),
+            let Some(cache) = shared.cache() else {
+                return;
+            };
+            cache.changed();
+            if reweigh {
+                let reservation = cache.reserve(&key);
+                let held = worker
+                    .state
+                    .lock()
+                    .expect("state")
+                    .materialized
+                    .get(&id)
+                    .is_some_and(|held| Arc::ptr_eq(held, &live));
+                if held {
+                    cache.live(reservation, live);
                 }
             }
         }
@@ -1316,6 +1505,7 @@ mod tests {
             by_key: Mutex::new(HashMap::new()),
             max_subscriptions: 100,
             token: None,
+            silence: DEFAULT_SILENCE,
             types: Mutex::new(HashMap::new()),
             fallbacks: Mutex::new(Vec::new()),
             refusals: Mutex::new(Vec::new()),
@@ -1621,6 +1811,19 @@ mod tests {
 
     /// The token goes out as a bearer, and only when there is one; it
     /// never shows in the configuration's `Debug`.
+    /// A token is in plain text over `ws://` to anything but this
+    /// machine, and never over `wss://`.
+    #[test]
+    fn a_token_over_plain_ws_to_another_host_is_named() {
+        assert!(token_in_clear("ws://engine:4848/zero/s2s/v1"));
+        assert!(token_in_clear("ws://10.0.0.7/zero/s2s/v1"));
+        assert!(!token_in_clear("ws://127.0.0.1:4848/zero/s2s/v1"));
+        assert!(!token_in_clear("ws://localhost/zero/s2s/v1"));
+        assert!(!token_in_clear("ws://[::1]:4848/zero/s2s/v1"));
+        assert!(!token_in_clear("wss://engine:4848/zero/s2s/v1"));
+        assert!(tls().is_some(), "the TLS config builds");
+    }
+
     #[test]
     fn the_token_goes_out_as_a_bearer() {
         let url = "ws://127.0.0.1:4848/zero/s2s/v1";

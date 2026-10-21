@@ -711,12 +711,12 @@ async fn an_engine_restart_under_traffic_loses_no_correctness() {
 }
 
 /// The three kinds of schema change: a widened table is absorbed and
-/// the cache keeps serving; a new enum type is absorbed but a bind of
-/// it is refused until the engine restarts; a dropped column stops the
-/// engine, reads go to Postgres meanwhile, and the restarted engine
-/// serves the schema as it is.
+/// the cache keeps serving; a new enum type is absorbed and learnt on
+/// its first bind; a dropped column stops the engine, reads go to
+/// Postgres meanwhile, and the restarted engine serves the schema as it
+/// is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn migrations_are_absorbed_refused_or_stop_the_engine() {
+async fn migrations_are_absorbed_learnt_or_stop_the_engine() {
     let Some(mut live) = Live::start().await else {
         return;
     };

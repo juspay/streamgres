@@ -818,9 +818,17 @@ impl Pool {
 }
 
 /// The session a storage connection runs in: `config` with the session's
-/// time zone pinned to UTC, and, under a read `timeout`, that long to
+/// time zone pinned to UTC, string literals pinned to the standard form
+/// and `bytea` to hex output, and, under a read `timeout`, that long to
 /// open and as the session's `statement_timeout`; the settings follow
 /// whatever options the connection string already carries, so they win.
+///
+/// The literal form matters for safety: a value from a server-to-server
+/// bind reaches the SQL as a quoted literal with only its quotes doubled,
+/// which is exact while `standard_conforming_strings` is on (Postgres's
+/// default) and would let a backslash escape the quote were a role or
+/// database to turn it off. `bytea_output = hex` is the form the feed and
+/// the catalog carry a `bytea` in.
 ///
 /// The zone matters: a time in a filter is spelled as a zone-less
 /// timestamp (`TIMESTAMP 'epoch' + N microseconds`, so an index on the
@@ -831,7 +839,8 @@ impl Pool {
 /// whose default zone is not UTC.
 pub(crate) fn session_config(config: &Config, timeout: Option<Duration>) -> Config {
     let mut config = config.clone();
-    let mut ours = "-c TimeZone=UTC".to_string();
+    let mut ours =
+        "-c TimeZone=UTC -c standard_conforming_strings=on -c bytea_output=hex".to_string();
     if let Some(limit) = timeout {
         config.connect_timeout(limit);
         ours.push_str(&format!(" -c statement_timeout={}", limit.as_millis()));
@@ -998,13 +1007,13 @@ mod tests {
         let mut config = Config::new();
         assert_eq!(
             session_config(&config, None).get_options(),
-            Some("-c TimeZone=UTC")
+            Some("-c TimeZone=UTC -c standard_conforming_strings=on -c bytea_output=hex")
         );
         config.options("-c TimeZone=Asia/Kolkata -c search_path=app");
         assert_eq!(
             session_config(&config, Some(Duration::from_millis(250))).get_options(),
             Some(
-                "-c TimeZone=Asia/Kolkata -c search_path=app -c TimeZone=UTC -c statement_timeout=250"
+                "-c TimeZone=Asia/Kolkata -c search_path=app -c TimeZone=UTC -c standard_conforming_strings=on -c bytea_output=hex -c statement_timeout=250"
             )
         );
         assert_eq!(

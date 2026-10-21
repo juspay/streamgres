@@ -8,32 +8,46 @@
 //! which columns form the primary key.
 //!
 //! ```text
-//! query     := read | write
-//! read      := SELECT '*' FROM ident [WHERE filter]
-//!              [ORDER BY column [ASC | DESC] (, column [ASC | DESC])*] [LIMIT integer]
-//! write     := INSERT INTO ident '(' ident (',' ident)* ')' VALUES row
-//!            | UPDATE ident SET assign (',' assign)* WHERE filter
-//!            | DELETE FROM ident WHERE filter
-//! row       := '(' value (',' value)* ')'
-//! assign    := ident '=' value
-//! filter    := conjunct (OR conjunct)*
-//! conjunct  := primary (AND primary)*
-//! primary   := '(' filter ')' | condition | TRUE | FALSE
-//! condition := column ('=' | '!=' | '<>' | '>' | '>=' | '<' | '<=') value
-//!            | column [NOT] IN '(' [value (',' value)*] ')'
-//!            | column IS [NOT] NULL
-//! column    := ident
-//! value     := NULL | TRUE | FALSE | number | string
-//!            | '[' [value (',' value)*] ']'
+//! query      := read | write
+//! read       := SELECT projection FROM from [WHERE filter]
+//!               [ORDER BY column [ASC | DESC] (, column [ASC | DESC])*]
+//!               [LIMIT count] [OFFSET count]
+//! projection := '*' | COUNT '(' '*' ')' [AS ident]
+//!             | column [AS ident] (',' column [AS ident])*
+//! from       := table | '(' from ')'
+//!             | from [INNER | LEFT [OUTER]] JOIN from ON filter
+//! count      := integer | bind
+//! write      := INSERT INTO ident '(' ident (',' ident)* ')' VALUES row
+//!             | UPDATE ident SET assign (',' assign)* WHERE filter
+//!             | DELETE FROM ident WHERE filter
+//! row        := '(' value (',' value)* ')'
+//! assign     := ident '=' value
+//! filter     := conjunct (OR conjunct)*
+//! conjunct   := primary (AND primary)*
+//! primary    := '(' filter ')' | condition | TRUE | FALSE
+//! condition  := column ('=' | '!=' | '<>' | '>' | '>=' | '<' | '<=') value
+//!             | column [NOT] IN '(' [value (',' value)*] ')'
+//!             | column '=' ANY '(' value ')' | column '!=' ALL '(' value ')'
+//!             | column IS [NOT] NULL
+//! column     := ident | ident '.' ident
+//! ident      := a bare word | a double-quoted name, `""` for a quote
+//! value      := NULL | TRUE | FALSE | number | string | bind
+//!             | '[' [value (',' value)*] ']'
+//! bind       := '$' integer
 //! ```
 //!
-//! Keywords are case-insensitive; identifiers are bare words; strings are
-//! single-quoted with `''` for an embedded quote; `TRUE` / `FALSE` as a
-//! filter parse to the vacuous `AND(vec![])` / `OR(vec![])`.
+//! Keywords are case-insensitive; strings are single-quoted with `''` for
+//! an embedded quote; `TRUE` / `FALSE` as a filter parse to the vacuous
+//! `AND(vec![])` / `OR(vec![])`. A bind is read from the parameters an
+//! ORM sends with the statement ([`parse_select`], [`binds`]); `= ANY`
+//! and `!= ALL` take an array, as ORMs render an `IN` list.
 //!
-//! # v1 restrictions (each rejected with a clear error, never narrowed silently)
+//! # Restrictions (each rejected with a clear error, never narrowed silently)
 //!
-//! - Single table only — `LEFT JOIN` is recognised and refused.
+//! - Joins, projections, `COUNT(*)` and `OFFSET` are read by
+//!   [`parse_select`], the server-to-server entry point, under the rules
+//!   in [`select`]; [`parse`] and [`parse_read`] take one table and
+//!   refuse a join or an `OFFSET`.
 //! - Writes address **exactly one row by primary key**: the `WHERE` of an
 //!   `UPDATE` / `DELETE` must be a conjunction of `pkey_column = value`
 //!   conditions covering the whole primary key. Predicate writes ("set all
@@ -140,6 +154,10 @@ pub struct Projected {
 
 /// A `SELECT` over one table or joined tables, with `$n` placeholders
 /// standing for `binds`: the engine's query tree and the projection.
+/// An `ORDER BY` on a column Postgres orders differently from the
+/// engine (an enum, a string under a linguistic collation, JSON) is
+/// refused: the engine would keep, and the backend return, other rows
+/// in another order ([`Catalog::orders_as_engine`]).
 pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result<Select, ParseError> {
     // An enum label travels in the binary format as its text, under the
     // enum's own OID; the catalog says which OIDs those are. Arrays of
@@ -171,6 +189,18 @@ pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result
     let select = parser.select(catalog)?;
     if !matches!(parser.peek(), Tok::Eof) {
         return parser.err(format!("unexpected trailing input: {}", parser.describe()));
+    }
+    if let Some((table, column, position)) = select
+        .ordered_by
+        .iter()
+        .find(|(table, column, _)| !catalog.orders_as_engine(table, column))
+    {
+        return Err(ParseError {
+            message: format!(
+                "ORDER BY `{table}`.`{column}`: Postgres orders this column by rules the engine does not follow (an enum, a collation other than C, JSON)"
+            ),
+            position: *position,
+        });
     }
     Ok(select)
 }
@@ -451,10 +481,11 @@ struct Parser<'b> {
     pos: usize,
     depth: usize,
     binds: &'b [BindValue],
-    /// What a number compared with a time column means. A literal in
-    /// SQL written by hand or by the Zero side is milliseconds, the
-    /// protocol's unit; a bound parameter carries Postgres's own
-    /// microseconds, which is what the engine keeps.
+    /// What a number compared with a time column means, set by the
+    /// entry point: [`parse`] and [`parse_read`] (SQL by hand, in the
+    /// Zero protocol's terms) read it as milliseconds; [`parse_select`],
+    /// the server-to-server path, reads every number there, literal or
+    /// bound, as microseconds, Postgres's own unit and the engine's.
     times: TimeUnit,
 }
 
@@ -920,11 +951,7 @@ impl Parser<'_> {
             ComparisonOperator::EQ
         } else if self.eat_sym("!=") {
             if self.eat_word("ALL") {
-                return Ok(Where::Condition(Condition {
-                    column,
-                    comparison_operator: ComparisonOperator::NOT_IN,
-                    value: self.quantified_list("ALL")?,
-                }));
+                return Ok(differs_from_all(column, self.quantified_list("ALL")?));
             }
             ComparisonOperator::NEQ
         } else if self.eat_sym(">=") {
@@ -961,7 +988,6 @@ impl Parser<'_> {
         }))
     }
 
-    /// The parenthesised value list of `IN` / `NOT IN`.
     /// The `(value)` after `ANY` / `ALL`: a list literal or a bind that
     /// decodes to one.
     fn quantified_list(&mut self, quantifier: &str) -> Result<Value, ParseError> {
@@ -978,6 +1004,7 @@ impl Parser<'_> {
         }
     }
 
+    /// The parenthesised value list of `IN` / `NOT IN`.
     fn value_list(&mut self) -> Result<Value, ParseError> {
         self.expect_sym("(")?;
         let mut items = Vec::new();
@@ -1268,6 +1295,21 @@ fn collect_pkey_equalities(filter: &Where, out: &mut Vec<(ColumnName, Value)>) -
     }
 }
 
+/// `column != ALL(list)`. Postgres holds it for every row when the list
+/// is empty, a `NULL` in the column included, which is no condition at
+/// all; the engine's `NOT IN` leaves `NULL` out, as its `NULL` rule
+/// does everywhere, so an empty list must not become one.
+pub(super) fn differs_from_all(column: ColumnName, list: Value) -> Where {
+    match &list {
+        Value::List(items) if items.is_empty() => Where::AND(Vec::new()),
+        _ => Where::Condition(Condition {
+            column,
+            comparison_operator: ComparisonOperator::NOT_IN,
+            value: list,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1419,6 +1461,76 @@ mod tests {
             let error = parse_select(sql, &[], &join_catalog()).expect_err(sql);
             assert!(error.message.contains(expect), "{}", error.message);
         }
+    }
+
+    /// The composition orders each root row's result rows together and
+    /// the joined tables depth first by key: an ORDER BY is accepted
+    /// only where it asks for that, so a key alone, a root order that
+    /// leaves ties, or siblings named out of order are refused.
+    #[test]
+    fn a_joined_order_must_be_the_composition_order() {
+        let catalog = join_catalog();
+        let books_then_reviews = r#"SELECT * FROM (("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) INNER JOIN "reviews" ON ("reviews"."book_id" = "books"."id"))"#;
+        let order = |clauses: &str| format!("{books_then_reviews} ORDER BY {clauses}");
+        parse_select(
+            &order(r#""authors"."id", "books"."id", "reviews"."id""#),
+            &[],
+            &catalog,
+        )
+        .expect("the composition order");
+        for (clauses, expect) in [
+            (r#""books"."id""#, "whole primary key"),
+            (r#""authors"."name", "books"."id""#, "whole primary key"),
+            (r#""authors"."id", "reviews"."id""#, "in the order the tables are joined"),
+            (r#""authors"."id", "reviews"."id", "books"."id""#, "in the order the tables are joined"),
+        ] {
+            let error = parse_select(&order(clauses), &[], &catalog).expect_err(clauses);
+            assert!(error.message.contains(expect), "{clauses}: {}", error.message);
+        }
+    }
+
+    /// An INNER JOIN written after a LEFT JOIN onto its table would drop
+    /// the rows the LEFT JOIN keeps; inside its parentheses it does not.
+    /// A WHERE on any table under a LEFT JOIN is refused, a grandchild
+    /// included.
+    #[test]
+    fn an_inner_join_under_a_left_join_must_be_nested() {
+        let catalog = join_catalog();
+        let flat = r#"SELECT * FROM (("authors" LEFT OUTER JOIN "books" ON ("books"."author_id" = "authors"."id")) INNER JOIN "reviews" ON ("reviews"."book_id" = "books"."id"))"#;
+        let error = parse_select(flat, &[], &catalog).expect_err("flat");
+        assert!(error.message.contains("under a LEFT JOIN"), "{}", error.message);
+        let nested = r#"SELECT * FROM ("authors" LEFT OUTER JOIN ("books" INNER JOIN "reviews" ON ("reviews"."book_id" = "books"."id")) ON ("books"."author_id" = "authors"."id"))"#;
+        parse_select(nested, &[], &catalog).expect("nested");
+        let error = parse_select(&format!(r#"{nested} WHERE "reviews"."stars" = 5"#), &[], &catalog)
+            .expect_err("a grandchild under the LEFT JOIN");
+        assert!(error.message.contains("LEFT JOIN inner"), "{}", error.message);
+    }
+
+    /// A COUNT counts every row: its LIMIT and OFFSET cut the one row it
+    /// returns, not the rows it counts.
+    #[test]
+    fn a_count_is_not_cut_by_its_limit() {
+        let select = parse_select(
+            r#"SELECT COUNT(*) FROM "tickets" LIMIT $1 OFFSET $2"#,
+            &[int8_bind(1), int8_bind(1)],
+            &catalog(),
+        )
+        .expect("a count with a limit");
+        assert_eq!(select.query.main_table.limit, u32::MAX);
+        assert_eq!((select.limit, select.offset), (1, 1));
+    }
+
+    /// An ORDER BY on a text column is followed only where Postgres
+    /// orders it as its text, which the catalog says per column.
+    #[test]
+    fn an_order_on_text_needs_a_byte_ordered_column() {
+        let sql = r#"SELECT * FROM "tickets" ORDER BY "tickets"."status" LIMIT 5"#;
+        let error = parse_select(sql, &[], &catalog()).expect_err("an unknown collation");
+        assert!(error.message.contains("rules the engine does not follow"), "{}", error.message);
+        let known = catalog().with_ordered_as_text([(TableName::from("tickets"), ColumnName::from("status"))]);
+        parse_select(sql, &[], &known).expect("a C-collated column");
+        parse_select(r#"SELECT * FROM "tickets" ORDER BY "tickets"."points" LIMIT 5"#, &[], &catalog())
+            .expect("a number");
     }
 
     #[test]
@@ -1588,6 +1700,37 @@ mod tests {
         )
         .expect_err("a scalar after ANY");
         assert!(scalar.message.contains("needs an array"), "{}", scalar.message);
+    }
+
+    /// `!= ALL` of an empty array holds for every row in Postgres, `NULL`
+    /// included, so it is no condition; `= ANY` of one holds for none.
+    #[test]
+    fn an_empty_array_under_all_is_no_condition() {
+        let mut bytes = Vec::new();
+        for word in [0i32, 0, 25] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        let empty = BindValue {
+            type_oid: 1009,
+            bytes: Some(bytes),
+        };
+        let all = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE ("tickets"."status" != ALL($1))"#,
+            std::slice::from_ref(&empty),
+            &catalog(),
+        )
+        .expect("!= ALL parses");
+        assert_eq!(all.filter, Where::AND(Vec::new()));
+        let any = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE ("tickets"."status" = ANY($1))"#,
+            &[empty],
+            &catalog(),
+        )
+        .expect("= ANY parses");
+        assert_eq!(
+            any.filter,
+            Where::condition("status", ComparisonOperator::IN, Value::List(Vec::new()))
+        );
     }
 
     #[test]

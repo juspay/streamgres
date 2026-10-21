@@ -14,6 +14,9 @@ When the three services are up, open <http://localhost:8080> for the
 stats page, or walk through it with curl. If a port is taken on your
 machine, override it: `DEMO_PORT=8081 ENGINE_PORT=4850
 POSTGRES_PORT=5435 docker compose -f demo/docker-compose.yml up --build`.
+Every port is published on this machine only, and the engine's S2S
+endpoint asks for a token (`STREAMGRES_S2S_TOKEN`, `demo-token` unless
+set): the stack holds a well-known database password.
 
 ## 1. A read, twice
 
@@ -122,9 +125,9 @@ curl -s localhost:8080/tickets/1 | jq '{source}'
 
 A column added with a constant default is absorbed: the read above is
 still served from the cache. `migrate new-type` adds an enum type and a
-column of it, which the engine absorbs too, but a bind of the new type
-(`/orgs/1/kind/bug`) is refused and served live until the engine
-restarts. `migrate drop` removes both: the engine cannot follow a
+column of it, which the engine absorbs too; the first read that binds
+the new type (`/orgs/1/kind/bug`) teaches the engine the type, and is
+served from the cache from then on. `migrate drop` removes both: the engine cannot follow a
 dropped column, so it stops, compose restarts it, and reads go to
 Postgres meanwhile. A `TRUNCATE` of a published table stops it the same
 way: the replication stream carries no rows for it to follow.
@@ -141,7 +144,8 @@ second.
 
 ## Latency
 
-Without the compose stack in the way, against the same services:
+Inside the demo's container, so no HTTP or port forwarding is in the
+measurement:
 
 ```bash
 docker compose -f demo/docker-compose.yml exec demo \
@@ -154,9 +158,10 @@ Streamgres route side by side.
 ## Running it against your own Postgres
 
 The backend is `crates/streamgres-demo`; `demo seed`, `demo
-serve` and `demo bench` take `DATABASE_URL` and
-`STREAMGRES_S2S_URL`; `demo verify` and `demo migrate` too.
-`DEMO_SCALE=10` seeds ten times the tickets, so pages run deep and
-the cache's byte limits matter. Postgres needs `wal_level = logical`,
-the publication and the schema-change trigger (`demo/postgres-init.sql`
-and `scripts/sql/ddl-triggers.sql`); see `docs/deploy.md`.
+serve` and `demo bench` take `DATABASE_URL`, `STREAMGRES_S2S_URL` and,
+when the engine asks for one, `STREAMGRES_S2S_TOKEN`; `demo verify` and
+`demo migrate` too. `DEMO_SCALE=10` seeds ten times the tickets, so
+pages run deep and the cache's byte limits matter. Postgres needs
+`wal_level = logical`, the publication and the schema-change trigger
+stack for the engine's app id (`demo/postgres-init.sql` and
+`demo/ddl-triggers.sql` are both for app `demo`); see `docs/deploy.md`.

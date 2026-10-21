@@ -4,8 +4,7 @@
 //! in the WAL, at the position of the change. A column added with a
 //! constant default it absorbs: held rows are widened and nothing
 //! restarts (`widen`). A new enum type and a column of it it absorbs
-//! too, but the type's OID is not in the map the engine read at start,
-//! so a bind of that type is refused until the engine restarts
+//! too, and learns the type the first time a read binds it
 //! (`new-type`). A column dropped it cannot follow: the engine stops,
 //! and restarted serves the schema as it is (`drop`, which also undoes
 //! the other two).
@@ -19,7 +18,7 @@ pub enum Step {
     /// `tags text NOT NULL DEFAULT ''` on tickets: absorbed.
     Widen,
     /// The enum `ticket_kind` and `kind ticket_kind` on tickets, filled
-    /// in: absorbed, but binds of the type are refused until a restart.
+    /// in: absorbed, and the type learnt on its first bind.
     NewType,
     /// Drops both columns and the type: the engine stops.
     Drop,
@@ -61,7 +60,7 @@ impl Step {
                 "the engine absorbs the column; cached reads keep working and keep being served from rows"
             }
             Step::NewType => {
-                "the engine absorbs the column, but `of_kind` (a bind of the new type) is refused and served live until the engine restarts"
+                "the engine absorbs the column, and learns the type the first time `of_kind` binds it; from then on it is served from rows"
             }
             Step::Drop => {
                 "the engine cannot follow a dropped column: it stops, and restarted serves the schema as it is; reads go to Postgres meanwhile"

@@ -48,6 +48,7 @@ pub struct TableTypes {
 }
 
 impl TableTypes {
+    /// The column named `name`, with its position.
     pub fn column(&self, name: &str) -> Option<(usize, &ColumnType)> {
         self.columns
             .iter()
@@ -59,6 +60,7 @@ impl TableTypes {
 /// Where the engine client asks for a table's types: the connection the
 /// read is on.
 pub trait TypeLookup {
+    /// The column types of `table`, in declaration order.
     fn table_types(&mut self, table: &str) -> QueryResult<TableTypes>;
 }
 
@@ -74,14 +76,19 @@ struct Attribute {
     typtype: String,
     #[diesel(sql_type = Oid)]
     typelem: u32,
+    #[diesel(sql_type = Text)]
+    typcategory: String,
     #[diesel(sql_type = Nullable<Text>)]
     elemtyptype: Option<String>,
 }
 
 impl Attribute {
+    /// The column's type. An array is a type of the array category: a
+    /// fixed-width type like `name` or `point` also names an element
+    /// type, and is not one.
     fn into_column(self) -> ColumnType {
         let kind = match self.typtype.as_str() {
-            "b" if self.typelem != 0 && self.elemtyptype.is_some() => {
+            "b" if self.typcategory == "A" && self.elemtyptype.is_some() => {
                 let element_kind = match self.elemtyptype.as_deref() {
                     Some("b") => TypeKind::Base,
                     Some("e") => TypeKind::Enum,
@@ -106,7 +113,7 @@ impl Attribute {
 }
 
 const ATTRIBUTE_COLUMNS: &str = "a.attname, a.atttypid, a.atttypmod, t.typtype::text AS typtype, \
-     t.typelem, et.typtype::text AS elemtyptype";
+     t.typelem, t.typcategory::text AS typcategory, et.typtype::text AS elemtyptype";
 
 impl<C> TypeLookup for C
 where
@@ -146,7 +153,8 @@ pub struct TableAttribute {
 /// in several schemas resolves to the first in the search path, as a
 /// bare name does.
 pub const ALL_TABLES_SQL: &str = "SELECT c.relname, a.attname, a.atttypid, a.atttypmod, \
-     t.typtype::text AS typtype, t.typelem, et.typtype::text AS elemtyptype \
+     t.typtype::text AS typtype, t.typelem, t.typcategory::text AS typcategory, \
+     et.typtype::text AS elemtyptype \
      FROM pg_class c \
      JOIN pg_namespace n ON n.oid = c.relnamespace \
      JOIN pg_attribute a ON a.attrelid = c.oid \

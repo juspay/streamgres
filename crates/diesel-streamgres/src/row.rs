@@ -5,8 +5,10 @@
 //! `PgRow` yields, each value's type OID and raw bytes in the format
 //! Postgres sent them in, and implements Diesel's [`Row`] over that, so
 //! `#[derive(Queryable)]`, `#[derive(QueryableByName)]` and every
-//! `FromSql` decode it exactly as they decode a live row. Nothing is
-//! re-encoded: a cached row is byte-identical to the one Postgres served.
+//! `FromSql` decode it exactly as they decode a live row. A row read from
+//! Postgres is kept as the bytes Postgres served, nothing re-encoded; a
+//! row built from the engine's rows carries the bytes [`crate::encode`]
+//! writes for its column's type, which decode the same.
 //!
 //! The column names are the same for every row of a result set, so they
 //! are captured once per set and shared ([`Columns`]). The OID travels

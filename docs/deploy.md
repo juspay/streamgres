@@ -297,11 +297,23 @@ depend on what the defaults happen to be:
     that cache their own reads
   - `/health`, `/metrics` and `/stats`
 
-  Keep `/metrics` and `/stats` private. Do the same for `/s2s/v1`, or set
-  `STREAMGRES_S2S_TOKEN`. Anyone who can open it can subscribe to the
-  rows of every table the engine follows. The two S2S limits multiply:
-  at most `STREAMGRES_S2S_MAX_CONNECTIONS` ×
-  `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` subscriptions in all.
+  Keep `/metrics` and `/stats` private. Do the same for `/s2s/v1`, and
+  set `STREAMGRES_S2S_TOKEN`. The endpoint carries no user: anyone who
+  can open it can subscribe to the rows of every table the engine
+  follows. The server speaks plain `ws://`, so the token crosses the
+  network as text: terminate TLS in front of it (an ingress, a mesh,
+  a sidecar) unless the backends share a private network with it. The
+  two S2S limits multiply: at most `STREAMGRES_S2S_MAX_CONNECTIONS` ×
+  `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` subscriptions in all. Each
+  S2S connection queues at most 4,096 frames and 64 MiB of them for a
+  backend that is slow to read; past that it is closed, and its socket
+  cut off 5 seconds later if it still cannot be flushed.
+- **Times.** The engine keeps every time in microseconds, Postgres's own
+  precision, and the S2S endpoint ships them so. Zero clients see a time
+  as its whole milliseconds, and a Zero query's filter or page cursor on
+  a time compares on the millisecond, as the client does. Rows of one
+  page that fall in the same millisecond are ordered by their
+  microseconds, then by key, where the client orders them by key alone.
 - **Health.** `GET /health` (also `/healthz`, `/readyz`, and each of them
   under the base path) returns `503` until the server is ready. That means
   the change feed has passed the first read snapshot, and the warm start, if

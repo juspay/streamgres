@@ -22,9 +22,8 @@ pub struct TicketStatusType;
 pub struct TicketPriorityType;
 
 /// The enum type a migration adds after the engine started
-/// (`demo migrate new-type`): a bind of it is refused until the
-/// engine restarts, which is the one schema change the engine cannot
-/// absorb.
+/// (`demo migrate new-type`): the engine learns it the first time a
+/// read binds it.
 #[derive(diesel::sql_types::SqlType, diesel::query_builder::QueryId)]
 #[diesel(postgres_type(name = "ticket_kind"))]
 pub struct TicketKindType;

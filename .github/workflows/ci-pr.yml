@@ -46,14 +46,17 @@ jobs:
       - name: Install rust cache
         uses: Swatinem/rust-cache@v2.7.7
 
-      - name: Clippy, warnings denied
-        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Clippy, warnings denied, every crate of the workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: Tests (accuracy)
     runs-on: ubuntu-latest
     env:
       STREAMGRES_PG_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+      # The Diesel wrapper's and the demo's tests read and write their own
+      # tables in the same database.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -77,8 +80,8 @@ jobs:
             -c wal_level=logical -c max_replication_slots=32 -c max_wal_senders=32
           until docker exec pg pg_isready -U postgres; do sleep 1; done
 
-      - name: Unit, scenario, randomized and live PostgreSQL tests
-        run: cargo test --release --locked
+      - name: Unit, scenario, randomized and live PostgreSQL tests, every crate
+        run: cargo test --release --locked --workspace
 
   perf:
     name: Benchmark against the base branch (performance)

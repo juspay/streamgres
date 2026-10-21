@@ -237,6 +237,33 @@ fn a_hung_engine_is_given_up_on_in_time_and_asked_again() {
     assert_eq!(tagged(&frames[3]), ("unsubscribe", 2));
 }
 
+/// An engine that greets and then goes silent (killed without a close,
+/// a network gone without a reset) is taken for dead once the socket has
+/// been quiet for the silence window, and dialled again.
+#[test]
+fn a_silent_engine_is_taken_for_dead() {
+    let fake = Fake::start(Answer::Never);
+    let engine = EngineClient::with_config(
+        fake.url.clone(),
+        Config {
+            connections: 1,
+            silence: Duration::from_millis(600),
+            ..Config::default()
+        },
+    );
+    thread::sleep(Duration::from_millis(2500));
+    assert!(
+        fake.accepts().len() >= 2,
+        "{} connections: the silent one was not given up",
+        fake.accepts().len()
+    );
+    assert!(
+        fake.frames().iter().any(|frame| frame[0] == "ping"),
+        "the quiet socket was pinged"
+    );
+    drop(engine);
+}
+
 #[test]
 fn a_dropped_socket_is_tried_again_every_second() {
     let fake = Fake::start(Answer::Close);

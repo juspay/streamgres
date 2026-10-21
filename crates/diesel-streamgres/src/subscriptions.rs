@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::cache::Live;
 use crate::key::QueryKey;
 use crate::materialized::Snapshot;
 use crate::row::OwnedRow;
@@ -34,13 +35,12 @@ pub enum Verdict {
     /// The engine will report every change to this query's rows; the
     /// cache reads Postgres for them and refills on each report.
     Accepted,
-    /// The engine serves the rows itself: here is the result, and every
-    /// change will replace the cache's entry. No Postgres read.
-    /// `store_bytes` is what the engine side keeps for the query, so
-    /// the cache can weigh it.
+    /// The engine serves the rows itself: here is the result, built
+    /// from `live`, which the cache keeps and builds the result from
+    /// again on a read after each change. No Postgres read.
     Rows {
         rows: Arc<[OwnedRow]>,
-        store_bytes: usize,
+        live: Arc<dyn Live>,
     },
     /// The engine cannot follow this query; the read goes to Postgres and
     /// is not cached. The reason is for logs and stats.
@@ -83,8 +83,9 @@ pub trait Subscriptions: Send + Sync {
         types: HashMap<String, Arc<TableTypes>>,
     ) -> Verdict;
 
-    /// The cache dropped the entry for good (evicted for size or age), so
-    /// the engine need not follow the query any more.
+    /// The cache dropped the entry for good (evicted for size or age, or
+    /// abandoned by a read), so the engine need not follow the query any
+    /// more.
     fn unsubscribe(&self, key: &QueryKey);
 
     /// Whether a refusal with this reason will hold for a while (the
