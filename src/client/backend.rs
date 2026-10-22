@@ -37,6 +37,49 @@ pub struct Identity {
     pub token: Option<String>,
 }
 
+impl Identity {
+    /// The claim that binds a client group to its first claimant. Prefers the
+    /// `sub` from the JWT token so that tabs with rotated tokens for the same
+    /// user share a group. Falls back to the cookie pairs (sorted and
+    /// deduplicated for stability) when there is no token or it carries no
+    /// `sub`. Returns `None` when there is neither.
+    pub fn stamp(&self) -> Option<String> {
+        if let Some(sub) = self.token.as_deref().and_then(jwt_sub) {
+            return Some(sub);
+        }
+        let cookie = self.cookie.as_deref().map(str::trim)?;
+        let mut pairs: Vec<&str> = cookie
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if pairs.is_empty() {
+            return None;
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        Some(pairs.join(";"))
+    }
+}
+
+/// Extract the `sub` claim from a JWT without verifying the signature.
+/// Returns `None` when the token is blank, malformed, or has no non-blank `sub`.
+fn jwt_sub(token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let payload_b64 = token.splitn(3, '.').nth(1)?;
+    use base64::Engine as _;
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload_b64))
+        .ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    let sub = payload.get("sub").and_then(|v| v.as_str())?;
+    if sub.is_empty() { None } else { Some(sub.to_owned()) }
+}
+
 /// The query endpoint's answer.
 #[derive(Debug)]
 pub enum TransformOutcome {
@@ -275,4 +318,47 @@ fn preview(text: &str) -> String {
         end -= 1;
     }
     format!("{}...", &text[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make(token: Option<&str>, cookie: Option<&str>) -> Identity {
+        Identity {
+            token: token.map(str::to_owned),
+            cookie: cookie.map(str::to_owned),
+            ..Identity::default()
+        }
+    }
+
+    // Two JWTs with the same `sub` ("user-123") but different `iat`.
+    const JWT_V1: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\
+        .eyJzdWIiOiAidXNlci0xMjMiLCAiaWF0IjogMTcwMDAwMDAwMH0.fakesig";
+    const JWT_V2: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\
+        .eyJzdWIiOiAidXNlci0xMjMiLCAiaWF0IjogMTcwMDAwMzYwMH0.fakesig";
+    const JWT_OTHER: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\
+        .eyJzdWIiOiAidXNlci00NTYiLCAiaWF0IjogMTcwMDAwMDAwMH0.fakesig";
+    // JWT with no `sub`.
+    const JWT_NOSUB: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\
+        .eyJzdWIiOiBudWxsLCAiaWF0IjogMTcwMDAwMDAwMH0.fakesig";
+
+    #[test]
+    fn stamp_prefers_jwt_sub_and_falls_back_to_cookie() {
+        // JWT sub is the stamp; two rotated tokens for the same user match.
+        assert_eq!(make(Some(JWT_V1), None).stamp(), Some("user-123".to_owned()));
+        assert_eq!(make(Some(JWT_V1), None).stamp(), make(Some(JWT_V2), None).stamp());
+        assert_ne!(make(Some(JWT_V1), None).stamp(), make(Some(JWT_OTHER), None).stamp());
+
+        // No token or no sub falls through to cookie.
+        let cookie_stamp = make(None, Some("sid=1; uid=2")).stamp();
+        assert_eq!(cookie_stamp, make(Some(""), Some("sid=1; uid=2")).stamp());
+        assert_eq!(cookie_stamp, make(Some(JWT_NOSUB), Some("sid=1; uid=2")).stamp());
+        // Same cookies in any order are the same stamp.
+        assert_eq!(cookie_stamp, make(None, Some("uid=2; sid=1")).stamp());
+
+        // No token and no cookie is no stamp.
+        assert_eq!(make(None, None).stamp(), None);
+        assert_eq!(make(None, Some("  ;  ")).stamp(), None);
+    }
 }
