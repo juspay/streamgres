@@ -563,7 +563,10 @@ impl AsyncConnection for AsyncSyncedConnection {
         async move {
             let _pending = token;
             if let Some(probe) = probe {
-                cache.learn_database(read_database(probe).await);
+                match read_database(probe).await {
+                    Some(database) => cache.learn_database(Some(database)),
+                    None => return live.await.map(Self::live_stream),
+                }
             }
             let reservation = cache.reserve(&key);
             let guard = Unfilled {
@@ -662,7 +665,8 @@ impl AsyncConnection for AsyncSyncedConnection {
 }
 
 /// The database `probe` ([`DATABASE_SQL`]) reads; `None` when it fails,
-/// and the engine's word is taken.
+/// and the read goes live without asking the engine, the next miss
+/// reading it again.
 async fn read_database(probe: LoadFuture<'_>) -> Option<Database> {
     let rows: Vec<PgRow> = probe.await.ok()?.try_collect().await.ok()?;
     rows.first()

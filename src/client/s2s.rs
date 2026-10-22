@@ -51,9 +51,10 @@
 //!   {"system": "...", "name": "..."}}]` first; `max_subscriptions` is the
 //!   per-connection limit, `null` for none, so a client can stop short of
 //!   it rather than be refused. `database` names what the engine streams
-//!   (the cluster's `system_identifier` and the database's name, `null`
-//!   when they cannot be read), so a backend reading another database
-//!   does not take these rows for its own.
+//!   (the cluster's `system_identifier` and the database's name), so a
+//!   backend reading another database does not take these rows for its
+//!   own. An engine that cannot read them closes the socket instead of
+//!   greeting it.
 //! - `["accepted", {"id": n}]` once the engine follows the query; from
 //!   that moment every change to its rows is reported, so the backend
 //!   reads Postgres only after it. In rows mode the body also carries
@@ -290,6 +291,10 @@ pub struct Handle {
     max_connections: usize,
     unauthorized: Throttle,
     full: Throttle,
+    unidentified: Throttle,
+    /// The database the engine streams, as `hello` names it, once read:
+    /// it cannot change while the process runs.
+    database: tokio::sync::OnceCell<Json>,
 }
 
 impl Handle {
@@ -305,6 +310,8 @@ impl Handle {
                 max_connections,
                 unauthorized: Throttle::new(REFUSAL_LOG_EVERY),
                 full: Throttle::new(REFUSAL_LOG_EVERY),
+                unidentified: Throttle::new(REFUSAL_LOG_EVERY),
+                database: tokio::sync::OnceCell::new(),
             },
             requests_rx,
         )
@@ -1094,6 +1101,16 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
 /// outlive it.
 async fn handle(socket: WebSocket, state: Arc<AppState>) {
     let handle = &state.s2s;
+    let database = match database(&state).await {
+        Ok(database) => database,
+        Err(error) => {
+            refusal(
+                &handle.unidentified,
+                &format!("the database it streams cannot be read: {error}"),
+            );
+            return;
+        }
+    };
     let conn = handle.next_conn.fetch_add(1, Ordering::Relaxed);
     let (mut sink, stream) = socket.split();
     let (out, mut out_rx) = Outgoing::new();
@@ -1117,7 +1134,7 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
         json!(["hello", {
             "protocol": PROTOCOL_VERSION,
             "max_subscriptions": (limit > 0).then_some(limit),
-            "database": database(&state).await,
+            "database": database,
         }]),
     );
     send(&out, lag_frame(&state.stats));
@@ -1311,17 +1328,27 @@ async fn prepare(
 /// `system_identifier` and the database's name, as a backend reads them
 /// through its own connection. A backend whose reads go to another
 /// database must not take this engine's rows for its own, and checks.
-/// `null` when they cannot be read, which a backend takes as unknown.
-async fn database(state: &AppState) -> Json {
-    let rows = state
-        .storage
-        .simple_query(DATABASE_SQL)
+/// Read once and kept, since it cannot change while the process runs.
+/// A read that fails is an error, and the connection is closed without
+/// a `hello`: a `null` would have the backend take the engine on trust,
+/// so it reconnects instead, reading Postgres meanwhile.
+async fn database(state: &AppState) -> Result<Json, String> {
+    state
+        .s2s
+        .database
+        .get_or_try_init(|| async {
+            let rows = state
+                .storage
+                .simple_query(DATABASE_SQL)
+                .await
+                .map_err(|error| error.to_string())?;
+            match rows.first().map(|row| (row.get(0), row.get(1))) {
+                Some((Some(system), Some(name))) => Ok(json!({"system": system, "name": name})),
+                _ => Err("the identity query returned no row".to_owned()),
+            }
+        })
         .await
-        .unwrap_or_default();
-    match rows.first().map(|row| (row.get(0), row.get(1))) {
-        Some((Some(system), Some(name))) => json!({"system": system, "name": name}),
-        _ => Json::Null,
-    }
+        .cloned()
 }
 
 /// The identity [`database`] announces.

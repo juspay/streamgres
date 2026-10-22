@@ -531,6 +531,9 @@ impl Cache {
     }
 
     /// Records the database a connection read; the first record stands.
+    /// `None` says there is none to check the engine's against, and
+    /// trusts it: the wrapper records only a database it read, and goes
+    /// live on a read that failed.
     pub fn learn_database(&self, database: Option<Database>) {
         let _ = self.database.set(database);
     }

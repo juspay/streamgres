@@ -476,7 +476,13 @@ where
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
         if !cache.knows_database() {
-            cache.learn_database(database_of(&mut self.inner));
+            match database_of(&mut self.inner) {
+                Some(database) => cache.learn_database(Some(database)),
+                None => {
+                    return LoadConnection::<B>::load(&mut self.inner, source)
+                        .map(SyncedCursor::Live);
+                }
+            }
         }
         let reservation = cache.reserve(&key);
         match cache.subscriptions().subscribe_with(&key, &mut self.inner) {
@@ -511,7 +517,8 @@ where
 }
 
 /// The database `conn` reads, as the engine names the one it streams;
-/// `None` when it cannot be read, and the engine's word is taken.
+/// `None` when it cannot be read, and the read goes live without asking
+/// the engine, the next miss reading it again.
 fn database_of<C>(conn: &mut C) -> Option<Database>
 where
     C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
