@@ -129,7 +129,10 @@ pub fn encode(cell: &Json, column: &ColumnType) -> Result<Option<OwnedValue>, Un
 /// One base-type cell in Postgres's binary format. The engine carries a
 /// `bytea` as Postgres's hex text, `\x` and two digits per byte; the
 /// binary format is the bytes themselves. A time travels in
-/// microseconds since the Unix epoch, and a date as such a time.
+/// microseconds since the Unix epoch, and a date as such a time;
+/// `infinity` and `-infinity` travel as the extreme `i64`s and become
+/// Postgres's own binary infinities, so a cached row decodes exactly as
+/// the live one does.
 fn scalar(cell: &Json, type_oid: u32, name: &str) -> Result<Vec<u8>, Unsupported> {
     Ok(match type_oid {
         oid::BOOL => vec![u8::from(
@@ -175,18 +178,22 @@ fn scalar(cell: &Json, type_oid: u32, name: &str) -> Result<Vec<u8>, Unsupported
             bytes.extend(serde_json::to_vec(cell).map_err(|_| mismatch(name, "JSON"))?);
             bytes
         }
-        oid::TIMESTAMP | oid::TIMESTAMPTZ => {
-            let micros = integer(cell, name)?;
-            (micros - PG_EPOCH_MICROS).to_be_bytes().to_vec()
-        }
-        oid::DATE => {
-            let micros = integer(cell, name)?;
-            let days = (micros - PG_EPOCH_MICROS).div_euclid(86_400_000_000);
-            i32::try_from(days)
-                .map_err(|_| mismatch(name, "a date"))?
-                .to_be_bytes()
-                .to_vec()
-        }
+        oid::TIMESTAMP | oid::TIMESTAMPTZ => match integer(cell, name)? {
+            i64::MAX => i64::MAX.to_be_bytes().to_vec(),
+            i64::MIN => i64::MIN.to_be_bytes().to_vec(),
+            micros => (micros - PG_EPOCH_MICROS).to_be_bytes().to_vec(),
+        },
+        oid::DATE => match integer(cell, name)? {
+            i64::MAX => i32::MAX.to_be_bytes().to_vec(),
+            i64::MIN => i32::MIN.to_be_bytes().to_vec(),
+            micros => {
+                let days = (micros - PG_EPOCH_MICROS).div_euclid(86_400_000_000);
+                i32::try_from(days)
+                    .map_err(|_| mismatch(name, "a date"))?
+                    .to_be_bytes()
+                    .to_vec()
+            }
+        },
         other => return Err(Unsupported(format!("column `{name}` has type oid {other}"))),
     })
 }
@@ -345,7 +352,7 @@ mod tests {
     }
 
     /// `jsonb` carries its version byte; times and dates count from
-    /// Postgres's epoch.
+    /// Postgres's epoch, and their infinities are Postgres's.
     #[test]
     fn json_and_times() {
         let jsonb = bytes(encode(&json!({"a": [1, null]}), &base(oid::JSONB)).unwrap());
@@ -369,6 +376,17 @@ mod tests {
             ),
             2i32.to_be_bytes()
         );
+        for (micros, timestamp, date) in [
+            (i64::MAX, i64::MAX, i32::MAX),
+            (i64::MIN, i64::MIN, i32::MIN),
+        ] {
+            assert_eq!(
+                bytes(encode(&json!(micros), &base(oid::TIMESTAMPTZ)).unwrap()),
+                timestamp.to_be_bytes(),
+                "an infinite time is Postgres's infinity"
+            );
+            assert_eq!(bytes(encode(&json!(micros), &base(oid::DATE)).unwrap()), date.to_be_bytes());
+        }
     }
 
     /// Malformed hex is refused, never a panic: a multi-byte character

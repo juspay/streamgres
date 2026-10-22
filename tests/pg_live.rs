@@ -1787,3 +1787,102 @@ fn a_time_range_is_read_right_in_any_session_zone() {
         let _ = PgStream::drop_slot(&dsn, slot, publication).await;
     });
 }
+
+/// Every time PostgreSQL can hold reaches the engine, through the
+/// snapshot and through the change feed: `infinity` and `-infinity` as
+/// the extreme microseconds (where they order, as PostgreSQL orders
+/// them), a BC date and a year past 9999 exactly. A single `infinity`
+/// in a published table used to stop the change feed, and the engine
+/// with it, on every restart until the row was changed by hand.
+#[test]
+fn every_time_postgres_holds_reaches_the_engine() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let names = Names::new("infinite");
+        let table = names.extra.clone();
+        let client = prepare(&dsn, &names).await;
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {table} (id int8 PRIMARY KEY, at timestamptz, naive timestamp, day date);
+                 INSERT INTO {table} VALUES
+                   (1, 'infinity', 'infinity', 'infinity'),
+                   (2, '-infinity', '-infinity', '-infinity'),
+                   (3, '4713-01-01 00:00:00+00 BC', '4713-01-01 00:00:00 BC', '4713-01-01 BC'),
+                   (4, '12345-06-07 08:09:10+00', '12345-06-07 08:09:10', '12345-06-07');"
+            ))
+            .await
+            .expect("times");
+        let catalog = Arc::new(Catalog::new(vec![DbTable::new(
+            table.as_str(),
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("at", ValueType::Timestamp),
+                DbColumn::new("naive", ValueType::Timestamp),
+                DbColumn::new("day", ValueType::Timestamp),
+            ],
+        )]));
+        let mut stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+        let expected = BTreeMap::from([
+            (1, i64::MAX),
+            (2, i64::MIN),
+            (3, -210_863_520_000_000_000),
+            (4, 327_416_976_550_000_000),
+        ]);
+        let read = |filter: Where| SingleTableReadQuery::new(table.as_str(), filter, OrderBy::new("id", Order::ASC), u32::MAX);
+        let snapshot = storage.select(&read(Where::AND(vec![]))).await.expect("select");
+        for (key, row) in &snapshot.rows {
+            let Some(Value::Int(id)) = key.pkey_value.get("id") else {
+                panic!("an id")
+            };
+            let day = if *id == 4 { 327_416_947_200_000_000 } else { expected[id] };
+            assert_eq!(row.data.get("at"), Some(&Value::Int(expected[id])), "at of {id}");
+            assert_eq!(row.data.get("naive"), Some(&Value::Int(expected[id])), "naive of {id}");
+            assert_eq!(row.data.get("day"), Some(&Value::Int(day)), "day of {id}");
+        }
+        assert_eq!(snapshot.rows.len(), 4);
+
+        let infinite = storage
+            .select(&read(Where::condition("at", ComparisonOperator::EQ, Value::Int(i64::MAX))))
+            .await
+            .expect("a condition on infinity renders");
+        assert_eq!(infinite.rows.len(), 1, "infinity finds its row");
+        let after = storage
+            .select(&read(Where::condition("at", ComparisonOperator::GT, Value::Int(0))))
+            .await
+            .expect("select");
+        assert_eq!(after.rows.len(), 2, "infinity and the year 12345 come after 1970");
+
+        client
+            .batch_execute(&format!(
+                "UPDATE {table} SET at = '-infinity', naive = '4713-01-01 00:00:00 BC' WHERE id = 1;
+                 INSERT INTO {table} VALUES (5, 'infinity', '12345-06-07 08:09:10', '-infinity');"
+            ))
+            .await
+            .expect("changes");
+        let mut images = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while images.len() < 2 {
+            assert!(Instant::now() < deadline, "the feed did not deliver both changes");
+            let batch = stream.poll().await.expect("the feed reads every time");
+            for (write, _) in batch.writes {
+                if let Some(image) = write.new_row_image() {
+                    images.push(image.data.clone());
+                }
+            }
+        }
+        assert_eq!(images[0].get("at"), Some(&Value::Int(i64::MIN)));
+        assert_eq!(images[0].get("naive"), Some(&Value::Int(-210_863_520_000_000_000)));
+        assert_eq!(images[1].get("at"), Some(&Value::Int(i64::MAX)));
+        assert_eq!(images[1].get("naive"), Some(&Value::Int(327_416_976_550_000_000)));
+        assert_eq!(images[1].get("day"), Some(&Value::Int(i64::MIN)));
+        cleanup(&dsn, &client, &names).await;
+    });
+}

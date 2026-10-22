@@ -270,10 +270,15 @@ pub fn select_expr(column: &str, declared: &ValueType) -> String {
     }
 }
 
-/// `expr` as microseconds since the epoch; `extract` is numeric with the
-/// column's full precision, so the rounding to `int8` is exact.
+/// `expr` as microseconds since the epoch, as the change feed reads it
+/// ([`super::text::epoch_micros`]): `extract` is exact at the column's
+/// full precision; `infinity` and `-infinity` are the extreme `int8`s,
+/// and a finite time past what `int8` microseconds count saturates one
+/// short of them, so no time Postgres holds fails the read.
 fn epoch_micros(expr: &str) -> String {
-    format!("(extract(epoch from {expr}) * 1000000)::int8")
+    format!(
+        "CASE WHEN isfinite({expr}) THEN LEAST(GREATEST(extract(epoch from {expr})::numeric * 1000000, -9223372036854775807), 9223372036854775806)::int8 WHEN {expr} > 'epoch' THEN 9223372036854775807 ELSE -9223372036854775808 END"
+    )
 }
 
 /// A column as the SQL its conditions compare it by: the bare column
@@ -304,7 +309,11 @@ fn literal_as(value: &Value, declared: Option<&ValueType>) -> String {
         (Value::Float(micros), Some(ValueType::Timestamp)) if micros.is_finite() => *micros as i64,
         _ => return literal(value),
     };
-    format!("(TIMESTAMP 'epoch' + {micros} * INTERVAL '1 microsecond')")
+    match micros {
+        super::text::INFINITY_MICROS => "TIMESTAMP 'infinity'".to_owned(),
+        super::text::NEG_INFINITY_MICROS => "TIMESTAMP '-infinity'".to_owned(),
+        _ => format!("(TIMESTAMP 'epoch' + {micros} * INTERVAL '1 microsecond')"),
+    }
 }
 
 /// A double-quoted identifier.
@@ -949,9 +958,22 @@ mod tests {
             "{sql}"
         );
         assert!(
-            sql.contains("(extract(epoch from \"createdAt\") * 1000000)::int8"),
+            sql.contains("extract(epoch from \"createdAt\")::numeric * 1000000"),
             "the projection still reads microseconds: {sql}"
         );
+    }
+
+    /// The infinities go both ways: read as the extreme microseconds,
+    /// and a condition on them renders as `infinity` again rather than
+    /// an interval past the end of time.
+    #[test]
+    fn an_infinite_time_reads_and_renders() {
+        let read = select_expr("at", &ValueType::Timestamp);
+        assert!(read.contains("WHEN isfinite(\"at\")"), "{read}");
+        assert!(read.contains("THEN 9223372036854775807 ELSE -9223372036854775808"), "{read}");
+        let timed = Some(&ValueType::Timestamp);
+        assert_eq!(literal_as(&Value::Int(i64::MAX), timed), "TIMESTAMP 'infinity'");
+        assert_eq!(literal_as(&Value::Int(i64::MIN), timed), "TIMESTAMP '-infinity'");
     }
 
     #[test]

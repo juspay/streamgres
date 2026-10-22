@@ -193,46 +193,105 @@ pub fn json_as_jsonb(text: &str) -> String {
     }
 }
 
+/// The microseconds the engine keeps for `infinity`: after every time,
+/// as Postgres orders it, and Postgres's own binary value for it.
+pub const INFINITY_MICROS: i64 = i64::MAX;
+
+/// The microseconds the engine keeps for `-infinity`.
+pub const NEG_INFINITY_MICROS: i64 = i64::MIN;
+
 /// Microseconds since the Unix epoch of a Postgres `timestamp`,
-/// `timestamptz` or `date` in its text form (`2026-09-15 10:00:00.123456`,
-/// with an optional `+05:30` style offset, or `2026-09-15`); a timestamp
-/// without a zone is read as UTC, the protocol's convention. `None` when the text
-/// is not a time (`infinity` included).
+/// `timestamptz` or `date` in its text form: `2026-09-15 10:00:00.123456`,
+/// with an optional `+05:30` (or `+05:53:28`) offset, or `2026-09-15`; a
+/// year past 9999, a trailing ` BC`, and `infinity` / `-infinity`
+/// ([`INFINITY_MICROS`]). A timestamp without a zone is read as UTC, the
+/// protocol's convention. Every time Postgres can hold reads; one past
+/// what the microseconds can count (the last thirty millennia of
+/// Postgres's range) saturates. `None` only for text that is not a
+/// time: the change feed stops on that, so nothing Postgres prints may
+/// land there.
 pub fn epoch_micros(text: &str) -> Option<i64> {
     let text = text.trim();
-    if text.len() == 10 {
-        let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
-        return Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros());
+    match text {
+        "infinity" => return Some(INFINITY_MICROS),
+        "-infinity" => return Some(NEG_INFINITY_MICROS),
+        _ => {}
     }
-    let (naive, offset_seconds) = split_offset(text);
-    let parsed = chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%d %H:%M:%S%.f")
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%d %H:%M:%S"))
-        .or_else(|_| chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%dT%H:%M:%S%.f"))
-        .ok()?;
-    Some(parsed.and_utc().timestamp_micros() - offset_seconds * 1_000_000)
+    let (text, bc) = match text.strip_suffix(" BC") {
+        Some(rest) => (rest, true),
+        None => (text, false),
+    };
+    let (date, time) = match text.split_once([' ', 'T']) {
+        Some((date, time)) => (date, Some(time)),
+        None => (text, None),
+    };
+    let mut parts = date.splitn(3, '-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let year = if bc { 1 - year } else { year };
+    let (seconds, micros, offset) = match time {
+        Some(time) => clock(time)?,
+        None => (0, 0, 0),
+    };
+    let total = i128::from(days_from_civil(year, month, day)) * 86_400_000_000
+        + i128::from(seconds - offset) * 1_000_000
+        + i128::from(micros);
+    Some(total.clamp(i128::from(i64::MIN + 1), i128::from(i64::MAX - 1)) as i64)
 }
 
-/// Split a trailing `+HH`, `+HH:MM` or `+HHMM` zone offset off a timestamp
-/// text, returning the rest and the offset in seconds east of UTC.
-fn split_offset(text: &str) -> (&str, i64) {
-    let Some(position) = text.rfind(['+', '-']) else {
-        return (text, 0);
+/// A time of day with its optional zone offset: seconds into the day,
+/// the fraction in microseconds, and the offset in seconds east of UTC.
+fn clock(text: &str) -> Option<(i64, i64, i64)> {
+    let (time, offset) = match text.find(['+', '-']) {
+        Some(at) => {
+            let (time, zone) = text.split_at(at);
+            let sign = if zone.starts_with('-') { -1 } else { 1 };
+            let mut fields = zone[1..].split(':');
+            let mut offset = 0;
+            for unit in [3600, 60, 1] {
+                match fields.next() {
+                    Some(field) if field.len() == 4 && unit == 3600 => {
+                        offset += field[..2].parse::<i64>().ok()? * 3600
+                            + field[2..].parse::<i64>().ok()? * 60;
+                    }
+                    Some(field) => offset += field.parse::<i64>().ok()? * unit,
+                    None => break,
+                }
+            }
+            (time, sign * offset)
+        }
+        None => (text, 0),
     };
-    if position < 11 {
-        return (text, 0);
+    let (whole, fraction) = time.split_once('.').unwrap_or((time, ""));
+    let mut fields = whole.split(':');
+    let hours: i64 = fields.next()?.parse().ok()?;
+    let minutes: i64 = fields.next()?.parse().ok()?;
+    let seconds: i64 = fields.next()?.parse().ok()?;
+    if fields.next().is_some() || fraction.len() > 6 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
     }
-    let (rest, zone) = text.split_at(position);
-    let sign = if zone.starts_with('-') { -1 } else { 1 };
-    let digits: String = zone[1..].chars().filter(char::is_ascii_digit).collect();
-    let (hours, minutes) = match digits.len() {
-        2 => (digits.parse::<i64>().unwrap_or(0), 0),
-        4 => (
-            digits[..2].parse::<i64>().unwrap_or(0),
-            digits[2..].parse::<i64>().unwrap_or(0),
-        ),
-        _ => return (text, 0),
+    let micros = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<i64>().ok()? * 10_i64.pow(6 - fraction.len() as u32)
     };
-    (rest, sign * (hours * 3600 + minutes * 60))
+    Some((hours * 3600 + minutes * 60 + seconds, micros, offset))
+}
+
+/// Days from 1970-01-01 to a proleptic Gregorian date, astronomical
+/// years (1 BC is year 0), for any year Postgres can hold; Howard
+/// Hinnant's `days_from_civil`.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 /// A JSON array text (what `to_json(column)::text` returns for an array
@@ -361,7 +420,29 @@ mod tests {
         assert_eq!(epoch_micros("1970-01-01 01:00:00+01"), Some(0));
         assert_eq!(epoch_micros("1970-01-01 05:30:00.25+05:30"), Some(250_000));
         assert_eq!(epoch_micros("1970-01-02"), Some(86_400_000_000));
-        assert_eq!(epoch_micros("infinity"), None);
+        assert_eq!(epoch_micros("not a time"), None);
+    }
+
+    /// Every time Postgres prints reads, so the change feed never stops
+    /// on one: the infinities as the extreme microseconds, BC dates, years
+    /// past 9999, offsets with seconds, and the instants either side of
+    /// the epoch; what the microseconds cannot count saturates.
+    #[test]
+    fn every_time_postgres_prints_reads() {
+        assert_eq!(epoch_micros("infinity"), Some(INFINITY_MICROS));
+        assert_eq!(epoch_micros("-infinity"), Some(NEG_INFINITY_MICROS));
+        assert_eq!(epoch_micros("1969-12-31 23:59:59.999999+00"), Some(-1));
+        assert_eq!(epoch_micros("2000-01-01 00:00:00+00"), Some(946_684_800_000_000));
+        assert_eq!(epoch_micros("0001-01-01 00:00:00+00"), Some(-62_135_596_800_000_000));
+        assert_eq!(epoch_micros("0001-12-31 BC"), Some(-62_135_596_800_000_000 - 86_400_000_000));
+        assert_eq!(epoch_micros("4713-01-01 00:00:00+00 BC"), Some(-210_863_520_000_000_000));
+        assert_eq!(epoch_micros("12345-06-07 08:09:10"), Some(327_416_976_550_000_000));
+        assert_eq!(epoch_micros("294276-12-31 23:59:59.999999+00"), Some(i64::MAX - 1));
+        assert_eq!(epoch_micros("1900-01-01 00:00:00+05:53:28"), Some(-2_208_988_800_000_000 - 21_208_000_000));
+        assert_eq!(epoch_micros("2026-10-21T10:00:00.5-0330"), epoch_micros("2026-10-21 13:30:00.5"));
+        for text in ["2026-13-01", "2026-01-01 25:00", "2026-01-01 10:00:00.1234567", "", "x-y-z"] {
+            assert_eq!(epoch_micros(text), None, "{text}");
+        }
     }
 
     /// Array literals split on unquoted commas, unquote, and read NULL.
