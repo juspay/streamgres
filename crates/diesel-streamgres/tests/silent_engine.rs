@@ -262,7 +262,10 @@ fn a_silent_engine_is_taken_for_dead() {
             ..Config::default()
         },
     );
-    thread::sleep(Duration::from_millis(2500));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while fake.accepts().len() < 2 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
     assert!(
         fake.accepts().len() >= 2,
         "{} connections: the silent one was not given up",
