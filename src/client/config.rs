@@ -18,6 +18,7 @@ use crate::sync::pg::{Keepalive, Settings, threads};
 pub struct Secret(pub String);
 
 impl std::fmt::Debug for Secret {
+    /// `Secret(..)`, never the value.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Secret(..)")
     }

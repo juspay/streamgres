@@ -214,7 +214,9 @@ pub fn value_type(data_type: &str, udt_name: &str) -> Option<ValueType> {
 
 /// The engine's type for a scalar Postgres type name (`information_schema`'s
 /// `data_type` or `pg_type`'s name alike); `None` for one the wire cannot
-/// carry.
+/// carry. A `bytea` is the hex text Postgres renders (`\x` and two digits
+/// a byte): what the change feed carries, and what a server-to-server
+/// client turns back into bytes.
 pub fn scalar_type(name: &str) -> Option<ValueType> {
     let name = name.to_ascii_lowercase();
     let name = name.split('(').next().unwrap_or("").trim();
@@ -250,9 +252,6 @@ pub fn scalar_type(name: &str) -> Option<ValueType> {
         | "macaddr"
         | "xml"
         | "tsvector" => ValueType::String,
-        // The hex text Postgres renders (`\x` and two digits a byte): what
-        // the change feed carries, and what a server-to-server client
-        // turns back into bytes.
         "bytea" => ValueType::String,
         _ => return None,
     })

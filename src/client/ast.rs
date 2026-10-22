@@ -623,7 +623,8 @@ fn time_condition(column: &str, op: ComparisonOperator, literal: &Json) -> Resul
 /// A JSON literal as the value a column of type `declared` compares
 /// against. A JSON column's cells are the text `jsonb` writes, so a literal
 /// against one, whatever its kind, is that text: the string `x` is `"x"`,
-/// a number its digits, an object its canonical form.
+/// a number its digits, an object its canonical form. A time literal is
+/// the protocol's milliseconds, kept as microseconds.
 fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> {
     Ok(match (literal, declared) {
         (Json::Null, _) => Value::Null,
@@ -636,7 +637,6 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
             Value::Float(number.as_f64().unwrap_or(f64::NAN))
         }
         (Json::Number(number), ValueType::String) => Value::String(number.to_string()),
-        // The protocol's milliseconds, kept as microseconds.
         (Json::Number(number), ValueType::Timestamp) => match number.as_i64() {
             Some(millis) => Value::Int(millis.saturating_mul(1000)),
             None => Value::Float(number.as_f64().unwrap_or(f64::NAN) * 1000.0),
@@ -1069,13 +1069,14 @@ mod tests {
         assert!(!holds(&next_page, &late) && !holds(&next_page, &after));
     }
 
+    /// A cursor compares on the prefix of the order it names, its
+    /// milliseconds kept as microseconds.
     #[test]
     fn cursors_compare_on_their_prefix() {
         let ast: Ast = serde_json::from_str(r#"{"table": "messages", "orderBy": [["createdAt", "desc"]], "start": {"row": {"createdAt": 1000}, "exclusive": true}, "limit": 5}"#).unwrap();
         let translated = translate(&ast, &catalog()).unwrap();
         assert_eq!(
             translated.query.main_table.filter,
-            // The cursor's milliseconds, kept as microseconds.
             Where::condition("createdAt", LT, Value::Int(1_000_000))
         );
         let empty: Ast = serde_json::from_str(r#"{"table": "messages", "orderBy": [["createdAt", "desc"]], "start": {"row": {"other": 1}, "exclusive": true}}"#).unwrap();

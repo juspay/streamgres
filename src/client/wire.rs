@@ -78,8 +78,8 @@ pub fn write_del(out: &mut Vec<u8>, table: &str, key: &DataFrameKey, declared: O
 }
 
 /// Append one cell as JSON, in the light of its declared type: a JSON
-/// column's text is embedded as it is when it parses, a time as its
-/// milliseconds, a list item by item.
+/// column's text is embedded as it is when it parses, a time (kept as
+/// microseconds) as its milliseconds, a list item by item.
 pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType>) {
     match value {
         Value::Null => out.extend_from_slice(b"null"),
@@ -91,8 +91,6 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
             }
             _ => write_text(out, text),
         },
-        // A time is kept as microseconds; the protocol's unit is
-        // milliseconds.
         Value::Int(int) if matches!(declared, Some(ValueType::Timestamp)) => {
             let _ = write!(out, "{}", int.div_euclid(1000));
         }
@@ -438,7 +436,8 @@ mod tests {
     }
 
     /// JSON columns are embedded, times are numbers, and the client's
-    /// schema filters the columns.
+    /// schema filters the columns. Keys are escaped, and a key column
+    /// that is a time goes out in milliseconds too.
     #[test]
     fn rows_serialize_for_the_client() {
         let table = DbTable::new(
@@ -486,7 +485,6 @@ mod tests {
         let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(written["id"]["id"], "a\"b", "keys are escaped");
 
-        // A key column that is a time goes out in milliseconds too.
         let timed = DbTable::new(
             "timed",
             ["at"],

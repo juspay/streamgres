@@ -157,11 +157,11 @@ pub struct Projected {
 /// An `ORDER BY` on a column Postgres orders differently from the
 /// engine (an enum, a string under a linguistic collation, JSON) is
 /// refused: the engine would keep, and the backend return, other rows
-/// in another order ([`Catalog::orders_as_engine`]).
+/// in another order ([`Catalog::orders_as_engine`]). An enum label
+/// travels in the binary format as its text, under the enum's own OID,
+/// which the catalog names; an array of enums likewise, under the
+/// array's OID.
 pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result<Select, ParseError> {
-    // An enum label travels in the binary format as its text, under the
-    // enum's own OID; the catalog says which OIDs those are. Arrays of
-    // enums likewise, under the array's OID.
     let binds: Vec<BindValue> = binds
         .iter()
         .map(|bind| match (catalog.is_enum_oid(bind.type_oid), bind.bytes.as_deref()) {
@@ -640,8 +640,9 @@ impl Parser<'_> {
         })
     }
 
-    /// A column name, validated to exist on `table`.
-    /// Dispatch on the leading keyword to a read or a write.
+    /// Dispatch on the leading keyword to a read or a write. A join or
+    /// an `OFFSET` is refused here: only a server-to-server client,
+    /// through [`parse_select`], skips rows itself.
     fn query(&mut self, catalog: &Catalog) -> Result<ParsedQuery, ParseError> {
         if self.is_word("SELECT") {
             let select = self.select(catalog)?;
@@ -649,7 +650,6 @@ impl Parser<'_> {
                 return self.err("a join parses through `parse_select`, not `parse`");
             }
             if select.offset > 0 {
-                // Only a server-to-server client skips rows itself.
                 return self.err("OFFSET is not supported");
             }
             Ok(ParsedQuery::Read(select.query.main_table))
@@ -663,12 +663,6 @@ impl Parser<'_> {
         }
     }
 
-    /// `SELECT * FROM …` with optional WHERE / ORDER BY / LIMIT.
-    ///
-    /// A missing WHERE subscribes to the whole table (the vacuously true
-    /// `AND(vec![])`). A missing ORDER BY defaults via [`default_order`],
-    /// and a missing LIMIT becomes `u32::MAX` — the model makes `limit`
-    /// mandatory, so absent means "no bound".
     /// Advances past the projection without reading it, up to `FROM`.
     fn skip_projection(&mut self) -> Result<(), ParseError> {
         let mut depth = 0usize;
@@ -697,6 +691,7 @@ impl Parser<'_> {
         Ok(None)
     }
 
+    /// `FROM` is next.
     fn expect_from(&mut self) -> Result<(), ParseError> {
         if self.is_word("FROM") {
             Ok(())
@@ -705,6 +700,7 @@ impl Parser<'_> {
         }
     }
 
+    /// `INSERT`, `UPDATE` or `DELETE` to the end of the statement.
     fn write(&mut self, catalog: &Catalog) -> Result<WriteQuery, ParseError> {
         if self.eat_word("INSERT") {
             self.expect_word("INTO")?;
@@ -903,7 +899,8 @@ impl Parser<'_> {
     /// A parenthesised filter, a `TRUE` / `FALSE` literal, or one condition.
     ///
     /// `TRUE` / `FALSE` parse to the identities: an empty `AND` is true, an
-    /// empty `OR` is false.
+    /// empty `OR` is false. `= ANY($1)` with an array parameter is how
+    /// ORMs render an `IN` list: one bind, many values.
     fn primary(&mut self, table: &DbTable) -> Result<Where, ParseError> {
         if self.eat_sym("(") {
             self.descend()?;
@@ -939,8 +936,6 @@ impl Parser<'_> {
             }));
         }
         let comparison_operator = if self.eat_sym("=") {
-            // `= ANY($1)` with an array parameter is how ORMs render an
-            // `IN` list: one bind, many values.
             if self.eat_word("ANY") {
                 return Ok(Where::Condition(Condition {
                     column,
@@ -1221,7 +1216,6 @@ fn coerce_to_type(
         (value @ Value::Float(_), ValueType::Float) => value,
         (value @ Value::String(_), ValueType::String) => value,
         (value @ Value::Bool(_), ValueType::Bool) => value,
-        // The engine keeps a time as microseconds.
         (Value::Int(int), ValueType::Timestamp) => Value::Int(match times {
             TimeUnit::Millis => int.saturating_mul(1000),
             TimeUnit::Micros => int,
@@ -1315,6 +1309,7 @@ mod tests {
     use super::*;
     use crate::model::{DbColumn, ValueType};
 
+    /// A `text` bind.
     fn text_bind(text: &str) -> BindValue {
         BindValue {
             type_oid: 25,
@@ -1322,6 +1317,7 @@ mod tests {
         }
     }
 
+    /// An `int8` bind.
     fn int8_bind(value: i64) -> BindValue {
         BindValue {
             type_oid: 20,
@@ -1329,6 +1325,7 @@ mod tests {
         }
     }
 
+    /// An `int4` bind.
     fn int4_bind(value: i32) -> BindValue {
         BindValue {
             type_oid: 23,
@@ -1336,10 +1333,11 @@ mod tests {
         }
     }
 
+    /// What Diesel renders for
+    /// `tickets.filter(status.eq("OPEN")).filter(points.gt(3)).order(id.desc()).first()`
+    /// parses as its literal twin does.
     #[test]
     fn a_diesel_query_parses_like_its_literal_twin() {
-        // What Diesel renders for
-        // tickets.filter(status.eq("OPEN")).filter(points.gt(3)).order(id.desc()).first()
         let diesel = r#"SELECT "tickets"."id", "tickets"."status", "tickets"."priority", "tickets"."points" FROM "tickets" WHERE (("tickets"."status" = $1) AND ("tickets"."points" > $2)) ORDER BY "tickets"."id" DESC LIMIT $3"#;
         let bound = parse_read_with_binds(
             diesel,
@@ -1355,6 +1353,8 @@ mod tests {
         assert_eq!(bound, literal);
     }
 
+    /// `parse_select` says what is selected: every column, a count under
+    /// its name, or the columns under their aliases.
     #[test]
     fn parse_select_tells_what_is_selected() {
         let all = parse_select("SELECT * FROM tickets", &[], &catalog()).unwrap().projection;
@@ -1388,6 +1388,8 @@ mod tests {
         assert!(parse_select("UPDATE tickets SET status = 'x' WHERE id = 1", &[], &catalog()).is_err());
     }
 
+    /// A projection may alias its columns, with or without `AS`; a
+    /// literal where a column list belongs is refused.
     #[test]
     fn projected_columns_may_be_aliased() {
         let aliased = parse_read(
@@ -1402,6 +1404,7 @@ mod tests {
         assert!(junk.message.contains("expected FROM"), "{}", junk.message);
     }
 
+    /// Authors, their books, and the books' reviews.
     fn join_catalog() -> Catalog {
         Catalog::new(vec![
             DbTable::new(
@@ -1433,17 +1436,17 @@ mod tests {
         ])
     }
 
+    /// `authors.inner_join(books).order((authors::id, books::id))`: the
+    /// backend composes books under each author by their key, so the
+    /// clause is met and dropped from the tree's order. A joined table
+    /// orders only by its key, only ascending, only after the root's
+    /// columns.
     #[test]
     fn a_joined_tables_primary_key_may_order_it() {
-        // tickets.inner_join(comments).order((tickets::id, comments::id)):
-        // the backend composes comments under each ticket by their key,
-        // so the clause is met and dropped from the tree's order.
         let sql = r#"SELECT "authors"."id", "books"."title" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) WHERE ("authors"."id" = $1) ORDER BY "authors"."id" ASC, "books"."id" ASC"#;
         let select = parse_select(sql, &[int8_bind(1)], &join_catalog()).expect("ordered by the child's key");
         let order: Vec<&str> = select.query.main_table.order_by.iter().map(|clause| clause.column.as_str()).collect();
         assert_eq!(order, vec!["id"], "only the root's order reaches the tree");
-
-        // Only the key, only ascending, only after the root's columns.
         for (sql, expect) in [
             (
                 r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) ORDER BY "books"."title""#,
@@ -1533,10 +1536,15 @@ mod tests {
             .expect("a number");
     }
 
+    /// Diesel's joins become the engine's tree:
+    /// `authors.inner_join(books).filter(authors::name.eq("x")).order(authors::id.desc()).limit(5)`;
+    /// `authors.left_join(books)`; `authors.inner_join(books.inner_join(reviews))`
+    /// in nested parentheses; an explicit `ON` with a condition on the
+    /// joined table, which filters it; and an inner join's `WHERE`
+    /// conjuncts, which go to the table they name.
     #[test]
     fn diesel_joins_become_the_engines_tree() {
         use crate::model::{Driver, Join};
-        // authors.inner_join(books).filter(authors::name.eq("x")).order(authors::id.desc()).limit(5)
         let sql = r#"SELECT "authors"."id", "books"."title" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) WHERE ("authors"."name" = $1) ORDER BY "authors"."id" DESC LIMIT $2"#;
         let select = parse_select(sql, &[text_bind("x"), int8_bind(5)], &join_catalog()).expect("inner join");
         let root = &select.query.main_table;
@@ -1567,7 +1575,6 @@ mod tests {
             ])
         );
 
-        // authors.left_join(books)
         let left = parse_select(
             r#"SELECT "authors"."name", "books"."title" FROM ("authors" LEFT OUTER JOIN "books" ON ("books"."author_id" = "authors"."id"))"#,
             &[],
@@ -1577,7 +1584,6 @@ mod tests {
         assert!(!left.query.joins[0].is_inner);
         assert_eq!(left.query.joins[0].driver, Driver::Main);
 
-        // authors.inner_join(books.inner_join(reviews)): nested parens
         let three = parse_select(
             r#"SELECT "authors"."name", "reviews"."stars" FROM ("authors" INNER JOIN ("books" INNER JOIN "reviews" ON ("reviews"."book_id" = "books"."id")) ON ("books"."author_id" = "authors"."id"))"#,
             &[],
@@ -1590,7 +1596,6 @@ mod tests {
         assert_eq!(reviews.sub.main_table.table.as_str(), "reviews");
         assert_eq!((reviews.main_table_column.as_str(), reviews.sub_table_column.as_str()), ("id", "book_id"));
 
-        // an explicit ON with a condition on the joined table: it filters books
         let explicit = parse_select(
             r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON (("books"."author_id" = "authors"."id") AND ("books"."title" = $1)))"#,
             &[text_bind("t")],
@@ -1606,7 +1611,6 @@ mod tests {
             })
         );
 
-        // WHERE conjuncts go to the table they name, for an inner join
         let split = parse_select(
             r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) WHERE (("books"."title" = $1) AND ("authors"."name" = $2))"#,
             &[text_bind("t"), text_bind("a")],
@@ -1617,6 +1621,8 @@ mod tests {
         assert!(matches!(split.query.joins[0].sub.main_table.filter, Where::Condition(Condition { ref column, .. }) if column.as_str() == "title"));
     }
 
+    /// Each join shape the engine cannot follow is refused with its
+    /// reason.
     #[test]
     fn join_shapes_the_engine_cannot_follow_are_named() {
         let catalog = join_catalog();
@@ -1654,9 +1660,10 @@ mod tests {
         );
     }
 
+    /// A `text[]` of `["OPEN", "DONE"]`, as Diesel binds `eq_any`, makes
+    /// `= ANY` an `IN` list.
     #[test]
     fn eq_any_with_an_array_bind_is_an_in_list() {
-        // text[] of ["OPEN", "DONE"] as Diesel binds `eq_any`.
         let mut bytes = Vec::new();
         for word in [1i32, 0, 25, 2, 1] {
             bytes.extend_from_slice(&word.to_be_bytes());
@@ -1733,6 +1740,8 @@ mod tests {
         );
     }
 
+    /// A `COUNT(*)` with an `IN` list of binds reads as the list of
+    /// literals does.
     #[test]
     fn a_count_and_an_in_list_of_binds() {
         let count = parse_read_with_binds(
@@ -1749,10 +1758,10 @@ mod tests {
         assert_eq!(count, literal);
     }
 
+    /// Reads keep a literal as spelled and compare by equality folding; a
+    /// bind is decoded by its OID and kept the same way, `NULL` included.
     #[test]
     fn a_bind_takes_the_value_its_literal_would() {
-        // Reads keep a literal as spelled and compare by equality folding;
-        // a bind is decoded by its OID and kept the same way.
         let q = parse_read_with_binds(
             r#"SELECT * FROM "tickets" WHERE "tickets"."points" = $1"#,
             &[int8_bind(7)],
@@ -1785,6 +1794,8 @@ mod tests {
         ));
     }
 
+    /// A bind or a projection that cannot be read is refused with its
+    /// reason.
     #[test]
     fn bind_and_projection_mistakes_are_named() {
         let missing = parse_read_with_binds(
@@ -1833,6 +1844,7 @@ mod tests {
         assert!(null_limit.message.contains("limit parameter"), "{}", null_limit.message);
     }
 
+    /// A quoted identifier keeps its case, spaces and doubled quotes.
     #[test]
     fn quoted_identifiers_keep_their_case_and_escapes() {
         let catalog = Catalog::new(vec![DbTable::new(
@@ -2320,10 +2332,28 @@ mod s2s_shapes {
     use super::*;
     use crate::model::Value;
 
+    /// The parser tests' catalog.
     fn catalog() -> Catalog {
         super::tests::catalog()
     }
 
+    /// A one-dimensional array of `labels`, no nulls, lower bound 1,
+    /// under element type `element`: the binary format Diesel sends.
+    fn label_array(element: i32, labels: &[&str]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for word in [1, 0, element, labels.len() as i32, 1] {
+            bytes.extend(word.to_be_bytes());
+        }
+        for label in labels {
+            bytes.extend((label.len() as i32).to_be_bytes());
+            bytes.extend(label.as_bytes());
+        }
+        bytes
+    }
+
+    /// An `OFFSET` widens the tree's limit to `limit + offset` and
+    /// travels beside it for the client to skip; with no `LIMIT` the
+    /// tree has none.
     #[test]
     fn an_offset_widens_the_limit_and_travels_separately() {
         let select = parse_select(
@@ -2349,6 +2379,10 @@ mod s2s_shapes {
         assert_eq!(no_limit.offset, 5);
     }
 
+    /// An enum bind is read as its label once the catalog knows its OID,
+    /// and refused before. An array of labels under the enum's array OID
+    /// carries the enum's own OID as its element type, as Diesel sends
+    /// it.
     #[test]
     fn an_enum_bind_is_its_label() {
         let catalog = catalog().with_enum_oids([777, 778]);
@@ -2363,8 +2397,6 @@ mod s2s_shapes {
         .expect("an enum bind");
         let shown = format!("{:?}", select.query.main_table.filter);
         assert!(shown.contains("open"), "{shown}");
-
-        // The same bind without the catalog knowing the OID is refused.
         let unknown = parse_select(
             r#"SELECT * FROM "tickets" WHERE "tickets"."status" = $1"#,
             &[BindValue {
@@ -2375,18 +2407,7 @@ mod s2s_shapes {
         )
         .expect_err("an unknown oid");
         assert!(unknown.message.contains("oid 777"), "{}", unknown.message);
-
-        // An array of enum labels under the enum's array OID.
-        let mut bytes = Vec::new();
-        bytes.extend(1i32.to_be_bytes()); // one dimension
-        bytes.extend(0i32.to_be_bytes()); // no nulls
-        bytes.extend(777i32.to_be_bytes()); // element oid: the enum's own, as Diesel sends it
-        bytes.extend(2i32.to_be_bytes()); // two elements
-        bytes.extend(1i32.to_be_bytes()); // lower bound
-        for label in ["open", "done"] {
-            bytes.extend((label.len() as i32).to_be_bytes());
-            bytes.extend(label.as_bytes());
-        }
+        let bytes = label_array(777, &["open", "done"]);
         let any = parse_select(
             r#"SELECT * FROM "tickets" WHERE "tickets"."status" = ANY($1)"#,
             &[BindValue {
@@ -2401,6 +2422,7 @@ mod s2s_shapes {
         let _ = Value::Null;
     }
 
+    /// An infinite time has no microsecond value: refused, not wrapped.
     #[test]
     fn an_infinite_time_bind_is_refused_not_wrapped() {
         let catalog = catalog();
@@ -2422,6 +2444,8 @@ mod s2s_shapes {
         }
     }
 
+    /// A `LIMIT` and `OFFSET` whose sum would reach the no-limit value
+    /// are refused rather than registering an unbounded query.
     #[test]
     fn a_limit_and_offset_that_saturate_are_refused() {
         let catalog = catalog();

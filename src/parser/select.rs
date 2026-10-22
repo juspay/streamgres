@@ -74,15 +74,15 @@ struct Ref {
 }
 
 impl Parser<'_> {
-    /// `SELECT` to the end of the statement.
+    /// `SELECT` to the end of the statement. The projection is read once
+    /// the `FROM` is known, so its columns can be checked; the engine
+    /// follows whole rows whatever is selected, so what it names is
+    /// validated and kept for the client.
     pub(super) fn select(&mut self, catalog: &Catalog) -> Result<Select, ParseError> {
         self.expect_word("SELECT")?;
         if self.is_word("DISTINCT") {
             return self.err("DISTINCT is not supported");
         }
-        // The projection is read once the FROM is known, so its columns
-        // can be checked; the engine follows whole rows whatever is
-        // selected, so what it names is validated and kept for the client.
         let projection_at = self.pos;
         self.skip_projection()?;
         self.expect_word("FROM")?;
@@ -386,6 +386,9 @@ impl Parser<'_> {
         Ok(terms)
     }
 
+    /// One term of an `ON`, appended to `terms`: in parentheses, either
+    /// one equality or a nested `AND` of terms; bare, an equality
+    /// between tables or a condition on one table.
     fn on_term(
         &mut self,
         nodes: &[Node<'_>],
@@ -394,7 +397,6 @@ impl Parser<'_> {
     ) -> Result<(), ParseError> {
         if self.eat_sym("(") {
             self.descend()?;
-            // Either a nested AND of terms, or one condition in parens.
             let before = self.pos;
             if let Ok(column) = self.column_ref(nodes, scope)
                 && self.eat_sym("=")
@@ -437,7 +439,8 @@ impl Parser<'_> {
 
     /// A filter whose conditions may name different tables, as a list of
     /// (table, filter) pairs: an `AND` of parts naming different tables
-    /// splits, an `OR` must stay within one table.
+    /// splits, an `OR` must stay within one table: each alternative must
+    /// collapse to one table, the same one.
     fn scoped_filter(
         &mut self,
         nodes: &[Node<'_>],
@@ -451,7 +454,6 @@ impl Parser<'_> {
         if alternatives.len() == 1 {
             return Ok(alternatives.pop().expect("one"));
         }
-        // Each alternative must collapse to one table, the same one.
         let mut node = None;
         let mut parts = Vec::new();
         for alternative in alternatives {
@@ -468,6 +470,7 @@ impl Parser<'_> {
         Ok(vec![(node.expect("at least one"), collapse(parts, Where::OR))])
     }
 
+    /// An `AND` of scoped primaries, as (table, filter) pairs.
     fn scoped_conjunct(
         &mut self,
         nodes: &[Node<'_>],
@@ -646,8 +649,11 @@ impl Parser<'_> {
     }
 }
 
+/// One term of an `ON`.
 enum OnTerm {
+    /// A column of one table equal to a column of another: the join key.
     Equality(Ref, Ref),
+    /// A condition on one table, which filters it.
     Condition(usize, Where),
 }
 
@@ -703,6 +709,7 @@ fn build(nodes: &[Node<'_>], index: usize, order_by: Vec<OrderBy>, limit: u32) -
 /// them: the tables depth first from the root, as the tree's joins are
 /// built, each table's key columns in turn.
 fn composition<'n>(nodes: &'n [Node<'_>]) -> Vec<(usize, &'n ColumnName)> {
+    /// Appends the key columns of the tables under `index`, depth first.
     fn walk<'n>(nodes: &'n [Node<'_>], index: usize, out: &mut Vec<(usize, &'n ColumnName)>) {
         for (child, _, _, _) in &nodes[index].edges {
             out.extend(nodes[*child].table.pkey.iter().map(|key| (*child, key)));

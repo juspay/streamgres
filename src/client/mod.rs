@@ -111,7 +111,10 @@ async fn join_worker(
 }
 
 /// Run the server with `config` until ctrl-c; returns the reason it could
-/// not start.
+/// not start. The engine feeds one consumer per group thread and one for
+/// the server-to-server endpoint, the last sink. Tasks are named for
+/// `tokio-console` when the runtime is built with `--cfg tokio_unstable`,
+/// and spawned plainly otherwise.
 pub fn serve(config: Config) -> Result<(), String> {
     log::set_level(config.log);
     log::set_format(config.log_format);
@@ -164,8 +167,6 @@ pub fn serve(config: Config) -> Result<(), String> {
                     &settings,
                     engine_catalog,
                     reads_handle,
-                    // One consumer per group thread, and one for the
-                    // server-to-server endpoint (the last sink).
                     shards + 1,
                     engine_stats,
                     engine_shutdown.clone(),
@@ -301,8 +302,6 @@ pub fn serve(config: Config) -> Result<(), String> {
         ready.clone(),
         config.s2s_connection_subscriptions,
     );
-    // Named for `tokio-console` when the runtime is built with
-    // `--cfg tokio_unstable`; a plain spawn otherwise.
     #[cfg(tokio_unstable)]
     tokio::task::Builder::new()
         .name("s2s")

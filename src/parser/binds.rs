@@ -75,6 +75,12 @@ pub fn looks_like_array(bytes: &[u8]) -> bool {
 }
 
 /// The value a bind stands for, or why it cannot stand for one.
+///
+/// Binary `jsonb` is a version byte followed by the text. A time is
+/// microseconds since 2000-01-01, and the engine keeps microseconds
+/// since the Unix epoch; `infinity` is `i64::MAX` and `-infinity`
+/// `i64::MIN` (for a date, `i32`'s), which fit no shift and which no
+/// cache can compare on, so they are refused.
 pub fn decode(bind: &BindValue) -> Result<Value, String> {
     let Some(bytes) = bind.bytes.as_deref() else {
         return Ok(Value::Null);
@@ -102,7 +108,6 @@ pub fn decode(bind: &BindValue) -> Result<Value, String> {
         }
         oid::JSON => Value::String(json_as_jsonb(utf8(bytes, bind.type_oid)?)),
         oid::JSONB => {
-            // Binary jsonb is a version byte followed by the text.
             let text = bytes
                 .split_first()
                 .filter(|(version, _)| **version == 1)
@@ -123,10 +128,6 @@ pub fn decode(bind: &BindValue) -> Result<Value, String> {
             ))
         }
         oid::TIMESTAMP | oid::TIMESTAMPTZ => {
-            // Microseconds since 2000-01-01; the engine keeps microseconds
-            // since the Unix epoch. `infinity` is i64::MAX, `-infinity`
-            // i64::MIN: neither fits the shift, and neither can be
-            // compared on by a cache.
             let micros = i64::from_be_bytes(bytes_of(8)?.try_into().unwrap());
             if micros == i64::MAX || micros == i64::MIN {
                 return Err("an infinite time bind".to_string());
@@ -277,12 +278,19 @@ fn array(bytes: &[u8], element_oid: u32) -> Result<Vec<Value>, String> {
     Ok(items)
 }
 
+/// The bytes as text, or why they are not.
 fn utf8(bytes: &[u8], type_oid: u32) -> Result<&str, String> {
     std::str::from_utf8(bytes).map_err(|_| format!("a bind of type oid {type_oid} is not UTF-8"))
 }
 
 /// Postgres's binary `numeric`: a header of base-10000 digit count,
 /// weight, sign and scale, then the digits.
+///
+/// The digits are rendered as text and the float parser does the
+/// rounding, which keeps every representable value exact. `weight` is
+/// the power of 10000 of the first group: zero or more means that many
+/// integer groups follow it, negative means every group is fractional
+/// and `-weight - 1` empty groups precede the first.
 fn numeric(bytes: &[u8]) -> Result<f64, String> {
     if bytes.len() < 8 {
         return Err("a numeric bind is shorter than its header".to_string());
@@ -301,11 +309,6 @@ fn numeric(bytes: &[u8]) -> Result<f64, String> {
         0xC000 => return Ok(f64::NAN),
         _ => return Err("a numeric bind has an unknown sign".to_string()),
     };
-    // Render the digits as text and let the float parser do the rounding,
-    // which keeps every representable value exact. `weight` is the power
-    // of 10000 of the first group: zero or more means that many integer
-    // groups follow it, negative means every group is fractional and
-    // `-weight - 1` empty groups precede the first.
     let group = |index: usize| word(8 + 2 * index);
     let mut text = String::new();
     if ndigits == 0 {
@@ -343,6 +346,7 @@ fn numeric(bytes: &[u8]) -> Result<f64, String> {
 mod tests {
     use super::*;
 
+    /// A bind of `type_oid` holding `bytes`.
     fn bind(type_oid: u32, bytes: &[u8]) -> BindValue {
         BindValue {
             type_oid,
@@ -350,6 +354,7 @@ mod tests {
         }
     }
 
+    /// Integers, floats and booleans take their Postgres widths.
     #[test]
     fn integers_floats_and_bools() {
         assert_eq!(decode(&bind(oid::INT2, &(-7i16).to_be_bytes())), Ok(Value::Int(-7)));
@@ -364,6 +369,7 @@ mod tests {
         assert_eq!(decode(&bind(oid::BOOL, &[0])), Ok(Value::Bool(false)));
     }
 
+    /// Text-like types are UTF-8, and a UUID is its hyphenated hex.
     #[test]
     fn text_like_types_and_uuids() {
         assert_eq!(
@@ -385,6 +391,8 @@ mod tests {
         assert!(decode(&bind(oid::TEXT, &[0xff])).is_err());
     }
 
+    /// JSON is normalised as a `jsonb` cell is; a `jsonb` bind needs its
+    /// version byte.
     #[test]
     fn json_is_normalised_like_a_jsonb_cell() {
         assert_eq!(
@@ -400,9 +408,10 @@ mod tests {
         assert!(decode(&bind(oid::JSONB, b"{}")).is_err(), "no version byte");
     }
 
+    /// Times and dates become microseconds since the Unix epoch:
+    /// 2000-01-01 00:00:01.5 is 1,500,000 Postgres microseconds.
     #[test]
     fn times_become_unix_microseconds() {
-        // 2000-01-01 00:00:01.5 as Postgres micros.
         let micros = 1_500_000i64;
         assert_eq!(
             decode(&bind(oid::TIMESTAMPTZ, &micros.to_be_bytes())),
@@ -418,41 +427,34 @@ mod tests {
         );
     }
 
+    /// `numeric` digit groups render to the value they spell:
+    /// `12345.678` is digits `[1, 2345, 6780]`, weight 1, positive,
+    /// scale 3; `-0.0042` is `[42]`, weight -1, negative, scale 4; `0`
+    /// has no digits; `70000` is `[7]`, weight 1.
     #[test]
     fn numerics_render_through_their_digit_groups() {
-        // 12345.678: digits [1, 2345, 6780], weight 1, positive, scale 3.
-        let mut bytes = Vec::new();
-        for word in [3u16, 1, 0, 3, 1, 2345, 6780] {
-            bytes.extend_from_slice(&word.to_be_bytes());
+        let numeric = |words: &[u16]| -> Vec<u8> {
+            words.iter().flat_map(|word| word.to_be_bytes()).collect()
+        };
+        for (words, value) in [
+            (&[3u16, 1, 0, 3, 1, 2345, 6780][..], 12345.678),
+            (&[1, 0xffff, 0x4000, 4, 42][..], -0.0042),
+            (&[0, 0, 0, 0][..], 0.0),
+            (&[1, 1, 0, 0, 7][..], 70000.0),
+        ] {
+            assert_eq!(decode(&bind(oid::NUMERIC, &numeric(words))), Ok(Value::Float(value)));
         }
-        assert_eq!(decode(&bind(oid::NUMERIC, &bytes)), Ok(Value::Float(12345.678)));
-        // -0.0042: digits [42], weight -1, negative, scale 4.
-        let mut bytes = Vec::new();
-        for word in [1u16, 0xffff, 0x4000, 4, 42] {
-            bytes.extend_from_slice(&word.to_be_bytes());
-        }
-        assert_eq!(decode(&bind(oid::NUMERIC, &bytes)), Ok(Value::Float(-0.0042)));
-        // 0: no digits.
-        let mut bytes = Vec::new();
-        for word in [0u16, 0, 0, 0] {
-            bytes.extend_from_slice(&word.to_be_bytes());
-        }
-        assert_eq!(decode(&bind(oid::NUMERIC, &bytes)), Ok(Value::Float(0.0)));
-        // 70000: digits [7], weight 1.
-        let mut bytes = Vec::new();
-        for word in [1u16, 1, 0, 0, 7] {
-            bytes.extend_from_slice(&word.to_be_bytes());
-        }
-        assert_eq!(decode(&bind(oid::NUMERIC, &bytes)), Ok(Value::Float(70000.0)));
     }
 
+    /// Arrays become lists: a `text[]` of `["OPEN", NULL, "DONE"]`, an
+    /// `int8[]` of `[7]`, and an empty array, which has zero dimensions.
+    /// A header cut short is refused.
     #[test]
     fn arrays_become_lists() {
-        // text[] of ["OPEN", NULL, "DONE"]
-        let mut bytes = Vec::new();
-        for word in [1i32, 1, 25, 3, 1] {
-            bytes.extend_from_slice(&word.to_be_bytes());
-        }
+        let header = |words: &[i32]| -> Vec<u8> {
+            words.iter().flat_map(|word| word.to_be_bytes()).collect()
+        };
+        let mut bytes = header(&[1, 1, 25, 3, 1]);
         bytes.extend_from_slice(&4i32.to_be_bytes());
         bytes.extend_from_slice(b"OPEN");
         bytes.extend_from_slice(&(-1i32).to_be_bytes());
@@ -466,19 +468,13 @@ mod tests {
                 Value::String("DONE".into())
             ]))
         );
-        // int8[] of [7]
-        let mut bytes = Vec::new();
-        for word in [1i32, 0, 20, 1, 1, 8] {
-            bytes.extend_from_slice(&word.to_be_bytes());
-        }
+        let mut bytes = header(&[1, 0, 20, 1, 1, 8]);
         bytes.extend_from_slice(&7i64.to_be_bytes());
         assert_eq!(decode(&bind(oid::INT8_ARRAY, &bytes)), Ok(Value::List(vec![Value::Int(7)])));
-        // an empty array: zero dimensions
-        let mut bytes = Vec::new();
-        for word in [0i32, 0, 25] {
-            bytes.extend_from_slice(&word.to_be_bytes());
-        }
-        assert_eq!(decode(&bind(oid::TEXT_ARRAY, &bytes)), Ok(Value::List(vec![])));
+        assert_eq!(
+            decode(&bind(oid::TEXT_ARRAY, &header(&[0, 0, 25]))),
+            Ok(Value::List(vec![]))
+        );
         assert!(decode(&bind(oid::TEXT_ARRAY, &[0, 0, 0, 2])).is_err());
     }
 
@@ -506,6 +502,8 @@ mod tests {
         );
     }
 
+    /// A missing value is `NULL`; an unknown type, a `bytea` and a wrong
+    /// width are refused.
     #[test]
     fn nulls_and_unknown_types() {
         assert_eq!(
