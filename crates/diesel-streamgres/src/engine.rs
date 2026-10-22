@@ -69,7 +69,7 @@ use tokio_tungstenite::tungstenite::handshake::client::Request;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
-use crate::cache::{Cache, Live};
+use crate::cache::{Cache, Database, Live};
 use crate::key::QueryKey;
 use crate::row::OwnedRow;
 use crate::materialized::{Materialized, Snapshot};
@@ -253,8 +253,9 @@ impl Shared {
     }
 
     /// The reasons this client refuses on its own, all of which pass.
-    const TRANSIENT: [&'static str; 8] = [
+    const TRANSIENT: [&'static str; 9] = [
         crate::subscriptions::STALE_TYPES,
+        "the engine has not said which database it streams",
         "the engine is not connected",
         "the engine client has stopped",
         "the engine did not answer in time",
@@ -386,6 +387,18 @@ impl Live for LiveStore {
     }
 }
 
+/// What an engine's `hello` said of the database it streams.
+#[derive(Debug, Clone, PartialEq)]
+enum Greeting {
+    /// No `hello` on this socket yet.
+    Waiting,
+    /// A `hello` that names no database: an engine from before it did,
+    /// or one that could not read it. Its rows are taken on trust.
+    Unnamed,
+    /// The database the engine streams.
+    Named(Database),
+}
+
 /// One socket to the engine and the subscriptions it carries.
 struct Worker {
     index: usize,
@@ -403,6 +416,8 @@ struct Worker {
     room: AtomicUsize,
     /// Why the latest attempt to connect failed, until one succeeds.
     connect_error: Mutex<Option<String>>,
+    /// What the engine on the socket said it streams, from its `hello`.
+    greeting: Mutex<Greeting>,
     state: Mutex<WorkerState>,
     shared: Arc<Shared>,
 }
@@ -736,6 +751,7 @@ impl Worker {
             held: AtomicUsize::new(0),
             room: AtomicUsize::new(0),
             connect_error: Mutex::new(None),
+            greeting: Mutex::new(Greeting::Waiting),
             state: Mutex::new(WorkerState {
                 next_id: 1,
                 by_key: HashMap::new(),
@@ -770,6 +786,23 @@ impl Worker {
         worker
     }
 
+    /// Why this socket's engine must not be asked for `key`'s rows: it has
+    /// not greeted yet, or it streams another database than the cache's
+    /// reads go to, whose rows would be served as this one's.
+    fn wrong_database(&self) -> Option<String> {
+        let greeting = self.greeting.lock().expect("greeting").clone();
+        let ours = self.shared.cache();
+        let ours = ours.as_ref().and_then(|cache| cache.database());
+        match (greeting, ours) {
+            (Greeting::Waiting, _) => Some("the engine has not said which database it streams".to_string()),
+            (Greeting::Named(theirs), Some(ours)) if theirs != *ours => Some(format!(
+                "the engine streams database `{}` of system {}, but reads here go to `{}` of system {}",
+                theirs.name, theirs.system, ours.name, ours.system
+            )),
+            _ => None,
+        }
+    }
+
     /// Subscribes `key` on this worker's socket and waits for the
     /// engine's verdict.
     ///
@@ -797,6 +830,13 @@ impl Worker {
                     self.shared.release(key, self.index);
                 }
                 return Outcome::Verdict(self.shared.refused(self.not_connected()));
+            }
+            if let Some(reason) = self.wrong_database() {
+                drop(state);
+                if held.is_none() {
+                    self.shared.release(key, self.index);
+                }
+                return Outcome::Verdict(self.shared.refused(reason));
             }
             if let Some(id) = held {
                 if state.pending.contains_key(&id) {
@@ -1293,6 +1333,7 @@ fn disconnected(worker: &Worker) {
     let (waiting, released, keys) = {
         let mut state = worker.state.lock().expect("state");
         worker.connected.store(false, Ordering::Release);
+        *worker.greeting.lock().expect("greeting") = Greeting::Waiting;
         state.materialized.clear();
         let mut waiting: Vec<SyncSender<Reply>> = Vec::new();
         let mut released: Vec<QueryKey> = Vec::new();
@@ -1395,6 +1436,12 @@ fn on_accepted(worker: &Worker, mut body: Json) {
         let _ = worker.outgoing.send(Outgoing::Unsubscribe { id });
         return;
     };
+    if !matches!(waiter, Some(Some(_)))
+        && let Some(reason) = worker.wrong_database()
+    {
+        resubscribed_elsewhere(worker, id, &key, reason);
+        return;
+    }
     match (waiter, snapshot) {
         (Some(Some(reply)), Some(snapshot)) => {
             let _ = reply.try_send(Reply::Snapshot(snapshot));
@@ -1414,13 +1461,42 @@ fn on_accepted(worker: &Worker, mut body: Json) {
     }
 }
 
-/// `hello`: how many subscriptions the engine takes on this socket.
+/// A key resubscribed after a reconnect, accepted by an engine that
+/// streams another database than the cache's reads go to: its rows are
+/// not this database's, so the key is let go as a refusal would, and its
+/// entry goes stale for the next read to take from Postgres.
+fn resubscribed_elsewhere(worker: &Worker, id: u64, key: &QueryKey, reason: String) {
+    let shared = &worker.shared;
+    {
+        let mut state = worker.state.lock().expect("state");
+        worker.drop_id(&mut state, id);
+    }
+    shared.release(key, worker.index);
+    let _ = shared.refused(reason);
+    let _ = worker.outgoing.send(Outgoing::Unsubscribe { id });
+    if let Some(cache) = shared.cache() {
+        cache.touched(key);
+    }
+}
+
+/// `hello`: how many subscriptions the engine takes on this socket, and
+/// which database it streams.
 fn on_hello(worker: &Worker, body: &Json) {
     let room = body
         .get("max_subscriptions")
         .and_then(Json::as_u64)
         .map_or(0, |room| usize::try_from(room).unwrap_or(usize::MAX));
     worker.room.store(room, Ordering::Relaxed);
+    let field = |name: &str| {
+        body.get("database")
+            .and_then(|database| database.get(name))
+            .and_then(Json::as_str)
+            .map(str::to_owned)
+    };
+    *worker.greeting.lock().expect("greeting") = match (field("system"), field("name")) {
+        (Some(system), Some(name)) => Greeting::Named(Database { system, name }),
+        _ => Greeting::Unnamed,
+    };
 }
 
 /// `refused`: the waiting subscribe gets the reason. A refusal after
@@ -1571,8 +1647,14 @@ mod tests {
             wait,
             Arc::clone(&shared),
         );
-        worker.connected.store(true, Ordering::Release);
+        greeted(&worker);
         (worker, outgoing, shared)
+    }
+
+    /// The socket is up and the engine has greeted, naming no database.
+    fn greeted(worker: &Worker) {
+        worker.connected.store(true, Ordering::Release);
+        *worker.greeting.lock().unwrap() = Greeting::Unnamed;
     }
 
     /// The types of table `t`: an `int4` id and a `text` name.
@@ -1749,7 +1831,7 @@ mod tests {
             "nothing to resubscribe"
         );
         assert_eq!(worker.held.load(Ordering::Relaxed), 0);
-        worker.connected.store(true, Ordering::Release);
+        greeted(&worker);
         inbound(&worker, &accepted_with_rows(1));
         let mut unsubscribed = false;
         while let Ok(message) = outgoing.try_recv() {
@@ -1781,7 +1863,7 @@ mod tests {
             worker.state.lock().unwrap().by_id.contains_key(&1),
             "an accepted key stays held"
         );
-        worker.connected.store(true, Ordering::Release);
+        greeted(&worker);
         let Outcome::Verdict(Verdict::Refused(reason)) = worker.subscribe(&key()) else {
             panic!("a read in the window goes live");
         };
@@ -1846,6 +1928,48 @@ mod tests {
             cache.refused_recently(&key()).is_none(),
             "forgotten with the socket"
         );
+    }
+
+    /// An engine that streams another database than the cache's reads go
+    /// to is not asked for rows, which would be served as this one's;
+    /// the right one is, and one that names no database is taken on
+    /// trust. A key resubscribed after a reconnect to the wrong one is
+    /// let go and its entry left stale.
+    #[test]
+    fn an_engine_on_another_database_is_not_asked() {
+        let ours = Database {
+            system: "7699115118699778086".into(),
+            name: "tickets".into(),
+        };
+        let hello = |system: &str, name: &str| json!({"database": {"system": system, "name": name}});
+        let (worker, mut outgoing, shared) = worker_waiting(Duration::from_millis(50));
+        let cache = Arc::new(Cache::new(1 << 20, Arc::new(crate::subscriptions::Unsynced)));
+        *shared.cache.lock().unwrap() = Some(Arc::downgrade(&cache));
+        cache.learn_database(Some(ours.clone()));
+
+        on_hello(&worker, &hello("7699114362382213158", "tickets"));
+        let Outcome::Verdict(Verdict::Refused(reason)) = worker.subscribe(&key()) else {
+            panic!("refused");
+        };
+        assert!(reason.contains("streams database `tickets` of system 7699114362382213158"), "{reason}");
+        assert!(outgoing.try_recv().is_err(), "the engine was not asked");
+
+        on_hello(&worker, &json!({}));
+        assert!(worker.wrong_database().is_none(), "an engine naming no database is trusted");
+        on_hello(&worker, &hello(&ours.system, &ours.name));
+        assert!(worker.wrong_database().is_none());
+        let handle = subscribing(&worker);
+        inbound(&worker, &json!(["accepted", {"id": 1}]).to_string());
+        assert!(matches!(handle.join().unwrap(), Outcome::Verdict(Verdict::Accepted)));
+        assert!(matches!(outgoing.try_recv(), Ok(Outgoing::Subscribe { id: 1, .. })));
+
+        disconnected(&worker);
+        assert!(worker.state.lock().unwrap().by_id.contains_key(&1), "held to resubscribe");
+        greeted(&worker);
+        on_hello(&worker, &hello(&ours.system, "staging"));
+        inbound(&worker, &json!(["accepted", {"id": 1}]).to_string());
+        assert!(matches!(outgoing.try_recv(), Ok(Outgoing::Unsubscribe { id: 1 })));
+        assert!(worker.state.lock().unwrap().by_id.is_empty(), "the key is let go");
     }
 
     /// This client's own refusal reasons all pass; the engine's are final.

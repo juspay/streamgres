@@ -70,7 +70,7 @@ use diesel::{Connection, ConnectionResult, QueryResult};
 
 #[cfg(feature = "async")]
 pub use crate::asynchronous::AsyncSyncedConnection;
-use crate::cache::Cache;
+use crate::cache::{Cache, DATABASE_SQL, Database};
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
 pub use crate::route::{Route, RouteDsl, Served, Via};
@@ -426,7 +426,9 @@ where
     /// updates. Once subscribed, the engine reports every change from
     /// there on, so what Postgres returns then is current until the
     /// first touch; a read that fails leaves no entry, and the
-    /// subscription ends with it rather than being held for nothing.
+    /// subscription ends with it rather than being held for nothing. The
+    /// first miss through a cache reads which database the cache's reads
+    /// go to, which the engine side checks its engine streams.
     fn load<'conn, 'query, T>(
         &'conn mut self,
         source: T,
@@ -468,6 +470,9 @@ where
         if cache.refused_recently(&key).is_some() {
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
+        if !cache.knows_database() {
+            cache.learn_database(database_of(&mut self.inner));
+        }
         let reservation = cache.reserve(&key);
         match cache.subscriptions().subscribe_with(&key, &mut self.inner) {
             Verdict::Refused(reason) => {
@@ -493,6 +498,20 @@ where
         cache.fill(reservation, Arc::clone(&rows));
         Ok(SyncedCursor::Cached(OwnedCursor::new(rows)))
     }
+}
+
+/// The database `conn` reads, as the engine names the one it streams;
+/// `None` when it cannot be read, and the engine's word is taken.
+fn database_of<C>(conn: &mut C) -> Option<Database>
+where
+    C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
+{
+    use diesel::RunQueryDsl;
+    diesel::sql_query(DATABASE_SQL)
+        .load::<Database>(conn)
+        .ok()?
+        .into_iter()
+        .next()
 }
 
 /// The SQL a statement renders to, for [`may_write`]; a statement that

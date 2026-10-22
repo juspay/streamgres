@@ -199,6 +199,10 @@ async fn the_endpoint_speaks_its_protocol() {
     assert_eq!(tag(&hello), "hello");
     assert_eq!(hello[1]["protocol"], 1);
     assert!(
+        hello[1]["database"]["system"].is_string() && hello[1]["database"]["name"].is_string(),
+        "the engine names the database it streams: {hello}"
+    );
+    assert!(
         hello[1]["max_subscriptions"].is_u64() || hello[1]["max_subscriptions"].is_null(),
         "{hello}"
     );

@@ -47,9 +47,13 @@
 //! - `["ping"]`
 //!
 //! Downstream:
-//! - `["hello", {"protocol": 1, "max_subscriptions": n}]` first;
-//!   `max_subscriptions` is the per-connection limit, `null` for none, so
-//!   a client can stop short of it rather than be refused.
+//! - `["hello", {"protocol": 1, "max_subscriptions": n, "database":
+//!   {"system": "...", "name": "..."}}]` first; `max_subscriptions` is the
+//!   per-connection limit, `null` for none, so a client can stop short of
+//!   it rather than be refused. `database` names what the engine streams
+//!   (the cluster's `system_identifier` and the database's name, `null`
+//!   when they cannot be read), so a backend reading another database
+//!   does not take these rows for its own.
 //! - `["accepted", {"id": n}]` once the engine follows the query; from
 //!   that moment every change to its rows is reported, so the backend
 //!   reads Postgres only after it. In rows mode the body also carries
@@ -1100,6 +1104,7 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
         json!(["hello", {
             "protocol": PROTOCOL_VERSION,
             "max_subscriptions": (limit > 0).then_some(limit),
+            "database": database(&state).await,
         }]),
     );
     log_info!("s2s connection {conn} open");
@@ -1262,6 +1267,27 @@ async fn prepare(
         shape,
     })))
 }
+
+/// Which database the engine streams, for `hello`: the cluster's
+/// `system_identifier` and the database's name, as a backend reads them
+/// through its own connection. A backend whose reads go to another
+/// database must not take this engine's rows for its own, and checks.
+/// `null` when they cannot be read, which a backend takes as unknown.
+async fn database(state: &AppState) -> Json {
+    let rows = state
+        .storage
+        .simple_query(DATABASE_SQL)
+        .await
+        .unwrap_or_default();
+    match rows.first().map(|row| (row.get(0), row.get(1))) {
+        Some((Some(system), Some(name))) => json!({"system": system, "name": name}),
+        _ => Json::Null,
+    }
+}
+
+/// The identity [`database`] announces.
+const DATABASE_SQL: &str =
+    "SELECT system_identifier::text, current_database()::text FROM pg_control_system()";
 
 /// Refuses a query whose filters would normalize to more than
 /// `max_disjuncts` disjuncts, or whose `IN` and `NOT IN` lists hold more

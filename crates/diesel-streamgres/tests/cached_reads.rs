@@ -279,10 +279,13 @@ fn the_connection_says_where_each_read_was_served_from() {
 }
 
 /// The subscription is registered before Postgres is read, so no commit in
-/// between goes unreported.
+/// between goes unreported. The cache is told its database first, which
+/// its first miss would otherwise read, so the one read counted is the
+/// query's.
 #[test]
 fn the_subscription_is_registered_before_postgres_is_read() {
     let mut w = World::new("order");
+    w.cache.learn_database(None);
     w.put("a", "1");
     let before = w.sent();
     w.read("a");
@@ -294,6 +297,23 @@ fn the_subscription_is_registered_before_postgres_is_read() {
     assert_eq!(key.binds.len(), 2, "the key's value and the LIMIT");
     assert_eq!(key.binds[0].type_oid, 25, "the first bind is a text");
     assert_eq!(key.binds[1].type_oid, 20, "the limit is an int8");
+}
+
+/// The first miss through a cache reads which database the cache's
+/// reads go to, once, beside the query; later misses do not.
+#[test]
+fn the_first_miss_reads_the_database_once() {
+    let mut w = World::new("database");
+    w.put("a", "1");
+    w.put("b", "2");
+    assert!(!w.cache.knows_database());
+    let before = w.sent();
+    w.read("a");
+    assert_eq!(w.sent(), before + 2, "the database and the read");
+    let database = w.cache.database().expect("read").clone();
+    assert!(!database.system.is_empty() && !database.name.is_empty(), "{database:?}");
+    w.read("b");
+    assert_eq!(w.sent(), before + 3, "only the read");
 }
 
 /// The same query with different binds makes different entries.

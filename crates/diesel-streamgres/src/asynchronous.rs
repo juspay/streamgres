@@ -69,7 +69,7 @@ use futures_util::future::{BoxFuture, FutureExt, TryFutureExt};
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use tokio::task::spawn_blocking;
 
-use crate::cache::Cache;
+use crate::cache::{Cache, DATABASE_SQL, Database};
 use crate::cursor::SyncedRow;
 use crate::key::QueryKey;
 use crate::route::{Route, Served};
@@ -474,6 +474,10 @@ impl AsyncConnection for AsyncSyncedConnection {
     /// types not known yet is read live this time, the types resolved
     /// for the next (one that cannot even be keyed until then too).
     ///
+    /// The first miss through a cache reads which database the cache's
+    /// reads go to before it subscribes, for the engine side to check its
+    /// engine streams the same one.
+    ///
     /// On a miss, the futures the read may need are built at once; which
     /// are polled depends on the engine's answer. The read's future owns
     /// the subscription from the moment the subscribe may have made it
@@ -539,6 +543,8 @@ impl AsyncConnection for AsyncSyncedConnection {
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
             return self.tracked(live);
         }
+        let probe: Option<LoadFuture<'query>> = (!cache.knows_database())
+            .then(|| self.inner.load(sql_query(DATABASE_SQL)));
         let live = self.inner.load(query);
         let catalog: Option<LoadFuture<'query>> = if self.catalog_loaded.load(Ordering::Acquire) {
             None
@@ -551,6 +557,9 @@ impl AsyncConnection for AsyncSyncedConnection {
         let served = Arc::clone(&self.served);
         async move {
             let _pending = token;
+            if let Some(probe) = probe {
+                cache.learn_database(read_database(probe).await);
+            }
             let reservation = cache.reserve(&key);
             let guard = Unfilled {
                 cache: Arc::clone(&cache),
@@ -641,6 +650,14 @@ impl AsyncConnection for AsyncSyncedConnection {
     fn set_prepared_statement_cache_size(&mut self, size: CacheSize) {
         self.inner.set_prepared_statement_cache_size(size)
     }
+}
+
+/// The database `probe` ([`DATABASE_SQL`]) reads; `None` when it fails,
+/// and the engine's word is taken.
+async fn read_database(probe: LoadFuture<'_>) -> Option<Database> {
+    let rows: Vec<PgRow> = probe.await.ok()?.try_collect().await.ok()?;
+    rows.first()
+        .and_then(|row| <Database as FromSqlRow<Untyped, Pg>>::build_from_row(row).ok())
 }
 
 /// The engine's rows for a key whose tables' types the engine side does

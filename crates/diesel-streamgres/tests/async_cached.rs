@@ -616,10 +616,13 @@ async fn a_route_scope_ends_when_its_future_is_dropped() {
 /// after, and finds the read gone.
 ///
 /// The guard's drop and the blocking thread's check can both end it; the
-/// second is a no-op on the engine side, so either count is right.
+/// second is a no-op on the engine side, so either count is right. The
+/// cache is told its database first, which a first miss would read
+/// before it subscribes.
 #[tokio::test]
 async fn a_read_dropped_after_subscribing_ends_its_subscription() {
     let mut w = World::new("async-drop-read").await;
+    w.cache.learn_database(None);
     w.put("mode", "a").await;
     let query = sg_configs::table
         .filter(sg_configs::key.eq(w.key("mode")))

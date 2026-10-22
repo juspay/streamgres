@@ -223,7 +223,7 @@ Engine to client:
 
 | frame | meaning |
 |---|---|
-| `["hello", {"protocol": 1, "max_subscriptions": n}]` | first frame; `max_subscriptions` is the per-connection limit, `null` for none |
+| `["hello", {"protocol": 1, "max_subscriptions": n, "database": {"system", "name"}}]` | first frame; `max_subscriptions` is the per-connection limit, `null` for none; `database` is what the engine streams (the cluster's `system_identifier` and the database's name), `null` when it cannot be read |
 | `["accepted", {"id", "nodes", "columns", "names", "count", "order", "limit", "offset"}]` | the engine follows the query; the body is the hydrated result, `nodes` per table with `table`, `key`, `parent`, `parent_column`, `child_column`, `inner`, `rows` |
 | `["delta", {"id", "changes": [{"table", "put": [row], "del": [key]}]}]` | one transaction's change to a rows-mode result; one entry per key, its last state, never in both lists, so apply order does not matter |
 | `["touched", {"ids"}]` | one transaction changed these refill-mode subscriptions |
@@ -311,6 +311,16 @@ cannot go in a request. While the socket is down, each refusal it gives
 says so (`the engine is not connected: ...`), and
 `EngineClient::connect_errors` lists them. A successful connect clears
 it.
+
+**The engine's database.** The engine's `hello` names the database it
+streams. The first miss through a cache reads the same of the database
+its reads go to (`cache::DATABASE_SQL`, readable by any role), once per
+cache, before it subscribes. A socket whose engine
+streams another database is not asked for rows, which would otherwise
+be served as this database's: every subscribe through it is refused,
+naming both, and the reads go to Postgres. A key resubscribed after a
+reconnect is checked the same way when its `accepted` arrives. An engine
+whose `hello` names no database is taken on trust.
 
 **The engine's limit.** The engine's `hello` names how many
 subscriptions it takes on one connection (`max_subscriptions`). The pool

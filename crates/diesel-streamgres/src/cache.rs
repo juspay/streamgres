@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use diesel::pg::PgMetadataCache;
@@ -293,8 +293,27 @@ pub struct Cache {
     /// The OIDs of user-defined types, resolved once per database for
     /// the async wrapper (the blocking one asks its connection).
     type_metadata: Arc<Mutex<PgMetadataCache>>,
+    /// The database this cache's reads go to, read once through the
+    /// first connection that misses; `None` inside when it could not be
+    /// read. The engine side compares it with the one its engine streams.
+    database: OnceLock<Option<Database>>,
     pub stats: Arc<Stats>,
 }
+
+/// A database as Postgres identifies it to any role: the cluster's
+/// `system_identifier` and the database's name. Two clusters restored
+/// from one backup share an identifier, so the name is kept too.
+#[derive(Debug, Clone, PartialEq, Eq, diesel::QueryableByName)]
+pub struct Database {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub system: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub name: String,
+}
+
+/// Reads a [`Database`] through a connection; the engine announces the
+/// same in its `hello`.
+pub const DATABASE_SQL: &str = "SELECT system_identifier::text AS system, current_database()::text AS name FROM pg_control_system()";
 
 impl Cache {
     /// A cache holding at most `max_bytes` of rows and keys, with the
@@ -355,6 +374,7 @@ impl Cache {
             last_write: AtomicU64::new(0),
             started: Instant::now(),
             type_metadata: Arc::new(Mutex::new(PgMetadataCache::new())),
+            database: OnceLock::new(),
             stats,
         }
     }
@@ -494,6 +514,22 @@ impl Cache {
             Stats::bump(&self.stats.stale_fills);
             self.stale(key);
         }
+    }
+
+    /// The database this cache's reads go to, once it has been read:
+    /// `None` until then, and when it could not be read.
+    pub fn database(&self) -> Option<&Database> {
+        self.database.get().and_then(Option::as_ref)
+    }
+
+    /// Whether the database has been looked for, found or not.
+    pub fn knows_database(&self) -> bool {
+        self.database.get().is_some()
+    }
+
+    /// Records the database a connection read; the first record stands.
+    pub fn learn_database(&self, database: Option<Database>) {
+        let _ = self.database.set(database);
     }
 
     /// The engine changed a query it serves from its own rows: counted;
