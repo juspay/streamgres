@@ -1172,7 +1172,10 @@ fn connect_failure(error: &tokio_tungstenite::tungstenite::Error) -> String {
 }
 
 /// Connects, serves until the socket breaks either way, reconnects,
-/// until the pool stops: one worker's socket.
+/// until the pool stops: one worker's socket. A quiet socket is pinged
+/// every third of the silence window, and how long it has been silent
+/// is looked at every thirtieth (a second at most), so it is taken for
+/// dead within that of the window, not at the next ping.
 async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedReceiver<Outgoing>) {
     let mut first = true;
     loop {
@@ -1213,6 +1216,9 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
         let every = (silence / 3).max(Duration::from_millis(1));
         let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let glance = (silence / 30).clamp(Duration::from_millis(1), Duration::from_secs(1));
+        let mut check = tokio::time::interval_at(tokio::time::Instant::now() + glance, glance);
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let resubscribe = worker.up();
         let mut up = true;
@@ -1244,6 +1250,7 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
                     heard.elapsed() < silence
                         && send_frame(&mut sink, json!(["ping"]).to_string()).await
                 },
+                _ = check.tick() => heard.elapsed() < silence,
                 message = outgoing.recv() => match message {
                     Some(Outgoing::Subscribe { id, sql, binds }) => {
                         send_frame(&mut sink, subscribe_frame(id, &sql, &binds)).await

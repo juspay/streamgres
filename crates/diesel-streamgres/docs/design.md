@@ -335,7 +335,7 @@ context.
 | verdict timeout | 5 s, configurable | the read goes live; the id is withdrawn |
 | send timeout | 10 s | the socket is given up on, so an engine that stops reading cannot block the worker |
 | ping | a third of the silence window | a quiet socket is pinged |
-| silence | 30 s, configurable | nothing heard: the socket is taken for dead (an engine killed without a close, a network gone without a reset), and its keys go stale |
+| silence | 30 s, configurable | nothing heard: the socket is taken for dead (an engine killed without a close, a network gone without a reset), and its keys go stale; checked every thirtieth of the window, a second at most, so the cache serves a frozen engine's rows for the window and no longer |
 | reconnect delay | 1 s | a lost socket is retried every second |
 
 **Refusals.** A refusal from the engine is remembered for the query and

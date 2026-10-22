@@ -32,6 +32,9 @@ enum Answer {
     Never,
     /// Closes at once.
     Close,
+    /// Greets this long after the handshake, then reads every frame and
+    /// answers none: the last frame heard falls between two pings.
+    GreetLate(Duration),
 }
 
 /// What a fake server records: when each handshake completed, and every
@@ -103,6 +106,9 @@ async fn serve(listener: TcpListener, answer: Answer, seen: Seen) {
         }
         let frames = Arc::clone(&seen.1);
         tokio::spawn(async move {
+            if let Answer::GreetLate(delay) = answer {
+                tokio::time::sleep(delay).await;
+            }
             let hello = serde_json::json!(["hello", {"protocol": 1}]).to_string();
             if socket.send(Message::Text(hello.into())).await.is_err() {
                 return;
@@ -265,6 +271,36 @@ fn a_silent_engine_is_taken_for_dead() {
     assert!(
         fake.frames().iter().any(|frame| frame[0] == "ping"),
         "the quiet socket was pinged"
+    );
+    drop(engine);
+}
+
+/// A silent socket is given up when the silence window runs out, not
+/// at the next ping up to a third of a window later. The engine greets
+/// 2.9 s in and then says nothing; with a 6 s window it is dead at 8.9
+/// s, and the 1 s reconnect delay brings the second connection at
+/// about 9.9 s. Looking only at each ping (2, 4, ... s) it was 11 s.
+#[test]
+fn a_silent_socket_is_given_up_on_time() {
+    let fake = Fake::start(Answer::GreetLate(Duration::from_millis(2900)));
+    let engine = EngineClient::with_config(
+        fake.url.clone(),
+        Config {
+            connections: 1,
+            silence: Duration::from_secs(6),
+            ..Config::default()
+        },
+    );
+    let started = Instant::now();
+    while fake.accepts().len() < 2 {
+        assert!(started.elapsed() < Duration::from_secs(20), "never redialled");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let accepts = fake.accepts();
+    let gap = accepts[1] - accepts[0];
+    assert!(
+        gap >= Duration::from_millis(9800) && gap < Duration::from_millis(10_500),
+        "redialled {gap:?} after the first connection; silent from 2.9 s, the window is 6 s"
     );
     drop(engine);
 }
