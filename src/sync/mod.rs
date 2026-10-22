@@ -15,6 +15,7 @@
 //! runtime, the engine's rules, and both drivers are shared.
 
 pub mod catalog;
+pub mod heartbeat;
 mod local;
 pub mod pg;
 mod runtime;

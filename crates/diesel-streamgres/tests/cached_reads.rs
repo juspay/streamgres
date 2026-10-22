@@ -42,6 +42,28 @@ struct FakeEngine {
     subscribed: Mutex<Vec<QueryKey>>,
     unsubscribed: Mutex<Vec<QueryKey>>,
     refuse_all: std::sync::atomic::AtomicBool,
+    /// Says the engine is too far behind for the cache to be trusted.
+    behind: std::sync::atomic::AtomicBool,
+    /// The next subscribe ships no rows, the engine's view, and leaves
+    /// the engine side behind, the way a socket that just reconnected to
+    /// a lagging engine hears its lag before the answer.
+    rows_from_behind: std::sync::atomic::AtomicBool,
+}
+
+/// An engine-side store that holds no rows.
+#[derive(Debug)]
+struct NoRows;
+
+impl diesel_streamgres::cache::Live for NoRows {
+    /// Always empty.
+    fn rows(&self) -> Option<Arc<[diesel_streamgres::row::OwnedRow]>> {
+        Some(Arc::from(Vec::new()))
+    }
+
+    /// Weighs nothing.
+    fn bytes(&self) -> usize {
+        0
+    }
 }
 
 impl Subscriptions for FakeEngine {
@@ -52,6 +74,13 @@ impl Subscriptions for FakeEngine {
             return Outcome::Verdict(Verdict::Refused("not a config read".into()));
         }
         self.subscribed.lock().unwrap().push(key.clone());
+        if self.rows_from_behind.swap(false, Ordering::SeqCst) {
+            self.behind.store(true, Ordering::SeqCst);
+            return Outcome::Verdict(Verdict::Rows {
+                rows: Arc::from(Vec::new()),
+                live: Arc::new(NoRows),
+            });
+        }
         Outcome::Verdict(Verdict::Accepted)
     }
 
@@ -68,6 +97,11 @@ impl Subscriptions for FakeEngine {
     /// Records the key.
     fn unsubscribe(&self, key: &QueryKey) {
         self.unsubscribed.lock().unwrap().push(key.clone());
+    }
+
+    /// As set by the test.
+    fn behind(&self) -> bool {
+        self.behind.load(Ordering::SeqCst)
     }
 }
 
@@ -314,6 +348,37 @@ fn the_first_miss_reads_the_database_once() {
     assert!(!database.system.is_empty() && !database.name.is_empty(), "{database:?}");
     w.read("b");
     assert_eq!(w.sent(), before + 3, "only the read");
+}
+
+/// While the engine side says it is too far behind, reads go to Postgres
+/// and see a change the engine has not reported; once it catches up the
+/// cache answers again, with what it held.
+#[test]
+fn a_lagging_engine_sends_reads_to_postgres() {
+    let mut w = World::new("lagging");
+    w.put("mode", "a");
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    w.put("mode", "b");
+    assert_eq!(w.read("mode").as_deref(), Some("a"), "cached, unreported");
+    w.engine.behind.store(true, Ordering::SeqCst);
+    assert_eq!(w.read("mode").as_deref(), Some("b"), "the engine is behind: Postgres");
+    assert_eq!(w.conn.last_served(), Some(Served::Postgres));
+    assert_eq!(w.cache.stats.lagging.load(Ordering::Relaxed), 1);
+    w.engine.behind.store(false, Ordering::SeqCst);
+    assert_eq!(w.read("mode").as_deref(), Some("a"), "caught up: the cache again");
+    assert_eq!(w.conn.last_served(), Some(Served::Cache));
+}
+
+/// An engine side found behind only once its answer arrives does not
+/// have that answer served: the read goes to Postgres.
+#[test]
+fn rows_from_a_lagging_engine_are_not_served() {
+    let mut w = World::new("rows_lagging");
+    w.put("mode", "a");
+    w.engine.rows_from_behind.store(true, Ordering::SeqCst);
+    assert_eq!(w.read("mode").as_deref(), Some("a"), "Postgres, not the empty rows");
+    assert_eq!(w.conn.last_served(), Some(Served::Postgres));
+    assert_eq!(w.cache.stats.lagging.load(Ordering::Relaxed), 1);
 }
 
 /// The same query with different binds makes different entries.

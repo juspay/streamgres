@@ -126,6 +126,9 @@ pub struct Transaction {
     pub catalog: Option<Arc<Catalog>>,
     pub committed_at_micros: i64,
     pub decode: Duration,
+    /// The engine's own heartbeat this event is ([`crate::sync::heartbeat`]),
+    /// which carries no write; `None` for a transaction.
+    pub heartbeat: Option<u64>,
 }
 
 /// One published table as the feed described it: the catalog table it
@@ -142,6 +145,23 @@ struct Relation {
 struct Described {
     name: ColumnName,
     plain_json: bool,
+}
+
+/// A heartbeat of this engine's, as the transaction that carries it to
+/// the engine thread behind every transaction before it: no write, and
+/// the position the feed is at ([`Feed::absorb`]). Content that is not
+/// a number is not one of ours.
+fn beat(content: &Bytes) -> Option<Transaction> {
+    let n = std::str::from_utf8(content).ok()?.parse::<u64>().ok()?;
+    Some(Transaction {
+        at: Lsn(0),
+        writes: Vec::new(),
+        schema: Vec::new(),
+        catalog: None,
+        committed_at_micros: 0,
+        decode: Duration::ZERO,
+        heartbeat: Some(n),
+    })
 }
 
 /// The mapping of decoded messages onto catalog writes: the catalog as
@@ -161,6 +181,8 @@ pub struct Decoder {
     /// that already has them, and the engine must still be told.
     changes: Vec<SchemaChange>,
     decode: Duration,
+    /// The prefix of this engine's heartbeats, when it sends any.
+    heartbeat: Option<String>,
 }
 
 impl Decoder {
@@ -173,6 +195,7 @@ impl Decoder {
             ddl: None,
             changes: Vec::new(),
             decode: Duration::ZERO,
+            heartbeat: None,
         }
     }
 
@@ -225,6 +248,7 @@ impl Decoder {
                     schema,
                     committed_at_micros: commit_time_micros,
                     decode: Duration::ZERO,
+                    heartbeat: None,
                 }))
             }
             ReplicationEvent::XLogData { data, .. } => {
@@ -235,14 +259,25 @@ impl Decoder {
                 prefix,
                 content,
                 lsn,
-                ..
+                transactional,
             } => {
                 if self.ddl.as_ref().is_some_and(|ddl| ddl.prefix == prefix) {
                     self.migrate(position(lsn), &content)?;
                 }
+                if !transactional && self.heartbeat.as_deref() == Some(prefix.as_str()) {
+                    return Ok(beat(&content));
+                }
                 Ok(None)
             }
             ReplicationEvent::KeepAlive { .. } | ReplicationEvent::StoppedAt { .. } => Ok(None),
+        }
+    }
+
+    /// The decoder hearing the heartbeats sent on `prefix`.
+    pub fn with_heartbeat(self, prefix: String) -> Self {
+        Decoder {
+            heartbeat: Some(prefix),
+            ..self
         }
     }
 
@@ -757,6 +792,7 @@ impl Transport {
                 received: Instant::now(),
                 committed_at_micros: transaction.committed_at_micros,
                 decode: transaction.decode,
+                heartbeat: transaction.heartbeat,
             };
             if out.send(committed).await.is_err() {
                 return Ok(());
@@ -909,6 +945,15 @@ impl Feed {
         self.decoder.catalog()
     }
 
+    /// The feed hearing the heartbeats sent on `prefix`
+    /// ([`crate::sync::heartbeat`]).
+    pub fn with_heartbeat(self, prefix: String) -> Self {
+        Feed {
+            decoder: self.decoder.with_heartbeat(prefix),
+            ..self
+        }
+    }
+
     /// Absorb one raw event: a keepalive or a commit moves the position,
     /// and a commit also yields the transaction it closes. A keepalive
     /// that arrives inside a transaction names a location below that
@@ -918,8 +963,11 @@ impl Feed {
         if let ReplicationEvent::KeepAlive { wal_end, .. } = &event {
             self.progress = self.progress.max(position(*wal_end));
         }
-        let transaction = self.decoder.absorb(event)?;
-        if let Some(transaction) = &transaction {
+        let mut transaction = self.decoder.absorb(event)?;
+        if let Some(transaction) = &mut transaction {
+            if transaction.heartbeat.is_some() {
+                transaction.at = self.progress;
+            }
             self.progress = self.progress.max(transaction.at);
         }
         Ok(transaction)
@@ -1525,6 +1573,43 @@ mod tests {
         assert_eq!(feed.progress(), Lsn::parse("0/200").unwrap());
         assert!(feed.absorb(keepalive("0/2A8")).unwrap().is_none());
         assert_eq!(feed.progress(), Lsn::parse("0/2A8").unwrap());
+    }
+
+    /// A logical message on `prefix`, transactional or not.
+    fn logical(prefix: &str, content: &str, transactional: bool) -> ReplicationEvent {
+        ReplicationEvent::Message {
+            transactional,
+            lsn: pgwire_replication::Lsn(0x300),
+            prefix: prefix.to_owned(),
+            content: Bytes::from(content.to_owned()),
+        }
+    }
+
+    /// A heartbeat of the feed's own is a transaction with no write, at
+    /// the position the feed is at, carrying its number; another
+    /// engine's, a transactional message on the prefix, or content that
+    /// is not a number is not one.
+    #[test]
+    fn a_heartbeat_comes_through_as_a_mark() {
+        let mut feed = Feed::new(catalog()).with_heartbeat("slot_a/heartbeat".to_owned());
+        assert!(feed.absorb(keepalive("0/100")).unwrap().is_none());
+        let beat = feed
+            .absorb(logical("slot_a/heartbeat", "7", false))
+            .unwrap()
+            .expect("a heartbeat");
+        assert_eq!(beat.heartbeat, Some(7));
+        assert!(beat.writes.is_empty());
+        assert_eq!(beat.at, Lsn::parse("0/100").unwrap());
+        assert_eq!(feed.progress(), Lsn::parse("0/100").unwrap());
+        for other in [
+            logical("slot_b/heartbeat", "8", false),
+            logical("slot_a/heartbeat", "9", true),
+            logical("slot_a/heartbeat", "nine", false),
+        ] {
+            assert!(feed.absorb(other).unwrap().is_none());
+        }
+        let mut deaf = Feed::new(catalog());
+        assert!(deaf.absorb(logical("slot_a/heartbeat", "7", false)).unwrap().is_none());
     }
 
     /// A JSON cell is decoded into the standard form whichever kind of

@@ -80,12 +80,18 @@ carries one. Then:
    `SELECT` (Diesel sends `INSERT ... RETURNING` through `load`), a read
    inside an open transaction, a read inside the read-your-writes window,
    `FOR UPDATE` and its variants, a `WITH` whose expressions modify data.
-3. **Refused recently.** A query the engine refused, with the same
+3. **Behind.** While the engine says it is further behind the database
+   than `STREAMGRES_S2S_MAX_LAG_MS`, or has said nothing for that long,
+   reads go live and `lagging` counts them. A miss whose engine rows
+   arrive with a lag past it, as on a socket that just reconnected to
+   a lagging engine, keeps them for later reads and serves this one
+   live.
+4. **Refused recently.** A query the engine refused, with the same
    values, within `STREAMGRES_REFUSED_TTL_MS` goes live without asking
    again.
-4. **Hit.** The entry under the key is served; in rows mode the result
+5. **Hit.** The entry under the key is served; in rows mode the result
    is built from the engine's rows if a change came since it last was.
-5. **Miss.** The key is reserved and the query subscribed. Rows mode
+6. **Miss.** The key is reserved and the query subscribed. Rows mode
    builds the entry from the engine's rows; refill mode reads Postgres
    and keeps what it returned; a refusal goes live.
 
@@ -229,6 +235,7 @@ Engine to client:
 | `["touched", {"ids"}]` | one transaction changed these refill-mode subscriptions |
 | `["refused", {"id", "reason"}]` | the engine cannot follow the query; after an `accepted`, it stopped following it |
 | `["pong"]` | reply to `ping` |
+| `["lag", {"ms"}]` | right after `hello`, then every 500 ms: how far at most the engine's applied changes trail the database, the age of the newest heartbeat it applied; `null` before the first heartbeat is sent |
 | `["error", {"reason"}]` | a frame that could not be read and names no id; a `subscribe` whose id reads is answered `refused` instead |
 
 An id is never reused on a socket: frames queued for an unsubscribed id
@@ -292,6 +299,7 @@ the environment (`Config::from_env`) or explicitly
 | `STREAMGRES_S2S_MAX_SUBSCRIPTIONS`  | subscriptions held across all sockets     | 10000   |
 | `STREAMGRES_S2S_VERDICT_TIMEOUT_MS` | wait for `accepted` or `refused`          | 5000    |
 | `STREAMGRES_S2S_SILENCE_MS`         | a socket silent this long is taken for dead | 10000 |
+| `STREAMGRES_S2S_MAX_LAG_MS`         | the engine's lag past which reads go live; 0 trusts the cache | 2000 |
 | `STREAMGRES_S2S_TOKEN`              | bearer token sent when a socket opens     | none    |
 
 The token goes out as `Authorization: Bearer <token>` on each socket's
@@ -321,6 +329,23 @@ be served as this database's: every subscribe through it is refused,
 naming both, and the reads go to Postgres. A key resubscribed after a
 reconnect is checked the same way when its `accepted` arrives. An engine
 whose `hello` names no database is taken on trust.
+
+**The engine's lag.** A large transaction, a slow apply or a stalled
+replication stream delay the cache without dropping the socket. The
+engine writes a heartbeat into the WAL every 500 ms
+(`pg_logical_emit_message`, not transactional, under the prefix
+`<slot>/heartbeat`; `STREAMGRES_HEARTBEAT_MS`, 0 off) and notes when it
+sent each. When its replication stream brings a heartbeat back and every
+change before it is applied and queued to the sockets, that heartbeat is
+applied, and so is every change committed before it was sent. Its lag is the age of the newest
+applied heartbeat, a bound on how stale it can be: under one interval
+while it keeps up, growing while the stream is stuck. Each socket is
+told the lag right after `hello`, so before any answer, and every
+500 ms. The wrapper adds the time since the last
+`lag` frame, so an engine that stops sending them is taken as falling
+behind too, and goes live while the largest lag over the connected
+sockets is past `STREAMGRES_S2S_MAX_LAG_MS`. An engine that reports no
+lag (`null`, or one that never sends the frame) is trusted, as before.
 
 **The engine's limit.** The engine's `hello` names how many
 subscriptions it takes on one connection (`max_subscriptions`). The pool
@@ -402,7 +427,7 @@ subscription and bump the generation.
 
 `cache::Stats` counts: `hits`, `misses`, `refused`, `refused_recently`,
 `touched`, `evicted`, `expired`, `stale_fills`, `oversized`, `replaced`,
-`after_write`, `locking`.
+`after_write`, `locking`, `lagging`.
 
 ## Routing
 

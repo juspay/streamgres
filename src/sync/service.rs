@@ -90,6 +90,10 @@ pub struct Transaction {
     pub received: Instant,
     pub committed_at_micros: i64,
     pub decode: Duration,
+    /// The engine's heartbeat this mark carries, passed to every consumer
+    /// once every transaction before it is applied
+    /// ([`crate::sync::heartbeat`]).
+    pub heartbeat: Option<u64>,
 }
 
 impl Transaction {
@@ -131,6 +135,7 @@ impl Transaction {
             received: Instant::now(),
             committed_at_micros: 0,
             decode: Duration::ZERO,
+            heartbeat: None,
         }
     }
 
@@ -173,6 +178,10 @@ impl Transaction {
 ///   least half the row limit: a query to report by name before it grows
 ///   into the limit and is refused. Sent once per read, to the owner of
 ///   one subscription of the tree.
+/// - `Heartbeat`: the engine's heartbeat `n` was applied
+///   ([`crate::sync::heartbeat`]), sent to every consumer behind the
+///   events of every transaction before it, so a consumer that has
+///   passed on those events can take it as applied.
 #[derive(Debug)]
 pub enum Event {
     Registered {
@@ -205,6 +214,7 @@ pub enum Event {
         table: TableName,
         rows: u64,
     },
+    Heartbeat(u64),
 }
 
 /// How a step ended: what its deltas travel inside of.
@@ -478,6 +488,7 @@ where
             received,
             committed_at_micros,
             decode,
+            heartbeat,
         } = transaction;
         let started = Instant::now();
         let mut step = Step::default();
@@ -557,6 +568,11 @@ where
                 routed,
             },
         );
+        if let Some(n) = heartbeat {
+            for sink in &self.sinks {
+                let _ = sink.send(Event::Heartbeat(n));
+            }
+        }
         self.reap();
     }
 

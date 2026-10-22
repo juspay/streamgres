@@ -301,6 +301,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         s2s_requests,
         ready.clone(),
         config.s2s_connection_subscriptions,
+        stats.clone(),
     );
     #[cfg(tokio_unstable)]
     tokio::task::Builder::new()

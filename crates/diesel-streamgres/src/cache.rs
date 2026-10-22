@@ -226,6 +226,9 @@ pub struct Stats {
     /// Reads sent to Postgres because the read's lock (`FOR UPDATE`)
     /// cannot be taken on a cache.
     pub locking: AtomicU64,
+    /// Reads sent to Postgres because the engine was further behind the
+    /// database than the cache may be.
+    pub lagging: AtomicU64,
 }
 
 impl Stats {

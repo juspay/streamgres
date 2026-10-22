@@ -89,6 +89,11 @@
 //!   is closed once its queue is full rather than buffered for: more
 //!   than 4096 frames, or more than 64 MiB of them, waiting.
 //! - `["pong"]`
+//! - `["lag", {"ms": n}]` right after `hello`, then every 500 ms: how far
+//!   at most the engine's applied changes trail the database, the age of
+//!   the newest heartbeat the replication stream has brought back and
+//!   the engine applied (`null` before the first is sent), so a backend
+//!   can stop trusting its copy while the engine is behind.
 //! - `["error", {"reason": "..."}]` for a frame that is not one of the
 //!   above (not JSON, an unknown tag, no usable `id`). A `subscribe`
 //!   whose `id` reads but whose body does not is answered `refused` with
@@ -130,6 +135,7 @@ use crate::model::{
 };
 use crate::parser::binds::decodes;
 use crate::parser::{BindValue, Projection, parse_select};
+use crate::stats::Stats;
 use crate::sync::catalog::with_enums;
 use crate::sync::{CatalogHandle, Command, Event};
 
@@ -266,6 +272,9 @@ struct TableChanges<'a> {
     put: Vec<&'a RawValue>,
     del: Vec<Json>,
 }
+
+/// How often every connection is told the engine's lag.
+const LAG_EVERY: Duration = Duration::from_millis(500);
 
 /// How often a refused upgrade of one kind is logged at most; the ones
 /// in between are counted into the next line.
@@ -537,6 +546,8 @@ struct Task {
     /// How many subscriptions one connection may hold, registering ones
     /// included (0: no limit).
     per_connection: usize,
+    /// Where the engine's lag is measured ([`crate::sync::heartbeat`]).
+    stats: Arc<Stats>,
 }
 
 /// Runs the task: the engine's events on one side, the connections'
@@ -544,6 +555,7 @@ struct Task {
 /// Queries are registered only once the engine's position covers the
 /// storage; until then a registration would read a snapshot the feed
 /// has not caught up with.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     catalog: Arc<CatalogHandle>,
     sink: usize,
@@ -552,6 +564,7 @@ pub async fn run(
     mut requests: mpsc::Receiver<Request>,
     mut ready: watch::Receiver<bool>,
     per_connection: usize,
+    stats: Arc<Stats>,
 ) {
     while !*ready.borrow() {
         if ready.changed().await.is_err() {
@@ -570,9 +583,13 @@ pub async fn run(
         hydrating: HashSet::new(),
         next_token: 1,
         per_connection,
+        stats,
     };
+    let mut lag = tokio::time::interval(LAG_EVERY);
+    lag.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = lag.tick() => task.report_lag(),
             event = events.recv() => match event {
                 Some(event) => task.event(event).await,
                 None => return,
@@ -586,6 +603,15 @@ pub async fn run(
 }
 
 impl Task {
+    /// Tells every connection how far behind the engine is, from its
+    /// heartbeats: `null` while it sends none.
+    fn report_lag(&mut self) {
+        let frame = lag_frame(&self.stats).to_string();
+        for connection in self.conns.values_mut() {
+            connection.send_text(frame.clone());
+        }
+    }
+
     /// Handles one connection's request.
     async fn request(&mut self, request: Request) {
         match request {
@@ -719,6 +745,7 @@ impl Task {
                     log_warn!("s2s connection {conn}: query {id} holds {rows} rows of {table}");
                 }
             }
+            Event::Heartbeat(n) => self.stats.freshness.applied(n),
         }
     }
 
@@ -1084,6 +1111,16 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
         }
         let _ = sink.send(Message::Close(None)).await;
     });
+    let limit = state.config.s2s_connection_subscriptions;
+    send(
+        &out,
+        json!(["hello", {
+            "protocol": PROTOCOL_VERSION,
+            "max_subscriptions": (limit > 0).then_some(limit),
+            "database": database(&state).await,
+        }]),
+    );
+    send(&out, lag_frame(&state.stats));
     if handle
         .requests
         .send(Request::Connected {
@@ -1098,15 +1135,6 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
         writer.abort();
         return;
     }
-    let limit = state.config.s2s_connection_subscriptions;
-    send(
-        &out,
-        json!(["hello", {
-            "protocol": PROTOCOL_VERSION,
-            "max_subscriptions": (limit > 0).then_some(limit),
-            "database": database(&state).await,
-        }]),
-    );
     log_info!("s2s connection {conn} open");
 
     let session = serve(conn, stream, closed, &out, &held, &state);
@@ -1120,6 +1148,16 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
         log_warn!("s2s connection {conn}: its frames were not read in time, cut off");
     }
     log_info!("s2s connection {conn} closed");
+}
+
+/// The `lag` frame: how far the engine's applied changes trail the
+/// database, `null` before the first heartbeat is sent.
+fn lag_frame(stats: &Stats) -> Json {
+    let ms = stats
+        .freshness
+        .lag()
+        .map(|lag| u64::try_from(lag.as_millis()).unwrap_or(u64::MAX));
+    json!(["lag", {"ms": ms}])
 }
 
 /// Reads frames until the backend closes, the task asks to close, or
@@ -1527,6 +1565,7 @@ mod tests {
             hydrating: HashSet::new(),
             next_token: 1,
             per_connection,
+            stats: Stats::shared_with_metric_prefix("test".to_owned()),
         };
         let frames = connect(&mut task, 1);
         (task, commands_rx, frames)
@@ -1678,6 +1717,31 @@ mod tests {
             vec![(1, "one".to_owned()), (2, "two".to_owned())]
         );
         assert_eq!(puts(&deltas[1]), vec![(1, "one".to_owned())]);
+    }
+
+    /// Every connection hears the engine's lag from its heartbeats:
+    /// `null` before the first, then the age of the first while none is
+    /// applied, then the age of the newest one the engine's events said
+    /// was applied.
+    #[tokio::test]
+    async fn every_connection_hears_the_lag() {
+        let (mut task, _commands, mut out) = task(0);
+        let mut other = connect(&mut task, 2);
+        task.report_lag();
+        assert_eq!(frames(&mut out), vec![json!(["lag", {"ms": null}])]);
+        task.stats
+            .freshness
+            .sent(1, std::time::Instant::now() - Duration::from_millis(1500));
+        task.report_lag();
+        for frames in [frames(&mut out), frames(&mut other)] {
+            let ms = frames[frames.len() - 1][1]["ms"].as_u64().expect("a lag");
+            assert!((1500..2500).contains(&ms), "{ms}");
+        }
+        task.stats.freshness.sent(2, std::time::Instant::now());
+        task.event(Event::Heartbeat(2)).await;
+        task.report_lag();
+        let ms = frames(&mut out)[0][1]["ms"].as_u64().expect("a lag");
+        assert!(ms < 500, "caught up: {ms}");
     }
 
     /// A queue takes frames until either bound is reached, always takes

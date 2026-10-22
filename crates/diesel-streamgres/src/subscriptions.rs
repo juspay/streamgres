@@ -96,6 +96,12 @@ pub trait Subscriptions: Send + Sync {
         true
     }
 
+    /// Whether the engine side is too far behind the database for the
+    /// cache to be trusted: reads then go to Postgres until it catches up.
+    fn behind(&self) -> bool {
+        false
+    }
+
     /// Both steps on a blocking connection: `lookup` is the connection
     /// the read is on. A lookup that fails stops the lookups; the engine
     /// side then reports the fallback for the types it lacks.

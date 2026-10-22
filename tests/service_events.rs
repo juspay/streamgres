@@ -97,6 +97,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
             Event::Committed { .. } => "committed",
             Event::Capped { .. } => "capped",
             Event::Heavy { .. } => "heavy",
+            Event::Heartbeat(_) => "heartbeat",
         })
         .collect()
 }
@@ -107,9 +108,11 @@ fn updates_of(event: &Event) -> &[streamgres::ivm::Delta] {
         Event::Registered { updates, .. }
         | Event::Landed { updates }
         | Event::Committed { updates, .. } => updates,
-        Event::Hydrated(_) | Event::Refused { .. } | Event::Capped { .. } | Event::Heavy { .. } => {
-            &[]
-        }
+        Event::Hydrated(_)
+        | Event::Refused { .. }
+        | Event::Capped { .. }
+        | Event::Heavy { .. }
+        | Event::Heartbeat(_) => &[],
     }
 }
 
@@ -309,6 +312,7 @@ fn a_commit_reports_the_position_and_the_watched_writes() {
                 catalog: None,
                 received: std::time::Instant::now(),
                 committed_at_micros: 0,
+                heartbeat: None,
                 decode: std::time::Duration::ZERO,
             }))
             .await
@@ -332,6 +336,49 @@ fn a_commit_reports_the_position_and_the_watched_writes() {
             "the commit is the one event; nobody subscribed, so it carries no delta, got {:?}",
             shapes(&seen)
         );
+    });
+}
+
+/// A heartbeat mark reaches every consumer as its own event, after the
+/// events of the transactions before it: a consumer that has passed
+/// those on may take the heartbeat as applied.
+#[test]
+fn a_heartbeat_follows_the_transactions_before_it_to_every_consumer() {
+    block_on(async {
+        let storage = Rc::new(MemoryStorage::new());
+        let (owner_tx, mut owner) = mpsc::unbounded_channel();
+        let (other_tx, mut other) = mpsc::unbounded_channel();
+        let (service, commands) =
+            Service::new(MultiTableIVM::new(), storage, owner_tx.clone());
+        let service = service.with_sinks(vec![owner_tx, other_tx]);
+        spawn_local(service.run());
+
+        let step = |writes: Vec<_>, at: u64, heartbeat: Option<u64>| Transaction {
+            writes,
+            at: Lsn(at),
+            progress: Lsn(at),
+            watched: Vec::new(),
+            schema: Vec::new(),
+            catalog: None,
+            received: std::time::Instant::now(),
+            committed_at_micros: 0,
+            heartbeat,
+            decode: Duration::ZERO,
+        };
+        commands
+            .send(Command::Transaction(step(vec![insert(1, "OPEN")], 10, None)))
+            .await
+            .expect("send");
+        commands
+            .send(Command::Transaction(step(Vec::new(), 10, Some(3))))
+            .await
+            .expect("send");
+        let (owner_seen, other_seen) = (drain(&mut owner).await, drain(&mut other).await);
+        for seen in [&owner_seen, &other_seen] {
+            assert_eq!(shapes(seen).first(), Some(&"committed"), "{:?}", shapes(seen));
+            assert_eq!(shapes(seen).last(), Some(&"heartbeat"), "{:?}", shapes(seen));
+            assert!(matches!(seen.last(), Some(Event::Heartbeat(3))));
+        }
     });
 }
 
@@ -725,6 +772,7 @@ fn a_serving_consumer_is_not_woken_for_nothing() {
                 catalog: None,
                 received: std::time::Instant::now(),
                 committed_at_micros: 0,
+                heartbeat: None,
                 decode: Duration::ZERO,
             }
         };

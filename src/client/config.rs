@@ -62,6 +62,11 @@ pub struct Config {
     /// `STREAMGRES_DDL_PREFIX`: the prefix of that trigger's logical
     /// messages (`<app>/<shard>/ddl`, so `zero/0/ddl`).
     pub ddl_prefix: String,
+    /// `STREAMGRES_HEARTBEAT_MS`: how often the engine writes a heartbeat
+    /// into the WAL to measure, end to end, how far behind it is (500; 0
+    /// sends none, and the S2S endpoint then reports no lag). Any role
+    /// may emit one; it needs the primary.
+    pub heartbeat: Duration,
     /// `STREAMGRES_SNAPSHOT_ROTATION_MS`: how often a fresh exported
     /// snapshot (a temporary replication slot) is minted for reads (1000).
     pub snapshot_rotation: Duration,
@@ -362,6 +367,7 @@ impl Config {
             schemas,
             slot: threads::slot_name(),
             slot_cleanup_age: millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
+            heartbeat: millis("STREAMGRES_HEARTBEAT_MS", 500)?,
             publication: first(&["STREAMGRES_PUBLICATION"])
                 .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
             ddl_trigger,
@@ -567,6 +573,7 @@ impl Config {
             ],
             ddl_trigger: self.ddl_trigger.clone(),
             ddl_prefix: self.ddl_prefix.clone(),
+            heartbeat: self.heartbeat,
         }
     }
 }
@@ -745,6 +752,13 @@ mod tests {
         ]);
         assert_eq!((set.s2s_max_disjuncts, set.s2s_max_list_values), (0, 7));
         assert!(config(&[("STREAMGRES_S2S_MAX_DISJUNCTS", "lots")]).is_err());
+    }
+
+    /// The engine beats every 500 ms unless told otherwise; 0 stops it.
+    #[test]
+    fn the_heartbeat_has_a_default() {
+        assert_eq!(config_with(&[]).heartbeat, Duration::from_millis(500));
+        assert_eq!(config_with(&[("STREAMGRES_HEARTBEAT_MS", "0")]).heartbeat, Duration::ZERO);
     }
 
     /// [`config`], expected to parse.

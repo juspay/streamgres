@@ -431,6 +431,7 @@ fn service_streams_end_to_end() {
                     catalog: None,
                     received: Instant::now(),
                     committed_at_micros: 0,
+                    heartbeat: None,
                     decode: std::time::Duration::ZERO,
                 }))
                 .await

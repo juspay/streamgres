@@ -694,6 +694,7 @@ impl Groups {
             Event::Refused { sub, reason } => self.refused(sub, &reason),
             Event::Capped { sub } => self.capped(sub),
             Event::Heavy { sub, table, rows } => self.heavy(sub, table.as_str(), rows),
+            Event::Heartbeat(_) => {}
             Event::Hydrated(subs) => {
                 for sub in subs {
                     let Some((group_id, hash)) = self.by_sub.get(&sub).cloned() else {

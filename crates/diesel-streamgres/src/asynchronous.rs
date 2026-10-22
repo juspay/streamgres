@@ -527,6 +527,11 @@ impl AsyncConnection for AsyncSyncedConnection {
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
             return self.tracked(live);
         }
+        if cache.subscriptions().behind() {
+            cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
+            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            return self.tracked(live);
+        }
         if !unknown.is_empty() {
             let live = self.inner.load(query);
             let live = self
@@ -598,6 +603,10 @@ impl AsyncConnection for AsyncSyncedConnection {
                 Verdict::Rows { rows, live: store } => {
                     guard.disarm();
                     cache.fill_live(reservation, store, &rows);
+                    if subscriptions.behind() {
+                        cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
+                        return live.await.map(Self::live_stream);
+                    }
                     served.store(2, Ordering::Release);
                     Ok(Self::cached_stream(rows))
                 }

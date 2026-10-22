@@ -428,7 +428,8 @@ where
     /// first touch; a read that fails leaves no entry, and the
     /// subscription ends with it rather than being held for nothing. The
     /// first miss through a cache reads which database the cache's reads
-    /// go to, which the engine side checks its engine streams.
+    /// go to, which the engine side checks its engine streams. While the
+    /// engine side is too far behind the database, reads go to Postgres.
     fn load<'conn, 'query, T>(
         &'conn mut self,
         source: T,
@@ -463,6 +464,10 @@ where
             cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
+        if cache.subscriptions().behind() {
+            cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
+            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+        }
         if let Some(rows) = cache.get(&key) {
             self.served = Some(Served::Cache);
             return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
@@ -481,6 +486,11 @@ where
             }
             Verdict::Rows { rows, live } => {
                 cache.fill_live(reservation, live, &rows);
+                if cache.subscriptions().behind() {
+                    cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
+                    return LoadConnection::<B>::load(&mut self.inner, source)
+                        .map(SyncedCursor::Live);
+                }
                 self.served = Some(Served::Engine);
                 return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
             }

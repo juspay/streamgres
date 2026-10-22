@@ -100,6 +100,11 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// nothing. A quiet socket is pinged three times in that time.
 pub const DEFAULT_SILENCE: Duration = Duration::from_secs(10);
 
+/// How far behind the database the engine may be, by its own heartbeats,
+/// before reads stop trusting the cache, when the environment says
+/// nothing.
+pub const DEFAULT_MAX_LAG: Duration = Duration::from_secs(2);
+
 /// How far a store's weight may drift from what its cache entry was
 /// weighed at, as a share of it (a quarter) and at least this many
 /// bytes, before the entry is weighed again.
@@ -113,6 +118,7 @@ const REWEIGH_BYTES: usize = 64 * 1024;
 /// | `STREAMGRES_S2S_MAX_SUBSCRIPTIONS`  | subscriptions held, all sockets    | 10000   |
 /// | `STREAMGRES_S2S_VERDICT_TIMEOUT_MS` | wait for `accepted` or `refused`   | 5000    |
 /// | `STREAMGRES_S2S_SILENCE_MS`         | a silent socket is taken for dead  | 10000   |
+/// | `STREAMGRES_S2S_MAX_LAG_MS`         | the engine's lag the cache allows; 0 trusts it | 2000 |
 /// | `STREAMGRES_S2S_TOKEN`              | bearer token the engine asks for   | none    |
 ///
 /// A number that is missing, not a number, or zero leaves the default;
@@ -124,6 +130,9 @@ pub struct Config {
     pub verdict_timeout: Duration,
     /// How long a socket may stay silent before it is taken for dead.
     pub silence: Duration,
+    /// How far behind the database the engine may be before reads go to
+    /// Postgres; zero trusts the cache whatever the engine says.
+    pub max_lag: Duration,
     /// Sent as `Authorization: Bearer <token>` when each socket opens,
     /// for an engine started with `STREAMGRES_S2S_TOKEN`.
     pub token: Option<String>,
@@ -137,6 +146,7 @@ impl std::fmt::Debug for Config {
             .field("max_subscriptions", &self.max_subscriptions)
             .field("verdict_timeout", &self.verdict_timeout)
             .field("silence", &self.silence)
+            .field("max_lag", &self.max_lag)
             .field("token", &self.token.as_ref().map(|_| ".."))
             .finish()
     }
@@ -150,6 +160,7 @@ impl Default for Config {
             max_subscriptions: DEFAULT_MAX_SUBSCRIPTIONS,
             verdict_timeout: DEFAULT_VERDICT_TIMEOUT,
             silence: DEFAULT_SILENCE,
+            max_lag: DEFAULT_MAX_LAG,
             token: None,
         }
     }
@@ -169,6 +180,12 @@ impl Config {
             silence: env_number("STREAMGRES_S2S_SILENCE_MS")
                 .map(|millis| Duration::from_millis(millis as u64))
                 .unwrap_or(defaults.silence),
+            max_lag: match std::env::var("STREAMGRES_S2S_MAX_LAG_MS").as_deref().map(str::trim) {
+                Ok("0") => Duration::ZERO,
+                _ => env_number("STREAMGRES_S2S_MAX_LAG_MS")
+                    .map(|millis| Duration::from_millis(millis as u64))
+                    .unwrap_or(defaults.max_lag),
+            },
             token: std::env::var("STREAMGRES_S2S_TOKEN")
                 .ok()
                 .filter(|token| !token.is_empty()),
@@ -218,6 +235,8 @@ struct Shared {
     token: Option<String>,
     /// How long a socket may stay silent before it is taken for dead.
     silence: Duration,
+    /// How far behind the engine may be before reads go to Postgres.
+    max_lag: Duration,
     /// Column types by table, learnt on the first rows-mode subscribe of
     /// a table and reused for every delta and resubscribe after; looked
     /// up again when a snapshot names a column they lack, which is how a
@@ -418,6 +437,9 @@ struct Worker {
     connect_error: Mutex<Option<String>>,
     /// What the engine on the socket said it streams, from its `hello`.
     greeting: Mutex<Greeting>,
+    /// The engine's lag as its latest `lag` frame said, and when that
+    /// came; `None` until one has, and while the engine measures none.
+    lag: Mutex<Option<(Duration, Instant)>>,
     state: Mutex<WorkerState>,
     shared: Arc<Shared>,
 }
@@ -478,6 +500,7 @@ impl EngineClient {
             max_subscriptions: config.max_subscriptions,
             token: config.token.clone(),
             silence: config.silence,
+            max_lag: config.max_lag,
             types: Mutex::new(HashMap::new()),
             fallbacks: Mutex::new(Vec::new()),
             refusals: Mutex::new(Vec::new()),
@@ -641,6 +664,12 @@ impl EngineClient {
         }
     }
 
+    /// How far behind the database the engine is, by its heartbeats: the
+    /// most any connected socket says, `None` when none says.
+    pub fn lag(&self) -> Option<Duration> {
+        self.pool.workers.iter().filter_map(|worker| worker.lag()).max()
+    }
+
     /// Why each socket that is down failed to connect, for those that
     /// have tried and failed.
     pub fn connect_errors(&self) -> Vec<String> {
@@ -715,6 +744,13 @@ impl Subscriptions for EngineClient {
             .any(|transient| reason.starts_with(transient))
     }
 
+    /// Whether the engine is further behind the database than
+    /// [`Config::max_lag`] allows, on any socket that says how far.
+    fn behind(&self) -> bool {
+        let max = self.pool.shared.max_lag;
+        !max.is_zero() && self.lag().is_some_and(|lag| lag > max)
+    }
+
     /// Releases the key from the routing map and its worker.
     fn unsubscribe(&self, key: &QueryKey) {
         let worker = self
@@ -752,6 +788,7 @@ impl Worker {
             room: AtomicUsize::new(0),
             connect_error: Mutex::new(None),
             greeting: Mutex::new(Greeting::Waiting),
+            lag: Mutex::new(None),
             state: Mutex::new(WorkerState {
                 next_id: 1,
                 by_key: HashMap::new(),
@@ -1088,6 +1125,18 @@ impl Worker {
         held
     }
 
+    /// How far behind the engine on this socket is: what it last said,
+    /// and the time since it said it, so an engine that stops saying
+    /// anything (frozen, or its frames held up) counts as falling further
+    /// behind; `None` when it has said nothing measurable.
+    fn lag(&self) -> Option<Duration> {
+        if !self.connected.load(Ordering::Acquire) {
+            return None;
+        }
+        let (lag, heard) = (*self.lag.lock().expect("lag"))?;
+        Some(lag + heard.elapsed())
+    }
+
     /// Records why the latest connect failed, or that one succeeded.
     fn connect_failed(&self, error: Option<String>) {
         *self.connect_error.lock().expect("connect_error") = error;
@@ -1334,6 +1383,7 @@ fn disconnected(worker: &Worker) {
         let mut state = worker.state.lock().expect("state");
         worker.connected.store(false, Ordering::Release);
         *worker.greeting.lock().expect("greeting") = Greeting::Waiting;
+        *worker.lag.lock().expect("lag") = None;
         state.materialized.clear();
         let mut waiting: Vec<SyncSender<Reply>> = Vec::new();
         let mut released: Vec<QueryKey> = Vec::new();
@@ -1392,6 +1442,7 @@ fn inbound(worker: &Worker, text: &str) {
         "refused" => on_refused(worker, &body),
         "delta" => on_delta(worker, body),
         "touched" => on_touched(worker, &body),
+        "lag" => on_lag(worker, &body),
         _ => {}
     }
 }
@@ -1589,6 +1640,16 @@ fn on_delta(worker: &Worker, body: Json) {
     }
 }
 
+/// `lag`: how far behind the database the engine is, by its heartbeats;
+/// `null` while it measures none.
+fn on_lag(worker: &Worker, body: &Json) {
+    let lag = body
+        .get("ms")
+        .and_then(Json::as_u64)
+        .map(|ms| (Duration::from_millis(ms), Instant::now()));
+    *worker.lag.lock().expect("lag") = lag;
+}
+
 /// `touched`: every named subscription's key goes stale.
 fn on_touched(worker: &Worker, body: &Json) {
     let Some(ids) = body.get("ids").and_then(Json::as_array) else {
@@ -1635,6 +1696,7 @@ mod tests {
             max_subscriptions: 100,
             token: None,
             silence: DEFAULT_SILENCE,
+            max_lag: DEFAULT_MAX_LAG,
             types: Mutex::new(HashMap::new()),
             fallbacks: Mutex::new(Vec::new()),
             refusals: Mutex::new(Vec::new()),
@@ -1970,6 +2032,53 @@ mod tests {
         inbound(&worker, &json!(["accepted", {"id": 1}]).to_string());
         assert!(matches!(outgoing.try_recv(), Ok(Outgoing::Unsubscribe { id: 1 })));
         assert!(worker.state.lock().unwrap().by_id.is_empty(), "the key is let go");
+    }
+
+    /// The engine's lag is what its latest frame said plus the time since,
+    /// so an engine that stops reporting counts as falling further behind;
+    /// none is known until a frame says, nor while it says `null`, nor
+    /// once the socket drops.
+    #[test]
+    fn the_lag_grows_while_the_engine_says_nothing() {
+        let (worker, _outgoing, _shared) = worker();
+        assert_eq!(worker.lag(), None);
+        inbound(&worker, &json!(["lag", {"ms": null}]).to_string());
+        assert_eq!(worker.lag(), None);
+        inbound(&worker, &json!(["lag", {"ms": 1500}]).to_string());
+        let lag = worker.lag().expect("said");
+        assert!(lag >= Duration::from_millis(1500) && lag < Duration::from_millis(1600), "{lag:?}");
+        *worker.lag.lock().unwrap() = Some((Duration::from_millis(1500), Instant::now() - Duration::from_secs(1)));
+        assert!(worker.lag().unwrap() >= Duration::from_millis(2500), "a second of silence adds a second");
+        disconnected(&worker);
+        assert_eq!(worker.lag(), None, "a dropped socket says nothing");
+    }
+
+    /// Reads stop trusting the cache once the engine is further behind
+    /// than the limit, and trust it again when it catches up; a zero
+    /// limit always trusts it.
+    #[test]
+    fn a_lagging_engine_sends_reads_to_postgres() {
+        let client = EngineClient::with_config("ws://127.0.0.1:1/never/s2s/v1", Config::default());
+        let worker = &client.pool.workers[0];
+        worker.connected.store(true, Ordering::Release);
+        assert!(!client.behind(), "no frame, no lag");
+        inbound(worker, &json!(["lag", {"ms": 50}]).to_string());
+        assert!(!client.behind());
+        inbound(worker, &json!(["lag", {"ms": 2500}]).to_string());
+        assert!(client.behind());
+        assert!(client.lag().unwrap() >= Duration::from_millis(2500));
+        inbound(worker, &json!(["lag", {"ms": 0}]).to_string());
+        assert!(!client.behind(), "caught up");
+        let trusting = EngineClient::with_config(
+            "ws://127.0.0.1:1/never/s2s/v1",
+            Config {
+                max_lag: Duration::ZERO,
+                ..Config::default()
+            },
+        );
+        trusting.pool.workers[0].connected.store(true, Ordering::Release);
+        inbound(&trusting.pool.workers[0], &json!(["lag", {"ms": 60000}]).to_string());
+        assert!(!trusting.behind());
     }
 
     /// This client's own refusal reasons all pass; the engine's are final.

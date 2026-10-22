@@ -95,8 +95,23 @@ async fn send(socket: &mut Socket, frame: Value) {
         .expect("send");
 }
 
-/// The next text frame within `wait`, if any.
+/// The next text frame within `wait` that is not a `lag`, which the
+/// engine sends on its own every 500 ms; `None` on a close or when none
+/// came.
 async fn next(socket: &mut Socket, wait: Duration) -> Option<Value> {
+    let deadline = Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let frame = next_any(socket, left).await?;
+        if tag(&frame) != "lag" {
+            return Some(frame);
+        }
+    }
+}
+
+/// The next text frame within `wait`, a `lag` included; `None` on a
+/// close or when none came.
+async fn next_any(socket: &mut Socket, wait: Duration) -> Option<Value> {
     let deadline = Instant::now() + wait;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -198,6 +213,11 @@ async fn the_endpoint_speaks_its_protocol() {
     let hello = expect(&mut socket, "hello").await;
     assert_eq!(tag(&hello), "hello");
     assert_eq!(hello[1]["protocol"], 1);
+    let lag = next_any(&mut socket, Duration::from_secs(5))
+        .await
+        .expect("a lag frame");
+    assert_eq!(tag(&lag), "lag", "the lag comes before any answer: {lag}");
+    assert!(lag[1]["ms"].is_u64() || lag[1]["ms"].is_null(), "{lag}");
     assert!(
         hello[1]["database"]["system"].is_string() && hello[1]["database"]["name"].is_string(),
         "the engine names the database it streams: {hello}"

@@ -94,8 +94,10 @@ curl -s localhost:8080/stats | jq
 how many times the engine's deltas replaced cached rows; `touched` how
 many times a change made the cache refill from Postgres (the `interval`
 query); `after_write` the reads sent to Postgres inside the
-read-your-writes window; `engine.materialized` the queries served from
-engine rows rather than refills; `writer` how many changes of each kind
+read-your-writes window; `lagging` the reads sent to Postgres because the
+engine was more than two seconds behind the database, as `engine.lag_ms`
+measures it; `engine.materialized` the queries served from engine rows
+rather than refills; `writer` how many changes of each kind
 the background writer made; `verify` what the self-check found.
 
 ## 7. The demo checks itself
