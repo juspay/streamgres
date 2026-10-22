@@ -13,10 +13,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::schema::{agents, attachments, comments, organizations, tickets};
 
+/// The `ticket_status` enum type.
 #[derive(diesel::sql_types::SqlType, diesel::query_builder::QueryId)]
 #[diesel(postgres_type(name = "ticket_status"))]
 pub struct TicketStatusType;
 
+/// The `ticket_priority` enum type.
 #[derive(diesel::sql_types::SqlType, diesel::query_builder::QueryId)]
 #[diesel(postgres_type(name = "ticket_priority"))]
 pub struct TicketPriorityType;
@@ -42,12 +44,14 @@ macro_rules! pg_enum {
         impl $name {
             pub const ALL: &'static [$name] = &[$($name::$variant),+];
 
+            /// The label Postgres knows the variant by.
             pub fn label(self) -> &'static str {
                 match self {
                     $($name::$variant => $label),+
                 }
             }
 
+            /// The variant a label names.
             pub fn parse(label: &str) -> Option<$name> {
                 match label {
                     $($label => Some($name::$variant),)+
@@ -57,6 +61,7 @@ macro_rules! pg_enum {
         }
 
         impl ToSql<$sql, Pg> for $name {
+            /// The label, as Postgres's binary format sends an enum.
             fn to_sql<'b>(&'b self, out: &mut Output<'b, '_, Pg>) -> serialize::Result {
                 out.write_all(self.label().as_bytes())?;
                 Ok(IsNull::No)
@@ -64,6 +69,7 @@ macro_rules! pg_enum {
         }
 
         impl FromSql<$sql, Pg> for $name {
+            /// The variant the label names.
             fn from_sql(value: PgValue<'_>) -> deserialize::Result<Self> {
                 let text = std::str::from_utf8(value.as_bytes())?;
                 Self::parse(text).ok_or_else(|| format!("not a {}: {text}", stringify!($name)).into())
@@ -87,6 +93,7 @@ impl TicketStatus {
     }
 }
 
+/// An organization.
 #[derive(Queryable, Selectable, Serialize, Debug, Clone, PartialEq)]
 #[diesel(table_name = organizations)]
 pub struct Organization {
@@ -95,6 +102,7 @@ pub struct Organization {
     pub name: String,
 }
 
+/// An agent of an organization.
 #[derive(Queryable, Selectable, Serialize, Debug, Clone, PartialEq)]
 #[diesel(table_name = agents)]
 pub struct Agent {
@@ -104,6 +112,7 @@ pub struct Agent {
     pub skills: Vec<String>,
 }
 
+/// A ticket.
 #[derive(Queryable, Selectable, Serialize, Debug, Clone, PartialEq)]
 #[diesel(table_name = tickets)]
 pub struct Ticket {
@@ -117,6 +126,7 @@ pub struct Ticket {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A comment on a ticket.
 #[derive(Queryable, Selectable, Serialize, Debug, Clone, PartialEq)]
 #[diesel(table_name = comments)]
 pub struct Comment {
@@ -127,6 +137,7 @@ pub struct Comment {
     pub created_at: DateTime<Utc>,
 }
 
+/// A file attached to a ticket.
 #[derive(Queryable, Selectable, Serialize, Debug, Clone, PartialEq)]
 #[diesel(table_name = attachments)]
 pub struct Attachment {
@@ -137,7 +148,8 @@ pub struct Attachment {
     pub data: Vec<u8>,
 }
 
-/// A ticket with the column `demo migrate new-type` adds.
+/// A ticket with its `sla`, an `interval` the wrapper cannot encode:
+/// the query reading it is refilled from Postgres on each change.
 #[derive(Queryable, Selectable, Serialize, Debug, Clone, PartialEq)]
 #[diesel(table_name = crate::schema::tickets_with_kind)]
 pub struct TicketOfKind {
@@ -186,6 +198,7 @@ pub struct TicketSla {
 }
 
 impl TicketSla {
+    /// The row as read, its interval in seconds.
     pub fn from_row((id, title, sla): (i64, String, Option<PgInterval>)) -> TicketSla {
         TicketSla {
             id,
@@ -195,6 +208,7 @@ impl TicketSla {
     }
 }
 
+/// Bytes as hex text in JSON.
 fn hex<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
     let text: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     serializer.serialize_str(&text)

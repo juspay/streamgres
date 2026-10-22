@@ -25,16 +25,21 @@ use diesel_streamgres::cache::Cache;
 use diesel_streamgres::engine::EngineClient;
 use diesel_streamgres::{Consistency, SyncedConnection};
 
+/// The value column, read by name.
 #[derive(QueryableByName)]
 struct Val {
     #[diesel(sql_type = Text)]
     v: String,
 }
 
+/// A variable from the environment, unless empty.
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+/// How long a commit takes to reach a refilled read, against a live engine
+/// and a table the environment names; skipped unless it is named.
+/// The row is put back afterwards.
 #[test]
 fn commit_to_refilled_read_latency() {
     let (Some(url), Some(database), Some(table), Some(key_column), Some(value_column), Some(row_key)) = (
@@ -109,7 +114,6 @@ fn commit_to_refilled_read_latency() {
         }
         took.push((committed.elapsed(), started.elapsed()));
     }
-    // Restore the row.
     sql_query(&update)
         .bind::<Text, _>(&original)
         .bind::<Text, _>(&row_key)

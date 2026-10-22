@@ -29,6 +29,8 @@ use streamgres_demo::queries::{Expected, Lookup, SyncConn};
 use streamgres_demo::schema::tickets;
 use streamgres_demo::{seed, verify, writer};
 
+/// The demo against a live Postgres and engine: the wrappers on one
+/// cache, and a plain connection for the truth and the changes.
 struct Live {
     cache: Arc<Cache>,
     engine: EngineClient,
@@ -98,6 +100,7 @@ impl Live {
         })
     }
 
+    /// One of the cache's counters now.
     fn stat(&self, counter: &AtomicU64) -> u64 {
         AtomicU64::load(counter, Ordering::Relaxed)
     }
@@ -108,6 +111,7 @@ impl Live {
             .with_route(Route::Postgres, |conn| lookup.run_sync(conn).unwrap())
     }
 
+    /// Runs `sql` on the plain connection, as another service would.
     async fn change(&mut self, sql: &str) {
         sql_query(sql)
             .execute(&mut self.plain)

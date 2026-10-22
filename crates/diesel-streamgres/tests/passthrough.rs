@@ -27,6 +27,7 @@ diesel::table! {
     }
 }
 
+/// A row as read.
 #[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
 #[diesel(table_name = sg_items)]
 struct Item {
@@ -39,6 +40,7 @@ struct Item {
     created: chrono::DateTime<chrono::Utc>,
 }
 
+/// A row to insert.
 #[derive(Insertable)]
 #[diesel(table_name = sg_items)]
 struct NewItem<'a> {
@@ -61,6 +63,7 @@ const SCHEMA: &str = "
     );
 ";
 
+/// The test database's URL.
 fn url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres:///diesel_streamgres_test?host=/tmp".to_string())
@@ -85,6 +88,7 @@ fn conn() -> SyncedConnection<PgConnection> {
     conn
 }
 
+/// Inserts three rows and returns them as read.
 fn seed(conn: &mut SyncedConnection<PgConnection>) -> Vec<Item> {
     let rows = vec![
         NewItem {
@@ -115,6 +119,7 @@ fn seed(conn: &mut SyncedConnection<PgConnection>) -> Vec<Item> {
         .expect("seed")
 }
 
+/// The wrapper loads rows exactly as the inner connection does.
 #[test]
 fn loads_rows_exactly_like_the_inner_connection() {
     let mut conn = conn();
@@ -141,6 +146,7 @@ fn loads_rows_exactly_like_the_inner_connection() {
     assert_eq!(through_wrapper[0].payload["len_mm"], 20);
 }
 
+/// `first` and `count` go through.
 #[test]
 fn first_and_count_go_through() {
     let mut conn = conn();
@@ -166,6 +172,7 @@ fn first_and_count_go_through() {
     assert_eq!(missing, None);
 }
 
+/// Writes return their counts and their `RETURNING` rows.
 #[test]
 fn writes_return_counts_and_returning_rows() {
     let mut conn = conn();
@@ -196,6 +203,9 @@ fn writes_return_counts_and_returning_rows() {
     assert_eq!(left, vec!["bolt", "spring washer"]);
 }
 
+/// Transactions roll back and nest through the wrapper: a failed
+/// transaction undoes its delete, and a nested savepoint that succeeds
+/// inside one that fails is undone with it.
 #[test]
 fn transactions_roll_back_and_nest_through_the_wrapper() {
     let mut conn = conn();
@@ -212,7 +222,6 @@ fn transactions_roll_back_and_nest_through_the_wrapper() {
     let count: i64 = sg_items::table.count().get_result(&mut conn).expect("count");
     assert_eq!(count, 3, "the inner transaction's delete was rolled back");
 
-    // A nested savepoint that succeeds inside one that fails.
     let outer: Result<(), diesel::result::Error> = conn.transaction(|c| {
         c.transaction(|c| {
             diesel::insert_into(sg_items::table)
@@ -235,6 +244,7 @@ fn transactions_roll_back_and_nest_through_the_wrapper() {
     assert_eq!(count, 3, "the outer rollback also undid the nested insert");
 }
 
+/// Two columns read by name.
 #[derive(QueryableByName, Debug, PartialEq)]
 struct NameQty {
     #[diesel(sql_type = Text)]
@@ -243,6 +253,7 @@ struct NameQty {
     qty: i32,
 }
 
+/// Raw SQL read by column name goes through.
 #[test]
 fn raw_sql_queries_by_name_go_through() {
     let mut conn = conn();
@@ -261,6 +272,7 @@ fn raw_sql_queries_by_name_go_through() {
     );
 }
 
+/// Postgres's row-by-row loading mode goes through.
 #[test]
 fn row_by_row_loading_mode_goes_through() {
     let mut conn = conn();
@@ -276,6 +288,7 @@ fn row_by_row_loading_mode_goes_through() {
     assert_eq!(names, vec!["bolt", "washer", "nut"]);
 }
 
+/// An r2d2 pool hands out wrapped connections, and takes them back.
 #[test]
 fn a_pool_hands_out_wrapped_connections() {
     let pool: Pool<ConnectionManager<SyncedConnection<PgConnection>>> = Pool::builder()
@@ -297,9 +310,11 @@ fn a_pool_hands_out_wrapped_connections() {
     assert!(pool.get_timeout(std::time::Duration::from_millis(500)).is_ok());
 }
 
+/// Counts the queries the connection starts.
 struct CountQueries(Arc<AtomicUsize>);
 
 impl Instrumentation for CountQueries {
+    /// Counts a query start.
     fn on_connection_event(&mut self, event: InstrumentationEvent<'_>) {
         if let InstrumentationEvent::StartQuery { .. } = event {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -307,6 +322,8 @@ impl Instrumentation for CountQueries {
     }
 }
 
+/// Instrumentation set on the wrapper sees the inner connection's
+/// queries.
 #[test]
 fn instrumentation_reaches_the_inner_connection() {
     let mut conn = conn();
@@ -319,6 +336,7 @@ fn instrumentation_reaches_the_inner_connection() {
     assert_eq!(started.load(Ordering::SeqCst), 2, "one insert, one count");
 }
 
+/// The wrapper resolves type metadata as the inner connection does.
 #[test]
 fn the_wrapper_resolves_type_metadata_like_the_inner_connection() {
     let mut conn = conn();

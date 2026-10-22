@@ -25,6 +25,7 @@ use streamgres_demo::pools::Stack;
 use streamgres_demo::queries::Lookup;
 use streamgres_demo::{api, bench, lag, seed, verify, writer};
 
+/// The demo's command line.
 #[derive(Parser)]
 #[command(
     name = "demo",
@@ -35,6 +36,7 @@ struct Cli {
     command: Command,
 }
 
+/// What the demo does.
 #[derive(Subcommand)]
 enum Command {
     /// Serves the HTTP API and the stats page.
@@ -90,10 +92,12 @@ enum Command {
     Migrate { step: String },
 }
 
+/// A required variable from the environment.
 fn env(name: &str) -> Result<String, String> {
     std::env::var(name).map_err(|_| format!("{name} is not set"))
 }
 
+/// Runs the command; exits 1 with the reason when it fails.
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
@@ -119,6 +123,7 @@ fn env_number(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Runs the command the line names.
 async fn run() -> Result<(), String> {
     match Cli::parse().command {
         Command::Seed => {
@@ -296,6 +301,7 @@ async fn run() -> Result<(), String> {
     }
 }
 
+/// A duration in microseconds, for a report line.
 fn micros(duration: Duration) -> String {
     format!("{}µs", duration.as_micros())
 }

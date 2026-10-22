@@ -180,6 +180,11 @@ async fn frames_for(socket: &mut Socket, wait: Duration) -> Vec<Value> {
     frames
 }
 
+/// The endpoint speaks its protocol against a live Postgres: `hello`
+/// and `pong`; `accepted` with the rows and the query's shape in rows
+/// mode, without them otherwise; `refused` with the id and the reason;
+/// a commit's `delta` and `touched`; an unsubscribed id no longer told;
+/// and `error` for a frame it cannot read.
 #[tokio::test]
 async fn the_endpoint_speaks_its_protocol() {
     let Some((url, dsn)) = targets() else {

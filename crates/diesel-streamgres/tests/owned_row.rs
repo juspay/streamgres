@@ -22,6 +22,7 @@ diesel::table! {
     }
 }
 
+/// A row of every column type the capture must keep.
 #[derive(Queryable, Selectable, Insertable, Debug, PartialEq, Clone)]
 #[diesel(table_name = sg_items)]
 struct Item {
@@ -34,11 +35,14 @@ struct Item {
     created: chrono::DateTime<chrono::Utc>,
 }
 
+/// The test database's URL.
 fn url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres:///diesel_streamgres_test?host=/tmp".to_string())
 }
 
+/// A wrapped connection inside a test transaction, the table created
+/// once.
 fn conn() -> SyncedConnection<PgConnection> {
     static SCHEMA_READY: std::sync::Once = std::sync::Once::new();
     SCHEMA_READY.call_once(|| {
@@ -56,6 +60,8 @@ fn conn() -> SyncedConnection<PgConnection> {
     conn
 }
 
+/// Three rows covering NULLs, empty and quoted array items, JSON and
+/// microsecond times; returns them as read live.
 fn seed(conn: &mut SyncedConnection<PgConnection>) -> Vec<Item> {
     conn.batch_execute(
         "INSERT INTO sg_items (name, qty, note, tags, payload, created) VALUES
@@ -81,6 +87,7 @@ fn captured(conn: &mut SyncedConnection<PgConnection>) -> Vec<OwnedRow> {
     capture_all(cursor).expect("capture")
 }
 
+/// A captured row decodes exactly as the live row did.
 #[test]
 fn a_captured_row_decodes_like_the_live_one() {
     let mut conn = conn();
@@ -98,6 +105,7 @@ fn a_captured_row_decodes_like_the_live_one() {
     assert_eq!(decoded[0].created.timestamp_subsec_micros(), 123456);
 }
 
+/// The rows of one result share one list of column names.
 #[test]
 fn rows_of_one_result_share_their_column_names() {
     let mut conn = conn();
@@ -112,6 +120,7 @@ fn rows_of_one_result_share_their_column_names() {
     assert!(rows[0].byte_len() > 0);
 }
 
+/// Three columns read by name, in another order than selected.
 #[derive(QueryableByName, Debug, PartialEq)]
 struct NameNote {
     #[diesel(sql_type = Text)]
@@ -122,6 +131,7 @@ struct NameNote {
     qty: i32,
 }
 
+/// A captured row decodes by column name.
 #[test]
 fn a_captured_row_decodes_by_column_name() {
     let mut conn = conn();
@@ -146,6 +156,7 @@ fn a_captured_row_decodes_by_column_name() {
     );
 }
 
+/// An owned cursor yields its rows in order, and knows how many.
 #[test]
 fn an_owned_cursor_yields_the_rows_in_order() {
     let mut conn = conn();
@@ -157,6 +168,7 @@ fn an_owned_cursor_yields_the_rows_in_order() {
     assert_eq!(back, rows);
 }
 
+/// A nested tuple reads its part of the row.
 #[test]
 fn nested_tuples_read_partial_rows() {
     let mut conn = conn();

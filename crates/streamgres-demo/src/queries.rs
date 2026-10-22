@@ -33,7 +33,9 @@ use crate::models::{
 };
 use crate::schema::{agents, attachments, comments, tickets, tickets_with_kind};
 
+/// The blocking wrapper the lookups run on.
 pub type SyncConn = SyncedConnection<PgConnection>;
+/// The async wrapper the lookups run on.
 pub type AsyncConn = AsyncSyncedConnection;
 
 /// Tickets per page of a queue.
@@ -432,29 +434,41 @@ where
     diesel_async::RunQueryDsl::load(query, conn).boxed()
 }
 
+/// Tickets, as the API serves them.
 type TicketQuery = tickets::BoxedQuery<'static, Pg, AsSelect<Ticket, Pg>>;
+/// A count of tickets.
 type CountQuery = tickets::BoxedQuery<'static, Pg, BigInt>;
+/// Tickets with their `interval` SLA.
 type SlaQuery = tickets::BoxedQuery<'static, Pg, (Int8, Text, Nullable<Interval>)>;
+/// Agents.
 type AgentsQuery = agents::BoxedQuery<'static, Pg, AsSelect<Agent, Pg>>;
+/// An attachment, `bytea` and all.
 type AttachmentQuery = attachments::BoxedQuery<'static, Pg, AsSelect<Attachment, Pg>>;
+/// Ticket statuses.
 type StatusesQuery = tickets::BoxedQuery<'static, Pg, TicketStatusType>;
+/// The latest update time.
 type LastActivityQuery = tickets::BoxedQuery<'static, Pg, Nullable<Timestamptz>>;
+/// Tickets with the kind a migration adds.
 type OfKindQuery = tickets_with_kind::BoxedQuery<'static, Pg, AsSelect<TicketOfKind, Pg>>;
+/// Tickets joined to their comments.
 type CommentsQuery = BoxedSelectStatement<
     'static,
     (Int8, Text, Int8, Text, Timestamptz),
     FromClause<InnerJoinQuerySource<tickets::table, comments::table>>,
     Pg,
 >;
+/// Comments left-joined to their authors.
 type AuthorsQuery = BoxedSelectStatement<
     'static,
     (Int8, Text, Nullable<Text>),
     FromClause<LeftJoinQuerySource<comments::table, agents::table>>,
     Pg,
 >;
+/// Raw SQL with its binds.
 type WorkloadQuery =
     diesel::query_builder::BoxedSqlQuery<'static, Pg, diesel::query_builder::SqlQuery>;
 
+/// One ticket by id.
 fn ticket(id: i64) -> TicketQuery {
     tickets::table
         .filter(tickets::id.eq(id))
@@ -462,6 +476,8 @@ fn ticket(id: i64) -> TicketQuery {
         .into_boxed()
 }
 
+/// A page of an organization's queue, newest first: an enum bound as
+/// an array, and an offset.
 fn queue(org: i64, statuses: Vec<TicketStatus>, page: i64) -> TicketQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -473,6 +489,7 @@ fn queue(org: i64, statuses: Vec<TicketStatus>, page: i64) -> TicketQuery {
         .into_boxed()
 }
 
+/// How many tickets the queue holds: a `COUNT(*)`.
 fn queue_count(org: i64, statuses: Vec<TicketStatus>) -> CountQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -481,6 +498,7 @@ fn queue_count(org: i64, statuses: Vec<TicketStatus>) -> CountQuery {
         .into_boxed()
 }
 
+/// A ticket's comments: an inner join, ordered by both keys.
 fn ticket_comments(ticket: i64) -> CommentsQuery {
     tickets::table
         .inner_join(comments::table)
@@ -496,6 +514,7 @@ fn ticket_comments(ticket: i64) -> CommentsQuery {
         .into_boxed()
 }
 
+/// One attachment: a `bytea`.
 fn attachment(id: i64) -> AttachmentQuery {
     attachments::table
         .filter(attachments::id.eq(id))
@@ -503,6 +522,7 @@ fn attachment(id: i64) -> AttachmentQuery {
         .into_boxed()
 }
 
+/// An organization's agents: a `text[]` column.
 fn org_agents(org: i64) -> AgentsQuery {
     agents::table
         .filter(agents::org_id.eq(org))
@@ -511,6 +531,7 @@ fn org_agents(org: i64) -> AgentsQuery {
         .into_boxed()
 }
 
+/// Tickets with an SLA: an `interval` the wrapper cannot encode.
 fn sla(org: i64) -> SlaQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -520,6 +541,7 @@ fn sla(org: i64) -> SlaQuery {
         .into_boxed()
 }
 
+/// Tickets whose title matches: `ILIKE`, which the engine refuses.
 fn search(org: i64, pattern: String) -> TicketQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -529,6 +551,7 @@ fn search(org: i64, pattern: String) -> TicketQuery {
         .into_boxed()
 }
 
+/// The most recently updated tickets: a limit.
 fn recent(org: i64, limit: i64) -> TicketQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -538,6 +561,7 @@ fn recent(org: i64, limit: i64) -> TicketQuery {
         .into_boxed()
 }
 
+/// One ticket by organization and id: a two-column condition.
 fn org_ticket(org: i64, id: i64) -> TicketQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -546,6 +570,7 @@ fn org_ticket(org: i64, id: i64) -> TicketQuery {
         .into_boxed()
 }
 
+/// Tickets with no agent: `IS NULL`.
 fn unassigned(org: i64) -> TicketQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -555,6 +580,7 @@ fn unassigned(org: i64) -> TicketQuery {
         .into_boxed()
 }
 
+/// High-priority or pending tickets: an `OR`.
 fn escalated(org: i64) -> TicketQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -568,6 +594,7 @@ fn escalated(org: i64) -> TicketQuery {
         .into_boxed()
 }
 
+/// Open tickets but the named ones: `!= ALL`.
 fn open_except(org: i64, except: Vec<i64>) -> TicketQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -578,6 +605,7 @@ fn open_except(org: i64, except: Vec<i64>) -> TicketQuery {
         .into_boxed()
 }
 
+/// Tickets created in a range: a timestamp range.
 fn created_between(org: i64, from: DateTime<Utc>, to: DateTime<Utc>) -> TicketQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -588,6 +616,7 @@ fn created_between(org: i64, from: DateTime<Utc>, to: DateTime<Utc>) -> TicketQu
         .into_boxed()
 }
 
+/// Tickets by id: an `IN` list of up to a hundred.
 fn many(ids: Vec<i64>) -> TicketQuery {
     tickets::table
         .filter(tickets::id.eq_any(ids))
@@ -596,10 +625,12 @@ fn many(ids: Vec<i64>) -> TicketQuery {
         .into_boxed()
 }
 
+/// A page past the end of the queue: an empty result.
 fn queue_end(org: i64) -> TicketQuery {
     queue(org, TicketStatus::ALL.to_vec(), 1000)
 }
 
+/// A condition no ticket meets: an empty result.
 fn nothing(org: i64) -> TicketQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -609,6 +640,7 @@ fn nothing(org: i64) -> TicketQuery {
         .into_boxed()
 }
 
+/// Every ticket of an organization.
 fn all_tickets(org: i64) -> TicketQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -617,6 +649,7 @@ fn all_tickets(org: i64) -> TicketQuery {
         .into_boxed()
 }
 
+/// A ticket's comments and their authors: a left join.
 fn comment_authors(ticket: i64) -> AuthorsQuery {
     comments::table
         .left_join(agents::table)
@@ -626,6 +659,8 @@ fn comment_authors(ticket: i64) -> AuthorsQuery {
         .into_boxed()
 }
 
+/// Agents with a skill: the array operator `@>`, which the engine
+/// refuses.
 fn skilled(org: i64, skill: String) -> AgentsQuery {
     agents::table
         .filter(agents::org_id.eq(org))
@@ -635,6 +670,7 @@ fn skilled(org: i64, skill: String) -> AgentsQuery {
         .into_boxed()
 }
 
+/// The statuses in use: `DISTINCT`, which the engine refuses.
 fn statuses(org: i64) -> StatusesQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -644,6 +680,7 @@ fn statuses(org: i64) -> StatusesQuery {
         .into_boxed()
 }
 
+/// Tickets per agent: `GROUP BY`, which the engine refuses.
 fn workload(org: i64) -> WorkloadQuery {
     diesel::sql_query(
         "SELECT agent_id, COUNT(*) AS tickets FROM tickets WHERE org_id = $1 \
@@ -653,6 +690,7 @@ fn workload(org: i64) -> WorkloadQuery {
     .bind::<BigInt, _>(org)
 }
 
+/// The latest update: `MAX`, which the engine refuses.
 fn last_activity(org: i64) -> LastActivityQuery {
     tickets::table
         .filter(tickets::org_id.eq(org))
@@ -660,6 +698,7 @@ fn last_activity(org: i64) -> LastActivityQuery {
         .into_boxed()
 }
 
+/// Tickets of a kind: an enum created after the engine started.
 fn of_kind(org: i64, kind: TicketKind) -> OfKindQuery {
     tickets_with_kind::table
         .filter(tickets_with_kind::org_id.eq(org))

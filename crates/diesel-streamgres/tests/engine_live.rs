@@ -25,6 +25,7 @@ diesel::table! {
     }
 }
 
+/// A config row.
 #[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
 #[diesel(table_name = sg_configs)]
 struct Config {
@@ -33,6 +34,9 @@ struct Config {
     value: String,
 }
 
+/// One test against a live engine: the wrapped connection and its
+/// cache, the engine client, a plain connection for changes, and the
+/// prefix of its keys.
 struct Live {
     conn: SyncedConnection<PgConnection>,
     cache: Arc<Cache>,
@@ -42,6 +46,8 @@ struct Live {
 }
 
 impl Live {
+    /// Connects to the engine `STREAMGRES_S2S_URL` names; `None`, and the
+    /// test skipped, when it names none.
     fn start(name: &str) -> Option<Live> {
         let Ok(url) = std::env::var("STREAMGRES_S2S_URL") else {
             eprintln!("STREAMGRES_S2S_URL not set; skipping");
@@ -75,10 +81,12 @@ impl Live {
         })
     }
 
+    /// A key of this test's.
     fn key(&self, name: &str) -> String {
         format!("{}{name}", self.prefix)
     }
 
+    /// Sets a key on the plain connection, as another service would.
     fn put(&mut self, name: &str, value: &str) {
         let key = self.key(name);
         diesel::insert_into(sg_configs::table)
@@ -90,6 +98,7 @@ impl Live {
             .expect("put");
     }
 
+    /// A key's value through the wrapper.
     fn read(&mut self, name: &str) -> Option<String> {
         let key = self.key(name);
         sg_configs::table
@@ -121,6 +130,7 @@ fn changes(cache: &Cache) -> u64 {
 }
 
 impl Drop for Live {
+    /// Deletes this test's keys.
     fn drop(&mut self) {
         let _ = diesel::delete(
             sg_configs::table.filter(sg_configs::key.like(format!("{}%", self.prefix))),
@@ -129,6 +139,8 @@ impl Drop for Live {
     }
 }
 
+/// A commit the engine reports makes the next read current: an update,
+/// a delete, and a row appearing under the key the query asks for.
 #[test]
 fn a_commit_the_engine_reports_refills_the_cache() {
     let Some(mut live) = Live::start("refill") else {
@@ -161,7 +173,6 @@ fn a_commit_the_engine_reports_refills_the_cache() {
         "a change keeps the subscription"
     );
 
-    // A delete is a change too.
     diesel::delete(sg_configs::table.filter(sg_configs::key.eq(live.key("rate"))))
         .execute(&mut live.other)
         .expect("delete");
@@ -174,12 +185,12 @@ fn a_commit_the_engine_reports_refills_the_cache() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    // And a row appearing under the key the query asks for.
     live.put("rate", "3");
     live.read_until("rate", "3", Duration::from_secs(10))
         .expect("the insert reached the cache");
 }
 
+/// A commit to a row the query does not read leaves the entry alone.
 #[test]
 fn an_unrelated_commit_does_not_touch_the_entry() {
     let Some(mut live) = Live::start("unrelated") else {
@@ -201,6 +212,9 @@ fn an_unrelated_commit_does_not_touch_the_entry() {
     assert_eq!(live.cache.stats.hits.load(Ordering::Relaxed), 1);
 }
 
+/// A query outside the engine's subset is refused and served live.
+///
+/// Raw SQL in the subset is accepted.
 #[test]
 fn a_query_outside_the_engines_subset_is_served_live() {
     let Some(mut live) = Live::start("live") else {
@@ -229,7 +243,7 @@ fn a_query_outside_the_engines_subset_is_served_live() {
     );
     assert_eq!(live.engine.subscribed(), 0);
 
-    // Raw SQL in the subset is accepted.
+    /// The value column, read by name.
     #[derive(QueryableByName, Debug, PartialEq)]
     struct Val {
         #[diesel(sql_type = Text)]
@@ -251,12 +265,14 @@ fn a_query_outside_the_engines_subset_is_served_live() {
     }
 }
 
+/// Evicting an entry ends its subscription with the engine.
+///
+/// A tiny budget: the second entry pushes the first out.
 #[test]
 fn evicting_an_entry_unsubscribes_it_from_the_engine() {
     let Some(mut live) = Live::start("evict") else {
         return;
     };
-    // A tiny budget: the second entry pushes the first out.
     let engine = live.engine.clone();
     let small = Arc::new(Cache::new(400, Arc::new(engine.clone())));
     engine.attach(&small);
@@ -295,6 +311,15 @@ fn evicting_an_entry_unsubscribes_it_from_the_engine() {
 
 /// Needs `STREAMGRES_RESTART_CMD`, a shell command that restarts the
 /// engine and returns once it serves again.
+///
+/// While the engine was away, the socket dropped and the cache was cleared;
+/// a change made meanwhile must be seen once reads resume.
+///
+/// The change made while the socket was down reaches the cache: in rows
+/// mode the entry is refilled from the engine's snapshot and then its
+/// deltas, so the read is eventual by the engine's propagation.
+///
+/// And the resubscription is live: a further change is reported.
 #[test]
 fn an_engine_restart_is_survived_without_a_stale_read() {
     let Some(mut live) = Live::start("restart") else {
@@ -315,17 +340,12 @@ fn an_engine_restart_is_survived_without_a_stale_read() {
         .expect("restart command");
     assert!(status.success(), "the restart command failed");
 
-    // While the engine was away, the socket dropped and the cache was
-    // cleared; a change made meanwhile must be seen once reads resume.
     live.put("v", "2");
     let deadline = Instant::now() + Duration::from_secs(10);
     while !live.engine.is_connected() {
         assert!(Instant::now() < deadline, "the client did not reconnect");
         std::thread::sleep(Duration::from_millis(50));
     }
-    // The change made while the socket was down reaches the cache: in
-    // rows mode the entry is refilled from the engine's snapshot and then
-    // its deltas, so the read is eventual by the engine's propagation.
     let took = live
         .read_until("v", "2", Duration::from_secs(10))
         .expect("the change made during the restart was seen");
@@ -345,7 +365,6 @@ fn an_engine_restart_is_survived_without_a_stale_read() {
         "served from the cache"
     );
 
-    // And the resubscription is live: a further change is reported.
     live.put("v", "3");
     let took = live
         .read_until("v", "3", Duration::from_secs(10))
@@ -357,9 +376,11 @@ fn an_engine_restart_is_survived_without_a_stale_read() {
     );
 }
 
+/// Counts the queries the connection starts.
 struct CountQueries(Arc<std::sync::atomic::AtomicUsize>);
 
 impl diesel::connection::Instrumentation for CountQueries {
+    /// Counts a query start.
     fn on_connection_event(&mut self, event: diesel::connection::InstrumentationEvent<'_>) {
         if let diesel::connection::InstrumentationEvent::StartQuery { .. } = event {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -367,6 +388,9 @@ impl diesel::connection::Instrumentation for CountQueries {
     }
 }
 
+/// In rows mode Postgres is read only for the table's column types, once.
+///
+/// A second query on the same table reuses the types: no lookup.
 #[test]
 fn rows_mode_reads_postgres_only_for_the_table_types() {
     let Some(mut live) = Live::start("rows") else {
@@ -409,13 +433,18 @@ fn rows_mode_reads_postgres_only_for_the_table_types() {
     );
     assert_eq!(live.cache.stats.touched.load(Ordering::Relaxed), 0);
 
-    // A second query on the same table reuses the types: no lookup.
     live.put("r2", "x");
     assert_eq!(live.read("r2").as_deref(), Some("x"));
     assert_eq!(sent.load(Ordering::SeqCst), 1);
     assert_eq!(live.engine.materialized(), 2);
 }
 
+/// Ordered, limited and counted results served from the engine's rows match
+/// Postgres.
+///
+/// A change that reorders the window.
+///
+/// A count.
 #[test]
 fn ordered_limited_and_counted_results_match_postgres() {
     let Some(mut live) = Live::start("order") else {
@@ -457,7 +486,6 @@ fn ordered_limited_and_counted_results_match_postgres() {
         ["z", "q"]
     );
 
-    // A change that reorders the window.
     live.put("k3", "zz");
     let started = Instant::now();
     loop {
@@ -472,7 +500,6 @@ fn ordered_limited_and_counted_results_match_postgres() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // A count.
     let count = |conn: &mut SyncedConnection<PgConnection>| -> i64 {
         sg_configs::table
             .filter(sg_configs::key.eq_any(&keys))
@@ -508,6 +535,19 @@ diesel::table! {
     }
 }
 
+/// Microsecond timestamps are served exactly; an interval column falls the
+/// query back to refills.
+///
+/// The engine learns a new column from the DDL trigger; give it a moment.
+///
+/// This row and any left by an earlier run that died before its own
+/// cleanup: the passthrough and owned-row suites read the whole table.
+///
+/// `created` is timestamptz(6): served from engine rows, to the
+/// microsecond.
+///
+/// An interval has no encoding here: the read goes to Postgres and refills
+/// on touches.
 #[test]
 fn microsecond_timestamps_are_exact_and_an_interval_falls_back() {
     let Some(mut live) = Live::start("fallback") else {
@@ -522,11 +562,8 @@ fn microsecond_timestamps_are_exact_and_an_interval_falls_back() {
              ALTER TABLE sg_items ADD COLUMN IF NOT EXISTS lead interval",
         )
         .unwrap();
-    // The engine learns a new column from the DDL trigger; give it a moment.
     std::thread::sleep(Duration::from_millis(500));
     let name = live.key("item");
-    // This row and any left by an earlier run that died before its own
-    // cleanup: the passthrough and owned-row suites read the whole table.
     diesel::delete(sg_items::table.filter(sg_items::name.like("fallback-%")))
         .execute(&mut live.other)
         .unwrap();
@@ -547,8 +584,6 @@ fn microsecond_timestamps_are_exact_and_an_interval_falls_back() {
         .inner()
         .set_instrumentation(CountQueries(sent.clone()));
 
-    // `created` is timestamptz(6): served from engine rows, to the
-    // microsecond.
     let with_created =
         |conn: &mut SyncedConnection<PgConnection>| -> (i32, chrono::DateTime<chrono::Utc>) {
             sg_items::table
@@ -574,8 +609,6 @@ fn microsecond_timestamps_are_exact_and_an_interval_falls_back() {
     assert_eq!(with_created(&mut live.conn), first, "and cached");
     assert_eq!(sent.load(Ordering::SeqCst), 1);
 
-    // An interval has no encoding here: the read goes to Postgres and
-    // refills on touches.
     let with_lead = |conn: &mut SyncedConnection<PgConnection>| -> (i32, Option<diesel::data_types::PgInterval>) {
         sg_items::table
             .filter(sg_items::name.eq(&name))
@@ -648,6 +681,19 @@ diesel::table! {
 diesel::joinable!(sg_books -> sg_authors (author_id));
 diesel::allow_tables_to_appear_in_same_query!(sg_authors, sg_books);
 
+/// Joins are composed from the engine's rows and stay current as either
+/// side changes.
+///
+/// Clean, then seed: ann has two books, bob none, cy one.
+///
+/// authors.inner_join(books), filtered by the authors in play, ordered.
+///
+/// A book for bob appears; one of ann's goes; cy is renamed.
+///
+/// The cached query still filters on the old names, so the renamed author
+/// leaves it, as it leaves the same query on Postgres.
+///
+/// A left join shows authors without books, and a count counts joined rows.
 #[test]
 fn joins_are_composed_from_the_engines_rows() {
     let Some(mut live) = Live::start("join") else {
@@ -666,7 +712,6 @@ fn joins_are_composed_from_the_engines_rows() {
         .iter()
         .map(|n| format!("{p}{n}"))
         .collect();
-    // Clean, then seed: ann has two books, bob none, cy one.
     diesel::delete(sg_books::table.filter(sg_books::title.like(format!("{p}%"))))
         .execute(&mut plain)
         .unwrap();
@@ -705,7 +750,6 @@ fn joins_are_composed_from_the_engines_rows() {
         .inner()
         .set_instrumentation(CountQueries(sent.clone()));
 
-    // authors.inner_join(books), filtered by the authors in play, ordered.
     type Pair = (String, String);
     let inner = |conn: &mut PgConnection, names: &[String]| -> Vec<Pair> {
         sg_authors::table
@@ -742,7 +786,6 @@ fn joins_are_composed_from_the_engines_rows() {
     assert_eq!(through(&mut live.conn, &names), expected);
     assert_eq!(sent.load(Ordering::SeqCst), 2);
 
-    // A book for bob appears; one of ann's goes; cy is renamed.
     diesel::insert_into(sg_books::table)
         .values((
             sg_books::author_id.eq(ids[1]),
@@ -757,8 +800,6 @@ fn joins_are_composed_from_the_engines_rows() {
         .set(sg_authors::name.eq(format!("{p}cyrus")))
         .execute(&mut plain)
         .unwrap();
-    // The cached query still filters on the old names, so the renamed
-    // author leaves it, as it leaves the same query on Postgres.
     let expected = inner(&mut plain, &names);
     assert_eq!(expected.len(), 2);
     let started = Instant::now();
@@ -775,7 +816,6 @@ fn joins_are_composed_from_the_engines_rows() {
     }
     assert_eq!(sent.load(Ordering::SeqCst), 2, "still no Postgres read");
 
-    // A left join shows authors without books, and a count counts joined rows.
     let mut names_now = names.clone();
     names_now[2] = format!("{p}cyrus");
     type Left = (String, Option<String>);
@@ -818,6 +858,10 @@ fn joins_are_composed_from_the_engines_rows() {
 
 /// A pool of sockets spreads the subscriptions across them, and a key
 /// stays with the socket that first took it.
+///
+/// A change on a key held by any socket reaches the cache.
+///
+/// Dropping one subscription frees its slot on its socket only.
 #[test]
 fn a_pool_spreads_subscriptions_across_its_sockets() {
     let Some(mut live) = Live::start("pool") else {
@@ -869,7 +913,6 @@ fn a_pool_spreads_subscriptions_across_its_sockets() {
     assert_eq!(engine.per_worker(), vec![2, 2, 2], "least-loaded routing");
     assert_eq!(engine.materialized(), 6, "{:?}", engine.fallbacks());
 
-    // A change on a key held by any socket reaches the cache.
     let before = changes(&cache);
     live.put("p4", "v4b");
     let started = Instant::now();
@@ -891,7 +934,6 @@ fn a_pool_spreads_subscriptions_across_its_sockets() {
     );
     assert_eq!(engine.subscribed(), 6);
 
-    // Dropping one subscription frees its slot on its socket only.
     let key = query_key(&mut conn, live.key("p4"));
     engine.unsubscribe(&key);
     cache.touched(&key);
@@ -917,6 +959,11 @@ fn query_key(
 /// Past the subscription cap the engine is not asked and the read is
 /// served live, like a refused query; a held key still comes from the
 /// cache.
+///
+/// The third key is live every time, so a change is seen at once; the held
+/// keys are cached.
+///
+/// Freeing a slot lets the next miss subscribe.
 #[test]
 fn the_subscription_cap_serves_the_rest_live() {
     let Some(mut live) = Live::start("cap") else {
@@ -969,8 +1016,6 @@ fn the_subscription_cap_serves_the_rest_live() {
         "the third was refused by the client"
     );
 
-    // The third key is live every time, so a change is seen at once;
-    // the held keys are cached.
     live.put("c2", "v2b");
     assert_eq!(read(&mut conn, live.key("c2")).as_deref(), Some("v2b"));
     let hits = cache.stats.hits.load(Ordering::Relaxed);
@@ -978,7 +1023,6 @@ fn the_subscription_cap_serves_the_rest_live() {
     assert_eq!(cache.stats.hits.load(Ordering::Relaxed), hits + 1);
     assert_eq!(engine.subscribed(), 2);
 
-    // Freeing a slot lets the next miss subscribe.
     let key = query_key(&mut conn, live.key("c0"));
     engine.unsubscribe(&key);
     cache.touched(&key);
@@ -1002,6 +1046,9 @@ diesel::table! {
 
 /// `bytea` travels as hex text and comes back as bytes; `OFFSET` is
 /// applied by the client over the rows the engine keeps.
+///
+/// A change inside the page arrives as a delta; the NULL row and the offset
+/// still apply.
 #[test]
 fn bytea_and_offset_are_served_from_engine_rows() {
     let Some(mut live) = Live::start("blobs") else {
@@ -1063,8 +1110,6 @@ fn bytea_and_offset_are_served_from_engine_rows() {
     );
     assert_eq!(live.engine.subscribed(), 1);
 
-    // A change inside the page arrives as a delta; the NULL row and the
-    // offset still apply.
     diesel::update(sg_blobs::table.filter(sg_blobs::name.eq(format!("{prefix}2"))))
         .set(sg_blobs::data.eq(Some(vec![0xab])))
         .execute(&mut live.other)
@@ -1100,6 +1145,11 @@ fn bytea_and_offset_are_served_from_engine_rows() {
         .execute(&mut live.other);
 }
 
+/// A row inserted and deleted in one transaction is not kept.
+///
+/// One transaction: a matching row comes and goes, and another row changes
+/// so the delta's arrival can be seen. The engine folds the ghost into an
+/// add and a delete; one frame must not leave it behind.
 #[test]
 fn a_row_inserted_and_deleted_in_one_transaction_is_not_kept() {
     let Some(mut live) = Live::start("ghost") else {
@@ -1126,9 +1176,6 @@ fn a_row_inserted_and_deleted_in_one_transaction_is_not_kept() {
         live.engine.fallbacks()
     );
 
-    // One transaction: a matching row comes and goes, and another row
-    // changes so the delta's arrival can be seen. The engine folds the
-    // ghost into an add and a delete; one frame must not leave it behind.
     let (real, ghost) = (live.key("real"), live.key("ghost"));
     live.other
         .transaction::<_, diesel::result::Error, _>(|conn| {

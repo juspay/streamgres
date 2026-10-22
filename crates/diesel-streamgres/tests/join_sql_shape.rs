@@ -10,6 +10,8 @@ diesel::joinable!(books -> authors (author_id));
 diesel::joinable!(reviews -> books (book_id));
 diesel::allow_tables_to_appear_in_same_query!(authors, books, reviews);
 
+/// Diesel renders an inner join, a left join, a nested join and an
+/// explicit `ON` in the shapes the engine's parser reads.
 #[test]
 fn diesel_renders_joins_as_the_engine_expects() {
     let inner = authors::table

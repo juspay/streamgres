@@ -28,6 +28,8 @@ diesel::table! {
     }
 }
 
+/// Sets `key` to `value` on a plain connection, as another service
+/// would.
 async fn put(other: &mut AsyncPgConnection, key: &str, value: &str) {
     diesel::insert_into(sg_configs::table)
         .values((sg_configs::key.eq(key), sg_configs::value.eq(value)))
@@ -39,6 +41,7 @@ async fn put(other: &mut AsyncPgConnection, key: &str, value: &str) {
         .expect("put");
 }
 
+/// `key`'s value, through the wrapper.
 async fn read(conn: &mut AsyncSyncedConnection, key: &str) -> Option<String> {
     sg_configs::table
         .filter(sg_configs::key.eq(key))
@@ -49,6 +52,13 @@ async fn read(conn: &mut AsyncSyncedConnection, key: &str) -> Option<String> {
         .expect("read")
 }
 
+/// Rows mode through the async wrapper against a live engine: the first
+/// read is served from the engine's rows and the second from the cache.
+///
+/// A change arrives as a delta and replaces the entry; no read.
+///
+/// A second query on the same table: the types are known, no catalog load,
+/// still rows mode.
 #[tokio::test]
 async fn rows_mode_through_the_async_wrapper() {
     let Ok(url) = std::env::var("STREAMGRES_S2S_URL") else {
@@ -94,7 +104,6 @@ async fn rows_mode_through_the_async_wrapper() {
     assert_eq!(read(&mut conn, &key).await.as_deref(), Some("1"));
     assert_eq!(stat(&cache.stats.hits), hits + 1);
 
-    // A change arrives as a delta and replaces the entry; no read.
     put(&mut other, &key, "2").await;
     let started = Instant::now();
     loop {
@@ -114,8 +123,6 @@ async fn rows_mode_through_the_async_wrapper() {
     assert!(stat(&cache.stats.replaced) >= 1);
     assert_eq!(stat(&cache.stats.touched), 0);
 
-    // A second query on the same table: the types are known, no catalog
-    // load, still rows mode.
     let key2 = format!("{prefix}r2");
     diesel::insert_into(sg_configs::table)
         .values((sg_configs::key.eq(&key2), sg_configs::value.eq("x")))

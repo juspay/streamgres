@@ -41,8 +41,10 @@ use crate::queries::Lookup;
 use crate::schema::tickets;
 use crate::verify;
 
+/// What every handler shares.
 pub type App = Arc<Stack>;
 
+/// Every route of the demo's HTTP API.
 pub fn router(stack: App) -> Router {
     Router::new()
         .route("/", get(index))
@@ -77,6 +79,7 @@ pub fn router(stack: App) -> Router {
         .with_state(stack)
 }
 
+/// The stats page.
 async fn index() -> Html<&'static str> {
     Html(include_str!("index.html"))
 }
@@ -98,6 +101,7 @@ async fn verify_once(State(app): State<App>) -> Json<Value> {
     }))
 }
 
+/// The counters as JSON, for `/stats` and the stats page.
 pub fn stats_json(app: &Stack) -> Value {
     let s = &app.cache.stats;
     let n = |counter: &AtomicU64| AtomicU64::load(counter, Ordering::Relaxed);
@@ -143,6 +147,8 @@ async fn lookups() -> Json<Value> {
     ))
 }
 
+/// A read's query parameters: the route and pool to take, and each
+/// lookup's own arguments.
 #[derive(Deserialize, Default)]
 struct ReadParams {
     route: Option<String>,
@@ -159,6 +165,7 @@ struct ReadParams {
 }
 
 impl ReadParams {
+    /// The statuses asked for, open and pending unless named.
     fn statuses(&self) -> Vec<TicketStatus> {
         match &self.status {
             Some(list) => list.split(',').filter_map(TicketStatus::parse).collect(),
@@ -184,10 +191,15 @@ impl ReadParams {
     }
 }
 
+/// A handler's answer: the read's report, or an error status.
 type Reply = Result<Json<Value>, (StatusCode, String)>;
 
 /// Runs a lookup on the pool and route the parameters ask for, and
-/// reports what happened.
+/// reports what happened. A route for one request is set on the pooled
+/// connection for the read and put back before the connection returns
+/// to the pool. Where the rows came from is read per connection, so it
+/// is right under concurrent requests, where a delta of the cache's
+/// shared counters would not be.
 async fn read(app: &Stack, params: &ReadParams, lookup: Lookup) -> Reply {
     let pool = match params.pool.as_deref() {
         Some("reporting") => &app.reporting,
@@ -203,8 +215,6 @@ async fn read(app: &Stack, params: &ReadParams, lookup: Lookup) -> Reply {
         _ => None,
     };
     let started = Instant::now();
-    // The query flag for one request: set on the pooled connection for
-    // the read and put back before the connection returns to the pool.
     let pool_route = conn.route();
     if let Some(route) = route {
         conn.set_route(route);
@@ -213,8 +223,6 @@ async fn read(app: &Stack, params: &ReadParams, lookup: Lookup) -> Reply {
     conn.set_route(pool_route);
     let rows = rows.map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let elapsed = started.elapsed();
-    // Per connection, so it is right under concurrent requests, where a
-    // delta of the cache's shared counters would not be.
     let source = match conn.last_served() {
         Some(Served::Cache) => "cache",
         Some(Served::Engine) => "engine",
@@ -232,6 +240,7 @@ async fn read(app: &Stack, params: &ReadParams, lookup: Lookup) -> Reply {
     })))
 }
 
+/// `GET /tickets/{id}`: the [`Lookup::Ticket`] lookup.
 async fn ticket(
     State(app): State<App>,
     Path(id): Path<i64>,
@@ -240,6 +249,7 @@ async fn ticket(
     read(&app, &params, Lookup::Ticket { id }).await
 }
 
+/// `GET /tickets/{id}/comments`: the [`Lookup::Comments`] lookup.
 async fn comments(
     State(app): State<App>,
     Path(id): Path<i64>,
@@ -248,6 +258,7 @@ async fn comments(
     read(&app, &params, Lookup::Comments { ticket: id }).await
 }
 
+/// `GET /attachments/{id}`: the [`Lookup::Attachment`] lookup.
 async fn attachment(
     State(app): State<App>,
     Path(id): Path<i64>,
@@ -256,6 +267,7 @@ async fn attachment(
     read(&app, &params, Lookup::Attachment { id }).await
 }
 
+/// `GET /orgs/{org}/queue`: the [`Lookup::Queue`] lookup.
 async fn queue(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -269,6 +281,7 @@ async fn queue(
     read(&app, &params, lookup).await
 }
 
+/// `GET /orgs/{org}/queue/count`: the [`Lookup::QueueCount`] lookup.
 async fn queue_count(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -281,6 +294,7 @@ async fn queue_count(
     read(&app, &params, lookup).await
 }
 
+/// `GET /orgs/{org}/agents`: the [`Lookup::Agents`] lookup.
 async fn agents(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -289,6 +303,7 @@ async fn agents(
     read(&app, &params, Lookup::Agents { org }).await
 }
 
+/// `GET /orgs/{org}/sla`: the [`Lookup::Sla`] lookup.
 async fn sla(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -297,6 +312,7 @@ async fn sla(
     read(&app, &params, Lookup::Sla { org }).await
 }
 
+/// `GET /orgs/{org}/search`: the [`Lookup::Search`] lookup.
 async fn search(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -309,6 +325,7 @@ async fn search(
     read(&app, &params, Lookup::Search { org, pattern }).await
 }
 
+/// `GET /orgs/{org}/recent`: the [`Lookup::Recent`] lookup.
 async fn recent(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -321,6 +338,7 @@ async fn recent(
     read(&app, &params, lookup).await
 }
 
+/// `GET /orgs/{org}/tickets/{id}`: the [`Lookup::OrgTicket`] lookup.
 async fn org_ticket(
     State(app): State<App>,
     Path((org, id)): Path<(i64, i64)>,
@@ -329,6 +347,7 @@ async fn org_ticket(
     read(&app, &params, Lookup::OrgTicket { org, id }).await
 }
 
+/// `GET /orgs/{org}/unassigned`: the [`Lookup::Unassigned`] lookup.
 async fn unassigned(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -337,6 +356,7 @@ async fn unassigned(
     read(&app, &params, Lookup::Unassigned { org }).await
 }
 
+/// `GET /orgs/{org}/escalated`: the [`Lookup::Escalated`] lookup.
 async fn escalated(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -345,6 +365,7 @@ async fn escalated(
     read(&app, &params, Lookup::Escalated { org }).await
 }
 
+/// `GET /orgs/{org}/open`: the [`Lookup::OpenExcept`] lookup.
 async fn open_except(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -354,6 +375,7 @@ async fn open_except(
     read(&app, &params, Lookup::OpenExcept { org, except }).await
 }
 
+/// `GET /orgs/{org}/created`: the [`Lookup::CreatedBetween`] lookup.
 async fn created_between(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -373,11 +395,14 @@ async fn created_between(
     read(&app, &params, lookup).await
 }
 
+/// `GET /tickets`: the [`Lookup::Many`] lookup, a hundred ids unless
+/// `ids` names others.
 async fn many(State(app): State<App>, Query(params): Query<ReadParams>) -> Reply {
     let ids = ReadParams::id_list(params.ids.as_deref(), (1..=100).collect());
     read(&app, &params, Lookup::Many { ids }).await
 }
 
+/// `GET /orgs/{org}/queue/end`: the [`Lookup::QueueEnd`] lookup.
 async fn queue_end(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -386,6 +411,7 @@ async fn queue_end(
     read(&app, &params, Lookup::QueueEnd { org }).await
 }
 
+/// `GET /orgs/{org}/nothing`: the [`Lookup::Nothing`] lookup.
 async fn nothing(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -394,6 +420,7 @@ async fn nothing(
     read(&app, &params, Lookup::Nothing { org }).await
 }
 
+/// `GET /orgs/{org}/tickets`: the [`Lookup::AllTickets`] lookup.
 async fn all_tickets(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -402,6 +429,7 @@ async fn all_tickets(
     read(&app, &params, Lookup::AllTickets { org }).await
 }
 
+/// `GET /tickets/{id}/authors`: the [`Lookup::CommentAuthors`] lookup.
 async fn comment_authors(
     State(app): State<App>,
     Path(id): Path<i64>,
@@ -410,6 +438,7 @@ async fn comment_authors(
     read(&app, &params, Lookup::CommentAuthors { ticket: id }).await
 }
 
+/// `GET /orgs/{org}/skilled`: the [`Lookup::Skilled`] lookup.
 async fn skilled(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -422,6 +451,7 @@ async fn skilled(
     read(&app, &params, Lookup::Skilled { org, skill }).await
 }
 
+/// `GET /orgs/{org}/statuses`: the [`Lookup::Statuses`] lookup.
 async fn statuses(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -430,6 +460,7 @@ async fn statuses(
     read(&app, &params, Lookup::Statuses { org }).await
 }
 
+/// `GET /orgs/{org}/workload`: the [`Lookup::Workload`] lookup.
 async fn workload(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -438,6 +469,7 @@ async fn workload(
     read(&app, &params, Lookup::Workload { org }).await
 }
 
+/// `GET /orgs/{org}/activity`: the [`Lookup::LastActivity`] lookup.
 async fn last_activity(
     State(app): State<App>,
     Path(org): Path<i64>,
@@ -446,6 +478,7 @@ async fn last_activity(
     read(&app, &params, Lookup::LastActivity { org }).await
 }
 
+/// `GET /orgs/{org}/kind/{kind}`: the [`Lookup::OfKind`] lookup.
 async fn of_kind(
     State(app): State<App>,
     Path((org, kind)): Path<(i64, String)>,
@@ -456,6 +489,7 @@ async fn of_kind(
     read(&app, &params, Lookup::OfKind { org, kind }).await
 }
 
+/// The body of a status change.
 #[derive(Deserialize)]
 struct StatusChange {
     status: TicketStatus,
@@ -497,6 +531,7 @@ fn param<'a>(params: &'a HashMap<String, String>, name: &str) -> Option<&'a str>
 }
 
 impl IntoResponse for Lookup {
+    /// The lookup as JSON.
     fn into_response(self) -> axum::response::Response {
         Json(self).into_response()
     }

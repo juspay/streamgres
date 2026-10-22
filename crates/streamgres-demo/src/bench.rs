@@ -12,6 +12,7 @@ use diesel_streamgres::Route;
 use crate::pools::Stack;
 use crate::queries::Lookup;
 
+/// One route's latencies over a run.
 #[derive(Debug, Clone)]
 pub struct Report {
     pub route: Route,
@@ -24,11 +25,15 @@ pub struct Report {
 }
 
 impl Report {
+    /// Requests per second over the run.
     pub fn per_second(&self) -> f64 {
         self.requests as f64 / self.elapsed.as_secs_f64().max(1e-9)
     }
 }
 
+/// Times `requests` reads of `lookup` on `route`, `concurrency` at a
+/// time, after one warm-up read (the subscribe and the fill) so the
+/// measurement is of the steady state on both routes.
 pub async fn run(
     stack: &Stack,
     lookup: &Lookup,
@@ -37,8 +42,6 @@ pub async fn run(
     requests: usize,
 ) -> Result<Report, String> {
     let per_task = requests.div_ceil(concurrency.max(1));
-    // Warm: subscribe and fill once, so the measurement is of the steady
-    // state on both routes.
     {
         let mut conn = stack.main.get().await.map_err(|error| error.to_string())?;
         let pool_route = conn.route();

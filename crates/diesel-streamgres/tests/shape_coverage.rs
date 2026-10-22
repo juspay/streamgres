@@ -96,6 +96,7 @@ struct Shape {
     active: bool,
 }
 
+/// The blocking wrapper every shape is read through.
 type Conn = SyncedConnection<PgConnection>;
 
 /// The names this run's rows go by, unique per process so parallel runs

@@ -140,6 +140,7 @@ fn client(fake: &Fake, verdict_timeout: Duration) -> (EngineClient, Arc<Cache>) 
     (engine, cache)
 }
 
+/// The test database's URL.
 fn url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres:///diesel_streamgres_test?host=/tmp".to_string())
@@ -178,6 +179,10 @@ fn tagged(frame: &serde_json::Value) -> (&str, u64) {
     )
 }
 
+/// An engine that takes the subscribe and never answers: the read
+/// waits the verdict timeout and no longer, goes live, and withdraws its
+/// id; the timeout is not remembered as a refusal, so the next read asks
+/// again.
 #[test]
 fn a_hung_engine_is_given_up_on_in_time_and_asked_again() {
     let fake = Fake::start(Answer::Never);
@@ -264,6 +269,8 @@ fn a_silent_engine_is_taken_for_dead() {
     drop(engine);
 }
 
+/// An engine that closes every socket is dialled again about once a
+/// second, never faster.
 #[test]
 fn a_dropped_socket_is_tried_again_every_second() {
     let fake = Fake::start(Answer::Close);

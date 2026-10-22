@@ -20,6 +20,7 @@ diesel::table! {
     }
 }
 
+/// A config row.
 #[derive(Queryable, QueryableByName, Selectable, Debug, PartialEq, Clone)]
 #[diesel(table_name = sg_configs)]
 struct Config {
@@ -28,6 +29,7 @@ struct Config {
     value: String,
 }
 
+/// The test database's URL.
 fn url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres:///diesel_streamgres_test?host=/tmp".to_string())
@@ -43,6 +45,8 @@ struct FakeEngine {
 }
 
 impl Subscriptions for FakeEngine {
+    /// Accepted for `sg_configs` unless told to refuse all, refused
+    /// otherwise.
     fn subscribe(&self, key: &QueryKey) -> Outcome {
         if self.refuse_all.load(Ordering::SeqCst) || !key.sql.contains("sg_configs") {
             return Outcome::Verdict(Verdict::Refused("not a config read".into()));
@@ -51,6 +55,7 @@ impl Subscriptions for FakeEngine {
         Outcome::Verdict(Verdict::Accepted)
     }
 
+    /// Accepted, with no rows.
     fn materialize(
         &self,
         _: &QueryKey,
@@ -60,14 +65,17 @@ impl Subscriptions for FakeEngine {
         Verdict::Accepted
     }
 
+    /// Records the key.
     fn unsubscribe(&self, key: &QueryKey) {
         self.unsubscribed.lock().unwrap().push(key.clone());
     }
 }
 
+/// Counts the queries the connection starts.
 struct CountQueries(Arc<AtomicUsize>);
 
 impl Instrumentation for CountQueries {
+    /// Counts a query start.
     fn on_connection_event(&mut self, event: InstrumentationEvent<'_>) {
         if let InstrumentationEvent::StartQuery { .. } = event {
             self.0.fetch_add(1, Ordering::SeqCst);
@@ -75,6 +83,8 @@ impl Instrumentation for CountQueries {
     }
 }
 
+/// One test's wrapped connection and cache, its fake engine, a plain
+/// connection for changes, and the prefix of its keys.
 struct World {
     conn: SyncedConnection<PgConnection>,
     cache: Arc<Cache>,
@@ -93,6 +103,7 @@ impl World {
         Self::with_budget(name, 64 * 1024 * 1024)
     }
 
+    /// A world whose cache holds at most `max_bytes`.
     fn with_budget(name: &str, max_bytes: u64) -> World {
         Self::with_limits(
             name,
@@ -103,6 +114,7 @@ impl World {
         )
     }
 
+    /// A world whose cache has `limits`, the table created once.
     fn with_limits(name: &str, limits: Limits) -> World {
         static SCHEMA_READY: std::sync::Once = std::sync::Once::new();
         SCHEMA_READY.call_once(|| {
@@ -134,6 +146,7 @@ impl World {
         }
     }
 
+    /// A key of this test's.
     fn key(&self, name: &str) -> String {
         format!("{}{name}", self.prefix)
     }
@@ -150,6 +163,7 @@ impl World {
             .expect("put");
     }
 
+    /// A key's value through the wrapper.
     fn read(&mut self, name: &str) -> Option<String> {
         let key = self.key(name);
         sg_configs::table
@@ -171,6 +185,7 @@ impl World {
         QueryKey::of(&query, self.conn.inner()).expect("key")
     }
 
+    /// How many queries reached Postgres so far.
     fn sent(&self) -> usize {
         self.sent.load(Ordering::SeqCst)
     }
@@ -189,6 +204,7 @@ impl World {
 }
 
 impl Drop for World {
+    /// Deletes this test's keys.
     fn drop(&mut self) {
         let _ = diesel::delete(
             sg_configs::table.filter(sg_configs::key.like(format!("{}%", self.prefix))),
@@ -197,6 +213,7 @@ impl Drop for World {
     }
 }
 
+/// A repeated read is served from the cache, without reaching Postgres.
 #[test]
 fn a_repeated_read_is_served_from_the_cache() {
     let mut w = World::new("repeat");
@@ -221,6 +238,7 @@ fn a_repeated_read_is_served_from_the_cache() {
     );
 }
 
+/// The connection says where each read was served from.
 #[test]
 fn the_connection_says_where_each_read_was_served_from() {
     let mut w = World::new("served");
@@ -260,6 +278,8 @@ fn the_connection_says_where_each_read_was_served_from() {
     );
 }
 
+/// The subscription is registered before Postgres is read, so no commit in
+/// between goes unreported.
 #[test]
 fn the_subscription_is_registered_before_postgres_is_read() {
     let mut w = World::new("order");
@@ -276,6 +296,7 @@ fn the_subscription_is_registered_before_postgres_is_read() {
     assert_eq!(key.binds[1].type_oid, 20, "the limit is an int8");
 }
 
+/// The same query with different binds makes different entries.
 #[test]
 fn different_binds_are_different_entries() {
     let mut w = World::new("binds");
@@ -288,13 +309,14 @@ fn different_binds_are_different_entries() {
     assert_ne!(w.key_of("a"), w.key_of("b"));
 }
 
+/// A change from elsewhere is not seen by the cache until the engine
+/// reports the query touched; the next read then refills from Postgres.
 #[test]
 fn a_touch_makes_the_next_read_refill_from_postgres() {
     let mut w = World::new("touch");
     w.put("limit", "10");
     assert_eq!(w.read("limit").as_deref(), Some("10"));
 
-    // A change from elsewhere: the cache does not see it...
     w.put("limit", "20");
     assert_eq!(
         w.read("limit").as_deref(),
@@ -302,7 +324,6 @@ fn a_touch_makes_the_next_read_refill_from_postgres() {
         "stale until the engine says so"
     );
 
-    // ...until the engine reports the query touched.
     let key = w.key_of("limit");
     w.cache.touched(&key);
     let before = w.sent();
@@ -316,14 +337,17 @@ fn a_touch_makes_the_next_read_refill_from_postgres() {
     );
 }
 
+/// A touch that lands while a miss is being read is not lost: the fill is
+/// dropped and the next read refills.
+///
+/// What `load` does on a miss, with a touch landing between the reservation
+/// and the fill.
 #[test]
 fn a_touch_during_the_read_is_not_lost() {
     let mut w = World::new("race");
     w.put("flag", "off");
     let key = w.key_of("flag");
 
-    // What `load` does on a miss, with a touch landing between the
-    // reservation and the fill.
     let reservation = w.cache.reserve(&key);
     w.put("flag", "on");
     w.cache.touched(&key);
@@ -342,6 +366,7 @@ fn a_touch_during_the_read_is_not_lost() {
     );
 }
 
+/// A connection routed to Postgres never reads the cache.
 #[test]
 fn a_strong_connection_never_reads_the_cache() {
     let mut w = World::new("strong");
@@ -359,6 +384,12 @@ fn a_strong_connection_never_reads_the_cache() {
     );
 }
 
+/// Inside a transaction reads go to Postgres and see the connection's own
+/// writes.
+///
+/// Right after the COMMIT the connection is in its read-your-writes window
+/// and reads Postgres; the entry itself is untouched until the engine says
+/// so.
 #[test]
 fn inside_a_transaction_reads_see_the_connections_own_writes() {
     let mut w = World::new("txn");
@@ -387,9 +418,6 @@ fn inside_a_transaction_reads_see_the_connections_own_writes() {
         1,
         "the transactional read did not subscribe"
     );
-    // Right after the COMMIT the connection is in its read-your-writes
-    // window and reads Postgres; the entry itself is untouched until the
-    // engine says so.
     assert_eq!(w.read("count").as_deref(), Some("2"));
     let cache_key = w.key_of("count");
     assert_eq!(
@@ -405,6 +433,7 @@ fn inside_a_transaction_reads_see_the_connections_own_writes() {
     );
 }
 
+/// A write that returns rows is never cached.
 #[test]
 fn a_write_returning_rows_is_never_cached() {
     let mut w = World::new("returning");
@@ -428,6 +457,12 @@ fn a_write_returning_rows_is_never_cached() {
     );
 }
 
+/// A query the engine refuses is read live every time.
+///
+/// The engine was asked once; the refusal is remembered and the second read
+/// went to Postgres without asking.
+///
+/// Raw SQL against another table is refused by this engine too.
 #[test]
 fn a_refused_query_is_read_live_every_time() {
     let mut w = World::new("refused");
@@ -440,14 +475,11 @@ fn a_refused_query_is_read_live_every_time() {
         Some("w"),
         "live, so the change is seen"
     );
-    // The engine was asked once; the refusal is remembered and the second
-    // read went to Postgres without asking.
     assert_eq!(w.cache.stats.refused.load(Ordering::Relaxed), 1);
     assert_eq!(w.cache.stats.refused_recently.load(Ordering::Relaxed), 1);
     assert_eq!(w.engine.subscribed.lock().unwrap().len(), 0);
     assert!(w.cache.is_empty());
 
-    // Raw SQL against another table is refused by this engine too.
     let rows: Vec<Config> = sql_query("SELECT id, key, value FROM sg_configs WHERE key = $1")
         .bind::<Text, _>(w.key("k"))
         .load(&mut w.conn)
@@ -459,6 +491,7 @@ fn a_refused_query_is_read_live_every_time() {
     assert_eq!(n, 42);
 }
 
+/// Entries over the byte budget are evicted, and their subscriptions end.
 #[test]
 fn over_budget_entries_are_evicted_and_unsubscribed() {
     let mut w = World::with_budget("evict", 600);
@@ -483,6 +516,7 @@ fn over_budget_entries_are_evicted_and_unsubscribed() {
     );
 }
 
+/// Cached rows decode into whole structs, by name, and as counts.
 #[test]
 fn cached_rows_decode_whole_structs_by_name_and_count() {
     let mut w = World::new("shapes");
@@ -513,6 +547,7 @@ fn cached_rows_decode_whole_structs_by_name_and_count() {
     let m: i64 = count().get_result(&mut w.conn).expect("count again");
     assert_eq!((n, m), (2, 2));
 
+    /// Two columns of a config, read by name.
     #[derive(QueryableByName, Debug, PartialEq)]
     struct Pair {
         #[diesel(sql_type = Text)]
@@ -531,6 +566,7 @@ fn cached_rows_decode_whole_structs_by_name_and_count() {
     assert_eq!(w.cache.stats.hits.load(Ordering::Relaxed), 3);
 }
 
+/// Clearing the cache makes every next read refill.
 #[test]
 fn clearing_the_cache_refills_everything() {
     let mut w = World::new("clear");
@@ -541,6 +577,11 @@ fn clearing_the_cache_refills_everything() {
     assert_eq!(w.read("x").as_deref(), Some("2"));
 }
 
+/// A query flagged Postgres bypasses the cache on a connection routed
+/// through Streamgres.
+///
+/// The flag wins over the connection: Postgres is read, the cached entry is
+/// neither used nor replaced, and nothing is subscribed.
 #[test]
 fn a_query_flagged_postgres_bypasses_the_cache_on_a_streamgres_connection() {
     let mut w = World::new("via-pg");
@@ -548,8 +589,6 @@ fn a_query_flagged_postgres_bypasses_the_cache_on_a_streamgres_connection() {
     assert_eq!(w.read("mode").as_deref(), Some("a"));
     w.put("mode", "b");
 
-    // The flag wins over the connection: Postgres is read, the cached
-    // entry is neither used nor replaced, and nothing is subscribed.
     let sent = w.sent();
     let subscribed = w.engine.subscribed.lock().unwrap().len();
     assert_eq!(w.read_via("mode", Route::Postgres).as_deref(), Some("b"));
@@ -562,6 +601,7 @@ fn a_query_flagged_postgres_bypasses_the_cache_on_a_streamgres_connection() {
     );
 }
 
+/// A query flagged Streamgres is cached on a connection routed to Postgres.
 #[test]
 fn a_query_flagged_streamgres_is_cached_on_a_postgres_connection() {
     let mut w = World::new("via-sg");
@@ -582,6 +622,8 @@ fn a_query_flagged_streamgres_is_cached_on_a_postgres_connection() {
     );
 }
 
+/// The route marker is part of neither the cache key nor the SQL the engine
+/// sees.
 #[test]
 fn the_marker_is_not_part_of_the_key_or_what_the_engine_sees() {
     let mut w = World::new("via-key");
@@ -604,6 +646,8 @@ fn the_marker_is_not_part_of_the_key_or_what_the_engine_sees() {
     );
 }
 
+/// A route scope covers every read inside it, and a query's own flag still
+/// wins.
 #[test]
 fn a_route_scope_covers_every_read_inside_it_and_the_query_flag_still_wins() {
     let mut w = World::new("scope");
@@ -638,6 +682,11 @@ fn a_route_scope_covers_every_read_inside_it_and_the_query_flag_still_wins() {
     assert_eq!(w.read("mode").as_deref(), Some("a"), "the scope ended");
 }
 
+/// An entry nobody reads expires on the idle clock, and its subscription
+/// ends.
+///
+/// Reads keep it alive; once it has expired, the next read subscribes
+/// again.
 #[test]
 fn an_entry_nobody_reads_expires_and_is_unsubscribed() {
     let mut w = World::with_limits(
@@ -649,7 +698,6 @@ fn an_entry_nobody_reads_expires_and_is_unsubscribed() {
     );
     w.put("mode", "a");
     assert_eq!(w.read("mode").as_deref(), Some("a"));
-    // Reads keep it alive.
     for _ in 0..4 {
         std::thread::sleep(std::time::Duration::from_millis(40));
         assert_eq!(w.read("mode").as_deref(), Some("a"));
@@ -662,12 +710,12 @@ fn an_entry_nobody_reads_expires_and_is_unsubscribed() {
     assert_eq!(w.engine.unsubscribed.lock().unwrap().len(), 1);
     assert_eq!(w.cache.stats.expired.load(Ordering::Relaxed), 1);
 
-    // The next read subscribes again.
     w.put("mode", "b");
     assert_eq!(w.read("mode").as_deref(), Some("b"));
     assert_eq!(w.engine.subscribed.lock().unwrap().len(), 2);
 }
 
+/// The time-to-live clock drops an entry however often it is read.
 #[test]
 fn time_to_live_drops_an_entry_however_often_it_is_read() {
     let mut w = World::with_limits(
@@ -700,6 +748,15 @@ fn time_to_live_drops_an_entry_however_often_it_is_read() {
     assert_eq!(w.engine.subscribed.lock().unwrap().len(), 2);
 }
 
+/// After its own write the connection reads Postgres for the read-your-
+/// writes window.
+///
+/// The write goes through the synced connection itself.
+///
+/// The window closes; the entry was neither used nor refreshed by the
+/// bypass, so without an engine touch the old rows are back.
+///
+/// A transaction's writes count from its COMMIT.
 #[test]
 fn after_a_write_the_connection_reads_postgres_for_a_window() {
     let mut w = World::new("ryw");
@@ -708,7 +765,6 @@ fn after_a_write_the_connection_reads_postgres_for_a_window() {
     w.put("mode", "a");
     assert_eq!(w.read("mode").as_deref(), Some("a"));
 
-    // The write goes through the synced connection itself.
     let key = w.key("mode");
     diesel::update(sg_configs::table.filter(sg_configs::key.eq(&key)))
         .set(sg_configs::value.eq("b"))
@@ -723,14 +779,11 @@ fn after_a_write_the_connection_reads_postgres_for_a_window() {
     assert_eq!(w.sent(), sent + 1, "read from Postgres");
     assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 1);
 
-    // The window closes; the entry was neither used nor refreshed by the
-    // bypass, so without an engine touch the old rows are back.
     std::thread::sleep(std::time::Duration::from_millis(200));
     let sent = w.sent();
     assert_eq!(w.read("mode").as_deref(), Some("a"));
     assert_eq!(w.sent(), sent, "served from the cache again");
 
-    // A transaction's writes count from its COMMIT.
     w.conn
         .transaction::<_, diesel::result::Error, _>(|conn| {
             diesel::update(sg_configs::table.filter(sg_configs::key.eq(&key)))
@@ -742,6 +795,7 @@ fn after_a_write_the_connection_reads_postgres_for_a_window() {
     assert_eq!(w.read("mode").as_deref(), Some("c"));
 }
 
+/// A locking read always goes to Postgres.
 #[test]
 fn a_locking_read_always_goes_to_postgres() {
     let mut w = World::new("locking");
@@ -765,6 +819,7 @@ fn a_locking_read_always_goes_to_postgres() {
     );
 }
 
+/// A route scope restores the outer route when its closure panics.
 #[test]
 fn a_route_scope_ends_when_the_closure_panics() {
     let mut w = World::new("scope-panic");
@@ -783,6 +838,8 @@ fn a_route_scope_ends_when_the_closure_panics() {
     );
 }
 
+/// Opening and abandoning a transaction is not a write: it opens no read-
+/// your-writes window.
 #[test]
 fn opening_and_abandoning_a_transaction_is_not_a_write() {
     let mut w = World::new("txn-control");
@@ -818,6 +875,11 @@ fn opening_and_abandoning_a_transaction_is_not_a_write() {
     assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 1);
 }
 
+/// A write on one connection is seen by reads on another connection of the
+/// same cache.
+///
+/// The second connection stands for another of the pool's: the same
+/// cache, its own socket.
 #[test]
 fn a_write_on_one_connection_is_seen_by_reads_on_another_of_the_same_cache() {
     let mut w = World::new("ryw-pool");
@@ -826,7 +888,6 @@ fn a_write_on_one_connection_is_seen_by_reads_on_another_of_the_same_cache() {
     w.put("mode", "a");
     assert_eq!(w.read("mode").as_deref(), Some("a"));
 
-    // A second connection of the "pool": same cache, its own socket.
     let mut sibling = SyncedConnection::with_cache(
         PgConnection::establish(&url()).expect("connect"),
         Arc::clone(&w.cache),
@@ -868,6 +929,7 @@ fn a_slow_write_opens_the_window_as_it_ends() {
     );
 }
 
+/// A read that fails after the engine accepted it ends its subscription.
 #[test]
 fn a_read_that_fails_after_the_engine_accepted_ends_its_subscription() {
     let mut w = World::new("accepted-error");

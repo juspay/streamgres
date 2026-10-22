@@ -12,31 +12,39 @@ use diesel_streamgres::subscriptions::{Outcome, Subscriptions, Verdict};
 use diesel_streamgres::types::TableTypes;
 use diesel_streamgres::{Attachment, Route, Settings, SyncedConnection, install};
 
+/// An engine side that refuses everything.
 struct Unsynced;
 
 impl Subscriptions for Unsynced {
+    /// Refused.
     fn subscribe(&self, _: &QueryKey) -> Outcome {
         Outcome::Verdict(Verdict::Refused("test".into()))
     }
+    /// Refused.
     fn materialize(&self, _: &QueryKey, _: Snapshot, _: std::collections::HashMap<String, Arc<TableTypes>>) -> Verdict {
         Verdict::Refused("test".into())
     }
+    /// Nothing to end.
     fn unsubscribe(&self, _: &QueryKey) {}
 }
 
+/// The test database's URL.
 fn url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres:///diesel_streamgres_test?host=/tmp".to_string())
 }
 
+/// Settings attach a cache per database and a route per pool, by the URL a
+/// connection is established with.
+///
+/// The application name stands in for the database here; a real
+/// configuration keys on the database the URL names.
 #[test]
 fn a_cache_per_database_and_a_route_per_pool() {
     let main = Arc::new(Cache::new(1024, Arc::new(Unsynced)));
     let accounts = Arc::new(Cache::new(1024, Arc::new(Unsynced)));
     let (main_for, accounts_for) = (Arc::clone(&main), Arc::clone(&accounts));
     install(Settings::by_url(move |url| {
-        // The application name stands in for the database here; a real
-        // configuration keys on the database the URL names.
         if url.contains("application_name=accounts") {
             Some(Attachment {
                 cache: Arc::clone(&accounts_for),
