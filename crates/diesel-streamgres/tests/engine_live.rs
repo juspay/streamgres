@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_types::Text;
-use diesel_streamgres::cache::Cache;
+use diesel_streamgres::cache::{Cache, DATABASE_SQL, Database};
 use diesel_streamgres::engine::EngineClient;
 use diesel_streamgres::subscriptions::Subscriptions;
 use diesel_streamgres::{Consistency, Served, SyncedConnection};
@@ -47,7 +47,8 @@ struct Live {
 
 impl Live {
     /// Connects to the engine `STREAMGRES_S2S_URL` names; `None`, and the
-    /// test skipped, when it names none.
+    /// test skipped, when it names none. The cache is told which database
+    /// it reads up front, so the statements a test counts are its own.
     fn start(name: &str) -> Option<Live> {
         let Ok(url) = std::env::var("STREAMGRES_S2S_URL") else {
             eprintln!("STREAMGRES_S2S_URL not set; skipping");
@@ -69,6 +70,10 @@ impl Live {
                     id serial PRIMARY KEY, key text NOT NULL UNIQUE, value text NOT NULL)",
             )
             .expect("schema");
+        let identity = diesel::sql_query(DATABASE_SQL)
+            .load::<Database>(&mut other)
+            .expect("the database's identity");
+        cache.learn_database(identity.into_iter().next());
         let prefix = format!("{name}-{}-", std::process::id());
         let inner = PgConnection::establish(&database).expect("connect");
         let conn = SyncedConnection::with_cache(inner, cache.clone(), Consistency::Eventual);
@@ -873,7 +878,7 @@ fn a_pool_spreads_subscriptions_across_its_sockets() {
         url,
         diesel_streamgres::engine::Config {
             connections: 3,
-            ..diesel_streamgres::engine::Config::default()
+            ..diesel_streamgres::engine::Config::from_env()
         },
     );
     let cache = Arc::new(Cache::new(64 * 1024 * 1024, Arc::new(engine.clone())));
@@ -976,7 +981,7 @@ fn the_subscription_cap_serves_the_rest_live() {
         diesel_streamgres::engine::Config {
             connections: 1,
             max_subscriptions: 2,
-            ..diesel_streamgres::engine::Config::default()
+            ..diesel_streamgres::engine::Config::from_env()
         },
     );
     let cache = Arc::new(Cache::new(64 * 1024 * 1024, Arc::new(engine.clone())));
