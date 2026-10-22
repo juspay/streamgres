@@ -17,6 +17,12 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// The most heartbeats kept waiting to be applied. Past it the second
+/// oldest is dropped, so the oldest still dates a lag with none applied,
+/// and a heartbeat applied later is dated by an older one kept, which
+/// can only overstate the lag.
+const WAITING: usize = 1024;
+
 /// Heartbeats sent and the newest applied.
 #[derive(Debug, Default)]
 pub struct Freshness {
@@ -26,8 +32,14 @@ pub struct Freshness {
 /// What [`Freshness`] guards.
 #[derive(Debug, Default)]
 struct Beats {
+    /// The number the next heartbeat goes out under: numbers keep rising
+    /// across reconnects, since a number at or below the newest applied
+    /// is not waited on.
+    next: u64,
+    /// The newest heartbeat written.
+    written: u64,
     /// Heartbeats sent and not yet applied, oldest first, with when
-    /// each was sent.
+    /// each was sent; at most [`WAITING`].
     sent: VecDeque<(u64, Instant)>,
     /// The newest heartbeat applied.
     applied: u64,
@@ -36,11 +48,27 @@ struct Beats {
 }
 
 impl Freshness {
+    /// The number for the next heartbeat, never one handed out before.
+    pub fn number(&self) -> u64 {
+        let mut beats = self.beats.lock().expect("heartbeats");
+        beats.next += 1;
+        beats.next
+    }
+
+    /// The newest heartbeat written, 0 before the first.
+    pub fn written(&self) -> u64 {
+        self.beats.lock().expect("heartbeats").written
+    }
+
     /// Records heartbeat `n` as sent at `at`. It may have been
     /// applied already.
     pub fn sent(&self, n: u64, at: Instant) {
         let mut beats = self.beats.lock().expect("heartbeats");
+        beats.written = beats.written.max(n);
         if n > beats.applied {
+            if beats.sent.len() >= WAITING {
+                beats.sent.remove(1);
+            }
             beats.sent.push_back((n, at));
         } else if n == beats.applied {
             beats.fresh = beats.fresh.max(Some(at));
@@ -83,31 +111,48 @@ pub fn prefix(slot: &str) -> String {
     format!("{slot}/heartbeat")
 }
 
-/// Emits heartbeats on `client` every `every`, numbered from 1, until the
-/// connection fails; each is recorded in `freshness` once it is in the
-/// WAL, as sent when it was asked for. A non-transactional message is
-/// decoded at once, in WAL order, whatever transactions are open.
+/// The statement writing one heartbeat on a server of version `version`
+/// (`server_version_num`). A message outside a transaction writes no
+/// commit record, so nothing would flush it, and logical decoding reads
+/// only flushed WAL: on a quiet database the heartbeat would wait for
+/// someone else's commit. PostgreSQL 17 flushes it when asked; before
+/// that, taking a transaction id gives the statement a commit record,
+/// whose flush covers the message.
+pub fn statement(version: u32) -> &'static str {
+    if version >= 170_000 {
+        "SELECT pg_logical_emit_message(false, $1::text, $2::text, true)"
+    } else {
+        "SELECT pg_logical_emit_message(false, $1::text, $2::text), pg_current_xact_id()"
+    }
+}
+
+/// Emits heartbeats on `client` every `every`, numbered by `freshness`,
+/// until the connection fails; each is recorded in `freshness` once it
+/// is in the WAL and flushed, as sent when it was asked for. A
+/// non-transactional message is decoded at once, in WAL order, whatever
+/// transactions are open.
 pub async fn emit(
     client: &tokio_postgres::Client,
     prefix: &str,
     every: Duration,
     freshness: &Freshness,
 ) -> Result<(), tokio_postgres::Error> {
-    let mut next = 1u64;
+    let version: u32 = client
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .await?
+        .get::<_, i32>(0)
+        .try_into()
+        .unwrap_or(0);
+    let heartbeat = client.prepare(statement(version)).await?;
     let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
+        let n = freshness.number();
         let at = Instant::now();
-        let content = next.to_string();
-        client
-            .execute(
-                "SELECT pg_logical_emit_message(false, $1::text, $2::text)",
-                &[&prefix, &content],
-            )
-            .await?;
-        freshness.sent(next, at);
-        next += 1;
+        let content = n.to_string();
+        client.execute(&heartbeat, &[&prefix, &content]).await?;
+        freshness.sent(n, at);
     }
 }
 
@@ -158,5 +203,49 @@ mod tests {
             freshness.lag().unwrap() < Duration::from_secs(1),
             "an old number is not waited on"
         );
+    }
+
+    /// Numbers keep rising however often the emitter starts over, so a
+    /// heartbeat after a reconnect is waited on; only the newest written
+    /// is remembered as written.
+    #[test]
+    fn numbers_never_repeat() {
+        let freshness = Freshness::default();
+        let first: Vec<u64> = (0..3).map(|_| freshness.number()).collect();
+        assert_eq!(first, vec![1, 2, 3]);
+        for &n in &first {
+            freshness.sent(n, Instant::now());
+        }
+        freshness.applied(3);
+        let after = freshness.number();
+        assert_eq!(after, 4, "a reconnect does not start over");
+        freshness.sent(after, Instant::now());
+        assert_eq!(freshness.beats.lock().unwrap().sent.len(), 1, "and is waited on");
+        freshness.applied(after);
+        assert!(freshness.beats.lock().unwrap().sent.is_empty());
+        assert_eq!(freshness.written(), 4);
+    }
+
+    /// While none is applied the waiting heartbeats stay bounded, the
+    /// oldest kept, so the lag still dates from it.
+    #[test]
+    fn waiting_heartbeats_are_bounded() {
+        let freshness = Freshness::default();
+        let long_ago = Instant::now() - Duration::from_secs(60);
+        freshness.sent(freshness.number(), long_ago);
+        for _ in 0..10 * WAITING {
+            freshness.sent(freshness.number(), Instant::now());
+        }
+        let waiting = freshness.beats.lock().unwrap().sent.len();
+        assert_eq!(waiting, WAITING);
+        assert!(freshness.lag().unwrap() >= Duration::from_secs(60));
+    }
+
+    /// PostgreSQL 17 is asked to flush the message; an older server is
+    /// given a commit record to flush it with.
+    #[test]
+    fn the_heartbeat_is_flushed_on_every_version() {
+        assert!(statement(170_002).ends_with(", true)"));
+        assert!(statement(160_004).contains("pg_current_xact_id()"));
     }
 }

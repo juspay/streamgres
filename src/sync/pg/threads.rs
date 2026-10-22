@@ -346,12 +346,16 @@ pub async fn stop_feed(mut feed: FeedHandle) -> Result<(), String> {
 /// names, for as long as the process runs, reconnecting a second after a
 /// failure. It runs off the engine thread (on the reads runtime), so a
 /// stalled engine thread shows as a growing lag rather than as heartbeats
-/// that stop coming. While heartbeats cannot be written the lag grows,
-/// so backends read Postgres until they are written again: an engine
-/// cut off from its database is taken as behind it.
+/// that stop coming. Once heartbeats have been written, a stretch in
+/// which they cannot be makes the lag grow, so backends read Postgres
+/// until they are written again. Until the first is written the lag is
+/// unknown and backends trust the engine, as they would one that sends
+/// no lag: a standby cannot write them, and its engine keeps serving.
+/// A failure is logged once until heartbeats are written again.
 async fn beat(config: tokio_postgres::Config, slot: String, every: Duration, stats: Arc<Stats>) {
     let prefix = crate::sync::heartbeat::prefix(&slot);
     let mut warned = false;
+    let mut written = 0;
     loop {
         let outcome = match super::open(&config, &tokio::runtime::Handle::current()).await {
             Ok(client) => crate::sync::heartbeat::emit(&client, &prefix, every, &stats.freshness)
@@ -359,6 +363,10 @@ async fn beat(config: tokio_postgres::Config, slot: String, every: Duration, sta
                 .map_err(|error| error.to_string()),
             Err(error) => Err(error.to_string()),
         };
+        if stats.freshness.written() != written {
+            written = stats.freshness.written();
+            warned = false;
+        }
         if let Err(error) = outcome
             && !warned
         {
