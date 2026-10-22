@@ -121,8 +121,8 @@ use super::{plan, wire};
 use crate::ivm::Delta;
 use crate::log::{log_debug, log_info, log_warn};
 use crate::model::{
-    DataFrameKey, DataFrameOperation, DataFrameRow, MultiTableReadQuery, Order, OrderBy, SubId,
-    TableName,
+    ComparisonOperator, DataFrameKey, DataFrameOperation, DataFrameRow, MultiTableReadQuery, Order,
+    OrderBy, SubId, TableName, Value, Where,
 };
 use crate::parser::binds::decodes;
 use crate::parser::{BindValue, Projection, parse_select};
@@ -1216,7 +1216,9 @@ async fn serve(
 /// Zero query is planned (which side of each join is read whole, how a
 /// page is read), so the engine registers it ready to run. A bind of a
 /// type the catalog has not seen may be an enum created since it was
-/// loaded: those are looked up first ([`learn_enums`]).
+/// loaded: those are looked up first ([`learn_enums`]). A query larger
+/// than the engine should take on its own thread is refused before it
+/// is planned ([`within_limits`]).
 async fn prepare(
     state: &AppState,
     conn: u64,
@@ -1235,6 +1237,11 @@ async fn prepare(
         catalog = state.catalog.load();
     }
     let select = parse_select(sql, binds, &catalog).map_err(|error| error.message)?;
+    within_limits(
+        &select.query,
+        state.config.s2s_max_disjuncts,
+        state.config.s2s_max_list_values,
+    )?;
     let shape = rows.then(|| Shape::new(&select.query, select.projection, select.limit, select.offset));
     let translated = Translated {
         query: select.query,
@@ -1254,6 +1261,68 @@ async fn prepare(
         query: planned.query,
         shape,
     })))
+}
+
+/// Refuses a query whose filters would normalize to more than
+/// `max_disjuncts` disjuncts, or whose `IN` and `NOT IN` lists hold more
+/// than `max_list_values` values; a limit of 0 is none. The engine does
+/// both on the thread every subscriber's changes go through, so one such
+/// query would hold them all up, and enough `OR`s would exhaust memory.
+fn within_limits(
+    query: &MultiTableReadQuery,
+    max_disjuncts: u64,
+    max_list_values: usize,
+) -> Result<(), String> {
+    let (disjuncts, values) = query_size(query);
+    if max_disjuncts > 0 && disjuncts > max_disjuncts {
+        return Err(format!(
+            "the filters expand to {disjuncts} alternatives, more than the {max_disjuncts} the engine follows"
+        ));
+    }
+    if max_list_values > 0 && values > max_list_values {
+        return Err(format!(
+            "the IN lists hold {values} values, more than the {max_list_values} the engine follows"
+        ));
+    }
+    Ok(())
+}
+
+/// How large a query is to the engine: the disjuncts its tables'
+/// filters normalize to, summed, and the values its `IN` and `NOT IN`
+/// lists hold. Counted from the filter trees without expanding them, so
+/// a filter whose expansion would not fit in memory is measured cheaply;
+/// the disjuncts saturate.
+fn query_size(query: &MultiTableReadQuery) -> (u64, usize) {
+    let (mut disjuncts, mut values) = filter_size(&query.main_table.filter);
+    for join in &query.joins {
+        let (more_disjuncts, more_values) = query_size(&join.sub);
+        disjuncts = disjuncts.saturating_add(more_disjuncts);
+        values = values.saturating_add(more_values);
+    }
+    (disjuncts, values)
+}
+
+/// [`query_size`] for one filter: an `AND` multiplies its parts'
+/// disjuncts, an `OR` adds them, as normalizing to an `OR` of `AND`s
+/// does.
+fn filter_size(filter: &Where) -> (u64, usize) {
+    match filter {
+        Where::Condition(condition) => {
+            let values = match (&condition.comparison_operator, &condition.value) {
+                (ComparisonOperator::IN | ComparisonOperator::NOT_IN, Value::List(items)) => {
+                    items.len()
+                }
+                _ => 0,
+            };
+            (1, values)
+        }
+        Where::AND(parts) => parts.iter().map(filter_size).fold((1, 0), |(d, v), (pd, pv)| {
+            (d.saturating_mul(pd), v.saturating_add(pv))
+        }),
+        Where::OR(parts) => parts.iter().map(filter_size).fold((0, 0), |(d, v), (pd, pv)| {
+            (d.saturating_add(pd), v.saturating_add(pv))
+        }),
+    }
 }
 
 /// Looks `oids` up among the database's enum types and teaches the
@@ -1398,6 +1467,18 @@ mod tests {
     use crate::ivm::{Audience, QueryPart, Subs};
     use crate::model::{Catalog, ColumnName, DbColumn, DbTable, Value, ValueType};
 
+    /// One table, `notes (id, name)`.
+    fn test_catalog() -> Catalog {
+        Catalog::new([DbTable::new(
+            "notes",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("name", ValueType::String),
+            ],
+        )])
+    }
+
     /// A task over one table, `notes (id, name)`, with connection 1 open:
     /// the task, the engine's commands, and connection 1's frames.
     fn task(
@@ -1407,14 +1488,7 @@ mod tests {
         mpsc::Receiver<Command<MultiTableReadQuery>>,
         mpsc::Receiver<String>,
     ) {
-        let catalog = Catalog::new([DbTable::new(
-            "notes",
-            ["id"],
-            vec![
-                DbColumn::new("id", ValueType::Int),
-                DbColumn::new("name", ValueType::String),
-            ],
-        )]);
+        let catalog = test_catalog();
         let (commands, commands_rx) = mpsc::channel(64);
         let mut task = Task {
             catalog: Arc::new(CatalogHandle::new(catalog)),
@@ -1697,6 +1771,41 @@ mod tests {
         assert!(!authorized(&with("Basic s3cret"), "s3cret"));
         assert!(!authorized(&with("s3cret"), "s3cret"));
         assert!(!authorized(&HeaderMap::new(), "s3cret"));
+    }
+
+    /// A query's size is counted from its filter trees as their expansion
+    /// would be: thirty `AND`ed `OR` pairs are 2^30 disjuncts, measured
+    /// without building one, and refused; an `IN` list counts its values.
+    #[test]
+    fn an_oversized_query_is_refused_before_the_engine_sees_it() {
+        let catalog = test_catalog();
+        let pairs = |k: usize| {
+            let filter = (0..k)
+                .map(|i| format!(r#"("notes"."id" = {i} OR "notes"."name" = 'n{i}')"#))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            parse_select(&format!(r#"SELECT * FROM "notes" WHERE {filter}"#), &[], &catalog)
+                .expect("parses")
+                .query
+        };
+        assert_eq!(query_size(&pairs(3)), (8, 0));
+        assert_eq!(query_size(&pairs(30)).0, 1 << 30);
+        assert!(within_limits(&pairs(10), 1024, 0).is_ok());
+        let refused = within_limits(&pairs(11), 1024, 0).expect_err("2048 disjuncts");
+        assert!(refused.contains("2048 alternatives"), "{refused}");
+        assert!(within_limits(&pairs(30), 0, 0).is_ok(), "0 lifts the limit");
+
+        let list = (0..5).map(|i| i.to_string()).collect::<Vec<_>>().join(", ");
+        let listed = parse_select(
+            &format!(r#"SELECT * FROM "notes" WHERE "notes"."id" IN ({list}) OR "notes"."id" NOT IN ({list})"#),
+            &[],
+            &catalog,
+        )
+        .expect("parses")
+        .query;
+        assert_eq!(query_size(&listed), (2, 10));
+        assert!(within_limits(&listed, 0, 10).is_ok());
+        assert!(within_limits(&listed, 0, 9).is_err());
     }
 
     /// Frames read into requests, and a bad one says which id it was for

@@ -283,6 +283,8 @@ depend on what the defaults happen to be:
 | `STREAMGRES_S2S_TOKEN` | none | secret a backend must send as `Authorization: Bearer <token>` to open the S2S endpoint. Unset, the endpoint takes any connection |
 | `STREAMGRES_S2S_MAX_CONNECTIONS` | `64` | S2S connections open at once; past it an upgrade is answered `503`. Each backend process opens `STREAMGRES_S2S_CONNECTIONS` (2), so 64 serves 32 processes. `0` lifts the limit |
 | `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` | `10000` | subscriptions one S2S connection may hold; past it a subscribe is refused. The engine announces it, and the client stops short of it. `0` lifts the limit |
+| `STREAMGRES_S2S_MAX_DISJUNCTS` | `1024` | alternatives an S2S query's filters may expand to (an `AND` of `OR`s multiplies them); past it a subscribe is refused and the backend reads Postgres. The engine expands a filter on the thread every subscriber's changes go through: an `AND` of thirty `OR` pairs would hold them all up and exhaust its memory. `0` lifts the limit |
+| `STREAMGRES_S2S_MAX_LIST_VALUES` | `10000` | `IN` and `NOT IN` values an S2S query may hold in all; past it a subscribe is refused. The engine files each value on that same thread, about a second per 150,000. `0` lifts the limit |
 | `STREAMGRES_LOG` | `info` | `error`, `warn`, `info` or `debug`. `debug` costs throughput |
 | `STREAMGRES_SLOW_QUERY_MS` | `1000` | queries and pushes slower than this are logged at `warn` |
 | `STREAMGRES_METRICS_INTERVAL_MS` | `10000` | how often process metrics are sampled |

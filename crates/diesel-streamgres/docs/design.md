@@ -199,6 +199,7 @@ identifiers, a column list, `*` or `COUNT(*)`, `$n` placeholders.
 | `ON` conditions and `WHERE` conjuncts that name one table | an `OR` across tables; a `WHERE` on any table under a `LEFT JOIN` |
 | joined tables ordered by their primary keys ascending, depth first, after root columns that cover the root's whole key | any other `ORDER BY` on a joined table; an unqualified column in a join |
 | binds of integers, floats, numerics, booleans, text-like types, UUIDs, JSON, timestamps, dates, enums (one created after the engine started is learnt on its first bind) | any other bind type; a time or date at infinity; a result over the engine's row limit |
+| filters that expand to at most 1,024 alternatives, with at most 10,000 `IN` and `NOT IN` values in all (`STREAMGRES_S2S_MAX_DISJUNCTS`, `STREAMGRES_S2S_MAX_LIST_VALUES` on the engine) | a larger query: an `AND` of `OR`s multiplies its alternatives, and the engine expands them on the thread every subscriber's changes go through |
 
 In a join, Diesel's `FROM ("a" INNER JOIN ("b" ...) ON (...))` becomes a
 tree: each `JOIN` is an edge from the table on its left (the parent) to

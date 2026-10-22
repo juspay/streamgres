@@ -156,6 +156,18 @@ pub struct Config {
     /// one S2S connection may hold, those still registering included; past
     /// it a subscribe is refused (10000; 0 lifts the limit).
     pub s2s_connection_subscriptions: usize,
+    /// `STREAMGRES_S2S_MAX_DISJUNCTS`: how many disjuncts an S2S query's
+    /// filters may normalize to, counted without expanding them; past it
+    /// a subscribe is refused (1024; 0 lifts the limit). The engine
+    /// expands a filter into its disjuncts on its own thread, so an `AND`
+    /// of thirty `OR` pairs would otherwise stall every subscriber and
+    /// exhaust memory.
+    pub s2s_max_disjuncts: u64,
+    /// `STREAMGRES_S2S_MAX_LIST_VALUES`: how many `IN` and `NOT IN` values
+    /// an S2S query may hold in all; past it a subscribe is refused
+    /// (10000; 0 lifts the limit). The engine files each value in its
+    /// routing index on its own thread, about a second per 150,000.
+    pub s2s_max_list_values: usize,
     /// `STREAMGRES_BYTES_PER_PART`: how many bytes of serialized row
     /// operations one poke part carries at most (768000, i.e. 750 KiB).
     pub bytes_per_part: usize,
@@ -434,6 +446,18 @@ impl Config {
                 })?,
                 None => 10_000,
             },
+            s2s_max_disjuncts: match first(&["STREAMGRES_S2S_MAX_DISJUNCTS"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("STREAMGRES_S2S_MAX_DISJUNCTS must be a number, got `{text}`")
+                })?,
+                None => 1024,
+            },
+            s2s_max_list_values: match first(&["STREAMGRES_S2S_MAX_LIST_VALUES"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("STREAMGRES_S2S_MAX_LIST_VALUES must be a number, got `{text}`")
+                })?,
+                None => 10_000,
+            },
             bytes_per_part: match first(&["STREAMGRES_BYTES_PER_PART"]) {
                 Some(text) => text.parse().map_err(|_| {
                     format!("STREAMGRES_BYTES_PER_PART must be a number of bytes, got `{text}`")
@@ -707,6 +731,20 @@ mod tests {
         let limited = config_with(&[("STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS", "3")]);
         assert_eq!(limited.s2s_connection_subscriptions, 3);
         assert!(config(&[("STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS", "x")]).is_err());
+    }
+
+    /// An S2S query's size is bounded unless told otherwise: 1024
+    /// disjuncts and 10000 list values, 0 lifting either.
+    #[test]
+    fn the_s2s_query_size_limits_have_defaults() {
+        let defaults = config_with(&[]);
+        assert_eq!((defaults.s2s_max_disjuncts, defaults.s2s_max_list_values), (1024, 10_000));
+        let set = config_with(&[
+            ("STREAMGRES_S2S_MAX_DISJUNCTS", "0"),
+            ("STREAMGRES_S2S_MAX_LIST_VALUES", "7"),
+        ]);
+        assert_eq!((set.s2s_max_disjuncts, set.s2s_max_list_values), (0, 7));
+        assert!(config(&[("STREAMGRES_S2S_MAX_DISJUNCTS", "lots")]).is_err());
     }
 
     /// [`config`], expected to parse.
