@@ -1163,7 +1163,7 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
         let (mut sink, mut stream) = socket.split();
         let mut heard = Instant::now();
         let silence = worker.shared.silence;
-        let every = silence / 3;
+        let every = (silence / 3).max(Duration::from_millis(1));
         let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -1809,8 +1809,6 @@ mod tests {
         assert_eq!(env_number("STREAMGRES_S2S_TEST_UNSET_VARIABLE"), None);
     }
 
-    /// The token goes out as a bearer, and only when there is one; it
-    /// never shows in the configuration's `Debug`.
     /// A token is in plain text over `ws://` to anything but this
     /// machine, and never over `wss://`.
     #[test]
@@ -1824,6 +1822,8 @@ mod tests {
         assert!(tls().is_some(), "the TLS config builds");
     }
 
+    /// The token goes out as a bearer, and only when there is one; it
+    /// never shows in the configuration's `Debug`.
     #[test]
     fn the_token_goes_out_as_a_bearer() {
         let url = "ws://127.0.0.1:4848/zero/s2s/v1";

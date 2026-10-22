@@ -190,9 +190,21 @@ impl Outgoing {
         }
     }
 
+    /// The writer's side of the byte count. It holds no sender, so the
+    /// queue still closes once every [`Outgoing`] is dropped.
+    fn drained(&self) -> Drained {
+        Drained(Arc::clone(&self.queued))
+    }
+}
+
+/// The bytes still waiting in a connection's [`Outgoing`], as its
+/// writer releases them.
+struct Drained(Arc<AtomicUsize>);
+
+impl Drained {
     /// The writer sent a frame of `len` bytes.
     fn sent(&self, len: usize) {
-        self.queued.fetch_sub(len, Ordering::AcqRel);
+        self.0.fetch_sub(len, Ordering::AcqRel);
     }
 }
 
@@ -1030,7 +1042,7 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
     let (out, mut out_rx) = Outgoing::new();
     let (close, closed) = oneshot::channel::<&'static str>();
     let held = Arc::new(AtomicUsize::new(0));
-    let drained = out.clone();
+    let drained = out.drained();
     let mut writer = tokio::spawn(async move {
         while let Some(text) = out_rx.recv().await {
             let len = text.len();
@@ -1555,9 +1567,26 @@ mod tests {
         assert!(out.push(big.clone()), "an empty queue takes any frame");
         assert!(!out.push("y".to_owned()), "past the byte bound");
         let sent = frames.try_recv().expect("the big frame");
-        out.sent(sent.len());
+        out.drained().sent(sent.len());
         assert!(out.push("y".to_owned()), "room again once it went out");
         assert_eq!(out.queued.load(Ordering::Acquire), 1);
+    }
+
+    /// The writer's byte count keeps no sender alive: once every
+    /// `Outgoing` is gone the writer's queue ends, so a closing
+    /// connection flushes and sends its close frame without waiting.
+    #[test]
+    fn the_writer_queue_closes_with_its_senders() {
+        let (out, mut frames) = Outgoing::new();
+        let drained = out.drained();
+        assert!(out.push("x".to_owned()));
+        drop(out);
+        assert_eq!(frames.try_recv().as_deref(), Ok("x"));
+        drained.sent(1);
+        assert!(matches!(
+            frames.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     /// A subscription touched by several deltas of one transaction is
