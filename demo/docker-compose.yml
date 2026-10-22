@@ -17,6 +17,11 @@ services:
       - max_replication_slots=16
       - -c
       - max_wal_senders=16
+      # A slot left by an engine that crashed (rather than stopped)
+      # holds WAL until it is dropped; this caps what it can hold, as
+      # docs/deploy.md advises, so a crash cannot fill the disk.
+      - -c
+      - max_slot_wal_keep_size=1GB
     environment:
       POSTGRES_USER: streamgres
       POSTGRES_PASSWORD: streamgres
