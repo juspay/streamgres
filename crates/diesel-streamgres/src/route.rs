@@ -93,10 +93,12 @@ pub struct Via<Q> {
 }
 
 impl<Q> Via<Q> {
+    /// The route the query is flagged with.
     pub fn route(&self) -> Route {
         self.route
     }
 
+    /// The query without its flag.
     pub fn into_inner(self) -> Q {
         self.query
     }
@@ -104,6 +106,7 @@ impl<Q> Via<Q> {
 
 /// Flags a query with its route: `query.via(Route::Postgres).first(conn)`.
 pub trait RouteDsl: Sized {
+    /// This read takes `route`.
     fn via(self, route: Route) -> Via<Self> {
         Via { query: self, route }
     }
@@ -122,6 +125,7 @@ pub trait RouteDsl: Sized {
 impl<T: Query> RouteDsl for T {}
 
 impl<Q: QueryFragment<Pg>> QueryFragment<Pg> for Via<Q> {
+    /// The query's SQL behind the route's marker comment.
     fn walk_ast<'b>(&'b self, mut out: AstPass<'_, 'b, Pg>) -> QueryResult<()> {
         out.push_sql(self.route.marker());
         self.query.walk_ast(out.reborrow())
@@ -130,8 +134,8 @@ impl<Q: QueryFragment<Pg>> QueryFragment<Pg> for Via<Q> {
 
 impl<Q: QueryId> QueryId for Via<Q> {
     type QueryId = Via<Q::QueryId>;
-    // The same query flagged both ways renders two SQL texts, so the
-    // prepared statement is keyed by the text, not the type.
+    /// The same query flagged both ways renders two SQL texts, so the
+    /// prepared statement is keyed by the text, not the type.
     const HAS_STATIC_QUERY_ID: bool = false;
 }
 
@@ -144,6 +148,7 @@ impl<Q, Conn> RunQueryDsl<Conn> for Via<Q> {}
 impl<Q: LimitDsl> LimitDsl for Via<Q> {
     type Output = Via<Q::Output>;
 
+    /// The query limited, still flagged.
     fn limit(self, limit: i64) -> Self::Output {
         Via {
             query: self.query.limit(limit),
@@ -155,6 +160,7 @@ impl<Q: LimitDsl> LimitDsl for Via<Q> {
 impl<Q: OffsetDsl> OffsetDsl for Via<Q> {
     type Output = Via<Q::Output>;
 
+    /// The query offset, still flagged.
     fn offset(self, offset: i64) -> Self::Output {
         Via {
             query: self.query.offset(offset),
@@ -167,6 +173,8 @@ impl<Q: OffsetDsl> OffsetDsl for Via<Q> {
 mod tests {
     use super::*;
 
+    /// A marker is stripped back to its route; other comments are not
+    /// markers.
     #[test]
     fn markers_round_trip() {
         for route in [Route::Streamgres, Route::Postgres] {
@@ -177,6 +185,7 @@ mod tests {
         assert_eq!(Route::strip("/* a comment */ SELECT 1"), None);
     }
 
+    /// The old route names are aliases of the new ones.
     #[test]
     fn old_names_still_mean_the_same() {
         assert_eq!(Route::Eventual, Route::Streamgres);

@@ -196,12 +196,15 @@ impl Snapshot {
     }
 }
 
+/// What the result is made of.
 enum Projection {
+    /// One row, the count of the joined rows.
     Count,
     /// `(node, column index in the node's types)` per output column.
     Columns(Vec<(usize, usize)>),
 }
 
+/// One table of the query, with the rows the engine shipped for it.
 struct Node {
     table: String,
     types: Arc<TableTypes>,
@@ -236,6 +239,8 @@ impl Materialized {
     /// Checks the query can be served from engine rows (every projected
     /// column encodable, every named column and table known) and loads
     /// the snapshot. `types` must cover every table of the snapshot.
+    /// Without a projection (`SELECT *`) the result is every column of
+    /// every table, in `FROM` order.
     pub fn new(
         snapshot: Snapshot,
         types: &HashMap<String, Arc<TableTypes>>,
@@ -353,7 +358,6 @@ impl Materialized {
                         Ok((node, column))
                     })
                     .collect::<Result<_, Unsupported>>()?,
-                // `SELECT *`: every column of every table, in FROM order.
                 None => nodes
                     .iter()
                     .enumerate()
@@ -506,16 +510,16 @@ impl Materialized {
     /// The joined rows: one entry per result row, holding each table's
     /// row or `None` where a left edge found no match. Root rows in the
     /// query's order; everything else in key order.
+    ///
+    /// Each child node's rows are indexed by the value of its join
+    /// column, in primary-key order by value: `ORDER BY child.id` in
+    /// Postgres puts 9 before 10, and so must this.
     fn assemble(&self) -> Vec<Vec<Option<&Json>>> {
-        // Per child node, its rows by the value of its join column.
         let mut by_value: Vec<HashMap<String, Vec<&Json>>> = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let mut index: HashMap<String, Vec<&Json>> = HashMap::new();
             if let Some(child_column) = node.child_column {
                 let name = &node.types.columns[child_column].name;
-                // Child rows under one parent come out in primary-key
-                // order, by value: `ORDER BY child.id` in Postgres puts
-                // 9 before 10, and so must this.
                 let mut keyed: Vec<(&String, &Json)> = node.rows.iter().collect();
                 keyed.sort_by(|(_, a), (_, b)| self.key_order(node, a, b));
                 for (_, row) in keyed {
@@ -564,7 +568,8 @@ impl Materialized {
     }
 
     /// Every result row the subtree under `node` makes with `row` as that
-    /// node's row, appended to `out`.
+    /// node's row, appended to `out`. An inner edge with no match makes
+    /// none; a left edge with no match leaves its subtree NULL.
     fn combos<'a>(
         &'a self,
         node: usize,
@@ -595,7 +600,6 @@ impl Materialized {
                 if child_node.inner {
                     return;
                 }
-                // A left edge with no match: the subtree stays NULL.
                 continue;
             }
             let mut next = Vec::with_capacity(partial.len() * child_combos.len());
@@ -634,15 +638,14 @@ fn json_bytes(value: &Json) -> usize {
 }
 
 /// Postgres's order for one clause: NULLs last ascending, first
-/// descending; numbers numerically, strings bytewise, booleans false
+/// descending (the reversal for descending applies to them as it does
+/// to values); numbers numerically, strings bytewise, booleans false
 /// first.
 fn compare(a: Option<&Json>, b: Option<&Json>, ascending: bool) -> Ordering {
     let a = a.filter(|v| !v.is_null());
     let b = b.filter(|v| !v.is_null());
     match (a, b) {
         (None, None) => Ordering::Equal,
-        // NULLs last ascending, first descending: the reversal below
-        // applies to them as it does to values.
         (None, Some(_)) => {
             if ascending {
                 Ordering::Greater
@@ -688,6 +691,7 @@ mod tests {
     use diesel::sql_types::{BigInt, Integer, Nullable, Text};
     use serde_json::json;
 
+    /// A base-type column.
     fn base(name: &str, oid: u32) -> ColumnType {
         ColumnType {
             name: name.into(),
@@ -697,6 +701,7 @@ mod tests {
         }
     }
 
+    /// The types of `t`, `books` and `reviews`.
     fn types() -> HashMap<String, Arc<TableTypes>> {
         HashMap::from([
             (
@@ -720,6 +725,7 @@ mod tests {
         ])
     }
 
+    /// The root node, table `t`, holding `rows`.
     fn root(rows: Vec<Json>) -> NodeSnapshot {
         NodeSnapshot {
             table: "t".into(),
@@ -732,6 +738,7 @@ mod tests {
         }
     }
 
+    /// A node joined under `parent` on `parent_column = child_column`.
     fn child(
         table: &str,
         parent: &str,
@@ -751,6 +758,7 @@ mod tests {
         }
     }
 
+    /// A snapshot of `t` alone, projecting `id` and `name`.
     fn snapshot(rows: Vec<Json>, order: Vec<(&str, bool)>, limit: Option<usize>) -> Snapshot {
         Snapshot {
             nodes: vec![root(rows)],
@@ -763,6 +771,7 @@ mod tests {
         }
     }
 
+    /// The rows as `(id, name)` pairs.
     fn decoded(rows: &Arc<[OwnedRow]>) -> Vec<(i32, String)> {
         rows.iter()
             .map(|row| {
@@ -778,6 +787,7 @@ mod tests {
         assert_eq!(Json::from("a\u{1f}b").to_string(), r#""a\u001fb""#);
     }
 
+    /// An offset skips rows before the limit takes its rows.
     #[test]
     fn an_offset_skips_rows_before_the_limit() {
         let mut snap = snapshot(
@@ -800,6 +810,8 @@ mod tests {
         assert_eq!(ids, vec![2, 3], "skipped one, took two");
     }
 
+    /// Rows come out in the query's order, NULLs last ascending, cut to
+    /// the limit and projected.
     #[test]
     fn rows_come_out_ordered_cut_and_projected() {
         let snap = snapshot(
@@ -819,6 +831,7 @@ mod tests {
         );
     }
 
+    /// Under `DESC` a NULL comes first, as Postgres puts it.
     #[test]
     fn descending_puts_nulls_first_as_postgres_does() {
         let snap = snapshot(
@@ -838,6 +851,7 @@ mod tests {
         );
     }
 
+    /// A second, longer row weighs more.
     #[test]
     fn the_store_weighs_its_rows() {
         let snap = snapshot(vec![json!({"id": 1, "name": "b", "rank": 2})], vec![], None);
@@ -854,6 +868,8 @@ mod tests {
         );
     }
 
+    /// A joined table's rows come out in key order by value (9, 10, 100),
+    /// not by text.
     #[test]
     fn child_rows_come_out_in_numeric_key_order() {
         let mut snap = snapshot(
@@ -887,6 +903,7 @@ mod tests {
         );
     }
 
+    /// Puts and deletes change the result.
     #[test]
     fn deltas_change_the_result() {
         let snap = snapshot(
@@ -912,6 +929,8 @@ mod tests {
         assert_eq!(m.len(), 2);
     }
 
+    /// A count is one `int8` row, which counts every row whatever the
+    /// limit.
     #[test]
     fn a_count_is_one_int8() {
         let mut snap = snapshot(vec![json!({"id": 1}), json!({"id": 2})], vec![], Some(1));
@@ -964,6 +983,8 @@ mod tests {
         assert_eq!(m.byte_len(), one_row, "a row that came and went weighs nothing");
     }
 
+    /// A projected column the client cannot encode refuses rows mode; an
+    /// unprojected one does not matter.
     #[test]
     fn an_unencodable_projected_column_refuses_rows_mode() {
         let mut t = types();
@@ -983,9 +1004,11 @@ mod tests {
         );
     }
 
+    /// Output columns are named by the statement's aliases.
     #[test]
     fn output_names_follow_the_aliases() {
         use diesel::deserialize::QueryableByName;
+        /// A row read by its output names.
         #[derive(QueryableByName, Debug, PartialEq)]
         struct Named {
             #[diesel(sql_type = Text)]
@@ -1017,6 +1040,7 @@ mod tests {
         );
     }
 
+    /// A NULL decodes into a nullable column.
     #[test]
     fn a_nullable_projection_decodes() {
         let snap = Snapshot {
@@ -1037,12 +1061,14 @@ mod tests {
     type Joined = (String, Option<String>);
     type JoinedSql = (Text, Nullable<Text>);
 
+    /// The rows as `(name, title)` pairs.
     fn joined(rows: &Arc<[OwnedRow]>) -> Vec<Joined> {
         rows.iter()
             .map(|row| <Joined as FromSqlRow<JoinedSql, Pg>>::build_from_row(row).unwrap())
             .collect()
     }
 
+    /// Authors `t` joined to their `books`, inner or left, in id order.
     fn authors_books(inner: bool, limit: Option<usize>) -> Snapshot {
         Snapshot {
             nodes: vec![
@@ -1076,6 +1102,7 @@ mod tests {
         }
     }
 
+    /// An inner join drops a parent with no match.
     #[test]
     fn an_inner_join_drops_parents_without_a_match() {
         let mut m = Materialized::new(authors_books(true, None), &types()).unwrap();
@@ -1089,6 +1116,8 @@ mod tests {
         );
     }
 
+    /// A left join keeps a parent with no match, NULL-extended, and the
+    /// limit counts joined rows.
     #[test]
     fn a_left_join_null_extends_and_the_limit_cuts_joined_rows() {
         let mut m = Materialized::new(authors_books(false, Some(3)), &types()).unwrap();
@@ -1103,6 +1132,8 @@ mod tests {
         );
     }
 
+    /// Changes on either side of a join recompose it; a parent that
+    /// leaves takes its rows with it.
     #[test]
     fn deltas_on_either_table_recompose_the_join() {
         let mut m = Materialized::new(authors_books(true, None), &types()).unwrap();
@@ -1125,6 +1156,7 @@ mod tests {
         );
     }
 
+    /// A join under a join, and a count of the rows it makes.
     #[test]
     fn a_nested_join_and_a_count_of_joined_rows() {
         let mut snap = authors_books(true, None);

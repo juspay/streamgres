@@ -72,6 +72,8 @@ pub fn supports(column: &ColumnType) -> Result<(), Unsupported> {
     }
 }
 
+/// Whether a base type can be encoded; a `numeric` cannot, since the
+/// engine holds it as a float and its exact digits are gone.
 fn supports_scalar(type_oid: u32, typmod: i32, name: &str) -> Result<(), Unsupported> {
     match type_oid {
         oid::BOOL
@@ -124,6 +126,10 @@ pub fn encode(cell: &Json, column: &ColumnType) -> Result<Option<OwnedValue>, Un
     Ok(Some(OwnedValue::new(type_oid, bytes)))
 }
 
+/// One base-type cell in Postgres's binary format. The engine carries a
+/// `bytea` as Postgres's hex text, `\x` and two digits per byte; the
+/// binary format is the bytes themselves. A time travels in
+/// microseconds since the Unix epoch, and a date as such a time.
 fn scalar(cell: &Json, type_oid: u32, name: &str) -> Result<Vec<u8>, Unsupported> {
     Ok(match type_oid {
         oid::BOOL => vec![u8::from(
@@ -156,8 +162,6 @@ fn scalar(cell: &Json, type_oid: u32, name: &str) -> Result<Vec<u8>, Unsupported
             }
             bytes
         }
-        // The engine carries `bytea` as Postgres's hex text, `\x` and two
-        // digits per byte; the binary format is the bytes themselves.
         oid::BYTEA => {
             let text = text(cell, name)?;
             let hex = text
@@ -219,6 +223,7 @@ fn array(
     Ok(out)
 }
 
+/// An integer cell; a float with no fraction counts as one.
 fn integer(cell: &Json, name: &str) -> Result<i64, Unsupported> {
     cell.as_i64()
         .or_else(|| cell.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64))
@@ -257,6 +262,7 @@ fn hex_bytes(hex: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// A string cell.
 fn text(cell: &Json, name: &str) -> Result<String, Unsupported> {
     match cell {
         Json::String(text) => Ok(text.clone()),
@@ -264,6 +270,7 @@ fn text(cell: &Json, name: &str) -> Result<String, Unsupported> {
     }
 }
 
+/// A cell that is not what its column's type wants.
 fn mismatch(name: &str, want: &str) -> Unsupported {
     Unsupported(format!("column `{name}`: expected {want}"))
 }
@@ -273,6 +280,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A base-type column named `c`.
     fn base(oid: u32) -> ColumnType {
         ColumnType {
             name: "c".into(),
@@ -282,10 +290,13 @@ mod tests {
         }
     }
 
+    /// An encoded value's bytes.
     fn bytes(value: Option<OwnedValue>) -> Vec<u8> {
         value.expect("a value").bytes().to_vec()
     }
 
+    /// Each scalar takes its Postgres width; a value that does not fit is
+    /// refused.
     #[test]
     fn scalars_take_their_postgres_widths() {
         assert_eq!(
@@ -333,6 +344,8 @@ mod tests {
         );
     }
 
+    /// `jsonb` carries its version byte; times and dates count from
+    /// Postgres's epoch.
     #[test]
     fn json_and_times() {
         let jsonb = bytes(encode(&json!({"a": [1, null]}), &base(oid::JSONB)).unwrap());
@@ -358,10 +371,11 @@ mod tests {
         );
     }
 
+    /// Malformed hex is refused, never a panic: a multi-byte character
+    /// where a hex digit should be would make slicing by byte index land
+    /// inside it.
     #[test]
     fn malformed_hex_is_refused_not_panicked() {
-        // A multi-byte character where a hex digit should be: slicing by
-        // byte index would land inside it and panic.
         let uuid = base(oid::UUID);
         assert!(encode(&json!("é1234567-89ab-cdef-0123-456789abcdef"), &uuid).is_err());
         assert!(encode(&json!("ééééééééééééééééééééééééééééééé"), &uuid).is_err());
@@ -376,6 +390,7 @@ mod tests {
         assert_eq!(hex_bytes("00ff"), Some(vec![0, 255]));
     }
 
+    /// A `bytea` is decoded from its `\x` hex text.
     #[test]
     fn bytea_is_decoded_from_hex_text() {
         let column = ColumnType {
@@ -391,6 +406,9 @@ mod tests {
         assert!(encode(&json!("\\x0"), &column).is_err(), "odd digits");
     }
 
+    /// What cannot be encoded is refused before any row is: an interval,
+    /// a numeric, a range. An array's header is one dimension, a
+    /// has-nulls flag, the element type, its length and lower bound 1.
     #[test]
     fn what_is_refused_up_front() {
         assert!(
@@ -418,7 +436,6 @@ mod tests {
         };
         assert!(supports(&text_array).is_ok());
         let encoded = bytes(encode(&json!(["a", null, "c,d"]), &text_array).unwrap());
-        // header: 1 dim, has nulls, text elements, length 3, lower bound 1
         assert_eq!(
             &encoded[..20],
             &[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 25, 0, 0, 0, 3, 0, 0, 0, 1]

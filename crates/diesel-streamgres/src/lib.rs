@@ -103,6 +103,7 @@ pub struct Settings {
     for_url: Box<AttachmentFor>,
 }
 
+/// What [`Settings`] asks of a URL.
 type AttachmentFor = dyn Fn(&str) -> Option<Attachment> + Send + Sync;
 
 impl Settings {
@@ -135,6 +136,8 @@ impl Settings {
     }
 }
 
+/// The settings [`install`] put in place, for every connection
+/// established after.
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
 /// How long after a write a connection's reads go to Postgres when the
@@ -217,6 +220,7 @@ impl<C> SyncedConnection<C> {
         self.route = route;
     }
 
+    /// The route this connection's reads take by default.
     pub fn route(&self) -> Route {
         self.route
     }
@@ -242,6 +246,7 @@ impl<C> SyncedConnection<C> {
         self.read_your_writes = window;
     }
 
+    /// How long after a write reads go to Postgres.
     pub fn read_your_writes(&self) -> Duration {
         self.read_your_writes
     }
@@ -256,6 +261,8 @@ impl<C> SyncedConnection<C> {
         }
     }
 
+    /// Whether a write went through the cache within the read-your-writes
+    /// window.
     fn within_write_window(&self) -> bool {
         self.cache
             .as_ref()
@@ -268,11 +275,13 @@ impl<C> SyncedConnection<C> {
     /// `interact` closure. The outer route is restored however `f`
     /// ends, a panic included.
     pub fn with_route<R>(&mut self, route: Route, f: impl FnOnce(&mut Self) -> R) -> R {
+        /// Puts the outer route back when dropped.
         struct Restore<'a, C> {
             conn: &'a mut SyncedConnection<C>,
             outer: Option<Route>,
         }
         impl<C> Drop for Restore<'_, C> {
+            /// Restores the outer route.
             fn drop(&mut self) {
                 self.conn.scoped = self.outer;
             }
@@ -326,13 +335,15 @@ where
     C: Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
 {
     type Backend = Pg;
-    // The ANSI manager is generic over the connection it drives: it issues
-    // `BEGIN`/`COMMIT`/`ROLLBACK` through `batch_execute` and keeps its depth
-    // in whatever `transaction_state` returns, so the wrapper reuses it and
-    // points it at the inner connection's state. One transaction state, not
-    // two that could disagree.
+    /// The ANSI manager is generic over the connection it drives: it
+    /// issues `BEGIN`/`COMMIT`/`ROLLBACK` through `batch_execute` and
+    /// keeps its depth in whatever `transaction_state` returns, so the
+    /// wrapper reuses it and points it at the inner connection's state.
+    /// One transaction state, not two that could disagree.
     type TransactionManager = AnsiTransactionManager;
 
+    /// Connects, attached to the cache [`install`] set up for this URL,
+    /// if any.
     fn establish(database_url: &str) -> ConnectionResult<Self> {
         let inner = C::establish(database_url)?;
         Ok(
@@ -348,6 +359,7 @@ where
         )
     }
 
+    /// Begins Diesel's test transaction on the inner connection.
     fn begin_test_transaction(&mut self) -> QueryResult<()> {
         self.inner.begin_test_transaction()
     }
@@ -369,14 +381,17 @@ where
         done
     }
 
+    /// The inner connection's transaction state.
     fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
         self.inner.transaction_state()
     }
 
+    /// The inner connection's instrumentation.
     fn instrumentation(&mut self) -> &mut dyn Instrumentation {
         self.inner.instrumentation()
     }
 
+    /// Sets the inner connection's instrumentation.
     fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
         self.inner.set_instrumentation(instrumentation)
     }
@@ -399,6 +414,19 @@ where
     where
         Self: 'conn;
 
+    /// A read, from the cache when it can be.
+    ///
+    /// The key is rendered before the route is known: a flag on the
+    /// query travels in its SQL, and is stripped from the key. A locking
+    /// read goes to Postgres, since the lock is the point: `FOR UPDATE`
+    /// outside a transaction still blocks a concurrent writer for the
+    /// statement. On a miss the generation is taken before subscribing,
+    /// so a touch, or an expiry that ends the subscription, between then
+    /// and the fill leaves nothing cached rather than something no one
+    /// updates. Once subscribed, the engine reports every change from
+    /// there on, so what Postgres returns then is current until the
+    /// first touch; a read that fails leaves no entry, and the
+    /// subscription ends with it rather than being held for nothing.
     fn load<'conn, 'query, T>(
         &'conn mut self,
         source: T,
@@ -411,8 +439,6 @@ where
         let Some(cache) = self.cache.clone() else {
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         };
-        // The key is rendered before the route is known: a flag on the
-        // query travels in its SQL, and is stripped from the key here.
         let mut key = QueryKey::of(&source, &mut self.inner)?;
         let route = key.take_route().or(self.scoped).unwrap_or(self.route);
         if !key.is_select() {
@@ -428,8 +454,6 @@ where
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
         if key.is_locking() {
-            // The lock is the point: `FOR UPDATE` outside a transaction
-            // still blocks a concurrent writer for the statement.
             cache.stats.locking.fetch_add(1, Ordering::Relaxed);
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
@@ -444,9 +468,6 @@ where
         if cache.refused_recently(&key).is_some() {
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
-        // The generation is taken before subscribing: a touch, or an
-        // expiry that ends the subscription, between here and the fill
-        // leaves nothing cached rather than something no one updates.
         let reservation = cache.reserve(&key);
         match cache.subscriptions().subscribe_with(&key, &mut self.inner) {
             Verdict::Refused(reason) => {
@@ -460,11 +481,6 @@ where
             }
             Verdict::Accepted => {}
         }
-
-        // Subscribed: the engine reports every change from here on, so
-        // what Postgres returns now is current until the first touch. A
-        // read that fails leaves no entry, so the subscription ends with
-        // it rather than being held for nothing.
         let rows = LoadConnection::<DefaultLoadingMode>::load(&mut self.inner, source)
             .and_then(capture_all);
         let rows: Arc<[OwnedRow]> = match rows {
@@ -527,7 +543,9 @@ fn reads_only(statement: &str) -> bool {
 }
 
 /// Whether a transaction is open on the connection. Inside one, reads must
-/// see the connection's own uncommitted writes, which no cache has.
+/// see the connection's own uncommitted writes, which no cache has. A
+/// broken transaction state counts as open: the inner connection reports
+/// it on the read.
 fn in_transaction<C>(conn: &mut C) -> bool
 where
     C: Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
@@ -535,8 +553,6 @@ where
     AnsiTransactionManager::transaction_manager_status_mut(conn)
         .transaction_depth()
         .map(|depth| depth.is_some())
-        // A broken transaction state counts as open: the inner connection
-        // reports it on the read.
         .unwrap_or(true)
 }
 
@@ -544,10 +560,12 @@ impl<C> R2D2Connection for SyncedConnection<C>
 where
     C: R2D2Connection + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
 {
+    /// Pings the inner connection.
     fn ping(&mut self) -> QueryResult<()> {
         self.inner.ping()
     }
 
+    /// Whether the inner connection is broken.
     fn is_broken(&mut self) -> bool {
         self.inner.is_broken()
     }
@@ -561,6 +579,7 @@ impl<C> GetPgMetadataCache for SyncedConnection<C>
 where
     C: GetPgMetadataCache,
 {
+    /// The inner connection's type metadata cache.
     fn get_metadata_cache(&mut self) -> &mut PgMetadataCache {
         self.inner.get_metadata_cache()
     }

@@ -97,7 +97,8 @@ pub trait Subscriptions: Send + Sync {
     }
 
     /// Both steps on a blocking connection: `lookup` is the connection
-    /// the read is on.
+    /// the read is on. A lookup that fails stops the lookups; the engine
+    /// side then reports the fallback for the types it lacks.
     fn subscribe_with(&self, key: &QueryKey, lookup: &mut dyn TypeLookup) -> Verdict {
         match self.subscribe(key) {
             Outcome::Verdict(verdict) => verdict,
@@ -108,7 +109,6 @@ pub trait Subscriptions: Send + Sync {
                         Ok(found) => {
                             types.insert(table, Arc::new(found));
                         }
-                        // The engine side reports the fallback.
                         Err(_) => break,
                     }
                 }
@@ -124,10 +124,12 @@ pub trait Subscriptions: Send + Sync {
 pub struct Unsynced;
 
 impl Subscriptions for Unsynced {
+    /// Refused: there is no engine.
     fn subscribe(&self, _: &QueryKey) -> Outcome {
         Outcome::Verdict(Verdict::Refused("no engine".to_string()))
     }
 
+    /// Refused: there is no engine.
     fn materialize(
         &self,
         _: &QueryKey,
@@ -137,5 +139,6 @@ impl Subscriptions for Unsynced {
         Verdict::Refused("no engine".to_string())
     }
 
+    /// Nothing to end.
     fn unsubscribe(&self, _: &QueryKey) {}
 }

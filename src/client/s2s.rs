@@ -129,6 +129,7 @@ use crate::parser::{BindValue, Projection, parse_select};
 use crate::sync::catalog::with_enums;
 use crate::sync::{CatalogHandle, Command, Event};
 
+/// The S2S protocol version the endpoint's `hello` announces.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// How many requests may wait for the task before a connection's reader
@@ -313,6 +314,7 @@ impl Handle {
 struct Admitted(Arc<AtomicUsize>);
 
 impl Drop for Admitted {
+    /// Gives the connection's place back.
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
     }
@@ -329,6 +331,7 @@ struct Throttle {
 }
 
 impl Throttle {
+    /// A throttle logging at most once per `every`.
     fn new(every: Duration) -> Throttle {
         Throttle {
             every,
@@ -450,6 +453,7 @@ impl Shape {
         offset: u32,
     ) -> Shape {
         let mut nodes = Vec::new();
+        /// Notes `query`'s node and its joined nodes below it, depth first.
         fn walk(
             query: &MultiTableReadQuery,
             parent: Option<usize>,
@@ -524,6 +528,7 @@ struct Task {
     /// Registered but not yet hydrated: `accepted` waits for the rows,
     /// so the backend's first read lands after the engine's.
     hydrating: HashSet<SubId>,
+    /// The token the next registration is sent under.
     next_token: u64,
     /// How many subscriptions one connection may hold, registering ones
     /// included (0: no limit).
@@ -532,6 +537,9 @@ struct Task {
 
 /// Runs the task: the engine's events on one side, the connections'
 /// requests on the other. Returns when both channels are closed.
+/// Queries are registered only once the engine's position covers the
+/// storage; until then a registration would read a snapshot the feed
+/// has not caught up with.
 pub async fn run(
     catalog: Arc<CatalogHandle>,
     sink: usize,
@@ -541,9 +549,6 @@ pub async fn run(
     mut ready: watch::Receiver<bool>,
     per_connection: usize,
 ) {
-    // Queries are registered only once the engine's position covers the
-    // storage; until then a registration would read a snapshot the feed
-    // has not caught up with.
     while !*ready.borrow() {
         if ready.changed().await.is_err() {
             return;
@@ -597,38 +602,45 @@ impl Task {
                 } = *subscribe;
                 self.subscribe(conn, id, query, shape).await
             }
-            Request::Unsubscribe { conn, id } => {
-                let Some(connection) = self.conns.get_mut(&conn) else {
-                    return;
-                };
-                let sub = connection.subs.remove(&id);
-                let registering = connection.registering.remove(&id);
-                connection.note_held();
-                if let Some(sub) = sub {
-                    self.forget(sub);
-                    let _ = self.commands.send(Command::Unregister(sub)).await;
-                }
-                // A registration still in flight for the id is not wanted
-                // either: `Registered` then finds no owner and unregisters
-                // it, and the id is free to subscribe again.
-                if let Some(token) = registering {
-                    self.by_token.remove(&token);
-                }
-            }
-            Request::Disconnected { conn } => {
-                if let Some(gone) = self.conns.remove(&conn) {
-                    let subs: Vec<SubId> = gone.subs.values().copied().collect();
-                    for sub in &subs {
-                        self.forget(*sub);
-                    }
-                    for token in gone.registering.values() {
-                        self.by_token.remove(token);
-                    }
-                    if !subs.is_empty() {
-                        let _ = self.commands.send(Command::UnregisterAll(subs)).await;
-                    }
-                }
-            }
+            Request::Unsubscribe { conn, id } => self.unsubscribe(conn, id).await,
+            Request::Disconnected { conn } => self.disconnected(conn).await,
+        }
+    }
+
+    /// Ends the connection's subscription `id`. A registration still in
+    /// flight for the id is not wanted either: `Registered` then finds no
+    /// owner and unregisters it, and the id is free to subscribe again.
+    async fn unsubscribe(&mut self, conn: u64, id: u64) {
+        let Some(connection) = self.conns.get_mut(&conn) else {
+            return;
+        };
+        let sub = connection.subs.remove(&id);
+        let registering = connection.registering.remove(&id);
+        connection.note_held();
+        if let Some(sub) = sub {
+            self.forget(sub);
+            let _ = self.commands.send(Command::Unregister(sub)).await;
+        }
+        if let Some(token) = registering {
+            self.by_token.remove(&token);
+        }
+    }
+
+    /// Ends every subscription of a connection that went away, and lets
+    /// go of its registrations in flight.
+    async fn disconnected(&mut self, conn: u64) {
+        let Some(gone) = self.conns.remove(&conn) else {
+            return;
+        };
+        let subs: Vec<SubId> = gone.subs.values().copied().collect();
+        for sub in &subs {
+            self.forget(*sub);
+        }
+        for token in gone.registering.values() {
+            self.by_token.remove(token);
+        }
+        if !subs.is_empty() {
+            let _ = self.commands.send(Command::UnregisterAll(subs)).await;
         }
     }
 
@@ -684,37 +696,7 @@ impl Task {
                 sub,
                 reads,
                 updates,
-            } => {
-                let Some((conn, id, shape)) = self.by_token.remove(&token) else {
-                    // The connection went away, or unsubscribed the id,
-                    // while the registration was in flight: the
-                    // subscription is not wanted.
-                    let _ = self.commands.send(Command::Unregister(sub)).await;
-                    return;
-                };
-                let Some(connection) = self.conns.get_mut(&conn) else {
-                    let _ = self.commands.send(Command::Unregister(sub)).await;
-                    return;
-                };
-                connection.registering.remove(&id);
-                connection.subs.insert(id, sub);
-                connection.note_held();
-                self.by_sub.insert(sub, (conn, id));
-                if let Some(mut shape) = shape {
-                    // A twin's rows come with the registration.
-                    for delta in &updates {
-                        if delta.targets().any(|target| target.sub == sub) {
-                            shape.absorb(&delta.table, &delta.op);
-                        }
-                    }
-                    self.shapes.insert(sub, shape);
-                }
-                if reads == 0 {
-                    self.accept(sub).await;
-                } else {
-                    self.hydrating.insert(sub);
-                }
-            }
+            } => self.registered(token, sub, reads, &updates).await,
             Event::Hydrated(subs) => {
                 for sub in subs {
                     if self.hydrating.remove(&sub) {
@@ -736,7 +718,42 @@ impl Task {
         }
     }
 
+    /// The engine registered the query of `token` as `sub`. When the
+    /// connection went away, or unsubscribed the id, while the
+    /// registration was in flight, the subscription is not wanted and is
+    /// unregistered. A twin's rows come with the registration, in
+    /// `updates`, and seed a rows-mode shape's snapshot.
+    async fn registered(&mut self, token: u64, sub: SubId, reads: usize, updates: &[Delta]) {
+        let Some((conn, id, shape)) = self.by_token.remove(&token) else {
+            let _ = self.commands.send(Command::Unregister(sub)).await;
+            return;
+        };
+        let Some(connection) = self.conns.get_mut(&conn) else {
+            let _ = self.commands.send(Command::Unregister(sub)).await;
+            return;
+        };
+        connection.registering.remove(&id);
+        connection.subs.insert(id, sub);
+        connection.note_held();
+        self.by_sub.insert(sub, (conn, id));
+        if let Some(mut shape) = shape {
+            for delta in updates {
+                if delta.targets().any(|target| target.sub == sub) {
+                    shape.absorb(&delta.table, &delta.op);
+                }
+            }
+            self.shapes.insert(sub, shape);
+        }
+        if reads == 0 {
+            self.accept(sub).await;
+        } else {
+            self.hydrating.insert(sub);
+        }
+    }
+
     /// `accepted`, with the hydrated rows for a rows-mode subscription.
+    /// A table that left the catalog meanwhile cannot be served: the
+    /// subscription is refused, and ended on the engine side too.
     async fn accept(&mut self, sub: SubId) {
         let Some((conn, id)) = self.by_sub.get(&sub).copied() else {
             return;
@@ -757,8 +774,6 @@ impl Task {
         let mut nodes = Vec::with_capacity(shape.nodes.len());
         for node in shape.nodes.iter_mut() {
             let Some(table) = catalog.table(node.table.as_str()) else {
-                // The subscription cannot be served: refused, and ended
-                // on the engine side too.
                 self.drop_sub(sub, "a table left the catalog").await;
                 return;
             };
@@ -827,10 +842,17 @@ impl Task {
     /// Every row is serialized once, for the first rows-mode
     /// subscription it reaches, and spliced into every frame that
     /// carries it.
+    ///
+    /// A subscription still hydrating is not told: the backend reads
+    /// only after `accepted`, which carries the change (rows mode) or
+    /// lands after it (touch mode). For a rows-mode subscription, per
+    /// table in order of appearance, the last operation on a key wins: a
+    /// row that left and came back is a put, one that came and went is
+    /// a delete, and no key is in both lists. A row of a table that left
+    /// the catalog mid-flight cannot be kept by the backend, so it goes
+    /// out as a delete.
     fn changed(&mut self, updates: &[Delta]) {
         let mut touched: HashMap<u64, HashSet<u64>> = HashMap::new();
-        // Per rows-mode subscription, per table in order of appearance,
-        // each key's last state in the transaction.
         let mut deltas: HashMap<SubId, Changes> = HashMap::new();
         let mut images: Vec<Box<RawValue>> = Vec::new();
         let catalog = self.catalog.load();
@@ -842,77 +864,38 @@ impl Task {
                     continue;
                 };
                 if self.hydrating.contains(&target.sub) {
-                    // Not accepted yet: the backend reads only after
-                    // `accepted`, which carries this change (rows mode)
-                    // or lands after it (touch mode).
                     if let Some(shape) = self.shapes.get_mut(&target.sub) {
                         shape.absorb(&delta.table, &delta.op);
                     }
                     continue;
                 }
-                if self.shapes.contains_key(&target.sub) {
-                    let changes = deltas.entry(target.sub).or_default();
-                    let index = match changes.iter().position(|(t, _)| *t == delta.table) {
-                        Some(index) => index,
-                        None => {
-                            changes.push((delta.table.clone(), HashMap::new()));
-                            changes.len() - 1
-                        }
-                    };
-                    let (_, keys) = &mut changes[index];
-                    // The last operation on a key wins: a row that left
-                    // and came back is a put, one that came and went is
-                    // a delete, and no key is in both lists.
-                    match (&delta.op, table) {
-                        (DataFrameOperation::Add(key, row), Some(table)) => {
-                            let image = *image.get_or_insert_with(|| {
-                                serialized(&wire::row_json(row, table)).map(|raw| {
-                                    images.push(raw);
-                                    images.len() - 1
-                                })
-                            });
-                            keys.insert(key.clone(), image);
-                        }
-                        (DataFrameOperation::Delete(key, _), _) => {
-                            keys.insert(key.clone(), None);
-                        }
-                        (DataFrameOperation::Add(key, _), None) => {
-                            // The table left the catalog mid-flight: the
-                            // backend cannot keep the row, so drop it.
-                            keys.insert(key.clone(), None);
-                        }
-                    }
-                } else {
+                if !self.shapes.contains_key(&target.sub) {
                     touched.entry(*conn).or_default().insert(*id);
+                    continue;
+                }
+                let keys = table_keys(deltas.entry(target.sub).or_default(), &delta.table);
+                match (&delta.op, table) {
+                    (DataFrameOperation::Add(key, row), Some(table)) => {
+                        let image = *image.get_or_insert_with(|| {
+                            serialized(&wire::row_json(row, table)).map(|raw| {
+                                images.push(raw);
+                                images.len() - 1
+                            })
+                        });
+                        keys.insert(key.clone(), image);
+                    }
+                    (DataFrameOperation::Delete(key, _) | DataFrameOperation::Add(key, _), _) => {
+                        keys.insert(key.clone(), None);
+                    }
                 }
             }
         }
         for (sub, changes) in deltas {
             if let Some((conn, id)) = self.by_sub.get(&sub)
                 && let Some(connection) = self.conns.get_mut(conn)
+                && let Some(text) = delta_frame(*id, &changes, &images)
             {
-                let changes: Vec<TableChanges> = changes
-                    .iter()
-                    .map(|(table, keys)| {
-                        let mut put = Vec::new();
-                        let mut del = Vec::new();
-                        for (key, row) in keys {
-                            match row {
-                                Some(index) => put.push(&*images[*index]),
-                                None => del.push(wire::key_json(key)),
-                            }
-                        }
-                        TableChanges {
-                            table: table.as_str(),
-                            put,
-                            del,
-                        }
-                    })
-                    .collect();
-                let body = DeltaBody { id: *id, changes };
-                if let Ok(text) = serde_json::to_string(&("delta", body)) {
-                    connection.send_text(text);
-                }
+                connection.send_text(text);
             }
         }
         for (conn, ids) in touched {
@@ -947,6 +930,46 @@ impl Task {
         self.shapes.remove(&sub);
         self.hydrating.remove(&sub);
     }
+}
+
+/// One table's keys in a subscription's changes, added in order of
+/// appearance the first time the table is named.
+fn table_keys<'c>(
+    changes: &'c mut Changes,
+    table: &TableName,
+) -> &'c mut HashMap<DataFrameKey, Option<usize>> {
+    let index = match changes.iter().position(|(named, _)| named == table) {
+        Some(index) => index,
+        None => {
+            changes.push((table.clone(), HashMap::new()));
+            changes.len() - 1
+        }
+    };
+    &mut changes[index].1
+}
+
+/// A `delta` frame for subscription `id`, its put rows spliced in from
+/// `images`, the transaction's serialized rows.
+fn delta_frame(id: u64, changes: &Changes, images: &[Box<RawValue>]) -> Option<String> {
+    let changes: Vec<TableChanges> = changes
+        .iter()
+        .map(|(table, keys)| {
+            let mut put = Vec::new();
+            let mut del = Vec::new();
+            for (key, row) in keys {
+                match row {
+                    Some(index) => put.push(&*images[*index]),
+                    None => del.push(wire::key_json(key)),
+                }
+            }
+            TableChanges {
+                table: table.as_str(),
+                put,
+                del,
+            }
+        })
+        .collect();
+    serde_json::to_string(&("delta", DeltaBody { id, changes })).ok()
 }
 
 /// A row image as JSON text, written once and spliced into every frame
@@ -1035,6 +1058,9 @@ fn authorized(headers: &HeaderMap, token: &str) -> bool {
 /// One upgraded connection, from `hello` to close. Its writer gets
 /// [`WRITER_DRAIN`] to flush once the session ends and is then cut off,
 /// so a backend that stopped reading cannot hold the connection open.
+/// Whatever ends the session, a panic in a frame's handling included,
+/// the task hears the connection is gone, or its subscriptions would
+/// outlive it.
 async fn handle(socket: WebSocket, state: Arc<AppState>) {
     let handle = &state.s2s;
     let conn = handle.next_conn.fetch_add(1, Ordering::Relaxed);
@@ -1078,9 +1104,6 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
     );
     log_info!("s2s connection {conn} open");
 
-    // Whatever ends the session, a panic in a frame's handling included,
-    // the task hears the connection is gone, or its subscriptions would
-    // outlive it.
     let session = serve(conn, stream, closed, &out, &held, &state);
     if AssertUnwindSafe(session).catch_unwind().await.is_err() {
         log_warn!("s2s connection {conn}: a frame's handling panicked");
@@ -1095,7 +1118,9 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
 }
 
 /// Reads frames until the backend closes, the task asks to close, or
-/// the task is gone.
+/// the task is gone. The task enforces the subscription limit; checking
+/// it here too keeps a connection at its limit from having more queries
+/// planned, which reads Postgres, only to be refused.
 async fn serve(
     conn: u64,
     mut stream: SplitStream<WebSocket>,
@@ -1147,9 +1172,6 @@ async fn serve(
                 binds,
                 rows,
             }) => {
-                // The task enforces the limit; checking it here too keeps
-                // a connection at its limit from having more queries
-                // planned, which reads Postgres, only to be refused.
                 let prepared = if limit > 0 && held.load(Ordering::Acquire) >= limit {
                     Err(format!(
                         "the subscription limit of {limit} per connection is reached"
@@ -1459,6 +1481,7 @@ mod tests {
         .await;
     }
 
+    /// A delta adding note `id` named `name`, aimed at `subs`.
     fn put(subs: &[u64], id: i64, name: &str) -> Delta {
         let key = DataFrameKey::from(HashMap::from([(ColumnName::from("id"), Value::Int(id))]));
         let row = DataFrameRow::from(HashMap::from([

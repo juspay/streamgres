@@ -64,6 +64,7 @@ pub trait TypeLookup {
     fn table_types(&mut self, table: &str) -> QueryResult<TableTypes>;
 }
 
+/// One column as `pg_attribute` and `pg_type` describe it.
 #[derive(QueryableByName)]
 struct Attribute {
     #[diesel(sql_type = Text)]
@@ -119,6 +120,7 @@ impl<C> TypeLookup for C
 where
     C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
 {
+    /// Reads the table's columns from the catalog on this connection.
     fn table_types(&mut self, table: &str) -> QueryResult<TableTypes> {
         let attributes = sql_query(format!(
             "SELECT {ATTRIBUTE_COLUMNS} \
@@ -165,12 +167,12 @@ pub const ALL_TABLES_SQL: &str = "SELECT c.relname, a.attname, a.atttypid, a.att
        AND a.attnum > 0 AND NOT a.attisdropped \
      ORDER BY array_position(current_schemas(false), n.nspname), c.relname, a.attnum";
 
-/// Groups [`ALL_TABLES_SQL`]'s rows by table.
+/// Groups [`ALL_TABLES_SQL`]'s rows by table. Rows of one table are
+/// contiguous; a later run under a name already taken is the same name
+/// in a later schema, which a bare name does not mean, so it is skipped
+/// whole.
 pub fn all_table_types(rows: Vec<TableAttribute>) -> std::collections::HashMap<String, TableTypes> {
     let mut tables: HashMap<String, TableTypes> = HashMap::new();
-    // Rows of one table are contiguous. A later run under a name already
-    // taken is the same name in a later schema, which a bare name does
-    // not mean, so it is skipped whole.
     let mut current: Option<(String, bool)> = None;
     for row in rows {
         let skip = match &current {

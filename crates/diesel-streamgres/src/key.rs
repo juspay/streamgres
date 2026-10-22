@@ -27,6 +27,7 @@ pub struct QueryKey {
     pub binds: Vec<Bind>,
 }
 
+/// Whether `text` starts with `word` as a whole word, case-insensitively.
 fn starts_with_word(text: &str, word: &str) -> bool {
     text.get(..word.len())
         .is_some_and(|head| head.eq_ignore_ascii_case(word))
@@ -130,6 +131,7 @@ impl QueryKey {
 mod tests {
     use super::*;
 
+    /// A key for `sql` with no binds.
     fn key(sql: &str) -> QueryKey {
         QueryKey {
             sql: sql.to_string(),
@@ -137,6 +139,8 @@ mod tests {
         }
     }
 
+    /// A `SELECT`, and a `WITH` that only reads, are reads; a `WITH`
+    /// that writes, and a word that only starts like one, are not.
     #[test]
     fn selects_and_reading_ctes_are_reads() {
         assert!(key("SELECT 1").is_select());
@@ -153,6 +157,7 @@ mod tests {
         assert!(!key("WITHIN").is_select());
     }
 
+    /// Every `FOR` locking clause marks a locking read.
     #[test]
     fn locking_reads_are_recognised() {
         assert!(key("SELECT * FROM t WHERE id = $1 FOR UPDATE").is_locking());

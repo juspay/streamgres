@@ -75,7 +75,8 @@ use crate::key::QueryKey;
 use crate::route::{Route, Served};
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::STALE_TYPES;
-use crate::subscriptions::{Outcome, Verdict};
+use crate::materialized::Snapshot;
+use crate::subscriptions::{Outcome, Subscriptions, Verdict};
 use crate::types::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
 use crate::{Attachment, SETTINGS, may_write, read_your_writes_from_env, rendered};
 
@@ -151,10 +152,12 @@ impl AsyncSyncedConnection {
         }
     }
 
+    /// Changes the route this connection's reads take by default.
     pub fn set_route(&mut self, route: Route) {
         self.route = route;
     }
 
+    /// The route this connection's reads take by default.
     pub fn route(&self) -> Route {
         self.route
     }
@@ -165,18 +168,22 @@ impl AsyncSyncedConnection {
         self.read_your_writes = window;
     }
 
+    /// How long after a write reads go to Postgres.
     pub fn read_your_writes(&self) -> Duration {
         self.read_your_writes
     }
 
+    /// The cache this connection reads through, if any.
     pub fn cache(&self) -> Option<&Arc<Cache>> {
         self.cache.as_ref()
     }
 
+    /// The connection that talks to Postgres.
     pub fn inner(&mut self) -> &mut AsyncPgConnection {
         &mut self.inner
     }
 
+    /// Gives the Postgres connection back.
     pub fn into_inner(self) -> AsyncPgConnection {
         self.inner
     }
@@ -189,11 +196,13 @@ impl AsyncSyncedConnection {
     where
         F: for<'a> FnOnce(&'a mut Self) -> BoxFuture<'a, R>,
     {
+        /// Puts the outer route back when dropped.
         struct Restore<'a> {
             conn: &'a mut AsyncSyncedConnection,
             outer: Option<Route>,
         }
         impl Drop for Restore<'_> {
+            /// Restores the outer route.
             fn drop(&mut self) {
                 self.conn.scoped = self.outer;
             }
@@ -244,12 +253,15 @@ impl AsyncSyncedConnection {
         .boxed()
     }
 
+    /// Whether a write went through the cache within the read-your-writes
+    /// window.
     fn within_write_window(&self) -> bool {
         self.cache
             .as_ref()
             .is_some_and(|cache| cache.wrote_within(self.read_your_writes))
     }
 
+    /// Whether a transaction is open; an unreadable state counts as one.
     fn in_transaction(&mut self) -> bool {
         AnsiTransactionManager::transaction_manager_status_mut(self)
             .transaction_depth()
@@ -280,12 +292,14 @@ impl AsyncSyncedConnection {
         }
     }
 
+    /// A Postgres read's rows as the wrapper's.
     fn live_stream<'a>(
         stream: BoxStream<'a, QueryResult<PgRow>>,
     ) -> BoxStream<'a, QueryResult<AsyncSyncedRow>> {
         stream.map_ok(SyncedRow::Live).boxed()
     }
 
+    /// Cached rows as the wrapper's.
     fn cached_stream(rows: Arc<[OwnedRow]>) -> BoxStream<'static, QueryResult<AsyncSyncedRow>> {
         stream::iter(OwnedCursor::new(rows).map(|row| row.map(SyncedRow::Cached))).boxed()
     }
@@ -328,6 +342,7 @@ struct TypeName {
 }
 
 impl TypeName {
+    /// The name as Diesel's metadata cache keys it.
     fn key(&self) -> PgMetadataCacheKey<'static> {
         PgMetadataCacheKey::new(
             self.schema.clone().map(Cow::Owned),
@@ -347,6 +362,8 @@ struct Lookup {
 }
 
 impl PgMetadataLookup for Lookup {
+    /// The type's OIDs when known; otherwise noted as unknown, and a
+    /// failed lookup for Diesel.
     fn lookup_type(&mut self, type_name: &str, schema: Option<&str>) -> PgTypeMetadata {
         let key = PgMetadataCacheKey::new(schema.map(Cow::Borrowed), Cow::Borrowed(type_name));
         if let Some(metadata) = self.cache.lock().expect("metadata").lookup_type(&key) {
@@ -362,6 +379,7 @@ impl PgMetadataLookup for Lookup {
         PgTypeMetadata::from_result(Err(FailedToLookupTypeError::new(key.into_owned())))
     }
 
+    /// The lookup itself.
     fn as_any<'a>(&mut self) -> &mut (dyn std::any::Any + 'a)
     where
         Self: 'a,
@@ -370,6 +388,7 @@ impl PgMetadataLookup for Lookup {
     }
 }
 
+/// A type's OID and its array type's.
 #[derive(QueryableByName)]
 struct TypeOids {
     #[diesel(sql_type = Oid)]
@@ -398,16 +417,17 @@ fn type_oids_query(
     }
 }
 
+/// A Postgres read in flight.
 type LoadFuture<'query> = BoxFuture<'query, QueryResult<BoxStream<'static, QueryResult<PgRow>>>>;
 
 impl SimpleAsyncConnection for AsyncSyncedConnection {
+    /// Runs SQL text, marking a possible write now and again when it
+    /// completes. diesel-async's future borrows the connection, so it
+    /// cannot be pipelined and needs no in-flight token.
     fn batch_execute(
         &mut self,
         query: &str,
     ) -> impl std::future::Future<Output = QueryResult<()>> + Send {
-        // diesel-async's future borrows the connection, so it cannot be
-        // pipelined and needs no in-flight token; the write is marked
-        // now and again when it completes.
         let cache = if may_write(query) {
             self.cache.clone()
         } else {
@@ -435,6 +455,8 @@ impl AsyncConnection for AsyncSyncedConnection {
     type Backend = Pg;
     type TransactionManager = AnsiTransactionManager;
 
+    /// Connects, attached to the cache [`crate::install`] set up for
+    /// this URL, if any.
     async fn establish(database_url: &str) -> ConnectionResult<Self> {
         let inner = AsyncPgConnection::establish(database_url).await?;
         Ok(
@@ -448,6 +470,17 @@ impl AsyncConnection for AsyncSyncedConnection {
         )
     }
 
+    /// A read, from the cache when it can be. A query whose binds name
+    /// types not known yet is read live this time, the types resolved
+    /// for the next (one that cannot even be keyed until then too).
+    ///
+    /// On a miss, the futures the read may need are built at once; which
+    /// are polled depends on the engine's answer. The read's future owns
+    /// the subscription from the moment the subscribe may have made it
+    /// until the fill; dropped before that, it ends it ([`Unfilled`]).
+    /// The subscribe runs on a blocking thread and cannot be cancelled,
+    /// so it checks the guard's flag once it returns: a subscription
+    /// made for a read that has gone is ended there, by the same path.
     fn load<'conn, 'query, T>(&'conn mut self, source: T) -> Self::LoadFuture<'conn, 'query>
     where
         T: AsQuery + 'query,
@@ -464,8 +497,6 @@ impl AsyncConnection for AsyncSyncedConnection {
             Err(error) => return std::future::ready(Err(error)).boxed(),
         };
         let Some(mut key) = key else {
-            // The query cannot even be keyed until its types are known:
-            // live this time, resolved for the next.
             let live = self.inner.load(query);
             let live = self
                 .resolving(unknown, live)
@@ -493,7 +524,6 @@ impl AsyncConnection for AsyncSyncedConnection {
             return self.tracked(live);
         }
         if !unknown.is_empty() {
-            // Live this time; the OIDs are resolved for the next time.
             let live = self.inner.load(query);
             let live = self
                 .resolving(unknown, live)
@@ -509,9 +539,6 @@ impl AsyncConnection for AsyncSyncedConnection {
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
             return self.tracked(live);
         }
-
-        // A miss. The futures the read may need are built now; which
-        // are polled depends on the engine's answer.
         let live = self.inner.load(query);
         let catalog: Option<LoadFuture<'query>> = if self.catalog_loaded.load(Ordering::Acquire) {
             None
@@ -525,12 +552,6 @@ impl AsyncConnection for AsyncSyncedConnection {
         async move {
             let _pending = token;
             let reservation = cache.reserve(&key);
-            // The future owns the subscription from the moment the
-            // subscribe may have made it until the fill; dropped before
-            // that, it ends it. The subscribe runs on a blocking thread
-            // and cannot be cancelled, so it checks the guard's flag once
-            // it returns: a subscription made for a read that has gone
-            // is ended there, by the same path.
             let guard = Unfilled {
                 cache: Arc::clone(&cache),
                 key: key.clone(),
@@ -555,39 +576,8 @@ impl AsyncConnection for AsyncSyncedConnection {
             let verdict = match outcome {
                 Outcome::Verdict(verdict) => verdict,
                 Outcome::NeedsTypes { snapshot, missing } => {
-                    let mut types: HashMap<String, Arc<TableTypes>> = HashMap::new();
-                    match catalog {
-                        Some(catalog) => {
-                            let rows: Vec<PgRow> = catalog.await?.try_collect().await?;
-                            let attributes = rows
-                                .iter()
-                                .map(|row| {
-                                    <TableAttribute as FromSqlRow<Untyped, Pg>>::build_from_row(row)
-                                        .map_err(Error::DeserializationError)
-                                })
-                                .collect::<QueryResult<Vec<_>>>()?;
-                            let all = all_table_types(attributes);
-                            // Every table's types, not only the missing
-                            // ones: the engine side keeps them, so the
-                            // next query on another table needs no
-                            // lookup at all. A table created since this
-                            // load is not among them; the next miss
-                            // loads the catalog again.
-                            catalog_loaded.store(
-                                missing.iter().all(|table| all.contains_key(table)),
-                                Ordering::Release,
-                            );
-                            for (table, found) in all {
-                                types.insert(table, Arc::new(found));
-                            }
-                            subscriptions.materialize(&key, snapshot, types)
-                        }
-                        None => {
-                            catalog_loaded.store(false, Ordering::Release);
-                            subscriptions.unsubscribe(&key);
-                            Verdict::Refused(STALE_TYPES.to_string())
-                        }
-                    }
+                    with_types(&*subscriptions, &key, snapshot, &missing, catalog, &catalog_loaded)
+                        .await?
                 }
             };
             match verdict {
@@ -615,6 +605,7 @@ impl AsyncConnection for AsyncSyncedConnection {
         .boxed()
     }
 
+    /// Runs a statement, marking a write when it may be one.
     fn execute_returning_count<'conn, 'query, T>(
         &'conn mut self,
         source: T,
@@ -631,21 +622,65 @@ impl AsyncConnection for AsyncSyncedConnection {
         }
     }
 
+    /// The inner connection's transaction state.
     fn transaction_state(&mut self) -> &mut AnsiTransactionManager {
         self.inner.transaction_state()
     }
 
+    /// The inner connection's instrumentation.
     fn instrumentation(&mut self) -> &mut dyn Instrumentation {
         self.inner.instrumentation()
     }
 
+    /// Sets the inner connection's instrumentation.
     fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
         self.inner.set_instrumentation(instrumentation)
     }
 
+    /// Sizes the inner connection's statement cache.
     fn set_prepared_statement_cache_size(&mut self, size: CacheSize) {
         self.inner.set_prepared_statement_cache_size(size)
     }
+}
+
+/// The engine's rows for a key whose tables' types the engine side does
+/// not know yet: every table's types are read from the catalog, not only
+/// the missing ones, since the engine side keeps them and the next query
+/// on another table then needs no lookup at all. A table created since
+/// this load is not among them, so the next miss loads the catalog
+/// again. A connection that already loaded the catalog has no lookup to
+/// make: the types it lacks are stale, and the read goes live.
+async fn with_types(
+    subscriptions: &dyn Subscriptions,
+    key: &QueryKey,
+    snapshot: Snapshot,
+    missing: &[String],
+    catalog: Option<LoadFuture<'_>>,
+    catalog_loaded: &AtomicBool,
+) -> QueryResult<Verdict> {
+    let Some(catalog) = catalog else {
+        catalog_loaded.store(false, Ordering::Release);
+        subscriptions.unsubscribe(key);
+        return Ok(Verdict::Refused(STALE_TYPES.to_string()));
+    };
+    let rows: Vec<PgRow> = catalog.await?.try_collect().await?;
+    let attributes = rows
+        .iter()
+        .map(|row| {
+            <TableAttribute as FromSqlRow<Untyped, Pg>>::build_from_row(row)
+                .map_err(Error::DeserializationError)
+        })
+        .collect::<QueryResult<Vec<_>>>()?;
+    let all = all_table_types(attributes);
+    catalog_loaded.store(
+        missing.iter().all(|table| all.contains_key(table)),
+        Ordering::Release,
+    );
+    let types: HashMap<String, Arc<TableTypes>> = all
+        .into_iter()
+        .map(|(table, found)| (table, Arc::new(found)))
+        .collect();
+    Ok(subscriptions.materialize(key, snapshot, types))
 }
 
 /// A subscription made for a read whose future may be dropped before
@@ -664,12 +699,14 @@ struct Unfilled {
 }
 
 impl Unfilled {
+    /// The read filled: the subscription is the cache's from here.
     fn disarm(mut self) {
         self.armed = false;
     }
 }
 
 impl Drop for Unfilled {
+    /// Ends the subscription if the read never filled.
     fn drop(&mut self) {
         if self.armed {
             self.gone.store(true, Ordering::Release);
@@ -683,6 +720,7 @@ impl Drop for Unfilled {
 /// pool that verifies connections on checkout (the default) catches
 /// that on its ping.
 impl PoolableConnection for AsyncSyncedConnection {
+    /// Whether the transaction manager says the connection is broken.
     fn is_broken(&mut self) -> bool {
         AnsiTransactionManager::is_broken_transaction_manager(self)
     }

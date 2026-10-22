@@ -43,10 +43,12 @@ impl OwnedValue {
         }
     }
 
+    /// The value's type.
     pub fn type_oid(&self) -> NonZeroU32 {
         self.type_oid
     }
 
+    /// The value in Postgres's binary format.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -139,12 +141,14 @@ const ROW_OVERHEAD: usize = 64;
 impl RowSealed for OwnedRow {}
 
 impl RowIndex<usize> for OwnedRow {
+    /// The position, if the row has that many columns.
     fn idx(&self, idx: usize) -> Option<usize> {
         (idx < self.values.len()).then_some(idx)
     }
 }
 
 impl<'a> RowIndex<&'a str> for OwnedRow {
+    /// The position of the column named `name`.
     fn idx(&self, name: &'a str) -> Option<usize> {
         self.columns.iter().position(|column| column == name)
     }
@@ -158,10 +162,12 @@ impl<'a> Row<'a, Pg> for OwnedRow {
         Self: 'f;
     type InnerPartialRow = Self;
 
+    /// How many columns the row has.
     fn field_count(&self) -> usize {
         self.values.len()
     }
 
+    /// One column, by position or name.
     fn get<'b, I>(&'b self, idx: I) -> Option<Self::Field<'b>>
     where
         'a: 'b,
@@ -171,6 +177,7 @@ impl<'a> Row<'a, Pg> for OwnedRow {
         Some(OwnedField { row: self, index })
     }
 
+    /// The columns in `range`, for a nested `Queryable`.
     fn partial_row(&self, range: std::ops::Range<usize>) -> PartialRow<'_, Self::InnerPartialRow> {
         PartialRow::new(self, range)
     }
@@ -183,10 +190,12 @@ pub struct OwnedField<'a> {
 }
 
 impl<'a> Field<'a, Pg> for OwnedField<'a> {
+    /// The column's name.
     fn field_name(&self) -> Option<&str> {
         Some(&self.row.columns[self.index])
     }
 
+    /// The column's value; `None` for `NULL`.
     fn value(&self) -> Option<PgValue<'_>> {
         let value = self.row.value(self.index)?;
         Some(PgValue::new(&value.bytes, &value.type_oid))
@@ -223,6 +232,7 @@ pub struct OwnedCursor {
 }
 
 impl OwnedCursor {
+    /// A cursor over `rows`, from the first.
     pub fn new(rows: Arc<[OwnedRow]>) -> Self {
         OwnedCursor { rows, next: 0 }
     }
@@ -231,12 +241,14 @@ impl OwnedCursor {
 impl Iterator for OwnedCursor {
     type Item = QueryResult<OwnedRow>;
 
+    /// The next row, shared with the cache.
     fn next(&mut self) -> Option<Self::Item> {
         let row = self.rows.get(self.next)?.clone();
         self.next += 1;
         Some(Ok(row))
     }
 
+    /// Exactly the rows left.
     fn size_hint(&self) -> (usize, Option<usize>) {
         let left = self.rows.len() - self.next;
         (left, Some(left))

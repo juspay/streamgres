@@ -147,12 +147,17 @@ pub struct Limits {
     pub refused_for: Option<Duration>,
 }
 
+/// The cache's byte budget when the environment says nothing: 256 MiB.
 pub const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;
+/// The largest result kept when the environment says nothing: 16 MiB.
 pub const DEFAULT_MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+/// How long an unread entry stays when the environment says nothing.
 pub const DEFAULT_TIME_TO_IDLE: Duration = Duration::from_secs(30 * 60);
+/// How long a refusal is remembered when the environment says nothing.
 pub const DEFAULT_REFUSED_FOR: Duration = Duration::from_secs(30);
 
 impl Default for Limits {
+    /// The documented defaults: idle expiry on, time to live off.
     fn default() -> Limits {
         Limits {
             max_bytes: DEFAULT_MAX_BYTES,
@@ -165,6 +170,8 @@ impl Default for Limits {
 }
 
 impl Limits {
+    /// The limits from the environment, each missing or unreadable one
+    /// at its default; a zero turns a clock or the entry limit off.
     pub fn from_env() -> Limits {
         let defaults = Limits::default();
         let millis = |name: &str, default: Option<Duration>| match env_number(name) {
@@ -186,6 +193,7 @@ impl Limits {
     }
 }
 
+/// A number from the environment.
 fn env_number(name: &str) -> Option<u64> {
     std::env::var(name).ok()?.trim().parse::<u64>().ok()
 }
@@ -221,6 +229,7 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// Counts one more.
     fn bump(counter: &AtomicU64) {
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -233,6 +242,7 @@ struct Slot {
     inflight: u32,
 }
 
+/// The generation of every key with a read in flight.
 type Generations = Arc<Mutex<HashMap<QueryKey, Slot>>>;
 
 /// A read's claim on a key between reserving it and filling it. Dropping
@@ -245,12 +255,14 @@ pub struct Reservation {
 }
 
 impl Reservation {
+    /// The key reserved.
     pub fn key(&self) -> &QueryKey {
         &self.key
     }
 }
 
 impl Drop for Reservation {
+    /// Lets the key's generation go once no other read holds one.
     fn drop(&mut self) {
         let mut generations = self.generations.lock().expect("generations");
         if let Some(slot) = generations.get_mut(&self.key) {
@@ -262,6 +274,7 @@ impl Drop for Reservation {
     }
 }
 
+/// Query results by key, kept current by the engine side.
 pub struct Cache {
     entries: moka::sync::Cache<QueryKey, Arc<Entry>>,
     generations: Generations,
@@ -497,6 +510,8 @@ impl Cache {
         bump(&self.generations, key);
     }
 
+    /// Stores `entry`, unless it is over the entry limit, in which case
+    /// the key is abandoned. Whether it was stored.
     fn insert(&self, key: &QueryKey, entry: Entry) -> bool {
         if entry.bytes as u64 > self.limits.max_entry_bytes {
             Stats::bump(&self.stats.oversized);
@@ -528,12 +543,13 @@ impl Cache {
     /// flight for the key by another read is dropped rather than kept
     /// with nothing to update it: the sequence the eviction listener
     /// uses, and the only way the wrapper may unsubscribe.
+    ///
+    /// The subscription goes first: the engine side bumps the generation
+    /// as it drops the key, so an engine delta that checked the key
+    /// before this point and inserts after it is dropped by its own
+    /// re-check. Then the bump again for a Postgres fill in flight, and
+    /// the entry.
     pub fn abandon(&self, key: &QueryKey) {
-        // The subscription first: the engine side bumps the generation
-        // as it drops the key, so an engine delta that checked the key
-        // before this point and inserts after it is dropped by its own
-        // re-check. Then the bump again for a Postgres fill in flight,
-        // and the entry.
         self.subscriptions.unsubscribe(key);
         bump(&self.generations, key);
         self.entries.invalidate(key);
@@ -609,6 +625,7 @@ impl Cache {
         self.generations.lock().expect("generations").len()
     }
 
+    /// The key's generation now; 0 when no read is in flight.
     fn generation(&self, key: &QueryKey) -> u64 {
         self.generations
             .lock()
@@ -627,6 +644,7 @@ fn bump(generations: &Generations, key: &QueryKey) {
 }
 
 impl std::fmt::Debug for Cache {
+    /// The entry count and the counters.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Cache")
             .field("entries", &self.entries.entry_count())
@@ -642,6 +660,7 @@ mod tests {
     use crate::subscriptions::{Outcome, Unsynced, Verdict};
     use crate::types::TableTypes;
 
+    /// A key for `sql` with no binds.
     fn key(sql: &str) -> QueryKey {
         QueryKey {
             sql: sql.to_string(),
@@ -649,6 +668,7 @@ mod tests {
         }
     }
 
+    /// An empty result.
     fn no_rows() -> Arc<[OwnedRow]> {
         Arc::from(Vec::new())
     }
@@ -660,10 +680,12 @@ mod tests {
     }
 
     impl Subscriptions for Recording {
+        /// Accepted.
         fn subscribe(&self, _: &QueryKey) -> Outcome {
             Outcome::Verdict(Verdict::Accepted)
         }
 
+        /// Accepted, with no rows.
         fn materialize(
             &self,
             _: &QueryKey,
@@ -673,16 +695,17 @@ mod tests {
             Verdict::Accepted
         }
 
+        /// Records the key.
         fn unsubscribe(&self, key: &QueryKey) {
             self.unsubscribed.lock().unwrap().push(key.clone());
         }
     }
 
+    /// Two readers of one key; the second gives up (its future was
+    /// dropped, or its read failed) and ends the subscription. The first
+    /// must not then store an entry nothing will invalidate.
     #[test]
     fn abandoning_a_key_fails_the_other_readers_fill() {
-        // Two readers of one key; the second gives up (its future was
-        // dropped, or its read failed) and ends the subscription. The
-        // first must not then store an entry nothing will invalidate.
         let engine = Arc::new(Recording::default());
         let cache = Cache::new(1 << 20, engine.clone());
         let k = key("SELECT 1");
@@ -699,10 +722,10 @@ mod tests {
         assert_eq!(cache.reservations(), 0);
     }
 
+    /// A rows-mode caller holds the snapshot's rows; a delta replaces the
+    /// entry before the caller fills. The older rows must lose.
     #[test]
     fn engine_rows_beat_a_fill_in_flight() {
-        // A rows-mode caller holds the snapshot's rows; a delta replaces
-        // the entry before the caller fills. The older rows must lose.
         let cache = Cache::new(1 << 20, Arc::new(Unsynced));
         let k = key("SELECT 1");
         let reservation = cache.reserve(&k);
@@ -722,10 +745,11 @@ mod tests {
         assert_eq!(cache.stats.stale_fills.load(Ordering::Relaxed), 1);
     }
 
+    /// The engine side reserved before building its rows; the key is
+    /// abandoned (which bumps as the subscription goes) in between, so
+    /// the rows are not served.
     #[test]
     fn a_replace_after_the_key_was_abandoned_does_not_stick() {
-        // The engine side reserved before building its rows; the key is
-        // abandoned (which bumps as the subscription goes) in between.
         let engine = Arc::new(Recording::default());
         let cache = Cache::new(1 << 20, engine.clone());
         let k = key("SELECT 1");
@@ -738,6 +762,8 @@ mod tests {
         );
     }
 
+    /// The engine's rows over the entry limit end the subscription, and
+    /// with it another reader's smaller fill.
     #[test]
     fn an_oversized_result_ends_the_subscription_and_the_other_fill() {
         let engine = Arc::new(Recording::default());
@@ -759,6 +785,7 @@ mod tests {
         );
     }
 
+    /// The defaults are the documented ones.
     #[test]
     fn limits_default_to_idle_on_and_ttl_off() {
         let limits = Limits::default();
@@ -769,6 +796,9 @@ mod tests {
         assert_eq!(env_number("STREAMGRES_CACHE_TEST_UNSET_VARIABLE"), None);
     }
 
+    /// A key's generation lives only while a read of it is in flight:
+    /// touches, evictions and expiries of keys nobody is reading leave
+    /// nothing behind, and a reservation dropped without a fill goes too.
     #[test]
     fn generations_live_only_while_a_read_is_in_flight() {
         let cache = Cache::new(1 << 20, Arc::new(Unsynced));
@@ -786,20 +816,17 @@ mod tests {
             0,
             "the reservation went with the fill"
         );
-
-        // Touches, evictions and expiries of keys nobody is reading leave
-        // nothing behind.
         for i in 0..1000 {
             cache.touched(&key(&format!("SELECT {i}")));
         }
         assert_eq!(cache.reservations(), 0);
-
-        // A reservation dropped without a fill goes too.
         let dropped = cache.reserve(&k);
         drop(dropped);
         assert_eq!(cache.reservations(), 0);
     }
 
+    /// A read that started before a touch cannot fill after a read that
+    /// started after it did.
     #[test]
     fn an_older_reservation_cannot_fill_after_a_newer_one_did() {
         let cache = Cache::new(1 << 20, Arc::new(Unsynced));
@@ -815,6 +842,8 @@ mod tests {
         assert_eq!(cache.reservations(), 0);
     }
 
+    /// A result over the entry limit is not kept, from Postgres or from
+    /// the engine.
     #[test]
     fn a_result_over_the_entry_limit_is_not_kept() {
         let cache = Cache::with_limits(
@@ -837,6 +866,7 @@ mod tests {
         );
     }
 
+    /// The write clock is the cache's, and a zero window is off.
     #[test]
     fn the_write_clock_is_shared() {
         let cache = Cache::new(1 << 20, Arc::new(Unsynced));
@@ -889,10 +919,12 @@ mod tests {
     struct Fixed(Arc<[OwnedRow]>);
 
     impl Live for Fixed {
+        /// The fixed rows.
         fn rows(&self) -> Option<Arc<[OwnedRow]>> {
             Some(Arc::clone(&self.0))
         }
 
+        /// Weighs nothing.
         fn bytes(&self) -> usize {
             0
         }

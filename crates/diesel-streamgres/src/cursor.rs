@@ -23,6 +23,7 @@ where
 {
     type Item = QueryResult<SyncedRow<R>>;
 
+    /// The next row, live or cached.
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             SyncedCursor::Live(inner) => inner.next().map(|row| row.map(SyncedRow::Live)),
@@ -30,6 +31,7 @@ where
         }
     }
 
+    /// The inner cursor's hint.
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
             SyncedCursor::Live(inner) => inner.size_hint(),
@@ -52,6 +54,7 @@ impl<R> RowIndex<usize> for SyncedRow<R>
 where
     R: RowIndex<usize>,
 {
+    /// The position, as the row behind it says.
     fn idx(&self, idx: usize) -> Option<usize> {
         match self {
             SyncedRow::Live(row) => row.idx(idx),
@@ -64,6 +67,7 @@ impl<'a, R> RowIndex<&'a str> for SyncedRow<R>
 where
     R: RowIndex<&'a str>,
 {
+    /// The position of a named column, as the row behind it says.
     fn idx(&self, idx: &'a str) -> Option<usize> {
         match self {
             SyncedRow::Live(row) => row.idx(idx),
@@ -83,6 +87,7 @@ where
         Self: 'f;
     type InnerPartialRow = Self;
 
+    /// How many columns the row has.
     fn field_count(&self) -> usize {
         match self {
             SyncedRow::Live(row) => row.field_count(),
@@ -90,6 +95,7 @@ where
         }
     }
 
+    /// One column, by position or name.
     fn get<'b, I>(&'b self, idx: I) -> Option<Self::Field<'b>>
     where
         'a: 'b,
@@ -102,6 +108,7 @@ where
         }
     }
 
+    /// The columns in `range`, for a nested `Queryable`.
     fn partial_row(&self, range: std::ops::Range<usize>) -> PartialRow<'_, Self::InnerPartialRow> {
         PartialRow::new(self, range)
     }
@@ -117,6 +124,7 @@ impl<'a, F> Field<'a, Pg> for SyncedField<'a, F>
 where
     F: Field<'a, Pg>,
 {
+    /// The column's name.
     fn field_name(&self) -> Option<&str> {
         match self {
             SyncedField::Live(field) => field.field_name(),
@@ -124,6 +132,7 @@ where
         }
     }
 
+    /// The column's value; `None` for `NULL`.
     fn value(&self) -> Option<PgValue<'_>> {
         match self {
             SyncedField::Live(field) => field.value(),
