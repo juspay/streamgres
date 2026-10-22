@@ -98,7 +98,7 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a socket may stay silent, pings unanswered, before it is
 /// taken for dead and its keys go stale, when the environment says
 /// nothing. A quiet socket is pinged three times in that time.
-pub const DEFAULT_SILENCE: Duration = Duration::from_secs(30);
+pub const DEFAULT_SILENCE: Duration = Duration::from_secs(10);
 
 /// How far a store's weight may drift from what its cache entry was
 /// weighed at, as a share of it (a quarter) and at least this many
@@ -112,7 +112,7 @@ const REWEIGH_BYTES: usize = 64 * 1024;
 /// | `STREAMGRES_S2S_CONNECTIONS`        | sockets to the engine              | 2       |
 /// | `STREAMGRES_S2S_MAX_SUBSCRIPTIONS`  | subscriptions held, all sockets    | 10000   |
 /// | `STREAMGRES_S2S_VERDICT_TIMEOUT_MS` | wait for `accepted` or `refused`   | 5000    |
-/// | `STREAMGRES_S2S_SILENCE_MS`         | a silent socket is taken for dead  | 30000   |
+/// | `STREAMGRES_S2S_SILENCE_MS`         | a silent socket is taken for dead  | 10000   |
 /// | `STREAMGRES_S2S_TOKEN`              | bearer token the engine asks for   | none    |
 ///
 /// A number that is missing, not a number, or zero leaves the default;
