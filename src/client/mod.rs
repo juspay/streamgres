@@ -57,6 +57,7 @@ pub mod ddl_triggers;
 pub mod groups;
 pub mod plan;
 pub mod protocol;
+pub mod s2s;
 pub mod sampler;
 pub mod schema;
 pub mod transform;
@@ -110,7 +111,10 @@ async fn join_worker(
 }
 
 /// Run the server with `config` until ctrl-c; returns the reason it could
-/// not start.
+/// not start. The engine feeds one consumer per group thread and one for
+/// the server-to-server endpoint, the last sink. Tasks are named for
+/// `tokio-console` when the runtime is built with `--cfg tokio_unstable`,
+/// and spawned plainly otherwise.
 pub fn serve(config: Config) -> Result<(), String> {
     log::set_level(config.log);
     log::set_format(config.log_format);
@@ -163,7 +167,7 @@ pub fn serve(config: Config) -> Result<(), String> {
                     &settings,
                     engine_catalog,
                     reads_handle,
-                    shards,
+                    shards + 1,
                     engine_stats,
                     engine_shutdown.clone(),
                 )
@@ -206,6 +210,10 @@ pub fn serve(config: Config) -> Result<(), String> {
         .map_err(|_| "the engine thread ended before it was up".to_owned())??;
 
     let (readiness, ready) = tokio::sync::watch::channel(false);
+    let mut events = events;
+    let s2s_events = events
+        .pop()
+        .ok_or("the engine started without the s2s sink".to_owned())?;
     let mut requests = Vec::with_capacity(shards);
     let mut group_threads = Vec::with_capacity(shards);
     for (shard, events) in events.into_iter().enumerate() {
@@ -280,6 +288,24 @@ pub fn serve(config: Config) -> Result<(), String> {
     let warm_budget = config.warm_start;
     let metrics_interval = config.metrics_interval;
     let (warmed_tx, warmed) = tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
+    let (s2s, s2s_requests) = s2s::Handle::new(config.s2s_max_connections);
+    let s2s_task = s2s::run(
+        catalog.clone(),
+        shards,
+        commands.clone(),
+        s2s_events,
+        s2s_requests,
+        ready.clone(),
+        config.s2s_connection_subscriptions,
+        stats.clone(),
+    );
+    #[cfg(tokio_unstable)]
+    tokio::task::Builder::new()
+        .name("s2s")
+        .spawn_on(s2s_task, server.handle())
+        .map_err(|error| format!("spawning the s2s task: {error}"))?;
+    #[cfg(not(tokio_unstable))]
+    server.spawn(s2s_task);
     let state = Arc::new(connection::AppState {
         config,
         requests,
@@ -294,6 +320,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         warmed,
         transforms,
         shutdown: shutdown.clone(),
+        s2s,
     });
     drop(readiness);
     if warm.enabled() {

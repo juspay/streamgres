@@ -77,6 +77,8 @@ pub struct AppState {
     pub warmed: watch::Receiver<bool>,
     pub transforms: Arc<TransformCache>,
     pub shutdown: Shutdown,
+    /// The server-to-server endpoint's task.
+    pub s2s: super::s2s::Handle,
 }
 
 /// One desired-query change between the client's message and the group
@@ -143,7 +145,9 @@ struct ConnectParams {
 pub fn router(state: Arc<AppState>) -> Router {
     let base = state.config.base_path.clone();
     let mut router =
-        Router::new().route(&format!("{base}/sync/v{{version}}/connect"), get(connect));
+        Router::new()
+            .route(&format!("{base}/sync/v{{version}}/connect"), get(connect))
+            .route(&format!("{base}/s2s/v1"), get(super::s2s::connect));
     for probe in ["health", "healthz", "readyz"] {
         router = router
             .route(&format!("{base}/{probe}"), get(health))

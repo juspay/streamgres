@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Streamgres ticket desk</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1a1a1a; --bg: #fafafa; --muted: #666; --line: #ddd; --ok: #2a7; --warn: #c80; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #eee; --bg: #151515; --muted: #999; --line: #333; } }
+  body { margin: 0; padding: 16px; font: 15px/1.45 system-ui, sans-serif; color: var(--fg); background: var(--bg); max-width: 960px; margin-inline: auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { color: var(--muted); margin: 0 0 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 16px; }
+  .card { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .card b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; }
+  .card span { color: var(--muted); font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  button { font: inherit; padding: 4px 10px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--fg); cursor: pointer; }
+  .cache { color: var(--ok); } .engine { color: var(--ok); } .postgres { color: var(--warn); }
+  code { font-size: 13px; }
+</style>
+</head>
+<body>
+<h1>Streamgres ticket desk</h1>
+<p class="sub">Reads go through the Diesel wrapper; the engine keeps the cache fresh. A background writer makes a change every second; <a href="/verify">/verify</a> compares every read with Postgres.</p>
+
+<div class="grid" id="counters"></div>
+
+<table>
+  <thead><tr><th>lookup</th><th>exercises</th><th>last</th><th>source</th><th>µs</th><th></th></tr></thead>
+  <tbody id="lookups"></tbody>
+</table>
+
+<p class="sub">Engine: <span id="engine"></span></p>
+
+<script>
+const paths = {
+  ticket: '/tickets/1', queue: '/orgs/1/queue?page=1', queue_count: '/orgs/1/queue/count?status=open',
+  comments: '/tickets/1/comments', attachment: '/attachments/1', agents: '/orgs/1/agents',
+  sla: '/orgs/1/sla', search: '/orgs/1/search?q=login', recent: '/orgs/1/recent?limit=5',
+  org_ticket: '/orgs/1/tickets/5', unassigned: '/orgs/1/unassigned', escalated: '/orgs/1/escalated',
+  open_except: '/orgs/1/open?except=1,2,3', created_between: '/orgs/1/created',
+  many: '/tickets?ids=' + Array.from({length: 100}, (_, i) => i + 1).join(','),
+  queue_end: '/orgs/1/queue/end', nothing: '/orgs/1/nothing', all_tickets: '/orgs/1/tickets',
+  comment_authors: '/tickets/1/authors', skilled: '/orgs/1/skilled?skill=billing',
+  statuses: '/orgs/1/statuses', workload: '/orgs/1/workload', last_activity: '/orgs/1/activity',
+};
+const last = {};
+async function refresh() {
+  const s = await (await fetch('/stats')).json();
+  const c = s.cache;
+  const v = s.verify, w = s.writer;
+  const cards = [
+    ['hits', c.hits], ['misses', c.misses], ['replaced', c.replaced], ['touched', c.touched],
+    ['refused', c.refused], ['after write', c.after_write], ['entries', c.entries], ['bytes', c.bytes],
+    ['writes', Object.entries(w).filter(([k]) => k !== 'errors').reduce((n, [, x]) => n + x, 0)],
+    ['verified', v.compared], ['lagged', v.lagged], ['mismatches', v.mismatches],
+  ];
+  document.getElementById('counters').innerHTML = cards.map(([k, v]) => `<div class="card"><b>${v}</b><span>${k}</span></div>`).join('');
+  const e = s.engine;
+  document.getElementById('engine').textContent =
+    `${e.connected ? 'connected' : 'not connected'}, ${e.connections} socket(s), ${e.subscribed} subscribed, ${e.materialized} in rows mode, ${e.store_bytes} store bytes` +
+    (e.fallbacks.length ? `; fallbacks: ${e.fallbacks.join(' | ')}` : '');
+}
+async function run(name) {
+  const r = await (await fetch(paths[name])).json();
+  last[name] = r;
+  render();
+  refresh();
+}
+let lookups = [];
+function render() {
+  document.getElementById('lookups').innerHTML = lookups.map(l => {
+    const r = last[l.name];
+    return `<tr><td><code>${(paths[l.name] || '').slice(0, 40)}</code></td><td>${l.exercises}</td>` +
+      `<td>${r ? (Array.isArray(r.rows) ? r.rows.length + ' row(s)' : JSON.stringify(r.rows)) : ''}</td>` +
+      `<td class="${r ? r.source : ''}">${r ? r.source : ''}</td><td>${r ? r.micros : ''}</td>` +
+      `<td><button onclick="run('${l.name}')">read</button></td></tr>`;
+  }).join('');
+}
+(async () => {
+  lookups = await (await fetch('/lookups')).json();
+  render();
+  refresh();
+  setInterval(refresh, 1000);
+})();
+</script>
+</body>
+</html>

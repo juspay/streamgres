@@ -333,6 +333,14 @@ fn json_string(out: &mut Vec<u8>, text: &str) {
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     tables: HashMap<TableName, DbTable>,
+    /// Type OIDs of the database's enums and their array types: a bound
+    /// parameter of one of these carries its label as text.
+    enum_oids: std::collections::HashSet<u32>,
+    /// Text-carried columns Postgres orders as the engine compares their
+    /// text, byte by byte: a `uuid`, a `bytea`'s hex, or a string under
+    /// the `C` collation. Any other text-carried column (an enum, a
+    /// string under a linguistic collation, an `inet`) orders otherwise.
+    ordered_as_text: std::collections::HashSet<(TableName, ColumnName)>,
 }
 
 impl Catalog {
@@ -343,7 +351,61 @@ impl Catalog {
                 .into_iter()
                 .map(|table| (table.name.clone(), table))
                 .collect(),
+            enum_oids: std::collections::HashSet::new(),
+            ordered_as_text: std::collections::HashSet::new(),
         }
+    }
+
+    /// The same catalog knowing these type OIDs are enums (or arrays of
+    /// enums).
+    pub fn with_enum_oids(mut self, oids: impl IntoIterator<Item = u32>) -> Self {
+        self.enum_oids = oids.into_iter().collect();
+        self
+    }
+
+    /// Whether a bound parameter of type `oid` is an enum label or an
+    /// array of them, which the wire carries as text.
+    pub fn is_enum_oid(&self, oid: u32) -> bool {
+        self.enum_oids.contains(&oid)
+    }
+
+    /// The enum type OIDs this catalog knows, for a catalog built from
+    /// this one to carry.
+    pub fn enum_oids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.enum_oids.iter().copied()
+    }
+
+    /// The same catalog knowing these text-carried columns order in
+    /// Postgres as their text does, byte by byte.
+    pub fn with_ordered_as_text(
+        mut self,
+        columns: impl IntoIterator<Item = (TableName, ColumnName)>,
+    ) -> Self {
+        self.ordered_as_text = columns.into_iter().collect();
+        self
+    }
+
+    /// Whether Postgres orders `table.column` as the engine compares it.
+    /// Numbers, booleans and times always do; a text-carried column only
+    /// when the catalog was told so; JSON and lists never do.
+    pub fn orders_as_engine(&self, table: &TableName, column: &ColumnName) -> bool {
+        match self
+            .table(table.as_str())
+            .and_then(|held| held.column(column.as_str()))
+            .map(|declared| &declared.r#type)
+        {
+            Some(ValueType::String) => self
+                .ordered_as_text
+                .contains(&(table.clone(), column.clone())),
+            Some(ValueType::Json | ValueType::List(_)) | None => false,
+            Some(_) => true,
+        }
+    }
+
+    /// The text-carried columns this catalog knows order as text, for a
+    /// catalog built from this one to carry.
+    pub fn ordered_as_text(&self) -> impl Iterator<Item = &(TableName, ColumnName)> + '_ {
+        self.ordered_as_text.iter()
     }
 
     /// The schema of table `name`, if the catalog contains it.

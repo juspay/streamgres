@@ -54,8 +54,10 @@ pub fn write_put(out: &mut Vec<u8>, table: &DbTable, row: &DataFrameRow) {
 }
 
 /// Append the `rowsPatch` entry deleting `key` from `table`:
-/// `{"op":"del","tableName":…,"id":{…}}`.
-pub fn write_del(out: &mut Vec<u8>, table: &str, key: &DataFrameKey) {
+/// `{"op":"del","tableName":…,"id":{…}}`. `declared` is the table's
+/// schema when the catalog has it, so a key column that is a time goes
+/// out in the protocol's milliseconds like every other cell.
+pub fn write_del(out: &mut Vec<u8>, table: &str, key: &DataFrameKey, declared: Option<&DbTable>) {
     out.extend_from_slice(b"{\"op\":\"del\",\"tableName\":");
     write_text(out, table);
     out.extend_from_slice(b",\"id\":{");
@@ -67,14 +69,17 @@ pub fn write_del(out: &mut Vec<u8>, table: &str, key: &DataFrameKey) {
         first = false;
         write_text(out, column.as_str());
         out.push(b':');
-        write_value(out, value, None);
+        let r#type = declared
+            .and_then(|table| table.column(column.as_str()))
+            .map(|column| &column.r#type);
+        write_value(out, value, r#type);
     }
     out.extend_from_slice(b"}}");
 }
 
 /// Append one cell as JSON, in the light of its declared type: a JSON
-/// column's text is embedded as it is when it parses, a time as its
-/// milliseconds, a list item by item.
+/// column's text is embedded as it is when it parses, a time (kept as
+/// microseconds) as its milliseconds, a list item by item.
 pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType>) {
     match value {
         Value::Null => out.extend_from_slice(b"null"),
@@ -86,6 +91,9 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
             }
             _ => write_text(out, text),
         },
+        Value::Int(int) if matches!(declared, Some(ValueType::Timestamp)) => {
+            let _ = write!(out, "{}", int.div_euclid(1000));
+        }
         Value::Int(int) => {
             let _ = write!(out, "{int}");
         }
@@ -123,7 +131,8 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
             out.push(b']');
         }
         Value::Map(_) | Value::Set(_) => {
-            if serde_json::to_writer(&mut *out, &value_json(value, declared)).is_err() {
+            let json = json_in(value, declared, Unit::Millis);
+            if serde_json::to_writer(&mut *out, &json).is_err() {
                 out.extend_from_slice(b"null");
             }
         }
@@ -156,8 +165,47 @@ pub fn key_json(key: &DataFrameKey) -> Json {
     Json::Object(object)
 }
 
-/// One cell as JSON, in the light of its declared type.
+/// One cell as JSON, in the light of its declared type, with a time as
+/// the microseconds the engine keeps (the server-to-server form; the
+/// Zero writer above scales to milliseconds).
 pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
+    json_in(value, declared, Unit::Micros)
+}
+
+/// The path a cell goes out on, which decides its unit: the engine's
+/// microseconds on the server-to-server path, milliseconds on Zero's.
+#[derive(Clone, Copy)]
+enum Unit {
+    Micros,
+    Millis,
+}
+
+impl Unit {
+    /// A time the engine keeps in microseconds, in this unit.
+    fn of(self, micros: i64) -> i64 {
+        match self {
+            Unit::Micros => micros,
+            Unit::Millis => micros.div_euclid(1000),
+        }
+    }
+
+    /// A float JSON has no number for (`NaN`, `±Infinity`). The
+    /// server-to-server path names it, as Postgres spells it, so the
+    /// backend gets the value back; Zero's protocol has always sent
+    /// `null`.
+    fn non_finite(self, float: f64) -> Json {
+        match self {
+            Unit::Millis => Json::Null,
+            Unit::Micros if float.is_nan() => Json::from("NaN"),
+            Unit::Micros if float > 0.0 => Json::from("Infinity"),
+            Unit::Micros => Json::from("-Infinity"),
+        }
+    }
+}
+
+/// One cell as JSON, with every time in it, nested ones included, in
+/// `unit`.
+fn json_in(value: &Value, declared: Option<&ValueType>, unit: Unit) -> Json {
     match value {
         Value::Null => Json::Null,
         Value::String(text) => match declared {
@@ -166,22 +214,31 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
             }
             _ => Json::String(text.clone()),
         },
+        Value::Int(int) if matches!(declared, Some(ValueType::Timestamp)) => {
+            Json::from(unit.of(*int))
+        }
         Value::Int(int) => Json::from(*int),
         Value::Float(float) if whole(*float) => Json::from(*float as i64),
-        Value::Float(float) => {
-            serde_json::Number::from_f64(*float).map_or(Json::Null, Json::Number)
-        }
+        Value::Float(float) => match serde_json::Number::from_f64(*float) {
+            Some(number) => Json::Number(number),
+            None => unit.non_finite(*float),
+        },
         Value::Bool(flag) => Json::Bool(*flag),
-        Value::Date(date) => date
-            .and_hms_opt(0, 0, 0)
-            .map_or(Json::Null, |at| Json::from(at.and_utc().timestamp_millis())),
-        Value::Datetime(datetime) => Json::from(datetime.and_utc().timestamp_millis()),
+        Value::Date(date) => date.and_hms_opt(0, 0, 0).map_or(Json::Null, |at| {
+            Json::from(unit.of(at.and_utc().timestamp_micros()))
+        }),
+        Value::Datetime(datetime) => Json::from(unit.of(datetime.and_utc().timestamp_micros())),
         Value::List(items) => {
             let inner = match declared {
                 Some(ValueType::List(inner)) => Some(inner.as_ref()),
                 _ => None,
             };
-            Json::Array(items.iter().map(|item| value_json(item, inner)).collect())
+            Json::Array(
+                items
+                    .iter()
+                    .map(|item| json_in(item, inner, unit))
+                    .collect(),
+            )
         }
         Value::Map(entries) => {
             let mut object = Map::with_capacity(entries.len());
@@ -190,14 +247,14 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
                     Value::String(text) => text.clone(),
                     other => format!("{other:?}"),
                 };
-                object.insert(key, value_json(item, None));
+                object.insert(key, json_in(item, None, unit));
             }
             Json::Object(object)
         }
         Value::Set(set) => Json::Array(
             set.members()
                 .iter()
-                .map(|item| value_json(item, None))
+                .map(|item| json_in(item, None, unit))
                 .collect(),
         ),
     }
@@ -299,12 +356,60 @@ mod tests {
             );
             let written: Json = serde_json::from_slice(&fast).expect("valid JSON");
             assert_eq!(written["tableName"], "odd \"table\"");
-            assert_eq!(written["value"], row_json(&planned, &table));
+            let mut expected = row_json(&planned, &table);
+            for time in ["ts", "day", "at"] {
+                expected[time] = Json::from(expected[time].as_i64().unwrap() / 1000);
+            }
+            expected["nan"] = Json::Null;
+            assert_eq!(
+                written["value"], expected,
+                "a time goes out in milliseconds, a NaN as null"
+            );
         }
     }
 
+    /// Every form of a time goes out in one unit per path: microseconds
+    /// on the server-to-server one, milliseconds on Zero's.
+    #[test]
+    fn a_time_has_one_unit_per_path() {
+        let at = chrono::NaiveDate::from_ymd_opt(2026, 10, 19)
+            .unwrap()
+            .and_hms_micro_opt(1, 2, 3, 456_789)
+            .unwrap();
+        let micros = at.and_utc().timestamp_micros();
+        let midnight = at
+            .date()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_micros();
+        let stamp = Some(&ValueType::Timestamp);
+        assert_eq!(value_json(&Value::Int(micros), stamp), Json::from(micros));
+        assert_eq!(value_json(&Value::Datetime(at), None), Json::from(micros));
+        assert_eq!(
+            value_json(&Value::Date(at.date()), None),
+            Json::from(midnight)
+        );
+        let zero = |value: &Value, declared| {
+            let mut out = Vec::new();
+            write_value(&mut out, value, declared);
+            String::from_utf8(out).unwrap()
+        };
+        let millis = (micros / 1000).to_string();
+        assert_eq!(zero(&Value::Int(micros), stamp), millis);
+        assert_eq!(zero(&Value::Datetime(at), None), millis);
+        assert_eq!(
+            zero(&Value::Date(at.date()), None),
+            (midnight / 1000).to_string()
+        );
+        let nested = Value::Map(HashMap::from([(Value::from("at"), Value::Datetime(at))]));
+        assert_eq!(value_json(&nested, None), serde_json::json!({"at": micros}));
+        assert_eq!(zero(&nested, None), format!(r#"{{"at":{millis}}}"#));
+    }
+
     /// A whole-valued float is written as an integer on both paths, a
-    /// fractional one as it is, and a NaN as null.
+    /// fractional one as it is; a NaN or an infinity is `null` to Zero
+    /// and named to a server-to-server backend.
     #[test]
     fn whole_floats_are_written_as_integers() {
         let mut out = Vec::new();
@@ -322,10 +427,17 @@ mod tests {
         assert_eq!(value_json(&Value::Float(1.0), None), serde_json::json!(1));
         assert_eq!(value_json(&Value::Float(1.5), None), serde_json::json!(1.5));
         assert!(!whole(1e17), "beyond 2^53 a float is left as it is");
+        assert_eq!(value_json(&Value::Float(f64::NAN), None), serde_json::json!("NaN"));
+        assert_eq!(value_json(&Value::Float(f64::INFINITY), None), serde_json::json!("Infinity"));
+        assert_eq!(
+            value_json(&Value::Float(f64::NEG_INFINITY), None),
+            serde_json::json!("-Infinity")
+        );
     }
 
     /// JSON columns are embedded, times are numbers, and the client's
-    /// schema filters the columns.
+    /// schema filters the columns. Keys are escaped, and a key column
+    /// that is a time goes out in milliseconds too.
     #[test]
     fn rows_serialize_for_the_client() {
         let table = DbTable::new(
@@ -346,7 +458,10 @@ mod tests {
         ]));
         let json = row_json(&row, &table);
         assert_eq!(json["meta"]["k"][1], 2);
-        assert_eq!(json["at"], 1_000);
+        assert_eq!(
+            json["at"], 1_000,
+            "the tree keeps the engine's microseconds"
+        );
         assert_eq!(json["extra"], 7, "every column the row carries is written");
 
         let mut bytes = Vec::new();
@@ -354,14 +469,50 @@ mod tests {
         let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(written["op"], "put");
         assert_eq!(written["tableName"], "t");
-        assert_eq!(written["value"], json, "the bytes say what the tree says");
+        let mut expected = json.clone();
+        expected["at"] = Json::from(1);
+        assert_eq!(
+            written["value"], expected,
+            "the bytes say what the tree says, times in milliseconds"
+        );
         let mut bytes = Vec::new();
         write_del(
             &mut bytes,
             "t",
             &DataFrameKey::new([("id", Value::from("a\"b"))]),
+            Some(&table),
         );
         let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(written["id"]["id"], "a\"b", "keys are escaped");
+
+        let timed = DbTable::new(
+            "timed",
+            ["at"],
+            vec![
+                DbColumn::new("at", ValueType::Timestamp),
+                DbColumn::new("v", ValueType::Int),
+            ],
+        );
+        let mut bytes = Vec::new();
+        write_del(
+            &mut bytes,
+            "timed",
+            &DataFrameKey::new([("at", Value::Int(1_000))]),
+            Some(&timed),
+        );
+        let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(written["id"]["at"], 1);
+        let mut bytes = Vec::new();
+        write_del(
+            &mut bytes,
+            "timed",
+            &DataFrameKey::new([("at", Value::Int(1_000))]),
+            None,
+        );
+        let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(
+            written["id"]["at"], 1_000,
+            "without the schema the number is left alone"
+        );
     }
 }

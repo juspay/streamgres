@@ -117,6 +117,30 @@ The server listens on `0.0.0.0:4848`. Point the client's `server` option at
 `.env.example`. `GET /health` returns `200` once the server is ready to serve
 queries.
 
+### Try it in five minutes
+
+`demo/docker-compose.yml` brings up Postgres, the server and a small
+ticket-desk backend built on the Diesel wrapper, with a background writer
+keeping the data moving; `demo/README.md` walks through it with curl, and
+<http://localhost:8080> shows the cache's counters live. The backend is
+`crates/streamgres-demo`, which is also the wrapper's test bed.
+
+### Server-to-server clients
+
+A backend that caches what it reads does not speak the Zero protocol. It
+connects to `ws://<host>:4848/<base>/s2s/v1` (with the bearer token in
+`STREAMGRES_S2S_TOKEN`, through TLS in front of the server off a private
+network) and subscribes the SQL its ORM rendered, `$n` binds and all;
+the server answers `accepted` with the hydrated rows (per table for a
+join; `bytea` as hex text, `OFFSET` left for the client to apply) or
+`refused`, then sends `delta` with the rows each committed transaction
+put or deleted, so the backend never reads Postgres for a query it
+holds. The protocol is documented in
+`src/client/s2s.rs`. The Diesel wrapper that uses it lives in this
+repository as [`crates/diesel-streamgres`](crates/diesel-streamgres):
+a drop-in `PgConnection` replacement whose reads come from an in-memory
+cache the engine keeps fresh.
+
 Configuration uses `STREAMGRES_*` environment variables, each documented in
 [`.env.example`](.env.example). Existing `XYNE_SYNC_*` variables are still
 accepted as fallbacks; a `STREAMGRES_*` value takes precedence when both are

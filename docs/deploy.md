@@ -280,6 +280,12 @@ depend on what the defaults happen to be:
 | `STREAMGRES_GROUP_LOG_BYTES` | `262144` | recent updates kept per client group, so a briefly disconnected tab catches up instead of starting over. `0` keeps none |
 | `STREAMGRES_MAX_MESSAGE_BYTES` | `16777216` | largest message accepted from a client |
 | `STREAMGRES_BYTES_PER_PART` | `768000` | bytes of serialized row changes per message part (750 KiB) |
+| `STREAMGRES_S2S_TOKEN` | none | secret a backend must send as `Authorization: Bearer <token>` to open the S2S endpoint. Unset, the endpoint takes any connection |
+| `STREAMGRES_S2S_MAX_CONNECTIONS` | `64` | S2S connections open at once; past it an upgrade is answered `503`. Each backend process opens `STREAMGRES_S2S_CONNECTIONS` (2), so 64 serves 32 processes. `0` lifts the limit |
+| `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` | `10000` | subscriptions one S2S connection may hold; past it a subscribe is refused. The engine announces it, and the client stops short of it. `0` lifts the limit |
+| `STREAMGRES_HEARTBEAT_MS` | `500` | how often the engine writes a heartbeat into the WAL (`pg_logical_emit_message`, not transactional) and measures how long its stream takes to bring it back. S2S clients are told that lag and read Postgres past their `STREAMGRES_S2S_MAX_LAG_MS`. Needs `STREAMGRES_PG_DSN` to reach a primary; `0` turns it off |
+| `STREAMGRES_S2S_MAX_DISJUNCTS` | `1024` | alternatives an S2S query's filters may expand to (an `AND` of `OR`s multiplies them); past it a subscribe is refused and the backend reads Postgres. The engine expands a filter on the thread every subscriber's changes go through: an `AND` of thirty `OR` pairs would hold them all up and exhaust its memory. `0` lifts the limit |
+| `STREAMGRES_S2S_MAX_LIST_VALUES` | `10000` | `IN` and `NOT IN` values an S2S query may hold in all; past it a subscribe is refused. The engine files each value on that same thread, about a second per 150,000. `0` lifts the limit |
 | `STREAMGRES_LOG` | `info` | `error`, `warn`, `info` or `debug`. `debug` costs throughput |
 | `STREAMGRES_SLOW_QUERY_MS` | `1000` | queries and pushes slower than this are logged at `warn` |
 | `STREAMGRES_METRICS_INTERVAL_MS` | `10000` | how often process metrics are sampled |
@@ -290,9 +296,27 @@ depend on what the defaults happen to be:
 
 - **One port, 4848.** It serves:
   - the WebSocket at `<base path>/sync/v51/connect`
+  - the server-to-server WebSocket at `<base path>/s2s/v1`, for backends
+    that cache their own reads
   - `/health`, `/metrics` and `/stats`
 
-  Keep `/metrics` and `/stats` private.
+  Keep `/metrics` and `/stats` private. Do the same for `/s2s/v1`, and
+  set `STREAMGRES_S2S_TOKEN`. The endpoint carries no user: anyone who
+  can open it can subscribe to the rows of every table the engine
+  follows. The server speaks plain `ws://`, so the token crosses the
+  network as text: terminate TLS in front of it (an ingress, a mesh,
+  a sidecar) unless the backends share a private network with it. The
+  two S2S limits multiply: at most `STREAMGRES_S2S_MAX_CONNECTIONS` ×
+  `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` subscriptions in all. Each
+  S2S connection queues at most 4,096 frames and 64 MiB of them for a
+  backend that is slow to read; past that it is closed, and its socket
+  cut off 5 seconds later if it still cannot be flushed.
+- **Times.** The engine keeps every time in microseconds, Postgres's own
+  precision, and the S2S endpoint ships them so. Zero clients see a time
+  as its whole milliseconds, and a Zero query's filter or page cursor on
+  a time compares on the millisecond, as the client does. Rows of one
+  page that fall in the same millisecond are ordered by their
+  microseconds, then by key, where the client orders them by key alone.
 - **Health.** `GET /health` (also `/healthz`, `/readyz`, and each of them
   under the base path) returns `503` until the server is ready. That means
   the change feed has passed the first read snapshot, and the warm start, if

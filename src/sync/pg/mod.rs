@@ -113,11 +113,11 @@ pub fn read_row_limit() -> usize {
         "STREAMGRES_SYNC_JOIN_LIMIT",
         "XYNE_SYNC_JOIN_LIMIT",
     ]
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .and_then(|value| value.trim().parse().ok())
-        .filter(|limit| *limit > 0)
-        .unwrap_or(DEFAULT_READ_ROW_LIMIT)
+    .iter()
+    .find_map(|name| std::env::var(name).ok())
+    .and_then(|value| value.trim().parse().ok())
+    .filter(|limit| *limit > 0)
+    .unwrap_or(DEFAULT_READ_ROW_LIMIT)
 }
 
 /// How the kernel probes a connection to the database while it is silent,
@@ -449,7 +449,7 @@ impl PgStorage {
         catalog: Arc<Catalog>,
         runtime: Handle,
     ) -> Result<Self, StorageError> {
-        let client = open(&read_config, &runtime).await?;
+        let client = open(&session_config(&read_config, None), &runtime).await?;
         let pool = Arc::new(Pool {
             config,
             read_config,
@@ -907,14 +907,12 @@ impl Pool {
 
     /// How a read's connection is opened: `config` (which carries the
     /// [`Keepalive`] the storage was given, if any, so the kernel probes
-    /// the connection while it sits idle in the pool), with the read
-    /// timeout also limiting how long a new connection may take to open.
+    /// the connection while it sits idle in the pool), the session's
+    /// time zone ([`session_config`]), and the read timeout as both the
+    /// time the connection may take to open and the session's
+    /// `statement_timeout`.
     fn read_config(&self) -> Config {
-        let mut config = self.read_config.clone();
-        if let Some(limit) = self.timeout() {
-            config.connect_timeout(limit);
-        }
-        config
+        session_config(&self.read_config, self.timeout())
     }
 
     /// Run one simple-query batch on a pooled connection, within the read
@@ -997,6 +995,42 @@ impl Pool {
         batch.push_str("; COMMIT");
         self.run(what, &batch).await
     }
+}
+
+/// The session a storage connection runs in: `config` with the session's
+/// time zone pinned to UTC, string literals pinned to the standard form
+/// and `bytea` to hex output, and, under a read `timeout`, that long to
+/// open and as the session's `statement_timeout`; the settings follow
+/// whatever options the connection string already carries, so they win.
+///
+/// The literal form matters for safety: a value from a server-to-server
+/// bind reaches the SQL as a quoted literal with only its quotes doubled,
+/// which is exact while `standard_conforming_strings` is on (Postgres's
+/// default) and would let a backslash escape the quote were a role or
+/// database to turn it off. `bytea_output = hex` is the form the feed and
+/// the catalog carry a `bytea` in.
+///
+/// The zone matters: a time in a filter is spelled as a zone-less
+/// timestamp (`TIMESTAMP 'epoch' + N microseconds`, so an index on the
+/// column answers it), which PostgreSQL reads in the session's zone when
+/// the column is `timestamptz`. The engine keeps every time as UTC
+/// microseconds, so the session must read the literal as UTC too, or a
+/// range on such a column misses rows by the zone's offset on a server
+/// whose default zone is not UTC.
+pub(crate) fn session_config(config: &Config, timeout: Option<Duration>) -> Config {
+    let mut config = config.clone();
+    let mut ours =
+        "-c TimeZone=UTC -c standard_conforming_strings=on -c bytea_output=hex".to_string();
+    if let Some(limit) = timeout {
+        config.connect_timeout(limit);
+        ours.push_str(&format!(" -c statement_timeout={}", limit.as_millis()));
+    }
+    let options = match config.get_options() {
+        Some(theirs) => format!("{theirs} {ours}"),
+        None => ours,
+    };
+    config.options(&options);
+    config
 }
 
 /// Run `work` as a task of `runtime` and wait for its result here.
@@ -1111,7 +1145,7 @@ fn decode_row(
 
 /// One column of a result row in its text form, decoded by the cast its
 /// declared type was read with ([`sql::select_expr`]): a time column
-/// arrives as its epoch milliseconds, a JSON column as the text of its
+/// arrives as its epoch microseconds, a JSON column as the text of its
 /// `jsonb` (kept in the standard form, [`text::standard_json`]), a list
 /// or map column as JSON text, the rest in Postgres's text form for the
 /// cast type.
@@ -1144,6 +1178,29 @@ fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every storage session runs in UTC, after the connection string's
+    /// own options so the zone wins, with the statement timeout beside
+    /// it when a read timeout is set.
+    #[test]
+    fn a_storage_session_is_pinned_to_utc() {
+        let mut config = Config::new();
+        assert_eq!(
+            session_config(&config, None).get_options(),
+            Some("-c TimeZone=UTC -c standard_conforming_strings=on -c bytea_output=hex")
+        );
+        config.options("-c TimeZone=Asia/Kolkata -c search_path=app");
+        assert_eq!(
+            session_config(&config, Some(Duration::from_millis(250))).get_options(),
+            Some(
+                "-c TimeZone=Asia/Kolkata -c search_path=app -c TimeZone=UTC -c standard_conforming_strings=on -c bytea_output=hex -c statement_timeout=250"
+            )
+        );
+        assert_eq!(
+            session_config(&config, Some(Duration::from_millis(250))).get_connect_timeout(),
+            Some(&Duration::from_millis(250))
+        );
+    }
 
     #[test]
     fn base36_keeps_any_snapshot_count_within_thirteen_digits() {

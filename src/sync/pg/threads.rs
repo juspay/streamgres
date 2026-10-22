@@ -68,6 +68,9 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 /// - `ddl_trigger`: the event trigger on `ddl_command_end` through which
 ///   schema changes are heard; the server will not serve without it.
 /// - `ddl_prefix`: the prefix of that trigger's logical messages.
+/// - `heartbeat`: how often the engine writes a heartbeat into the WAL
+///   to measure how far behind it is ([`crate::sync::heartbeat`]); zero
+///   for none.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub dsn: String,
@@ -87,6 +90,7 @@ pub struct Settings {
     pub watched: Vec<TableName>,
     pub ddl_trigger: String,
     pub ddl_prefix: String,
+    pub heartbeat: Duration,
 }
 
 /// What every slot a server names for itself starts with.
@@ -216,7 +220,8 @@ pub fn spawn_feed(
                     prefix: settings.ddl_prefix.clone(),
                     schemas: settings.schemas.clone(),
                 };
-                let mut feed = Feed::with_ddl(catalog, ddl);
+                let mut feed = Feed::with_ddl(catalog, ddl)
+                    .with_heartbeat(crate::sync::heartbeat::prefix(&settings.slot));
                 let mut start = Some(start);
                 let mut failures = 0u32;
                 loop {
@@ -337,6 +342,41 @@ pub async fn stop_feed(mut feed: FeedHandle) -> Result<(), String> {
     }
 }
 
+/// Writes this engine's heartbeats into the WAL of the database `config`
+/// names, for as long as the process runs, reconnecting a second after a
+/// failure. It runs off the engine thread (on the reads runtime), so a
+/// stalled engine thread shows as a growing lag rather than as heartbeats
+/// that stop coming. Once heartbeats have been written, a stretch in
+/// which they cannot be makes the lag grow, so backends read Postgres
+/// until they are written again. Until the first is written the lag is
+/// unknown and backends trust the engine, as they would one that sends
+/// no lag: a standby cannot write them, and its engine keeps serving.
+/// A failure is logged once until heartbeats are written again.
+async fn beat(config: tokio_postgres::Config, slot: String, every: Duration, stats: Arc<Stats>) {
+    let prefix = crate::sync::heartbeat::prefix(&slot);
+    let mut warned = false;
+    let mut written = 0;
+    loop {
+        let outcome = match super::open(&config, &tokio::runtime::Handle::current()).await {
+            Ok(client) => crate::sync::heartbeat::emit(&client, &prefix, every, &stats.freshness)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        if stats.freshness.written() != written {
+            written = stats.freshness.written();
+            warned = false;
+        }
+        if let Err(error) = outcome
+            && !warned
+        {
+            log_warn!("heartbeats stopped: {error}; retrying every second");
+            warned = true;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// Bring the engine side up on the current thread's local set: the slot
 /// made to exist, the storage over `settings` (its reads running on
 /// `reads`) with its first snapshot minted, the feed thread started at
@@ -367,14 +407,18 @@ pub async fn start(
         .parse()
         .map_err(|error| format!("connecting the read pool: {error}"))?;
     settings.keepalive.apply(&mut read_config);
-    let pg =
-        PgStorage::connect_configured_with_read_config(config, read_config, catalog.load(), reads)
-            .await
-            .map_err(|error| format!("connecting the storage: {error}"))?
-            .with_rotation(settings.snapshot_rotation)
-            .with_read_connections(settings.read_connections)
-            .with_read_idle_connections(settings.read_idle_connections)
-            .with_read_timeout(settings.read_timeout);
+    let pg = PgStorage::connect_configured_with_read_config(
+        config.clone(),
+        read_config,
+        catalog.load(),
+        reads.clone(),
+    )
+    .await
+    .map_err(|error| format!("connecting the storage: {error}"))?
+    .with_rotation(settings.snapshot_rotation)
+    .with_read_connections(settings.read_connections)
+    .with_read_idle_connections(settings.read_idle_connections)
+    .with_read_timeout(settings.read_timeout);
     let pg = Arc::new(pg);
     let (feed, feed_handle) = spawn_feed(
         settings.clone(),
@@ -390,6 +434,9 @@ pub async fn start(
             .await
             .map_err(|error| format!("warming the memory tables: {error}"))?;
         log_info!("memory tables warmed with {rows} rows");
+    }
+    if !settings.heartbeat.is_zero() {
+        reads.spawn(beat(config.clone(), settings.slot.clone(), settings.heartbeat, Arc::clone(&stats)));
     }
     let (sinks, events): (Vec<_>, Vec<_>) = (0..consumers.max(1))
         .map(|_| mpsc::unbounded_channel())

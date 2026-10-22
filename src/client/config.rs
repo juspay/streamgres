@@ -13,6 +13,17 @@ use crate::log::{Format, Level};
 use crate::model::TableName;
 use crate::sync::pg::{Keepalive, Settings, threads};
 
+/// A setting that must not reach a log: its `Debug` shows no value.
+#[derive(Clone)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    /// `Secret(..)`, never the value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
 /// Everything the server reads from the environment.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -51,6 +62,11 @@ pub struct Config {
     /// `STREAMGRES_DDL_PREFIX`: the prefix of that trigger's logical
     /// messages (`<app>/<shard>/ddl`, so `zero/0/ddl`).
     pub ddl_prefix: String,
+    /// `STREAMGRES_HEARTBEAT_MS`: how often the engine writes a heartbeat
+    /// into the WAL to measure, end to end, how far behind it is (500; 0
+    /// sends none, and the S2S endpoint then reports no lag). Any role
+    /// may emit one; it needs the primary.
+    pub heartbeat: Duration,
     /// `STREAMGRES_SNAPSHOT_ROTATION_MS`: how often a fresh exported
     /// snapshot (a temporary replication slot) is minted for reads (1000).
     pub snapshot_rotation: Duration,
@@ -132,6 +148,31 @@ pub struct Config {
     /// `STREAMGRES_MAX_MESSAGE_BYTES`: the largest inbound WebSocket message
     /// accepted (16 MiB).
     pub max_message_bytes: usize,
+    /// `STREAMGRES_S2S_TOKEN`: the secret a backend must present as
+    /// `Authorization: Bearer <token>` to open the S2S endpoint. Unset or
+    /// empty, the endpoint takes any connection, which only a trusted
+    /// network should be given.
+    pub s2s_token: Option<Secret>,
+    /// `STREAMGRES_S2S_MAX_CONNECTIONS`: how many S2S connections may be
+    /// open at once; past it an upgrade is answered 503 (64; 0 lifts the
+    /// limit). A backend process opens `STREAMGRES_S2S_CONNECTIONS` (2).
+    pub s2s_max_connections: usize,
+    /// `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS`: how many subscriptions
+    /// one S2S connection may hold, those still registering included; past
+    /// it a subscribe is refused (10000; 0 lifts the limit).
+    pub s2s_connection_subscriptions: usize,
+    /// `STREAMGRES_S2S_MAX_DISJUNCTS`: how many disjuncts an S2S query's
+    /// filters may normalize to, counted without expanding them; past it
+    /// a subscribe is refused (1024; 0 lifts the limit). The engine
+    /// expands a filter into its disjuncts on its own thread, so an `AND`
+    /// of thirty `OR` pairs would otherwise stall every subscriber and
+    /// exhaust memory.
+    pub s2s_max_disjuncts: u64,
+    /// `STREAMGRES_S2S_MAX_LIST_VALUES`: how many `IN` and `NOT IN` values
+    /// an S2S query may hold in all; past it a subscribe is refused
+    /// (10000; 0 lifts the limit). The engine files each value in its
+    /// routing index on its own thread, about a second per 150,000.
+    pub s2s_max_list_values: usize,
     /// `STREAMGRES_BYTES_PER_PART`: how many bytes of serialized row
     /// operations one poke part carries at most (768000, i.e. 750 KiB).
     pub bytes_per_part: usize,
@@ -321,6 +362,7 @@ impl Config {
             schemas,
             slot: threads::slot_name(),
             slot_cleanup_age: millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
+            heartbeat: millis("STREAMGRES_HEARTBEAT_MS", 500)?,
             publication: first(&["STREAMGRES_PUBLICATION"])
                 .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
             ddl_trigger,
@@ -388,6 +430,34 @@ impl Config {
                     format!("STREAMGRES_MAX_MESSAGE_BYTES must be a number, got `{text}`")
                 })?,
                 None => 16 * 1024 * 1024,
+            },
+            s2s_token: first(&["STREAMGRES_S2S_TOKEN"]).map(Secret),
+            s2s_max_connections: match first(&["STREAMGRES_S2S_MAX_CONNECTIONS"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("STREAMGRES_S2S_MAX_CONNECTIONS must be a number, got `{text}`")
+                })?,
+                None => 64,
+            },
+            s2s_connection_subscriptions: match first(&["STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS"])
+            {
+                Some(text) => text.parse().map_err(|_| {
+                    format!(
+                        "STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS must be a number, got `{text}`"
+                    )
+                })?,
+                None => 10_000,
+            },
+            s2s_max_disjuncts: match first(&["STREAMGRES_S2S_MAX_DISJUNCTS"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("STREAMGRES_S2S_MAX_DISJUNCTS must be a number, got `{text}`")
+                })?,
+                None => 1024,
+            },
+            s2s_max_list_values: match first(&["STREAMGRES_S2S_MAX_LIST_VALUES"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("STREAMGRES_S2S_MAX_LIST_VALUES must be a number, got `{text}`")
+                })?,
+                None => 10_000,
             },
             bytes_per_part: match first(&["STREAMGRES_BYTES_PER_PART"]) {
                 Some(text) => text.parse().map_err(|_| {
@@ -497,6 +567,7 @@ impl Config {
             ],
             ddl_trigger: self.ddl_trigger.clone(),
             ddl_prefix: self.ddl_prefix.clone(),
+            heartbeat: self.heartbeat,
         }
     }
 }
@@ -625,6 +696,63 @@ mod tests {
         assert_eq!(config.ddl_trigger, "my_trigger");
         assert_eq!(config.ddl_prefix, "mine/ddl");
         assert_eq!(config.engine_settings().ddl_trigger, "my_trigger");
+    }
+
+    /// The S2S endpoint takes any connection unless a token is set, and
+    /// the token never shows in the configuration's `Debug`.
+    #[test]
+    fn the_s2s_token_is_optional_and_kept_out_of_logs() {
+        assert!(config_with(&[]).s2s_token.is_none());
+        assert!(
+            config_with(&[("STREAMGRES_S2S_TOKEN", "")])
+                .s2s_token
+                .is_none()
+        );
+        let config = config_with(&[("STREAMGRES_S2S_TOKEN", "hunter2")]);
+        assert_eq!(
+            config.s2s_token.as_ref().map(|token| token.0.as_str()),
+            Some("hunter2")
+        );
+        assert!(!format!("{config:?}").contains("hunter2"));
+    }
+
+    /// 64 S2S connections may be open unless told otherwise.
+    #[test]
+    fn the_s2s_connection_count_has_a_default() {
+        assert_eq!(config_with(&[]).s2s_max_connections, 64);
+        let limited = config_with(&[("STREAMGRES_S2S_MAX_CONNECTIONS", "0")]);
+        assert_eq!(limited.s2s_max_connections, 0);
+        assert!(config(&[("STREAMGRES_S2S_MAX_CONNECTIONS", "many")]).is_err());
+    }
+
+    /// One S2S connection holds 10000 subscriptions unless told otherwise.
+    #[test]
+    fn the_s2s_connection_limit_has_a_default() {
+        assert_eq!(config_with(&[]).s2s_connection_subscriptions, 10_000);
+        let limited = config_with(&[("STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS", "3")]);
+        assert_eq!(limited.s2s_connection_subscriptions, 3);
+        assert!(config(&[("STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS", "x")]).is_err());
+    }
+
+    /// An S2S query's size is bounded unless told otherwise: 1024
+    /// disjuncts and 10000 list values, 0 lifting either.
+    #[test]
+    fn the_s2s_query_size_limits_have_defaults() {
+        let defaults = config_with(&[]);
+        assert_eq!((defaults.s2s_max_disjuncts, defaults.s2s_max_list_values), (1024, 10_000));
+        let set = config_with(&[
+            ("STREAMGRES_S2S_MAX_DISJUNCTS", "0"),
+            ("STREAMGRES_S2S_MAX_LIST_VALUES", "7"),
+        ]);
+        assert_eq!((set.s2s_max_disjuncts, set.s2s_max_list_values), (0, 7));
+        assert!(config(&[("STREAMGRES_S2S_MAX_DISJUNCTS", "lots")]).is_err());
+    }
+
+    /// The engine beats every 500 ms unless told otherwise; 0 stops it.
+    #[test]
+    fn the_heartbeat_has_a_default() {
+        assert_eq!(config_with(&[]).heartbeat, Duration::from_millis(500));
+        assert_eq!(config_with(&[("STREAMGRES_HEARTBEAT_MS", "0")]).heartbeat, Duration::ZERO);
     }
 
     /// [`config`], expected to parse.

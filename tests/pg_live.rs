@@ -12,18 +12,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
-use tokio::task::{LocalSet, spawn_local};
-use tokio_postgres::{Client, NoTls};
+use streamgres::client::ddl_triggers::trigger_stack_sql;
 use streamgres::ivm::{Delta, Engine, Fetch, MultiTableIVM, QueryPart};
 use streamgres::model::*;
-use streamgres::client::ddl_triggers::trigger_stack_sql;
 use streamgres::sync::pg::ddl::DdlSource;
 use streamgres::sync::pg::estimate_cache::EstimateCache;
 use streamgres::sync::pg::{PgStorage, PgStream};
 use streamgres::sync::{
     CatalogHandle, Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
 };
+use tokio::sync::mpsc;
+use tokio::task::{LocalSet, spawn_local};
+use tokio_postgres::{Client, NoTls};
 
 /// The database under test, if any.
 fn dsn() -> Option<String> {
@@ -432,6 +432,7 @@ fn service_streams_end_to_end() {
                     catalog: None,
                     received: Instant::now(),
                     committed_at_micros: 0,
+                    heartbeat: None,
                     decode: std::time::Duration::ZERO,
                 }))
                 .await
@@ -1844,6 +1845,198 @@ fn unchanged_out_of_line_values_are_never_lost() {
             runtime.stats().rows_completed >= 1,
             "the held-open read completed the reply"
         );
+        cleanup(&dsn, &client, &names).await;
+    });
+}
+
+/// A range on a `timestamptz` column is read right whatever zone the
+/// session would otherwise run in: the engine keeps times as UTC
+/// microseconds and spells a time in a filter as a zone-less timestamp,
+/// which PostgreSQL reads in the session's zone, so the storage pins the
+/// session to UTC after whatever the connection string asks for. A
+/// `timestamp` column, zone-less on both sides, reads the same either
+/// way. The desk's "created between" lookup missed every row on a
+/// server whose default zone was not UTC, until each row's next write.
+#[test]
+fn a_time_range_is_read_right_in_any_session_zone() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let table = "live_zone_events";
+        let slot = "xyne_sync_live_zone";
+        let publication = "xyne_sync_live_zone_pub";
+        let client = admin(&dsn).await;
+        PgStream::drop_slot(&dsn, slot, publication)
+            .await
+            .expect("drop slot");
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table};
+                 CREATE TABLE {table} (id int8 PRIMARY KEY, at timestamptz NOT NULL, naive timestamp NOT NULL);
+                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;
+                 INSERT INTO {table} VALUES
+                   (1, '2026-10-01 08:00:00+00', '2026-10-01 08:00:00'),
+                   (2, '2026-10-01 09:30:00+00', '2026-10-01 09:30:00'),
+                   (3, '2026-10-01 11:30:00+00', '2026-10-01 11:30:00'),
+                   (4, '2026-10-01 12:30:00+00', '2026-10-01 12:30:00');",
+            ))
+            .await
+            .expect("prepare");
+        let catalog = Arc::new(Catalog::new(vec![DbTable::new(
+            table,
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("at", ValueType::Timestamp),
+                DbColumn::new("naive", ValueType::Timestamp),
+            ],
+        )]));
+        let mut stream = PgStream::open(&dsn, slot, publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let mut config: tokio_postgres::Config = dsn.parse().expect("dsn");
+        config.options("-c TimeZone=Asia/Kolkata");
+        let storage = PgStorage::connect_configured(
+            config,
+            catalog.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+
+        let micros = |hour: i64| -> Value {
+            let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+            let at = day.and_hms_opt(hour as u32, 0, 0).unwrap().and_utc();
+            Value::Int(at.timestamp_micros())
+        };
+        for column in ["at", "naive"] {
+            let query = SingleTableReadQuery::new(
+                table,
+                Where::AND(vec![
+                    Where::condition(column, ComparisonOperator::GTE, micros(9)),
+                    Where::condition(column, ComparisonOperator::LT, micros(12)),
+                ]),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            );
+            let snapshot = storage.select(&query).await.expect("select");
+            let read: BTreeSet<i64> = snapshot
+                .rows
+                .iter()
+                .filter_map(|(key, _)| match key.pkey_value.get("id") {
+                    Some(Value::Int(id)) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                read,
+                BTreeSet::from([2, 3]),
+                "the rows between 09:00 and 12:00 UTC by `{column}`, in a session asked for Asia/Kolkata"
+            );
+        }
+        let _ = client
+            .batch_execute(&format!("DROP TABLE IF EXISTS {table};"))
+            .await;
+        let _ = PgStream::drop_slot(&dsn, slot, publication).await;
+    });
+}
+
+/// Every time PostgreSQL can hold reaches the engine, through the
+/// snapshot and through the change feed: `infinity` and `-infinity` as
+/// the extreme microseconds (where they order, as PostgreSQL orders
+/// them), a BC date and a year past 9999 exactly. A single `infinity`
+/// in a published table used to stop the change feed, and the engine
+/// with it, on every restart until the row was changed by hand.
+#[test]
+fn every_time_postgres_holds_reaches_the_engine() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let names = Names::new("infinite");
+        let table = names.extra.clone();
+        let client = prepare(&dsn, &names).await;
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {table} (id int8 PRIMARY KEY, at timestamptz, naive timestamp, day date);
+                 INSERT INTO {table} VALUES
+                   (1, 'infinity', 'infinity', 'infinity'),
+                   (2, '-infinity', '-infinity', '-infinity'),
+                   (3, '4713-01-01 00:00:00+00 BC', '4713-01-01 00:00:00 BC', '4713-01-01 BC'),
+                   (4, '12345-06-07 08:09:10+00', '12345-06-07 08:09:10', '12345-06-07');"
+            ))
+            .await
+            .expect("times");
+        let catalog = Arc::new(Catalog::new(vec![DbTable::new(
+            table.as_str(),
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("at", ValueType::Timestamp),
+                DbColumn::new("naive", ValueType::Timestamp),
+                DbColumn::new("day", ValueType::Timestamp),
+            ],
+        )]));
+        let mut stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+        let expected = BTreeMap::from([
+            (1, i64::MAX),
+            (2, i64::MIN),
+            (3, -210_863_520_000_000_000),
+            (4, 327_416_976_550_000_000),
+        ]);
+        let read = |filter: Where| SingleTableReadQuery::new(table.as_str(), filter, OrderBy::new("id", Order::ASC), u32::MAX);
+        let snapshot = storage.select(&read(Where::AND(vec![]))).await.expect("select");
+        for (key, row) in &snapshot.rows {
+            let Some(Value::Int(id)) = key.pkey_value.get("id") else {
+                panic!("an id")
+            };
+            let day = if *id == 4 { 327_416_947_200_000_000 } else { expected[id] };
+            assert_eq!(row.data.get("at"), Some(&Value::Int(expected[id])), "at of {id}");
+            assert_eq!(row.data.get("naive"), Some(&Value::Int(expected[id])), "naive of {id}");
+            assert_eq!(row.data.get("day"), Some(&Value::Int(day)), "day of {id}");
+        }
+        assert_eq!(snapshot.rows.len(), 4);
+
+        let infinite = storage
+            .select(&read(Where::condition("at", ComparisonOperator::EQ, Value::Int(i64::MAX))))
+            .await
+            .expect("a condition on infinity renders");
+        assert_eq!(infinite.rows.len(), 1, "infinity finds its row");
+        let after = storage
+            .select(&read(Where::condition("at", ComparisonOperator::GT, Value::Int(0))))
+            .await
+            .expect("select");
+        assert_eq!(after.rows.len(), 2, "infinity and the year 12345 come after 1970");
+
+        client
+            .batch_execute(&format!(
+                "UPDATE {table} SET at = '-infinity', naive = '4713-01-01 00:00:00 BC' WHERE id = 1;
+                 INSERT INTO {table} VALUES (5, 'infinity', '12345-06-07 08:09:10', '-infinity');"
+            ))
+            .await
+            .expect("changes");
+        let mut images = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while images.len() < 2 {
+            assert!(Instant::now() < deadline, "the feed did not deliver both changes");
+            let batch = stream.poll().await.expect("the feed reads every time");
+            for (write, _) in batch.writes {
+                if let Some(image) = write.new_row_image() {
+                    images.push(image.data.clone());
+                }
+            }
+        }
+        assert_eq!(images[0].get("at"), Some(&Value::Int(i64::MIN)));
+        assert_eq!(images[0].get("naive"), Some(&Value::Int(-210_863_520_000_000_000)));
+        assert_eq!(images[1].get("at"), Some(&Value::Int(i64::MAX)));
+        assert_eq!(images[1].get("naive"), Some(&Value::Int(327_416_976_550_000_000)));
+        assert_eq!(images[1].get("day"), Some(&Value::Int(i64::MIN)));
         cleanup(&dsn, &client, &names).await;
     });
 }

@@ -146,7 +146,7 @@ impl PublishedTable {
 
 /// The engine's type for a published column, mapped as the startup
 /// catalog maps `information_schema`: an array is a list of its element's
-/// type, an enum is a string, `bytea` is not carried.
+/// type, an enum is a string, `bytea` is its hex text.
 pub fn column_type(column: &PublishedColumn) -> Option<ValueType> {
     if let Some(element) = column.data_type.strip_suffix("[]") {
         let element = element.trim_end_matches("[]");
@@ -284,7 +284,7 @@ fn typed(text: &str, declared: &ValueType) -> Option<Value> {
             "f" | "false" | "0" => false,
             _ => return None,
         }),
-        ValueType::Timestamp => Value::Int(text::epoch_millis(text)?),
+        ValueType::Timestamp => Value::Int(text::epoch_micros(text)?),
         ValueType::List(inner) => match text::array_literal(text, inner) {
             Value::List(items) => Value::List(items),
             _ => return None,
@@ -564,7 +564,7 @@ mod tests {
                 &ValueType::Timestamp
             ),
             Some(Value::Int(
-                text::epoch_millis("2026-01-02 03:04:05+00").unwrap()
+                text::epoch_micros("2026-01-02 03:04:05+00").unwrap()
             ))
         );
         for expression in [
@@ -610,7 +610,8 @@ mod tests {
             column_type(&column("text[]", "b")),
             Some(ValueType::List(Box::new(ValueType::String)))
         );
-        assert_eq!(column_type(&column("bytea", "b")), None);
+        assert_eq!(column_type(&column("bytea", "b")), Some(ValueType::String));
+        assert_eq!(column_type(&column("int4range", "r")), None);
     }
 
     /// A column added with a constant default, a table added, both

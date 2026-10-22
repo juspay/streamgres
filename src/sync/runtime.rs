@@ -271,7 +271,17 @@ impl<E: Engine> Runtime<E> {
             snapshot.at,
             self.position
         );
+        let read_rows = snapshot.rows.len();
         let (rows, worst_read) = self.bring_up(&flight.fetch, snapshot.rows, snapshot.at);
+        crate::log::log_debug!(
+            "read {} of {}: {} rows at {}, {} after bringing up to {}",
+            flight.fetch.id.0,
+            flight.fetch.query.table,
+            read_rows,
+            snapshot.at,
+            rows.len(),
+            self.position
+        );
         self.stats.reads_landed += 1;
         step.updates = self.engine.land(&flight.fetch, &rows, worst_read.as_ref());
         self.landed.push(rows);

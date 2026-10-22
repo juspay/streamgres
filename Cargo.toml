@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/*"]
+
 [package]
 name = "streamgres"
 version = "0.1.0"
@@ -5,7 +8,15 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 
+[features]
+# `tokio-console` support for local debugging: build with
+# `RUSTFLAGS="--cfg tokio_unstable" cargo build --features console`, run
+# the server, then `tokio-console` attaches on 127.0.0.1:6669.
+console = ["dep:console-subscriber"]
+
 [dependencies]
+console-subscriber = { version = "0.5", optional = true }
+
 # The hasher of the engine's integer-keyed maps (subscription, row, read
 # and tree ids): one multiply per key instead of SipHash (see
 # `model::ids`). Keys that are user data keep the default hasher.
@@ -98,3 +109,8 @@ log = "0.4"
 # the same.
 [profile.release]
 debug = "limited"
+
+[lints.rust]
+# `tokio_unstable` is set with `RUSTFLAGS="--cfg tokio_unstable"` for
+# `tokio-console` builds (see the `console` feature).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }

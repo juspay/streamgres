@@ -268,24 +268,29 @@ pub fn cast_of(declared: &ValueType) -> &'static str {
 }
 
 /// The SQL reading one column in the form the engine keeps it: a time
-/// column as epoch milliseconds, a JSON column as the text of its `jsonb`
+/// column as epoch microseconds, a JSON column as the text of its `jsonb`
 /// (the cast is nothing for a `jsonb` column, and gives a `json` column's
 /// stored text the one spelling `jsonb` has), an array or map column as
 /// JSON text, every other cast to its declared type's Postgres form.
 pub fn select_expr(column: &str, declared: &ValueType) -> String {
     let quoted = quote_ident(column);
     match declared {
-        ValueType::Timestamp => epoch_millis(&quoted),
+        ValueType::Timestamp => epoch_micros(&quoted),
         ValueType::Json => format!("{quoted}::jsonb::text"),
         ValueType::List(_) | ValueType::Map(_, _) => format!("to_json({quoted})::text"),
         other => format!("{quoted}::{}", cast_of(other)),
     }
 }
 
-/// `expr` as milliseconds since the epoch; `extract` is numeric, so the
-/// rounding to `int8` keeps the millisecond a `timestamp(3)` column has.
-fn epoch_millis(expr: &str) -> String {
-    format!("(extract(epoch from {expr}) * 1000)::int8")
+/// `expr` as microseconds since the epoch, as the change feed reads it
+/// ([`super::text::epoch_micros`]): `extract` is exact at the column's
+/// full precision; `infinity` and `-infinity` are the extreme `int8`s,
+/// and a finite time past what `int8` microseconds count saturates one
+/// short of them, so no time Postgres holds fails the read.
+fn epoch_micros(expr: &str) -> String {
+    format!(
+        "CASE WHEN isfinite({expr}) THEN LEAST(GREATEST(extract(epoch from {expr})::numeric * 1000000, -9223372036854775807), 9223372036854775806)::int8 WHEN {expr} > 'epoch' THEN 9223372036854775807 ELSE -9223372036854775808 END"
+    )
 }
 
 /// A column as the SQL its conditions compare it by: the bare column
@@ -303,7 +308,7 @@ fn column_expr(column: &str, scope: &Scope<'_>) -> String {
 }
 
 /// A literal compared against a column of `declared` type: the engine
-/// keeps a time as milliseconds since the epoch, so against a time
+/// keeps a time as microseconds since the epoch, so against a time
 /// column the number becomes the timestamp it names, and the column
 /// itself stays bare for the index; against a JSON column the text the
 /// engine holds is the `jsonb` it names.
@@ -311,12 +316,16 @@ fn literal_as(value: &Value, declared: Option<&ValueType>) -> String {
     if let (Value::String(text), Some(ValueType::Json)) = (value, declared) {
         return format!("{}::jsonb", quote_literal(text));
     }
-    let millis = match (value, declared) {
-        (Value::Int(millis), Some(ValueType::Timestamp)) => *millis,
-        (Value::Float(millis), Some(ValueType::Timestamp)) if millis.is_finite() => *millis as i64,
+    let micros = match (value, declared) {
+        (Value::Int(micros), Some(ValueType::Timestamp)) => *micros,
+        (Value::Float(micros), Some(ValueType::Timestamp)) if micros.is_finite() => *micros as i64,
         _ => return literal(value),
     };
-    format!("(TIMESTAMP 'epoch' + {millis} * INTERVAL '1 millisecond')")
+    match micros {
+        super::text::INFINITY_MICROS => "TIMESTAMP 'infinity'".to_owned(),
+        super::text::NEG_INFINITY_MICROS => "TIMESTAMP '-infinity'".to_owned(),
+        _ => format!("(TIMESTAMP 'epoch' + {micros} * INTERVAL '1 microsecond')"),
+    }
 }
 
 /// A double-quoted identifier.
@@ -347,7 +356,9 @@ fn render_where(filter: &Where, scope: &Scope<'_>) -> String {
     }
 }
 
-/// One leaf, with the engine's `NULL` and list semantics made explicit.
+/// One leaf, with the engine's `NULL` and list semantics made explicit:
+/// a `NOT IN` of no values holds for every row with a value, as the
+/// engine evaluates it, so a read and the routing agree on `NULL`.
 fn render_condition(condition: &Condition, scope: &Scope<'_>) -> String {
     use ComparisonOperator::*;
     if condition.column.is_composite() && condition.comparison_operator != EXISTS {
@@ -371,7 +382,11 @@ fn render_condition(condition: &Condition, scope: &Scope<'_>) -> String {
                 .map(|value| literal_as(value, declared))
                 .collect();
             if literals.is_empty() {
-                return if negated { "TRUE" } else { "FALSE" }.to_owned();
+                return if negated {
+                    format!("{column} IS NOT NULL")
+                } else {
+                    "FALSE".to_owned()
+                };
             }
             let keyword = if negated { "NOT IN" } else { "IN" };
             format!("{column} {keyword} ({})", literals.join(", "))
@@ -539,6 +554,21 @@ mod tests {
         sql[sql.find(" WHERE ").expect("a WHERE") + 7..].to_owned()
     }
 
+    /// A `NOT IN` of no values keeps every row with a value and none
+    /// without, as the engine's routing does; an `IN` of none keeps none.
+    #[test]
+    fn an_empty_list_renders_as_the_engine_evaluates_it() {
+        let empty = || Value::List(Vec::new());
+        assert_eq!(
+            comments_where(Condition::new("body", ComparisonOperator::NOT_IN, empty())),
+            "\"body\" IS NOT NULL"
+        );
+        assert_eq!(
+            comments_where(Condition::new("body", ComparisonOperator::IN, empty())),
+            "FALSE"
+        );
+    }
+
     /// A composite key renders as a row constructor compared whole: its
     /// `IN` lists the set's pairs as tuples, each component typed by its
     /// own column; `=` compares one tuple, `<>` and `NOT IN` compare one
@@ -558,7 +588,7 @@ mod tests {
                 ComparisonOperator::IN,
                 Value::Set(set)
             )),
-            "(\"org\", \"at\") IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond')))"
+            "(\"org\", \"at\") IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond')))"
         );
         assert_eq!(
             comments_where(Condition::new(
@@ -566,7 +596,7 @@ mod tests {
                 ComparisonOperator::EQ,
                 pair("acme", 1000)
             )),
-            "(\"org\", \"at\") = ('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond'))"
+            "(\"org\", \"at\") = ('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond'))"
         );
         assert_eq!(
             comments_where(Condition::new(
@@ -574,7 +604,7 @@ mod tests {
                 ComparisonOperator::NEQ,
                 pair("acme", 1000)
             )),
-            "((\"org\", \"at\") <> ('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond')) AND \"org\" IS NOT NULL AND \"at\" IS NOT NULL)"
+            "((\"org\", \"at\") <> ('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond')) AND \"org\" IS NOT NULL AND \"at\" IS NOT NULL)"
         );
         let with_null = Value::List(vec![Value::Null, Value::Int(1000)]);
         let narrow = Value::List(vec!["acme".into()]);
@@ -589,7 +619,7 @@ mod tests {
                     pair("acme", 1000)
                 ]),
             )),
-            "(\"org\", \"at\") IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond')))"
+            "(\"org\", \"at\") IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond')))"
         );
         assert_eq!(
             comments_where(Condition::new(
@@ -613,7 +643,7 @@ mod tests {
                 ComparisonOperator::NOT_IN,
                 Value::List(vec![pair("acme", 1000)])
             )),
-            "((\"org\", \"at\") NOT IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond'))) AND \"org\" IS NOT NULL AND \"at\" IS NOT NULL)"
+            "((\"org\", \"at\") NOT IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond'))) AND \"org\" IS NOT NULL AND \"at\" IS NOT NULL)"
         );
         assert_eq!(
             comments_where(Condition::new(
@@ -903,8 +933,8 @@ mod tests {
     }
 
     /// A time condition compares the bare column against the timestamp
-    /// the millisecond literal names, so an index on the column answers
-    /// it; the projection still returns milliseconds.
+    /// the microsecond literal names, so an index on the column answers
+    /// it; the projection still returns microseconds.
     #[test]
     fn a_time_condition_compares_the_column_itself() {
         let table = DbTable::new(
@@ -931,18 +961,31 @@ mod tests {
         let sql = select_sql(&query, &table);
         assert!(
             sql.contains(
-                "\"createdAt\" > (TIMESTAMP 'epoch' + 1750000000000 * INTERVAL '1 millisecond')"
+                "\"createdAt\" > (TIMESTAMP 'epoch' + 1750000000000 * INTERVAL '1 microsecond')"
             ),
             "{sql}"
         );
         assert!(
-            sql.contains("\"createdAt\" IN ((TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond'), (TIMESTAMP 'epoch' + 2000 * INTERVAL '1 millisecond'))"),
+            sql.contains("\"createdAt\" IN ((TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond'), (TIMESTAMP 'epoch' + 2000 * INTERVAL '1 microsecond'))"),
             "{sql}"
         );
         assert!(
-            sql.contains("(extract(epoch from \"createdAt\") * 1000)::int8"),
-            "the projection still reads milliseconds: {sql}"
+            sql.contains("extract(epoch from \"createdAt\")::numeric * 1000000"),
+            "the projection still reads microseconds: {sql}"
         );
+    }
+
+    /// The infinities go both ways: read as the extreme microseconds,
+    /// and a condition on them renders as `infinity` again rather than
+    /// an interval past the end of time.
+    #[test]
+    fn an_infinite_time_reads_and_renders() {
+        let read = select_expr("at", &ValueType::Timestamp);
+        assert!(read.contains("WHEN isfinite(\"at\")"), "{read}");
+        assert!(read.contains("THEN 9223372036854775807 ELSE -9223372036854775808"), "{read}");
+        let timed = Some(&ValueType::Timestamp);
+        assert_eq!(literal_as(&Value::Int(i64::MAX), timed), "TIMESTAMP 'infinity'");
+        assert_eq!(literal_as(&Value::Int(i64::MIN), timed), "TIMESTAMP '-infinity'");
     }
 
     #[test]
