@@ -472,11 +472,10 @@ async fn handle(
     if let Some((kind, reason)) = refusal {
         log_event!(
             Level::Info,
-            "connection refused",
+            "client told to start over",
             wsid = wsid,
-            group = crate::log::group(&group_id),
+            group = group_id,
             cookie = conn.params.base_cookie.as_deref().unwrap_or(""),
-            kind = kind,
             reason = reason
         );
         send(&out, protocol::error(kind, &format!("{reason}; start a fresh sync")));

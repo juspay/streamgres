@@ -858,8 +858,7 @@ impl Groups {
             && stamp.as_deref() != Some(bound.as_str())
         {
             log_info!(
-                "connection {wsid} refused client group {}: the group is bound to another identity",
-                crate::log::group(group_id)
+                "connection {wsid} refused client group {group_id}: the group is bound to another identity"
             );
             return ConnectReply::Refused {
                 reason: "this client group belongs to another identity".to_owned(),

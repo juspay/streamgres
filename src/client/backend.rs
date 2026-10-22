@@ -38,46 +38,46 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// The claim that binds a client group to its first claimant
-    /// ([`super::groups`]): the auth token, or a digest of the cookie
-    /// header's pairs when there is no token. Never the raw values — a
-    /// group's binding holds no credential — and the pairs are trimmed,
-    /// sorted and de-duplicated first, so the same cookies in another
-    /// order are the same claim. A blank token or cookie is no claim at
-    /// all.
+    /// The claim that binds a client group to its first claimant. Prefers the
+    /// `sub` from the JWT token so that tabs with rotated tokens for the same
+    /// user share a group. Falls back to the cookie pairs (sorted and
+    /// deduplicated for stability) when there is no token or it carries no
+    /// `sub`. Returns `None` when there is neither.
     pub fn stamp(&self) -> Option<String> {
-        if let Some(token) = self
-            .token
-            .as_deref()
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-        {
-            return Some(claim("token", token));
+        if let Some(sub) = self.token.as_deref().and_then(jwt_sub) {
+            return Some(sub);
         }
         let cookie = self.cookie.as_deref().map(str::trim)?;
         let mut pairs: Vec<&str> = cookie
             .split(';')
             .map(str::trim)
-            .filter(|pair| !pair.is_empty())
+            .filter(|s| !s.is_empty())
             .collect();
         if pairs.is_empty() {
             return None;
         }
         pairs.sort_unstable();
         pairs.dedup();
-        Some(claim("cookie", &pairs.join("\n")))
+        Some(pairs.join(";"))
     }
 }
 
-/// `kind-<hash>` of `material`: what a group's binding holds instead of the
-/// credential itself. The kind keeps a token and a cookie that print the
-/// same apart.
-fn claim(kind: &str, material: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    kind.hash(&mut hasher);
-    material.hash(&mut hasher);
-    format!("{kind}-{:016x}", hasher.finish())
+/// Extract the `sub` claim from a JWT without verifying the signature.
+/// Returns `None` when the token is blank, malformed, or has no non-blank `sub`.
+fn jwt_sub(token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let payload_b64 = token.splitn(3, '.').nth(1)?;
+    use base64::Engine as _;
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload_b64))
+        .ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    let sub = payload.get("sub").and_then(|v| v.as_str())?;
+    if sub.is_empty() { None } else { Some(sub.to_owned()) }
 }
 
 /// The query endpoint's answer.
@@ -324,8 +324,7 @@ fn preview(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A claim of `token` and `cookie`.
-    fn identity(token: Option<&str>, cookie: Option<&str>) -> Identity {
+    fn make(token: Option<&str>, cookie: Option<&str>) -> Identity {
         Identity {
             token: token.map(str::to_owned),
             cookie: cookie.map(str::to_owned),
@@ -333,35 +332,33 @@ mod tests {
         }
     }
 
-    /// The token is the claim when there is one; a blank token falls
-    /// through to the cookies; a blank or absent cookie is no claim. What
-    /// is held is a digest, never the value itself.
-    #[test]
-    fn a_stamp_is_the_token_or_the_cookies_and_never_blank() {
-        let stamp = identity(Some("token-alice"), Some("sid=1")).stamp();
-        assert_eq!(
-            stamp,
-            identity(Some("  token-alice  "), Some("sid=1")).stamp()
-        );
-        assert!(!stamp.unwrap().contains("token-alice"));
-        assert_eq!(
-            identity(Some(""), Some("sid=1")).stamp(),
-            identity(None, Some("sid=1")).stamp()
-        );
-        assert_eq!(identity(None, None).stamp(), None);
-        assert_eq!(identity(None, Some(" ; ; ")).stamp(), None);
-    }
+    // Two JWTs with the same `sub` ("user-123") but different `iat`.
+    const JWT_V1: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\
+        .eyJzdWIiOiAidXNlci0xMjMiLCAiaWF0IjogMTcwMDAwMDAwMH0.fakesig";
+    const JWT_V2: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\
+        .eyJzdWIiOiAidXNlci0xMjMiLCAiaWF0IjogMTcwMDAwMzYwMH0.fakesig";
+    const JWT_OTHER: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\
+        .eyJzdWIiOiAidXNlci00NTYiLCAiaWF0IjogMTcwMDAwMDAwMH0.fakesig";
+    // JWT with no `sub`.
+    const JWT_NOSUB: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\
+        .eyJzdWIiOiBudWxsLCAiaWF0IjogMTcwMDAwMDAwMH0.fakesig";
 
-    /// The same cookies in any order, with blanks or repeats among them,
-    /// are one claim; a different cookie value is another.
     #[test]
-    fn a_cookie_stamp_is_one_claim_per_set_of_cookies() {
-        let order = identity(None, Some("a=1; b=2")).stamp();
-        assert_eq!(order, identity(None, Some("b=2;a=1")).stamp());
-        assert_eq!(order, identity(None, Some("  b=2 ;  a=1  ")).stamp());
-        assert_eq!(order, identity(None, Some("a=1;; b=2;")).stamp());
-        assert_eq!(order, identity(None, Some("a=1; a=1; b=2")).stamp());
-        assert_ne!(order, identity(None, Some("a=1; b=3")).stamp());
-        assert_ne!(order, identity(None, Some("a=1; b=2; sid=3")).stamp());
+    fn stamp_prefers_jwt_sub_and_falls_back_to_cookie() {
+        // JWT sub is the stamp; two rotated tokens for the same user match.
+        assert_eq!(make(Some(JWT_V1), None).stamp(), Some("user-123".to_owned()));
+        assert_eq!(make(Some(JWT_V1), None).stamp(), make(Some(JWT_V2), None).stamp());
+        assert_ne!(make(Some(JWT_V1), None).stamp(), make(Some(JWT_OTHER), None).stamp());
+
+        // No token or no sub falls through to cookie.
+        let cookie_stamp = make(None, Some("sid=1; uid=2")).stamp();
+        assert_eq!(cookie_stamp, make(Some(""), Some("sid=1; uid=2")).stamp());
+        assert_eq!(cookie_stamp, make(Some(JWT_NOSUB), Some("sid=1; uid=2")).stamp());
+        // Same cookies in any order are the same stamp.
+        assert_eq!(cookie_stamp, make(None, Some("uid=2; sid=1")).stamp());
+
+        // No token and no cookie is no stamp.
+        assert_eq!(make(None, None).stamp(), None);
+        assert_eq!(make(None, Some("  ;  ")).stamp(), None);
     }
 }
