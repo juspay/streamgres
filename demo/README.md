@@ -125,9 +125,12 @@ curl -s localhost:8080/tickets/1 | jq '{source}'
 
 A column added with a constant default is absorbed: the read above is
 still served from the cache. `migrate new-type` adds an enum type and a
-column of it, which the engine absorbs too; the first read that binds
-the new type (`/orgs/1/kind/bug`) teaches the engine the type, and is
-served from the cache from then on. `migrate drop` removes both: the engine cannot follow a
+column of it, which the engine absorbs too. On a connection, the first
+two reads that bind the new type (`/orgs/1/kind/bug`) go to Postgres:
+the first teaches the wrapper the type's OID, the second teaches the
+engine the type and the wrapper the table's new column. From then on
+the query is served from the cache.
+`migrate drop` removes both: the engine cannot follow a
 dropped column, so it stops, compose restarts it, and reads go to
 Postgres meanwhile. A `TRUNCATE` of a published table stops it the same
 way: the replication stream carries no rows for it to follow.
