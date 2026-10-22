@@ -1289,6 +1289,7 @@ async fn prepare(
     let translated = Translated {
         query: select.query,
         hidden: HashSet::new(),
+        uncursored: None,
     };
     let planned = plan::plan(
         sql,
