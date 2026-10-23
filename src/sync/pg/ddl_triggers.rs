@@ -6,7 +6,7 @@
 //! Ported statement for statement from zero-cache's
 //! `change-source/pg/schema/{ddl,published}.ts` (Rocicorp, Apache-2.0).
 
-use crate::sync::pg::sql::{quote_ident, quote_literal};
+use super::sql::{quote_ident, quote_literal};
 
 /// The advisory lock every DDL statement takes under zero-cache's start
 /// trigger, so that the schemas its messages carry diff in order.
@@ -382,7 +382,7 @@ mod tests {
     /// app, shard and publication, then check the output in.
     #[test]
     fn the_checked_in_stack_is_the_generators() {
-        let checked_in = include_str!("../../scripts/sql/ddl-triggers.sql");
+        let checked_in = include_str!("../../../scripts/sql/ddl-triggers.sql");
         assert_eq!(checked_in, trigger_stack_sql("xyne", 0, &["xyne_sync_pub"]));
     }
 

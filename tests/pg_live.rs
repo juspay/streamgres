@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use streamgres::client::ddl_triggers::trigger_stack_sql;
+use streamgres::sync::pg::ddl_triggers::trigger_stack_sql;
 use streamgres::ivm::{Delta, Engine, Fetch, MultiTableIVM, QueryPart};
 use streamgres::model::*;
 use streamgres::sync::pg::ddl::DdlSource;

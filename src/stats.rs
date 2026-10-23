@@ -551,7 +551,7 @@ impl Stats {
     }
 
     /// Fresh measurements behind a shared handle, using `prefix` for metric names.
-    pub(crate) fn shared_with_metric_prefix(prefix: String) -> Arc<Self> {
+    pub fn shared_with_metric_prefix(prefix: String) -> Arc<Self> {
         Arc::new(Self::with_metric_prefix(prefix))
     }
 

@@ -49,6 +49,9 @@ jobs:
       - name: Clippy, warnings denied, every crate of the workspace
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      - name: Clippy, warnings denied, the engine without the server
+        run: cargo clippy -p streamgres --no-default-features --lib --tests --bins --locked -- -D warnings
+
   test:
     name: Tests (accuracy)
     runs-on: ubuntu-latest

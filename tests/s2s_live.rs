@@ -10,6 +10,8 @@
 //! it then connects with it, and checks that a missing or wrong token is
 //! answered 401.
 
+#![cfg(feature = "server")]
+
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 

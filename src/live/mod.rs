@@ -1,6 +1,6 @@
 //! Following a backend's SQL: a backend subscribes the SQL its ORM
 //! renders and is kept current on it, over whatever carries the frames.
-//! The S2S endpoint ([`crate::client::s2s`]) carries them over a
+//! The S2S endpoint (`client::s2s`, with the `server` feature) carries them over a
 //! WebSocket; a backend that embeds the engine carries them over
 //! channels in its own process. A [`session`] reads the backend's frames
 //! from any stream of text and queues the engine's on an [`Outgoing`],

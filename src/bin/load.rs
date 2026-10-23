@@ -96,7 +96,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use streamgres::client::ddl_triggers::trigger_stack_sql;
+use streamgres::sync::pg::ddl_triggers::trigger_stack_sql;
 
 type Json = Json_;
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;

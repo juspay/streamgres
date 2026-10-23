@@ -50,6 +50,7 @@
 
 pub mod catalog;
 pub mod ddl;
+pub mod ddl_triggers;
 pub mod estimate;
 pub mod estimate_cache;
 pub mod replication;
