@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::model::{Catalog, DbColumn, DbTable};
+use crate::model::{Catalog, ColumnName, DbColumn, DbTable, TableName};
 
 /// The catalog every thread reads through, replaced whole by the feed
 /// when the schema grows.
@@ -59,8 +59,8 @@ impl CatalogHandle {
 /// `catalog` with `table` in it, replacing a table of the same name,
 /// and knowing the same enum types and text orderings: a bound enum
 /// label must stay readable after a migration, and a column's ordering
-/// does not change with it. A column the migration adds is not known to
-/// order as text, so an ordering on it is refused rather than guessed.
+/// does not change with it. The orderings of the columns a migration
+/// adds come from its message ([`with_ordered`]).
 pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
     let name = table.name.clone();
     Catalog::new(
@@ -72,6 +72,19 @@ pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
     )
     .with_enum_oids(catalog.enum_oids())
     .with_ordered_as_text(catalog.ordered_as_text().cloned())
+    .with_bytewise_default(catalog.bytewise_default())
+}
+
+/// `catalog` knowing `columns` of `table` order as their text too.
+pub fn with_ordered(
+    catalog: &Catalog,
+    table: &TableName,
+    columns: impl IntoIterator<Item = ColumnName>,
+) -> Catalog {
+    let added = columns.into_iter().map(|column| (table.clone(), column));
+    catalog
+        .clone()
+        .with_ordered_as_text(catalog.ordered_as_text().cloned().chain(added))
 }
 
 /// `catalog` knowing `oids` are enum types too, as a type created after

@@ -341,6 +341,10 @@ pub struct Catalog {
     /// the `C` collation. Any other text-carried column (an enum, a
     /// string under a linguistic collation, an `inet`) orders otherwise.
     ordered_as_text: std::collections::HashSet<(TableName, ColumnName)>,
+    /// Whether the database's default collation orders strings byte by
+    /// byte, so a string column a migration adds under it orders as its
+    /// text; false when not known.
+    bytewise_default: bool,
 }
 
 impl Catalog {
@@ -353,7 +357,21 @@ impl Catalog {
                 .collect(),
             enum_oids: std::collections::HashSet::new(),
             ordered_as_text: std::collections::HashSet::new(),
+            bytewise_default: false,
         }
+    }
+
+    /// The same catalog knowing whether the database's default collation
+    /// orders strings byte by byte.
+    pub fn with_bytewise_default(mut self, bytewise: bool) -> Self {
+        self.bytewise_default = bytewise;
+        self
+    }
+
+    /// Whether the database's default collation orders strings byte by
+    /// byte, as far as this catalog knows.
+    pub fn bytewise_default(&self) -> bool {
+        self.bytewise_default
     }
 
     /// The same catalog knowing these type OIDs are enums (or arrays of

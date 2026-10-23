@@ -37,6 +37,7 @@ WITH published_columns AS (SELECT
   pt.typtype,
   elem_pt.typtype AS "elemTyptype",
   coll.collisdeterministic AS "collationIsDeterministic",
+  coll.collname AS "collationName",
   NULLIF(atttypmod, -1) AS "maxLen",
   attndims "arrayDims",
   attnotnull AS "notNull",
@@ -78,6 +79,7 @@ tables AS (SELECT json_build_object(
       'elemPgTypeClass', "elemTyptype",
       'typeOID', "typeOID",
       'collationIsDeterministic', "collationIsDeterministic",
+      'collationName', "collationName",
       'characterMaximumLength', CASE WHEN "typeOID" = 1043 OR "typeOID" = 1042
                                      THEN "maxLen" - 4
                                      ELSE "maxLen" END,

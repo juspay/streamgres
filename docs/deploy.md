@@ -191,6 +191,13 @@ Two kinds of change are followed while the server runs:
 The rows already in memory get the new column, and the new shape is served
 from the next snapshot on. Clients are sent nothing for the change.
 
+An `ORDER BY` on a new string column is followed when the column's collation
+orders bytes (`C`, `POSIX`, or the database's default when that does), as on a
+column loaded at startup. The trigger stack says which collation each column
+has; a stack installed before it did (no `collationName` in its messages) does
+not, and an `ORDER BY` on such a column is served from Postgres until the next
+restart. Re-run the setup SQL to update an older stack.
+
 **Any other change to a served table stops the server**, with one log line
 naming the change. That includes dropping or renaming a column or table,
 changing a type or key, and adding a column with an expression default such as

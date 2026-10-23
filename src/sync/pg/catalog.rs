@@ -131,7 +131,8 @@ pub async fn load_catalog(
     Ok((
         Catalog::new(tables)
             .with_enum_oids(enum_oids)
-            .with_ordered_as_text(ordered),
+            .with_ordered_as_text(ordered)
+            .with_bytewise_default(default_collation.is_bytewise()),
         notes,
     ))
 }
@@ -182,6 +183,27 @@ pub fn orders_as_text(
         "text" | "character varying" | "character" => match collation {
             Some(name) => is_bytewise_collation(name),
             None => default.is_bytewise(),
+        },
+        _ => false,
+    }
+}
+
+/// [`orders_as_text`] for a column a schema-change message publishes:
+/// its type as `pg_type` names it, and its collation's name (`default`
+/// for the database's, whose verdict is `bytewise_default`). A string
+/// column with no collation named, from a trigger stack older than the
+/// name, is not known to order as text.
+pub fn published_orders_as_text(
+    type_name: &str,
+    collation: Option<&str>,
+    bytewise_default: bool,
+) -> bool {
+    match type_name {
+        "uuid" | "bytea" | "name" | "time" => true,
+        "text" | "varchar" | "bpchar" => match collation {
+            Some("default") => bytewise_default,
+            Some(name) => is_bytewise_collation(name),
+            None => false,
         },
         _ => false,
     }

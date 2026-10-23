@@ -368,3 +368,78 @@ fn a_start_behind_an_open_transaction_does_not_block_the_caller() {
             .expect("stop");
     });
 }
+
+/// A table a migration creates while the engine runs is ordered as one
+/// it loaded at startup: an `ORDER BY` on a column under a byte-order
+/// collation is followed, one under a linguistic collation refused,
+/// whichever way the engine learned the table.
+#[test]
+fn a_table_created_while_serving_is_ordered_as_one_loaded_at_start() {
+    let Some(dsn) = dsn("order") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("order");
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        let linguistic: String = client
+            .query_one("SELECT datcollate FROM pg_database WHERE datname = current_database()", &[])
+            .await
+            .expect("the default collation")
+            .get(0);
+        let engine = Engine::start(config(&dsn, &names));
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        let later = format!("{}_later", names.table);
+        client
+            .batch_execute(&format!(
+                r#"CREATE TABLE {later} (id int8 PRIMARY KEY, code text COLLATE "C" NOT NULL, label text NOT NULL);
+                   INSERT INTO {later} VALUES (1, 'b', 'b'), (2, 'a', 'a');"#
+            ))
+            .await
+            .expect("a table created while the engine serves");
+        let mut session = engine.connect().expect("a session");
+        assert_eq!(next(&mut session).await.expect("hello")[0], "hello");
+        let answer = |id: u64, column: &str| {
+            json!(["subscribe", {
+                "id": id,
+                "sql": format!(r#"SELECT "id", "{column}" FROM "{later}" ORDER BY "{column}" ASC, "id" ASC"#),
+                "binds": [],
+                "rows": true
+            }])
+            .to_string()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut id = 0;
+        let by_code = loop {
+            id += 1;
+            session.sender().send(answer(id, "code")).await.expect("send");
+            let frame = next(&mut session).await.expect("an answer");
+            if frame[0] == "accepted" || Instant::now() >= deadline {
+                break frame;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(by_code[0], "accepted", "a byte-order column is followed: {by_code}");
+        let ids: Vec<i64> = by_code[1]["nodes"][0]["rows"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|row| row["id"].as_i64().expect("id"))
+            .collect();
+        assert_eq!(ids.len(), 2);
+        if !matches!(linguistic.as_str(), "C" | "POSIX" | "C.UTF-8" | "C.utf8") {
+            session.sender().send(answer(id + 1, "label")).await.expect("send");
+            let by_label = next(&mut session).await.expect("an answer");
+            assert_eq!(
+                by_label[0], "refused",
+                "a column under the default {linguistic} collation is not: {by_label}"
+            );
+        }
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop())
+            .await
+            .expect("stop");
+    });
+}

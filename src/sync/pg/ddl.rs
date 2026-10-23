@@ -18,11 +18,11 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 use tokio_postgres::Client;
 
-use super::catalog::{scalar_type, table_name};
+use super::catalog::{published_orders_as_text, scalar_type, table_name};
 use super::text;
 use crate::ivm::SchemaChange;
-use crate::model::{Catalog, DbColumn, DbTable, TableName, Value, ValueType};
-use crate::sync::catalog::{with_column, with_table};
+use crate::model::{Catalog, ColumnName, DbColumn, DbTable, TableName, Value, ValueType};
+use crate::sync::catalog::{with_column, with_ordered, with_table};
 use crate::sync::storage::StorageError;
 
 /// Where the feed hears of schema changes: the prefix of the trigger's
@@ -88,6 +88,22 @@ pub struct PublishedColumn {
     #[serde(rename = "pgTypeClass")]
     pub pg_type_class: Option<String>,
     pub dflt: Option<String>,
+    /// Its collation's name (`default` for the database's); absent from
+    /// a trigger stack older than it, and for a type with none.
+    #[serde(rename = "collationName", default)]
+    pub collation_name: Option<String>,
+}
+
+impl PublishedColumn {
+    /// Whether Postgres orders the column as its text compares, byte by
+    /// byte ([`published_orders_as_text`]).
+    pub fn orders_as_text(&self, bytewise_default: bool) -> bool {
+        published_orders_as_text(
+            &self.data_type,
+            self.collation_name.as_deref(),
+            bytewise_default,
+        )
+    }
 }
 
 impl DdlMessage {
@@ -330,6 +346,12 @@ pub fn classify(
                 match table.to_db_table() {
                     Ok(added) => {
                         catalog_now = with_table(&catalog_now, added.clone());
+                        let ordered = table
+                            .columns
+                            .iter()
+                            .filter(|(_, column)| column.orders_as_text(catalog.bytewise_default()))
+                            .map(|(column, _)| ColumnName::from(column.as_str()));
+                        catalog_now = with_ordered(&catalog_now, &added.name, ordered);
                         changes.push(SchemaChange::TableAdded { table: added });
                     }
                     Err(reason) => crate::log::log_warn!("new table not carried: {reason}"),
@@ -342,6 +364,14 @@ pub fn classify(
                     {
                         catalog_now =
                             with_table(&catalog_now, with_column(current, column.clone()));
+                        let ordered = table
+                            .columns
+                            .get(column.name.as_str())
+                            .is_some_and(|published| {
+                                published.orders_as_text(catalog.bytewise_default())
+                            })
+                            .then(|| column.name.clone());
+                        catalog_now = with_ordered(&catalog_now, &held.name, ordered);
                     }
                     changes.push(change);
                 }
@@ -588,6 +618,44 @@ mod tests {
         );
     }
 
+    /// A table a migration creates is ordered as one loaded at startup:
+    /// a string column under a byte-order collation orders as text, one
+    /// under the database's default only when that default does, one a
+    /// trigger stack names no collation for never; a `uuid` always.
+    #[test]
+    fn a_created_tables_orderings_come_from_its_message() {
+        let column = |name: &str, data_type: &str, collation: Option<&str>| {
+            let collation = collation.map_or("null".to_owned(), |name| format!("\"{name}\""));
+            format!(
+                r#""{name}": {{"pos": 1, "dataType": "{data_type}", "pgTypeClass": "b", "typeOID": 1, "notNull": false, "dflt": null, "collationName": {collation}}}"#
+            )
+        };
+        let notes = format!(
+            r#"{{"oid": 2, "schema": "public", "name": "notes", "columns": {{{}, {}, {}, {}, {}}}, "primaryKey": ["id"], "publications": {{}}}}"#,
+            column("id", "int8", None),
+            column("code", "text", Some("C")),
+            column("label", "varchar", Some("default")),
+            column("legacy", "text", None),
+            column("ref", "uuid", None),
+        );
+        let tickets = published("tickets", TICKETS, &["id"]);
+        let message = message(&tickets, &format!("{tickets}, {notes}"));
+        let ordered = |catalog: &Catalog, column: &str| {
+            catalog.orders_as_engine(&TableName::from("notes"), &ColumnName::from(column))
+        };
+        let schemas = ["public".to_owned()];
+        let linguistic = classify(&catalog(), &schemas, &message).expect("classified").catalog;
+        assert!(ordered(&linguistic, "code"), "C orders as text");
+        assert!(!ordered(&linguistic, "label"), "a linguistic default does not");
+        assert!(!ordered(&linguistic, "legacy"), "no collation named: not known");
+        assert!(ordered(&linguistic, "ref"), "a uuid always does");
+        let bytewise = classify(&catalog().with_bytewise_default(true), &schemas, &message)
+            .expect("classified")
+            .catalog;
+        assert!(ordered(&bytewise, "label"), "a byte-order default does");
+        assert!(bytewise.bytewise_default(), "carried into the next catalog");
+    }
+
     /// Published types map as the startup catalog maps them.
     #[test]
     fn published_types_map_like_the_catalog() {
@@ -595,6 +663,7 @@ mod tests {
             data_type: data_type.to_owned(),
             pg_type_class: Some(class.to_owned()),
             dflt: None,
+            collation_name: None,
         };
         assert_eq!(column_type(&column("int8", "b")), Some(ValueType::Int));
         assert_eq!(
