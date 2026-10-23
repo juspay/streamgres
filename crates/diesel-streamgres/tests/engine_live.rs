@@ -196,7 +196,9 @@ fn a_commit_the_engine_reports_refills_the_cache() {
 /// Read-your-writes by position: after a write through the wrapper every
 /// read sees it, and the cache serves again as soon as the engine has
 /// delivered it, well inside the window an engine without positions
-/// would hold reads to Postgres for.
+/// would hold reads to Postgres for. A write to a table no query follows
+/// holds reads back too, until the engine's position passes it, which it
+/// does with the commit, not at the next heartbeat.
 #[test]
 fn a_write_is_read_back_and_the_cache_serves_once_it_is_delivered() {
     let Some(mut live) = Live::start("ryw-position") else {
@@ -234,6 +236,29 @@ fn a_write_is_read_back_and_the_cache_serves_once_it_is_delivered() {
         }
         eprintln!("write to a cache-served read: {:?}", wrote.elapsed());
     }
+
+    live.other
+        .batch_execute("CREATE TABLE IF NOT EXISTS sg_unfollowed (id serial PRIMARY KEY, note text)")
+        .expect("a table nobody follows");
+    live.conn
+        .batch_execute("INSERT INTO sg_unfollowed (note) VALUES ('x')")
+        .expect("a write nobody follows");
+    let wrote = Instant::now();
+    loop {
+        assert_eq!(live.read("mode").as_deref(), Some("d"));
+        if live.conn.last_served() == Some(Served::Cache) {
+            break;
+        }
+        assert!(
+            wrote.elapsed() < Duration::from_secs(2),
+            "the cache never served again"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    eprintln!(
+        "write nobody follows to a cache-served read: {:?}",
+        wrote.elapsed()
+    );
 }
 
 /// A commit to a row the query does not read leaves the entry alone.

@@ -500,8 +500,9 @@ async fn beat(config: tokio_postgres::Config, slot: String, every: Duration, sta
 /// made to exist, the storage over `settings` (its reads running on
 /// `reads`) with its first snapshot minted, the feed thread started at
 /// that snapshot's point, and the service, keeping `catalog` current,
-/// delivering its events to `consumers` streams and its timings to
-/// `stats`. Must run inside a `LocalSet`. Making the slot and minting
+/// delivering its events to `consumers` streams (those at `every_commit`
+/// told of every commit, [`Service::with_every_commit`]) and its timings
+/// to `stats`. Must run inside a `LocalSet`. Making the slot and minting
 /// the first snapshot each wait for every transaction open at the time,
 /// so a long one holds them back; `shutdown` requested meanwhile gives
 /// up on either.
@@ -510,6 +511,7 @@ pub async fn start(
     catalog: Arc<CatalogHandle>,
     reads: tokio::runtime::Handle,
     consumers: usize,
+    every_commit: &[usize],
     stats: Arc<Stats>,
     shutdown: Shutdown,
 ) -> Result<(Started, ServiceTask), String> {
@@ -604,6 +606,7 @@ pub async fn start(
             .with_feed(feed)
             .with_catalog(catalog)
             .with_sinks(sinks)
+            .with_every_commit(every_commit)
             .with_stats(stats)
             .run(),
     );

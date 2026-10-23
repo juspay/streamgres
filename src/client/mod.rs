@@ -167,6 +167,7 @@ pub fn serve(config: Config) -> Result<(), String> {
                     engine_catalog,
                     reads_handle,
                     shards + 1,
+                    &[shards],
                     engine_stats,
                     engine_shutdown.clone(),
                 )

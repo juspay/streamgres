@@ -820,3 +820,68 @@ fn a_serving_consumer_is_not_woken_for_nothing() {
         assert_eq!(ids(&drain(&mut owner).await), vec![3]);
     });
 }
+
+/// A consumer told of every commit hears one with nothing for it, with
+/// no changes and the commit's position, so its position keeps up with
+/// the engine's; the others are still not woken.
+#[test]
+fn a_consumer_told_of_every_commit_hears_each_position() {
+    block_on(async {
+        let storage = Rc::new(MemoryStorage::new());
+        let (owner_tx, mut owner) = mpsc::unbounded_channel();
+        let (idle_tx, mut idle) = mpsc::unbounded_channel();
+        let (follower_tx, mut follower) = mpsc::unbounded_channel();
+        let (service, commands) =
+            Service::new(MultiTableIVM::new(), storage, owner_tx.clone());
+        let service = service
+            .with_sinks(vec![owner_tx, idle_tx, follower_tx])
+            .with_every_commit(&[2]);
+        spawn_local(service.run());
+
+        let transaction = |id: i64, at: u64| {
+            let write = insert(id, "OPEN");
+            Transaction {
+                watched: Vec::new(),
+                writes: vec![write],
+                at: Lsn(at),
+                progress: Lsn(at),
+                schema: Vec::new(),
+                catalog: None,
+                received: std::time::Instant::now(),
+                committed_at_micros: 0,
+                heartbeat: None,
+                decode: Duration::ZERO,
+            }
+        };
+        commands
+            .send(Command::Transaction(transaction(1, 10)))
+            .await
+            .expect("send");
+        for events in [&mut owner, &mut idle, &mut follower] {
+            drain(events).await;
+        }
+        commands
+            .send(Command::Register {
+                sink: 0,
+                query: open_tickets(),
+                token: 1,
+            })
+            .await
+            .expect("send");
+        drain(&mut owner).await;
+
+        commands
+            .send(Command::Transaction(transaction(2, 20)))
+            .await
+            .expect("send");
+        assert_eq!(ids(&drain(&mut owner).await), vec![2]);
+        assert!(drain(&mut idle).await.is_empty(), "nothing for it");
+        let heard = drain(&mut follower).await;
+        assert!(
+            matches!(heard.as_slice(), [Event::Committed { updates, position, .. }]
+                if updates.is_empty() && *position == Lsn(20)),
+            "told of the commit's position: {:?}",
+            shapes(&heard)
+        );
+    });
+}

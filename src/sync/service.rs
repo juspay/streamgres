@@ -255,6 +255,9 @@ pub struct Service<E: Engine, S: Storage> {
     commands: mpsc::Receiver<Command<E::Query>>,
     feed: Option<mpsc::Receiver<Transaction>>,
     sinks: Vec<mpsc::UnboundedSender<Event>>,
+    /// The sinks told of every commit, one with nothing for them
+    /// included ([`Service::with_every_commit`]).
+    every_commit: Vec<usize>,
     stats: Option<Arc<Stats>>,
     /// The sink every live subscription belongs to: where its deltas and
     /// whatever else concerns it are sent.
@@ -311,6 +314,7 @@ where
             commands,
             feed: None,
             sinks: vec![events],
+            every_commit: Vec::new(),
             stats: None,
             owners: IdMap::default(),
             awaiting: IdMap::default(),
@@ -349,6 +353,17 @@ where
         if !sinks.is_empty() {
             self.sinks = sinks;
         }
+        self
+    }
+
+    /// Tell the sinks at `indices` of every commit, even one with nothing
+    /// for them. With several sinks, a serving engine wakes a sink only
+    /// for a commit that changes its subscriptions or carries a watched
+    /// write; a sink whose clients wait on the engine's position (the
+    /// live task, [`crate::live`], whose backends read their own writes
+    /// once it is past them) must hear it move on every commit.
+    pub fn with_every_commit(mut self, indices: &[usize]) -> Self {
+        self.every_commit = indices.to_vec();
         self
     }
 
@@ -802,8 +817,9 @@ where
                 routed,
             } => {
                 let skip_empty = self.serving && self.sinks.len() > 1 && watched.is_empty();
-                for (sink, batch) in self.sinks.iter().zip(self.partition(updates)) {
-                    if skip_empty && batch.is_empty() {
+                let batches = self.partition(updates);
+                for (index, (sink, batch)) in self.sinks.iter().zip(batches).enumerate() {
+                    if skip_empty && batch.is_empty() && !self.every_commit.contains(&index) {
                         continue;
                     }
                     let _ = sink.send(Event::Committed {

@@ -742,7 +742,7 @@ fn run_engine(
     };
     let local = tokio::task::LocalSet::new();
     local.block_on(&runtime, async move {
-        match threads::start(&settings, catalog, reads, 1, stats, shutdown.clone()).await {
+        match threads::start(&settings, catalog, reads, 1, &[0], stats, shutdown.clone()).await {
             Ok((engine, service)) => {
                 let _ = started.send(Ok(engine));
                 match service.await {
