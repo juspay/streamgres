@@ -76,6 +76,12 @@ pub struct Config {
     /// `STREAMGRES_ESTIMATE_CACHE`: how many estimates it keeps (300000);
     /// not a number keeps the default.
     pub estimate_capacity: usize,
+    /// `STREAMGRES_FEED_SLOT=temporary`: the feed streams from a
+    /// temporary slot that PostgreSQL drops when its connection ends, so
+    /// a process killed outright leaves no slot holding WAL; a feed that
+    /// drops then restarts the engine from a fresh snapshot. Anything
+    /// else keeps the permanent slot, which a reconnect resumes.
+    pub temporary_slot: bool,
     /// `STREAMGRES_SNAPSHOT_ROTATION_MS`: how often a fresh exported
     /// snapshot (a temporary replication slot) is minted for reads (1000).
     pub snapshot_rotation: Duration,
@@ -388,6 +394,8 @@ impl Config {
             estimate_capacity: first(&["STREAMGRES_ESTIMATE_CACHE"])
                 .and_then(|text| text.trim().parse().ok())
                 .unwrap_or(estimate_cache::DEFAULT_CAPACITY),
+            temporary_slot: first(&["STREAMGRES_FEED_SLOT"])
+                .is_some_and(|value| value.trim() == "temporary"),
             publication: first(&["STREAMGRES_PUBLICATION"])
                 .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
             ddl_trigger,
@@ -597,6 +605,7 @@ impl Config {
             memory_tables: self.memory_tables.clone(),
             estimate_ttl: self.estimate_ttl,
             estimate_capacity: self.estimate_capacity,
+            temporary_slot: self.temporary_slot,
         }
     }
 }

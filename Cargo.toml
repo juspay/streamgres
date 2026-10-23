@@ -145,3 +145,8 @@ debug = "limited"
 # `tokio_unstable` is set with `RUSTFLAGS="--cfg tokio_unstable"` for
 # `tokio-console` builds (see the `console` feature).
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
+# A pgwire-replication that can make its slot a temporary one on the
+# replication connection (vendor/pgwire-replication/VENDORED.md).
+[patch.crates-io]
+pgwire-replication = { path = "vendor/pgwire-replication" }

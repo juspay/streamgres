@@ -12,16 +12,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use streamgres::sync::pg::ddl_triggers::trigger_stack_sql;
 use streamgres::ivm::{Delta, Engine, Fetch, MultiTableIVM, QueryPart};
 use streamgres::model::*;
 use streamgres::sync::pg::ddl::DdlSource;
+use streamgres::sync::pg::ddl_triggers::trigger_stack_sql;
 use streamgres::sync::pg::estimate_cache::EstimateCache;
-use streamgres::sync::pg::{PgStorage, PgStream};
+use streamgres::sync::pg::{Feed, PgStorage, PgStream, Transport};
 use streamgres::sync::{
     CatalogHandle, Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, NoTls};
 
@@ -2037,6 +2037,94 @@ fn every_time_postgres_holds_reaches_the_engine() {
         assert_eq!(images[1].get("at"), Some(&Value::Int(i64::MAX)));
         assert_eq!(images[1].get("naive"), Some(&Value::Int(327_416_976_550_000_000)));
         assert_eq!(images[1].get("day"), Some(&Value::Int(i64::MIN)));
+        cleanup(&dsn, &client, &names).await;
+    });
+}
+
+/// A temporary slot made before the first read snapshot streams from
+/// earlier than the snapshot. The feed skipping through the snapshot's
+/// point drops exactly the transactions the snapshot holds, ten here,
+/// and passes every one after it; the slot is gone once its connection
+/// is.
+#[test]
+fn a_temporary_slot_skips_what_the_first_snapshot_holds() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let names = Names::new("temporary");
+        let client = prepare(&dsn, &names).await;
+        let insert = |id: i64| {
+            format!(
+                "INSERT INTO {} VALUES ({id}, 'OPEN', 7, 0)",
+                names.tickets
+            )
+        };
+        let transport = Transport::open_temporary(&dsn, &names.slot, &names.publication)
+            .await
+            .expect("a temporary slot");
+        for id in 100..110 {
+            client.batch_execute(&insert(id)).await.expect("before");
+        }
+        let catalog = Arc::new(names.catalog());
+        let pg = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("storage");
+        let point = pg.first_position();
+        for id in 200..210 {
+            client.batch_execute(&insert(id)).await.expect("after");
+        }
+        let (out, mut received) = mpsc::channel(1024);
+        let (stop, stopped) = watch::channel(false);
+        let streaming = spawn_local(async move {
+            let mut feed = Feed::new(catalog).skipping_through(point);
+            transport
+                .stream_with_shutdown(Duration::from_millis(50), &mut feed, &[], out, stopped)
+                .await
+        });
+        let mut seen = BTreeSet::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !seen.contains(&209) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let Ok(Some(transaction)) = tokio::time::timeout(left, received.recv()).await else {
+                panic!("the stream stopped short at {seen:?}");
+            };
+            for write in transaction.writes {
+                if let WriteQuery::INSERT(insert) = write
+                    && insert.table.as_str() == names.tickets
+                    && let Value::Int(id) = insert.pkey_value.pkey_value["id"]
+                {
+                    seen.insert(id);
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            (200..210).collect::<BTreeSet<i64>>(),
+            "the snapshot's transactions are dropped, the later ones all arrive"
+        );
+        let temporary: Option<bool> = client
+            .query_opt(
+                "SELECT temporary FROM pg_replication_slots WHERE slot_name = $1",
+                &[&names.slot],
+            )
+            .await
+            .expect("slots")
+            .map(|row| row.get(0));
+        assert_eq!(temporary, Some(true));
+        stop.send_replace(true);
+        let _ = streaming.await;
+        let gone = Instant::now() + Duration::from_secs(5);
+        while client
+            .query_opt(
+                "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
+                &[&names.slot],
+            )
+            .await
+            .expect("slots")
+            .is_some()
+        {
+            assert!(Instant::now() < gone, "the slot outlived its connection");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         cleanup(&dsn, &client, &names).await;
     });
 }

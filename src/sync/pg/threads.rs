@@ -68,6 +68,10 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 /// - `ddl_trigger`: the event trigger on `ddl_command_end` through which
 ///   schema changes are heard; the server will not serve without it.
 /// - `ddl_prefix`: the prefix of that trigger's logical messages.
+/// - `temporary_slot`: the feed's slot is a temporary one its own
+///   replication connection makes, which PostgreSQL drops when that
+///   connection ends ([`spawn_temporary_feed`]); a feed that drops
+///   stops the engine, to start over on a fresh slot and snapshot.
 /// - `heartbeat`: how often the engine writes a heartbeat into the WAL
 ///   to measure how far behind it is ([`crate::sync::heartbeat`]); zero
 ///   for none.
@@ -100,6 +104,7 @@ pub struct Settings {
     pub memory_tables: Vec<TableName>,
     pub estimate_ttl: Duration,
     pub estimate_capacity: usize,
+    pub temporary_slot: bool,
 }
 
 /// What every slot a server names for itself starts with.
@@ -326,6 +331,107 @@ pub fn spawn_feed(
     ))
 }
 
+/// The feed thread on a temporary slot ([`Transport::open_temporary`]):
+/// `created` resolves once the slot exists, or with why it could not be
+/// made; the first read snapshot must be taken after that, and its point
+/// sent on `first`, through which the feed then drops what the snapshot
+/// already holds. A stream that ends for any reason but a stop cannot be
+/// resumed, so it fails `shutdown`, for the engine to start over.
+#[allow(clippy::type_complexity)]
+pub fn spawn_temporary_feed(
+    settings: Settings,
+    catalog: Arc<Catalog>,
+    shutdown: Shutdown,
+) -> Result<
+    (
+        mpsc::Receiver<Transaction>,
+        FeedHandle,
+        tokio::sync::oneshot::Receiver<Result<(), String>>,
+        tokio::sync::oneshot::Sender<Lsn>,
+    ),
+    String,
+> {
+    let (out, transactions) = mpsc::channel(1024);
+    let (stop, stop_rx) = watch::channel(false);
+    let (created_tx, created) = tokio::sync::oneshot::channel();
+    let (first, first_rx) = tokio::sync::oneshot::channel::<Lsn>();
+    let thread = std::thread::Builder::new()
+        .name("streamgres-feed".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("feed runtime");
+            let slot = settings.slot.clone();
+            let ended = runtime.block_on(async move {
+                let transport = match Transport::open_temporary(
+                    &settings.dsn,
+                    &settings.slot,
+                    &settings.publication,
+                )
+                .await
+                {
+                    Ok(transport) => {
+                        let _ = created_tx.send(Ok(()));
+                        transport
+                    }
+                    Err(error) => {
+                        let _ = created_tx.send(Err(error.to_string()));
+                        return None;
+                    }
+                };
+                let point = first_rx.await.ok()?;
+                log_info!(
+                    "change feed open on temporary slot {}, skipping through {point}",
+                    settings.slot
+                );
+                let ddl = DdlSource {
+                    prefix: settings.ddl_prefix.clone(),
+                    schemas: settings.schemas.clone(),
+                };
+                let mut feed = Feed::with_ddl(catalog, ddl)
+                    .with_heartbeat(crate::sync::heartbeat::prefix(&settings.slot))
+                    .skipping_through(point);
+                let outcome = transport
+                    .stream_with_shutdown(
+                        POSITION_EVERY,
+                        &mut feed,
+                        &settings.watched,
+                        out.clone(),
+                        stop_rx.clone(),
+                    )
+                    .await;
+                if *stop_rx.borrow() || out.is_closed() {
+                    return None;
+                }
+                Some(match outcome {
+                    Ok(()) => "the change feed's connection ended".to_owned(),
+                    Err(error) => format!("the change feed failed: {error}"),
+                })
+            });
+            if let Some(why) = ended {
+                log_error!(
+                    "{why}; its temporary slot {slot} went with it and cannot be resumed, so the engine stops to start over"
+                );
+                if !shutdown.requested() {
+                    shutdown.fail(format!("{why} on a temporary slot"));
+                }
+            } else {
+                log_info!("change feed thread stopped");
+            }
+        })
+        .map_err(|error| format!("feed thread: {error}"))?;
+    Ok((
+        transactions,
+        FeedHandle {
+            stop,
+            thread: Some(thread),
+        },
+        created,
+        first,
+    ))
+}
+
 /// Stop the feed thread and wait until its replication connection is closed.
 pub async fn stop_feed(mut feed: FeedHandle) -> Result<(), String> {
     feed.stop.send_replace(true);
@@ -403,9 +509,23 @@ pub async fn start(
     Transport::cleanup_inactive_slots(&settings.dsn, settings.slot_cleanup_age)
         .await
         .map_err(|error| format!("cleaning up inactive replication slots: {error}"))?;
-    Transport::prepare(&settings.dsn, &settings.slot, &settings.publication)
-        .await
-        .map_err(|error| format!("preparing the change feed: {error}"))?;
+    let temporary = if settings.temporary_slot {
+        Transport::require_publication(&settings.dsn, &settings.publication)
+            .await
+            .map_err(|error| format!("preparing the change feed: {error}"))?;
+        let (feed, handle, created, first) =
+            spawn_temporary_feed(settings.clone(), catalog.load(), shutdown.clone())?;
+        created
+            .await
+            .map_err(|_| "the change feed thread ended before its slot was made".to_owned())?
+            .map_err(|error| format!("opening the change feed: {error}"))?;
+        Some((feed, handle, first))
+    } else {
+        Transport::prepare(&settings.dsn, &settings.slot, &settings.publication)
+            .await
+            .map_err(|error| format!("preparing the change feed: {error}"))?;
+        None
+    };
     let mut config: tokio_postgres::Config = settings
         .dsn
         .parse()
@@ -431,12 +551,18 @@ pub async fn start(
     .with_read_row_limit(settings.row_limit)
     .with_estimates(settings.estimate_ttl, settings.estimate_capacity);
     let pg = Arc::new(pg);
-    let (feed, feed_handle) = spawn_feed(
-        settings.clone(),
-        catalog.load(),
-        pg.first_position(),
-        shutdown,
-    )?;
+    let (feed, feed_handle) = match temporary {
+        Some((feed, handle, first)) => {
+            let _ = first.send(pg.first_position());
+            (feed, handle)
+        }
+        None => spawn_feed(
+            settings.clone(),
+            catalog.load(),
+            pg.first_position(),
+            shutdown,
+        )?,
+    };
     let cached = settings.memory_tables.clone();
     let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
     if !cached.is_empty() {
