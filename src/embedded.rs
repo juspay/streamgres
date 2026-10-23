@@ -117,17 +117,26 @@ pub struct Config {
     pub row_limit: usize,
     /// Tables mirrored in memory.
     pub memory_tables: Vec<TableName>,
+    /// How many storage reads may hold a connection at once, and how
+    /// many connections stay open while idle.
     pub read_connections: usize,
     pub read_idle_connections: usize,
+    /// Threads of the runtime that serves reads and sessions.
     pub read_threads: usize,
+    /// How long one storage read may take.
     pub read_timeout: Duration,
+    /// How often a fresh snapshot is minted for reads.
     pub snapshot_rotation: Duration,
+    /// TCP keepalive on the engine's connections.
     pub keepalive: Keepalive,
     /// What one session may ask the engine to follow.
     pub limits: Limits,
+    /// Which side of a join the planner reads first.
     pub join_preferred: Side,
+    /// How long, and how many, query plans are kept.
     pub plan_ttl: Duration,
     pub plan_cache: usize,
+    /// How long, and how many, row-count estimates are kept.
     pub estimate_ttl: Duration,
     pub estimate_capacity: usize,
     /// The wait before the first restart; it doubles while starts keep
@@ -204,23 +213,7 @@ impl Config {
                 .map_err(|_| format!("STREAMGRES_SHARD must be a number, got `{text}`"))?,
             None => 0,
         };
-        let list = |text: String| -> Vec<String> {
-            text.split(',')
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(str::to_owned)
-                .collect()
-        };
-        let row_limit = match env.first(&[
-            "STREAMGRES_ROW_LIMIT",
-            "STREAMGRES_READ_ROW_LIMIT",
-            "STREAMGRES_JOIN_LIMIT",
-        ]) {
-            Some(text) => text.parse::<usize>().ok().filter(|limit| *limit > 0).ok_or_else(|| {
-                format!("STREAMGRES_ROW_LIMIT must be a positive number of rows, got `{text}`")
-            })?,
-            None => defaults.row_limit,
-        };
+        let (estimate_ttl, estimate_capacity) = env.estimates();
         let setup = match env.value("STREAMGRES_EMBEDDED_SETUP").as_deref() {
             None | Some("install") => Setup::Install,
             Some("require") => Setup::Require,
@@ -230,25 +223,13 @@ impl Config {
                 ));
             }
         };
-        let join_preferred = match env.value("STREAMGRES_JOIN_PREFERRED_SIDE").as_deref() {
-            None | Some("parent") => Side::Parent,
-            Some("child") => Side::Child,
-            Some(other) => {
-                return Err(format!(
-                    "STREAMGRES_JOIN_PREFERRED_SIDE must be `parent` or `child`, got `{other}`"
-                ));
-            }
-        };
         Ok(Config {
             read_dsn: env.value("STREAMGRES_READ_PG_DSN").unwrap_or_else(|| dsn.clone()),
             setup,
             publication: env
                 .value("STREAMGRES_PUBLICATION")
                 .unwrap_or(defaults.publication.clone()),
-            schemas: env
-                .value("STREAMGRES_SCHEMAS")
-                .map(list)
-                .unwrap_or_else(|| vec!["public".to_owned(), format!("{app_id}_{shard}")]),
+            schemas: env.schemas(&app_id, shard),
             ddl_trigger: env
                 .value("STREAMGRES_DDL_TRIGGER")
                 .unwrap_or_else(|| format!("{app_id}_ddl_end_{shard}")),
@@ -256,17 +237,14 @@ impl Config {
                 .value("STREAMGRES_DDL_PREFIX")
                 .unwrap_or_else(|| format!("{app_id}/{shard}/ddl")),
             heartbeat: env.millis("STREAMGRES_HEARTBEAT_MS", 500)?,
-            row_limit,
-            memory_tables: env
-                .value("STREAMGRES_MEMORY_TABLES")
-                .map(|text| list(text).into_iter().map(TableName::from).collect())
-                .unwrap_or_default(),
+            row_limit: env.row_limit()?,
+            memory_tables: env.memory_tables(),
             read_connections: env.number("STREAMGRES_READ_CONNECTIONS", defaults.read_connections)?,
             read_idle_connections: env.number(
                 "STREAMGRES_READ_IDLE_CONNECTIONS",
                 defaults.read_idle_connections,
             )?,
-            read_threads: env.number("STREAMGRES_READ_THREADS", defaults.read_threads)?.max(1),
+            read_threads: env.positive("STREAMGRES_READ_THREADS", defaults.read_threads)?,
             read_timeout: env.millis("STREAMGRES_READ_TIMEOUT_MS", 10_000)?,
             snapshot_rotation: env.millis("STREAMGRES_SNAPSHOT_ROTATION_MS", 1_000)?,
             keepalive: Keepalive {
@@ -286,17 +264,11 @@ impl Config {
                     defaults.limits.max_list_values,
                 )?,
             },
-            join_preferred,
+            join_preferred: env.join_preferred()?,
             plan_ttl: env.millis("STREAMGRES_PLAN_TTL_MS", 600_000)?,
             plan_cache: env.number("STREAMGRES_PLAN_CACHE", defaults.plan_cache)?,
-            estimate_ttl: env
-                .value("STREAMGRES_ESTIMATE_TTL_MS")
-                .and_then(|text| text.trim().parse().ok())
-                .map_or(defaults.estimate_ttl, Duration::from_millis),
-            estimate_capacity: env
-                .value("STREAMGRES_ESTIMATE_CACHE")
-                .and_then(|text| text.trim().parse().ok())
-                .unwrap_or(defaults.estimate_capacity),
+            estimate_ttl,
+            estimate_capacity,
             dsn,
             app: app_id,
             shard,
@@ -855,7 +827,7 @@ async fn prepare_on(client: &tokio_postgres::Client, config: &Config) -> Result<
     if standby {
         return Err("the database is a standby; an embedded engine runs against the primary its backend writes to (an engine on a standby is an S2S server's choice)".to_owned());
     }
-    if config.setup == Setup::Require || set_up(client, config).await? {
+    if config.setup == Setup::Require || is_set_up(client, config).await? {
         return Ok(());
     }
     if config.ddl_trigger != format!("{}_ddl_end_{}", config.app, config.shard)
@@ -885,19 +857,25 @@ async fn prepare_on(client: &tokio_postgres::Client, config: &Config) -> Result<
 }
 
 /// Whether the database has the publication and an enabled trigger.
-async fn set_up(client: &tokio_postgres::Client, config: &Config) -> Result<bool, String> {
-    let published = client
-        .query_opt(
-            "SELECT 1 FROM pg_publication WHERE pubname = $1",
-            &[&config.publication],
-        )
+async fn is_set_up(client: &tokio_postgres::Client, config: &Config) -> Result<bool, String> {
+    let published = publication_exists(client, &config.publication)
         .await
-        .map_err(|error| format!("looking for the publication: {error}"))?
-        .is_some();
+        .map_err(|error| format!("looking for the publication: {error}"))?;
     let triggered = ddl::trigger_present(client, &config.ddl_trigger)
         .await
         .map_err(|error| format!("looking for the event trigger: {error}"))?;
     Ok(published && triggered)
+}
+
+/// Whether the publication `name` exists.
+async fn publication_exists(
+    client: &tokio_postgres::Client,
+    name: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    Ok(client
+        .query_opt("SELECT 1 FROM pg_publication WHERE pubname = $1", &[&name])
+        .await?
+        .is_some())
 }
 
 /// Inside the open transaction, under [`SETUP_LOCK`]: creates what is
@@ -914,15 +892,10 @@ async fn install(client: &tokio_postgres::Client, config: &Config) -> Result<Vec
         .await
         .map_err(failed)?;
     let mut installed = Vec::new();
-    let published = client
-        .query_opt(
-            "SELECT 1 FROM pg_publication WHERE pubname = $1",
-            &[&config.publication],
-        )
+    if !publication_exists(client, &config.publication)
         .await
         .map_err(failed)?
-        .is_some();
-    if !published {
+    {
         client
             .batch_execute(&format!(
                 "CREATE PUBLICATION {} FOR ALL TABLES",
@@ -980,7 +953,7 @@ mod tests {
             "STREAMGRES_PG_DSN" => Some("postgres://primary/app".to_owned()),
             "XYNE_SYNC_APP_ID" => Some("demo".to_owned()),
             "STREAMGRES_PUBLICATION" => Some("demo_pub".to_owned()),
-            "STREAMGRES_READ_THREADS" => Some("0".to_owned()),
+            "STREAMGRES_READ_THREADS" => Some("3".to_owned()),
             "STREAMGRES_S2S_MAX_DISJUNCTS" => Some("64".to_owned()),
             _ => None,
         });
@@ -992,7 +965,7 @@ mod tests {
         assert_eq!(config.ddl_prefix, "demo/0/ddl");
         assert_eq!(config.publication, "demo_pub");
         assert_eq!(config.read_connections, 4);
-        assert_eq!(config.read_threads, 1, "at least one");
+        assert_eq!(config.read_threads, 3);
         assert_eq!(config.limits.max_disjuncts, 64);
         let settings = config.settings();
         assert!(settings.temporary_slot);
@@ -1009,6 +982,12 @@ mod tests {
             }))
             .map(|config| config.setup)
         };
+        let zero_threads = Config::from_lookup(&Env::new(|name: &str| match name {
+            "STREAMGRES_PG_DSN" => Some("postgres://primary/app".to_owned()),
+            "STREAMGRES_READ_THREADS" => Some("0".to_owned()),
+            _ => None,
+        }));
+        assert!(zero_threads.is_err(), "no threads is refused, as the server refuses it");
         assert_eq!(setup("require"), Ok(Setup::Require));
         assert_eq!(setup("install"), Ok(Setup::Install));
         assert!(setup("maybe").is_err());

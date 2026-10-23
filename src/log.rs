@@ -176,7 +176,11 @@ pub fn event(level: Level, message: String, fields: Vec<(&'static str, String)>)
 /// hand it to the facade.
 fn submit(level: Level, message: String, fields: Vec<(&'static str, String)>) {
     if FACADE.load(Ordering::Relaxed) {
-        ::log::log!(target: "streamgres", facade_level(level), "{}", facade_text(&message, &fields));
+        if fields.is_empty() {
+            ::log::log!(target: "streamgres", facade_level(level), "{message}");
+        } else {
+            ::log::log!(target: "streamgres", facade_level(level), "{}", facade_text(&message, &fields));
+        }
         return;
     }
     let line = Line {

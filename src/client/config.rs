@@ -11,7 +11,7 @@ use std::time::Duration;
 use super::plan::{Policy, Side};
 use crate::log::{Format, Level};
 use crate::model::TableName;
-use crate::sync::pg::{Keepalive, Settings, estimate_cache, threads};
+use crate::sync::pg::{Keepalive, Settings, threads};
 
 /// A setting that must not reach a log: its `Debug` shows no value.
 #[derive(Clone)]
@@ -278,39 +278,12 @@ impl Config {
             .unwrap_or_else(|| format!("{app_id}_ddl_end_{shard}"));
         let ddl_prefix =
             first(&["STREAMGRES_DDL_PREFIX"]).unwrap_or_else(|| format!("{app_id}/{shard}/ddl"));
-        let schemas = match first(&["STREAMGRES_SCHEMAS"]) {
-            Some(text) => text
-                .split(',')
-                .map(|schema| schema.trim().to_owned())
-                .filter(|schema| !schema.is_empty())
-                .collect(),
-            None => vec!["public".to_owned(), format!("{app_id}_{shard}")],
-        };
+        let schemas = env.schemas(&app_id, shard);
         let forward_cookies = first(&["STREAMGRES_FORWARD_COOKIES", "ZERO_QUERY_FORWARD_COOKIES"])
             .is_none_or(|value| value != "false" && value != "0");
-        let row_limit = match first(&[
-            "STREAMGRES_ROW_LIMIT",
-            "STREAMGRES_READ_ROW_LIMIT",
-            "STREAMGRES_JOIN_LIMIT",
-        ]) {
-            Some(text) => text
-                .parse::<u64>()
-                .ok()
-                .filter(|limit| *limit > 0)
-                .ok_or_else(|| {
-                    format!("STREAMGRES_ROW_LIMIT must be a positive number of rows, got `{text}`")
-                })?,
-            None => 100_000,
-        };
-        let join_preferred_side = match first(&["STREAMGRES_JOIN_PREFERRED_SIDE"]).as_deref() {
-            None | Some("parent") => Side::Parent,
-            Some("child") => Side::Child,
-            Some(other) => {
-                return Err(format!(
-                    "STREAMGRES_JOIN_PREFERRED_SIDE must be child or parent, got `{other}`"
-                ));
-            }
-        };
+        let row_limit = u64::try_from(env.row_limit()?).unwrap_or(u64::MAX);
+        let join_preferred_side = env.join_preferred()?;
+        let (estimate_ttl, estimate_capacity) = env.estimates();
         let log = match first(&["STREAMGRES_LOG"]).as_deref() {
             None | Some("info") => Level::Info,
             Some("debug") => Level::Debug,
@@ -357,22 +330,9 @@ impl Config {
             slot: threads::slot_name(),
             slot_cleanup_age: millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
             heartbeat: millis("STREAMGRES_HEARTBEAT_MS", 500)?,
-            memory_tables: first(&["STREAMGRES_MEMORY_TABLES"])
-                .map(|names| {
-                    names
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .map(TableName::from)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            estimate_ttl: first(&["STREAMGRES_ESTIMATE_TTL_MS"])
-                .and_then(|text| text.trim().parse().ok())
-                .map_or(estimate_cache::DEFAULT_TTL, Duration::from_millis),
-            estimate_capacity: first(&["STREAMGRES_ESTIMATE_CACHE"])
-                .and_then(|text| text.trim().parse().ok())
-                .unwrap_or(estimate_cache::DEFAULT_CAPACITY),
+            memory_tables: env.memory_tables(),
+            estimate_ttl,
+            estimate_capacity,
             temporary_slot: first(&["STREAMGRES_FEED_SLOT"])
                 .is_some_and(|value| value.trim() == "temporary"),
             publication: first(&["STREAMGRES_PUBLICATION"])
@@ -393,16 +353,7 @@ impl Config {
                 None => 16,
             },
             read_timeout: millis("STREAMGRES_READ_TIMEOUT_MS", 10_000)?,
-            read_threads: match first(&["STREAMGRES_READ_THREADS"]) {
-                Some(text) => text
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|threads| *threads > 0)
-                    .ok_or_else(|| {
-                        format!("STREAMGRES_READ_THREADS must be a positive number, got `{text}`")
-                    })?,
-                None => 2,
-            },
+            read_threads: env.positive("STREAMGRES_READ_THREADS", 2)?,
             pg_keepalive_idle: millis("STREAMGRES_PG_KEEPALIVE_IDLE_MS", 30_000)?,
             pg_keepalive_interval: millis("STREAMGRES_PG_KEEPALIVE_INTERVAL_MS", 10_000)?,
             pg_keepalive_retries: match first(&["STREAMGRES_PG_KEEPALIVE_RETRIES"]) {
@@ -592,6 +543,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::pg::estimate_cache;
 
     /// The configuration `vars` describe, over the three variables that
     /// have no default.
