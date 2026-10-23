@@ -299,17 +299,25 @@ streaming change feed.
 
 ```text
 src/
-  model/     values, schema, queries, rows and operations
-  parser/    SQL parser for single-table reads and writes
-  ivm/       the engine: routing index, frames, windows, join tree
-  sync/      runtime, storage trait, in-memory store, PostgreSQL reads and change feed
-  client/    the WebSocket server and Zero protocol, query planning, client groups
-  bin/       server, bench and load binaries
-tests/       scenario tests, live PostgreSQL tests, and a 283-query suite
-             taken from a production application
-scripts/     smoke, end-to-end and load scripts; CI helpers
-docker/      the server image
-docs/        deployment and observability guides
+  model/       values, schema, queries, rows and operations
+  parser/      SQL parser for single-table reads and writes
+  ivm/         the engine: routing index, frames, windows, join tree
+  sync/        runtime, storage trait, in-memory store, PostgreSQL reads and change feed
+  plan.rs      the join planner
+  live/        the S2S protocol over any transport, and the task that follows backends' SQL
+  embedded.rs  the engine inside a host process
+  client/      the WebSocket server, Zero protocol, client groups, the S2S endpoint
+               (feature `server`)
+  bin/         server, bench and load binaries
+crates/
+  diesel-streamgres/  the Diesel wrapper: a cache the engine keeps current
+  streamgres-demo/    a ticket desk built on the wrapper
+vendor/        pgwire-replication with temporary slots (VENDORED.md)
+tests/         scenario tests, live PostgreSQL tests, and a 283-query suite
+               taken from a production application
+scripts/       smoke, end-to-end and load scripts; CI helpers
+docker/        the server image
+docs/          deployment, Diesel backend and observability guides
 ```
 
 ---

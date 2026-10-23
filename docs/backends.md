@@ -88,7 +88,8 @@ application that does not configure through the environment.
   `Stopped`.
 - **A long transaction delays the start.** Making a slot waits for every
   transaction open at that moment, so an engine started behind one stays
-  `Starting` until it ends. The caller never waits.
+  `Starting` until it ends. The caller never waits, and `Engine::stop`
+  returns at once even then.
 - **Its slot is temporary.** PostgreSQL drops it when the feed's
   connection ends, however the process ends, so a crashed or killed
   process leaves no slot holding WAL.
@@ -120,7 +121,7 @@ backend process:
 | `STREAMGRES_SCHEMAS` | `public,<app>_<shard>` | |
 | `STREAMGRES_EMBEDDED_SETUP` | `install` | or `require` |
 | `STREAMGRES_READ_CONNECTIONS` | 4 | read connections the engine opens |
-| `STREAMGRES_READ_THREADS` | 1 | |
+| `STREAMGRES_READ_THREADS` | 1 | at least 1 |
 | `STREAMGRES_HEARTBEAT_MS` | 500 | how often the engine measures its lag; 0 off |
 | `STREAMGRES_ROW_LIMIT` | 100000 | the most rows one read may return |
 

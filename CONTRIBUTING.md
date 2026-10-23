@@ -60,7 +60,7 @@ Every pull request runs:
 
 | Job | What it runs |
 | --- | --- |
-| Lints | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
+| Lints | `cargo clippy --workspace --all-targets --locked -- -D warnings`, the same for the engine without its `server` feature, and `scripts/check-downstream.sh` (the crates built as another project's dependencies) |
 | Tests | `cargo test --release --locked --workspace` against PostgreSQL 17 |
 | Benchmark | `bench` on your branch and the base branch, five alternating rounds, compared by `scripts/bench-compare.py` |
 | Image | builds `docker/server/Dockerfile` and drives it end to end with `scripts/smoke.mjs` |
