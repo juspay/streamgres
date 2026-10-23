@@ -74,6 +74,11 @@ use crate::cache::{Cache, DATABASE_SQL, Database};
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
 pub use crate::route::{Route, RouteDsl, Served, Via};
+/// The engine inside this process ([`engine::EngineClient::embedded`]):
+/// its handle, its configuration and the SQL that sets a database up
+/// for it, so an application depends on this crate alone.
+#[cfg(feature = "embedded")]
+pub use streamgres::embedded;
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::Verdict;
 

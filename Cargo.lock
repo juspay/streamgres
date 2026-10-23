@@ -637,6 +637,7 @@ dependencies = [
  "rustls-native-certs",
  "scoped-futures",
  "serde_json",
+ "streamgres",
  "tokio",
  "tokio-tungstenite 0.30.0",
 ]

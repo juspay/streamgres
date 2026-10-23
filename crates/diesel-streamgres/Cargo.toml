@@ -10,8 +10,13 @@ description = "A Diesel connection wrapper serving reads from a cache the Stream
 # `AsyncSyncedConnection`, the same wrapper over diesel-async's
 # `AsyncPgConnection`.
 async = ["dep:diesel-async", "diesel-async/postgres", "diesel-async/pool"]
+# The engine inside this process (`EngineClient::embedded`): the same
+# frames as the S2S endpoint, over channels to an engine this process
+# runs, instead of a socket to one elsewhere.
+embedded = ["dep:streamgres"]
 
 [dependencies]
+streamgres = { path = "../..", default-features = false, optional = true }
 base64 = "0.23.1"
 diesel = { version = "2.2.10", features = ["postgres", "r2d2", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 diesel-async = { version = "0.6", features = ["postgres"], optional = true }

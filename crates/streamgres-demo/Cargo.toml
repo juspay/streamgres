@@ -12,7 +12,7 @@ name = "demo"
 path = "src/main.rs"
 
 [dependencies]
-diesel-streamgres = { path = "../diesel-streamgres", features = ["async"] }
+diesel-streamgres = { path = "../diesel-streamgres", features = ["async", "embedded"] }
 diesel = { version = "2.2.10", features = ["postgres", "r2d2", "chrono"] }
 diesel-async = { version = "0.6", features = ["postgres", "bb8"] }
 axum = "0.8"

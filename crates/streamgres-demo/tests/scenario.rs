@@ -19,7 +19,8 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl as _};
 use diesel_streamgres::cache::{Cache, Limits};
-use diesel_streamgres::engine::EngineClient;
+use diesel_streamgres::embedded;
+use diesel_streamgres::engine::{Config as EngineConfig, EngineClient};
 use diesel_streamgres::{AsyncSyncedConnection, Route, RouteDsl, Served, SyncedConnection};
 use serde_json::Value;
 use streamgres_demo::migrate::Step;
@@ -57,18 +58,14 @@ impl Live {
     /// As [`Live::start`], with the cache's limits chosen. No refusal
     /// memory, so a refusal under test is re-asked rather than remembered.
     async fn start_with(limits: Limits) -> Option<Live> {
-        let Ok(url) = std::env::var("STREAMGRES_S2S_URL") else {
-            eprintln!("STREAMGRES_S2S_URL not set; skipping");
-            return None;
-        };
+        let engine = engine_client()?;
         let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
         let mut seeder = PgConnection::establish(&database_url).expect("connect");
         Step::Drop.run(&mut seeder).expect("undo the migrations");
         seed::run(&mut seeder).expect("seed");
-        let engine = EngineClient::connect(url);
         let cache = Arc::new(Cache::with_limits(limits, Arc::new(engine.clone())));
         engine.attach(&cache);
-        if !connected(&engine, Duration::from_secs(5)).await {
+        if !connected(&engine, Duration::from_secs(30)).await {
             assert!(
                 restart(&engine).await,
                 "the engine did not connect (a migration left behind may have stopped it; set STREAMGRES_RESTART_CMD)"
@@ -523,21 +520,40 @@ async fn a_read_dropped_mid_flight_leaves_no_subscription_behind() {
     );
 }
 
+/// A client of the test's engine: the one `STREAMGRES_S2S_URL` names,
+/// or, with `STREAMGRES_ENGINE=embedded`, one this test process runs,
+/// configured from the environment, one for every test. `None`, and the
+/// test skipped, when neither is named.
+fn engine_client() -> Option<EngineClient> {
+    if std::env::var("STREAMGRES_ENGINE").as_deref() == Ok("embedded") {
+        static ENGINE: std::sync::OnceLock<embedded::Engine> = std::sync::OnceLock::new();
+        let engine = ENGINE
+            .get_or_init(|| {
+                embedded::Engine::start(
+                    embedded::Config::from_env().expect("an embedded engine's configuration"),
+                )
+            })
+            .clone();
+        return Some(EngineClient::embedded(engine, EngineConfig::from_env()));
+    }
+    let Ok(url) = std::env::var("STREAMGRES_S2S_URL") else {
+        eprintln!("neither STREAMGRES_S2S_URL nor STREAMGRES_ENGINE=embedded set; skipping");
+        return None;
+    };
+    Some(EngineClient::connect(url))
+}
+
 /// The process-wide stack the pool-based tests share: the wrapper's
 /// settings install once per process.
 async fn stack() -> Option<Arc<Stack>> {
     static STACK: tokio::sync::OnceCell<Arc<Stack>> = tokio::sync::OnceCell::const_new();
-    let (Ok(url), Ok(database_url)) = (
-        std::env::var("STREAMGRES_S2S_URL"),
-        std::env::var("DATABASE_URL"),
-    ) else {
-        eprintln!("STREAMGRES_S2S_URL not set; skipping");
+    let (Some(engine), Ok(database_url)) = (engine_client(), std::env::var("DATABASE_URL")) else {
         return None;
     };
     let stack = STACK
         .get_or_init(|| async {
-            let stack = Stack::connect(&database_url, &url).await.expect("stack");
-            assert!(stack.wait_for_engine(Duration::from_secs(5)).await);
+            let stack = Stack::with_engine(&database_url, engine).await.expect("stack");
+            assert!(stack.wait_for_engine(Duration::from_secs(30)).await);
             Arc::new(stack)
         })
         .await;
@@ -560,9 +576,8 @@ async fn plain_pool(database_url: &str) -> Pool<AsyncPgConnection> {
 /// Tells an engine-side answer from a client-side one in a mismatch.
 async fn fresh_answer(name: &str) -> Value {
     let lookup = Lookup::named(name).expect("a demo lookup");
-    let url = std::env::var("STREAMGRES_S2S_URL").unwrap();
     let database_url = std::env::var("DATABASE_URL").unwrap();
-    let engine = EngineClient::connect(url);
+    let engine = engine_client().expect("the engine the test started with");
     let cache = Arc::new(Cache::new(16 * 1024 * 1024, Arc::new(engine.clone())));
     engine.attach(&cache);
     assert!(connected(&engine, Duration::from_secs(10)).await);

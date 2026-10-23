@@ -5,7 +5,8 @@
 //! | variable              | meaning                                        | default        |
 //! |-----------------------|------------------------------------------------|----------------|
 //! | `DATABASE_URL`        | the Postgres the engine follows                | required       |
-//! | `STREAMGRES_S2S_URL`  | `ws://host:port/<base>/s2s/v1`                 | required       |
+//! | `STREAMGRES_S2S_URL`  | `ws://host:port/<base>/s2s/v1`                 | required unless embedded |
+//! | `STREAMGRES_ENGINE`   | `embedded` runs the engine in this process, configured by the server's own variables (`STREAMGRES_PG_DSN`, `STREAMGRES_APP_ID`, `STREAMGRES_PUBLICATION`, ...) | the S2S endpoint |
 //! | `DEMO_ADDR`           | where `serve` listens                          | `0.0.0.0:8080` |
 //! | `DEMO_WRITER_MS`      | the background writer's tick; 0 turns it off   | `1000`         |
 //! | `DEMO_WRITER_MIX`     | the writer's operations, comma separated       | all of them    |
@@ -108,7 +109,7 @@ async fn main() {
 
 /// A connected stack, or why not.
 async fn connect() -> Result<Stack, String> {
-    let stack = Stack::connect(&env("DATABASE_URL")?, &env("STREAMGRES_S2S_URL")?).await?;
+    let stack = Stack::connect(&env("DATABASE_URL")?).await?;
     if !stack.wait_for_engine(Duration::from_secs(10)).await {
         return Err("the engine is not reachable".to_string());
     }
@@ -135,7 +136,7 @@ async fn run() -> Result<(), String> {
         }
         Command::Serve => {
             let stack =
-                Arc::new(Stack::connect(&env("DATABASE_URL")?, &env("STREAMGRES_S2S_URL")?).await?);
+                Arc::new(Stack::connect(&env("DATABASE_URL")?).await?);
             for warning in stack.engine.warnings() {
                 eprintln!("demo: {warning}");
             }

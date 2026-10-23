@@ -5,6 +5,8 @@
 //! `DATABASE_URL` pointing at the database that engine streams. Skips
 //! itself otherwise.
 
+mod transport;
+
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -46,16 +48,12 @@ struct Live {
 }
 
 impl Live {
-    /// Connects to the engine `STREAMGRES_S2S_URL` names; `None`, and the
-    /// test skipped, when it names none. The cache is told which database
+    /// Connects to the test's engine ([`transport`]); `None`, and the
+    /// test skipped, when none is given. The cache is told which database
     /// it reads up front, so the statements a test counts are its own.
     fn start(name: &str) -> Option<Live> {
-        let Ok(url) = std::env::var("STREAMGRES_S2S_URL") else {
-            eprintln!("STREAMGRES_S2S_URL not set; skipping");
-            return None;
-        };
+        let engine = transport::client(diesel_streamgres::engine::Config::from_env())?;
         let database = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-        let engine = EngineClient::connect(url);
         let cache = Arc::new(Cache::new(64 * 1024 * 1024, Arc::new(engine.clone())));
         engine.attach(&cache);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -876,15 +874,12 @@ fn a_pool_spreads_subscriptions_across_its_sockets() {
     let Some(mut live) = Live::start("pool") else {
         return;
     };
-    let url = std::env::var("STREAMGRES_S2S_URL").unwrap();
     let database = std::env::var("DATABASE_URL").unwrap();
-    let engine = EngineClient::with_config(
-        url,
-        diesel_streamgres::engine::Config {
-            connections: 3,
-            ..diesel_streamgres::engine::Config::from_env()
-        },
-    );
+    let engine = transport::client(diesel_streamgres::engine::Config {
+        connections: 3,
+        ..diesel_streamgres::engine::Config::from_env()
+    })
+    .expect("the engine the test started with");
     let cache = Arc::new(Cache::new(64 * 1024 * 1024, Arc::new(engine.clone())));
     engine.attach(&cache);
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -982,16 +977,13 @@ fn the_subscription_cap_serves_the_rest_live() {
     let Some(mut live) = Live::start("cap") else {
         return;
     };
-    let url = std::env::var("STREAMGRES_S2S_URL").unwrap();
     let database = std::env::var("DATABASE_URL").unwrap();
-    let engine = EngineClient::with_config(
-        url,
-        diesel_streamgres::engine::Config {
-            connections: 1,
-            max_subscriptions: 2,
-            ..diesel_streamgres::engine::Config::from_env()
-        },
-    );
+    let engine = transport::client(diesel_streamgres::engine::Config {
+        connections: 1,
+        max_subscriptions: 2,
+        ..diesel_streamgres::engine::Config::from_env()
+    })
+    .expect("the engine the test started with");
     let cache = Arc::new(Cache::new(64 * 1024 * 1024, Arc::new(engine.clone())));
     engine.attach(&cache);
     let deadline = Instant::now() + Duration::from_secs(5);

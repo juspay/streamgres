@@ -436,12 +436,33 @@ enum Greeting {
     Named(Database),
 }
 
-/// One socket to the engine and the subscriptions it carries.
+/// What a worker connects to.
+#[derive(Clone)]
+enum Target {
+    /// An engine's S2S endpoint, at this URL.
+    Remote(String),
+    /// An engine in this process.
+    #[cfg(feature = "embedded")]
+    Local(streamgres::embedded::Engine),
+}
+
+impl Target {
+    /// The remote engine's URL; `None` for one in this process.
+    fn url(&self) -> Option<&str> {
+        match self {
+            Target::Remote(url) => Some(url),
+            #[cfg(feature = "embedded")]
+            Target::Local(_) => None,
+        }
+    }
+}
+
+/// One connection to the engine and the subscriptions it carries.
 struct Worker {
     index: usize,
     /// The worker itself, for the stores it hands the cache.
     this: Weak<Worker>,
-    url: String,
+    target: Target,
     verdict_timeout: Duration,
     outgoing: mpsc::UnboundedSender<Outgoing>,
     connected: AtomicBool,
@@ -487,6 +508,34 @@ pub struct EngineClient {
 }
 
 impl EngineClient {
+    /// A client of the engine the environment names: with the
+    /// `embedded` feature and `STREAMGRES_ENGINE=embedded`, one this
+    /// process starts, configured from the server's own variables
+    /// ([`streamgres::embedded::Config::from_env`]); otherwise the one at
+    /// `STREAMGRES_S2S_URL`. Either way the pool's shape is
+    /// [`Config::from_env`]'s. Why not, when neither is named.
+    pub fn from_env() -> Result<EngineClient, String> {
+        let config = Config::from_env();
+        let mode = std::env::var("STREAMGRES_ENGINE").unwrap_or_default();
+        if mode == "embedded" {
+            #[cfg(feature = "embedded")]
+            {
+                let engine = streamgres::embedded::Engine::start(
+                    streamgres::embedded::Config::from_env()?,
+                );
+                return Ok(EngineClient::embedded(engine, config));
+            }
+            #[cfg(not(feature = "embedded"))]
+            return Err(
+                "STREAMGRES_ENGINE=embedded needs diesel-streamgres built with its `embedded` feature"
+                    .to_owned(),
+            );
+        }
+        let url = std::env::var("STREAMGRES_S2S_URL")
+            .map_err(|_| "STREAMGRES_S2S_URL must name the engine, or STREAMGRES_ENGINE=embedded run one in this process".to_owned())?;
+        Ok(EngineClient::with_config(url, config))
+    }
+
     /// Starts the pool for `url` (`ws://host:port/<base>/s2s/v1`) with
     /// [`Config::from_env`]. Returns at once; the sockets connect in the
     /// background and subscribes are refused until one has.
@@ -508,7 +557,20 @@ impl EngineClient {
     /// A client with `config` (zero connections taken as one). Returns at
     /// once, as [`EngineClient::connect`] does.
     pub fn with_config(url: impl Into<String>, config: Config) -> EngineClient {
-        let url = url.into();
+        Self::with_target(Target::Remote(url.into()), config)
+    }
+
+    /// A client of `engine`, an engine this process runs, with `config`
+    /// (its token unused): the same frames as over a socket, carried by
+    /// channels, and the same cache, routing and checks on top. Returns
+    /// at once; each connection waits for the engine to serve.
+    #[cfg(feature = "embedded")]
+    pub fn embedded(engine: streamgres::embedded::Engine, config: Config) -> EngineClient {
+        Self::with_target(Target::Local(engine), config)
+    }
+
+    /// A client of `target`, its connections started.
+    fn with_target(target: Target, config: Config) -> EngineClient {
         let config = Config {
             connections: config.connections.max(1),
             ..config
@@ -529,7 +591,7 @@ impl EngineClient {
             .map(|index| {
                 Worker::start(
                     index,
-                    url.clone(),
+                    target.clone(),
                     config.verdict_timeout,
                     Arc::clone(&shared),
                 )
@@ -618,7 +680,7 @@ impl EngineClient {
     /// up, for its log: a bearer token that would cross the network in
     /// plain text, over `ws://` to another host.
     pub fn warnings(&self) -> Vec<String> {
-        let url = self.pool.workers.first().map(|worker| worker.url.as_str());
+        let url = self.pool.workers.first().and_then(|worker| worker.target.url());
         match (url, &self.pool.shared.token) {
             (Some(url), Some(_)) if token_in_clear(url) => vec![format!(
                 "STREAMGRES_S2S_TOKEN goes to `{url}` in plain text; use wss:// or a TLS-terminating proxy"
@@ -790,7 +852,7 @@ impl Worker {
     /// running.
     fn new(
         index: usize,
-        url: String,
+        target: Target,
         verdict_timeout: Duration,
         shared: Arc<Shared>,
     ) -> (Arc<Worker>, mpsc::UnboundedReceiver<Outgoing>) {
@@ -798,7 +860,7 @@ impl Worker {
         let worker = Arc::new_cyclic(|this| Worker {
             index,
             this: this.clone(),
-            url,
+            target,
             verdict_timeout,
             outgoing,
             connected: AtomicBool::new(false),
@@ -819,14 +881,14 @@ impl Worker {
         (worker, outgoing_rx)
     }
 
-    /// A worker running its socket on a thread of its own.
+    /// A worker running its connection on a thread of its own.
     fn start(
         index: usize,
-        url: String,
+        target: Target,
         verdict_timeout: Duration,
         shared: Arc<Shared>,
     ) -> Arc<Worker> {
-        let (worker, outgoing_rx) = Worker::new(index, url, verdict_timeout, shared);
+        let (worker, outgoing_rx) = Worker::new(index, target, verdict_timeout, shared);
         let task = Arc::clone(&worker);
         thread::Builder::new()
             .name(format!("streamgres-engine-{index}"))
@@ -1264,11 +1326,106 @@ fn connect_failure(error: &tokio_tungstenite::tungstenite::Error) -> String {
     }
 }
 
-/// Connects, serves until the socket breaks either way, reconnects,
-/// until the pool stops: one worker's socket. A quiet socket is pinged
-/// every third of the silence window, and how long it has been silent
-/// is looked at every thirtieth (a second at most), so it is taken for
-/// dead within that of the window, not at the next ping.
+/// The socket a remote engine is reached on.
+type Socket = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+/// The sending half of a connection to an engine.
+enum Sender {
+    Socket(futures_util::stream::SplitSink<Socket, Message>),
+    #[cfg(feature = "embedded")]
+    Local(mpsc::Sender<String>),
+}
+
+/// The receiving half of a connection to an engine.
+enum Receiver {
+    Socket(futures_util::stream::SplitStream<Socket>),
+    #[cfg(feature = "embedded")]
+    Local(streamgres::embedded::Session),
+}
+
+/// What a connection brought.
+enum Heard {
+    /// A frame: a socket's text stays in the socket's buffer.
+    Socket(tokio_tungstenite::tungstenite::Utf8Bytes),
+    #[cfg(feature = "embedded")]
+    Local(String),
+    /// Something else the socket carries (a ping, a pong, binary).
+    Other,
+    /// The connection ended.
+    Closed,
+}
+
+/// Opens a connection to `worker`'s engine: a socket to a remote one, a
+/// session with one in this process. Why not, when it cannot.
+async fn open(worker: &Worker) -> Result<(Sender, Receiver), String> {
+    match &worker.target {
+        Target::Remote(url) => {
+            let request = upgrade_request(url, worker.shared.token.as_deref())?;
+            let (socket, _) =
+                tokio_tungstenite::connect_async_tls_with_config(request, None, false, tls())
+                    .await
+                    .map_err(|error| connect_failure(&error))?;
+            let (sink, stream) = socket.split();
+            Ok((Sender::Socket(sink), Receiver::Socket(stream)))
+        }
+        #[cfg(feature = "embedded")]
+        Target::Local(engine) => {
+            let session = engine.connect()?;
+            Ok((Sender::Local(session.sender()), Receiver::Local(session)))
+        }
+    }
+}
+
+impl Sender {
+    /// Sends one frame, giving the connection up if it does not take it
+    /// in time.
+    async fn send(&mut self, frame: String) -> bool {
+        match self {
+            Sender::Socket(sink) => matches!(
+                timeout(SEND_TIMEOUT, sink.send(Message::Text(frame.into()))).await,
+                Ok(Ok(()))
+            ),
+            #[cfg(feature = "embedded")]
+            Sender::Local(engine) => matches!(timeout(SEND_TIMEOUT, engine.send(frame)).await, Ok(Ok(()))),
+        }
+    }
+
+    /// Closes the connection.
+    async fn close(&mut self) {
+        match self {
+            Sender::Socket(sink) => {
+                let _ = sink.close().await;
+            }
+            #[cfg(feature = "embedded")]
+            Sender::Local(_) => {}
+        }
+    }
+}
+
+impl Receiver {
+    /// What the connection brings next; cancelling it loses nothing.
+    async fn next(&mut self) -> Heard {
+        match self {
+            Receiver::Socket(stream) => match stream.next().await {
+                Some(Ok(Message::Text(text))) => Heard::Socket(text),
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => Heard::Closed,
+                Some(Ok(_)) => Heard::Other,
+            },
+            #[cfg(feature = "embedded")]
+            Receiver::Local(session) => session.recv().await.map_or(Heard::Closed, Heard::Local),
+        }
+    }
+}
+
+/// Connects, serves until the connection breaks either way, reconnects,
+/// until the pool stops: one worker's connection, a socket to a remote
+/// engine or a session with one in this process, the same frames over
+/// either. A quiet connection is pinged every third of the silence
+/// window, and how long it has been silent is looked at every thirtieth
+/// (a second at most), so it is taken for dead within that of the
+/// window, not at the next ping.
 async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedReceiver<Outgoing>) {
     let mut first = true;
     loop {
@@ -1279,31 +1436,16 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
         if worker.shared.stopped.load(Ordering::Acquire) {
             return;
         }
-        let request = match upgrade_request(&worker.url, worker.shared.token.as_deref()) {
-            Ok(request) => request,
+        let (mut sender, mut receiver) = match open(&worker).await {
+            Ok(link) => {
+                worker.connect_failed(None);
+                link
+            }
             Err(error) => {
                 worker.connect_failed(Some(error));
                 continue;
             }
         };
-        let socket = match tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            None,
-            false,
-            tls(),
-        )
-        .await
-        {
-            Ok((socket, _)) => {
-                worker.connect_failed(None);
-                socket
-            }
-            Err(error) => {
-                worker.connect_failed(Some(connect_failure(&error)));
-                continue;
-            }
-        };
-        let (mut sink, mut stream) = socket.split();
         let mut heard = Instant::now();
         let silence = worker.shared.silence;
         let every = (silence / 3).max(Duration::from_millis(1));
@@ -1321,38 +1463,42 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
                 &key.sql,
                 &key.binds.iter().map(bind_json).collect::<Vec<_>>(),
             );
-            if !send_frame(&mut sink, frame).await {
+            if !sender.send(frame).await {
                 up = false;
                 break;
             }
         }
         while up {
             up = tokio::select! {
-                frame = stream.next() => {
+                frame = receiver.next() => {
                     heard = Instant::now();
                     match frame {
-                        Some(Ok(Message::Text(text))) => {
+                        Heard::Socket(text) => {
                             inbound(&worker, &text);
                             true
                         }
-                        Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Binary(_))) | Some(Ok(Message::Frame(_))) => true,
-                        Some(Ok(Message::Close(_))) | Some(Err(_)) | None => false,
+                        #[cfg(feature = "embedded")]
+                        Heard::Local(text) => {
+                            inbound(&worker, &text);
+                            true
+                        }
+                        Heard::Other => true,
+                        Heard::Closed => false,
                     }
                 },
                 _ = ping.tick() => {
-                    heard.elapsed() < silence
-                        && send_frame(&mut sink, json!(["ping"]).to_string()).await
+                    heard.elapsed() < silence && sender.send(json!(["ping"]).to_string()).await
                 },
                 _ = check.tick() => heard.elapsed() < silence,
                 message = outgoing.recv() => match message {
                     Some(Outgoing::Subscribe { id, sql, binds }) => {
-                        send_frame(&mut sink, subscribe_frame(id, &sql, &binds)).await
+                        sender.send(subscribe_frame(id, &sql, &binds)).await
                     }
                     Some(Outgoing::Unsubscribe { id }) => {
-                        send_frame(&mut sink, json!(["unsubscribe", {"id": id}]).to_string()).await
+                        sender.send(json!(["unsubscribe", {"id": id}]).to_string()).await
                     }
                     Some(Outgoing::Stop) | None => {
-                        let _ = sink.close().await;
+                        sender.close().await;
                         return;
                     }
                 },
@@ -1360,17 +1506,6 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
         }
         disconnected(&worker);
     }
-}
-
-/// Sends one frame, giving the socket up if it does not take it in time.
-async fn send_frame<S>(sink: &mut S, frame: String) -> bool
-where
-    S: futures_util::Sink<Message> + Unpin,
-{
-    matches!(
-        timeout(SEND_TIMEOUT, sink.send(Message::Text(frame.into()))).await,
-        Ok(Ok(()))
-    )
 }
 
 /// The socket is down. Every wait ends refused, and what it waited for
@@ -1724,7 +1859,7 @@ mod tests {
         });
         let (worker, outgoing) = Worker::new(
             0,
-            "ws://127.0.0.1:1/never".to_string(),
+            Target::Remote("ws://127.0.0.1:1/never".to_string()),
             wait,
             Arc::clone(&shared),
         );

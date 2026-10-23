@@ -5,6 +5,8 @@
 
 #![cfg(feature = "async")]
 
+mod transport;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -12,7 +14,6 @@ use std::time::{Duration, Instant};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use diesel_streamgres::cache::Cache;
-use diesel_streamgres::engine::EngineClient;
 use diesel_streamgres::{AsyncSyncedConnection, Route};
 
 /// diesel-async's `RunQueryDsl::load` shadows `AtomicU64::load`.
@@ -61,12 +62,10 @@ async fn read(conn: &mut AsyncSyncedConnection, key: &str) -> Option<String> {
 /// still rows mode.
 #[tokio::test]
 async fn rows_mode_through_the_async_wrapper() {
-    let Ok(url) = std::env::var("STREAMGRES_S2S_URL") else {
-        eprintln!("STREAMGRES_S2S_URL not set; skipping");
+    let Some(engine) = transport::client(diesel_streamgres::engine::Config::from_env()) else {
         return;
     };
     let database = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-    let engine = EngineClient::connect(url);
     let cache = Arc::new(Cache::new(64 * 1024 * 1024, Arc::new(engine.clone())));
     engine.attach(&cache);
     let deadline = Instant::now() + Duration::from_secs(5);

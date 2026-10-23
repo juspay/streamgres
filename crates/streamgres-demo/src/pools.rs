@@ -66,10 +66,17 @@ fn install_settings(cache: &Arc<Cache>) {
 }
 
 impl Stack {
-    /// Connects to the engine and opens the pools. The engine's sockets
-    /// come up in the background; reads before that go live.
-    pub async fn connect(database_url: &str, s2s_url: &str) -> Result<Stack, String> {
-        let engine = EngineClient::connect(s2s_url);
+    /// Connects to the engine the environment names
+    /// ([`EngineClient::from_env`]: the one at `STREAMGRES_S2S_URL`, or,
+    /// with `STREAMGRES_ENGINE=embedded`, one this process runs) and
+    /// opens the pools. The engine comes up in the background; reads
+    /// before that go live.
+    pub async fn connect(database_url: &str) -> Result<Stack, String> {
+        Stack::with_engine(database_url, EngineClient::from_env()?).await
+    }
+
+    /// As [`Stack::connect`], through `engine`.
+    pub async fn with_engine(database_url: &str, engine: EngineClient) -> Result<Stack, String> {
         let cache = Arc::new(Cache::with_limits(
             Limits::from_env(),
             Arc::new(engine.clone()),

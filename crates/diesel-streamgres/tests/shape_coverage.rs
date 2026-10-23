@@ -16,6 +16,8 @@
 //! does; skips itself otherwise. The enum type must exist before the
 //! engine starts, since the engine reads its type map at start.
 
+mod transport;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -367,12 +369,8 @@ impl Live {
     /// it is created, and a subscribe refused in that moment would
     /// otherwise be remembered for the run.
     fn start() -> Option<Live> {
-        let Ok(url) = std::env::var("STREAMGRES_S2S_URL") else {
-            eprintln!("STREAMGRES_S2S_URL not set; skipping");
-            return None;
-        };
+        let engine = transport::client(diesel_streamgres::engine::Config::from_env())?;
         let database = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-        let engine = EngineClient::connect(url);
         let limits = Limits {
             refused_for: None,
             ..Limits::default()
