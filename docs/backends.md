@@ -34,7 +34,8 @@ process count:
   each and refuses to take the last ones another consumer may need.
 - About 7 to 10% of a core of walsender CPU on the database per engine at
   1,000 transactions a second.
-- Each process holds its own copy of the rows its queries follow.
+- Each process holds its own copy of the rows its queries follow, and
+  spends its own CPU applying every change to them (section 7).
 
 **The S2S server is for anything larger.** Backend processes scale out
 freely and add no slots: only the engine servers hold them, so the cost on
@@ -250,3 +251,26 @@ Local PostgreSQL 17, the engine and the backend on one host:
 | a write to the next read served from the cache | 6 to 13 ms | |
 
 Over a network the S2S numbers grow by its round trip.
+
+### Embedded engines under write load
+
+Three backend processes, each with an embedded engine following the same
+200 queries over a 100,000-row table (four columns; every row in some
+query), with 1,000 single-row updates a second on the primary, all on one
+4-core host:
+
+| | per engine |
+|---|---|
+| walsender CPU on the database | 8.4% of a core (25.2% for the three) |
+| the engine's CPU in its process | about 20% of a core; 48% at 5,000 updates a second |
+| memory, engine started, no queries | 7.5 MB |
+| memory, holding the 100,000 rows | 90 MB at first, levelling off at 109 MB once every row had changed |
+| replication slots | 2 while serving, 3 while a read snapshot rotates |
+
+One engine alone cost the same per engine. The memory is about 1 KB per
+held row in this table, for the rows and the indexes the queries need;
+it grows with the rows followed, not with the write rate. The CPU is
+mostly work every committed transaction costs whether or not a query
+follows it, decoding the feed and stepping the engine: an engine following nothing still
+took 15% of a core at 1,000 updates a second. Per transaction it falls
+as the rate rises, since busier feeds arrive in batches.
