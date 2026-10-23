@@ -154,11 +154,16 @@ idle. PgBouncer's own pool settings control the PostgreSQL backend connections.
 
 ### Physical standbys
 
-- A new read snapshot on a standby waits for the primary's next
-  running-transactions record. A busy primary writes one every 15 s;
-  `SELECT pg_log_standby_snapshot()` on the primary forces one. Until it
-  arrives, reads keep using the current snapshot, so the only cost is memory,
-  not correctness.
+- A new slot on a standby waits for the primary's next running-transactions
+  record. The primary writes one every 15 s while it has written anything
+  since the last, and none while it is idle; `SELECT pg_log_standby_snapshot()`
+  on the primary writes one at once.
+  - At startup the feed's slot and the first read snapshot each wait so. A
+    server that has waited 10 s on a slot logs what it is waiting for. On an
+    idle primary, run `pg_log_standby_snapshot()` there, or start the server
+    once the primary has writes.
+  - Later read snapshots wait the same way. Until one arrives, reads keep
+    using the current snapshot, so the only cost is memory, not correctness.
 - Set `hot_standby_feedback = on` on the standby, so the primary's vacuum does
   not cancel the snapshots.
 

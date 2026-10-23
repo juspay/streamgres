@@ -898,12 +898,14 @@ async fn prepare_slot(
         .await?
         .is_some();
     if !exists {
-        client
-            .execute(
+        super::noting_a_slow_slot(
+            slot,
+            client.execute(
                 "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
                 &[&slot],
-            )
-            .await?;
+            ),
+        )
+        .await?;
     }
     Ok(client)
 }

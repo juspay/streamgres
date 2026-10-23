@@ -187,8 +187,10 @@ An S2S server can follow a PostgreSQL 16+ physical standby instead of the
 primary, moving its walsender CPU and slots off the primary. The costs:
 - `hot_standby_feedback = on` on the standby.
 - A new slot on a standby waits for the primary's next running-transactions
-  record: up to 15 s on a quiet primary (`SELECT pg_log_standby_snapshot()`
-  on the primary forces one).
+  record: up to 15 s on a primary with writes, and for as long as an idle
+  one stays idle (`SELECT pg_log_standby_snapshot()` on the primary writes
+  one). This holds the server's start back; see
+  [`deploy.md`](deploy.md#physical-standbys).
 - The standby's replay lag adds to the engine's.
 - A standby cannot write heartbeats, so the engine reports no lag and
   backends trust it whatever its delay (`STREAMGRES_S2S_MAX_LAG_MS` has
@@ -196,7 +198,13 @@ primary, moving its walsender CPU and slots off the primary. The costs:
 - The feed, its slot and the read snapshots must all be on that one
   server.
 
-This setup is not yet covered by this repository's tests.
+Measured against a local PostgreSQL 17 standby, with writes on the
+primary and the wrapper's live suites (`engine_live`, `async_live`,
+`shape_coverage`) passing: a change reached the engine's rows in about
+5 ms, and a write to the next read served from the cache took 8 to 18 ms.
+A physical standby shares the primary's WAL positions, so a write's
+position compares directly with the engine's. These runs are manual: CI
+has no standby.
 
 ## 5. Read your writes
 

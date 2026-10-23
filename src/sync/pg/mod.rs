@@ -189,11 +189,13 @@ fn snapshot_slot_name() -> String {
 pub async fn mint(config: &Config) -> Result<Alias, StorageError> {
     let mut minter = ReplicationConnection::open(config).await?;
     let slot = snapshot_slot_name();
-    let rows = minter
-        .simple_query(&format!(
+    let rows = noting_a_slow_slot(
+        &slot,
+        minter.simple_query(&format!(
             "CREATE_REPLICATION_SLOT \"{slot}\" TEMPORARY LOGICAL pgoutput EXPORT_SNAPSHOT"
-        ))
-        .await?;
+        )),
+    )
+    .await?;
     let unreadable = || StorageError("CREATE_REPLICATION_SLOT returned no usable row".to_owned());
     let row = rows.first().ok_or_else(unreadable)?;
     let lsn = parse_lsn(
@@ -210,6 +212,28 @@ pub async fn mint(config: &Config) -> Result<Alias, StorageError> {
         lsn,
         _minter: minter,
     })
+}
+
+/// How long a slot's creation may wait before [`noting_a_slow_slot`] says
+/// why.
+const SLOW_SLOT: Duration = Duration::from_secs(10);
+
+/// `creating`, the creation of `slot`, run to the end; once it has waited
+/// [`SLOW_SLOT`], a log line says what it waits for. A slot waits for
+/// every transaction open when it is asked for, and on a standby for the
+/// primary's next running-transactions record as well, which a quiet
+/// primary may not write for a long time.
+pub(crate) async fn noting_a_slow_slot<T>(slot: &str, creating: impl Future<Output = T>) -> T {
+    let mut creating = std::pin::pin!(creating);
+    tokio::select! {
+        done = &mut creating => return done,
+        () = tokio::time::sleep(SLOW_SLOT) => {}
+    }
+    log_info!(
+        "creating slot {slot} has waited {} s: it waits for every transaction open when it was asked for to end, and on a standby for the primary's next running-transactions record (`SELECT pg_log_standby_snapshot()` on the primary writes one)",
+        SLOW_SLOT.as_secs()
+    );
+    creating.await
 }
 
 impl From<tokio_postgres::Error> for StorageError {
