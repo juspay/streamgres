@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use streamgres::embedded::{Config, Engine, Session, State, setup_sql};
+use streamgres::embedded::{Config, Engine, Session, Setup, State, setup_sql};
 use tokio_postgres::{Client, NoTls};
 
 
@@ -89,6 +89,7 @@ async fn tear_down(client: &Client, names: &Names) {
 fn config(dsn: &str, names: &Names) -> Config {
     let mut config = Config::new(dsn);
     config.publication = names.publication.clone();
+    config.app = names.app.clone();
     config.schemas = vec!["public".to_owned()];
     config.ddl_trigger = format!("{}_ddl_end_0", names.app);
     config.ddl_prefix = format!("{}/0/ddl", names.app);
@@ -204,6 +205,137 @@ fn an_embedded_engine_serves_restarts_and_leaves_no_slot() {
         assert_eq!(engine.slot(), None);
         tear_down(&client, &names).await;
     });
+}
+
+/// An engine on a database nobody set up sets it up itself: the
+/// publication and the trigger stack, once, however many engines start
+/// together; it then serves, and follows a schema change. One told to
+/// require the setup refuses a database without it. On a database of its
+/// own: event triggers fire for every statement in their database, other
+/// tests' too.
+#[test]
+fn an_engine_sets_up_a_database_nobody_set_up() {
+    let Some(dsn) = dsn() else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("setup");
+        let table = &names.table;
+        let server = admin(&dsn).await;
+        let database = format!("embedded_setup_{}", std::process::id());
+        for statement in [
+            format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"),
+            format!("CREATE DATABASE {database}"),
+        ] {
+            server.batch_execute(&statement).await.expect("a database of its own");
+        }
+        let dsn = with_database(&dsn, &database);
+        let client = admin(&dsn).await;
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {table} (id int8 PRIMARY KEY, name text NOT NULL, n int4 NOT NULL);
+                 INSERT INTO {table} VALUES (1, 'one', 1);"
+            ))
+            .await
+            .expect("the table");
+
+        let mut requiring = config(&dsn, &names);
+        requiring.setup = Setup::Require;
+        let refused = Engine::start(requiring);
+        reach(&refused, |state| matches!(state, State::Down(_)), Duration::from_secs(30)).await;
+        let State::Down(reason) = refused.state() else { unreachable!() };
+        assert!(reason.contains("event trigger"), "{reason}");
+        let stopping = refused.clone();
+        tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+
+        let mut installing = config(&dsn, &names);
+        installing.setup = Setup::Install;
+        let engines: Vec<Engine> = (0..2).map(|_| Engine::start(installing.clone())).collect();
+        for engine in &engines {
+            reach(engine, |state| *state == State::Serving, Duration::from_secs(60)).await;
+        }
+        let published: i64 = client
+            .query_one("SELECT count(*) FROM pg_publication WHERE pubname = $1", &[&names.publication])
+            .await
+            .expect("publications")
+            .get(0);
+        assert_eq!(published, 1);
+        let triggers: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_event_trigger WHERE evtname = $1 AND evtenabled <> 'D'",
+                &[&format!("{}_ddl_end_0", names.app)],
+            )
+            .await
+            .expect("triggers")
+            .get(0);
+        assert_eq!(triggers, 1);
+
+        let mut session = engines[0].connect().expect("a session");
+        assert_eq!(next(&mut session).await.expect("hello")[0], "hello");
+        client
+            .batch_execute(&format!("ALTER TABLE {table} ADD COLUMN note text"))
+            .await
+            .expect("a schema change");
+        let sql = format!(r#"SELECT "id", "note" FROM "{table}" WHERE "n" > $1"#);
+        let bind = json!({"oid": 23, "bytes": "AAAAAA=="});
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut id = 1;
+        loop {
+            session
+                .sender()
+                .send(json!(["subscribe", {"id": id, "sql": sql, "binds": [bind], "rows": true}]).to_string())
+                .await
+                .expect("send");
+            let answer = next(&mut session).await.expect("an answer");
+            if answer[0] == "accepted" {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the new column never served: {answer}");
+            id += 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        for engine in engines {
+            tokio::task::spawn_blocking(move || engine.stop()).await.expect("stop");
+        }
+        drop(session);
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let held: i64 = server
+                .query_one("SELECT count(*) FROM pg_replication_slots WHERE database = $1", &[&database])
+                .await
+                .expect("slots")
+                .get(0);
+            if held == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the slots outlived their engines");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        server
+            .batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
+            .await
+            .expect("drop its database");
+    });
+}
+
+/// `dsn` with its database replaced by `database`, as a URL or as
+/// `key=value` pairs.
+fn with_database(dsn: &str, database: &str) -> String {
+    if dsn.contains("://") {
+        let (base, query) = dsn.split_once('?').map_or((dsn, None), |(base, query)| (base, Some(query)));
+        let (server, _) = base.rsplit_once('/').expect("a database in the URL");
+        let server = if server.ends_with('/') || server.ends_with(':') { base } else { server };
+        match query {
+            Some(query) => format!("{server}/{database}?{query}"),
+            None => format!("{server}/{database}"),
+        }
+    } else {
+        format!("{dsn} dbname={database}")
+    }
 }
 
 /// Making a slot waits for every transaction open at the time, so an

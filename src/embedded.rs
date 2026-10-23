@@ -21,10 +21,15 @@
 //! engine starts over on a fresh slot and snapshot; sessions end with
 //! it, and their backends reconnect.
 //!
-//! Before each start the supervisor checks the database has room for
-//! [`SLOTS_PER_ENGINE`] more replication slots and connections, and
-//! refuses to take the last ones another consumer may need. Log lines go
-//! to the `log` facade ([`crate::log::to_facade`]).
+//! An embedded engine runs against the primary, the database its backend
+//! writes to: it is for an application of one or a few processes, each
+//! running its own engine with its own slot (a fleet shares a few S2S
+//! servers instead, whose cost on the database does not grow with it).
+//! Before each start the supervisor refuses a standby, sets the database
+//! up when it is not ([`Setup`]), and checks it has room for
+//! [`SLOTS_PER_ENGINE`] more replication slots and connections, refusing
+//! to take the last ones another consumer may need. Log lines go to the
+//! `log` facade ([`crate::log::to_facade`]).
 
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -40,7 +45,8 @@ use crate::model::{Lsn, TableName};
 use crate::plan::{PlanCache, Policy, Side};
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
-use crate::sync::pg::{DEFAULT_READ_ROW_LIMIT, Keepalive, Settings, estimate_cache, threads};
+use crate::sync::pg::sql::quote_ident;
+use crate::sync::pg::{DEFAULT_READ_ROW_LIMIT, Keepalive, Settings, ddl, estimate_cache, threads};
 use crate::sync::{CatalogHandle, Event};
 
 /// Replication slots, and replication connections, one engine holds at
@@ -58,6 +64,24 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// new one, and the next start waits the shortest time again.
 const STEADY: Duration = Duration::from_secs(60);
 
+/// The advisory lock the engines of one database take to set it up, so
+/// processes starting together install the setup once.
+const SETUP_LOCK: i64 = 0x5354_5245_414d_5350; // "STREAMSP"
+
+/// How an engine gets the database set up for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setup {
+    /// Creates the publication (`FOR ALL TABLES`) and installs the
+    /// schema-change trigger stack ([`setup_sql`]) when either is
+    /// missing, once, under an advisory lock; what is there is left
+    /// alone. Needs a role allowed to create both: a superuser, or a
+    /// managed database's admin role.
+    Install,
+    /// Requires both, as the S2S server does, for a database a migration
+    /// sets up.
+    Require,
+}
+
 /// An embedded engine's configuration. [`Config::new`] gives the
 /// defaults for a database; [`Config::from_env`] reads the same
 /// variables the server does, with defaults sized for a backend's
@@ -69,7 +93,13 @@ pub struct Config {
     pub dsn: String,
     /// Where ordinary reads go; may be a PgBouncer transaction pool.
     pub read_dsn: String,
-    /// The publication the feed streams; never created here.
+    /// The app and shard the schema-change trigger stack is installed
+    /// for ([`setup_sql`]).
+    pub app: String,
+    pub shard: u32,
+    /// How the database gets set up.
+    pub setup: Setup,
+    /// The publication the feed streams.
     pub publication: String,
     /// The schemas whose tables are followed.
     pub schemas: Vec<String>,
@@ -109,6 +139,9 @@ impl Config {
         Config {
             read_dsn: dsn.clone(),
             dsn,
+            app: "zero".to_owned(),
+            shard: 0,
+            setup: Setup::Install,
             publication: "xyne_sync_pub".to_owned(),
             schemas: vec!["public".to_owned(), "zero_0".to_owned()],
             ddl_trigger: "zero_ddl_end_0".to_owned(),
@@ -150,7 +183,9 @@ impl Config {
     /// (`STREAMGRES_PG_DSN`, `STREAMGRES_APP_ID`, `STREAMGRES_SHARD`,
     /// `STREAMGRES_PUBLICATION`, `STREAMGRES_SCHEMAS`,
     /// `STREAMGRES_READ_CONNECTIONS` and the rest), legacy names
-    /// included, an embedded engine's defaults otherwise.
+    /// included, an embedded engine's defaults otherwise; and its own,
+    /// `STREAMGRES_EMBEDDED_SETUP` (`install`, the default, or
+    /// `require`).
     pub fn from_lookup<F: Fn(&str) -> Option<String>>(env: &Env<F>) -> Result<Config, String> {
         let dsn = env
             .first(&["STREAMGRES_PG_DSN", "ZERO_UPSTREAM_DB"])
@@ -182,6 +217,15 @@ impl Config {
             })?,
             None => defaults.row_limit,
         };
+        let setup = match env.value("STREAMGRES_EMBEDDED_SETUP").as_deref() {
+            None | Some("install") => Setup::Install,
+            Some("require") => Setup::Require,
+            Some(other) => {
+                return Err(format!(
+                    "STREAMGRES_EMBEDDED_SETUP must be `install` or `require`, got `{other}`"
+                ));
+            }
+        };
         let join_preferred = match env.value("STREAMGRES_JOIN_PREFERRED_SIDE").as_deref() {
             None | Some("parent") => Side::Parent,
             Some("child") => Side::Child,
@@ -193,6 +237,7 @@ impl Config {
         };
         Ok(Config {
             read_dsn: env.value("STREAMGRES_READ_PG_DSN").unwrap_or_else(|| dsn.clone()),
+            setup,
             publication: env
                 .value("STREAMGRES_PUBLICATION")
                 .unwrap_or(defaults.publication.clone()),
@@ -249,6 +294,8 @@ impl Config {
                 .and_then(|text| text.trim().parse().ok())
                 .unwrap_or(defaults.estimate_capacity),
             dsn,
+            app: app_id,
+            shard,
             ..defaults
         })
     }
@@ -284,9 +331,9 @@ impl Config {
 
 /// The SQL that sets a database up for an engine of app `app`, shard
 /// `shard`, streaming `publication`: the schema-change event trigger
-/// stack the engine requires, for the application's migrations to run
-/// (the engine never changes a database's schema itself). The
-/// publication is the deployment's, created beside it.
+/// stack the engine requires, for a migration to run when the engine
+/// does not install it itself ([`Setup::Require`]). The publication is
+/// the deployment's, created beside it.
 pub fn setup_sql(app: &str, shard: u32, publication: &str) -> String {
     crate::sync::pg::ddl_triggers::trigger_stack_sql(app, shard, &[publication])
 }
@@ -590,6 +637,7 @@ fn join_within(thread: JoinHandle<()>, name: &str) {
 /// serving sessions once the feed has passed the first snapshot.
 async fn launch(config: &Config, stats: &Arc<Stats>) -> Result<Running, String> {
     let settings = config.settings();
+    prepare(config).await?;
     let catalog = Arc::new(CatalogHandle::new(
         threads::load_catalog_at(&settings.dsn, &settings.schemas).await?,
     ));
@@ -745,6 +793,123 @@ fn covered(position: Lsn, floor: Lsn) -> bool {
     floor.0 != 0 && position >= floor
 }
 
+/// Readies the database for an engine: an error on a standby, an
+/// embedded engine being for the primary its backend writes to; with
+/// [`Setup::Install`], the publication and the trigger stack installed
+/// when either is missing. The checks after it require both.
+async fn prepare(config: &Config) -> Result<(), String> {
+    let (client, connection) = tokio_postgres::connect(&config.dsn, tokio_postgres::NoTls)
+        .await
+        .map_err(|error| format!("connecting to the database: {error}"))?;
+    let connection = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let prepared = prepare_on(&client, config).await;
+    drop(client);
+    let _ = connection.await;
+    prepared
+}
+
+/// [`prepare`] over `client`.
+async fn prepare_on(client: &tokio_postgres::Client, config: &Config) -> Result<(), String> {
+    let standby: bool = client
+        .query_one("SELECT pg_is_in_recovery()", &[])
+        .await
+        .map_err(|error| format!("asking whether the database is a standby: {error}"))?
+        .get(0);
+    if standby {
+        return Err("the database is a standby; an embedded engine runs against the primary its backend writes to (an engine on a standby is an S2S server's choice)".to_owned());
+    }
+    if config.setup == Setup::Require || set_up(client, config).await? {
+        return Ok(());
+    }
+    if config.ddl_trigger != format!("{}_ddl_end_{}", config.app, config.shard)
+        || config.ddl_prefix != format!("{}/{}/ddl", config.app, config.shard)
+    {
+        return Err(format!(
+            "the event trigger `{}` and prefix `{}` are not the ones the setup installs for app `{}`, shard {}; install them yourself and set STREAMGRES_EMBEDDED_SETUP=require",
+            config.ddl_trigger, config.ddl_prefix, config.app, config.shard
+        ));
+    }
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|error| format!("setting the database up: {error}"))?;
+    let installed = install(client, config).await;
+    let ended = if installed.is_ok() { "COMMIT" } else { "ROLLBACK" };
+    let ended = client.batch_execute(ended).await;
+    let installed = installed?;
+    ended.map_err(|error| format!("setting the database up: {error}"))?;
+    if !installed.is_empty() {
+        log_info!(
+            "set the database up for the embedded engine: created {}",
+            installed.join(" and ")
+        );
+    }
+    Ok(())
+}
+
+/// Whether the database has the publication and an enabled trigger.
+async fn set_up(client: &tokio_postgres::Client, config: &Config) -> Result<bool, String> {
+    let published = client
+        .query_opt(
+            "SELECT 1 FROM pg_publication WHERE pubname = $1",
+            &[&config.publication],
+        )
+        .await
+        .map_err(|error| format!("looking for the publication: {error}"))?
+        .is_some();
+    let triggered = ddl::trigger_present(client, &config.ddl_trigger)
+        .await
+        .map_err(|error| format!("looking for the event trigger: {error}"))?;
+    Ok(published && triggered)
+}
+
+/// Inside the open transaction, under [`SETUP_LOCK`]: creates what is
+/// still missing once the lock is held (another process may have set the
+/// database up while this one waited). Returns what it created.
+async fn install(client: &tokio_postgres::Client, config: &Config) -> Result<Vec<&'static str>, String> {
+    let failed = |error: tokio_postgres::Error| {
+        format!(
+            "setting the database up: {error} (this needs a role that may create publications and event triggers; run `setup_sql` and create the publication as one, and set STREAMGRES_EMBEDDED_SETUP=require)"
+        )
+    };
+    client
+        .execute("SELECT pg_advisory_xact_lock($1)", &[&SETUP_LOCK])
+        .await
+        .map_err(failed)?;
+    let mut installed = Vec::new();
+    let published = client
+        .query_opt(
+            "SELECT 1 FROM pg_publication WHERE pubname = $1",
+            &[&config.publication],
+        )
+        .await
+        .map_err(failed)?
+        .is_some();
+    if !published {
+        client
+            .batch_execute(&format!(
+                "CREATE PUBLICATION {} FOR ALL TABLES",
+                quote_ident(&config.publication)
+            ))
+            .await
+            .map_err(failed)?;
+        installed.push("the publication");
+    }
+    let triggered = ddl::trigger_present(client, &config.ddl_trigger)
+        .await
+        .map_err(|error| format!("looking for the event trigger: {error}"))?;
+    if !triggered {
+        client
+            .batch_execute(&setup_sql(&config.app, config.shard, &config.publication))
+            .await
+            .map_err(failed)?;
+        installed.push("the schema-change trigger stack");
+    }
+    Ok(installed)
+}
+
 /// An error unless the database at `dsn` has room for
 /// [`SLOTS_PER_ENGINE`] more replication slots and replication
 /// connections: an engine that took the last ones would starve another
@@ -805,6 +970,19 @@ mod tests {
         assert!(settings.slot.starts_with(threads::SLOT_PREFIX));
         assert_ne!(settings.slot, config.settings().slot, "a fresh slot per start");
         assert!(Config::from_lookup(&Env::new(|_: &str| None)).is_err(), "a database is required");
+        assert_eq!((config.app.as_str(), config.shard), ("demo", 0));
+        assert_eq!(config.setup, Setup::Install, "set up by default");
+        let setup = |value: &'static str| {
+            Config::from_lookup(&Env::new(move |name: &str| match name {
+                "STREAMGRES_PG_DSN" => Some("postgres://primary/app".to_owned()),
+                "STREAMGRES_EMBEDDED_SETUP" => Some(value.to_owned()),
+                _ => None,
+            }))
+            .map(|config| config.setup)
+        };
+        assert_eq!(setup("require"), Ok(Setup::Require));
+        assert_eq!(setup("install"), Ok(Setup::Install));
+        assert!(setup("maybe").is_err());
     }
 
     /// Ready once the position covers a snapshot that has been taken.
