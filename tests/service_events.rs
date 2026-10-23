@@ -106,7 +106,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
 fn updates_of(event: &Event) -> &[streamgres::ivm::Delta] {
     match event {
         Event::Registered { updates, .. }
-        | Event::Landed { updates }
+        | Event::Landed { updates, .. }
         | Event::Committed { updates, .. } => updates,
         Event::Hydrated(_)
         | Event::Refused { .. }

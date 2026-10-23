@@ -50,9 +50,11 @@
 //!   backend reading another database does not take these rows for its
 //!   own. An engine that cannot read them closes the socket instead of
 //!   greeting it.
-//! - `["accepted", {"id": n}]` once the engine follows the query; from
-//!   that moment every change to its rows is reported, so the backend
-//!   reads Postgres only after it. In rows mode the body also carries
+//! - `["accepted", {"id": n, "lsn": p}]` once the engine follows the
+//!   query; from that moment every change to its rows is reported, so
+//!   the backend reads Postgres only after it, and on a standby only once
+//!   it has replayed past `lsn` (every change at or below it is not
+//!   reported; `null` before the engine has a position). In rows mode the body also carries
 //!   the hydrated result: `"nodes"`, one per table of the query, root
 //!   first, each with `"table"`, `"key"` (its primary-key columns),
 //!   `"parent"` (the table it joins to, `null` for the root),
@@ -74,8 +76,10 @@
 //! - `["refused", {"id": n, "reason": "..."}]` when the engine cannot
 //!   follow the query (outside the SQL subset, an unknown table, too many
 //!   rows). The backend serves that query live.
-//! - `["touched", {"ids": [n, ...]}]` per transaction that changed the
-//!   rows of those subscriptions, for subscriptions not in rows mode.
+//! - `["touched", {"ids": [n, ...], "lsn": p}]` per transaction that
+//!   changed the rows of those subscriptions, for subscriptions not in
+//!   rows mode; a read on a standby refills them only once it has
+//!   replayed past `lsn` (`null` before the engine has a position).
 //! - `["delta", {"id": n, "changes": [{"table": t, "put": [row, ...], "del": [key, ...]}, ...]}]`
 //!   per transaction, for one subscription in rows mode: per table, the
 //!   rows that entered or changed and the keys of rows that left. One
@@ -544,7 +548,7 @@ struct Task {
     shapes: HashMap<SubId, Shape>,
     /// Registered but not yet hydrated: `accepted` waits for the rows,
     /// so the backend's first read lands after the engine's.
-    hydrating: HashSet<SubId>,
+    hydrating: HashMap<SubId, u64>,
     /// The token the next registration is sent under.
     next_token: u64,
     /// How many subscriptions one connection may hold, registering ones
@@ -589,7 +593,7 @@ pub async fn run(
         by_token: HashMap::new(),
         by_sub: HashMap::new(),
         shapes: HashMap::new(),
-        hydrating: HashSet::new(),
+        hydrating: HashMap::new(),
         next_token: 1,
         per_connection,
         stats,
@@ -757,11 +761,12 @@ impl Task {
                 sub,
                 reads,
                 updates,
-            } => self.registered(token, sub, reads, &updates).await,
+                position,
+            } => self.registered(token, sub, reads, &updates, position.0).await,
             Event::Hydrated(subs) => {
                 for sub in subs {
-                    if self.hydrating.remove(&sub) {
-                        self.accept(sub).await;
+                    if let Some(since) = self.hydrating.remove(&sub) {
+                        self.accept(sub, since).await;
                     }
                 }
             }
@@ -773,10 +778,10 @@ impl Task {
             Event::Committed {
                 updates, position, ..
             } => {
-                self.changed(&updates);
+                self.changed(&updates, position.0);
                 self.delivered.fetch_max(position.0, Ordering::AcqRel);
             }
-            Event::Landed { updates } => self.changed(&updates),
+            Event::Landed { updates, position } => self.changed(&updates, position.0),
             Event::Heavy { sub, table, rows } => {
                 if let Some((conn, id)) = self.by_sub.get(&sub) {
                     log_warn!("s2s connection {conn}: query {id} holds {rows} rows of {table}");
@@ -796,8 +801,16 @@ impl Task {
     /// connection went away, or unsubscribed the id, while the
     /// registration was in flight, the subscription is not wanted and is
     /// unregistered. A twin's rows come with the registration, in
-    /// `updates`, and seed a rows-mode shape's snapshot.
-    async fn registered(&mut self, token: u64, sub: SubId, reads: usize, updates: &[Delta]) {
+    /// `updates`, and seed a rows-mode shape's snapshot; `position` is the
+    /// engine's when it registered.
+    async fn registered(
+        &mut self,
+        token: u64,
+        sub: SubId,
+        reads: usize,
+        updates: &[Delta],
+        position: u64,
+    ) {
         let Some((conn, id, shape)) = self.by_token.remove(&token) else {
             let _ = self.commands.send(Command::Unregister(sub)).await;
             return;
@@ -819,24 +832,29 @@ impl Task {
             self.shapes.insert(sub, shape);
         }
         if reads == 0 {
-            self.accept(sub).await;
+            self.accept(sub, position).await;
         } else {
-            self.hydrating.insert(sub);
+            self.hydrating.insert(sub, position);
         }
     }
 
-    /// `accepted`, with the hydrated rows for a rows-mode subscription.
-    /// A table that left the catalog meanwhile cannot be served: the
-    /// subscription is refused, and ended on the engine side too.
-    async fn accept(&mut self, sub: SubId) {
+    /// `accepted`, with the hydrated rows for a rows-mode subscription,
+    /// and the position a read of its rows must have caught up with: the
+    /// engine's at registration (`since`), or the position delivered
+    /// since, past every change that came while it hydrated and went
+    /// untold. A table that left the catalog meanwhile cannot be served:
+    /// the subscription is refused, and ended on the engine side too.
+    async fn accept(&mut self, sub: SubId, since: u64) {
         let Some((conn, id)) = self.by_sub.get(&sub).copied() else {
             return;
         };
         let Some(connection) = self.conns.get_mut(&conn) else {
             return;
         };
+        let since = since.max(self.delivered.load(Ordering::Acquire));
+        let lsn = (since > 0).then_some(since);
         let Some(shape) = self.shapes.get_mut(&sub) else {
-            connection.send(accepted(id));
+            connection.send(accepted(id, lsn));
             return;
         };
         let catalog = self.catalog.load();
@@ -908,6 +926,7 @@ impl Task {
             "order": order,
             "limit": limit,
             "offset": shape.offset,
+            "lsn": lsn,
         }]));
     }
 
@@ -924,8 +943,10 @@ impl Task {
     /// row that left and came back is a put, one that came and went is
     /// a delete, and no key is in both lists. A row of a table that left
     /// the catalog mid-flight cannot be kept by the backend, so it goes
-    /// out as a delete.
-    fn changed(&mut self, updates: &[Delta]) {
+    /// out as a delete. A touch names the engine's `position` with the
+    /// change, which a refill from a standby must have replayed past.
+    fn changed(&mut self, updates: &[Delta], position: u64) {
+        let lsn = (position > 0).then_some(position);
         let mut touched: HashMap<u64, HashSet<u64>> = HashMap::new();
         let mut deltas: HashMap<SubId, Changes> = HashMap::new();
         let mut images: Vec<Box<RawValue>> = Vec::new();
@@ -937,7 +958,7 @@ impl Task {
                 let Some((conn, id)) = self.by_sub.get(&target.sub) else {
                     continue;
                 };
-                if self.hydrating.contains(&target.sub) {
+                if self.hydrating.contains_key(&target.sub) {
                     if let Some(shape) = self.shapes.get_mut(&target.sub) {
                         shape.absorb(&delta.table, &delta.op);
                     }
@@ -975,7 +996,7 @@ impl Task {
         for (conn, ids) in touched {
             if let Some(connection) = self.conns.get_mut(&conn) {
                 let ids: Vec<u64> = ids.into_iter().collect();
-                connection.send(json!(["touched", {"ids": ids}]));
+                connection.send(json!(["touched", {"ids": ids, "lsn": lsn}]));
             }
         }
     }
@@ -1053,9 +1074,10 @@ fn serialized(image: &Json) -> Option<Box<RawValue>> {
     serde_json::value::to_raw_value(image).ok()
 }
 
-/// An `accepted` with no rows.
-fn accepted(id: u64) -> Json {
-    json!(["accepted", {"id": id}])
+/// An `accepted` with no rows, and the position a read of them must
+/// have caught up with.
+fn accepted(id: u64, lsn: Option<u64>) -> Json {
+    json!(["accepted", {"id": id, "lsn": lsn}])
 }
 
 /// A `refused` for the backend's `id`.
@@ -1556,7 +1578,7 @@ mod tests {
             by_token: HashMap::new(),
             by_sub: HashMap::new(),
             shapes: HashMap::new(),
-            hydrating: HashSet::new(),
+            hydrating: HashMap::new(),
             next_token: 1,
             per_connection,
             stats: Stats::shared_with_metric_prefix("test".to_owned()),
@@ -1612,6 +1634,7 @@ mod tests {
             sub: SubId(sub),
             updates: Vec::new(),
             reads: 0,
+            position: crate::model::Lsn(0),
         })
         .await;
     }
@@ -1689,7 +1712,7 @@ mod tests {
         register(&mut task, 2, 20).await;
         frames(&mut out);
 
-        task.changed(&[put(&[10, 20], 1, "one"), put(&[10], 2, "two")]);
+        task.changed(&[put(&[10, 20], 1, "one"), put(&[10], 2, "two")], 0);
         let mut deltas: Vec<Json> = frames(&mut out);
         deltas.sort_by_key(|frame| frame[1]["id"].as_u64());
         let puts = |frame: &Json| -> Vec<(i64, String)> {
@@ -1761,6 +1784,54 @@ mod tests {
         .await;
         task.report_lag();
         assert_eq!(frames(&mut out)[0][1]["lsn"], 700, "never back");
+    }
+
+    /// `accepted` names the position a read of the query's rows must
+    /// have caught up with: the engine's at registration, or the one
+    /// delivered since when that is further, as after changes that came
+    /// while the subscription hydrated; and a touch names its change's.
+    #[tokio::test]
+    async fn accepted_names_the_position_a_read_must_have_reached() {
+        let (mut task, _commands, mut out) = task(0);
+        subscribe(&mut task, 1, 1, false).await;
+        task.delivered.store(200, Ordering::Release);
+        task.event(Event::Registered {
+            token: 1,
+            sub: SubId(1),
+            updates: Vec::new(),
+            reads: 0,
+            position: crate::model::Lsn(300),
+        })
+        .await;
+        assert_eq!(frames(&mut out), vec![json!(["accepted", {"id": 1, "lsn": 300}])]);
+
+        subscribe(&mut task, 1, 2, false).await;
+        task.event(Event::Registered {
+            token: 2,
+            sub: SubId(2),
+            updates: Vec::new(),
+            reads: 1,
+            position: crate::model::Lsn(400),
+        })
+        .await;
+        task.event(Event::Committed {
+            updates: Vec::new(),
+            position: crate::model::Lsn(500),
+            floor: crate::model::Lsn(1),
+            watched: Vec::new(),
+            received: std::time::Instant::now(),
+            routed: std::time::Instant::now(),
+        })
+        .await;
+        task.event(Event::Hydrated(vec![SubId(2)])).await;
+        assert_eq!(frames(&mut out), vec![json!(["accepted", {"id": 2, "lsn": 500}])]);
+
+        task.changed(&[put(&[1], 1, "one")], 900);
+        assert_eq!(
+            frames(&mut out),
+            vec![json!(["touched", {"ids": [1], "lsn": 900}])],
+            "a touch names the change's position"
+        );
     }
 
     /// A moved position reaches every connection within a few
@@ -1866,8 +1937,8 @@ mod tests {
         register(&mut task, 1, 10).await;
         assert_eq!(task.conns[&1].held.load(Ordering::Acquire), 1);
         frames(&mut out);
-        task.changed(&[put(&[10], 1, "one"), put(&[10], 2, "two"), put(&[10], 3, "three")]);
-        assert_eq!(frames(&mut out), vec![json!(["touched", {"ids": [1]}])]);
+        task.changed(&[put(&[10], 1, "one"), put(&[10], 2, "two"), put(&[10], 3, "three")], 0);
+        assert_eq!(frames(&mut out), vec![json!(["touched", {"ids": [1], "lsn": null}])]);
         task.request(Request::Unsubscribe { conn: 1, id: 1 }).await;
         assert_eq!(task.conns[&1].held.load(Ordering::Acquire), 0);
     }

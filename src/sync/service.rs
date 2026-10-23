@@ -154,11 +154,14 @@ impl Transaction {
 /// watched writes are one event.
 ///
 /// - `Registered`: the subscription a [`Command::Register`] became, with
-///   that command's `token`, the rows it was served at once (a twin's) and
+///   that command's `token`, the rows it was served at once (a twin's),
 ///   `reads`, how many storage reads the registration issued (zero when
-///   the frames already held answered it). It precedes every other event
-///   about the subscription.
-/// - `Landed`: a storage read landed, with the deltas it produced.
+///   the frames already held answered it), and the engine's `position`
+///   then: every change committed at or below it was applied before the
+///   subscription began, and none after it goes unreported. It precedes
+///   every other event about the subscription.
+/// - `Landed`: a storage read landed, with the deltas it produced and the
+///   engine's `position`, which the read was brought up to.
 /// - `Refused`: a storage read the subscription depended on was refused
 ///   (it returned more rows than a read may), so the subscription is gone;
 ///   `reason` is what the client can be told.
@@ -191,9 +194,11 @@ pub enum Event {
         sub: SubId,
         updates: Vec<Delta>,
         reads: usize,
+        position: Lsn,
     },
     Landed {
         updates: Vec<Delta>,
+        position: Lsn,
     },
     Refused {
         sub: SubId,
@@ -229,6 +234,7 @@ enum Outcome {
         token: u64,
         sub: SubId,
         reads: usize,
+        position: Lsn,
     },
     Landed,
     Committed {
@@ -451,6 +457,7 @@ where
                         token,
                         sub,
                         reads,
+                        position: self.runtime.position(),
                     },
                 );
                 self.settle(&[sub]);
@@ -763,6 +770,7 @@ where
                 token,
                 sub,
                 reads,
+                position,
             } => {
                 self.send_to(
                     sink,
@@ -771,13 +779,18 @@ where
                         sub,
                         updates,
                         reads,
+                        position,
                     },
                 );
             }
             Outcome::Landed => {
+                let position = self.runtime.position();
                 for (sink, batch) in self.sinks.iter().zip(self.partition(updates)) {
                     if !batch.is_empty() {
-                        let _ = sink.send(Event::Landed { updates: batch });
+                        let _ = sink.send(Event::Landed {
+                            updates: batch,
+                            position,
+                        });
                     }
                 }
             }

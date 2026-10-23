@@ -500,7 +500,7 @@ fn service_streams_end_to_end() {
         loop {
             match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
                 Ok(Some(
-                    Event::Landed { updates: batch }
+                    Event::Landed { updates: batch, .. }
                     | Event::Committed { updates: batch, .. }
                     | Event::Registered { updates: batch, .. },
                 )) => {
@@ -1444,7 +1444,7 @@ fn owners_added(events: &[Event], table: &str) -> BTreeMap<i64, Option<Value>> {
     for event in events {
         let updates: &[Delta] = match event {
             Event::Registered { updates, .. }
-            | Event::Landed { updates }
+            | Event::Landed { updates, .. }
             | Event::Committed { updates, .. } => updates,
             _ => &[],
         };
@@ -1632,7 +1632,7 @@ fn schema_changes_follow_the_trigger() {
         let extra_ids: Vec<i64> = extra
             .iter()
             .flat_map(|event| match event {
-                Event::Registered { updates, .. } | Event::Landed { updates } => updates.as_slice(),
+                Event::Registered { updates, .. } | Event::Landed { updates, .. } => updates.as_slice(),
                 _ => &[],
             })
             .filter_map(|delta| match &delta.op {

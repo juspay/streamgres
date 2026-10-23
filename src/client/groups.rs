@@ -686,11 +686,12 @@ impl Groups {
                 sub,
                 updates,
                 reads,
+                ..
             } => {
                 self.registered(token, sub, reads);
                 self.absorb(updates);
             }
-            Event::Landed { updates } => self.absorb(updates),
+            Event::Landed { updates, .. } => self.absorb(updates),
             Event::Refused { sub, reason } => self.refused(sub, &reason),
             Event::Capped { sub } => self.capped(sub),
             Event::Heavy { sub, table, rows } => self.heavy(sub, table.as_str(), rows),
@@ -2120,6 +2121,7 @@ mod tests {
                 sub: SubId(sub),
                 updates: rows.iter().map(|(id, name)| put(sub, *id, name)).collect(),
                 reads: 1,
+                position: Lsn(0),
             });
             self.core.event(Event::Hydrated(vec![SubId(sub)]));
             self.core.flush();
@@ -2127,7 +2129,10 @@ mod tests {
 
         /// Deltas arrive from the engine side and the thread flushes.
         fn deliver(&mut self, updates: Vec<Delta>) {
-            self.core.event(Event::Landed { updates });
+            self.core.event(Event::Landed {
+                updates,
+                position: Lsn(0),
+            });
             self.core.flush();
         }
 
@@ -3462,6 +3467,7 @@ mod tests {
                                 sub,
                                 updates: deltas(table, sub, rows),
                                 reads: 1,
+                                position: Lsn(0),
                             });
                             core.event(Event::Hydrated(vec![sub]));
                             let flushing = Instant::now();
@@ -3481,6 +3487,7 @@ mod tests {
                             sub,
                             updates: deltas(table, sub, rows),
                             reads: 1,
+                            position: Lsn(0),
                         });
                         hydrated.push(sub);
                     }
@@ -4093,6 +4100,7 @@ mod tests {
                         sub,
                         updates: deltas(table, sub, rows),
                         reads: 1,
+                        position: Lsn(0),
                     });
                     core.event(Event::Hydrated(vec![sub]));
                     let started = Instant::now();
@@ -4144,6 +4152,7 @@ mod tests {
                             Step::Land(groups, updates) => {
                                 core.event(Event::Landed {
                                     updates: updates.clone(),
+                                    position: Lsn(0),
                                 });
                                 let started = Instant::now();
                                 core.flush();
