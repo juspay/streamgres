@@ -11,9 +11,15 @@
 //! `json` (one object per line with `ts`, `level`, `thread`, `msg` and
 //! the event's fields); `log_error!`, `log_warn!`, `log_info!` and
 //! `log_debug!` format like `println!`, and `log_event!` adds fields.
+//!
+//! A process that embeds the engine has a logger of its own: after
+//! [`to_facade`] no log thread is started and every line goes to the
+//! `log` facade instead, on the thread that logged it, under the target
+//! `streamgres`, filtered by the facade's level rather than
+//! [`set_level`]'s.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -54,6 +60,7 @@ enum Item {
 const QUEUE: usize = 65_536;
 
 static LEVEL: AtomicU8 = AtomicU8::new(2);
+static FACADE: AtomicBool = AtomicBool::new(false);
 static FORMAT: AtomicU8 = AtomicU8::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static QUEUED: AtomicU64 = AtomicU64::new(0);
@@ -64,6 +71,35 @@ static TAP_DROPPED: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     /// The current thread's name, read once.
     static THREAD: String = std::thread::current().name().unwrap_or("?").to_owned();
+}
+
+/// Send every line to the `log` facade from now on, instead of the log
+/// thread and stderr: for a host process that installs its own logger.
+pub fn to_facade() {
+    FACADE.store(true, Ordering::Release);
+}
+
+/// The facade's level for `level`.
+fn facade_level(level: Level) -> ::log::Level {
+    match level {
+        Level::Error => ::log::Level::Error,
+        Level::Warn => ::log::Level::Warn,
+        Level::Info => ::log::Level::Info,
+        Level::Debug => ::log::Level::Debug,
+    }
+}
+
+/// A line as the facade gets it: the message, then each field as
+/// `key=value`.
+fn facade_text(message: &str, fields: &[(&'static str, String)]) -> String {
+    let mut text = message.to_owned();
+    for (key, value) in fields {
+        text.push(' ');
+        text.push_str(key);
+        text.push('=');
+        text.push_str(value);
+    }
+    text
 }
 
 /// Set the level below which lines are written.
@@ -92,6 +128,9 @@ pub fn format() -> Format {
 
 /// Whether `level` is written.
 pub fn enabled(level: Level) -> bool {
+    if FACADE.load(Ordering::Relaxed) {
+        return facade_level(level) <= ::log::max_level();
+    }
     rank(level) <= LEVEL.load(Ordering::Relaxed)
 }
 
@@ -133,8 +172,13 @@ pub fn event(level: Level, message: String, fields: Vec<(&'static str, String)>)
     submit(level, message, fields);
 }
 
-/// Hand a line to the log thread, or count it dropped.
+/// Hand a line to the log thread, or count it dropped; in facade mode,
+/// hand it to the facade.
 fn submit(level: Level, message: String, fields: Vec<(&'static str, String)>) {
+    if FACADE.load(Ordering::Relaxed) {
+        ::log::log!(target: "streamgres", facade_level(level), "{}", facade_text(&message, &fields));
+        return;
+    }
     let line = Line {
         at: chrono::Utc::now(),
         level,
@@ -159,6 +203,10 @@ fn submit(level: Level, message: String, fields: Vec<(&'static str, String)>) {
 /// Wait until everything queued so far is written, for at most a second:
 /// what a process does before it exits.
 pub fn flush() {
+    if FACADE.load(Ordering::Relaxed) {
+        ::log::logger().flush();
+        return;
+    }
     let (done_tx, done_rx) = sync_channel(1);
     let sent = sender()
         .lock()
