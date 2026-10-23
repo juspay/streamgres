@@ -4,7 +4,9 @@
 //! counts as unset. The engine core never reads the environment itself;
 //! the server's configuration and an embedded engine's
 //! [`crate::embedded::Config::from_env`] read it through this, so the
-//! two take the same names.
+//! two take the same names. The engine settings both read ([`Env::row_limit`],
+//! [`Env::schemas`] and the rest) are parsed here once, so the two cannot
+//! read them differently.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -95,9 +97,6 @@ impl<F: Fn(&str) -> Option<String>> Env<F> {
             })
             .unwrap_or_default()
     }
-
-    // The engine settings both the server and an embedded engine read,
-    // read once here so the two cannot disagree.
 
     /// `STREAMGRES_ROW_LIMIT` (or `STREAMGRES_READ_ROW_LIMIT`,
     /// `STREAMGRES_JOIN_LIMIT`): the most rows one read may return.

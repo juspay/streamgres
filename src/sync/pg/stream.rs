@@ -71,11 +71,11 @@ use tokio_postgres::types::PgLsn;
 use super::ddl::{self, DdlSource};
 use crate::ivm::SchemaChange;
 use crate::log::{log_error, log_info, log_warn};
-use crate::shutdown::Shutdown;
 use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, DeleteQuery, InsertQuery, Lsn,
     RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
 };
+use crate::shutdown::Shutdown;
 use crate::sync::service::{Command, Transaction as Committed};
 use crate::sync::storage::StorageError;
 

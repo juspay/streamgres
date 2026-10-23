@@ -160,17 +160,26 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
         let _ = sink.send(Message::Close(None)).await;
     });
     let inbound = stream
-        .take_while(|frame| future::ready(matches!(frame, Ok(message) if !matches!(message, Message::Close(_)))))
-        .filter_map(|frame| {
-            future::ready(match frame {
-                Ok(Message::Text(text)) => Some(text.as_str().to_owned()),
-                _ => None,
-            })
-        });
+        .take_while(|frame| future::ready(open(frame)))
+        .filter_map(|frame| future::ready(text(frame)));
     live::session(&state.live, Box::pin(inbound), out).await;
     if tokio::time::timeout(WRITER_DRAIN, &mut writer).await.is_err() {
         writer.abort();
         log_warn!("an s2s connection's frames were not read in time; cut off");
+    }
+}
+
+/// Whether the socket is still open after `frame`: not on a close, nor
+/// an error.
+fn open(frame: &Result<Message, axum::Error>) -> bool {
+    matches!(frame, Ok(message) if !matches!(message, Message::Close(_)))
+}
+
+/// A text frame's text; the other kinds carry nothing for the session.
+fn text(frame: Result<Message, axum::Error>) -> Option<String> {
+    match frame {
+        Ok(Message::Text(text)) => Some(text.as_str().to_owned()),
+        _ => None,
     }
 }
 
@@ -182,15 +191,15 @@ mod tests {
     /// connections close; a zero limit hands them out without one.
     #[test]
     fn connections_are_admitted_up_to_the_limit() {
-        let handle = Admission::new(2);
-        let first = handle.admit().expect("a place");
-        let second = handle.admit().expect("a place");
-        assert!(handle.admit().is_none());
+        let admission = Admission::new(2);
+        let first = admission.admit().expect("a place");
+        let second = admission.admit().expect("a place");
+        assert!(admission.admit().is_none());
         drop(first);
-        let third = handle.admit().expect("the freed place");
-        assert!(handle.admit().is_none());
+        let third = admission.admit().expect("the freed place");
+        assert!(admission.admit().is_none());
         drop((second, third));
-        assert_eq!(handle.open.load(Ordering::Acquire), 0);
+        assert_eq!(admission.open.load(Ordering::Acquire), 0);
 
         let open = Admission::new(0);
         let places: Vec<Admitted> = (0..100).map(|_| open.admit().expect("a place")).collect();

@@ -331,26 +331,28 @@ pub fn spawn_feed(
     ))
 }
 
-/// The feed thread on a temporary slot ([`Transport::open_temporary`]):
-/// `created` resolves once the slot exists, or with why it could not be
-/// made; the first read snapshot must be taken after that, and its point
-/// sent on `first`, through which the feed then drops what the snapshot
-/// already holds. A stream that ends for any reason but a stop cannot be
-/// resumed, so it fails `shutdown`, for the engine to start over.
-#[allow(clippy::type_complexity)]
+/// A feed thread on a temporary slot, as [`spawn_temporary_feed`]
+/// starts it.
+pub struct TemporaryFeed {
+    /// The transactions it decodes.
+    pub transactions: mpsc::Receiver<Transaction>,
+    pub handle: FeedHandle,
+    /// Resolves once the slot exists, or with why it could not be made.
+    pub created: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    /// Where the first read snapshot's point goes, once it is taken
+    /// (after `created`); the feed drops what the snapshot holds.
+    pub first: tokio::sync::oneshot::Sender<Lsn>,
+}
+
+/// The feed thread on a temporary slot ([`Transport::open_temporary`]),
+/// which gives up making it once `shutdown` is requested. A stream that
+/// ends for any reason but a stop cannot be resumed, so it fails
+/// `shutdown`, for the engine to start over.
 pub fn spawn_temporary_feed(
     settings: Settings,
     catalog: Arc<Catalog>,
     shutdown: Shutdown,
-) -> Result<
-    (
-        mpsc::Receiver<Transaction>,
-        FeedHandle,
-        tokio::sync::oneshot::Receiver<Result<(), String>>,
-        tokio::sync::oneshot::Sender<Lsn>,
-    ),
-    String,
-> {
+) -> Result<TemporaryFeed, String> {
     let (out, transactions) = mpsc::channel(1024);
     let (stop, stop_rx) = watch::channel(false);
     let (created_tx, created) = tokio::sync::oneshot::channel();
@@ -423,15 +425,15 @@ pub fn spawn_temporary_feed(
             }
         })
         .map_err(|error| format!("feed thread: {error}"))?;
-    Ok((
+    Ok(TemporaryFeed {
         transactions,
-        FeedHandle {
+        handle: FeedHandle {
             stop,
             thread: Some(thread),
         },
         created,
         first,
-    ))
+    })
 }
 
 /// Stop the feed thread and wait until its replication connection is closed.
@@ -499,7 +501,10 @@ async fn beat(config: tokio_postgres::Config, slot: String, every: Duration, sta
 /// `reads`) with its first snapshot minted, the feed thread started at
 /// that snapshot's point, and the service, keeping `catalog` current,
 /// delivering its events to `consumers` streams and its timings to
-/// `stats`. Must run inside a `LocalSet`.
+/// `stats`. Must run inside a `LocalSet`. Making the slot and minting
+/// the first snapshot each wait for every transaction open at the time,
+/// so a long one holds them back; `shutdown` requested meanwhile gives
+/// up on either.
 pub async fn start(
     settings: &Settings,
     catalog: Arc<CatalogHandle>,
@@ -515,13 +520,17 @@ pub async fn start(
         Transport::require_publication(&settings.dsn, &settings.publication)
             .await
             .map_err(|error| format!("preparing the change feed: {error}"))?;
-        let (feed, handle, created, first) =
-            spawn_temporary_feed(settings.clone(), catalog.load(), shutdown.clone())?;
+        let TemporaryFeed {
+            transactions,
+            handle,
+            created,
+            first,
+        } = spawn_temporary_feed(settings.clone(), catalog.load(), shutdown.clone())?;
         created
             .await
             .map_err(|_| "the change feed thread ended before its slot was made".to_owned())?
             .map_err(|error| format!("opening the change feed: {error}"))?;
-        Some((feed, handle, first))
+        Some((transactions, handle, first))
     } else {
         Transport::prepare(&settings.dsn, &settings.slot, &settings.publication)
             .await
@@ -538,8 +547,6 @@ pub async fn start(
         .parse()
         .map_err(|error| format!("connecting the read pool: {error}"))?;
     settings.keepalive.apply(&mut read_config);
-    // Minting the first snapshot waits for every transaction open at the
-    // time, so a long one holds it back; a shutdown meanwhile gives up.
     let connected = PgStorage::connect_configured_with_read_config(
         config.clone(),
         read_config,

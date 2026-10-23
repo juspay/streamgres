@@ -54,8 +54,8 @@
 //!   query; from that moment every change to its rows is reported, so
 //!   the backend reads Postgres only after it, and on a standby only once
 //!   it has replayed past `lsn` (every change at or below it is not
-//!   reported; `null` before the engine has a position). In rows mode the body also carries
-//!   the hydrated result: `"nodes"`, one per table of the query, root
+//!   reported; `null` before the engine has a position). In rows mode
+//!   the body also carries the hydrated result: `"nodes"`, one per table of the query, root
 //!   first, each with `"table"`, `"key"` (its primary-key columns),
 //!   `"parent"` (the table it joins to, `null` for the root),
 //!   `"parent_column"` and `"child_column"` (the join equality),
@@ -291,14 +291,6 @@ pub struct Hub {
 }
 
 impl Hub {
-    /// The position up to which every change the engine committed has
-    /// been queued to every session that follows a query it touched: the
-    /// task advances it after each commit's changes are queued, and on
-    /// each heartbeat. A `lag` frame carries it, behind those changes.
-    pub fn delivered(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.delivered)
-    }
-
     /// A hub, and the requests its sessions send the task ([`run`]).
     pub fn new() -> (Hub, mpsc::Receiver<Request>) {
         let (requests, requests_rx) = mpsc::channel(REQUEST_QUEUE);
@@ -312,6 +304,14 @@ impl Hub {
             },
             requests_rx,
         )
+    }
+
+    /// The position up to which every change the engine committed has
+    /// been queued to every session that follows a query it touched: the
+    /// task advances it after each commit's changes are queued, and on
+    /// each heartbeat. A `lag` frame carries it, behind those changes.
+    pub fn delivered(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.delivered)
     }
 }
 
