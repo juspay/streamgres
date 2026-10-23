@@ -290,7 +290,7 @@ impl Shared {
     }
 
     /// The reasons this client refuses on its own, all of which pass.
-    const TRANSIENT: [&'static str; 9] = [
+    const TRANSIENT: [&'static str; 10] = [
         crate::subscriptions::STALE_TYPES,
         "the engine has not said which database it streams",
         "the engine is not connected",
@@ -300,6 +300,7 @@ impl Shared {
         "the subscription limit of ",
         "the subscription is pending",
         "the subscription ended before its rows were built",
+        "the subscription's rows are being built",
     ];
 
     /// Appends `reason` to `log`, keeping the last eight.
@@ -367,6 +368,14 @@ struct LiveStore {
 }
 
 impl LiveStore {
+    /// Whether the store is still waiting for its rows: a read of its
+    /// key then goes to Postgres and fills nothing. A refill would race
+    /// the read building it, and could land after the store's entry and
+    /// replace it with rows no delta ever updates.
+    fn is_building(&self) -> bool {
+        matches!(*self.store.lock().expect("store"), Store::Building(_))
+    }
+
     /// An empty store for subscription `id`, waiting for its snapshot.
     fn building(id: u64, key: QueryKey, worker: Weak<Worker>) -> Arc<LiveStore> {
         Arc::new(LiveStore {
@@ -990,6 +999,12 @@ impl Worker {
                     );
                 }
                 let store = state.materialized.get(&id).cloned();
+                if store.as_ref().is_some_and(|store| store.is_building()) {
+                    return Outcome::Verdict(
+                        self.shared
+                            .refused("the subscription's rows are being built".to_string()),
+                    );
+                }
                 let since = state.since.get(&id).copied();
                 drop(state);
                 return Outcome::Verdict(held_rows(store, since));
@@ -2022,6 +2037,41 @@ mod tests {
             vec![(1, "a".into()), (2, "b".into())],
             "the store has the delta's row"
         );
+    }
+
+    /// While the first reader looks the types up, the store waits for
+    /// its rows: a second read of the key goes to Postgres and must fill
+    /// nothing, or its rows could land after the store's entry and
+    /// replace it with rows no delta ever updates. Once built, the store
+    /// serves.
+    #[test]
+    fn a_read_while_the_store_is_built_fills_nothing() {
+        let (worker, _outgoing, _shared) = worker();
+        let handle = subscribing(&worker);
+        inbound(&worker, &accepted_with_rows(1));
+        let Outcome::NeedsTypes { snapshot, .. } = handle.join().unwrap() else {
+            panic!("the types are looked up");
+        };
+        let Outcome::Verdict(Verdict::Refused(reason)) = worker.subscribe(&key()) else {
+            panic!("not a refill while the store is built");
+        };
+        assert!(reason.contains("being built"), "{reason}");
+        assert!(
+            Shared::TRANSIENT.iter().any(|transient| reason.starts_with(transient)),
+            "not final: asked again next time"
+        );
+        worker
+            .shared
+            .types
+            .lock()
+            .unwrap()
+            .insert("t".to_string(), t_types());
+        let Verdict::Rows { .. } = worker.materialize_key(&key(), snapshot) else {
+            panic!("rows mode");
+        };
+        let Outcome::Verdict(Verdict::Rows { .. }) = worker.subscribe(&key()) else {
+            panic!("held in rows mode");
+        };
     }
 
     /// Types learnt before a migration lack the column it added: a

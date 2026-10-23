@@ -284,6 +284,10 @@ again still ends when its idle time runs out.
 puts an empty `Building` store in place under the lock that ends the
 subscriber's wait, so a delta right behind it queues there.
 `materialize` drains the queue and turns that store `Ready` in place.
+Another read of the key meanwhile goes to Postgres and fills nothing
+(a transient refusal, not remembered): a refill would race the read
+building the store, and landing after the store's entry it would
+replace it with rows no delta ever updates.
 
 **Late answers.** A subscribe the client gave up on is withdrawn. An
 `accepted` for an id nobody holds is answered with `unsubscribe`.
