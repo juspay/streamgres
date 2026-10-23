@@ -344,7 +344,25 @@ pub struct WalPosition {
     pub lsn: Option<String>,
 }
 
+/// What a [`WalPosition`] query read, when it could be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Read {
+    /// A position.
+    At(u64),
+    /// `NULL`: no insert position on a standby ([`WAL_POSITION_SQL`]),
+    /// no replay position on a primary ([`REPLAY_POSITION_SQL`]).
+    Null,
+}
+
 impl WalPosition {
+    /// What it read; `None` for a position that does not parse.
+    pub fn read(&self) -> Option<Read> {
+        match self.lsn {
+            None => Some(Read::Null),
+            Some(_) => self.position().map(Read::At),
+        }
+    }
+
     /// The position as a number, `hi/lo` read as `hi << 32 | lo` as
     /// PostgreSQL and the engine count it; `None` on a standby or when it
     /// does not parse.
@@ -858,6 +876,10 @@ mod tests {
             assert_eq!(read(bad), None, "{bad}");
         }
         assert_eq!(WalPosition { lsn: None }.position(), None, "a standby");
+        assert_eq!(WalPosition { lsn: None }.read(), Some(Read::Null));
+        let read = |lsn: &str| WalPosition { lsn: Some(lsn.to_string()) }.read();
+        assert_eq!(read("1/0"), Some(Read::At(1 << 32)));
+        assert_eq!(read("1/"), None, "unreadable, not NULL");
     }
 
     /// An empty result.

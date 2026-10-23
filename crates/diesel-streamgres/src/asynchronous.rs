@@ -70,7 +70,8 @@ use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use tokio::task::spawn_blocking;
 
 use crate::cache::{
-    AfterWrites, Cache, DATABASE_SQL, Database, REPLAY_POSITION_SQL, WAL_POSITION_SQL, WalPosition,
+    AfterWrites, Cache, DATABASE_SQL, Database, REPLAY_POSITION_SQL, Read, WAL_POSITION_SQL,
+    WalPosition,
 };
 use crate::cursor::SyncedRow;
 use crate::key::QueryKey;
@@ -275,7 +276,7 @@ impl AsyncSyncedConnection {
                 && result.is_ok()
             {
                 let writes = cache.write_count();
-                if let Some(Some(position)) = read_position(probe).await {
+                if let Some(Read::At(position)) = read_position(probe).await {
                     cache.resolve_writes(writes, position);
                 }
             }
@@ -486,7 +487,7 @@ impl SimpleAsyncConnection for AsyncSyncedConnection {
                 if resolve && result.is_ok() {
                     let writes = cache.write_count();
                     let probe = inner.load(sql_query(WAL_POSITION_SQL));
-                    if let Some(Some(position)) = read_position(probe).await {
+                    if let Some(Read::At(position)) = read_position(probe).await {
                         cache.resolve_writes(writes, position);
                     }
                 }
@@ -586,8 +587,8 @@ impl AsyncConnection for AsyncSyncedConnection {
                 let live = async move {
                     let (position, live) = futures_util::join!(read_position(probe), live);
                     match position {
-                        Some(Some(position)) => cache.resolve_writes(writes, position),
-                        Some(None) => cache.saw_standby(),
+                        Some(Read::At(position)) => cache.resolve_writes(writes, position),
+                        Some(Read::Null) => cache.saw_standby(),
                         None => {}
                     }
                     live.map(Self::live_stream)
@@ -689,11 +690,11 @@ impl AsyncConnection for AsyncSyncedConnection {
                     let keep = match replay {
                         None => true,
                         Some(replay) => match read_position(replay).await {
-                            Some(None) => {
+                            Some(Read::Null) => {
                                 primary.store(true, Ordering::Release);
                                 true
                             }
-                            Some(Some(replayed)) => {
+                            Some(Read::At(replayed)) => {
                                 cache.saw_standby();
                                 since.is_some_and(|since| replayed >= since)
                             }
@@ -764,17 +765,13 @@ async fn read_database(probe: LoadFuture<'_>) -> Option<Database> {
         .and_then(|row| <Database as FromSqlRow<Untyped, Pg>>::build_from_row(row).ok())
 }
 
-/// The position `probe` ([`WAL_POSITION_SQL`], [`REPLAY_POSITION_SQL`])
-/// reads: `Some(None)` for its `NULL`, `None` when it fails.
-async fn read_position(probe: LoadFuture<'_>) -> Option<Option<u64>> {
+/// What `probe` ([`WAL_POSITION_SQL`], [`REPLAY_POSITION_SQL`]) reads;
+/// `None` when it fails.
+async fn read_position(probe: LoadFuture<'_>) -> Option<Read> {
     let rows: Vec<PgRow> = probe.await.ok()?.try_collect().await.ok()?;
-    let read = rows
-        .first()
-        .and_then(|row| <WalPosition as FromSqlRow<Untyped, Pg>>::build_from_row(row).ok())?;
-    match read.lsn {
-        None => Some(None),
-        Some(_) => read.position().map(Some),
-    }
+    <WalPosition as FromSqlRow<Untyped, Pg>>::build_from_row(rows.first()?)
+        .ok()?
+        .read()
 }
 
 /// The engine's rows for a key whose tables' types the engine side does

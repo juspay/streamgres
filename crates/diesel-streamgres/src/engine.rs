@@ -1262,13 +1262,22 @@ impl Worker {
 /// has them, else accepted, for the caller to read Postgres past
 /// `since`.
 fn held_rows(store: Option<Arc<LiveStore>>, since: Option<u64>) -> Verdict {
-    match store.as_ref().and_then(|store| store.rows()) {
-        Some(rows) => Verdict::Rows {
-            rows,
-            live: store.expect("the rows' store"),
-        },
-        None => Verdict::Accepted { since },
+    if let Some(live) = store
+        && let Some(rows) = live.rows()
+    {
+        return Verdict::Rows { rows, live };
     }
+    Verdict::Accepted { since }
+}
+
+/// Raises subscription `id`'s position to `at`: no change at or before
+/// it goes unreported ([`WorkerState::since`]).
+fn raise_since(state: &mut WorkerState, id: u64, at: u64) {
+    state
+        .since
+        .entry(id)
+        .and_modify(|since| *since = (*since).max(at))
+        .or_insert(at);
 }
 
 /// Applies one `delta` body to a store: every table's departures, then
@@ -1407,6 +1416,18 @@ enum Heard {
     Closed,
 }
 
+impl Heard {
+    /// The frame's text, for a frame.
+    fn text(&self) -> Option<&str> {
+        match self {
+            Heard::Socket(text) => Some(text.as_str()),
+            #[cfg(feature = "embedded")]
+            Heard::Local(text) => Some(text),
+            Heard::Other | Heard::Closed => None,
+        }
+    }
+}
+
 /// Opens a connection to `worker`'s engine: a socket to a remote one, a
 /// session with one in this process. Why not, when it cannot.
 async fn open(worker: &Worker) -> Result<(Sender, Receiver), String> {
@@ -1438,7 +1459,9 @@ impl Sender {
                 Ok(Ok(()))
             ),
             #[cfg(feature = "embedded")]
-            Sender::Local(engine) => matches!(timeout(SEND_TIMEOUT, engine.send(frame)).await, Ok(Ok(()))),
+            Sender::Local(engine) => {
+                matches!(timeout(SEND_TIMEOUT, engine.send(frame)).await, Ok(Ok(())))
+            }
         }
     }
 
@@ -1522,19 +1545,10 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
             up = tokio::select! {
                 frame = receiver.next() => {
                     heard = Instant::now();
-                    match frame {
-                        Heard::Socket(text) => {
-                            inbound(&worker, &text);
-                            true
-                        }
-                        #[cfg(feature = "embedded")]
-                        Heard::Local(text) => {
-                            inbound(&worker, &text);
-                            true
-                        }
-                        Heard::Other => true,
-                        Heard::Closed => false,
+                    if let Some(text) = frame.text() {
+                        inbound(&worker, text);
                     }
+                    !matches!(frame, Heard::Closed)
                 },
                 _ = ping.tick() => {
                     heard.elapsed() < silence && sender.send(json!(["ping"]).to_string()).await
@@ -1671,8 +1685,7 @@ fn on_accepted(worker: &Worker, mut body: Json) {
         if key.is_some()
             && let Some(since) = since
         {
-            let held = state.since.entry(id).or_default();
-            *held = (*held).max(since);
+            raise_since(&mut state, id, since);
         }
         if let Some(key) = &key
             && snapshot.is_some()
@@ -1882,8 +1895,7 @@ fn on_touched(worker: &Worker, body: &Json) {
                 continue;
             };
             if let Some(position) = position {
-                let held = state.since.entry(id).or_default();
-                *held = (*held).max(position);
+                raise_since(&mut state, id, position);
             }
             keys.push(key);
         }

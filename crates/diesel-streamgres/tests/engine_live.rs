@@ -237,6 +237,10 @@ fn a_write_is_read_back_and_the_cache_serves_once_it_is_delivered() {
 }
 
 /// A commit to a row the query does not read leaves the entry alone.
+///
+/// The rows are written on another connection, which read-your-writes
+/// does not cover: the first read may come from an engine a moment
+/// behind them, so it waits for them.
 #[test]
 fn an_unrelated_commit_does_not_touch_the_entry() {
     let Some(mut live) = Live::start("unrelated") else {
@@ -244,8 +248,10 @@ fn an_unrelated_commit_does_not_touch_the_entry() {
     };
     live.put("a", "1");
     live.put("b", "1");
-    assert_eq!(live.read("a").as_deref(), Some("1"));
+    live.read_until("a", "1", Duration::from_secs(10))
+        .expect("the row reached the cache");
     let touched_before = live.cache.stats.touched.load(Ordering::Relaxed);
+    let hits_before = live.cache.stats.hits.load(Ordering::Relaxed);
 
     live.put("b", "2");
     std::thread::sleep(Duration::from_millis(500));
@@ -255,7 +261,11 @@ fn an_unrelated_commit_does_not_touch_the_entry() {
         touched_before,
         "a change to another row's key is not a touch of this query"
     );
-    assert_eq!(live.cache.stats.hits.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        live.cache.stats.hits.load(Ordering::Relaxed),
+        hits_before + 1,
+        "served from the cache"
+    );
 }
 
 /// A query outside the engine's subset is refused and served live.

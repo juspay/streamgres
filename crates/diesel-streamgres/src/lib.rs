@@ -73,7 +73,8 @@ use diesel::{Connection, ConnectionResult, QueryResult};
 #[cfg(feature = "async")]
 pub use crate::asynchronous::AsyncSyncedConnection;
 use crate::cache::{
-    AfterWrites, Cache, DATABASE_SQL, Database, REPLAY_POSITION_SQL, WAL_POSITION_SQL, WalPosition,
+    AfterWrites, Cache, DATABASE_SQL, Database, REPLAY_POSITION_SQL, Read, WAL_POSITION_SQL,
+    WalPosition,
 };
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
@@ -337,7 +338,7 @@ where
             return;
         }
         let writes = cache.write_count();
-        if let Some(Some(position)) = read_position(&mut self.inner, WAL_POSITION_SQL) {
+        if let Some(Read::At(position)) = read_position(&mut self.inner, WAL_POSITION_SQL) {
             cache.resolve_writes(writes, position);
         }
     }
@@ -353,11 +354,11 @@ where
             return true;
         }
         match read_position(&mut self.inner, REPLAY_POSITION_SQL) {
-            Some(None) => {
+            Some(Read::Null) => {
                 self.primary = true;
                 true
             }
-            Some(Some(replayed)) => {
+            Some(Read::At(replayed)) => {
                 cache.saw_standby();
                 since.is_some_and(|since| replayed >= since)
             }
@@ -619,14 +620,14 @@ where
 {
     match cache.after_writes(window) {
         AfterWrites::Resolve(writes) => match read_position(conn, WAL_POSITION_SQL) {
-            Some(Some(position)) => {
+            Some(Read::At(position)) => {
                 cache.resolve_writes(writes, position);
                 match cache.after_writes(window) {
                     AfterWrites::Resolve(_) => AfterWrites::Postgres,
                     decided => decided,
                 }
             }
-            Some(None) => {
+            Some(Read::Null) => {
                 cache.saw_standby();
                 cache.by_window(window)
             }
@@ -636,20 +637,18 @@ where
     }
 }
 
-/// The position `sql` ([`WAL_POSITION_SQL`], [`REPLAY_POSITION_SQL`])
-/// reads on `conn`: `Some(None)` for its `NULL`, `None` when it cannot
-/// be read.
-fn read_position<C>(conn: &mut C, sql: &str) -> Option<Option<u64>>
+/// What `sql` ([`WAL_POSITION_SQL`], [`REPLAY_POSITION_SQL`]) reads on
+/// `conn`; `None` when it cannot be read.
+fn read_position<C>(conn: &mut C, sql: &str) -> Option<Read>
 where
     C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
 {
     use diesel::RunQueryDsl;
-    let read = diesel::sql_query(sql).load::<WalPosition>(conn).ok()?;
-    let read = read.first()?;
-    match read.lsn {
-        None => Some(None),
-        Some(_) => read.position().map(Some),
-    }
+    diesel::sql_query(sql)
+        .load::<WalPosition>(conn)
+        .ok()?
+        .first()?
+        .read()
 }
 
 /// Whether `sql` ends a transaction with its writes: a `COMMIT` or an
