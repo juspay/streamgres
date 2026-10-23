@@ -34,11 +34,11 @@
 //! A read is given [`PgStorage::with_read_timeout`] to finish, counted
 //! from the moment it holds a connection permit (the wait for a permit is
 //! the server's own queue, not PostgreSQL's time). Two clocks run: the
-//! connections the pool opens carry the limit as their session's
-//! `statement_timeout`, so PostgreSQL stops working on a statement it has
-//! been running that long, and the pool stops waiting after the same
-//! time, which covers what PostgreSQL cannot cancel (a connection that
-//! will not open, a network that went silent). Either way the read is
+//! read transaction sets a local `statement_timeout`, so PostgreSQL stops
+//! working on a statement it has been running that long, and the pool
+//! stops waiting after the same time, which covers what PostgreSQL cannot
+//! cancel (a connection that will not open, a network that went silent).
+//! Either way the read is
 //! **refused**, naming the table: reading it again would load a database
 //! that is already slow, so the query that needed it is told, by name,
 //! and asked for again later by the client. The connection is dropped.
@@ -50,6 +50,8 @@
 
 pub mod catalog;
 pub mod ddl;
+pub mod estimate;
+pub mod estimate_cache;
 pub mod replication;
 pub mod sql;
 pub mod stream;
@@ -86,6 +88,7 @@ const WAITING_ALIASES: usize = 2;
 /// [`PgStorage::with_read_connections`] says otherwise; further reads wait
 /// their turn instead of opening connections the server would refuse.
 const DEFAULT_READ_CONNECTIONS: usize = 16;
+const DEFAULT_READ_IDLE_CONNECTIONS: usize = 16;
 
 /// The most rows one read may bring back before it is refused, unless
 /// `STREAMGRES_ROW_LIMIT` says otherwise. Older `STREAMGRES_READ_ROW_LIMIT`,
@@ -350,11 +353,14 @@ impl Aliases {
 /// What every read shares: the connection settings, the pooled idle
 /// connections, the permits, the aliases and the runtime the work runs on.
 ///
-/// - `config`: how to connect; one connection is opened per read in
-///   flight and kept for reuse in `idle`, since each read is its own
-///   transaction.
+/// - `config`: the direct PostgreSQL endpoint used to mint snapshots.
+/// - `read_config`: where ordinary SQL reads connect; this can be PgBouncer.
+///   One client connection is opened per read in flight and kept for reuse
+///   in `idle`, since each read is its own transaction.
 /// - `permits`: how many reads may be in flight at once; the rest queue
 ///   here rather than at the server's connection limit.
+/// - `idle_limit`: the most read connections kept open for reuse when no
+///   read is using them.
 /// - `aliases`: the current alias and the ones waiting to become it, and
 ///   the catalog (the tables' declared columns, which the `SELECT` casts
 ///   to and the rows decode by) in force on the current one; a read
@@ -369,8 +375,10 @@ impl Aliases {
 /// - `runtime`: where the reads, the connections and the minter run.
 struct Pool {
     config: Config,
+    read_config: Config,
     idle: Mutex<Vec<Client>>,
     permits: Arc<Semaphore>,
+    idle_limit: AtomicUsize,
     /// The most rows one read may return before it is refused.
     row_limit: AtomicUsize,
     aliases: Mutex<Aliases>,
@@ -387,9 +395,12 @@ struct Pool {
 /// - `pool`: what the reads share (cloned into every read task).
 /// - `delay`: a test hook: hold every snapshot open this long before
 ///   reading, so writes can be committed behind it deliberately.
+/// - `estimates`: the planner's estimates already answered
+///   ([`estimate_cache`]).
 pub struct PgStorage {
     pool: Arc<Pool>,
     delay: Option<Duration>,
+    estimates: Arc<estimate_cache::EstimateCache>,
 }
 
 impl Drop for PgStorage {
@@ -409,7 +420,7 @@ impl PgStorage {
     /// first read; mint the first alias (it becomes current with the first
     /// [`Storage::advance`] past its point) and keep minting one every
     /// [`PgStorage::with_rotation`] interval (250 ms by default). Every
-    /// read, connection and mint from then on runs as a task of `runtime`.
+    /// read and mint from then on runs as a task of `runtime`.
     pub async fn connect_on(
         dsn: &str,
         catalog: Arc<Catalog>,
@@ -419,18 +430,32 @@ impl PgStorage {
     }
 
     /// Connect as [`PgStorage::connect_on`] does, from a `config` already
-    /// parsed and, say, given a [`Keepalive`]: every connection the storage
-    /// opens, the reads' and the minters', is opened from it.
+    /// parsed and, say, given a [`Keepalive`]. Reads and snapshot minting
+    /// both use this endpoint.
     pub async fn connect_configured(
         config: Config,
         catalog: Arc<Catalog>,
         runtime: Handle,
     ) -> Result<Self, StorageError> {
-        let client = open(&config, &runtime).await?;
+        Self::connect_configured_with_read_config(config.clone(), config, catalog, runtime).await
+    }
+
+    /// Connect the read pool through `read_config`, while minting exported
+    /// snapshots through the direct PostgreSQL `config`. The read endpoint
+    /// must reach the same database as the snapshot exporter.
+    pub async fn connect_configured_with_read_config(
+        config: Config,
+        read_config: Config,
+        catalog: Arc<Catalog>,
+        runtime: Handle,
+    ) -> Result<Self, StorageError> {
+        let client = open(&read_config, &runtime).await?;
         let pool = Arc::new(Pool {
             config,
+            read_config,
             idle: Mutex::new(vec![client]),
             permits: Arc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
+            idle_limit: AtomicUsize::new(DEFAULT_READ_IDLE_CONNECTIONS),
             row_limit: AtomicUsize::new(read_row_limit()),
             aliases: Mutex::new(Aliases::new(catalog)),
             rotation: AtomicU64::new(250),
@@ -444,7 +469,11 @@ impl PgStorage {
         pool.first.store(first.lsn.0, Ordering::Relaxed);
         pool.lock_aliases().waiting.push_back(first);
         rotate(pool.clone());
-        Ok(PgStorage { pool, delay: None })
+        Ok(PgStorage {
+            pool,
+            delay: None,
+            estimates: Arc::new(estimate_cache::EstimateCache::from_env()),
+        })
     }
 
     /// Refuse a read past `limit` rows instead of the environment's budget
@@ -464,8 +493,10 @@ impl PgStorage {
     pub fn with_read_connections(self, limit: usize) -> Self {
         let pool = Arc::new(Pool {
             config: self.pool.config.clone(),
+            read_config: self.pool.read_config.clone(),
             idle: Mutex::new(std::mem::take(&mut *self.pool.lock_idle())),
             permits: Arc::new(Semaphore::new(limit.max(1))),
+            idle_limit: AtomicUsize::new(self.pool.idle_limit.load(Ordering::Relaxed)),
             row_limit: AtomicUsize::new(self.pool.row_limit.load(Ordering::Relaxed)),
             aliases: Mutex::new(self.pool.lock_aliases().take()),
             rotation: AtomicU64::new(self.pool.rotation.load(Ordering::Relaxed)),
@@ -477,18 +508,41 @@ impl PgStorage {
         });
         rotate(pool.clone());
         let delay = self.delay;
+        let estimates = self.estimates.clone();
         drop(self);
-        PgStorage { pool, delay }
+        PgStorage {
+            pool,
+            delay,
+            estimates,
+        }
+    }
+
+    /// Keep at most `limit` read connections idle for reuse; excess idle
+    /// connections are closed. Zero closes every connection after its read.
+    pub fn with_read_idle_connections(self, limit: usize) -> Self {
+        self.pool.idle_limit.store(limit, Ordering::Relaxed);
+        self.pool.lock_idle().truncate(limit);
+        self
     }
 
     /// Give a read `timeout` to finish before it is refused (zero: as
-    /// long as it takes). The connections opened so far carry no limit of
-    /// their own, so they are let go and the next reads open theirs.
+    /// long as it takes). Each read sets the limit in its own transaction.
     pub fn with_read_timeout(self, timeout: Duration) -> Self {
         let millis = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
         self.pool.timeout.store(millis, Ordering::Relaxed);
-        self.pool.lock_idle().clear();
         self
+    }
+
+    /// Keep the planner's estimates as `cache` says instead of as the
+    /// environment does.
+    pub fn with_estimate_cache(mut self, cache: estimate_cache::EstimateCache) -> Self {
+        self.estimates = Arc::new(cache);
+        self
+    }
+
+    /// The planner's estimates already answered.
+    pub fn estimate_cache(&self) -> &estimate_cache::EstimateCache {
+        &self.estimates
     }
 
     /// Mint a fresh alias every `every`.
@@ -521,14 +575,22 @@ impl PgStorage {
             .map(|alias| alias.lsn)
     }
 
-    /// Run one plain statement (no snapshot, autocommit) on a pooled
-    /// connection and return its rows as text; for the few reads that are
-    /// not the engine's (a client's mutation ids at connect time).
+    /// Run one plain read (no snapshot) on a pooled connection and return
+    /// its rows as text; for the few reads that are not the engine's (a
+    /// client's mutation ids at connect time). With a timeout, use a
+    /// transaction so the server-side limit ends with this read.
     pub async fn simple_query(&self, sql: &str) -> Result<Vec<SimpleQueryRow>, StorageError> {
         let pool = self.pool.clone();
         let sql = sql.to_owned();
         run_on(&self.pool.runtime, async move {
-            pool.run("a statement", &sql).await
+            let batch = match pool.timeout() {
+                Some(limit) => format!(
+                    "BEGIN READ ONLY; SET LOCAL statement_timeout = {}; {sql}; COMMIT",
+                    limit.as_millis()
+                ),
+                None => sql,
+            };
+            pool.run("a statement", &batch).await
         })
         .await
     }
@@ -611,15 +673,48 @@ impl Storage for PgStorage {
         .await
     }
 
+    /// PostgreSQL's estimate of the count ([`estimate::Estimation`]): the
+    /// `EXPLAIN`s of the tree's nodes and the statistics of its join
+    /// columns, each from the estimate cache when an earlier tree asked
+    /// it, waited for when one is asking it, and otherwise asked in one
+    /// batch, on no snapshot (estimates read no rows), the catalog the
+    /// current reads describe tables by. The tables' sizes are read first
+    /// when they are due, to forget the tables whose statistics moved.
+    async fn estimate(&self, query: &MultiTableReadQuery, cap: u64) -> Result<u64, StorageError> {
+        let pool = self.pool.clone();
+        let cache = self.estimates.clone();
+        let query = query.clone();
+        run_on(&self.pool.runtime, async move {
+            let catalog = pool.lock_aliases().catalog.clone();
+            let estimation =
+                estimate::Estimation::new(&query, &catalog).map_err(StorageError)?;
+            if cache.sizes_due() {
+                match pool.run("reading the tables' sizes", estimate_cache::SIZES_SQL).await {
+                    Ok(rows) => cache.sizes(rows.iter().map(|row| {
+                        let field = |index: usize| row.get(index).unwrap_or_default().to_owned();
+                        (field(0), field(1), field(2))
+                    })),
+                    Err(error) => log_warn!("reading the tables' sizes failed: {error}"),
+                }
+            }
+            let what = format!("estimating the rows of `{}`", query.main_table.table);
+            let rows = estimated(&pool, &cache, &estimation, &what).await?;
+            Ok(estimate::capped(rows, cap))
+        })
+        .await
+    }
+
     /// Flip to the newest minted alias the stream has passed.
     fn advance(&self, feed: Lsn) {
         self.pool.lock_aliases().advance(feed);
     }
 
     /// Reads on the alias that first reaches `at`, and every later one,
-    /// describe their tables by `catalog`.
+    /// describe their tables by `catalog`; the estimates answered so far
+    /// are forgotten, a table having perhaps changed shape.
     fn follow(&self, at: Lsn, catalog: Arc<Catalog>) {
         self.pool.lock_aliases().upcoming.push_back((at, catalog));
+        self.estimates.clear();
     }
 
     /// [`PgStorage::mint_now`].
@@ -631,6 +726,117 @@ impl Storage for PgStorage {
     fn floor(&self) -> Lsn {
         self.alias_position().unwrap_or_default()
     }
+}
+
+/// The rows `estimation` puts its tree at, every statement and join
+/// column answered from `cache` where it can be: the rest asked of `pool`
+/// in one batch (`what` naming it in a refusal) and handed to the cache,
+/// those another batch is asking waited for. A key whose asker went away
+/// or failed is asked again once; a batch that fails is the error, its
+/// failure handed to those waiting on it.
+async fn estimated(
+    pool: &Pool,
+    cache: &estimate_cache::EstimateCache,
+    estimation: &estimate::Estimation,
+    what: &str,
+) -> Result<f64, StorageError> {
+    use estimate_cache::{Answer, Key, Lookup};
+    let statements = estimation.statements();
+    let columns = estimation.columns();
+    let keys: Vec<(&str, Key)> = statements
+        .iter()
+        .map(|(table, sql)| (table.as_str(), Key::statement(sql)))
+        .chain(
+            columns
+                .iter()
+                .map(|(table, column)| (table.as_str(), Key::column(table, column))),
+        )
+        .collect();
+    let mut answers: Vec<Option<Answer>> = vec![None; keys.len()];
+    let mut failure = None;
+    for _ in 0..2 {
+        let missing: Vec<usize> = (0..keys.len()).filter(|&at| answers[at].is_none()).collect();
+        if missing.is_empty() {
+            break;
+        }
+        let wanted: Vec<(&str, Key)> = missing.iter().map(|&at| keys[at]).collect();
+        let mut asking = Vec::new();
+        let mut waiting = Vec::new();
+        for (&at, found) in missing.iter().zip(cache.lookup(&wanted)) {
+            match found {
+                Lookup::Known(answer) => answers[at] = Some(answer),
+                Lookup::Wait(answer) => waiting.push((at, answer)),
+                Lookup::Ask(ask) => asking.push((at, ask)),
+            }
+        }
+        if !asking.is_empty() {
+            let asked: Vec<&str> = asking
+                .iter()
+                .filter(|(at, _)| *at < statements.len())
+                .map(|(at, _)| statements[*at].1.as_str())
+                .collect();
+            let stats_of: Vec<(&str, &str)> = asking
+                .iter()
+                .filter(|(at, _)| *at >= statements.len())
+                .map(|(at, _)| {
+                    let (table, column) = &columns[at - statements.len()];
+                    (table.as_str(), column.as_str())
+                })
+                .collect();
+            let batch = estimate::batch(&asked, &stats_of);
+            let parsed = match pool.run_messages(what, &batch).await {
+                Ok(messages) => estimate::parse(messages, asked.len(), !stats_of.is_empty())
+                    .map_err(StorageError),
+                Err(error) => Err(error),
+            };
+            let (rows, stats) = match parsed {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    for (_, ask) in asking {
+                        cache.answer(ask, Err(error.to_string()));
+                    }
+                    return Err(error);
+                }
+            };
+            let mut rows = rows.into_iter();
+            for (at, ask) in asking {
+                let answer = match at.checked_sub(statements.len()) {
+                    None => Answer::Rows(rows.next().unwrap_or_default()),
+                    Some(column) => Answer::Stats(stats.get(&columns[column]).copied()),
+                };
+                answers[at] = Some(answer);
+                cache.answer(ask, Ok(answer));
+            }
+        }
+        for (at, mut answer) in waiting {
+            let seen = match answer.wait_for(Option::is_some).await {
+                Ok(seen) => seen.clone(),
+                Err(_) => None,
+            };
+            match seen {
+                Some(Ok(seen)) => answers[at] = Some(seen),
+                Some(Err(error)) => failure = Some(error),
+                None => {}
+            }
+        }
+    }
+    let mut explained = Vec::with_capacity(statements.len());
+    let mut stats = std::collections::HashMap::new();
+    for (at, answer) in answers.into_iter().enumerate() {
+        match answer {
+            Some(Answer::Rows(rows)) => explained.push(rows),
+            Some(Answer::Stats(Some(found))) => {
+                stats.insert(columns[at - statements.len()].clone(), found);
+            }
+            Some(Answer::Stats(None)) => {}
+            None => {
+                return Err(StorageError(failure.unwrap_or_else(|| {
+                    format!("{what}: an estimate was not answered")
+                })));
+            }
+        }
+    }
+    estimation.evaluate(&explained, &stats).map_err(StorageError)
 }
 
 impl Pool {
@@ -701,20 +907,12 @@ impl Pool {
 
     /// How a read's connection is opened: `config` (which carries the
     /// [`Keepalive`] the storage was given, if any, so the kernel probes
-    /// the connection while it sits idle in the pool), and the read
-    /// timeout as both the time the connection may take to open and the
-    /// session's `statement_timeout`, after whatever options the
-    /// connection string already carries.
+    /// the connection while it sits idle in the pool), with the read
+    /// timeout also limiting how long a new connection may take to open.
     fn read_config(&self) -> Config {
-        let mut config = self.config.clone();
+        let mut config = self.read_config.clone();
         if let Some(limit) = self.timeout() {
             config.connect_timeout(limit);
-            let ours = format!("-c statement_timeout={}", limit.as_millis());
-            let options = match config.get_options() {
-                Some(theirs) => format!("{theirs} {ours}"),
-                None => ours,
-            };
-            config.options(&options);
         }
         config
     }
@@ -724,6 +922,16 @@ impl Pool {
     /// `what` names the work in the refusal of a batch that did not
     /// finish in time: PostgreSQL cancelled it, or the wait ended first.
     async fn run(&self, what: &str, batch: &str) -> Result<Vec<SimpleQueryRow>, StorageError> {
+        self.run_messages(what, batch).await.map(rows_of)
+    }
+
+    /// [`Pool::run`], every message of the batch returned: the results of
+    /// each of its statements.
+    async fn run_messages(
+        &self,
+        what: &str,
+        batch: &str,
+    ) -> Result<Vec<SimpleQueryMessage>, StorageError> {
         let _permit = self.permit().await?;
         let limit = self.timeout();
         let work = async {
@@ -731,7 +939,7 @@ impl Pool {
             match client.simple_query(batch).await {
                 Ok(messages) => {
                     self.release(client);
-                    Ok(rows_of(messages))
+                    Ok(messages)
                 }
                 Err(error) => match limit {
                     Some(limit) if error.code() == Some(&SqlState::QUERY_CANCELED) => {
@@ -753,7 +961,10 @@ impl Pool {
     /// Return a connection after a successful statement; a failed one's
     /// connection is dropped instead, in case it is broken or mid-abort.
     fn release(&self, client: Client) {
-        self.lock_idle().push(client);
+        let mut idle = self.lock_idle();
+        if idle.len() < self.idle_limit.load(Ordering::Relaxed) {
+            idle.push(client);
+        }
     }
 
     /// Run one positioned statement as a single simple-query batch: the
@@ -772,6 +983,12 @@ impl Pool {
             "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '{}';",
             alias.snapshot.replace('\'', "''")
         );
+        if let Some(limit) = self.timeout() {
+            batch.push_str(&format!(
+                " SET LOCAL statement_timeout = {};",
+                limit.as_millis()
+            ));
+        }
         if let Some(delay) = delay {
             batch.push_str(&format!(" SELECT pg_sleep({});", delay.as_secs_f64()));
         }

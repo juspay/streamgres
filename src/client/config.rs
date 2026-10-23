@@ -22,10 +22,15 @@ pub struct Config {
     /// (`/zero`, so the connect route is `/zero/sync/v51/connect`).
     pub base_path: String,
     /// `STREAMGRES_PG_DSN` (or `ZERO_UPSTREAM_DB`): the database, with the
-    /// user and password in the URL.
+    /// user and password in the URL. This direct connection is used for
+    /// catalog/replication/snapshot minting.
     pub dsn: String,
     /// `STREAMGRES_MASTER_PG_DSN`: writable primary used for startup setup.
     pub master_dsn: String,
+    /// `STREAMGRES_READ_PG_DSN`: optional read endpoint, such as PgBouncer.
+    /// Defaults to `dsn`; it must reach the same database as the direct DSN
+    /// because reads import snapshots minted through the direct connection.
+    pub read_dsn: String,
     /// `STREAMGRES_SCHEMAS`: the schemas whose tables the catalog carries
     /// (`public` plus the app's `zero_<shard>` schema by default).
     pub schemas: Vec<String>,
@@ -47,9 +52,12 @@ pub struct Config {
     /// `STREAMGRES_SNAPSHOT_ROTATION_MS`: how often a fresh exported
     /// snapshot (a temporary replication slot) is minted for reads (1000).
     pub snapshot_rotation: Duration,
-    /// `STREAMGRES_READ_CONNECTIONS`: how many storage reads may hold a
-    /// Postgres connection at once; the rest queue (16).
+    /// `STREAMGRES_READ_CONNECTIONS`: maximum concurrent storage reads;
+    /// additional reads wait for a permit (16).
     pub read_connections: usize,
+    /// `STREAMGRES_READ_IDLE_CONNECTIONS`: maximum read connections kept
+    /// idle for reuse (16; zero closes each connection after its read).
+    pub read_idle_connections: usize,
     /// `STREAMGRES_READ_TIMEOUT_MS`: how long one storage read (a query's
     /// rows, a planner's count, a client group's mutation ids) may take,
     /// the connection it may have to open included and the wait for a free
@@ -120,7 +128,7 @@ pub struct Config {
     /// told to start over (262144; 0 keeps none).
     pub group_log_bytes: usize,
     /// `STREAMGRES_MAX_MESSAGE_BYTES`: the largest inbound WebSocket message
-    /// accepted (16 MiB).
+    /// accepted (16 MiB). Must be a positive number of bytes.
     pub max_message_bytes: usize,
     /// `STREAMGRES_BYTES_PER_PART`: how many bytes of serialized row
     /// operations one poke part carries at most (768000, i.e. 750 KiB).
@@ -139,17 +147,12 @@ pub struct Config {
     /// default) or `child` (the subquery, Zero's `whereExists` as
     /// translated).
     pub join_preferred_side: Side,
-    /// `STREAMGRES_PLAN_TTL_MS`: how long a join plan is remembered before
-    /// the query is counted again (600000).
+    /// `STREAMGRES_PLAN_TTL_MS`: how long a join plan is remembered for
+    /// its tree before the tree is sized again (600000).
     pub plan_ttl: Duration,
     /// `STREAMGRES_PLAN_CACHE`: how many join plans are remembered at most
-    /// (10000), by tree and, apart, by query name.
+    /// (10000), one per tree.
     pub plan_cache: usize,
-    /// `STREAMGRES_PLAN_QUERY_TTL_MS`: how long a plan made for a query is
-    /// laid onto every later query of the same name (and join skeleton),
-    /// whatever its arguments, before the name is counted again (86400000,
-    /// a day; 0 plans every tree on its own).
-    pub plan_query_ttl: Duration,
     /// `STREAMGRES_TRANSFORM_TTL_MS`: how long the application server's
     /// transform of a query is kept per identity (60000; zero-cache keeps
     /// its own for 5000; 0 keeps none).
@@ -223,6 +226,7 @@ impl Config {
             .ok_or("STREAMGRES_PG_DSN (or ZERO_UPSTREAM_DB) must name the database")?;
         let master_dsn = first(&["STREAMGRES_MASTER_PG_DSN"])
             .ok_or("STREAMGRES_MASTER_PG_DSN must name the writable primary database")?;
+        let read_dsn = first(&["STREAMGRES_READ_PG_DSN"]).unwrap_or_else(|| dsn.clone());
         let query_url = first(&["STREAMGRES_QUERY_URL", "ZERO_QUERY_URL"])
             .ok_or("STREAMGRES_QUERY_URL (or ZERO_QUERY_URL) must name the query endpoint")?;
         let mutate_url = first(&["STREAMGRES_MUTATE_URL", "ZERO_MUTATE_URL"])
@@ -312,6 +316,7 @@ impl Config {
             base_path,
             dsn,
             master_dsn,
+            read_dsn,
             schemas,
             slot: threads::slot_name(),
             slot_cleanup_age: millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
@@ -323,6 +328,12 @@ impl Config {
             read_connections: match first(&["STREAMGRES_READ_CONNECTIONS"]) {
                 Some(text) => text.parse().map_err(|_| {
                     format!("STREAMGRES_READ_CONNECTIONS must be a number, got `{text}`")
+                })?,
+                None => 16,
+            },
+            read_idle_connections: match first(&["STREAMGRES_READ_IDLE_CONNECTIONS"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("STREAMGRES_READ_IDLE_CONNECTIONS must be a number, got `{text}`")
                 })?,
                 None => 16,
             },
@@ -372,9 +383,15 @@ impl Config {
                 None => 256 * 1024,
             },
             max_message_bytes: match first(&["STREAMGRES_MAX_MESSAGE_BYTES"]) {
-                Some(text) => text.parse().map_err(|_| {
-                    format!("STREAMGRES_MAX_MESSAGE_BYTES must be a number, got `{text}`")
-                })?,
+                Some(text) => text
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|bytes| *bytes > 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "STREAMGRES_MAX_MESSAGE_BYTES must be a positive number of bytes, got `{text}`"
+                        )
+                    })?,
                 None => 16 * 1024 * 1024,
             },
             bytes_per_part: match first(&["STREAMGRES_BYTES_PER_PART"]) {
@@ -392,7 +409,6 @@ impl Config {
                     .map_err(|_| format!("STREAMGRES_PLAN_CACHE must be a number, got `{text}`"))?,
                 None => 10_000,
             },
-            plan_query_ttl: millis("STREAMGRES_PLAN_QUERY_TTL_MS", 86_400_000)?,
             transform_ttl: millis("STREAMGRES_TRANSFORM_TTL_MS", 60_000)?,
             transform_cache: match first(&["STREAMGRES_TRANSFORM_CACHE"]) {
                 Some(text) => text.parse().map_err(|_| {
@@ -465,12 +481,14 @@ impl Config {
     pub fn engine_settings(&self) -> Settings {
         Settings {
             dsn: self.dsn.clone(),
+            read_dsn: self.read_dsn.clone(),
             slot: self.slot.clone(),
             slot_cleanup_age: self.slot_cleanup_age,
             publication: self.publication.clone(),
             schemas: self.schemas.clone(),
             snapshot_rotation: self.snapshot_rotation,
             read_connections: self.read_connections,
+            read_idle_connections: self.read_idle_connections,
             read_timeout: self.read_timeout,
             read_threads: self.read_threads,
             keepalive: Keepalive {
@@ -536,6 +554,32 @@ mod tests {
         }
         assert_ne!(first.slot, second.slot);
         assert_eq!(first.engine_settings().slot, first.slot);
+    }
+
+    #[test]
+    fn read_dsn_defaults_to_direct_dsn_and_can_be_overridden() {
+        let direct = config(&[]).unwrap();
+        assert_eq!(direct.read_dsn, direct.dsn);
+        assert_eq!(direct.engine_settings().read_dsn, direct.dsn);
+
+        let pooled = config(&[("STREAMGRES_READ_PG_DSN", "postgresql://u:p@pooler/app")]).unwrap();
+        assert_eq!(pooled.dsn, "postgresql://u:p@db/app");
+        assert_eq!(pooled.read_dsn, "postgresql://u:p@pooler/app");
+        assert_eq!(pooled.engine_settings().read_dsn, pooled.read_dsn);
+    }
+
+    #[test]
+    fn read_idle_connection_limit_defaults_and_allows_zero() {
+        let defaults = config(&[]).unwrap();
+        assert_eq!(defaults.read_idle_connections, 16);
+        assert_eq!(defaults.engine_settings().read_idle_connections, 16);
+
+        let no_idle = config(&[("STREAMGRES_READ_IDLE_CONNECTIONS", "0")]).unwrap();
+        assert_eq!(no_idle.read_idle_connections, 0);
+        assert_eq!(no_idle.engine_settings().read_idle_connections, 0);
+
+        let invalid = config(&[("STREAMGRES_READ_IDLE_CONNECTIONS", "many")]).unwrap_err();
+        assert!(invalid.contains("STREAMGRES_READ_IDLE_CONNECTIONS"));
     }
 
     #[test]
@@ -634,6 +678,13 @@ mod tests {
                 retries: 5,
             }
         );
+    }
+
+    /// Zero disables the message size cap, so it is refused.
+    #[test]
+    fn zero_max_message_bytes_is_refused() {
+        let error = config(&[("STREAMGRES_MAX_MESSAGE_BYTES", "0")]).unwrap_err();
+        assert!(error.contains("STREAMGRES_MAX_MESSAGE_BYTES"), "{error}");
     }
 
     /// A value that is not a number is refused by the variable's name.

@@ -99,6 +99,12 @@ pub enum Driver {
 /// sub node that drives its edge is read whole, so its limit is an
 /// ordinary window on that node. A `NULL` (or missing) join value never
 /// matches, consistent with the engine's NULL semantics.
+///
+/// An edge on several columns at once names a composite key on each side
+/// ([`ColumnName::composite`]): `(org, id)` against `(org, ticket)`. The
+/// join value is then the pair, computed from each row where the layer
+/// reads a join value ([`ColumnName::of`]), so a row matches only when
+/// every column agrees, and a `NULL` in any of them matches nothing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Join {
     pub sub: MultiTableReadQuery,

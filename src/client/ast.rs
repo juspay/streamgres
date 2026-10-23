@@ -6,7 +6,8 @@
 //! root's `limit` becomes its window and a `related` node's `limit` its
 //! window per parent row (the engine's driven windows), the primary key is
 //! appended to the ordering when absent so pages are deterministic, and
-//! every literal is coerced to its column's catalog type. Subqueries Zero
+//! every literal is coerced to its column's catalog type, and a
+//! correlation on several columns joins on a composite key. Subqueries Zero
 //! marks as permission checks are registered but their parts are not
 //! shipped to the client, the way zero-cache withholds them. Two `EXISTS`
 //! tests beside each other under a node's `AND`, on the same to-one
@@ -21,7 +22,7 @@ use serde_json::Value as Json;
 use crate::ivm::QueryPart;
 use crate::model::ComparisonOperator::{EQ, GT, GTE, IN, LT, LTE, NEQ, NOT_IN};
 use crate::model::{
-    Catalog, ComparisonOperator, DbTable, Join, MultiTableReadQuery, Order, OrderBy,
+    Catalog, ColumnName, ComparisonOperator, DbTable, Join, MultiTableReadQuery, Order, OrderBy,
     SingleTableReadQuery, Value, ValueType, Where,
 };
 
@@ -109,15 +110,19 @@ pub struct Correlation {
 }
 
 /// One to-one relationship an `EXISTS` tests, as [`merge_exists`] groups
-/// them: the parent column, the child column and the child table.
-type Relationship<'a> = (&'a str, &'a str, &'a str);
+/// them: the parent columns, the child columns and the child table.
+type Relationship<'a> = (&'a [String], &'a [String], &'a str);
 
-/// A translated query: the tree to register, and the parts whose rows
-/// stay on the server (permission subqueries).
+/// A translated query: the tree to register, the parts whose rows stay
+/// on the server (permission subqueries), and, when a page of it has a
+/// keyset cursor, the same tree with every cursor left out — what the
+/// planner estimates its sizes on, so a page turn asks nothing a first
+/// page did not.
 #[derive(Debug, Clone)]
 pub struct Translated {
     pub query: MultiTableReadQuery,
     pub hidden: HashSet<QueryPart>,
+    pub uncursored: Option<MultiTableReadQuery>,
 }
 
 /// Translate `ast` against `catalog`; an error says what the engine
@@ -125,7 +130,34 @@ pub struct Translated {
 pub fn translate(ast: &Ast, catalog: &Catalog) -> Result<Translated, String> {
     let mut hidden = HashSet::new();
     let query = node(ast, Vec::new(), false, catalog, &mut hidden)?;
-    Ok(Translated { query, hidden })
+    let uncursored = match without_cursors(ast) {
+        Some(plain) => Some(node(&plain, Vec::new(), false, catalog, &mut HashSet::new())?),
+        None => None,
+    };
+    Ok(Translated {
+        query,
+        hidden,
+        uncursored,
+    })
+}
+
+/// `ast` with the cursor of every page in it (its own and its related
+/// subqueries'; an `EXISTS` has none) left out, when it has one.
+fn without_cursors(ast: &Ast) -> Option<Ast> {
+    fn has(ast: &Ast) -> bool {
+        ast.start.is_some() || ast.related.iter().any(|sub| has(&sub.subquery))
+    }
+    fn clear(ast: &mut Ast) {
+        ast.start = None;
+        for sub in &mut ast.related {
+            clear(&mut sub.subquery);
+        }
+    }
+    has(ast).then(|| {
+        let mut plain = ast.clone();
+        clear(&mut plain);
+        plain
+    })
 }
 
 /// Build the tree below `ast` at `path`.
@@ -199,12 +231,16 @@ fn node(
     for (index, sub) in ast.related.iter().enumerate() {
         let mut child_path = path.clone();
         child_path.push(index);
-        joins.push(edge(sub, child_path, concealed, false, catalog, hidden)?);
+        joins.push(edge(
+            sub, table, child_path, concealed, false, catalog, hidden,
+        )?);
     }
     for (offset, sub) in inner.iter().enumerate() {
         let mut child_path = path.clone();
         child_path.push(left_count + offset);
-        joins.push(edge(sub, child_path, concealed, true, catalog, hidden)?);
+        joins.push(edge(
+            sub, table, child_path, concealed, true, catalog, hidden,
+        )?);
     }
     Ok(MultiTableReadQuery::new(main_table, joins))
 }
@@ -232,8 +268,8 @@ fn merge_exists<'a>(condition: &'a Condition, catalog: &Catalog) -> Cow<'a, Cond
             continue;
         };
         let key = (
-            sub.correlation.parent_field[0].as_str(),
-            sub.correlation.child_field[0].as_str(),
+            sub.correlation.parent_field.as_slice(),
+            sub.correlation.child_field.as_slice(),
             sub.subquery.table.as_str(),
         );
         match groups.iter_mut().find(|(held, _)| *held == key) {
@@ -278,19 +314,23 @@ fn exists_of(condition: &Condition) -> Option<&CorrelatedSubquery> {
     }
 }
 
-/// Whether `sub` joins its parent to at most one row: one column pair,
-/// the child's column its table's single-column primary key, and the
-/// subquery a plain test (no page, order or cursor, as an `EXISTS` never
-/// has).
+/// Whether `sub` joins its parent to at most one row: the child's
+/// columns its table's primary key, whole and in order, and the subquery
+/// a plain test (no page, order or cursor, as an `EXISTS` never has).
 fn to_one(sub: &CorrelatedSubquery, catalog: &Catalog) -> bool {
     let (correlation, subquery) = (&sub.correlation, &sub.subquery);
-    correlation.parent_field.len() == 1
-        && correlation.child_field.len() == 1
+    !correlation.child_field.is_empty()
+        && correlation.parent_field.len() == correlation.child_field.len()
         && subquery.limit.is_none()
         && subquery.order_by.is_empty()
         && subquery.start.is_none()
         && catalog.table(&subquery.table).is_some_and(|table| {
-            table.pkey.len() == 1 && table.pkey[0].as_str() == correlation.child_field[0]
+            table.pkey.len() == correlation.child_field.len()
+                && table
+                    .pkey
+                    .iter()
+                    .zip(&correlation.child_field)
+                    .all(|(key, column)| *key == column.as_str())
         })
 }
 
@@ -372,31 +412,70 @@ fn conceal_condition(condition: &mut Condition) {
 }
 
 /// One join edge and the subtree under it: a LEFT edge for `related`, an
-/// INNER edge driven from the sub for `EXISTS`.
+/// INNER edge driven from the sub for `EXISTS`. A correlation on several
+/// columns joins on a composite key ([`ColumnName::composite`]), one name
+/// for the columns on each side.
 fn edge(
     sub: &CorrelatedSubquery,
+    parent: &DbTable,
     child_path: Vec<usize>,
     concealed_parent: bool,
     is_inner: bool,
     catalog: &Catalog,
     hidden: &mut HashSet<QueryPart>,
 ) -> Result<Join, String> {
-    let (Some(parent_column), Some(child_column)) = (
-        sub.correlation.parent_field.first(),
-        sub.correlation.child_field.first(),
-    ) else {
-        return Err("a join without columns".to_owned());
-    };
-    if sub.correlation.parent_field.len() != 1 || sub.correlation.child_field.len() != 1 {
-        return Err("compound join keys are not supported".to_owned());
-    }
+    let (parent_key, child_key) =
+        correlation_keys(&sub.correlation, parent, catalog, &sub.subquery.table)?;
     let concealed = concealed_parent || sub.system.as_deref() == Some("permissions");
     let child = node(&sub.subquery, child_path, concealed, catalog, hidden)?;
     Ok(if is_inner {
-        Join::inner(child, parent_column.as_str(), child_column.as_str())
+        Join::inner(child, parent_key, child_key)
     } else {
-        Join::left(child, parent_column.as_str(), child_column.as_str())
+        Join::left(child, parent_key, child_key)
     })
+}
+
+/// The keys the two sides of `correlation` join on, each column checked
+/// against its table: the parent's against `parent`, the child's against
+/// `child_table`. Both sides must name the same number of columns, at
+/// least one.
+fn correlation_keys(
+    correlation: &Correlation,
+    parent: &DbTable,
+    catalog: &Catalog,
+    child_table: &str,
+) -> Result<(ColumnName, ColumnName), String> {
+    if correlation.parent_field.is_empty() || correlation.child_field.is_empty() {
+        return Err("a join without columns".to_owned());
+    }
+    if correlation.parent_field.len() != correlation.child_field.len() {
+        return Err(format!(
+            "a join of `{}` to `{child_table}` names {} parent columns and {} child columns",
+            parent.name,
+            correlation.parent_field.len(),
+            correlation.child_field.len()
+        ));
+    }
+    for column in &correlation.parent_field {
+        if parent.column(column).is_none() {
+            return Err(format!(
+                "unknown column `{}.{column}` in a join",
+                parent.name
+            ));
+        }
+    }
+    let child = catalog
+        .table(child_table)
+        .ok_or_else(|| format!("unknown table `{child_table}`"))?;
+    for column in &correlation.child_field {
+        if child.column(column).is_none() {
+            return Err(format!("unknown column `{child_table}.{column}` in a join"));
+        }
+    }
+    Ok((
+        ColumnName::composite(&correlation.parent_field),
+        ColumnName::composite(&correlation.child_field),
+    ))
 }
 
 /// A predicate node as a `Where`; `EXISTS` subqueries are collected into
@@ -422,20 +501,23 @@ fn translate_condition<'a>(
         )),
         Condition::CorrelatedSubquery { related, op } => match op.as_str() {
             "EXISTS" => {
-                let column = related
-                    .correlation
-                    .parent_field
-                    .first()
-                    .ok_or("an EXISTS without a join column")?;
-                if table.column(column).is_none() {
-                    return Err(format!(
-                        "unknown column `{}.{column}` in EXISTS",
-                        table.name
-                    ));
+                if related.correlation.parent_field.is_empty() {
+                    return Err("an EXISTS without a join column".to_owned());
+                }
+                for column in &related.correlation.parent_field {
+                    if table.column(column).is_none() {
+                        return Err(format!(
+                            "unknown column `{}.{column}` in EXISTS",
+                            table.name
+                        ));
+                    }
                 }
                 let index = inner.len();
                 inner.push(related);
-                Ok(Where::exists(column.as_str(), index))
+                Ok(Where::exists(
+                    ColumnName::composite(&related.correlation.parent_field),
+                    index,
+                ))
             }
             "NOT EXISTS" => Err("NOT EXISTS is not supported".to_owned()),
             other => Err(format!("unknown subquery operator `{other}`")),
@@ -901,6 +983,23 @@ mod tests {
         );
     }
 
+    /// A page with a cursor carries the same tree without it, which the
+    /// first page is; a tree without a cursor carries none.
+    #[test]
+    fn a_cursor_is_left_out_of_the_uncursored_tree() {
+        let first: Ast = serde_json::from_str(r#"{"table": "messages", "where": {"type": "simple", "op": "=", "left": {"type": "column", "name": "visibleTo"}, "right": {"type": "literal", "value": "me"}}, "orderBy": [["createdAt", "desc"]], "limit": 5}"#).unwrap();
+        let mut turned = first.clone();
+        turned.start = Some(Bound {
+            row: serde_json::from_str(r#"{"createdAt": 1000}"#).unwrap(),
+            exclusive: true,
+        });
+        let first = translate(&first, &catalog()).unwrap();
+        assert!(first.uncursored.is_none());
+        let turned = translate(&turned, &catalog()).unwrap();
+        assert_ne!(turned.query, first.query, "the cursor is in the tree");
+        assert_eq!(turned.uncursored, Some(first.query), "and not in its uncursored tree");
+    }
+
     /// What the engine cannot run is refused by name.
     /// A text argument with a NUL byte is refused at translation: the
     /// database's text cannot hold it, and a read carrying it would fail
@@ -912,6 +1011,140 @@ mod tests {
             translate(&nul, &catalog())
                 .unwrap_err()
                 .contains("NUL byte")
+        );
+    }
+
+    /// `items(org, id)` keyed by both columns, with `links(org, item, kind)`
+    /// pointing at them.
+    fn compound_catalog() -> Catalog {
+        Catalog::new(vec![
+            DbTable::new(
+                "items",
+                ["org", "id"],
+                vec![
+                    DbColumn::new("org", ValueType::String),
+                    DbColumn::new("id", ValueType::String),
+                    DbColumn::new("title", ValueType::String),
+                ],
+            ),
+            DbTable::new(
+                "links",
+                ["id"],
+                vec![
+                    DbColumn::new("id", ValueType::String),
+                    DbColumn::new("org", ValueType::String),
+                    DbColumn::new("item", ValueType::String),
+                    DbColumn::new("kind", ValueType::String),
+                ],
+            ),
+        ])
+    }
+
+    /// A correlation on several columns joins on a composite key, one
+    /// name per side: `related` becomes a LEFT edge on it, an `EXISTS`
+    /// an INNER edge with the leaf on the parent's key.
+    #[test]
+    fn a_compound_correlation_joins_on_a_composite_key() {
+        let ast: Ast = serde_json::from_str(r#"{
+            "table": "items",
+            "where": {"type": "correlatedSubquery", "op": "EXISTS", "related": {
+                "correlation": {"parentField": ["org", "id"], "childField": ["org", "item"]},
+                "subquery": {"table": "links", "where": {"type": "simple", "op": "=", "left": {"type": "column", "name": "kind"}, "right": {"type": "literal", "value": "blocks"}}}
+            }},
+            "related": [{
+                "correlation": {"parentField": ["org", "id"], "childField": ["org", "item"]},
+                "subquery": {"table": "links"}
+            }]
+        }"#).unwrap();
+        let translated = translate(&ast, &compound_catalog()).expect("translates");
+        let query = translated.query;
+        let parent_key = ColumnName::composite(["org", "id"]);
+        let child_key = ColumnName::composite(["org", "item"]);
+        assert_eq!(query.joins.len(), 2);
+        assert_eq!(query.joins[0].main_table_column, parent_key);
+        assert_eq!(query.joins[0].sub_table_column, child_key);
+        assert!(!query.joins[0].is_inner);
+        assert_eq!(query.joins[1].main_table_column, parent_key);
+        assert_eq!(query.joins[1].sub_table_column, child_key);
+        assert!(query.joins[1].is_inner);
+        assert_eq!(query.main_table.filter, Where::exists(parent_key, 0));
+    }
+
+    /// A compound correlation must name the same number of columns on
+    /// both sides, every one a column of its table.
+    #[test]
+    fn a_compound_correlation_is_checked_column_by_column() {
+        let related = |parent: &str, child: &str| -> Ast {
+            serde_json::from_str(&format!(
+                r#"{{
+                "table": "items",
+                "related": [{{
+                    "correlation": {{"parentField": {parent}, "childField": {child}}},
+                    "subquery": {{"table": "links"}}
+                }}]
+            }}"#
+            ))
+            .unwrap()
+        };
+        let error = |parent: &str, child: &str| {
+            translate(&related(parent, child), &compound_catalog()).unwrap_err()
+        };
+        assert!(error(r#"["org", "id"]"#, r#"["item"]"#).contains("2 parent columns and 1 child"));
+        assert!(error(r#"["org", "ghost"]"#, r#"["org", "item"]"#).contains("`items.ghost`"));
+        assert!(error(r#"["org", "id"]"#, r#"["org", "ghost"]"#).contains("`links.ghost`"));
+        assert!(error("[]", "[]").contains("without columns"));
+        assert!(
+            translate(
+                &related(r#"["org", "id"]"#, r#"["org", "item"]"#),
+                &compound_catalog()
+            )
+            .is_ok()
+        );
+    }
+
+    /// Two `EXISTS` on the same compound to-one relationship — the
+    /// child's columns its composite primary key — merge into one, as
+    /// single-column ones do; a relationship on part of the key does not.
+    #[test]
+    fn exists_on_a_compound_key_merge_when_it_is_the_whole_key() {
+        let test = |child: &str, kind: &str| {
+            format!(
+                r#"{{"type": "correlatedSubquery", "op": "EXISTS", "related": {{
+                    "correlation": {{"parentField": ["org", "item"], "childField": {child}}},
+                    "subquery": {{"table": "items", "where": {{"type": "simple", "op": "=", "left": {{"type": "column", "name": "title"}}, "right": {{"type": "literal", "value": "{kind}"}}}}}}
+                }}}}"#
+            )
+        };
+        let ast = |child: &str| -> Ast {
+            serde_json::from_str(&format!(
+                r#"{{"table": "links", "where": {{"type": "and", "conditions": [{}, {}]}}}}"#,
+                test(child, "a"),
+                test(child, "b")
+            ))
+            .unwrap()
+        };
+        let whole = translate(&ast(r#"["org", "id"]"#), &compound_catalog()).expect("translates");
+        assert_eq!(whole.query.joins.len(), 1, "one edge for both tests");
+        let mut pkey_reversed = compound_catalog();
+        pkey_reversed = Catalog::new(
+            pkey_reversed
+                .tables()
+                .map(|table| {
+                    if table.name == "items" {
+                        let mut columns: Vec<DbColumn> = table.columns.values().cloned().collect();
+                        columns.sort_by(|a, b| a.name.cmp(&b.name));
+                        DbTable::new("items", ["id", "org"], columns)
+                    } else {
+                        table.clone()
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let reordered = translate(&ast(r#"["org", "id"]"#), &pkey_reversed).expect("translates");
+        assert_eq!(
+            reordered.query.joins.len(),
+            2,
+            "the key in another order is not the key"
         );
     }
 

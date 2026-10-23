@@ -96,6 +96,18 @@ pub fn count_sql(
     ))
 }
 
+/// `EXPLAIN (FORMAT JSON)` of the rows of `name` (described by `table`)
+/// matching `filter`, rendered as a plain `SELECT` renders it (an
+/// `EXISTS` leaf is false): PostgreSQL's estimate of the rows, nothing
+/// read.
+pub fn explain_sql(name: &str, table: &DbTable, filter: &Where) -> String {
+    format!(
+        "EXPLAIN (FORMAT JSON) SELECT 1 FROM {} WHERE {}",
+        quote_ident(name),
+        render_where(filter, &Scope::plain(table))
+    )
+}
+
 /// What a filter's columns refer to while it is rendered: the table (for
 /// the columns' types) and, in a count, the alias the columns are
 /// qualified with, the node whose inner edges an `EXISTS` leaf may name,
@@ -181,7 +193,9 @@ impl<'a> Scope<'a> {
 
     /// `EXISTS (SELECT 1 FROM sub AS tN WHERE tN.sub_col = alias.main_col
     /// AND <sub's filter>)` for `join`, the sub rendered in a scope of its
-    /// own.
+    /// own; a composite key is one `=` per column pair, as PostgreSQL
+    /// itself spells a row comparison, and keys of different widths (which
+    /// the parser never builds) join nothing.
     fn semi_join(&self, join: &crate::model::Join) -> String {
         let (Some(catalog), Some(aliases)) = (self.catalog, self.aliases) else {
             return "FALSE".to_owned();
@@ -189,14 +203,28 @@ impl<'a> Scope<'a> {
         let Some(sub) = Scope::counted(&join.sub, catalog, aliases) else {
             return "FALSE".to_owned();
         };
+        if join.sub_table_column.parts().count() != join.main_table_column.parts().count() {
+            return "FALSE".to_owned();
+        }
+        let pairs: Vec<String> = join
+            .sub_table_column
+            .parts()
+            .zip(join.main_table_column.parts())
+            .map(|(sub_column, main_column)| {
+                format!(
+                    "{}.{} = {}.{}",
+                    sub.alias,
+                    quote_ident(sub_column),
+                    self.alias,
+                    quote_ident(main_column)
+                )
+            })
+            .collect();
         format!(
-            "EXISTS (SELECT 1 FROM {} AS {} WHERE ({}.{} = {}.{} AND {}))",
+            "EXISTS (SELECT 1 FROM {} AS {} WHERE ({} AND {}))",
             quote_ident(join.sub.main_table.table.as_str()),
             sub.alias,
-            sub.alias,
-            quote_ident(join.sub_table_column.as_str()),
-            self.alias,
-            quote_ident(join.main_table_column.as_str()),
+            pairs.join(" AND "),
             sub.render_node()
         )
     }
@@ -322,6 +350,9 @@ fn render_where(filter: &Where, scope: &Scope<'_>) -> String {
 /// One leaf, with the engine's `NULL` and list semantics made explicit.
 fn render_condition(condition: &Condition, scope: &Scope<'_>) -> String {
     use ComparisonOperator::*;
+    if condition.column.is_composite() && condition.comparison_operator != EXISTS {
+        return render_composite(condition, scope);
+    }
     let column = column_expr(condition.column.as_str(), scope);
     let declared = scope
         .table
@@ -356,6 +387,74 @@ fn render_condition(condition: &Condition, scope: &Scope<'_>) -> String {
         GTE => format!("{column} >= {}", literal_as(&condition.value, declared)),
         LT => format!("{column} < {}", literal_as(&condition.value, declared)),
         LTE => format!("{column} <= {}", literal_as(&condition.value, declared)),
+    }
+}
+
+/// A leaf on a composite key: the key's columns as a row constructor,
+/// compared whole with tuples of the same width, each component typed by
+/// its own column (an `unknown` literal in a row constructor takes the
+/// column's type, which keeps `uuid` and enum columns comparable; the
+/// list stays a row constructor at every length for that reason, where
+/// a `VALUES` would type its text columns as `text`). The engine compares
+/// a composite by equality and membership only, so any other operator is
+/// `FALSE`; a tuple the key could never equal (not a list, the wrong
+/// width, a `NULL` component) is left out of an `IN`, makes a `NOT IN`
+/// `FALSE` (as a `NULL` member does) and makes an `=` `FALSE`. A key with
+/// a `NULL` component has no value in the engine, so `<>` and `NOT IN`,
+/// which PostgreSQL would hold true for such a row, require every
+/// component present.
+fn render_composite(condition: &Condition, scope: &Scope<'_>) -> String {
+    use ComparisonOperator::*;
+    let parts: Vec<&str> = condition.column.parts().collect();
+    let columns: Vec<String> = parts.iter().map(|part| column_expr(part, scope)).collect();
+    let row = format!("({})", columns.join(", "));
+    let present: Vec<String> = columns
+        .iter()
+        .map(|column| format!("{column} IS NOT NULL"))
+        .collect();
+    let present = present.join(" AND ");
+    let tuple = |value: &Value| -> Option<String> {
+        let Value::List(components) = value else {
+            return None;
+        };
+        if components.len() != parts.len() || components.iter().any(Value::is_null) {
+            return None;
+        }
+        let literals: Vec<String> = components
+            .iter()
+            .zip(&parts)
+            .map(|(component, part)| {
+                let declared = scope.table.column(part).map(|declared| &declared.r#type);
+                literal_as(component, declared)
+            })
+            .collect();
+        Some(format!("({})", literals.join(", ")))
+    };
+    match condition.comparison_operator {
+        EQ => tuple(&condition.value).map_or_else(
+            || "FALSE".to_owned(),
+            |literal| format!("{row} = {literal}"),
+        ),
+        NEQ => tuple(&condition.value).map_or_else(
+            || "FALSE".to_owned(),
+            |literal| format!("({row} <> {literal} AND {present})"),
+        ),
+        IN | NOT_IN => {
+            let members = members_of(&condition.value);
+            let negated = condition.comparison_operator == NOT_IN;
+            let tuples: Vec<String> = members.iter().filter_map(tuple).collect();
+            if negated && tuples.len() != members.len() {
+                return "FALSE".to_owned();
+            }
+            if tuples.is_empty() {
+                return if negated { "TRUE" } else { "FALSE" }.to_owned();
+            }
+            if negated {
+                return format!("({row} NOT IN ({}) AND {present})", tuples.join(", "));
+            }
+            format!("{row} IN ({})", tuples.join(", "))
+        }
+        _ => "FALSE".to_owned(),
     }
 }
 
@@ -412,6 +511,236 @@ mod tests {
                 DbColumn::new("points", ValueType::Int),
             ],
         )
+    }
+
+    /// `comments(id, org, ticket, at)`.
+    fn comments() -> DbTable {
+        DbTable::new(
+            "comments",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("org", ValueType::String),
+                DbColumn::new("ticket", ValueType::Int),
+                DbColumn::new("at", ValueType::Timestamp),
+            ],
+        )
+    }
+
+    /// A select over `comments` with one leaf.
+    fn comments_where(condition: Condition) -> String {
+        let query = SingleTableReadQuery::new(
+            "comments",
+            Where::Condition(condition),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        );
+        let sql = select_sql(&query, &comments());
+        sql[sql.find(" WHERE ").expect("a WHERE") + 7..].to_owned()
+    }
+
+    /// A composite key renders as a row constructor compared whole: its
+    /// `IN` lists the set's pairs as tuples, each component typed by its
+    /// own column; `=` compares one tuple, `<>` and `NOT IN` compare one
+    /// and require every component present, as the engine does; a member
+    /// the key could never equal (a `NULL` component, the wrong width,
+    /// not a list) is dropped from an `IN`, makes a `NOT IN` `FALSE` and
+    /// an `=` `FALSE`; an ordering on a composite is `FALSE`.
+    #[test]
+    fn a_composite_key_renders_as_a_row_constructor() {
+        let key = crate::model::ColumnName::composite(["org", "at"]);
+        let pair = |org: &str, at: i64| Value::List(vec![org.into(), Value::Int(at)]);
+        let set = SharedSet::new();
+        set.insert(&pair("acme", 1000));
+        assert_eq!(
+            comments_where(Condition::new(
+                key.clone(),
+                ComparisonOperator::IN,
+                Value::Set(set)
+            )),
+            "(\"org\", \"at\") IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond')))"
+        );
+        assert_eq!(
+            comments_where(Condition::new(
+                key.clone(),
+                ComparisonOperator::EQ,
+                pair("acme", 1000)
+            )),
+            "(\"org\", \"at\") = ('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond'))"
+        );
+        assert_eq!(
+            comments_where(Condition::new(
+                key.clone(),
+                ComparisonOperator::NEQ,
+                pair("acme", 1000)
+            )),
+            "((\"org\", \"at\") <> ('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond')) AND \"org\" IS NOT NULL AND \"at\" IS NOT NULL)"
+        );
+        let with_null = Value::List(vec![Value::Null, Value::Int(1000)]);
+        let narrow = Value::List(vec!["acme".into()]);
+        assert_eq!(
+            comments_where(Condition::new(
+                key.clone(),
+                ComparisonOperator::IN,
+                Value::List(vec![
+                    with_null.clone(),
+                    narrow.clone(),
+                    "acme".into(),
+                    pair("acme", 1000)
+                ]),
+            )),
+            "(\"org\", \"at\") IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond')))"
+        );
+        assert_eq!(
+            comments_where(Condition::new(
+                key.clone(),
+                ComparisonOperator::IN,
+                Value::List(vec![with_null.clone()])
+            )),
+            "FALSE"
+        );
+        assert_eq!(
+            comments_where(Condition::new(
+                key.clone(),
+                ComparisonOperator::NOT_IN,
+                Value::List(vec![pair("acme", 1000), with_null.clone()]),
+            )),
+            "FALSE"
+        );
+        assert_eq!(
+            comments_where(Condition::new(
+                key.clone(),
+                ComparisonOperator::NOT_IN,
+                Value::List(vec![pair("acme", 1000)])
+            )),
+            "((\"org\", \"at\") NOT IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond'))) AND \"org\" IS NOT NULL AND \"at\" IS NOT NULL)"
+        );
+        assert_eq!(
+            comments_where(Condition::new(
+                key.clone(),
+                ComparisonOperator::EQ,
+                with_null
+            )),
+            "FALSE"
+        );
+        assert_eq!(
+            comments_where(Condition::new(
+                key.clone(),
+                ComparisonOperator::GT,
+                pair("acme", 1000)
+            )),
+            "FALSE"
+        );
+        assert_eq!(
+            comments_where(Condition::new(key, ComparisonOperator::IS, Value::Null)),
+            "FALSE"
+        );
+    }
+
+    /// A long list stays a row constructor: a `VALUES` would type its
+    /// text columns as `text`, which a `uuid` or enum key column cannot be
+    /// compared with.
+    #[test]
+    fn a_long_list_of_pairs_stays_a_row_constructor() {
+        let key = crate::model::ColumnName::composite(["org", "ticket"]);
+        let pairs: Vec<Value> = (0..100)
+            .map(|ticket| Value::List(vec!["acme".into(), Value::Int(ticket)]))
+            .collect();
+        let sql = comments_where(Condition::new(
+            key,
+            ComparisonOperator::IN,
+            Value::List(pairs),
+        ));
+        assert!(
+            sql.starts_with("(\"org\", \"ticket\") IN (('acme', 0), "),
+            "{sql}"
+        );
+        assert!(sql.ends_with("('acme', 99))"), "{sql}");
+        assert!(!sql.contains("VALUES"), "{sql}");
+    }
+
+    /// An `EXISTS` leaf on a composite key, the leaf the parser writes for
+    /// a compound `whereExists`, counts through the edge's semi-join like
+    /// a plain one: the same SQL as the unnamed edge, conjoined once.
+    #[test]
+    fn an_exists_leaf_on_a_composite_key_counts_its_semi_join() {
+        let catalog = Catalog::new([tickets(), comments()]);
+        let node = |table: &str, filter: Where| {
+            SingleTableReadQuery::new(table, filter, OrderBy::new("id", Order::ASC), u32::MAX)
+        };
+        let key = crate::model::ColumnName::composite(["points", "id"]);
+        let query = MultiTableReadQuery::new(
+            node(
+                "tickets",
+                Where::AND(vec![
+                    Where::condition("status", ComparisonOperator::EQ, "OPEN"),
+                    Where::exists(key.clone(), 0),
+                ]),
+            ),
+            vec![Join::inner(
+                MultiTableReadQuery::single(node("comments", Where::AND(Vec::new()))),
+                key,
+                crate::model::ColumnName::composite(["ticket", "org"]),
+            )],
+        );
+        let count = count_sql(&query, &catalog, 50).expect("known");
+        assert_eq!(
+            count,
+            "SELECT count(*) FROM (SELECT 1 FROM \"tickets\" AS t0 WHERE (t0.\"status\" = 'OPEN' AND \
+             EXISTS (SELECT 1 FROM \"comments\" AS t1 WHERE (t1.\"ticket\" = t0.\"points\" AND t1.\"org\" = t0.\"id\" AND TRUE))\
+             ) LIMIT 50) AS capped"
+        );
+    }
+
+    /// Keys of different widths, which only a caller of the model API can
+    /// build, join nothing rather than silently joining on a prefix.
+    #[test]
+    fn a_semi_join_on_keys_of_different_widths_is_false() {
+        let catalog = Catalog::new([tickets(), comments()]);
+        let node = |table: &str, filter: Where| {
+            SingleTableReadQuery::new(table, filter, OrderBy::new("id", Order::ASC), u32::MAX)
+        };
+        let query = MultiTableReadQuery::new(
+            node("tickets", Where::AND(Vec::new())),
+            vec![Join::inner(
+                MultiTableReadQuery::single(node("comments", Where::AND(Vec::new()))),
+                crate::model::ColumnName::composite(["points", "id"]),
+                "ticket",
+            )],
+        );
+        let count = count_sql(&query, &catalog, 50).expect("known");
+        assert_eq!(
+            count,
+            "SELECT count(*) FROM (SELECT 1 FROM \"tickets\" AS t0 WHERE (TRUE AND FALSE) LIMIT 50) AS capped"
+        );
+    }
+
+    /// A count joins a composite key column by column in its semi-join,
+    /// the spelling PostgreSQL gives a row comparison itself.
+    #[test]
+    fn a_count_joins_a_composite_key_column_by_column() {
+        let catalog = Catalog::new([tickets(), comments()]);
+        let node = |table: &str, filter: Where| {
+            SingleTableReadQuery::new(table, filter, OrderBy::new("id", Order::ASC), u32::MAX)
+        };
+        let query = MultiTableReadQuery::new(
+            node(
+                "tickets",
+                Where::condition("status", ComparisonOperator::EQ, "OPEN"),
+            ),
+            vec![Join::inner(
+                MultiTableReadQuery::single(node("comments", Where::AND(Vec::new()))),
+                crate::model::ColumnName::composite(["points", "id"]),
+                crate::model::ColumnName::composite(["ticket", "org"]),
+            )],
+        );
+        let count = count_sql(&query, &catalog, 50).expect("known");
+        assert_eq!(
+            count,
+            "SELECT count(*) FROM (SELECT 1 FROM \"tickets\" AS t0 WHERE (t0.\"status\" = 'OPEN' AND \
+             EXISTS (SELECT 1 FROM \"comments\" AS t1 WHERE (t1.\"ticket\" = t0.\"points\" AND t1.\"org\" = t0.\"id\" AND TRUE))\
+             ) LIMIT 50) AS capped"
+        );
     }
 
     /// Columns are cast, the filter is parenthesized, and an unbounded

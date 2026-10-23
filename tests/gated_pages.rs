@@ -1,7 +1,8 @@
 //! The join layer against a reference evaluator, over runs of random
 //! writes: inner edges driven from either side, chains of them, `EXISTS`
-//! inside `OR`, and pages (`ORDER BY` / `LIMIT`) that drive their own
-//! inner edges, at the root and per parent row. After every write each
+//! inside `OR`, pages (`ORDER BY` / `LIMIT`) that drive their own
+//! inner edges, at the root and per parent row, and the same shapes
+//! joined on a composite key (`(org, assignee) = (org, id)`). After every write each
 //! subscription's parts must show exactly what evaluating its query over
 //! the storage from scratch gives: a row passes when its own `WHERE`
 //! holds with every `EXISTS` answered by a passing row of that sub, a
@@ -11,7 +12,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
-use streamgres::ivm::{Engine, Fetch, MultiTableIVM, QueryPart, SubId, evaluate_with, order_rows};
+use streamgres::ivm::{
+    Engine, Fetch, FetchKind, MultiTableIVM, QueryPart, SubId, evaluate_with, order_rows,
+};
 use streamgres::model::*;
 use streamgres::sync::{Local, Lsn, MemoryStorage, Runtime, Snapshot};
 
@@ -61,6 +64,25 @@ fn whole(mut spec: MultiTableReadQuery) -> MultiTableReadQuery {
     spec
 }
 
+/// The composite key naming a ticket's user: `(org, assignee)` on the
+/// ticket, `(org, id)` on the user. The tables' `org` columns take two
+/// values, so half the single-column matches fail the pair.
+fn org_user_key() -> (ColumnName, ColumnName) {
+    (
+        ColumnName::composite(["org", "assignee"]),
+        ColumnName::composite(["org", "id"]),
+    )
+}
+
+/// The composite key naming a user's profile: `(org, id)` on the user,
+/// `(org, user_id)` on the profile.
+fn org_profile_key() -> (ColumnName, ColumnName) {
+    (
+        ColumnName::composite(["org", "id"]),
+        ColumnName::composite(["org", "user_id"]),
+    )
+}
+
 /// The subscriptions under test, by name.
 fn specs() -> Vec<(&'static str, MultiTableReadQuery)> {
     let users = || MultiTableReadQuery::single(all("users"));
@@ -70,6 +92,17 @@ fn specs() -> Vec<(&'static str, MultiTableReadQuery)> {
     };
     let from_main = |sub, main: &str, column: &str| Join::inner_from_main(sub, main, column);
     let from_sub = |sub, main: &str, column: &str| Join::inner(sub, main, column);
+    let org_user = org_user_key;
+    let org_profile = org_profile_key;
+    let users_with_org_profiles =
+        |driver: fn(MultiTableReadQuery, ColumnName, ColumnName) -> Join| {
+            let (main, sub) = org_profile();
+            MultiTableReadQuery::new(all("users"), vec![driver(profiles(), main, sub)])
+        };
+    let composite_from_main =
+        |sub, main: ColumnName, column: ColumnName| Join::inner_from_main(sub, main, column);
+    let composite_from_sub =
+        |sub, main: ColumnName, column: ColumnName| Join::inner(sub, main, column);
     vec![
         (
             "inner from the main",
@@ -213,14 +246,116 @@ fn specs() -> Vec<(&'static str, MultiTableReadQuery)> {
                 )],
             ),
         ),
+        (
+            "inner from the main on a composite key",
+            MultiTableReadQuery::new(
+                node("tickets", open(), &[], u32::MAX),
+                vec![Join::inner_from_main(users(), org_user().0, org_user().1)],
+            ),
+        ),
+        (
+            "inner from the sub on a composite key",
+            MultiTableReadQuery::new(
+                node("tickets", open(), &[], u32::MAX),
+                vec![Join::inner(users(), org_user().0, org_user().1)],
+            ),
+        ),
+        (
+            "a composite chain from the main",
+            MultiTableReadQuery::new(
+                node("tickets", open(), &[], u32::MAX),
+                vec![Join::inner_from_main(
+                    users_with_org_profiles(composite_from_main),
+                    org_user().0,
+                    org_user().1,
+                )],
+            ),
+        ),
+        (
+            "a composite chain from the subs",
+            MultiTableReadQuery::new(
+                node("tickets", open(), &[], u32::MAX),
+                vec![Join::inner(
+                    users_with_org_profiles(composite_from_sub),
+                    org_user().0,
+                    org_user().1,
+                )],
+            ),
+        ),
+        (
+            "a composite edge beside a plain one",
+            MultiTableReadQuery::new(
+                node("tickets", open(), &[], u32::MAX),
+                vec![
+                    Join::inner_from_main(users(), org_user().0, org_user().1),
+                    Join::inner(
+                        MultiTableReadQuery::single(node(
+                            "teams",
+                            Where::condition("active", ComparisonOperator::EQ, Value::Int(1)),
+                            &[],
+                            u32::MAX,
+                        )),
+                        "team",
+                        "id",
+                    ),
+                ],
+            ),
+        ),
+        (
+            "a page under a composite gate",
+            MultiTableReadQuery::new(
+                node("tickets", open(), &[("project", Order::DESC)], 3),
+                vec![Join::inner_from_main(users(), org_user().0, org_user().1)],
+            ),
+        ),
+        (
+            "a page under a composite gate, read whole",
+            whole(MultiTableReadQuery::new(
+                node("tickets", open(), &[], 3),
+                vec![Join::inner_from_main(users(), org_user().0, org_user().1)],
+            )),
+        ),
+        (
+            "a composite gate inside OR",
+            MultiTableReadQuery::new(
+                node(
+                    "tickets",
+                    Where::AND(vec![
+                        open(),
+                        Where::OR(vec![
+                            Where::condition("project", ComparisonOperator::EQ, Value::Int(0)),
+                            Where::exists(org_user().0, 0),
+                        ]),
+                    ]),
+                    &[("project", Order::ASC)],
+                    4,
+                ),
+                vec![Join::inner_from_main(users(), org_user().0, org_user().1)],
+            ),
+        ),
+        (
+            "a page per parent on a composite key under a composite gate",
+            MultiTableReadQuery::new(
+                node("teams", Where::AND(Vec::new()), &[], u32::MAX),
+                vec![Join::left(
+                    MultiTableReadQuery::new(
+                        node("tickets", open(), &[("project", Order::DESC)], 2),
+                        vec![Join::inner_from_main(users(), org_user().0, org_user().1)],
+                    ),
+                    ColumnName::composite(["org", "id"]),
+                    ColumnName::composite(["org", "team"]),
+                )],
+            ),
+        ),
     ]
 }
 
-/// A row's value in `column`.
+/// A row's value in `column`, a composite key's as the list of its
+/// components ([`ColumnName::of`]).
 fn value_of(row: &DataFrameRow, column: &ColumnName) -> Value {
-    row.data
-        .get(column.as_str())
-        .cloned()
+    column
+        .of(&row.data)
+        .map(std::borrow::Cow::into_owned)
         .unwrap_or(Value::Null)
 }
 
@@ -362,6 +497,128 @@ fn actual(
     }
 }
 
+/// A page per parent under a gate recalls a candidate it dropped with
+/// one read across its windows, issued on behalf of one of them; the read
+/// must land into the other windows even when the window it was issued
+/// for is gone by then. Tickets 13 and 14 are assigned to user 4 before
+/// user 4 exists, so the pages of teams 0 and 2 drop them; user 4
+/// arrives, the recall goes out, and the team whose window issued it is
+/// deleted before the read lands: the other team's ticket comes back.
+#[test]
+fn a_recall_lands_after_the_window_that_issued_it_is_gone() {
+    let storage = MemoryStorage::new();
+    let mut runtime = Runtime::new(MultiTableIVM::new());
+    let mut lsn = 0u64;
+    let key =
+        |id: i64| DataFrameKey::new(HashMap::from([(ColumnName::from("id"), Value::Int(id))]));
+    let insert = |table: &str, id: i64, pairs: &[(&str, i64)]| -> WriteQuery {
+        let mut data: HashMap<ColumnName, Value> = pairs
+            .iter()
+            .map(|(column, value)| ((*column).into(), Value::Int(*value)))
+            .collect();
+        data.insert("id".into(), Value::Int(id));
+        WriteQuery::INSERT(InsertQuery {
+            table: TableName::from(table),
+            pkey_value: key(id),
+            record: DataFrameRow::from(data),
+        })
+    };
+    let ticket = |id: i64, team: i64, assignee: i64| {
+        insert(
+            "tickets",
+            id,
+            &[
+                ("open", 1),
+                ("assignee", assignee),
+                ("project", 1),
+                ("team", team),
+            ],
+        )
+    };
+    for write in [
+        insert("teams", 0, &[("active", 1)]),
+        insert("teams", 2, &[("active", 1)]),
+        insert("users", 3, &[("rank", 1)]),
+        ticket(5, 0, 3),
+        ticket(6, 2, 3),
+    ] {
+        storage.apply(&write);
+        lsn += 1;
+    }
+    runtime.progress(Lsn(lsn));
+    let spec = specs()
+        .into_iter()
+        .find(|(name, _)| *name == "a page per parent under a gate")
+        .map(|(_, spec)| spec)
+        .expect("the shape");
+    let (sub, step) = runtime.register(spec.clone());
+    let mut out: Vec<Fetch> = step.selects;
+    let land_all = |runtime: &mut Runtime<MultiTableIVM>, out: &mut Vec<Fetch>, lsn: u64| {
+        while let Some(fetch) = out.pop() {
+            let snapshot = Snapshot {
+                rows: storage.rows(&fetch.query),
+                at: Lsn(lsn),
+            };
+            out.extend(runtime.fetched(fetch.id, snapshot).selects);
+        }
+    };
+    let shown = |runtime: &Runtime<MultiTableIVM>| {
+        let mut shown = BTreeMap::new();
+        actual(runtime.engine(), sub, &spec, Vec::new(), &mut shown);
+        shown
+    };
+    land_all(&mut runtime, &mut out, lsn);
+    assert_eq!(shown(&runtime), expected(&spec, &storage), "registered");
+
+    for write in [ticket(13, 0, 4), ticket(14, 2, 4)] {
+        storage.apply(&write);
+        lsn += 1;
+        out.extend(runtime.write(&write, Lsn(lsn)).selects);
+    }
+    land_all(&mut runtime, &mut out, lsn);
+    assert_eq!(
+        shown(&runtime),
+        expected(&spec, &storage),
+        "user 4 does not exist: 13 and 14 are not shown"
+    );
+
+    let arrives = insert("users", 4, &[("rank", 1)]);
+    storage.apply(&arrives);
+    lsn += 1;
+    let mut selects = runtime.write(&arrives, Lsn(lsn)).selects;
+    let recalled = selects
+        .iter()
+        .position(|fetch| fetch.kind == FetchKind::Lookup)
+        .expect("the pages recall the value they dropped");
+    let recall = selects.remove(recalled);
+    out.extend(selects);
+    let issuer_team = runtime
+        .engine()
+        .describe(sub)
+        .iter()
+        .find_map(|line| {
+            let rest = line.split(&format!("{:?} for Int(", recall.sub)).nth(1)?;
+            rest.split(')').next()?.parse::<i64>().ok()
+        })
+        .expect("the recall was issued on behalf of one team's window");
+    let gone = WriteQuery::DELETE(DeleteQuery {
+        table: TableName::from("teams"),
+        pkey_value: key(issuer_team),
+    });
+    storage.apply(&gone);
+    lsn += 1;
+    out.extend(runtime.write(&gone, Lsn(lsn)).selects);
+    land_all(&mut runtime, &mut out, lsn);
+    out.push(recall);
+    land_all(&mut runtime, &mut out, lsn);
+    assert_eq!(
+        shown(&runtime),
+        expected(&spec, &storage),
+        "the surviving team's ticket for user 4 is back: {:#?}",
+        runtime.engine().describe(sub)
+    );
+}
+
 /// A small deterministic generator.
 struct Random(u64);
 
@@ -385,11 +642,17 @@ fn random_write(
         0..=4 => (
             "tickets",
             14,
-            vec![("open", 2), ("assignee", 5), ("project", 4), ("team", 3)],
+            vec![
+                ("open", 2),
+                ("assignee", 5),
+                ("project", 4),
+                ("team", 3),
+                ("org", 2),
+            ],
         ),
-        5..=6 => ("users", 5, vec![("rank", 3)]),
-        7..=8 => ("profiles", 6, vec![("user_id", 5)]),
-        _ => ("teams", 3, vec![("active", 2)]),
+        5..=6 => ("users", 5, vec![("rank", 3), ("org", 2)]),
+        7..=8 => ("profiles", 6, vec![("user_id", 5), ("org", 2)]),
+        _ => ("teams", 3, vec![("active", 2), ("org", 2)]),
     };
     let id = random.below(ids);
     let key = DataFrameKey::new([("id", Value::Int(id))]);
@@ -430,10 +693,10 @@ fn random_write(
 /// what it produced and the trees' state.
 fn run(seed: u64, steps: usize) {
     let _ = (
-        table("tickets", &["open", "assignee", "project", "team"]),
-        table("users", &["rank"]),
-        table("profiles", &["user_id"]),
-        table("teams", &["active"]),
+        table("tickets", &["open", "assignee", "project", "team", "org"]),
+        table("users", &["rank", "org"]),
+        table("profiles", &["user_id", "org"]),
+        table("teams", &["active", "org"]),
     );
     let storage = Rc::new(MemoryStorage::new());
     let mut ivm: Ivm = Local::new(MultiTableIVM::new(), storage.clone());

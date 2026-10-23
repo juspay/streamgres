@@ -56,6 +56,8 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 ///   for reads.
 /// - `read_connections`: how many storage reads may hold a connection at
 ///   once.
+/// - `read_idle_connections`: how many read connections to keep open for
+///   reuse after their reads finish.
 /// - `read_timeout`: how long one storage read may take before it is
 ///   given up and refused; zero for no limit.
 /// - `read_threads`: how many threads the reads pool runs on.
@@ -69,12 +71,16 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub dsn: String,
+    /// Endpoint for ordinary SQL reads; may be a PgBouncer transaction pool.
+    /// Snapshot minting and replication always use `dsn` above.
+    pub read_dsn: String,
     pub slot: String,
     pub slot_cleanup_age: Duration,
     pub publication: String,
     pub schemas: Vec<String>,
     pub snapshot_rotation: Duration,
     pub read_connections: usize,
+    pub read_idle_connections: usize,
     pub read_timeout: Duration,
     pub read_threads: usize,
     pub keepalive: Keepalive,
@@ -356,12 +362,19 @@ pub async fn start(
         .parse()
         .map_err(|error| format!("connecting the storage: {error}"))?;
     settings.keepalive.apply(&mut config);
-    let pg = PgStorage::connect_configured(config, catalog.load(), reads)
-        .await
-        .map_err(|error| format!("connecting the storage: {error}"))?
-        .with_rotation(settings.snapshot_rotation)
-        .with_read_connections(settings.read_connections)
-        .with_read_timeout(settings.read_timeout);
+    let mut read_config: tokio_postgres::Config = settings
+        .read_dsn
+        .parse()
+        .map_err(|error| format!("connecting the read pool: {error}"))?;
+    settings.keepalive.apply(&mut read_config);
+    let pg =
+        PgStorage::connect_configured_with_read_config(config, read_config, catalog.load(), reads)
+            .await
+            .map_err(|error| format!("connecting the storage: {error}"))?
+            .with_rotation(settings.snapshot_rotation)
+            .with_read_connections(settings.read_connections)
+            .with_read_idle_connections(settings.read_idle_connections)
+            .with_read_timeout(settings.read_timeout);
     let pg = Arc::new(pg);
     let (feed, feed_handle) = spawn_feed(
         settings.clone(),

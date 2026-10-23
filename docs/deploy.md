@@ -71,11 +71,14 @@ branch name and the short commit SHA.
   `max_replication_slots` and `max_wal_senders`. Each server uses one slot
   for its change feed, `xyne_sync_slot_<uuid>`, plus short-lived ones,
   `xyne_sync_snap_*`, behind its read snapshots.
-- **Spare connections.** Allow about 40 connections:
-  `STREAMGRES_READ_CONNECTIONS`, plus the feed, plus a few more.
+- **Spare connections.** Without PgBouncer, allow about
+  `STREAMGRES_READ_CONNECTIONS` direct read connections, plus the feed and a
+  few snapshot-minting connections. With PgBouncer, size PostgreSQL's read
+  connection budget for PgBouncer's server pool instead.
 - **A role** with `REPLICATION` and `SELECT` on the served schemas.
-- **A direct connection, not PgBouncer.** Logical replication does not pass
-  through PgBouncer.
+- **A direct connection for replication.** `STREAMGRES_PG_DSN` connects
+  directly to PostgreSQL for the logical feed and snapshot minting.
+  Replication must not use the read pool.
 
 The change feed writes nothing to the database it follows. Its position comes
 from commits and PostgreSQL keepalives. `STREAMGRES_PG_DSN` can point at:
@@ -84,20 +87,29 @@ from commits and PostgreSQL keepalives. `STREAMGRES_PG_DSN` can point at:
 - a physical standby (PostgreSQL 16 or later, the first version that can do
   logical decoding on a standby).
 
-Startup setup uses `STREAMGRES_MASTER_PG_DSN` to connect to the writable primary.
-It creates the `<app>_<shard>` mutation schema, publication, DDL functions, and
-event triggers when absent. Existing objects are checked without replacement;
-a mismatch stops startup. The master role must be a PostgreSQL superuser to
-create the publication and event triggers.
+Ordinary SQL reads can optionally use a separate endpoint:
+`STREAMGRES_READ_PG_DSN` may point to PgBouncer configured for transaction
+pooling. It defaults to `STREAMGRES_PG_DSN`, preserving direct reads when
+unset. The PgBouncer database must resolve to the same PostgreSQL database
+and server as the direct DSN: each read imports a snapshot minted over the
+direct connection. Reads run in one `BEGIN`/`COMMIT` transaction, so the
+PgBouncer backend remains assigned through snapshot import and query. Keep
+the feed and snapshot minting on the direct DSN. `STREAMGRES_READ_CONNECTIONS`
+limits concurrent reads sent toward PgBouncer; `STREAMGRES_READ_IDLE_CONNECTIONS`
+limits how many Streamgres-to-PgBouncer client connections remain open while
+idle. PgBouncer's own pool settings control the PostgreSQL backend connections.
 
 ### Startup setup
 
-Choose `STREAMGRES_PUBLICATION` and `STREAMGRES_SCHEMAS`. On first startup,
-Streamgres creates the publication and the schema-change trigger stack on the
-primary. Existing objects must match the configured app ID, shard, publication,
-and expected definitions. The trigger names and WAL prefix are derived from
-`STREAMGRES_APP_ID` and `STREAMGRES_SHARD`. During a migration, the triggers
-record the published schema before and after the DDL in that transaction's WAL.
+`STREAMGRES_MASTER_PG_DSN` connects to the writable primary. On first startup,
+Streamgres creates the `<app>_<shard>` mutation schema, publication, DDL
+functions, and event triggers. Existing objects are validated without
+replacement; mismatches stop startup. The master role must be a PostgreSQL
+superuser to create the publication and event triggers. Choose
+`STREAMGRES_PUBLICATION` and `STREAMGRES_SCHEMAS` for the publication scope.
+Trigger names and the WAL message prefix come from `STREAMGRES_APP_ID` and
+`STREAMGRES_SHARD`; the triggers record the published schema before and after
+DDL in that transaction's WAL.
 
 ### Replication slots
 
@@ -193,10 +205,13 @@ directory is read first, and variables already set take precedence.
 
 | variable | meaning |
 |---|---|
-| `STREAMGRES_PG_DSN` | the PostgreSQL to follow, reached directly (section 3) |
+| `STREAMGRES_PG_DSN` | direct PostgreSQL endpoint for catalog, feed and snapshot minting (section 3) |
 | `STREAMGRES_MASTER_PG_DSN` | writable primary used during startup setup |
 | `STREAMGRES_QUERY_URL` | the application server's query endpoint |
 | `STREAMGRES_MUTATE_URL` | the application server's mutate endpoint |
+
+`STREAMGRES_READ_PG_DSN` is optional. Set it to the PgBouncer endpoint for
+reads; when unset, reads use `STREAMGRES_PG_DSN` directly.
 
 ### Set explicitly
 
@@ -216,7 +231,8 @@ depend on what the defaults happen to be:
 | `STREAMGRES_GROUP_TTL_MS` | `3600000` | `60000` | how long a disconnected client group's state is kept. A client back within it resumes instead of re-downloading everything |
 | `STREAMGRES_GROUP_THREADS` | `2` | `1` | threads that build and send updates to clients |
 | `STREAMGRES_READ_THREADS` | `4` | `2` | threads that run and decode database reads |
-| `STREAMGRES_READ_CONNECTIONS` | `32` | `16` | database connections for reads |
+| `STREAMGRES_READ_CONNECTIONS` | `32` | `16` | maximum concurrent storage reads; limits how many requests Streamgres can send to PostgreSQL/PgBouncer at once |
+| `STREAMGRES_READ_IDLE_CONNECTIONS` | `16` | `16` | maximum read connections Streamgres keeps idle for reuse; `0` closes them after use. With transaction pooling these are idle PgBouncer client connections, not PostgreSQL backends |
 | `STREAMGRES_ROW_LIMIT` | sized to your data | `100000` | the most rows read into memory at once. A larger read is refused, and the query named in logs and metrics |
 | `STREAMGRES_PLAN_FILE` | `/var/lib/streamgres/plans.json` | unset | query shapes seen so far, planned again at startup, so the first clients after a restart are fast. Needs a writable volume |
 | `STREAMGRES_LOG_FORMAT` | `json` | `text` | already set in the image |
@@ -236,8 +252,8 @@ depend on what the defaults happen to be:
 | `STREAMGRES_BACKEND_TIMEOUT_MS` | `30000` | longest a call to the application server may take. `0` means no limit |
 | `STREAMGRES_PG_KEEPALIVE_IDLE_MS`, `_INTERVAL_MS`, `_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on database connections. `0` idle time turns it off |
 | `STREAMGRES_JOIN_PREFERRED_SIDE` | `parent` | which side drives a join when both plans cost the same |
-| `STREAMGRES_PLAN_QUERY_TTL_MS` | `86400000` | how long one plan is reused for every query of the same name and join shape. `0` plans every query separately |
-| `STREAMGRES_PLAN_TTL_MS`, `STREAMGRES_PLAN_CACHE` | `600000`, `10000` | how long refused plans are remembered, and how many plans are kept |
+| `STREAMGRES_PLAN_TTL_MS`, `STREAMGRES_PLAN_CACHE` | `600000`, `10000` | how long each query tree's plan (or refusal) is remembered before it is sized again, and how many are kept. A tree is sized from PostgreSQL's estimates (`EXPLAIN` and `pg_stats`, nothing executed; a page without its cursor), and a side that cannot be estimated is counted |
+| `STREAMGRES_ESTIMATE_TTL_MS`, `STREAMGRES_ESTIMATE_CACHE` | `86400000`, `300000` | how long the planner's estimates (each `EXPLAIN` by its text, each join column's statistics) are remembered, and how many. A table's estimates are also dropped when its `reltuples`/`relpages` change (an `ANALYZE` or `VACUUM`, read every 5 minutes) and on a schema change; `0` keeps none, but a statement already being asked is still shared |
 | `STREAMGRES_TRANSFORM_TTL_MS`, `STREAMGRES_TRANSFORM_CACHE` | `60000`, `20000` | how long query ASTs from the application server are cached per user, and how many |
 | `STREAMGRES_WARM_START_MS` | `20000` | most time spent re-planning saved query shapes at startup |
 | `STREAMGRES_PING_INTERVAL_MS`, `STREAMGRES_CLIENT_TIMEOUT_MS`, `STREAMGRES_PONG_INTERVAL_MS` | `30000`, `45000`, `3000` | connection liveness |
@@ -321,7 +337,7 @@ though nothing is wrong.
 ## 9. Known limits
 
 - **Unsupported queries are refused, not run.** This covers `LIKE`/`ILIKE`,
-  `NOT EXISTS`, compound join keys, and any read over `STREAMGRES_ROW_LIMIT`.
+  `NOT EXISTS`, and any read over `STREAMGRES_ROW_LIMIT`.
   Each one is refused by name, in `/stats.refused_queries` and in the
   `query refused` log event. The client sees that one query fail; the rest of
   the app is unaffected.

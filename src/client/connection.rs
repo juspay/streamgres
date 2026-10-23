@@ -110,6 +110,7 @@ struct QueuedPush {
 enum PushWork {
     Mutations {
         push: protocol::Push,
+        ack_attempts: Vec<(protocol::MutationId, u64)>,
         identity: Identity,
     },
     Cleanup {
@@ -275,7 +276,6 @@ async fn stats(
 ) -> axum::Json<Json> {
     let mut body = state.stats.json();
     body["plans_cached"] = json!(state.plans.len());
-    body["plan_queries"] = json!(state.plans.queries());
     body["group_threads"] = json!(state.requests.len());
     if query
         .get("reset")
@@ -1034,11 +1034,19 @@ impl Conn {
             );
             return;
         }
-        for mutation in &push.mutation_ids {
-            self.state.stats.push_sent(&mutation.client_id, mutation.id);
-        }
+        let ack_attempts = push
+            .mutation_ids
+            .iter()
+            .map(|mutation| {
+                (
+                    mutation.clone(),
+                    self.state.stats.push_sent(&mutation.client_id, mutation.id),
+                )
+            })
+            .collect();
         self.queue_push(PushWork::Mutations {
             push,
+            ack_attempts,
             identity: self.identity.clone(),
         })
         .await;
@@ -1060,8 +1068,12 @@ async fn push_loop(
     while let Some(QueuedPush { queued, work }) = pushes.recv().await {
         state.stats.push_queue.record(queued.elapsed());
         match work {
-            PushWork::Mutations { push, identity } => {
-                forward_push(&state, &params, &out, &identity, push).await;
+            PushWork::Mutations {
+                push,
+                ack_attempts,
+                identity,
+            } => {
+                forward_push(&state, &params, &out, &identity, push, ack_attempts).await;
             }
             PushWork::Cleanup { body, identity } => {
                 clean_up_results(&state, &params.wsid, &identity, body).await;
@@ -1081,6 +1093,7 @@ async fn forward_push(
     out: &mpsc::UnboundedSender<Outbound>,
     identity: &Identity,
     push: protocol::Push,
+    ack_attempts: Vec<(protocol::MutationId, u64)>,
 ) {
     let started = Instant::now();
     let outcome = state.backend.push(identity, &push.body).await;
@@ -1107,7 +1120,20 @@ async fn forward_push(
     );
     match outcome {
         PushOutcome::Response(json) => {
-            if let Some(reply) = direct_push_reply(&json, &push.mutation_ids) {
+            let reply = direct_push_reply(&json, &push.mutation_ids);
+            let accepted = accepted_push_attempts(&json, &ack_attempts);
+            for ((mutation, token), accepted) in ack_attempts.iter().zip(accepted) {
+                if accepted {
+                    state
+                        .stats
+                        .push_backend_accepted(&mutation.client_id, mutation.id, *token);
+                } else {
+                    state
+                        .stats
+                        .push_no_poke(&mutation.client_id, mutation.id, *token);
+                }
+            }
+            if let Some(reply) = reply {
                 if json.get("mutations").and_then(Json::as_array).is_none()
                     && json.get("kind").and_then(Json::as_str) != Some("PushFailed")
                 {
@@ -1127,12 +1153,85 @@ async fn forward_push(
             preview,
             message,
         } => {
+            for (mutation, token) in &ack_attempts {
+                state
+                    .stats
+                    .push_no_poke(&mutation.client_id, mutation.id, *token);
+            }
             send(
                 out,
                 protocol::push_failed(&push.mutation_ids, status, preview.as_deref(), &message),
             );
         }
     }
+}
+
+/// Which attempts the backend accepted far enough to expect an LMID poke.
+/// Unknown results are conservative: discard their timers rather than risk
+/// recording a push-to-poke duration for an attempt that was never processed.
+fn accepted_push_attempts(response: &Json, attempts: &[(protocol::MutationId, u64)]) -> Vec<bool> {
+    let rejected = || vec![false; attempts.len()];
+
+    if response.get("kind").and_then(Json::as_str) == Some("PushFailed") {
+        let Some(unprocessed) = response
+            .get("mutationIDs")
+            .and_then(Json::as_array)
+            .filter(|ids| !ids.is_empty())
+            .and_then(|ids| {
+                ids.iter()
+                    .map(parse_mutation_id)
+                    .collect::<Option<Vec<_>>>()
+            })
+        else {
+            return rejected();
+        };
+
+        // PushFailed lists the unprocessed suffix. Only trust it when it
+        // exactly matches this push; otherwise the processed prefix is unknown.
+        if unprocessed.len() > attempts.len()
+            || !attempts[attempts.len() - unprocessed.len()..]
+                .iter()
+                .map(|(mutation, _)| mutation)
+                .eq(unprocessed.iter())
+        {
+            return rejected();
+        }
+
+        let accepted_count = attempts.len() - unprocessed.len();
+        return (0..attempts.len())
+            .map(|index| index < accepted_count)
+            .collect();
+    }
+
+    let Some(mutations) = response.get("mutations").and_then(Json::as_array) else {
+        return rejected();
+    };
+
+    attempts
+        .iter()
+        .map(|(attempt, _)| {
+            let Some(mutation) = mutations.iter().find(|mutation| {
+                mutation.get("id").and_then(parse_mutation_id).as_ref() == Some(attempt)
+            }) else {
+                return false;
+            };
+            match mutation.get("result").and_then(Json::as_object) {
+                Some(result) => match result.get("error") {
+                    None => true,
+                    Some(Json::String(error)) => error == "app",
+                    Some(_) => false,
+                },
+                None => false,
+            }
+        })
+        .collect()
+}
+
+fn parse_mutation_id(value: &Json) -> Option<protocol::MutationId> {
+    Some(protocol::MutationId {
+        client_id: value.get("clientID")?.as_str()?.to_owned(),
+        id: value.get("id")?.as_i64()?,
+    })
 }
 
 /// Send one cleanup push; its answer matters only to the counters and
@@ -1416,4 +1515,5 @@ mod tests {
             assert_eq!(reply[1]["kind"], "PushFailed", "{response}");
         }
     }
+
 }

@@ -2105,6 +2105,7 @@ mod tests {
                     planned: Some(Ok(Box::new(Translated {
                         query,
                         hidden: HashSet::new(),
+                        uncursored: None,
                     }))),
                 }],
             );
@@ -3441,6 +3442,7 @@ mod tests {
                                 planned: Some(Ok(Box::new(Translated {
                                     query,
                                     hidden: HashSet::new(),
+                                    uncursored: None,
                                 }))),
                             }],
                         );
@@ -4078,6 +4080,7 @@ mod tests {
                             planned: Some(Ok(Box::new(Translated {
                                 query,
                                 hidden: HashSet::new(),
+                                uncursored: None,
                             }))),
                         }],
                     );

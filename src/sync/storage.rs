@@ -97,6 +97,16 @@ pub trait Storage {
         count_by_select(self, query, cap).await
     }
 
+    /// The rows [`Storage::count`] would count, estimated rather than
+    /// counted, no higher than `cap`: what a planner asks instead of the
+    /// count when the count's own cost is the one to avoid. An estimate
+    /// may be off either way; an error says the tree cannot be estimated
+    /// (the caller counts it instead). A source with no estimates of its
+    /// own counts.
+    async fn estimate(&self, query: &MultiTableReadQuery, cap: u64) -> Result<u64, StorageError> {
+        self.count(query, cap).await
+    }
+
     /// The stream has been delivered (and applied by the engine) up to
     /// `feed`: a snapshot at or below it may now serve reads.
     fn advance(&self, feed: Lsn);
@@ -171,10 +181,10 @@ fn matching_rows<'a, S: Storage + ?Sized>(
             let mut carried = HashSet::new();
             if join.is_inner {
                 for (_, row) in matching_rows(storage, &join.sub).await? {
-                    if let Some(value) = row.data.get(&join.sub_table_column)
+                    if let Some(value) = join.sub_table_column.of(&row.data)
                         && !value.is_null()
                     {
-                        carried.insert(value.clone());
+                        carried.insert(value.into_owned());
                     }
                 }
             }
@@ -195,9 +205,9 @@ fn matching_rows<'a, S: Storage + ?Sized>(
             .filter(|(_, row)| {
                 let carries = |position: usize| {
                     let join = &node.joins[position];
-                    row.data
-                        .get(&join.main_table_column)
-                        .is_some_and(|value| values[position].contains(value))
+                    join.main_table_column
+                        .of(&row.data)
+                        .is_some_and(|value| values[position].contains(&*value))
                 };
                 let exists =
                     |leaf: &Condition| exists_position(&inner, &leaf.value).is_some_and(carries);
