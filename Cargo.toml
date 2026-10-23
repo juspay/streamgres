@@ -1,5 +1,8 @@
 [workspace]
 members = ["crates/*"]
+# A dependency of the engine, built as one but kept out of the
+# workspace's lints and tests.
+exclude = ["vendor/pgwire-replication"]
 
 [package]
 name = "streamgres"
@@ -70,7 +73,12 @@ uuid = { version = "1", features = ["v4"] }
 # connection speaking START_REPLICATION with the `pgoutput` plugin, and the
 # row messages it carries, decoded. Apache-2.0 OR MIT and MIT respectively;
 # TLS is left off, as it is for tokio-postgres above.
-pgwire-replication = { version = "0.4", default-features = false, features = ["scram"] }
+# A copy of pgwire-replication 0.4.0 that can make its slot a temporary one
+# (vendor/pgwire-replication/VENDORED.md), under its own package name so a
+# graph that also has the released crate never mistakes one for the other.
+# A path, not a `[patch]`: a dependent's build ignores this workspace's
+# patches, and would get the released crate without the change.
+pgwire-replication = { package = "streamgres-pgwire-replication", version = "0.4.0", path = "vendor/pgwire-replication", default-features = false, features = ["scram"] }
 pgoutput = "0.0.7"
 # The replication-protocol connection that mints exported snapshots
 # (`src/sync/pg/replication.rs`): tokio-postgres cannot open one, so the
@@ -145,8 +153,3 @@ debug = "limited"
 # `tokio_unstable` is set with `RUSTFLAGS="--cfg tokio_unstable"` for
 # `tokio-console` builds (see the `console` feature).
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
-
-# A pgwire-replication that can make its slot a temporary one on the
-# replication connection (vendor/pgwire-replication/VENDORED.md).
-[patch.crates-io]
-pgwire-replication = { path = "vendor/pgwire-replication" }

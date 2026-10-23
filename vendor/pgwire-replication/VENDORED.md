@@ -10,5 +10,11 @@ ends, however it ends, so an engine killed outright leaves no slot holding
 WAL. A temporary slot can only be streamed by the connection that made it,
 which is why it cannot be made beforehand with an ordinary query.
 
-The root `Cargo.toml` points `[patch.crates-io]` here. Once the same option
-is released upstream, drop this directory and the patch.
+It is packaged as `streamgres-pgwire-replication` (its library is still
+`pgwire_replication`), and the root `Cargo.toml` depends on it by path
+under the name `pgwire-replication`. A path rather than a
+`[patch.crates-io]`: a crate that depends on Streamgres builds with its own
+workspace's patches, not this one's, and would get the released crate
+without the change (`scripts/check-downstream.sh` builds the crates from
+outside the workspace to keep it so). Once the same option is released
+upstream, drop this directory and depend on the release.

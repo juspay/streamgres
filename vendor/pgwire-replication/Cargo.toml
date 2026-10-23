@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 rust-version = "1.88"
-name = "pgwire-replication"
+name = "streamgres-pgwire-replication"
 version = "0.4.0"
 authors = ["Vahid Negahdari <vahid.negahdari@gmail.com>"]
 build = false

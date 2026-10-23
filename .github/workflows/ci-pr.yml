@@ -52,6 +52,9 @@ jobs:
       - name: Clippy, warnings denied, the engine without the server
         run: cargo clippy -p streamgres --no-default-features --lib --tests --bins --locked -- -D warnings
 
+      - name: The crates build as another project's dependencies
+        run: scripts/check-downstream.sh
+
   test:
     name: Tests (accuracy)
     runs-on: ubuntu-latest

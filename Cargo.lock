@@ -1824,22 +1824,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03462d520225c102d2a2ab96f12ac90abdbcbc1161e9aa0e1f007e315ecfed16"
 
 [[package]]
-name = "pgwire-replication"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bytes",
- "hmac 0.12.1",
- "rand 0.9.5",
- "sha2 0.10.9",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "phf"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2724,7 +2708,6 @@ dependencies = [
  "once_cell",
  "percent-encoding",
  "pgoutput",
- "pgwire-replication",
  "postgres-protocol",
  "pyroscope",
  "reqwest 0.12.28",
@@ -2733,6 +2716,7 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2",
+ "streamgres-pgwire-replication",
  "tikv-jemallocator",
  "tokio",
  "tokio-postgres",
@@ -2755,6 +2739,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "streamgres-pgwire-replication"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "hmac 0.12.1",
+ "rand 0.9.5",
+ "sha2 0.10.9",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
