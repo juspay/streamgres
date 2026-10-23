@@ -2,7 +2,8 @@
 //! session the S2S frames over channels, starts over on a fresh
 //! temporary slot when its feed is cut, and leaves no slot behind when it
 //! stops. Needs `STREAMGRES_PG_DSN` with `wal_level = logical`; skips
-//! itself otherwise.
+//! itself otherwise. Each test runs in a database of its own
+//! ([`support::Database`]), its trigger stack with it.
 
 use std::time::{Duration, Instant};
 
@@ -10,14 +11,13 @@ use serde_json::{Value, json};
 use streamgres::embedded::{Config, Engine, Session, Setup, State, setup_sql};
 use tokio_postgres::{Client, NoTls};
 
+mod support;
 
-/// The database, when the test is given one.
-fn dsn() -> Option<String> {
-    let dsn = std::env::var("STREAMGRES_PG_DSN").ok();
-    if dsn.is_none() {
-        eprintln!("STREAMGRES_PG_DSN not set: embedded live scenario skipped");
-    }
-    dsn
+use support::Database;
+
+/// A database of the test tagged `tag`'s own, when a server is given.
+fn dsn(tag: &str) -> Option<Database> {
+    Database::create(&format!("embedded_{tag}"))
 }
 
 /// A connection for the test's own statements.
@@ -67,24 +67,6 @@ async fn set_up(client: &Client, names: &Names) {
         .expect("set up the trigger stack");
 }
 
-/// Removes what [`set_up`] made, the trigger stack included: its event
-/// triggers fire on every statement that changes a schema in the
-/// database, other tests' too, for as long as they are installed.
-async fn tear_down(client: &Client, names: &Names) {
-    let app = &names.app;
-    let _ = client
-        .batch_execute(&format!(
-            "DROP EVENT TRIGGER IF EXISTS {app}_ddl_start_0;
-             DROP EVENT TRIGGER IF EXISTS {app}_ddl_end_0;
-             DROP SCHEMA IF EXISTS {app}_0 CASCADE;
-             DROP TABLE IF EXISTS {table};
-             DROP PUBLICATION IF EXISTS {publication};",
-            table = names.table,
-            publication = names.publication,
-        ))
-        .await;
-}
-
 /// An engine's configuration for a test's names.
 fn config(dsn: &str, names: &Names) -> Config {
     let mut config = Config::new(dsn);
@@ -132,7 +114,7 @@ async fn next(session: &mut Session) -> Option<Value> {
 /// The engine's whole life: start, serve, a cut feed, a fresh start, stop.
 #[test]
 fn an_embedded_engine_serves_restarts_and_leaves_no_slot() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("life") else { return };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -203,7 +185,6 @@ fn an_embedded_engine_serves_restarts_and_leaves_no_slot() {
         }
         assert!(engine.connect().is_err(), "no session once stopped");
         assert_eq!(engine.slot(), None);
-        tear_down(&client, &names).await;
     });
 }
 
@@ -211,7 +192,7 @@ fn an_embedded_engine_serves_restarts_and_leaves_no_slot() {
 /// once, not when the transaction ends, and leaves no slot behind.
 #[test]
 fn a_stop_while_the_start_is_held_back_returns_at_once() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("stop") else { return };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -249,19 +230,16 @@ fn a_stop_while_the_start_is_held_back_returns_at_once() {
             .expect("slots")
             .get(0);
         assert_eq!(leftover, 0, "no slot left behind");
-        tear_down(&client, &names).await;
     });
 }
 
 /// An engine on a database nobody set up sets it up itself: the
 /// publication and the trigger stack, once, however many engines start
 /// together; it then serves, and follows a schema change. One told to
-/// require the setup refuses a database without it. On a database of its
-/// own: event triggers fire for every statement in their database, other
-/// tests' too.
+/// require the setup refuses a database without it.
 #[test]
 fn an_engine_sets_up_a_database_nobody_set_up() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("setup") else { return };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -269,15 +247,6 @@ fn an_engine_sets_up_a_database_nobody_set_up() {
     runtime.block_on(async {
         let names = names("setup");
         let table = &names.table;
-        let server = admin(&dsn).await;
-        let database = format!("embedded_setup_{}", std::process::id());
-        for statement in [
-            format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"),
-            format!("CREATE DATABASE {database}"),
-        ] {
-            server.batch_execute(&statement).await.expect("a database of its own");
-        }
-        let dsn = with_database(&dsn, &database);
         let client = admin(&dsn).await;
         client
             .batch_execute(&format!(
@@ -347,11 +316,13 @@ fn an_engine_sets_up_a_database_nobody_set_up() {
             tokio::task::spawn_blocking(move || engine.stop()).await.expect("stop");
         }
         drop(session);
-        drop(client);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let held: i64 = server
-                .query_one("SELECT count(*) FROM pg_replication_slots WHERE database = $1", &[&database])
+            let held: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM pg_replication_slots WHERE database = current_database()",
+                    &[],
+                )
                 .await
                 .expect("slots")
                 .get(0);
@@ -361,27 +332,7 @@ fn an_engine_sets_up_a_database_nobody_set_up() {
             assert!(Instant::now() < deadline, "the slots outlived their engines");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        server
-            .batch_execute(&format!("DROP DATABASE {database} WITH (FORCE)"))
-            .await
-            .expect("drop its database");
     });
-}
-
-/// `dsn` with its database replaced by `database`, as a URL or as
-/// `key=value` pairs.
-fn with_database(dsn: &str, database: &str) -> String {
-    if dsn.contains("://") {
-        let (base, query) = dsn.split_once('?').map_or((dsn, None), |(base, query)| (base, Some(query)));
-        let (server, _) = base.rsplit_once('/').expect("a database in the URL");
-        let server = if server.ends_with('/') || server.ends_with(':') { base } else { server };
-        match query {
-            Some(query) => format!("{server}/{database}?{query}"),
-            None => format!("{server}/{database}"),
-        }
-    } else {
-        format!("{dsn} dbname={database}")
-    }
 }
 
 /// Making a slot waits for every transaction open at the time, so an
@@ -389,7 +340,7 @@ fn with_database(dsn: &str, database: &str) -> String {
 /// caller never waits, and the engine serves once it has.
 #[test]
 fn a_start_behind_an_open_transaction_does_not_block_the_caller() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("held") else { return };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -415,6 +366,5 @@ fn a_start_behind_an_open_transaction_does_not_block_the_caller() {
         tokio::task::spawn_blocking(move || stopping.stop())
             .await
             .expect("stop");
-        tear_down(&client, &names).await;
     });
 }

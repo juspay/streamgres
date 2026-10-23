@@ -4,8 +4,9 @@
 //! mirrored in memory; and schema changes followed through the
 //! schema-change trigger stack. They run only when `STREAMGRES_PG_DSN` names a
 //! database with `wal_level = logical` (and free replication slots), and
-//! report themselves skipped otherwise; each scenario uses its own tables
-//! and slot, so they can run in parallel.
+//! report themselves skipped otherwise; each scenario runs in a database
+//! of its own ([`support::Database`]), so they can run in parallel without
+//! one's schema-change triggers firing on another's statements.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
@@ -25,13 +26,13 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, NoTls};
 
-/// The database under test, if any.
-fn dsn() -> Option<String> {
-    let dsn = std::env::var("STREAMGRES_PG_DSN").ok();
-    if dsn.is_none() {
-        eprintln!("STREAMGRES_PG_DSN not set: live Postgres scenario skipped");
-    }
-    dsn
+mod support;
+
+use support::Database;
+
+/// A database of the test tagged `tag`'s own, if a server is named.
+fn dsn(tag: &str) -> Option<Database> {
+    Database::create(tag)
 }
 
 /// Run `body` on a current-thread runtime with a local task set (the
@@ -272,7 +273,7 @@ async fn drain(
 /// image.
 #[test]
 fn registration_behind_open_snapshot() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("registration_behind_open_snapshot") else { return };
     block_on(async {
         let names = Names::new("wal");
         let client = prepare(&dsn, &names).await;
@@ -391,7 +392,7 @@ fn registration_behind_open_snapshot() {
 /// holds, and the mirror follows the stream.
 #[test]
 fn service_streams_end_to_end() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("service_streams_end_to_end") else { return };
     block_on(async {
         let names = Names::new("service");
         let client = prepare(&dsn, &names).await;
@@ -558,7 +559,7 @@ fn service_streams_end_to_end() {
 /// into `mutationsPatch` entries.
 #[test]
 fn mutation_results_travel_the_feed() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("mutation_results_travel_the_feed") else { return };
     block_on(async {
         let names = Names::new("results");
         let client = prepare(&dsn, &names).await;
@@ -652,7 +653,7 @@ fn mutation_results_travel_the_feed() {
 /// connections, and every one of them succeeds.
 #[test]
 fn reads_queue_at_the_connection_bound() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("reads_queue_at_the_connection_bound") else { return };
     block_on(async {
         let names = Names::new("pool");
         let client = prepare(&dsn, &names).await;
@@ -702,7 +703,7 @@ fn reads_queue_at_the_connection_bound() {
 /// 10, so a planner learns whether a side fits without scanning it whole.
 #[test]
 fn a_count_stops_at_the_cap_on_the_snapshot() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("a_count_stops_at_the_cap_on_the_snapshot") else { return };
     block_on(async {
         let names = Names::new("count");
         let client = prepare(&dsn, &names).await;
@@ -799,7 +800,7 @@ fn a_count_stops_at_the_cap_on_the_snapshot() {
 /// passes the cap.
 #[test]
 fn an_estimate_sizes_a_tree_without_counting_it() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("an_estimate_sizes_a_tree_without_countin") else { return };
     block_on(async {
         let names = Names::new("estimate");
         let client = prepare(&dsn, &names).await;
@@ -888,7 +889,7 @@ fn an_estimate_sizes_a_tree_without_counting_it() {
 /// table.
 #[test]
 fn an_estimate_is_remembered_until_its_table_moves() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("an_estimate_is_remembered_until_its_tabl") else { return };
     block_on(async {
         let names = Names::new("estcache");
         let client = prepare(&dsn, &names).await;
@@ -948,7 +949,7 @@ fn an_estimate_is_remembered_until_its_table_moves() {
 /// window bounds it before the budget does.
 #[test]
 fn a_read_past_the_row_budget_is_refused() {
-    let Some(dsn) = dsn() else {
+    let Some(dsn) = dsn("a_read_past_the_row_budget_is_refused") else {
         return;
     };
     block_on(async {
@@ -1005,7 +1006,7 @@ fn a_read_past_the_row_budget_is_refused() {
 /// Postgres used to refuse.
 #[test]
 fn a_json_column_is_filtered_by_value() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("a_json_column_is_filtered_by_value") else { return };
     block_on(async {
         let table = "live_json_values";
         let slot = "xyne_sync_live_json";
@@ -1156,7 +1157,7 @@ fn a_json_column_is_filtered_by_value() {
 /// leaf on the key, counts through the edge's semi-join.
 #[test]
 fn a_compound_key_is_served_by_postgres() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("a_compound_key_is_served_by_postgres") else { return };
     block_on(async {
         let parents = "live_compound_parents";
         let children = "live_compound_children";
@@ -1287,7 +1288,7 @@ fn a_compound_key_is_served_by_postgres() {
 /// is set, the same test sends its reads through that endpoint.
 #[test]
 fn a_read_past_its_time_is_refused() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("a_read_past_its_time_is_refused") else { return };
     let read_dsn = std::env::var("STREAMGRES_READ_PG_DSN").unwrap_or_else(|_| dsn.clone());
     block_on(async {
         let names = Names::new("timeout");
@@ -1363,7 +1364,7 @@ fn a_read_past_its_time_is_refused() {
 /// storage are, which is what a server waits for before it serves.
 #[test]
 fn an_idle_feed_brings_the_first_snapshot_into_use() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("an_idle_feed_brings_the_first_snapshot_i") else { return };
     block_on(async {
         let names = Names::new("idle");
         let client = prepare(&dsn, &names).await;
@@ -1472,7 +1473,7 @@ fn owners_added(events: &[Event], table: &str) -> BTreeMap<i64, Option<Value>> {
 /// reason.
 #[test]
 fn schema_changes_follow_the_trigger() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("schema_changes_follow_the_trigger") else { return };
     block_on(async {
         let names = Names::new("ddl");
         let client = prepare(&dsn, &names).await;
@@ -1687,7 +1688,7 @@ fn schema_changes_follow_the_trigger() {
 /// the frame without `md`: the frame ends equal to what Postgres holds.
 #[test]
 fn unchanged_out_of_line_values_are_never_lost() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("unchanged_out_of_line_values_are_never_l") else { return };
     block_on(async {
         let names = Names::new("toast");
         let table = names.extra.clone();
@@ -1859,7 +1860,7 @@ fn unchanged_out_of_line_values_are_never_lost() {
 /// server whose default zone was not UTC, until each row's next write.
 #[test]
 fn a_time_range_is_read_right_in_any_session_zone() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("a_time_range_is_read_right_in_any_sessio") else { return };
     block_on(async {
         let table = "live_zone_events";
         let slot = "xyne_sync_live_zone";
@@ -1950,7 +1951,7 @@ fn a_time_range_is_read_right_in_any_session_zone() {
 /// with it, on every restart until the row was changed by hand.
 #[test]
 fn every_time_postgres_holds_reaches_the_engine() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("every_time_postgres_holds_reaches_the_en") else { return };
     block_on(async {
         let names = Names::new("infinite");
         let table = names.extra.clone();
@@ -2048,7 +2049,7 @@ fn every_time_postgres_holds_reaches_the_engine() {
 /// is.
 #[test]
 fn a_temporary_slot_skips_what_the_first_snapshot_holds() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("a_temporary_slot_skips_what_the_first_sn") else { return };
     block_on(async {
         let names = Names::new("temporary");
         let client = prepare(&dsn, &names).await;
