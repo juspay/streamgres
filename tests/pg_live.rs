@@ -2058,7 +2058,8 @@ fn a_temporary_slot_skips_what_the_first_snapshot_holds() {
                 names.tickets
             )
         };
-        let transport = Transport::open_temporary(&dsn, &names.slot, &names.publication)
+        let shutdown = streamgres::shutdown::Shutdown::new();
+        let transport = Transport::open_temporary(&dsn, &names.slot, &names.publication, &shutdown)
             .await
             .expect("a temporary slot");
         for id in 100..110 {

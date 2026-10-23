@@ -64,6 +64,10 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// new one, and the next start waits the shortest time again.
 const STEADY: Duration = Duration::from_secs(60);
 
+/// How long connecting to check the database may take, unless the DSN
+/// says (`connect_timeout`).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The advisory lock the engines of one database take to set it up, so
 /// processes starting together install the setup once.
 const SETUP_LOCK: i64 = 0x5354_5245_414d_5350; // "STREAMSP"
@@ -527,7 +531,20 @@ impl Supervisor {
         while !*self.stop.borrow() {
             self.state.send_replace(State::Starting);
             let started = Instant::now();
-            let reason = match runtime.block_on(launch(&self.config, &self.stats)) {
+            let shutdown = Shutdown::new();
+            let launched = runtime.block_on(async {
+                let launch = launch(&self.config, &self.stats, shutdown.clone());
+                tokio::pin!(launch);
+                let mut stop = self.stop.clone();
+                tokio::select! {
+                    launched = &mut launch => launched,
+                    _ = stop.wait_for(|stopped| *stopped) => {
+                        shutdown.request();
+                        launch.await
+                    }
+                }
+            });
+            let reason = match launched {
                 Ok(running) => {
                     *self.current.lock().expect("current") = Some(Arc::clone(&running.instance));
                     let reason = runtime.block_on(running.watch(&mut self.stop, &self.state));
@@ -538,6 +555,7 @@ impl Supervisor {
                     running.tear_down(&runtime);
                     reason
                 }
+                Err(_) if *self.stop.borrow() => None,
                 Err(reason) => {
                     self.state.send_replace(State::Down(reason.clone()));
                     Some(reason)
@@ -632,24 +650,23 @@ fn join_within(thread: JoinHandle<()>, name: &str) {
     }
 }
 
-/// Brings one engine up: the catalog, the schema-change trigger and room
-/// for its slots checked, the engine thread started, and the live task
-/// serving sessions once the feed has passed the first snapshot.
-async fn launch(config: &Config, stats: &Arc<Stats>) -> Result<Running, String> {
+/// Brings one engine up: the database checked and set up, the catalog
+/// loaded, the schema-change trigger required, the engine thread started,
+/// and the live task serving sessions once the feed has passed the first
+/// snapshot. A `shutdown` requested meanwhile ends a wait for the slot.
+async fn launch(config: &Config, stats: &Arc<Stats>, shutdown: Shutdown) -> Result<Running, String> {
     let settings = config.settings();
     prepare(config).await?;
     let catalog = Arc::new(CatalogHandle::new(
         threads::load_catalog_at(&settings.dsn, &settings.schemas).await?,
     ));
     threads::require_ddl_trigger(&settings.dsn, &settings.ddl_trigger).await?;
-    room_for_slots(&settings.dsn).await?;
     let io = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(settings.read_threads.max(1))
         .enable_all()
         .thread_name("streamgres-embedded-io")
         .build()
         .map_err(|error| format!("tokio: {error}"))?;
-    let shutdown = Shutdown::new();
     let (started_tx, started_rx) = oneshot::channel();
     let engine = {
         let catalog = Arc::clone(&catalog);
@@ -681,7 +698,13 @@ async fn launch(config: &Config, stats: &Arc<Stats>) -> Result<Running, String> 
         storage,
         feed,
     } = started;
-    let events = events.pop().ok_or("the engine started without its sink")?;
+    let Some(events) = events.pop() else {
+        shutdown.request();
+        let _ = threads::stop_feed(feed).await;
+        join_within(engine, "engine");
+        io.shutdown_background();
+        return Err("the engine started without its sink".to_owned());
+    };
     let (readiness, ready) = watch::channel(false);
     let (gated, gated_events) = mpsc::unbounded_channel();
     io.spawn(gate(events, gated, readiness));
@@ -793,18 +816,30 @@ fn covered(position: Lsn, floor: Lsn) -> bool {
     floor.0 != 0 && position >= floor
 }
 
-/// Readies the database for an engine: an error on a standby, an
-/// embedded engine being for the primary its backend writes to; with
-/// [`Setup::Install`], the publication and the trigger stack installed
-/// when either is missing. The checks after it require both.
+/// Readies the database for an engine, on one connection: an error on a
+/// standby, an embedded engine being for the primary its backend writes
+/// to; with [`Setup::Install`], the publication and the trigger stack
+/// installed when either is missing (the checks after it require both);
+/// and room for the engine's slots.
 async fn prepare(config: &Config) -> Result<(), String> {
-    let (client, connection) = tokio_postgres::connect(&config.dsn, tokio_postgres::NoTls)
+    let mut connect: tokio_postgres::Config = config
+        .dsn
+        .parse()
+        .map_err(|error| format!("STREAMGRES_PG_DSN: {error}"))?;
+    if connect.get_connect_timeout().is_none() {
+        connect.connect_timeout(CONNECT_TIMEOUT);
+    }
+    let (client, connection) = connect
+        .connect(tokio_postgres::NoTls)
         .await
         .map_err(|error| format!("connecting to the database: {error}"))?;
     let connection = tokio::spawn(async move {
         let _ = connection.await;
     });
-    let prepared = prepare_on(&client, config).await;
+    let prepared = match prepare_on(&client, config).await {
+        Ok(()) => room_for_slots(&client).await,
+        failed => failed,
+    };
     drop(client);
     let _ = connection.await;
     prepared
@@ -910,15 +945,11 @@ async fn install(client: &tokio_postgres::Client, config: &Config) -> Result<Vec
     Ok(installed)
 }
 
-/// An error unless the database at `dsn` has room for
-/// [`SLOTS_PER_ENGINE`] more replication slots and replication
-/// connections: an engine that took the last ones would starve another
-/// consumer, a replica or another engine, of them.
-async fn room_for_slots(dsn: &str) -> Result<(), String> {
-    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
-        .await
-        .map_err(|error| format!("connecting to the database: {error}"))?;
-    let connection = tokio::spawn(connection);
+/// An error unless the database has room for [`SLOTS_PER_ENGINE`] more
+/// replication slots and replication connections: an engine that took
+/// the last ones would starve another consumer, a replica or another
+/// engine, of them.
+async fn room_for_slots(client: &tokio_postgres::Client) -> Result<(), String> {
     let row = client
         .query_one(
             "SELECT current_setting('max_replication_slots')::int8 - (SELECT count(*) FROM pg_replication_slots), \
@@ -926,9 +957,7 @@ async fn room_for_slots(dsn: &str) -> Result<(), String> {
             &[],
         )
         .await
-        .map_err(|error| format!("reading the replication limits: {error}"));
-    connection.abort();
-    let row = row?;
+        .map_err(|error| format!("reading the replication limits: {error}"))?;
     let (slots, senders): (i64, i64) = (row.get(0), row.get(1));
     if slots < SLOTS_PER_ENGINE || senders < SLOTS_PER_ENGINE {
         return Err(format!(

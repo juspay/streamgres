@@ -71,6 +71,7 @@ use tokio_postgres::types::PgLsn;
 use super::ddl::{self, DdlSource};
 use crate::ivm::SchemaChange;
 use crate::log::{log_error, log_info, log_warn};
+use crate::shutdown::Shutdown;
 use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, DeleteQuery, InsertQuery, Lsn,
     RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
@@ -575,11 +576,14 @@ impl Transport {
     /// ends, so a process killed outright leaves nothing holding WAL; the
     /// stream cannot be resumed, so a feed that drops must start over on
     /// a fresh slot and snapshot. Returns once the slot exists, so a read
-    /// snapshot taken after it holds nothing the stream will not bring.
+    /// snapshot taken after it holds nothing the stream will not bring,
+    /// asking on one connection every 20 ms; gives up when `shutdown` is
+    /// requested meanwhile.
     pub async fn open_temporary(
         dsn: &str,
         slot: &str,
         publication: &str,
+        shutdown: &Shutdown,
     ) -> Result<Self, StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
         let feed = ReplicationClient::connect(
@@ -592,6 +596,7 @@ impl Transport {
             config,
             slot: slot.to_owned(),
         };
+        let watcher = super::open(&transport.config, &tokio::runtime::Handle::current()).await?;
         let deadline = tokio::time::Instant::now() + TEMPORARY_SLOT_WAIT;
         loop {
             if !transport.feed.is_running() {
@@ -599,7 +604,14 @@ impl Transport {
                     "the replication connection ended before temporary slot {slot} was made"
                 )));
             }
-            if Transport::slot_exists(dsn, slot).await? {
+            let made = watcher
+                .query_opt(
+                    "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
+                    &[&slot],
+                )
+                .await?
+                .is_some();
+            if made {
                 return Ok(transport);
             }
             if tokio::time::Instant::now() >= deadline {
@@ -607,7 +619,14 @@ impl Transport {
                     "temporary slot {slot} was not made within {TEMPORARY_SLOT_WAIT:?}; a long-running transaction holds slot creation back"
                 )));
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+                () = shutdown.wait() => {
+                    return Err(StorageError(format!(
+                        "stopped before temporary slot {slot} was made"
+                    )));
+                }
+            }
         }
     }
 

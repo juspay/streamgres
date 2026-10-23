@@ -207,6 +207,52 @@ fn an_embedded_engine_serves_restarts_and_leaves_no_slot() {
     });
 }
 
+/// Stopping an engine whose start a transaction holds back returns at
+/// once, not when the transaction ends, and leaves no slot behind.
+#[test]
+fn a_stop_while_the_start_is_held_back_returns_at_once() {
+    let Some(dsn) = dsn() else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("stop");
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        let holder = admin(&dsn).await;
+        holder
+            .batch_execute("BEGIN; SELECT pg_current_xact_id();")
+            .await
+            .expect("an open transaction");
+        let engine = Engine::start(config(&dsn, &names));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(engine.state(), State::Starting, "held back by the transaction");
+        let called = Instant::now();
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop())
+            .await
+            .expect("stop");
+        assert!(
+            called.elapsed() < Duration::from_secs(3),
+            "stop waited {:?} for the transaction",
+            called.elapsed()
+        );
+        assert_eq!(engine.state(), State::Stopped);
+        holder.batch_execute("COMMIT").await.expect("commit");
+        let leftover: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_replication_slots WHERE database = current_database() AND NOT active",
+                &[],
+            )
+            .await
+            .expect("slots")
+            .get(0);
+        assert_eq!(leftover, 0, "no slot left behind");
+        tear_down(&client, &names).await;
+    });
+}
+
 /// An engine on a database nobody set up sets it up itself: the
 /// publication and the trigger stack, once, however many engines start
 /// together; it then serves, and follows a schema change. One told to

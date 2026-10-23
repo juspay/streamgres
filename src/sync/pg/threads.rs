@@ -363,11 +363,13 @@ pub fn spawn_temporary_feed(
                 .build()
                 .expect("feed runtime");
             let slot = settings.slot.clone();
+            let starting = shutdown.clone();
             let ended = runtime.block_on(async move {
                 let transport = match Transport::open_temporary(
                     &settings.dsn,
                     &settings.slot,
                     &settings.publication,
+                    &starting,
                 )
                 .await
                 {
@@ -536,21 +538,30 @@ pub async fn start(
         .parse()
         .map_err(|error| format!("connecting the read pool: {error}"))?;
     settings.keepalive.apply(&mut read_config);
-    let pg = PgStorage::connect_configured_with_read_config(
+    // Minting the first snapshot waits for every transaction open at the
+    // time, so a long one holds it back; a shutdown meanwhile gives up.
+    let connected = PgStorage::connect_configured_with_read_config(
         config.clone(),
         read_config,
         catalog.load(),
         reads.clone(),
-    )
-    .await
-    .map_err(|error| format!("connecting the storage: {error}"))?
-    .with_rotation(settings.snapshot_rotation)
-    .with_read_connections(settings.read_connections)
-    .with_read_idle_connections(settings.read_idle_connections)
-    .with_read_timeout(settings.read_timeout)
-    .with_read_row_limit(settings.row_limit)
-    .with_estimates(settings.estimate_ttl, settings.estimate_capacity);
-    let pg = Arc::new(pg);
+    );
+    let pg = tokio::select! {
+        connected = connected => {
+            connected.map_err(|error| format!("connecting the storage: {error}"))?
+        }
+        () = shutdown.wait() => {
+            return Err("stopped before the first snapshot was taken".to_owned());
+        }
+    };
+    let pg = Arc::new(
+        pg.with_rotation(settings.snapshot_rotation)
+            .with_read_connections(settings.read_connections)
+            .with_read_idle_connections(settings.read_idle_connections)
+            .with_read_timeout(settings.read_timeout)
+            .with_read_row_limit(settings.row_limit)
+            .with_estimates(settings.estimate_ttl, settings.estimate_capacity),
+    );
     let (feed, feed_handle) = match temporary {
         Some((feed, handle, first)) => {
             let _ = first.send(pg.first_position());
