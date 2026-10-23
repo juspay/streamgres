@@ -78,7 +78,8 @@ carries one. Then:
    connection's route. `Route::Postgres` reads live.
 2. **Reads that are never cached** go live: a statement that is not a
    `SELECT` (Diesel sends `INSERT ... RETURNING` through `load`), a read
-   inside an open transaction, a read inside the read-your-writes window,
+   inside an open transaction, a read after a write the cache may not
+   hold yet (read your writes, below),
    `FOR UPDATE` and its variants, a `WITH` whose expressions modify data.
 3. **Behind.** While the engine says it is further behind the database
    than `STREAMGRES_S2S_MAX_LAG_MS`, or has said nothing for that long,
@@ -235,7 +236,7 @@ Engine to client:
 | `["touched", {"ids"}]` | one transaction changed these refill-mode subscriptions |
 | `["refused", {"id", "reason"}]` | the engine cannot follow the query; after an `accepted`, it stopped following it |
 | `["pong"]` | reply to `ping` |
-| `["lag", {"ms"}]` | right after `hello`, then every 500 ms: how far at most the engine's applied changes trail the database, the age of the newest heartbeat it applied; `null` before the first heartbeat is sent |
+| `["lag", {"ms", "lsn"}]` | right after `hello`, every 500 ms, and within 10 ms of `lsn` moving: `ms` is how far at most the engine's applied changes trail the database, the age of the newest heartbeat it applied (`null` before the first heartbeat is sent); `lsn` is the WAL position up to which every change has been sent on this socket, frames being in order (`null` before any; an older engine sends none) |
 | `["error", {"reason"}]` | a frame that could not be read and names no id; a `subscribe` whose id reads is answered `refused` instead |
 
 An id is never reused on a socket: frames queued for an unsubscribed id
@@ -463,12 +464,29 @@ routes.
 Postgres read sees the new row and a cache read the old one. So after a
 write through a cache (`execute`, raw SQL with any statement but
 `SELECT`, `BEGIN`, `ROLLBACK`, `SAVEPOINT` or `SET`, `INSERT ...
-RETURNING`, a `COMMIT`), every read through that cache goes live for
-`STREAMGRES_READ_YOUR_WRITES_MS` (default 1000, 0 off;
-`set_read_your_writes` per connection), counted from when the write
-ends, however long it took. The clock lives on the cache, so a write on
-one pooled connection covers reads on the others. A Postgres read never
-writes into the cache.
+RETURNING`, a `COMMIT`), reads through that cache go live until the
+cache holds the write. The cache counts writes, each marked as it
+starts and as it ends, so a write on one pooled connection covers reads
+on the others.
+
+- **By position**, when the engine side reports one (the `lsn` of every
+  connected socket's `lag` frames; the least of them counts). The first
+  read after a write reads `pg_current_wal_insert_lsn()`, which is past
+  the commit of every write marked before it: one small query on the
+  blocking wrapper, pipelined with the read itself on the async one.
+  Reads go live until the engine side's position reaches it, then the
+  cache serves again: within a few milliseconds of the delta, however
+  long that took. A write marked after the lookup sends the next read
+  to look it up again.
+- **By window**, when the engine side reports no position (an older
+  engine), the lookup fails, or the connection is to a standby (which
+  has no insert position): reads go live for
+  `STREAMGRES_READ_YOUR_WRITES_MS` (default 1000) after the last
+  write's end, however long it took.
+
+`STREAMGRES_READ_YOUR_WRITES_MS=0` (or `set_read_your_writes` per
+connection) turns both off. A Postgres read never writes into the
+cache.
 
 ## diesel-async
 

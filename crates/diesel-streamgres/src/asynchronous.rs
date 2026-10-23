@@ -69,7 +69,7 @@ use futures_util::future::{BoxFuture, FutureExt, TryFutureExt};
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use tokio::task::spawn_blocking;
 
-use crate::cache::{Cache, DATABASE_SQL, Database};
+use crate::cache::{AfterWrites, Cache, DATABASE_SQL, Database, WAL_POSITION_SQL, WalPosition};
 use crate::cursor::SyncedRow;
 use crate::key::QueryKey;
 use crate::route::{Route, Served};
@@ -217,13 +217,26 @@ impl AsyncSyncedConnection {
         Arc::strong_count(&self.inflight) > 1
     }
 
-    /// Marks the write now, and again when `future` completes: a read
-    /// issued after the write's future resolves is what the window is
-    /// for, and the clock should start as late as the write did.
+    /// Marks the write now, and again when `future` completes or is
+    /// dropped: a read issued after the write's future resolves is what
+    /// the window is for, and the clock should start as late as the write
+    /// did; a write whose future is dropped may still commit, and its
+    /// second mark sends the next read to look up the position again.
     fn written<'a, T: Send + 'a>(
         &mut self,
         future: BoxFuture<'a, QueryResult<T>>,
     ) -> BoxFuture<'a, QueryResult<T>> {
+        /// Marks the write again when the write's future goes, however
+        /// it goes.
+        struct Ended(Option<Arc<Cache>>);
+        impl Drop for Ended {
+            /// Marks the write's end.
+            fn drop(&mut self) {
+                if let Some(cache) = &self.0 {
+                    cache.mark_write();
+                }
+            }
+        }
         let cache = self.cache.clone();
         if let Some(cache) = &cache {
             cache.mark_write();
@@ -231,11 +244,8 @@ impl AsyncSyncedConnection {
         let token = Arc::clone(&self.inflight);
         async move {
             let _pending = token;
-            let result = future.await;
-            if let Some(cache) = cache {
-                cache.mark_write();
-            }
-            result
+            let _ended = Ended(cache);
+            future.await
         }
         .boxed()
     }
@@ -253,13 +263,6 @@ impl AsyncSyncedConnection {
         .boxed()
     }
 
-    /// Whether a write went through the cache within the read-your-writes
-    /// window.
-    fn within_write_window(&self) -> bool {
-        self.cache
-            .as_ref()
-            .is_some_and(|cache| cache.wrote_within(self.read_your_writes))
-    }
 
     /// Whether a transaction is open; an unreadable state counts as one.
     fn in_transaction(&mut self) -> bool {
@@ -522,10 +525,27 @@ impl AsyncConnection for AsyncSyncedConnection {
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
             return self.tracked(live);
         }
-        if self.within_write_window() {
-            cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
-            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
-            return self.tracked(live);
+        match cache.after_writes(self.read_your_writes) {
+            AfterWrites::Serve => {}
+            AfterWrites::Postgres => {
+                cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
+                let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+                return self.tracked(live);
+            }
+            AfterWrites::Resolve(writes) => {
+                cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
+                let probe = self.inner.load(sql_query(WAL_POSITION_SQL));
+                let live = self.inner.load(query);
+                let live = async move {
+                    let (position, live) = futures_util::join!(wal_position(probe), live);
+                    if let Some(position) = position {
+                        cache.resolve_writes(writes, position);
+                    }
+                    live.map(Self::live_stream)
+                }
+                .boxed();
+                return self.tracked(live);
+            }
         }
         if cache.subscriptions().behind() {
             cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
@@ -671,6 +691,16 @@ async fn read_database(probe: LoadFuture<'_>) -> Option<Database> {
     let rows: Vec<PgRow> = probe.await.ok()?.try_collect().await.ok()?;
     rows.first()
         .and_then(|row| <Database as FromSqlRow<Untyped, Pg>>::build_from_row(row).ok())
+}
+
+/// Where the database will put its next WAL record, as `probe`
+/// ([`WAL_POSITION_SQL`]) reads it; `None` when it fails, and the writes
+/// it was read for are resolved by the next read.
+async fn wal_position(probe: LoadFuture<'_>) -> Option<u64> {
+    let rows: Vec<PgRow> = probe.await.ok()?.try_collect().await.ok()?;
+    rows.first()
+        .and_then(|row| <WalPosition as FromSqlRow<Untyped, Pg>>::build_from_row(row).ok())?
+        .position()
 }
 
 /// The engine's rows for a key whose tables' types the engine side does

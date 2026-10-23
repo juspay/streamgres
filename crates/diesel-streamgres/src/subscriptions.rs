@@ -102,6 +102,13 @@ pub trait Subscriptions: Send + Sync {
         false
     }
 
+    /// The WAL position up to which every change has reached the cache,
+    /// for read-your-writes by position; `None` when the engine side
+    /// cannot say, and the cache falls back to a time window.
+    fn position(&self) -> Option<u64> {
+        None
+    }
+
     /// Both steps on a blocking connection: `lookup` is the connection
     /// the read is on. A lookup that fails stops the lookups; the engine
     /// side then reports the fallback for the types it lacks.

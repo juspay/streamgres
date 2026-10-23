@@ -50,7 +50,7 @@
 //! refills on its next read. Keys the engine then refuses are forgotten.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread;
@@ -479,6 +479,11 @@ struct Worker {
     /// The engine's lag as its latest `lag` frame said, and when that
     /// came; `None` until one has, and while the engine measures none.
     lag: Mutex<Option<(Duration, Instant)>>,
+    /// The position up to which every change has reached this worker, as
+    /// the engine's latest `lag` frame said (frames arrive in order, so
+    /// every change before it has been applied here); 0 until one has,
+    /// and while the socket is down.
+    position: AtomicU64,
     state: Mutex<WorkerState>,
     shared: Arc<Shared>,
 }
@@ -831,6 +836,23 @@ impl Subscriptions for EngineClient {
         !max.is_zero() && self.lag().is_some_and(|lag| lag > max)
     }
 
+    /// The least position every connected socket has received every
+    /// change up to; `None` with no socket up, or while one has not
+    /// said, as an engine from before positions never does.
+    fn position(&self) -> Option<u64> {
+        let mut least: Option<u64> = None;
+        for worker in &self.pool.workers {
+            if !worker.connected.load(Ordering::Acquire) {
+                continue;
+            }
+            match worker.position.load(Ordering::Acquire) {
+                0 => return None,
+                position => least = Some(least.map_or(position, |least| least.min(position))),
+            }
+        }
+        least
+    }
+
     /// Releases the key from the routing map and its worker.
     fn unsubscribe(&self, key: &QueryKey) {
         let worker = self
@@ -869,6 +891,7 @@ impl Worker {
             connect_error: Mutex::new(None),
             greeting: Mutex::new(Greeting::Waiting),
             lag: Mutex::new(None),
+            position: AtomicU64::new(0),
             state: Mutex::new(WorkerState {
                 next_id: 1,
                 by_key: HashMap::new(),
@@ -1523,6 +1546,7 @@ fn disconnected(worker: &Worker) {
         worker.connected.store(false, Ordering::Release);
         *worker.greeting.lock().expect("greeting") = Greeting::Waiting;
         *worker.lag.lock().expect("lag") = None;
+        worker.position.store(0, Ordering::Release);
         state.materialized.clear();
         let mut waiting: Vec<SyncSender<Reply>> = Vec::new();
         let mut released: Vec<QueryKey> = Vec::new();
@@ -1794,14 +1818,19 @@ fn on_delta(worker: &Worker, body: Json) {
     }
 }
 
-/// `lag`: how far behind the database the engine is, by its heartbeats;
-/// `null` while it measures none.
+/// `lag`: how far behind the database the engine is, by its heartbeats
+/// (`null` while it measures none), and the position up to which every
+/// change has been sent on this socket (an engine from before positions
+/// sends none).
 fn on_lag(worker: &Worker, body: &Json) {
     let lag = body
         .get("ms")
         .and_then(Json::as_u64)
         .map(|ms| (Duration::from_millis(ms), Instant::now()));
     *worker.lag.lock().expect("lag") = lag;
+    if let Some(position) = body.get("lsn").and_then(Json::as_u64) {
+        worker.position.fetch_max(position, Ordering::AcqRel);
+    }
 }
 
 /// `touched`: every named subscription's key goes stale.
@@ -2275,6 +2304,37 @@ mod tests {
         trusting.pool.workers[0].connected.store(true, Ordering::Release);
         inbound(&trusting.pool.workers[0], &json!(["lag", {"ms": 60000}]).to_string());
         assert!(!trusting.behind());
+    }
+
+    /// The client's position is the least any connected socket has
+    /// heard, and unknown while one has heard none: its keys may be
+    /// behind the others'. A socket that drops forgets its own, and only
+    /// connected sockets count.
+    #[test]
+    fn the_position_is_the_least_every_connected_socket_has_heard() {
+        let client = EngineClient::with_config(
+            "ws://127.0.0.1:1/never/s2s/v1",
+            Config {
+                connections: 2,
+                ..Config::default()
+            },
+        );
+        let (first, second) = (&client.pool.workers[0], &client.pool.workers[1]);
+        assert_eq!(client.position(), None, "nothing connected");
+        first.connected.store(true, Ordering::Release);
+        second.connected.store(true, Ordering::Release);
+        inbound(first, &json!(["lag", {"ms": 0, "lsn": 900}]).to_string());
+        assert_eq!(client.position(), None, "the second has heard none");
+        inbound(second, &json!(["lag", {"ms": 0, "lsn": 700}]).to_string());
+        assert_eq!(client.position(), Some(700));
+        inbound(second, &json!(["lag", {"ms": 0, "lsn": 600}]).to_string());
+        assert_eq!(client.position(), Some(700), "a position never moves back");
+        inbound(second, &json!(["lag", {"ms": 0, "lsn": null}]).to_string());
+        assert_eq!(client.position(), Some(700), "an older frame shape keeps it");
+        disconnected(second);
+        assert_eq!(client.position(), Some(900), "only connected sockets count");
+        second.connected.store(true, Ordering::Release);
+        assert_eq!(client.position(), None, "reconnected, it has heard none");
     }
 
     /// This client's own refusal reasons all pass; the engine's are final.

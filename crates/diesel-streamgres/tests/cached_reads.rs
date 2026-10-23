@@ -48,6 +48,9 @@ struct FakeEngine {
     /// the engine side behind, the way a socket that just reconnected to
     /// a lagging engine hears its lag before the answer.
     rows_from_behind: std::sync::atomic::AtomicBool,
+    /// The position the engine side says it has delivered every change
+    /// up to; 0 says none, as an engine from before positions.
+    position: std::sync::atomic::AtomicU64,
 }
 
 /// An engine-side store that holds no rows.
@@ -102,6 +105,11 @@ impl Subscriptions for FakeEngine {
     /// As set by the test.
     fn behind(&self) -> bool {
         self.behind.load(Ordering::SeqCst)
+    }
+
+    /// As set by the test.
+    fn position(&self) -> Option<u64> {
+        Some(self.position.load(Ordering::SeqCst)).filter(|&position| position != 0)
     }
 }
 
@@ -878,6 +886,67 @@ fn after_a_write_the_connection_reads_postgres_for_a_window() {
         })
         .unwrap();
     assert_eq!(w.read("mode").as_deref(), Some("c"));
+}
+
+/// With the engine side saying how far it has delivered, a read after a
+/// write goes to Postgres until that position is past the write's commit,
+/// and to the cache as soon as it is, however long either takes: the
+/// window plays no part.
+///
+/// The first read after a write looks the write's position up, one more
+/// query; the reads after it do not.
+///
+/// The engine side gets past the write: the cache answers (with its old
+/// rows, the fake engine never touching them).
+///
+/// A further write is looked up again.
+#[test]
+fn after_a_write_reads_wait_for_the_engine_side_to_deliver_it() {
+    let mut w = World::new("ryw-position");
+    w.conn
+        .set_read_your_writes(std::time::Duration::from_millis(50));
+    w.engine.position.store(1, Ordering::SeqCst);
+    w.put("mode", "a");
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    let sent = w.sent();
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    assert_eq!(w.sent(), sent, "no write yet: from the cache");
+
+    let key = w.key("mode");
+    diesel::update(sg_configs::table.filter(sg_configs::key.eq(&key)))
+        .set(sg_configs::value.eq("b"))
+        .execute(&mut w.conn)
+        .unwrap();
+    let sent = w.sent();
+    assert_eq!(w.read("mode").as_deref(), Some("b"));
+    assert_eq!(w.sent(), sent + 2, "the write's position, then the read");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let sent = w.sent();
+    assert_eq!(
+        w.read("mode").as_deref(),
+        Some("b"),
+        "past the window, still from Postgres: not delivered yet"
+    );
+    assert_eq!(w.sent(), sent + 1, "the position is known");
+    assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 2);
+
+    w.engine.position.store(u64::MAX, Ordering::SeqCst);
+    let sent = w.sent();
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    assert_eq!(w.sent(), sent, "delivered: from the cache");
+
+    diesel::update(sg_configs::table.filter(sg_configs::key.eq(&key)))
+        .set(sg_configs::value.eq("c"))
+        .execute(&mut w.conn)
+        .unwrap();
+    let sent = w.sent();
+    assert_eq!(w.read("mode").as_deref(), Some("a"));
+    assert_eq!(
+        w.sent(),
+        sent + 1,
+        "looked up, already delivered: from the cache"
+    );
+    assert_eq!(w.cache.stats.after_write.load(Ordering::Relaxed), 2);
 }
 
 /// A locking read always goes to Postgres.

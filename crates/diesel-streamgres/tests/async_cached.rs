@@ -93,6 +93,9 @@ fn url() -> String {
 struct FakeEngine {
     subscribed: Mutex<Vec<QueryKey>>,
     unsubscribed: Mutex<Vec<QueryKey>>,
+    /// The position the engine side says it has delivered every change
+    /// up to; 0 says none, as an engine from before positions.
+    position: AtomicU64,
 }
 
 impl Subscriptions for FakeEngine {
@@ -118,6 +121,11 @@ impl Subscriptions for FakeEngine {
     /// Records the key.
     fn unsubscribe(&self, key: &QueryKey) {
         self.unsubscribed.lock().unwrap().push(key.clone());
+    }
+
+    /// As set by the test.
+    fn position(&self) -> Option<u64> {
+        Some(stat(&self.position)).filter(|&position| position != 0)
     }
 }
 
@@ -438,6 +446,41 @@ async fn after_a_write_the_connection_reads_postgres_for_a_window() {
         Some("a"),
         "the window closed; the entry was not refreshed"
     );
+    w.clean().await;
+}
+
+/// With the engine side saying how far it has delivered, a read after a
+/// write goes to Postgres, looking the write's position up alongside,
+/// until the engine side is past it, the window playing no part; then the
+/// cache answers again.
+#[tokio::test]
+async fn after_a_write_reads_wait_for_the_engine_side_to_deliver_it() {
+    let mut w = World::new("async-ryw-position").await;
+    w.conn.set_read_your_writes(Duration::from_millis(50));
+    w.engine.position.store(1, Ordering::SeqCst);
+    w.put("mode", "a").await;
+    assert_eq!(w.read("mode").await.as_deref(), Some("a"));
+    let key = w.key("mode");
+    diesel::update(sg_configs::table.filter(sg_configs::key.eq(&key)))
+        .set(sg_configs::value.eq("b"))
+        .execute(&mut w.conn)
+        .await
+        .unwrap();
+    assert_eq!(w.read("mode").await.as_deref(), Some("b"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        w.read("mode").await.as_deref(),
+        Some("b"),
+        "past the window, still from Postgres: not delivered yet"
+    );
+    assert_eq!(stat(&w.cache.stats.after_write), 2);
+    w.engine.position.store(u64::MAX, Ordering::SeqCst);
+    assert_eq!(
+        w.read("mode").await.as_deref(),
+        Some("a"),
+        "delivered: from the cache"
+    );
+    assert_eq!(stat(&w.cache.stats.after_write), 2);
     w.clean().await;
 }
 

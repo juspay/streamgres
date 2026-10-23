@@ -293,6 +293,16 @@ pub struct Cache {
     /// since `started` plus one; 0 is never.
     last_write: AtomicU64,
     started: Instant,
+    /// How many times a connection through this cache has marked a
+    /// write; each write is marked as it starts and as it ends.
+    writes: AtomicU64,
+    /// How many of those marks [`Cache::target`] covers: every write
+    /// marked by then had committed below it, if it committed at all.
+    resolved: AtomicU64,
+    /// A WAL position past the commit of every write [`Cache::resolved`]
+    /// counts: once the engine side has delivered every change up to it,
+    /// the cache holds them all.
+    target: AtomicU64,
     /// The OIDs of user-defined types, resolved once per database for
     /// the async wrapper (the blocking one asks its connection).
     type_metadata: Arc<Mutex<PgMetadataCache>>,
@@ -317,6 +327,50 @@ pub struct Database {
 /// Reads a [`Database`] through a connection; the engine announces the
 /// same in its `hello`.
 pub const DATABASE_SQL: &str = "SELECT system_identifier::text AS system, current_database()::text AS name FROM pg_control_system()";
+
+/// Where the next WAL record will go, as [`WAL_POSITION_SQL`] reads it:
+/// past the commit record of every transaction that has committed; `None`
+/// on a standby, which writes no WAL of its own.
+#[derive(Debug, Clone, PartialEq, Eq, diesel::QueryableByName)]
+pub struct WalPosition {
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub lsn: Option<String>,
+}
+
+impl WalPosition {
+    /// The position as a number, `hi/lo` read as `hi << 32 | lo` as
+    /// PostgreSQL and the engine count it; `None` on a standby or when it
+    /// does not parse.
+    pub fn position(&self) -> Option<u64> {
+        let (hi, lo) = self.lsn.as_deref()?.split_once('/')?;
+        let hi = u64::from_str_radix(hi, 16).ok()?;
+        let lo = u64::from_str_radix(lo, 16).ok()?;
+        (hi <= u64::from(u32::MAX) && lo <= u64::from(u32::MAX)).then_some(hi << 32 | lo)
+    }
+}
+
+/// Reads a [`WalPosition`]. The insert position, not the write or flush
+/// one: with `synchronous_commit` off a commit returns before its record
+/// is written, and only the insert position is sure to be past it. A
+/// standby has none (the function raises there), so it reads `NULL`:
+/// reads through a replica fall back to the window.
+pub const WAL_POSITION_SQL: &str = "SELECT CASE WHEN pg_is_in_recovery() THEN NULL ELSE pg_current_wal_insert_lsn()::text END AS lsn";
+
+/// Whether a read through the cache may be served from it, given the
+/// writes through it ([`Cache::after_writes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterWrites {
+    /// Every write through the cache has reached it, or the window
+    /// since the last one has passed.
+    Serve,
+    /// A write through the cache may not have reached it yet: the read
+    /// goes to Postgres.
+    Postgres,
+    /// Writes through the cache have no position yet: the read goes to
+    /// Postgres, and reads [`WAL_POSITION_SQL`] with it to give them one
+    /// ([`Cache::resolve_writes`] with this count).
+    Resolve(u64),
+}
 
 impl Cache {
     /// A cache holding at most `max_bytes` of rows and keys, with the
@@ -376,6 +430,9 @@ impl Cache {
             limits,
             last_write: AtomicU64::new(0),
             started: Instant::now(),
+            writes: AtomicU64::new(0),
+            resolved: AtomicU64::new(0),
+            target: AtomicU64::new(0),
             type_metadata: Arc::new(Mutex::new(PgMetadataCache::new())),
             database: OnceLock::new(),
             stats,
@@ -601,6 +658,50 @@ impl Cache {
     pub fn mark_write(&self) {
         let nanos = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
         self.last_write.fetch_max(nanos + 1, Ordering::Release);
+        self.writes.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Whether a read may be served from the cache after the writes
+    /// through it, a connection's `window` being its read-your-writes
+    /// window. By position when the engine side reports one: a read
+    /// waits for every write to have reached the cache, however long
+    /// that takes, and no longer. Otherwise by the window: a read goes
+    /// to Postgres for `window` after the last write. A zero window
+    /// turns both off.
+    pub fn after_writes(&self, window: Duration) -> AfterWrites {
+        if window.is_zero() {
+            return AfterWrites::Serve;
+        }
+        let Some(position) = self.subscriptions.position() else {
+            return self.by_window(window);
+        };
+        let writes = self.writes.load(Ordering::Acquire);
+        if writes > self.resolved.load(Ordering::Acquire) {
+            return AfterWrites::Resolve(writes);
+        }
+        if position >= self.target.load(Ordering::Acquire) {
+            AfterWrites::Serve
+        } else {
+            AfterWrites::Postgres
+        }
+    }
+
+    /// [`Cache::after_writes`] by the window alone, for when the position
+    /// of the writes could not be read.
+    pub fn by_window(&self, window: Duration) -> AfterWrites {
+        if self.wrote_within(window) {
+            AfterWrites::Postgres
+        } else {
+            AfterWrites::Serve
+        }
+    }
+
+    /// The first `writes` marks committed, if at all, below `position`,
+    /// read after the count was taken. The target only rises: a later
+    /// read of the position covers every earlier one.
+    pub fn resolve_writes(&self, writes: u64, position: u64) {
+        self.target.fetch_max(position, Ordering::AcqRel);
+        self.resolved.fetch_max(writes, Ordering::AcqRel);
     }
 
     /// Whether a connection through this cache wrote within `window`.
@@ -708,6 +809,24 @@ mod tests {
             sql: sql.to_string(),
             binds: Vec::new(),
         }
+    }
+
+    /// A position reads as PostgreSQL prints it, and nothing else does.
+    #[test]
+    fn a_wal_position_reads_as_postgres_prints_it() {
+        let read = |lsn: &str| {
+            WalPosition {
+                lsn: Some(lsn.to_string()),
+            }
+            .position()
+        };
+        assert_eq!(read("0/0"), Some(0));
+        assert_eq!(read("16/B374D848"), Some(0x16_B374_D848));
+        assert_eq!(read("FFFFFFFF/FFFFFFFF"), Some(u64::MAX));
+        for bad in ["", "16", "16/", "/1", "1/2/3", "x/1", "100000000/0"] {
+            assert_eq!(read(bad), None, "{bad}");
+        }
+        assert_eq!(WalPosition { lsn: None }.position(), None, "a standby");
     }
 
     /// An empty result.

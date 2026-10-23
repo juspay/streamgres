@@ -17,9 +17,11 @@
 //!   ([`RouteDsl::via`]), or in a [`SyncedConnection::with_route`] scope,
 //!   or by the connection's own route, in that order of precedence;
 //! - no transaction is open on it (inside one, the application must see
-//!   its own writes), and the connection has not written for the last
-//!   [`SyncedConnection::read_your_writes`] window (after one, it must
-//!   see what it wrote before the engine has shipped it);
+//!   its own writes), and every write through the cache has reached it:
+//!   by the engine's position when it reports one, else for the
+//!   [`SyncedConnection::read_your_writes`] window after the last write
+//!   (after one, a read must see what was written before the engine has
+//!   shipped it);
 //! - the statement is a `SELECT` (Diesel sends `INSERT ... RETURNING`
 //!   through the same path);
 //! - the engine accepted a subscription for the query
@@ -70,7 +72,7 @@ use diesel::{Connection, ConnectionResult, QueryResult};
 
 #[cfg(feature = "async")]
 pub use crate::asynchronous::AsyncSyncedConnection;
-use crate::cache::{Cache, DATABASE_SQL, Database};
+use crate::cache::{AfterWrites, Cache, DATABASE_SQL, Database, WAL_POSITION_SQL, WalPosition};
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
 pub use crate::route::{Route, RouteDsl, Served, Via};
@@ -150,9 +152,10 @@ static SETTINGS: OnceLock<Settings> = OnceLock::new();
 pub const DEFAULT_READ_YOUR_WRITES: Duration = Duration::from_millis(1000);
 
 /// `STREAMGRES_READ_YOUR_WRITES_MS`: how long after a write a
-/// connection's reads go to Postgres, so a flow that writes and then
-/// reads sees its own write before the engine has shipped it. 0 turns
-/// the window off. Read once per process.
+/// connection's reads go to Postgres when the engine reports no
+/// position, so a flow that writes and then reads sees its own write
+/// before the engine has shipped it. 0 turns read-your-writes off, by
+/// position too. Read once per process.
 pub fn read_your_writes_from_env() -> Duration {
     static WINDOW: OnceLock<Duration> = OnceLock::new();
     *WINDOW.get_or_init(|| {
@@ -241,11 +244,14 @@ impl<C> SyncedConnection<C> {
     }
 
     /// How long after a write reads through this connection's cache go
-    /// to Postgres. A write is followed, in the same flow, by reads that
-    /// expect to see it, often on another connection of the same pool;
-    /// the cache sees the write only once the engine has shipped the
-    /// commit, so for this window every connection sharing the cache
-    /// reads the database. The clock is the cache's; the window is this
+    /// to Postgres when the engine reports no position. A write is
+    /// followed, in the same flow, by reads that expect to see it, often
+    /// on another connection of the same pool; the cache sees the write
+    /// only once the engine has shipped the commit. With positions, reads
+    /// go to Postgres until the engine has delivered past the write, and
+    /// the window only says whether to wait at all (zero turns it off);
+    /// without, every connection sharing the cache reads the database for
+    /// the window. The clock is the cache's; the window is this
     /// connection's. From `STREAMGRES_READ_YOUR_WRITES_MS` by default.
     pub fn set_read_your_writes(&mut self, window: Duration) {
         self.read_your_writes = window;
@@ -266,13 +272,6 @@ impl<C> SyncedConnection<C> {
         }
     }
 
-    /// Whether a write went through the cache within the read-your-writes
-    /// window.
-    fn within_write_window(&self) -> bool {
-        self.cache
-            .as_ref()
-            .is_some_and(|cache| cache.wrote_within(self.read_your_writes))
-    }
 
     /// Runs `f` with every read inside it routed `route`, whatever the
     /// connection's own route; a flag on the query itself still wins.
@@ -465,7 +464,7 @@ where
             cache.stats.locking.fetch_add(1, Ordering::Relaxed);
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
-        if self.within_write_window() {
+        if after_writes(&cache, self.read_your_writes, &mut self.inner) != AfterWrites::Serve {
             cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
@@ -534,6 +533,44 @@ where
         .ok()?
         .into_iter()
         .next()
+}
+
+/// Whether a read may be served from `cache` after the writes through
+/// it, with `window` the connection's read-your-writes window
+/// ([`Cache::after_writes`]). Writes with no position yet get one here:
+/// one small query on `conn`, for the first read after a write; when it
+/// fails, the window decides.
+fn after_writes<C>(cache: &Cache, window: Duration, conn: &mut C) -> AfterWrites
+where
+    C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
+{
+    match cache.after_writes(window) {
+        AfterWrites::Resolve(writes) => match wal_position(conn) {
+            Some(position) => {
+                cache.resolve_writes(writes, position);
+                match cache.after_writes(window) {
+                    AfterWrites::Resolve(_) => AfterWrites::Postgres,
+                    decided => decided,
+                }
+            }
+            None => cache.by_window(window),
+        },
+        decided => decided,
+    }
+}
+
+/// Where `conn`'s database will put its next WAL record
+/// ([`WAL_POSITION_SQL`]); `None` when it cannot be read.
+fn wal_position<C>(conn: &mut C) -> Option<u64>
+where
+    C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
+{
+    use diesel::RunQueryDsl;
+    diesel::sql_query(WAL_POSITION_SQL)
+        .load::<WalPosition>(conn)
+        .ok()?
+        .first()?
+        .position()
 }
 
 /// The SQL a statement renders to, for [`may_write`]; a statement that

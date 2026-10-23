@@ -193,6 +193,49 @@ fn a_commit_the_engine_reports_refills_the_cache() {
         .expect("the insert reached the cache");
 }
 
+/// Read-your-writes by position: after a write through the wrapper every
+/// read sees it, and the cache serves again as soon as the engine has
+/// delivered it, well inside the window an engine without positions
+/// would hold reads to Postgres for.
+#[test]
+fn a_write_is_read_back_and_the_cache_serves_once_it_is_delivered() {
+    let Some(mut live) = Live::start("ryw-position") else {
+        return;
+    };
+    live.conn.set_read_your_writes(Duration::from_secs(5));
+    live.put("mode", "a");
+    assert_eq!(live.read("mode").as_deref(), Some("a"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while live.engine.position().is_none() {
+        assert!(Instant::now() < deadline, "the engine never said its position");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let key = live.key("mode");
+    for value in ["b", "c", "d"] {
+        diesel::update(sg_configs::table.filter(sg_configs::key.eq(&key)))
+            .set(sg_configs::value.eq(value))
+            .execute(&mut live.conn)
+            .expect("write");
+        let wrote = Instant::now();
+        loop {
+            assert_eq!(
+                live.read("mode").as_deref(),
+                Some(value),
+                "every read sees the write"
+            );
+            if live.conn.last_served() == Some(Served::Cache) {
+                break;
+            }
+            assert!(
+                wrote.elapsed() < Duration::from_secs(2),
+                "the cache never served again"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        eprintln!("write to a cache-served read: {:?}", wrote.elapsed());
+    }
+}
+
 /// A commit to a row the query does not read leaves the entry alone.
 #[test]
 fn an_unrelated_commit_does_not_touch_the_entry() {
