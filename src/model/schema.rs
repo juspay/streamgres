@@ -268,7 +268,7 @@ pub struct DbTable {
 /// key followed by `:` (and preceded by `,` after the first) with the
 /// type the column declares. A row on that layout is then written as the
 /// head, each column's key bytes and value, and `}}`, with no lookup or
-/// escaping per cell (`client::wire::write_put`). Built by
+/// escaping per cell (`wire::write_put`). Built by
 /// [`DbTable::new`], so once per table when the catalog is read and once
 /// more when a migration adds the table or a column to it.
 #[derive(Debug, PartialEq, Eq)]

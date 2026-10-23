@@ -77,8 +77,10 @@ pub struct AppState {
     pub warmed: watch::Receiver<bool>,
     pub transforms: Arc<TransformCache>,
     pub shutdown: Shutdown,
-    /// The server-to-server endpoint's task.
-    pub s2s: super::s2s::Handle,
+    /// Who may open the server-to-server endpoint.
+    pub s2s: super::s2s::Admission,
+    /// What its sessions share with the task that follows their queries.
+    pub live: Arc<crate::live::Context>,
 }
 
 /// One desired-query change between the client's message and the group

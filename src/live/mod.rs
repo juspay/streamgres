@@ -1,5 +1,10 @@
-//! The server-to-server endpoint: a backend subscribes the SQL its ORM
-//! renders and is kept current on it.
+//! Following a backend's SQL: a backend subscribes the SQL its ORM
+//! renders and is kept current on it, over whatever carries the frames.
+//! The S2S endpoint ([`crate::client::s2s`]) carries them over a
+//! WebSocket; a backend that embeds the engine carries them over
+//! channels in its own process. A [`session`] reads the backend's frames
+//! from any stream of text and queues the engine's on an [`Outgoing`],
+//! so both run the same code.
 //!
 //! A backend keeps its own copy of what it reads (a Diesel wrapper serves
 //! repeated reads from a local cache). In rows mode the engine ships the
@@ -8,8 +13,8 @@
 //! Postgres. Otherwise it is sent a `touched` naming every subscription a
 //! committed transaction changed the rows of, and reads Postgres again.
 //! A query outside what the engine follows is `refused`, and the backend
-//! serves it live. The endpoint carries no user: it serves whatever the
-//! SQL names, so it belongs to trusted backends, behind its token.
+//! serves it live. A session carries no user: it serves whatever the SQL
+//! names, so it belongs to trusted backends.
 //!
 //! One task ([`run`]) owns every S2S subscription: it is one more
 //! consumer of the engine's events beside the group threads, with its own
@@ -19,20 +24,10 @@
 //!
 //! # Protocol
 //!
-//! JSON text frames, each a two-element array of a tag and a body, on a
-//! WebSocket at `{base}/s2s/v1`.
-//!
-//! Admission:
-//! - With `STREAMGRES_S2S_TOKEN` set, the upgrade must carry
-//!   `Authorization: Bearer <token>` and is answered 401 otherwise.
-//!   Unset, any connection is taken, so the port belongs on a trusted
-//!   network.
-//! - At most `STREAMGRES_S2S_MAX_CONNECTIONS` connections are open at
-//!   once; past that the upgrade is answered 503.
-//! - A connection holds at most `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS`
-//!   subscriptions, those still registering included; a subscribe past
-//!   that is refused. The two limits together bound what one engine
-//!   follows for its backends.
+//! JSON text frames, each a two-element array of a tag and a body. A
+//! connection holds at most `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS`
+//! subscriptions, those still registering included; a subscribe past
+//! that is refused.
 //!
 //! Upstream:
 //! - `["subscribe", {"id": n, "sql": "...", "binds": [{"oid": 25, "bytes": "<base64>"}, {"oid": 20, "bytes": null}], "rows": bool}]`
@@ -110,24 +105,18 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use futures_util::stream::SplitStream;
-use futures_util::{FutureExt, SinkExt, StreamExt};
+use futures_util::{FutureExt, Stream, StreamExt};
 use serde::Serialize;
 use serde_json::value::RawValue;
 use serde_json::{Value as Json, json};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::ast::Translated;
-use super::connection::AppState;
-use super::{plan, wire};
+use crate::plan::{self, PlanCache, Policy, Translated};
+use crate::sync::pg::PgStorage;
+use crate::wire;
 use crate::ivm::Delta;
 use crate::log::{log_debug, log_info, log_warn};
 use crate::model::{
@@ -158,11 +147,6 @@ const OUTGOING_QUEUE: usize = 4096;
 /// always let onto an empty queue, so one large result still goes out.
 const OUTGOING_BYTES: usize = 64 * 1024 * 1024;
 
-/// How long a closing connection's writer may take to flush what is
-/// queued. A backend that stopped reading never lets it finish, and
-/// waiting for it would hold the connection's place and socket forever.
-const WRITER_DRAIN: Duration = Duration::from_secs(5);
-
 /// A connection's outgoing frames, bounded in frames and in bytes, with
 /// the bytes still waiting for its writer.
 #[derive(Debug, Clone)]
@@ -173,7 +157,7 @@ pub struct Outgoing {
 
 impl Outgoing {
     /// A queue and the receiving end its writer drains.
-    fn new() -> (Outgoing, mpsc::Receiver<String>) {
+    pub fn new() -> (Outgoing, mpsc::Receiver<String>) {
         let (frames, receiver) = mpsc::channel(OUTGOING_QUEUE);
         let queued = Arc::new(AtomicUsize::new(0));
         (Outgoing { frames, queued }, receiver)
@@ -204,18 +188,18 @@ impl Outgoing {
 
     /// The writer's side of the byte count. It holds no sender, so the
     /// queue still closes once every [`Outgoing`] is dropped.
-    fn drained(&self) -> Drained {
+    pub fn drained(&self) -> Drained {
         Drained(Arc::clone(&self.queued))
     }
 }
 
 /// The bytes still waiting in a connection's [`Outgoing`], as its
 /// writer releases them.
-struct Drained(Arc<AtomicUsize>);
+pub struct Drained(Arc<AtomicUsize>);
 
 impl Drained {
     /// The writer sent a frame of `len` bytes.
-    fn sent(&self, len: usize) {
+    pub fn sent(&self, len: usize) {
         self.0.fetch_sub(len, Ordering::AcqRel);
     }
 }
@@ -279,72 +263,67 @@ const LAG_EVERY: Duration = Duration::from_millis(500);
 
 /// How often a refused upgrade of one kind is logged at most; the ones
 /// in between are counted into the next line.
-const REFUSAL_LOG_EVERY: Duration = Duration::from_secs(60);
+pub(crate) const REFUSAL_LOG_EVERY: Duration = Duration::from_secs(60);
 
-/// The handle connections talk to the task through.
+/// What sessions share: the requests they send the task, the ids they
+/// are given, and the database the engine streams once it is read.
 #[derive(Debug)]
-pub struct Handle {
+pub struct Hub {
     requests: mpsc::Sender<Request>,
     next_conn: AtomicU64,
-    /// Connections open now, against `max_connections` (0: no limit).
-    open: Arc<AtomicUsize>,
-    max_connections: usize,
-    unauthorized: Throttle,
-    full: Throttle,
     unidentified: Throttle,
     /// The database the engine streams, as `hello` names it, once read:
     /// it cannot change while the process runs.
     database: tokio::sync::OnceCell<Json>,
 }
 
-impl Handle {
-    /// A handle admitting at most `max_connections` at once (0: no
-    /// limit), and the requests its connections send the task.
-    pub fn new(max_connections: usize) -> (Handle, mpsc::Receiver<Request>) {
+impl Hub {
+    /// A hub, and the requests its sessions send the task ([`run`]).
+    pub fn new() -> (Hub, mpsc::Receiver<Request>) {
         let (requests, requests_rx) = mpsc::channel(REQUEST_QUEUE);
         (
-            Handle {
+            Hub {
                 requests,
                 next_conn: AtomicU64::new(1),
-                open: Arc::new(AtomicUsize::new(0)),
-                max_connections,
-                unauthorized: Throttle::new(REFUSAL_LOG_EVERY),
-                full: Throttle::new(REFUSAL_LOG_EVERY),
                 unidentified: Throttle::new(REFUSAL_LOG_EVERY),
                 database: tokio::sync::OnceCell::new(),
             },
             requests_rx,
         )
     }
-
-    /// A place among the open connections, if one is free; it is given
-    /// back when the [`Admitted`] drops.
-    fn admit(&self) -> Option<Admitted> {
-        let limit = self.max_connections;
-        self.open
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
-                (limit == 0 || open < limit).then_some(open + 1)
-            })
-            .ok()?;
-        Some(Admitted(Arc::clone(&self.open)))
-    }
 }
 
-/// One open connection's place, held for as long as the connection is.
-struct Admitted(Arc<AtomicUsize>);
+/// How large a query, and how many of them, one connection may ask the
+/// engine to follow; zero is no limit.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Subscriptions one connection may hold, registering ones included.
+    pub per_connection: usize,
+    /// Disjuncts a query's filters may normalize to ([`within_limits`]).
+    pub max_disjuncts: u64,
+    /// Values an `IN` or `NOT IN` list may hold.
+    pub max_list_values: usize,
+}
 
-impl Drop for Admitted {
-    /// Gives the connection's place back.
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
-    }
+/// Everything a session needs of the engine side: the hub, the catalog
+/// queries are parsed against, the storage that plans and identifies
+/// them, the plans remembered across connections, the join policy, the
+/// limits, and the stats the lag is read from.
+pub struct Context {
+    pub hub: Hub,
+    pub catalog: Arc<CatalogHandle>,
+    pub storage: Arc<PgStorage>,
+    pub plans: Arc<PlanCache>,
+    pub policy: Policy,
+    pub limits: Limits,
+    pub stats: Arc<Stats>,
 }
 
 /// Lets a repeated warning through at most once per period. A backend
 /// with the wrong token retries every second, and so can anyone who
 /// reaches the port, so each refusal cannot be a log line.
 #[derive(Debug)]
-struct Throttle {
+pub(crate) struct Throttle {
     every: Duration,
     next: Mutex<Option<Instant>>,
     quiet: AtomicU64,
@@ -352,7 +331,7 @@ struct Throttle {
 
 impl Throttle {
     /// A throttle logging at most once per `every`.
-    fn new(every: Duration) -> Throttle {
+    pub(crate) fn new(every: Duration) -> Throttle {
         Throttle {
             every,
             next: Mutex::new(None),
@@ -374,7 +353,7 @@ impl Throttle {
 }
 
 /// Logs a refused upgrade, throttled per kind.
-fn refusal(throttle: &Throttle, what: &str) {
+pub(crate) fn refusal(throttle: &Throttle, what: &str) {
     if let Some(quiet) = throttle.pass(Instant::now()) {
         if quiet == 0 {
             log_warn!("s2s connection refused: {what}");
@@ -1035,100 +1014,34 @@ fn send(out: &Outgoing, message: Json) -> bool {
     out.push(message.to_string())
 }
 
-/// The route handler: upgrades the socket once the engine is serving.
-pub async fn connect(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
-) -> Response {
-    if let Some(token) = &state.config.s2s_token
-        && !authorized(&headers, &token.0)
-    {
-        refusal(&state.s2s.unauthorized, "no valid bearer token");
-        return (StatusCode::UNAUTHORIZED, "a bearer token is required").into_response();
-    }
-    if !*state.ready.borrow() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "the engine is not serving yet",
-        )
-            .into_response();
-    }
-    let Some(admitted) = state.s2s.admit() else {
-        let what = format!(
-            "{} connections are open, the most allowed",
-            state.s2s.max_connections
-        );
-        refusal(&state.s2s.full, &what);
-        return (StatusCode::SERVICE_UNAVAILABLE, "too many S2S connections").into_response();
-    };
-    let upgrade = upgrade.max_message_size(state.config.max_message_bytes);
-    upgrade.on_upgrade(move |socket| async move {
-        handle(socket, state).await;
-        drop(admitted);
-    })
-}
-
-/// Whether the request carries `Authorization: Bearer <token>`. The
-/// comparison walks the whole token whatever was presented, so neither
-/// a near miss nor a presented length says anything about the token.
-fn authorized(headers: &HeaderMap, token: &str) -> bool {
-    let Some(presented) = headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split_once(' '))
-        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
-        .map(|(_, presented)| presented.trim_start_matches(' '))
-    else {
-        return false;
-    };
-    let (presented, token) = (presented.as_bytes(), token.as_bytes());
-    let lengths = u8::from(presented.len() != token.len());
-    token
-        .iter()
-        .enumerate()
-        .fold(lengths, |differ, (at, byte)| {
-            differ | (presented.get(at).copied().unwrap_or(0) ^ byte)
-        })
-        == 0
-}
-
-/// One upgraded connection, from `hello` to close. Its writer gets
-/// [`WRITER_DRAIN`] to flush once the session ends and is then cut off,
-/// so a backend that stopped reading cannot hold the connection open.
-/// Whatever ends the session, a panic in a frame's handling included,
-/// the task hears the connection is gone, or its subscriptions would
-/// outlive it.
-async fn handle(socket: WebSocket, state: Arc<AppState>) {
-    let handle = &state.s2s;
-    let database = match database(&state).await {
+/// One connection, from `hello` to close, over any transport: `inbound`
+/// is the backend's text frames, and `out` the queue the transport's
+/// writer drains. Before it greets, the session reads which database
+/// the engine streams; when that cannot be read it ends at once, and
+/// the transport closes the connection without a `hello`. Whatever ends
+/// the session (the inbound frames ending, the task asking to close, a
+/// panic in a frame's handling) the task hears the connection is gone,
+/// or its subscriptions would outlive it. The transport flushes and
+/// closes once this returns.
+pub async fn session<S>(context: &Context, inbound: S, out: Outgoing)
+where
+    S: Stream<Item = String> + Unpin,
+{
+    let hub = &context.hub;
+    let database = match database(context).await {
         Ok(database) => database,
         Err(error) => {
             refusal(
-                &handle.unidentified,
+                &hub.unidentified,
                 &format!("the database it streams cannot be read: {error}"),
             );
             return;
         }
     };
-    let conn = handle.next_conn.fetch_add(1, Ordering::Relaxed);
-    let (mut sink, stream) = socket.split();
-    let (out, mut out_rx) = Outgoing::new();
+    let conn = hub.next_conn.fetch_add(1, Ordering::Relaxed);
     let (close, closed) = oneshot::channel::<&'static str>();
     let held = Arc::new(AtomicUsize::new(0));
-    let drained = out.drained();
-    let mut writer = tokio::spawn(async move {
-        while let Some(text) = out_rx.recv().await {
-            let len = text.len();
-            let sent = sink.send(Message::Text(text.into())).await;
-            drained.sent(len);
-            if sent.is_err() {
-                break;
-            }
-        }
-        let _ = sink.send(Message::Close(None)).await;
-    });
-    let limit = state.config.s2s_connection_subscriptions;
+    let limit = context.limits.per_connection;
     send(
         &out,
         json!(["hello", {
@@ -1137,8 +1050,8 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
             "database": database,
         }]),
     );
-    send(&out, lag_frame(&state.stats));
-    if handle
+    send(&out, lag_frame(&context.stats));
+    if hub
         .requests
         .send(Request::Connected {
             conn,
@@ -1149,21 +1062,14 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
         .await
         .is_err()
     {
-        writer.abort();
         return;
     }
     log_info!("s2s connection {conn} open");
-
-    let session = serve(conn, stream, closed, &out, &held, &state);
-    if AssertUnwindSafe(session).catch_unwind().await.is_err() {
+    let serving = serve(conn, inbound, closed, &out, &held, context);
+    if AssertUnwindSafe(serving).catch_unwind().await.is_err() {
         log_warn!("s2s connection {conn}: a frame's handling panicked");
     }
-    let _ = handle.requests.send(Request::Disconnected { conn }).await;
-    drop(out);
-    if tokio::time::timeout(WRITER_DRAIN, &mut writer).await.is_err() {
-        writer.abort();
-        log_warn!("s2s connection {conn}: its frames were not read in time, cut off");
-    }
+    let _ = hub.requests.send(Request::Disconnected { conn }).await;
     log_info!("s2s connection {conn} closed");
 }
 
@@ -1181,20 +1087,22 @@ fn lag_frame(stats: &Stats) -> Json {
 /// the task is gone. The task enforces the subscription limit; checking
 /// it here too keeps a connection at its limit from having more queries
 /// planned, which reads Postgres, only to be refused.
-async fn serve(
+async fn serve<S>(
     conn: u64,
-    mut stream: SplitStream<WebSocket>,
+    mut inbound: S,
     mut closed: oneshot::Receiver<&'static str>,
     out: &Outgoing,
     held: &AtomicUsize,
-    state: &Arc<AppState>,
-) {
-    let handle = &state.s2s;
-    let limit = state.config.s2s_connection_subscriptions;
+    context: &Context,
+) where
+    S: Stream<Item = String> + Unpin,
+{
+    let hub = &context.hub;
+    let limit = context.limits.per_connection;
     let unread = || log_warn!("s2s connection {conn} closed: the backend is not reading its frames");
     loop {
         let frame = tokio::select! {
-            frame = stream.next() => frame,
+            frame = inbound.next() => frame,
             reason = &mut closed => {
                 if let Ok(reason) = reason {
                     log_warn!("s2s connection {conn} closed: {reason}");
@@ -1202,12 +1110,8 @@ async fn serve(
                 return;
             }
         };
-        let text = match frame {
-            Some(Ok(Message::Text(text))) => text,
-            Some(Ok(Message::Ping(_)))
-            | Some(Ok(Message::Pong(_)))
-            | Some(Ok(Message::Binary(_))) => continue,
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+        let Some(text) = frame else {
+            return;
         };
         match upstream(&text) {
             Ok(Frame::Ping) => {
@@ -1217,7 +1121,7 @@ async fn serve(
                 }
             }
             Ok(Frame::Unsubscribe { id }) => {
-                if handle
+                if hub
                     .requests
                     .send(Request::Unsubscribe { conn, id })
                     .await
@@ -1237,7 +1141,7 @@ async fn serve(
                         "the subscription limit of {limit} per connection is reached"
                     ))
                 } else {
-                    prepare(state, conn, id, &sql, &binds, rows).await
+                    prepare(context, conn, id, &sql, &binds, rows).await
                 };
                 let request = match prepared {
                     Ok(request) => request,
@@ -1250,7 +1154,7 @@ async fn serve(
                         continue;
                     }
                 };
-                if handle.requests.send(request).await.is_err() {
+                if hub.requests.send(request).await.is_err() {
                     return;
                 }
             }
@@ -1280,27 +1184,27 @@ async fn serve(
 /// than the engine should take on its own thread is refused before it
 /// is planned ([`within_limits`]).
 async fn prepare(
-    state: &AppState,
+    context: &Context,
     conn: u64,
     id: u64,
     sql: &str,
     binds: &[BindValue],
     rows: bool,
 ) -> Result<Request, String> {
-    let mut catalog = state.catalog.load();
+    let mut catalog = context.catalog.load();
     let unknown: Vec<u32> = binds
         .iter()
         .map(|bind| bind.type_oid)
         .filter(|oid| !decodes(*oid) && !catalog.is_enum_oid(*oid))
         .collect();
-    if !unknown.is_empty() && learn_enums(state, &unknown).await {
-        catalog = state.catalog.load();
+    if !unknown.is_empty() && learn_enums(context, &unknown).await {
+        catalog = context.catalog.load();
     }
     let select = parse_select(sql, binds, &catalog).map_err(|error| error.message)?;
     within_limits(
         &select.query,
-        state.config.s2s_max_disjuncts,
-        state.config.s2s_max_list_values,
+        context.limits.max_disjuncts,
+        context.limits.max_list_values,
     )?;
     let shape = rows.then(|| Shape::new(&select.query, select.projection, select.limit, select.offset));
     let translated = Translated {
@@ -1311,9 +1215,9 @@ async fn prepare(
     let planned = plan::plan(
         sql,
         translated,
-        state.config.policy(),
-        &state.plans,
-        &*state.storage,
+        context.policy,
+        &context.plans,
+        &*context.storage,
     )
     .await?;
     Ok(Request::Subscribe(Box::new(Subscribe {
@@ -1332,12 +1236,12 @@ async fn prepare(
 /// A read that fails is an error, and the connection is closed without
 /// a `hello`: a `null` would have the backend take the engine on trust,
 /// so it reconnects instead, reading Postgres meanwhile.
-async fn database(state: &AppState) -> Result<Json, String> {
-    state
-        .s2s
+async fn database(context: &Context) -> Result<Json, String> {
+    context
+        .hub
         .database
         .get_or_try_init(|| async {
-            let rows = state
+            let rows = context
                 .storage
                 .simple_query(DATABASE_SQL)
                 .await
@@ -1422,13 +1326,13 @@ fn filter_size(filter: &Where) -> (u64, usize) {
 /// enum created after the catalog was loaded reads as its label. Whether
 /// any was learned; a failed lookup learns nothing, and the bind is then
 /// refused as a type the engine does not carry.
-async fn learn_enums(state: &AppState, oids: &[u32]) -> bool {
+async fn learn_enums(context: &Context, oids: &[u32]) -> bool {
     let list: Vec<String> = oids.iter().map(u32::to_string).collect();
     let list = list.join(", ");
     let sql = format!(
         "SELECT oid::text, typarray::text FROM pg_type WHERE typtype = 'e' AND (oid IN ({list}) OR typarray IN ({list}))"
     );
-    let Ok(rows) = state.storage.simple_query(&sql).await else {
+    let Ok(rows) = context.storage.simple_query(&sql).await else {
         return false;
     };
     let learned: Vec<u32> = rows
@@ -1441,7 +1345,7 @@ async fn learn_enums(state: &AppState, oids: &[u32]) -> bool {
     if learned.is_empty() {
         return false;
     }
-    state
+    context
         .catalog
         .update(|catalog| with_enums(catalog, learned.iter().copied()));
     true
@@ -1838,25 +1742,6 @@ mod tests {
         assert!(task.by_sub.is_empty());
     }
 
-    /// Places are handed out up to the limit and come back when their
-    /// connections close; a zero limit hands them out without one.
-    #[test]
-    fn connections_are_admitted_up_to_the_limit() {
-        let (handle, _requests) = Handle::new(2);
-        let first = handle.admit().expect("a place");
-        let second = handle.admit().expect("a place");
-        assert!(handle.admit().is_none());
-        drop(first);
-        let third = handle.admit().expect("the freed place");
-        assert!(handle.admit().is_none());
-        drop((second, third));
-        assert_eq!(handle.open.load(Ordering::Acquire), 0);
-
-        let (open, _requests) = Handle::new(0);
-        let places: Vec<Admitted> = (0..100).map(|_| open.admit().expect("a place")).collect();
-        assert_eq!(open.open.load(Ordering::Acquire), places.len());
-    }
-
     /// The first warning passes, the next ones within the period are
     /// counted, and the first after it says how many were held back.
     #[test]
@@ -1869,26 +1754,6 @@ mod tests {
         assert_eq!(throttle.pass(start + Duration::from_secs(60)), Some(2));
         assert_eq!(throttle.pass(start + Duration::from_secs(61)), None);
         assert_eq!(throttle.pass(start + Duration::from_secs(200)), Some(1));
-    }
-
-    /// Only the configured token, as a bearer, opens the endpoint.
-    #[test]
-    fn only_the_bearer_token_authorizes() {
-        let with = |value: &str| {
-            let mut headers = HeaderMap::new();
-            headers.insert(AUTHORIZATION, value.parse().unwrap());
-            headers
-        };
-        assert!(authorized(&with("Bearer s3cret"), "s3cret"));
-        assert!(authorized(&with("bearer s3cret"), "s3cret"));
-        assert!(authorized(&with("BEARER  s3cret"), "s3cret"));
-        assert!(!authorized(&with("Bearer s3cres"), "s3cret"));
-        assert!(!authorized(&with("Bearer s3cret2"), "s3cret"));
-        assert!(!authorized(&with("Bearer s3cre"), "s3cret"));
-        assert!(!authorized(&with("Bearer "), "s3cret"));
-        assert!(!authorized(&with("Basic s3cret"), "s3cret"));
-        assert!(!authorized(&with("s3cret"), "s3cret"));
-        assert!(!authorized(&HeaderMap::new(), "s3cret"));
     }
 
     /// A query's size is counted from its filter trees as their expansion

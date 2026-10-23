@@ -136,7 +136,8 @@ join; `bytea` as hex text, `OFFSET` left for the client to apply) or
 `refused`, then sends `delta` with the rows each committed transaction
 put or deleted, so the backend never reads Postgres for a query it
 holds. The protocol is documented in
-`src/client/s2s.rs`. The Diesel wrapper that uses it lives in this
+`src/live/mod.rs` (the WebSocket endpoint that carries it is
+`src/client/s2s.rs`). The Diesel wrapper that uses it lives in this
 repository as [`crates/diesel-streamgres`](crates/diesel-streamgres):
 a drop-in `PgConnection` replacement whose reads come from an in-memory
 cache the engine keeps fresh.

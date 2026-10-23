@@ -55,14 +55,14 @@ pub mod config;
 pub mod connection;
 pub mod ddl_triggers;
 pub mod groups;
-pub mod plan;
 pub mod protocol;
 pub mod s2s;
 pub mod sampler;
 pub mod schema;
 pub mod transform;
 pub mod warm;
-pub mod wire;
+
+pub use crate::{plan, wire};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -288,8 +288,22 @@ pub fn serve(config: Config) -> Result<(), String> {
     let warm_budget = config.warm_start;
     let metrics_interval = config.metrics_interval;
     let (warmed_tx, warmed) = tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
-    let (s2s, s2s_requests) = s2s::Handle::new(config.s2s_max_connections);
-    let s2s_task = s2s::run(
+    let (hub, s2s_requests) = crate::live::Hub::new();
+    let live = Arc::new(crate::live::Context {
+        hub,
+        catalog: catalog.clone(),
+        storage: storage.clone(),
+        plans: plans.clone(),
+        policy: config.policy(),
+        limits: crate::live::Limits {
+            per_connection: config.s2s_connection_subscriptions,
+            max_disjuncts: config.s2s_max_disjuncts,
+            max_list_values: config.s2s_max_list_values,
+        },
+        stats: stats.clone(),
+    });
+    let s2s = s2s::Admission::new(config.s2s_max_connections);
+    let s2s_task = crate::live::run(
         catalog.clone(),
         shards,
         commands.clone(),
@@ -321,6 +335,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         transforms,
         shutdown: shutdown.clone(),
         s2s,
+        live,
     });
     drop(readiness);
     if warm.enabled() {

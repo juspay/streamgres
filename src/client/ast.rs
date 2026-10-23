@@ -113,17 +113,7 @@ pub struct Correlation {
 /// them: the parent columns, the child columns and the child table.
 type Relationship<'a> = (&'a [String], &'a [String], &'a str);
 
-/// A translated query: the tree to register, the parts whose rows stay
-/// on the server (permission subqueries), and, when a page of it has a
-/// keyset cursor, the same tree with every cursor left out — what the
-/// planner estimates its sizes on, so a page turn asks nothing a first
-/// page did not.
-#[derive(Debug, Clone)]
-pub struct Translated {
-    pub query: MultiTableReadQuery,
-    pub hidden: HashSet<QueryPart>,
-    pub uncursored: Option<MultiTableReadQuery>,
-}
+pub use crate::plan::Translated;
 
 /// Translate `ast` against `catalog`; an error says what the engine
 /// cannot run.

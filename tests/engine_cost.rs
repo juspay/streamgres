@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use streamgres::client::plan::{Planner, Policy, Side};
+use streamgres::plan::{Planner, Policy, Side};
 use streamgres::ivm::MultiTableIVM;
 use streamgres::model::Order::DESC;
 use streamgres::model::{
