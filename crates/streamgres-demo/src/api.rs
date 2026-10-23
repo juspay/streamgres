@@ -97,6 +97,7 @@ async fn verify_once(State(app): State<App>) -> Json<Value> {
         "compared": outcome.compared,
         "lagged": outcome.lagged,
         "mismatches": outcome.mismatches,
+        "live_disagreed": outcome.live_disagreed,
         "totals": app.verify.json(),
     }))
 }

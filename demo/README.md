@@ -109,7 +109,11 @@ curl -s localhost:8080/verify | jq '{compared, lagged, mismatches}'
 Every lookup is read through the cache and through Postgres and
 compared. A pair that differs is read again for up to a second, since
 the cache may lag a commit by the engine's propagation delay; one that
-never agrees is a mismatch, returned with both answers. With
+never agrees is a mismatch, returned with both answers. A pair whose
+cached side was itself read from Postgres (the shapes the engine
+refuses, a refill) is counted as `live_disagreed` instead: under steady
+writes two live reads a moment apart can differ, which says nothing
+about the cache. With
 `DEMO_VERIFY_MS=500` the backend runs this pass every half second
 in the background, under the writer, and `/stats` carries the totals.
 The writer's mix covers inserts, deletes, moves between organizations,

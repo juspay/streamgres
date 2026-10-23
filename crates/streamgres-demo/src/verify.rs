@@ -5,8 +5,13 @@
 //! so a difference is not a mismatch until it has had time to settle:
 //! the pair is re-read until the two agree or `settle` runs out. A pair
 //! that agreed on a later read counts as `lagged`; one that never did is
-//! a mismatch, kept with both answers. The verify loop (`demo
-//! verify`) and `/verify` run this; `/stats` shows the counters.
+//! a mismatch, kept with both answers. A pair whose cached side was
+//! itself read from Postgres (a query the engine refuses, a refill, a
+//! read the wrapper sent live) says nothing about the cache: under
+//! steady writes two live reads a moment apart can differ for the whole
+//! settle time, so such a pair counts as `live_disagreed`, not as a
+//! mismatch. The verify loop (`demo verify`) and `/verify` run this;
+//! `/stats` shows the counters.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +19,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
+
+use diesel_streamgres::Served;
 
 use crate::pools::Stack;
 use crate::queries::Lookup;
@@ -32,6 +39,8 @@ pub struct Outcome {
     pub compared: u64,
     pub lagged: u64,
     pub mismatches: Vec<Mismatch>,
+    /// Pairs that never agreed with both sides read from Postgres.
+    pub live_disagreed: u64,
 }
 
 /// The counters over every pass so far, and the last mismatch.
@@ -41,6 +50,7 @@ pub struct Counts {
     pub compared: AtomicU64,
     pub lagged: AtomicU64,
     pub mismatches: AtomicU64,
+    pub live_disagreed: AtomicU64,
     pub errors: AtomicU64,
     pub last: Mutex<Option<Mismatch>>,
 }
@@ -58,6 +68,7 @@ impl Counts {
             "compared": AtomicU64::load(&self.compared, Ordering::Relaxed),
             "lagged": AtomicU64::load(&self.lagged, Ordering::Relaxed),
             "mismatches": AtomicU64::load(&self.mismatches, Ordering::Relaxed),
+            "live_disagreed": AtomicU64::load(&self.live_disagreed, Ordering::Relaxed),
             "errors": AtomicU64::load(&self.errors, Ordering::Relaxed),
             "last_mismatch": last,
         })
@@ -70,20 +81,26 @@ impl Counts {
         self.lagged.fetch_add(outcome.lagged, Ordering::Relaxed);
         self.mismatches
             .fetch_add(outcome.mismatches.len() as u64, Ordering::Relaxed);
+        self.live_disagreed
+            .fetch_add(outcome.live_disagreed, Ordering::Relaxed);
         if let (Some(last), Ok(mut slot)) = (outcome.mismatches.last(), self.last.lock()) {
             *slot = Some(last.clone());
         }
     }
 }
 
+/// What one comparison found: both answers, whether a later read was
+/// needed, and whether the last cached read came from Postgres.
+struct Compared {
+    cached: Value,
+    postgres: Value,
+    lagged: bool,
+    live: bool,
+}
+
 /// Reads `lookup` through the cache and through Postgres until the two
-/// agree or `settle` runs out: the answers, and whether a later read
-/// was needed.
-async fn compare(
-    stack: &Stack,
-    lookup: &Lookup,
-    settle: Duration,
-) -> Result<(Value, Value, bool), String> {
+/// agree or `settle` runs out.
+async fn compare(stack: &Stack, lookup: &Lookup, settle: Duration) -> Result<Compared, String> {
     let mut cached_conn = stack.main.get().await.map_err(|error| error.to_string())?;
     let mut truth_conn = stack
         .reporting
@@ -102,7 +119,12 @@ async fn compare(
             .await
             .map_err(|error| format!("{}: postgres read: {error}", lookup.name()))?;
         if cached == truth || started.elapsed() >= settle {
-            return Ok((cached, truth, lagged));
+            return Ok(Compared {
+                live: cached_conn.last_served() == Some(Served::Postgres),
+                cached,
+                postgres: truth,
+                lagged,
+            });
         }
         lagged = true;
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -114,16 +136,21 @@ pub async fn once(stack: &Stack, lookups: &[Lookup], settle: Duration) -> Outcom
     let mut outcome = Outcome::default();
     for lookup in lookups {
         match compare(stack, lookup, settle).await {
-            Ok((cached, postgres, lagged)) => {
+            Ok(compared) => {
                 outcome.compared += 1;
-                if lagged {
+                if compared.lagged {
                     outcome.lagged += 1;
                 }
-                if cached != postgres {
+                if compared.cached == compared.postgres {
+                    continue;
+                }
+                if compared.live {
+                    outcome.live_disagreed += 1;
+                } else {
                     outcome.mismatches.push(Mismatch {
                         lookup: lookup.name().to_string(),
-                        cached,
-                        postgres,
+                        cached: compared.cached,
+                        postgres: compared.postgres,
                     });
                 }
             }
