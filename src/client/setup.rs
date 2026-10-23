@@ -22,7 +22,7 @@ pub async fn ensure(master_dsn: &str, config: &Config) -> Result<(), String> {
     let (mut client, connection) = tokio_postgres::connect(master_dsn, NoTls)
         .await
         .map_err(|error| format!("connecting to primary database: {error}"))?;
-    let connection = tokio::spawn(async move { connection.await });
+    let connection = tokio::spawn(connection);
     let result = async {
         let tx = client
             .transaction()
@@ -652,7 +652,7 @@ mod tests {
         ensure(&dsn, &config).await.unwrap();
 
         let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
-        let connection = tokio::spawn(async move { connection.await });
+        let connection = tokio::spawn(connection);
         client
             .batch_execute(&format!(
                 "UPDATE {}.\"publishedSchema\" SET current = json_build_object(
