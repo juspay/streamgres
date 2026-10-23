@@ -867,6 +867,10 @@ fn joins_are_composed_from_the_engines_rows() {
 /// A change on a key held by any socket reaches the cache.
 ///
 /// Dropping one subscription frees its slot on its socket only.
+///
+/// The rows are written on another connection, so a first read may be
+/// answered from an engine that has not applied them yet: each is read
+/// until it shows, as eventual consistency allows.
 #[test]
 fn a_pool_spreads_subscriptions_across_its_sockets() {
     let Some(mut live) = Live::start("pool") else {
@@ -909,10 +913,14 @@ fn a_pool_spreads_subscriptions_across_its_sockets() {
             .unwrap()
     };
     for i in 0..6 {
-        assert_eq!(
-            read(&mut conn, live.key(&format!("p{i}"))).as_deref(),
-            Some(format!("v{i}").as_str())
-        );
+        let started = Instant::now();
+        while read(&mut conn, live.key(&format!("p{i}"))).as_deref() != Some(format!("v{i}").as_str()) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "p{i} never reached the engine's rows"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
     assert_eq!(engine.subscribed(), 6);
     assert_eq!(engine.per_worker(), vec![2, 2, 2], "least-loaded routing");
