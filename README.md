@@ -140,7 +140,10 @@ holds. The protocol is documented in
 `src/client/s2s.rs`). The Diesel wrapper that uses it lives in this
 repository as [`crates/diesel-streamgres`](crates/diesel-streamgres):
 a drop-in `PgConnection` replacement whose reads come from an in-memory
-cache the engine keeps fresh.
+cache the engine keeps fresh. A small application can run the engine
+inside its own process instead (`STREAMGRES_ENGINE=embedded`), against
+its primary; [`docs/backends.md`](docs/backends.md) covers choosing
+between the two, replicas and read-your-writes.
 
 Configuration uses `STREAMGRES_*` environment variables, each documented in
 [`.env.example`](.env.example). Existing `XYNE_SYNC_*` variables are still

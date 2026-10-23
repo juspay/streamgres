@@ -80,14 +80,21 @@ branch name and the short commit SHA.
   directly to PostgreSQL for the logical feed and snapshot minting.
   Replication must not use the read pool.
 
-**The server writes nothing to the database it follows.** It reads rows and
-the replication stream. Its position in the stream comes from each commit and
-from the keepalives PostgreSQL sends anyway. So `STREAMGRES_PG_DSN` can point
-at:
+**The server writes nothing to the database it follows but its
+heartbeats.** It reads rows and the replication stream. Its position in the
+stream comes from each commit and from the keepalives PostgreSQL sends
+anyway. Every `STREAMGRES_HEARTBEAT_MS` it writes a logical message (no
+table) to measure its lag, which only a primary accepts. So
+`STREAMGRES_PG_DSN` can point at:
 - the primary,
 - a logical replica, or
 - a physical standby (PostgreSQL 16 or later, the first version that can do
-  logical decoding on a standby).
+  logical decoding on a standby). There the heartbeats fail, the server
+  reports no lag, and backends trust it whatever its delay.
+
+Run the one-time setup below on the primary, as a migration. Backends that
+cache their reads through the Diesel wrapper may read from replicas; see
+[`backends.md`](backends.md).
 
 Ordinary SQL reads can optionally use a separate endpoint:
 `STREAMGRES_READ_PG_DSN` may point to PgBouncer configured for transaction

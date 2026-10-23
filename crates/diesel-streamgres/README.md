@@ -41,6 +41,16 @@ diesel_streamgres::install(Settings::single(
 //   conn.with_route(Route::Streamgres, |c| configs::table.find(key).first(c))
 ```
 
+## The engine in this process
+
+With the `embedded` feature, `EngineClient::from_env()` runs the engine
+inside the application when `STREAMGRES_ENGINE=embedded`, against the
+primary at `STREAMGRES_PG_DSN`, and connects to `STREAMGRES_S2S_URL`
+otherwise; the rest of the code is the same. It suits one or a few
+processes: each holds its own replication slot. See
+[`docs/backends.md`](../../docs/backends.md) for choosing a mode, reading
+from replicas and read-your-writes.
+
 ## diesel-async
 
 With the `async` feature, `AsyncSyncedConnection` wraps diesel-async's
