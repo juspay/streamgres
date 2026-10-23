@@ -256,30 +256,9 @@ impl Config {
     /// The configuration `lookup` describes (the environment's, or a
     /// test's): an unset or empty variable takes its default.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, String> {
-        let value = |name: &str| {
-            lookup(name)
-                .filter(|value| !value.is_empty())
-                .or_else(|| {
-                    name.strip_prefix("STREAMGRES_")
-                        .and_then(|suffix| lookup(&format!("STREAMGRES_SYNC_{suffix}")))
-                        .filter(|value| !value.is_empty())
-                })
-                .or_else(|| {
-                    name.strip_prefix("STREAMGRES_")
-                        .and_then(|suffix| lookup(&format!("XYNE_SYNC_{suffix}")))
-                        .filter(|value| !value.is_empty())
-                })
-        };
-        let first = |names: &[&str]| names.iter().find_map(|name| value(name));
-        let millis = |name: &str, default: u64| -> Result<Duration, String> {
-            match first(&[name]) {
-                Some(text) => text
-                    .parse::<u64>()
-                    .map(Duration::from_millis)
-                    .map_err(|_| format!("{name} must be a number of milliseconds, got `{text}`")),
-                None => Ok(Duration::from_millis(default)),
-            }
-        };
+        let env = crate::env::Env::new(lookup);
+        let first = |names: &[&str]| env.first(names);
+        let millis = |name: &str, default: u64| env.millis(name, default);
         let dsn = first(&["STREAMGRES_PG_DSN", "ZERO_UPSTREAM_DB"])
             .ok_or("STREAMGRES_PG_DSN (or ZERO_UPSTREAM_DB) must name the database")?;
         let read_dsn = first(&["STREAMGRES_READ_PG_DSN"]).unwrap_or_else(|| dsn.clone());

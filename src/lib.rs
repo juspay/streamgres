@@ -65,6 +65,8 @@
 
 #[cfg(feature = "server")]
 pub mod client;
+pub mod embedded;
+pub mod env;
 pub mod ivm;
 pub mod live;
 pub mod log;
