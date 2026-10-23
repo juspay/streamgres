@@ -11,7 +11,7 @@ use std::time::Duration;
 use super::plan::{Policy, Side};
 use crate::log::{Format, Level};
 use crate::model::TableName;
-use crate::sync::pg::{Keepalive, Settings, threads};
+use crate::sync::pg::{Keepalive, Settings, estimate_cache, threads};
 
 /// A setting that must not reach a log: its `Debug` shows no value.
 #[derive(Clone)]
@@ -67,6 +67,15 @@ pub struct Config {
     /// sends none, and the S2S endpoint then reports no lag). Any role
     /// may emit one; it needs the primary.
     pub heartbeat: Duration,
+    /// `STREAMGRES_MEMORY_TABLES`: tables mirrored in memory, comma
+    /// separated, and answered from there rather than read (none).
+    pub memory_tables: Vec<TableName>,
+    /// `STREAMGRES_ESTIMATE_TTL_MS`: how long the planner keeps a
+    /// statement's estimate (a day); not a number keeps the default.
+    pub estimate_ttl: Duration,
+    /// `STREAMGRES_ESTIMATE_CACHE`: how many estimates it keeps (300000);
+    /// not a number keeps the default.
+    pub estimate_capacity: usize,
     /// `STREAMGRES_SNAPSHOT_ROTATION_MS`: how often a fresh exported
     /// snapshot (a temporary replication slot) is minted for reads (1000).
     pub snapshot_rotation: Duration,
@@ -363,6 +372,22 @@ impl Config {
             slot: threads::slot_name(),
             slot_cleanup_age: millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
             heartbeat: millis("STREAMGRES_HEARTBEAT_MS", 500)?,
+            memory_tables: first(&["STREAMGRES_MEMORY_TABLES"])
+                .map(|names| {
+                    names
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(TableName::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            estimate_ttl: first(&["STREAMGRES_ESTIMATE_TTL_MS"])
+                .and_then(|text| text.trim().parse().ok())
+                .map_or(estimate_cache::DEFAULT_TTL, Duration::from_millis),
+            estimate_capacity: first(&["STREAMGRES_ESTIMATE_CACHE"])
+                .and_then(|text| text.trim().parse().ok())
+                .unwrap_or(estimate_cache::DEFAULT_CAPACITY),
             publication: first(&["STREAMGRES_PUBLICATION"])
                 .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
             ddl_trigger,
@@ -568,6 +593,10 @@ impl Config {
             ddl_trigger: self.ddl_trigger.clone(),
             ddl_prefix: self.ddl_prefix.clone(),
             heartbeat: self.heartbeat,
+            row_limit: usize::try_from(self.row_limit).unwrap_or(usize::MAX),
+            memory_tables: self.memory_tables.clone(),
+            estimate_ttl: self.estimate_ttl,
+            estimate_capacity: self.estimate_capacity,
         }
     }
 }
@@ -746,6 +775,33 @@ mod tests {
         ]);
         assert_eq!((set.s2s_max_disjuncts, set.s2s_max_list_values), (0, 7));
         assert!(config(&[("STREAMGRES_S2S_MAX_DISJUNCTS", "lots")]).is_err());
+    }
+
+    /// The memory tables, the row limit and the estimate cache are read
+    /// here, legacy names included, so the engine core reads no
+    /// environment of its own; a number that does not parse keeps the
+    /// estimate defaults, as it always did.
+    #[test]
+    fn the_engine_settings_come_from_the_configuration() {
+        let defaults = config_with(&[]).engine_settings();
+        assert!(defaults.memory_tables.is_empty());
+        assert_eq!(defaults.row_limit, 100_000);
+        assert_eq!(defaults.estimate_ttl, estimate_cache::DEFAULT_TTL);
+        assert_eq!(defaults.estimate_capacity, estimate_cache::DEFAULT_CAPACITY);
+        let set = config_with(&[
+            ("XYNE_SYNC_MEMORY_TABLES", " orgs, ,agents "),
+            ("STREAMGRES_SYNC_ROW_LIMIT", "500"),
+            ("STREAMGRES_ESTIMATE_TTL_MS", "60000"),
+            ("STREAMGRES_ESTIMATE_CACHE", "lots"),
+        ])
+        .engine_settings();
+        assert_eq!(
+            set.memory_tables,
+            vec![TableName::from("orgs"), TableName::from("agents")]
+        );
+        assert_eq!(set.row_limit, 500);
+        assert_eq!(set.estimate_ttl, Duration::from_secs(60));
+        assert_eq!(set.estimate_capacity, estimate_cache::DEFAULT_CAPACITY);
     }
 
     /// The engine beats every 500 ms unless told otherwise; 0 stops it.

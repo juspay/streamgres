@@ -145,7 +145,7 @@ pub fn serve(config: Config) -> Result<(), String> {
     crate::stats::Stats::install(&stats);
     let shards = config.group_threads.max(1);
     stats.read_row_limit.store(
-        crate::sync::pg::read_row_limit() as u64,
+        config.row_limit,
         std::sync::atomic::Ordering::Relaxed,
     );
 

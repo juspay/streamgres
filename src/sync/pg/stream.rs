@@ -570,7 +570,7 @@ impl Transport {
             )));
         }
         let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
-        let prefix = "xyne_sync_slot_";
+        let prefix = super::threads::SLOT_PREFIX;
         let slots = client
             .query(
                 "SELECT slot_name FROM pg_replication_slots \

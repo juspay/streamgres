@@ -71,6 +71,11 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 /// - `heartbeat`: how often the engine writes a heartbeat into the WAL
 ///   to measure how far behind it is ([`crate::sync::heartbeat`]); zero
 ///   for none.
+/// - `row_limit`: the most rows one read may return, and the planner's
+///   bound on a side it reads whole ([`super::DEFAULT_READ_ROW_LIMIT`]).
+/// - `memory_tables`: tables mirrored in memory and answered from there.
+/// - `estimate_ttl`, `estimate_capacity`: how long the planner's
+///   estimates are kept, and how many.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub dsn: String,
@@ -91,6 +96,10 @@ pub struct Settings {
     pub ddl_trigger: String,
     pub ddl_prefix: String,
     pub heartbeat: Duration,
+    pub row_limit: usize,
+    pub memory_tables: Vec<TableName>,
+    pub estimate_ttl: Duration,
+    pub estimate_capacity: usize,
 }
 
 /// What every slot a server names for itself starts with.
@@ -418,7 +427,9 @@ pub async fn start(
     .with_rotation(settings.snapshot_rotation)
     .with_read_connections(settings.read_connections)
     .with_read_idle_connections(settings.read_idle_connections)
-    .with_read_timeout(settings.read_timeout);
+    .with_read_timeout(settings.read_timeout)
+    .with_read_row_limit(settings.row_limit)
+    .with_estimates(settings.estimate_ttl, settings.estimate_capacity);
     let pg = Arc::new(pg);
     let (feed, feed_handle) = spawn_feed(
         settings.clone(),
@@ -426,7 +437,7 @@ pub async fn start(
         pg.first_position(),
         shutdown,
     )?;
-    let cached = Sources::cached_from_env();
+    let cached = settings.memory_tables.clone();
     let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
     if !cached.is_empty() {
         let rows = storage
@@ -442,7 +453,7 @@ pub async fn start(
         .map(|_| mpsc::unbounded_channel())
         .unzip();
     let first = sinks[0].clone();
-    let engine = MultiTableIVM::new().with_row_limit(super::read_row_limit());
+    let engine = MultiTableIVM::new().with_row_limit(settings.row_limit);
     let (service, commands) = Service::new(engine, storage, first);
     let service = spawn_local(
         service

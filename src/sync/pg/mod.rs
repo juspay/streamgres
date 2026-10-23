@@ -91,34 +91,12 @@ const DEFAULT_READ_CONNECTIONS: usize = 16;
 const DEFAULT_READ_IDLE_CONNECTIONS: usize = 16;
 
 /// The most rows one read may bring back before it is refused, unless
-/// `STREAMGRES_ROW_LIMIT` says otherwise. Older `STREAMGRES_READ_ROW_LIMIT`,
-/// `STREAMGRES_JOIN_LIMIT`, and `XYNE_SYNC_ROW_LIMIT`/`XYNE_SYNC_READ_ROW_LIMIT`/
-/// `XYNE_SYNC_JOIN_LIMIT` names remain accepted: a query
-/// without a `LIMIT` over a large table would otherwise be buffered whole,
-/// and one such query is enough to take the process down. The planner reads
-/// whole no side of a join past the same number, so a side it calls small is
-/// one a read returns.
-const DEFAULT_READ_ROW_LIMIT: usize = 100_000;
-
-/// [`DEFAULT_READ_ROW_LIMIT`], or the environment's override.
-pub fn read_row_limit() -> usize {
-    [
-        "STREAMGRES_ROW_LIMIT",
-        "STREAMGRES_SYNC_ROW_LIMIT",
-        "XYNE_SYNC_ROW_LIMIT",
-        "STREAMGRES_READ_ROW_LIMIT",
-        "STREAMGRES_SYNC_READ_ROW_LIMIT",
-        "XYNE_SYNC_READ_ROW_LIMIT",
-        "STREAMGRES_JOIN_LIMIT",
-        "STREAMGRES_SYNC_JOIN_LIMIT",
-        "XYNE_SYNC_JOIN_LIMIT",
-    ]
-    .iter()
-    .find_map(|name| std::env::var(name).ok())
-    .and_then(|value| value.trim().parse().ok())
-    .filter(|limit| *limit > 0)
-    .unwrap_or(DEFAULT_READ_ROW_LIMIT)
-}
+/// [`PgStorage::with_read_row_limit`] says otherwise (the server's
+/// `STREAMGRES_ROW_LIMIT`): a query without a `LIMIT` over a large table
+/// would otherwise be buffered whole, and one such query is enough to
+/// take the process down. The planner reads whole no side of a join past
+/// the same number, so a side it calls small is one a read returns.
+pub const DEFAULT_READ_ROW_LIMIT: usize = 100_000;
 
 /// How the kernel probes a connection to the database while it is silent,
 /// so that whatever is between (a NAT, a load balancer) does not drop it as
@@ -456,7 +434,7 @@ impl PgStorage {
             idle: Mutex::new(vec![client]),
             permits: Arc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
             idle_limit: AtomicUsize::new(DEFAULT_READ_IDLE_CONNECTIONS),
-            row_limit: AtomicUsize::new(read_row_limit()),
+            row_limit: AtomicUsize::new(DEFAULT_READ_ROW_LIMIT),
             aliases: Mutex::new(Aliases::new(catalog)),
             rotation: AtomicU64::new(250),
             wake: Notify::new(),
@@ -472,14 +450,25 @@ impl PgStorage {
         Ok(PgStorage {
             pool,
             delay: None,
-            estimates: Arc::new(estimate_cache::EstimateCache::from_env()),
+            estimates: Arc::new(estimate_cache::EstimateCache::new(
+                estimate_cache::DEFAULT_TTL,
+                estimate_cache::DEFAULT_CAPACITY,
+            )),
         })
     }
 
-    /// Refuse a read past `limit` rows instead of the environment's budget
-    /// (tests; at least one).
+    /// Refuse a read past `limit` rows instead of
+    /// [`DEFAULT_READ_ROW_LIMIT`] (at least one).
     pub fn with_read_row_limit(self, limit: usize) -> Self {
         self.pool.row_limit.store(limit.max(1), Ordering::Relaxed);
+        self
+    }
+
+    /// Keep the planner's estimates for `ttl`, at most `capacity` of them,
+    /// instead of [`estimate_cache::DEFAULT_TTL`] and
+    /// [`estimate_cache::DEFAULT_CAPACITY`].
+    pub fn with_estimates(mut self, ttl: Duration, capacity: usize) -> Self {
+        self.estimates = Arc::new(estimate_cache::EstimateCache::new(ttl, capacity));
         self
     }
 

@@ -18,9 +18,6 @@ use crate::model::{
     Where, WriteQuery,
 };
 
-/// The environment variable naming the tables to mirror in memory.
-pub const MEMORY_TABLES_VAR: &str = "STREAMGRES_MEMORY_TABLES";
-
 /// One [`Storage`] over two: the in-memory mirror for the cached tables,
 /// Postgres for everything else.
 ///
@@ -51,34 +48,6 @@ impl Sources {
             cached: cached.into_iter().collect(),
             catalog,
         }
-    }
-
-    /// The tables named in `STREAMGRES_MEMORY_TABLES` (or the legacy
-    /// `STREAMGRES_SYNC_MEMORY_TABLES` or `XYNE_SYNC_MEMORY_TABLES`; empty
-    /// when unset).
-    pub fn cached_from_env() -> Vec<TableName> {
-        std::env::var(MEMORY_TABLES_VAR)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                std::env::var("STREAMGRES_SYNC_MEMORY_TABLES")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            })
-            .or_else(|| {
-                std::env::var("XYNE_SYNC_MEMORY_TABLES")
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            })
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                    .map(TableName::from)
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     /// Whether `table` is answered from memory.
