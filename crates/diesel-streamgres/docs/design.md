@@ -391,8 +391,12 @@ types learnt, since a migration may have changed one.
 marks the cache entries of its keys stale, which go live until it is
 back, and
 on reconnect resubscribes every key it holds under the same ids.
-Rows-mode keys rebuild from the snapshot with no Postgres read;
-refill-mode keys refill on their next read; keys now refused are
+The drop forgets the column types learnt, and a resubscribe has no
+connection to look them up on, so a rows-mode key is let go when its
+rows come back and its next read subscribes it afresh, looks the types
+up and is served from rows again (types learnt again before a
+resubscribe answers let it rebuild with no Postgres read). Refill-mode
+keys refill on their next read; keys now refused are
 forgotten. A key is pending until the engine accepts it again, and reads
 of it go live meanwhile. One socket dropping affects only its keys. With
 the engine unreachable, every subscribe is refused at once, so an engine

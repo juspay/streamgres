@@ -260,6 +260,24 @@ impl Shared {
         self.cache.lock().expect("cache").as_ref()?.upgrade()
     }
 
+    /// The tables of `snapshot` whose column types are not known, or are
+    /// known without a column it names: types learnt before a migration
+    /// added it.
+    fn missing_types(&self, snapshot: &Snapshot) -> Vec<String> {
+        let types = self.types.lock().expect("types");
+        snapshot
+            .tables()
+            .filter(|table| {
+                types.get(*table).is_none_or(|known| {
+                    snapshot
+                        .columns_of(table)
+                        .any(|column| known.column(column).is_none())
+                })
+            })
+            .map(str::to_string)
+            .collect()
+    }
+
     /// Notes why a subscription fell back from rows to refills.
     fn fell_back(&self, reason: String) {
         Self::remember(&self.fallbacks, reason);
@@ -850,8 +868,7 @@ impl Worker {
     /// would fill an entry that a refusal or a timeout then leaves
     /// without a subscription, so this read goes live and the next one
     /// finds the answer. A key already subscribed (a refill after a
-    /// touch, or a resubscribe the reader could not materialise without
-    /// a connection) gets the rows if its store has them.
+    /// touch) gets the rows if its store has them.
     ///
     /// The reader thread puts a `Building` store in place before it
     /// hands a snapshot over, so every delta from that moment on queues
@@ -912,20 +929,7 @@ impl Worker {
         match verdict.recv_timeout(self.verdict_timeout) {
             Ok(Reply::Verdict(verdict)) => Outcome::Verdict(verdict),
             Ok(Reply::Snapshot(snapshot)) => {
-                let missing: Vec<String> = {
-                    let types = self.shared.types.lock().expect("types");
-                    snapshot
-                        .tables()
-                        .filter(|table| {
-                            types.get(*table).is_none_or(|known| {
-                                snapshot
-                                    .columns_of(table)
-                                    .any(|column| known.column(column).is_none())
-                            })
-                        })
-                        .map(str::to_string)
-                        .collect()
-                };
+                let missing = self.shared.missing_types(&snapshot);
                 if missing.is_empty() {
                     Outcome::Verdict(self.materialize(id, snapshot))
                 } else {
@@ -1458,7 +1462,11 @@ fn inbound(worker: &Worker, text: &str) {
 /// the store is built from the types already known and the cache
 /// refilled without a read, the key reserved before the rows are built
 /// as a Postgres read reserves it; in touch mode it is accepted, and the
-/// next read refills it.
+/// next read refills it. The types are forgotten with the socket, and
+/// with no connection here to look them up, a resubscribe whose tables
+/// lack them is let go ([`let_go`]) rather than kept refilling from
+/// Postgres: the next read subscribes it afresh, looks them up, and is
+/// served from rows again.
 fn on_accepted(worker: &Worker, mut body: Json) {
     let shared = &worker.shared;
     let Some(id) = body.get("id").and_then(Json::as_u64) else {
@@ -1501,6 +1509,10 @@ fn on_accepted(worker: &Worker, mut body: Json) {
             let _ = reply.try_send(Reply::Verdict(Verdict::Accepted));
         }
         (Some(None) | None, Some(snapshot)) => {
+            if !shared.missing_types(&snapshot).is_empty() {
+                let_go(worker, id, &key);
+                return;
+            }
             let reservation = shared.cache().map(|cache| cache.reserve(&key));
             if let Verdict::Rows { live, .. } = worker.materialize(id, snapshot)
                 && let (Some(cache), Some(reservation)) = (shared.cache(), reservation)
@@ -1517,13 +1529,20 @@ fn on_accepted(worker: &Worker, mut body: Json) {
 /// not this database's, so the key is let go as a refusal would, and its
 /// entry goes stale for the next read to take from Postgres.
 fn resubscribed_elsewhere(worker: &Worker, id: u64, key: &QueryKey, reason: String) {
+    let _ = worker.shared.refused(reason);
+    let_go(worker, id, key);
+}
+
+/// Ends a resubscribed key's subscription here and with the engine, and
+/// leaves its entry stale, so the next read takes it as a miss and
+/// subscribes it afresh.
+fn let_go(worker: &Worker, id: u64, key: &QueryKey) {
     let shared = &worker.shared;
     {
         let mut state = worker.state.lock().expect("state");
         worker.drop_id(&mut state, id);
     }
     shared.release(key, worker.index);
-    let _ = shared.refused(reason);
     let _ = worker.outgoing.send(Outgoing::Unsubscribe { id });
     if let Some(cache) = shared.cache() {
         cache.touched(key);
@@ -1935,6 +1954,48 @@ mod tests {
             worker.subscribe(&key()),
             Outcome::Verdict(Verdict::Accepted)
         ));
+    }
+
+    /// A dropped socket forgets the types, so the rows a resubscribe
+    /// brings back cannot be built: the key is let go, not kept
+    /// refilling from Postgres, and the next read subscribes it afresh
+    /// and is asked for the types. With the types known, a resubscribe
+    /// is served from rows again at once.
+    #[test]
+    fn a_resubscribe_without_types_lets_the_key_go() {
+        let (worker, mut outgoing, shared) = worker();
+        shared.types.lock().unwrap().insert("t".to_string(), t_types());
+        let handle = subscribing(&worker);
+        inbound(&worker, &accepted_with_rows(1));
+        assert!(matches!(handle.join().unwrap(), Outcome::Verdict(Verdict::Rows { .. })));
+
+        disconnected(&worker);
+        greeted(&worker);
+        shared.types.lock().unwrap().insert("t".to_string(), t_types());
+        inbound(&worker, &accepted_with_rows(1));
+        assert!(
+            worker.state.lock().unwrap().materialized.contains_key(&1),
+            "types known: rows again"
+        );
+
+        disconnected(&worker);
+        greeted(&worker);
+        while outgoing.try_recv().is_ok() {}
+        inbound(&worker, &accepted_with_rows(1));
+        assert!(matches!(outgoing.try_recv(), Ok(Outgoing::Unsubscribe { id: 1 })));
+        {
+            let state = worker.state.lock().unwrap();
+            assert!(state.by_id.is_empty(), "the key is let go");
+            assert!(state.materialized.is_empty());
+        }
+        assert!(shared.fallbacks.lock().unwrap().is_empty(), "not turned to refills");
+
+        let handle = subscribing(&worker);
+        inbound(&worker, &accepted_with_rows(2));
+        let Outcome::NeedsTypes { missing, .. } = handle.join().unwrap() else {
+            panic!("the next read looks the types up");
+        };
+        assert_eq!(missing, vec!["t".to_string()]);
     }
 
     /// An engine that takes the subscribe and never answers: the wait
