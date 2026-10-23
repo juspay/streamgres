@@ -84,7 +84,7 @@ impl Subscriptions for FakeEngine {
                 live: Arc::new(NoRows),
             });
         }
-        Outcome::Verdict(Verdict::Accepted)
+        Outcome::Verdict(Verdict::Accepted { since: None })
     }
 
     /// Accepted, with no rows.
@@ -94,7 +94,7 @@ impl Subscriptions for FakeEngine {
         _: diesel_streamgres::materialized::Snapshot,
         _: std::collections::HashMap<String, Arc<diesel_streamgres::types::TableTypes>>,
     ) -> Verdict {
-        Verdict::Accepted
+        Verdict::Accepted { since: None }
     }
 
     /// Records the key.
@@ -322,8 +322,8 @@ fn the_connection_says_where_each_read_was_served_from() {
 
 /// The subscription is registered before Postgres is read, so no commit in
 /// between goes unreported. The cache is told its database first, which
-/// its first miss would otherwise read, so the one read counted is the
-/// query's.
+/// its first miss would otherwise read, so the reads counted are the
+/// query's and, once per connection, whether it is on a primary.
 #[test]
 fn the_subscription_is_registered_before_postgres_is_read() {
     let mut w = World::new("order");
@@ -334,7 +334,7 @@ fn the_subscription_is_registered_before_postgres_is_read() {
     let key = w.key_of("a");
     let subscribed = w.engine.subscribed.lock().unwrap();
     assert_eq!(subscribed.as_slice(), std::slice::from_ref(&key));
-    assert_eq!(w.sent(), before + 1, "exactly one read reached Postgres");
+    assert_eq!(w.sent(), before + 2, "whether it is a primary, then the read");
     assert!(key.is_select());
     assert_eq!(key.binds.len(), 2, "the key's value and the LIMIT");
     assert_eq!(key.binds[0].type_oid, 25, "the first bind is a text");
@@ -342,7 +342,8 @@ fn the_subscription_is_registered_before_postgres_is_read() {
 }
 
 /// The first miss through a cache reads which database the cache's
-/// reads go to, once, beside the query; later misses do not.
+/// reads go to, once, beside the query (and the connection's first
+/// refill whether it is on a primary); later misses do not.
 #[test]
 fn the_first_miss_reads_the_database_once() {
     let mut w = World::new("database");
@@ -351,11 +352,11 @@ fn the_first_miss_reads_the_database_once() {
     assert!(!w.cache.knows_database());
     let before = w.sent();
     w.read("a");
-    assert_eq!(w.sent(), before + 2, "the database and the read");
+    assert_eq!(w.sent(), before + 3, "the database, the primary and the read");
     let database = w.cache.database().expect("read").clone();
     assert!(!database.system.is_empty() && !database.name.is_empty(), "{database:?}");
     w.read("b");
-    assert_eq!(w.sent(), before + 3, "only the read");
+    assert_eq!(w.sent(), before + 4, "only the read");
 }
 
 /// While the engine side says it is too far behind, reads go to Postgres

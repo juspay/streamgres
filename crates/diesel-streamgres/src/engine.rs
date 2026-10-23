@@ -338,6 +338,10 @@ struct WorkerState {
     /// Subscriptions served from the engine's rows, each behind its own
     /// lock so a delta to one is applied without holding up the rest.
     materialized: HashMap<u64, Arc<LiveStore>>,
+    /// The position of the last change the engine will not report for
+    /// each subscription, as its `accepted` and `touched` frames name
+    /// it: what a refill from a standby must have replayed past.
+    since: HashMap<u64, u64>,
 }
 
 /// A rows-mode subscription's store, from the moment the engine's
@@ -898,6 +902,7 @@ impl Worker {
                 by_id: HashMap::new(),
                 pending: HashMap::new(),
                 materialized: HashMap::new(),
+                since: HashMap::new(),
             }),
             shared,
         });
@@ -985,8 +990,9 @@ impl Worker {
                     );
                 }
                 let store = state.materialized.get(&id).cloned();
+                let since = state.since.get(&id).copied();
                 drop(state);
-                return Outcome::Verdict(held_rows(store));
+                return Outcome::Verdict(held_rows(store, since));
             }
             let id = state.next_id;
             state.next_id += 1;
@@ -1071,6 +1077,7 @@ impl Worker {
         }
         state.pending.remove(&id);
         state.materialized.remove(&id);
+        state.since.remove(&id);
         self.note_held(state);
         key
     }
@@ -1089,9 +1096,12 @@ impl Worker {
     fn materialize(&self, id: u64, snapshot: Snapshot) -> Verdict {
         let shared = &self.shared;
         let fallback = |reason: String| {
-            self.state.lock().expect("state").materialized.remove(&id);
+            let mut state = self.state.lock().expect("state");
+            state.materialized.remove(&id);
+            let since = state.since.get(&id).copied();
+            drop(state);
             shared.fell_back(reason);
-            Verdict::Accepted
+            Verdict::Accepted { since }
         };
         let types: HashMap<String, Arc<TableTypes>> = {
             let known = shared.types.lock().expect("types");
@@ -1145,9 +1155,10 @@ impl Worker {
             Err(error) => {
                 drop(store);
                 state.materialized.remove(&id);
+                let since = state.since.get(&id).copied();
                 drop(state);
                 shared.fell_back(error.0);
-                Verdict::Accepted
+                Verdict::Accepted { since }
             }
         }
     }
@@ -1233,14 +1244,15 @@ impl Worker {
 }
 
 /// The verdict for a key already subscribed: its store's rows when it
-/// has them, else accepted, for the caller to read Postgres.
-fn held_rows(store: Option<Arc<LiveStore>>) -> Verdict {
-    match store {
-        Some(store) => match store.rows() {
-            Some(rows) => Verdict::Rows { rows, live: store },
-            None => Verdict::Accepted,
+/// has them, else accepted, for the caller to read Postgres past
+/// `since`.
+fn held_rows(store: Option<Arc<LiveStore>>, since: Option<u64>) -> Verdict {
+    match store.as_ref().and_then(|store| store.rows()) {
+        Some(rows) => Verdict::Rows {
+            rows,
+            live: store.expect("the rows' store"),
         },
-        None => Verdict::Accepted,
+        None => Verdict::Accepted { since },
     }
 }
 
@@ -1636,10 +1648,17 @@ fn on_accepted(worker: &Worker, mut body: Json) {
     if snapshot.is_none() && carried_rows {
         shared.fell_back("the accepted frame was not understood".to_string());
     }
+    let since = body.get("lsn").and_then(Json::as_u64);
     let (waiter, key) = {
         let mut state = worker.state.lock().expect("state");
         let waiter = state.pending.remove(&id);
         let key = state.by_id.get(&id).cloned();
+        if key.is_some()
+            && let Some(since) = since
+        {
+            let held = state.since.entry(id).or_default();
+            *held = (*held).max(since);
+        }
         if let Some(key) = &key
             && snapshot.is_some()
         {
@@ -1665,7 +1684,7 @@ fn on_accepted(worker: &Worker, mut body: Json) {
             let _ = reply.try_send(Reply::Snapshot(snapshot));
         }
         (Some(Some(reply)), None) => {
-            let _ = reply.try_send(Reply::Verdict(Verdict::Accepted));
+            let _ = reply.try_send(Reply::Verdict(Verdict::Accepted { since }));
         }
         (Some(None) | None, Some(snapshot)) => {
             if !shared.missing_types(&snapshot).is_empty() {
@@ -1833,17 +1852,27 @@ fn on_lag(worker: &Worker, body: &Json) {
     }
 }
 
-/// `touched`: every named subscription's key goes stale.
+/// `touched`: every named subscription's key goes stale, and a refill
+/// from a standby must have replayed past the change's position.
 fn on_touched(worker: &Worker, body: &Json) {
     let Some(ids) = body.get("ids").and_then(Json::as_array) else {
         return;
     };
+    let position = body.get("lsn").and_then(Json::as_u64);
     let keys: Vec<QueryKey> = {
-        let state = worker.state.lock().expect("state");
-        ids.iter()
-            .filter_map(Json::as_u64)
-            .filter_map(|id| state.by_id.get(&id).cloned())
-            .collect()
+        let mut state = worker.state.lock().expect("state");
+        let mut keys = Vec::new();
+        for id in ids.iter().filter_map(Json::as_u64) {
+            let Some(key) = state.by_id.get(&id).cloned() else {
+                continue;
+            };
+            if let Some(position) = position {
+                let held = state.since.entry(id).or_default();
+                *held = (*held).max(position);
+            }
+            keys.push(key);
+        }
+        keys
     };
     if let Some(cache) = worker.shared.cache() {
         for key in &keys {
@@ -2101,7 +2130,7 @@ mod tests {
         inbound(&worker, &json!(["accepted", {"id": 1}]).to_string());
         assert!(matches!(
             handle.join().unwrap(),
-            Outcome::Verdict(Verdict::Accepted)
+            Outcome::Verdict(Verdict::Accepted { since: None })
         ));
         disconnected(&worker);
         assert!(
@@ -2116,7 +2145,7 @@ mod tests {
         inbound(&worker, &json!(["accepted", {"id": 1}]).to_string());
         assert!(matches!(
             worker.subscribe(&key()),
-            Outcome::Verdict(Verdict::Accepted)
+            Outcome::Verdict(Verdict::Accepted { since: None })
         ));
     }
 
@@ -2247,7 +2276,7 @@ mod tests {
         assert!(worker.wrong_database().is_none());
         let handle = subscribing(&worker);
         inbound(&worker, &json!(["accepted", {"id": 1}]).to_string());
-        assert!(matches!(handle.join().unwrap(), Outcome::Verdict(Verdict::Accepted)));
+        assert!(matches!(handle.join().unwrap(), Outcome::Verdict(Verdict::Accepted { .. })));
         assert!(matches!(outgoing.try_recv(), Ok(Outgoing::Subscribe { id: 1, .. })));
 
         disconnected(&worker);

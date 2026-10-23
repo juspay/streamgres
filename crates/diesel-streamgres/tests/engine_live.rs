@@ -674,10 +674,14 @@ fn microsecond_timestamps_are_exact_and_an_interval_falls_back() {
         live.engine.fallbacks()
     );
     assert_eq!(live.engine.subscribed(), 2);
-    assert_eq!(sent.load(Ordering::SeqCst), 2, "the row read");
+    assert_eq!(
+        sent.load(Ordering::SeqCst),
+        3,
+        "the row read, and the connection's first refill asks whether it is on a primary"
+    );
     assert_eq!(with_lead(&mut live.conn), lead, "and cached");
     assert!(
-        sent.load(Ordering::SeqCst) <= 3,
+        sent.load(Ordering::SeqCst) <= 4,
         "at most one redundant refill"
     );
     let settled = sent.load(Ordering::SeqCst);

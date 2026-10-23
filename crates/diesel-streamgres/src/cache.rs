@@ -36,7 +36,7 @@
 //! those must see it too.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -221,7 +221,7 @@ pub struct Stats {
     pub oversized: AtomicU64,
     /// Entries the engine's own rows replaced (rows mode).
     pub replaced: AtomicU64,
-    /// Reads sent to Postgres because their connection had just written.
+    /// Reads sent to Postgres because a write had not reached the cache.
     pub after_write: AtomicU64,
     /// Reads sent to Postgres because the read's lock (`FOR UPDATE`)
     /// cannot be taken on a cache.
@@ -229,6 +229,9 @@ pub struct Stats {
     /// Reads sent to Postgres because the engine was further behind the
     /// database than the cache may be.
     pub lagging: AtomicU64,
+    /// Reads from a standby not kept: it had not replayed past the last
+    /// change the engine will not report for the query.
+    pub unreplayed: AtomicU64,
 }
 
 impl Stats {
@@ -303,6 +306,10 @@ pub struct Cache {
     /// counts: once the engine side has delivered every change up to it,
     /// the cache holds them all.
     target: AtomicU64,
+    /// Whether reads through the cache have gone to a standby, which
+    /// cannot say where the primary's WAL is: writes then read it
+    /// themselves, on their own connection, once committed.
+    standby_reads: AtomicBool,
     /// The OIDs of user-defined types, resolved once per database for
     /// the async wrapper (the blocking one asks its connection).
     type_metadata: Arc<Mutex<PgMetadataCache>>,
@@ -355,6 +362,11 @@ impl WalPosition {
 /// standby has none (the function raises there), so it reads `NULL`:
 /// reads through a replica fall back to the window.
 pub const WAL_POSITION_SQL: &str = "SELECT CASE WHEN pg_is_in_recovery() THEN NULL ELSE pg_current_wal_insert_lsn()::text END AS lsn";
+
+/// Reads a [`WalPosition`]: how far a standby has replayed, `NULL` on a
+/// primary, which is current (a promoted one included, whose last replay
+/// position stays behind).
+pub const REPLAY_POSITION_SQL: &str = "SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text END AS lsn";
 
 /// Whether a read through the cache may be served from it, given the
 /// writes through it ([`Cache::after_writes`]).
@@ -433,6 +445,7 @@ impl Cache {
             writes: AtomicU64::new(0),
             resolved: AtomicU64::new(0),
             target: AtomicU64::new(0),
+            standby_reads: AtomicBool::new(false),
             type_metadata: Arc::new(Mutex::new(PgMetadataCache::new())),
             database: OnceLock::new(),
             stats,
@@ -704,6 +717,24 @@ impl Cache {
         self.resolved.fetch_max(writes, Ordering::AcqRel);
     }
 
+    /// How many write marks there have been, for a write that reads the
+    /// position itself once it has committed ([`Cache::resolve_writes`]).
+    pub fn write_count(&self) -> u64 {
+        self.writes.load(Ordering::Acquire)
+    }
+
+    /// A read through the cache went to a standby.
+    pub fn saw_standby(&self) {
+        self.standby_reads.store(true, Ordering::Release);
+    }
+
+    /// Whether reads through the cache have gone to a standby, so a
+    /// committed write reads the WAL position on its own connection
+    /// rather than leaving it to a read that cannot.
+    pub fn reads_standbys(&self) -> bool {
+        self.standby_reads.load(Ordering::Acquire)
+    }
+
     /// Whether a connection through this cache wrote within `window`.
     pub fn wrote_within(&self, window: Duration) -> bool {
         if window.is_zero() {
@@ -843,7 +874,7 @@ mod tests {
     impl Subscriptions for Recording {
         /// Accepted.
         fn subscribe(&self, _: &QueryKey) -> Outcome {
-            Outcome::Verdict(Verdict::Accepted)
+            Outcome::Verdict(Verdict::Accepted { since: None })
         }
 
         /// Accepted, with no rows.
@@ -853,7 +884,7 @@ mod tests {
             _: Snapshot,
             _: HashMap<String, Arc<TableTypes>>,
         ) -> Verdict {
-            Verdict::Accepted
+            Verdict::Accepted { since: None }
         }
 
         /// Records the key.

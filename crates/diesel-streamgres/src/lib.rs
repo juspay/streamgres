@@ -72,7 +72,9 @@ use diesel::{Connection, ConnectionResult, QueryResult};
 
 #[cfg(feature = "async")]
 pub use crate::asynchronous::AsyncSyncedConnection;
-use crate::cache::{AfterWrites, Cache, DATABASE_SQL, Database, WAL_POSITION_SQL, WalPosition};
+use crate::cache::{
+    AfterWrites, Cache, DATABASE_SQL, Database, REPLAY_POSITION_SQL, WAL_POSITION_SQL, WalPosition,
+};
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
 pub use crate::route::{Route, RouteDsl, Served, Via};
@@ -189,6 +191,9 @@ pub struct SyncedConnection<C = diesel::PgConnection> {
     read_your_writes: Duration,
     /// Where the last read was served from; `None` before the first.
     served: Option<Served>,
+    /// Whether the connection is known to be to a primary, whose reads
+    /// are current; learned on the first refill, and never asked again.
+    primary: bool,
 }
 
 impl<C> SyncedConnection<C> {
@@ -201,6 +206,7 @@ impl<C> SyncedConnection<C> {
             scoped: None,
             read_your_writes: Duration::ZERO,
             served: None,
+            primary: false,
         }
     }
 
@@ -214,6 +220,7 @@ impl<C> SyncedConnection<C> {
             scoped: None,
             read_your_writes: read_your_writes_from_env(),
             served: None,
+            primary: false,
         }
     }
 
@@ -311,9 +318,58 @@ impl<C> SyncedConnection<C> {
     }
 }
 
+impl<C> SyncedConnection<C>
+where
+    C: LoadConnection<DefaultLoadingMode>
+        + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
+{
+    /// Once a write has committed, reads its WAL position on this
+    /// connection, when reads through the cache go to standbys
+    /// ([`Cache::reads_standbys`]): a standby cannot say where the
+    /// primary's WAL is, so without this its reads would wait out the
+    /// window. Inside a transaction nothing has committed yet; its
+    /// `COMMIT` (`committed`) reads it.
+    fn resolve_written(&mut self, committed: bool) {
+        let Some(cache) = self.cache.clone() else {
+            return;
+        };
+        if !cache.reads_standbys() || (!committed && in_transaction(&mut self.inner)) {
+            return;
+        }
+        let writes = cache.write_count();
+        if let Some(Some(position)) = read_position(&mut self.inner, WAL_POSITION_SQL) {
+            cache.resolve_writes(writes, position);
+        }
+    }
+
+    /// Whether a read on this connection now sees every change up to
+    /// `since`, the last the engine will not report for the query: on a
+    /// primary always (learned once), on a standby once it has replayed
+    /// past it. Asked before the read, which then sees at least as much.
+    /// A standby with no position to compare, or one that cannot say how
+    /// far it has replayed, is not trusted.
+    fn replayed_past(&mut self, cache: &Cache, since: Option<u64>) -> bool {
+        if self.primary {
+            return true;
+        }
+        match read_position(&mut self.inner, REPLAY_POSITION_SQL) {
+            Some(None) => {
+                self.primary = true;
+                true
+            }
+            Some(Some(replayed)) => {
+                cache.saw_standby();
+                since.is_some_and(|since| replayed >= since)
+            }
+            None => false,
+        }
+    }
+}
+
 impl<C> SimpleConnection for SyncedConnection<C>
 where
-    C: SimpleConnection,
+    C: LoadConnection<DefaultLoadingMode>
+        + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
 {
     /// Raw SQL may write; so does the ANSI manager's `COMMIT`, which is
     /// when a transaction's writes become what the next read expects.
@@ -327,6 +383,9 @@ where
         let done = self.inner.batch_execute(query);
         if writes {
             self.wrote();
+            if done.is_ok() {
+                self.resolve_written(commits(query));
+            }
         }
         done
     }
@@ -336,7 +395,8 @@ impl<C> ConnectionSealed for SyncedConnection<C> {}
 
 impl<C> Connection for SyncedConnection<C>
 where
-    C: Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
+    C: LoadConnection<DefaultLoadingMode>
+        + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
 {
     type Backend = Pg;
     /// The ANSI manager is generic over the connection it drives: it
@@ -381,6 +441,9 @@ where
         let done = self.inner.execute_returning_count(source);
         if writes {
             self.wrote();
+            if done.is_ok() {
+                self.resolve_written(false);
+            }
         }
         done
     }
@@ -449,12 +512,17 @@ where
         let mut key = QueryKey::of(&source, &mut self.inner)?;
         let route = key.take_route().or(self.scoped).unwrap_or(self.route);
         if !key.is_select() {
-            let cache = self.cache.clone();
             self.wrote();
-            let done = LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
-            if let Some(cache) = cache {
-                cache.mark_write();
+            if cache.reads_standbys() && !in_transaction(&mut self.inner) {
+                let rows = LoadConnection::<DefaultLoadingMode>::load(&mut self.inner, source)
+                    .and_then(capture_all);
+                self.wrote();
+                let rows = rows?;
+                self.resolve_written(false);
+                return Ok(SyncedCursor::Cached(OwnedCursor::new(Arc::from(rows))));
             }
+            let done = LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+            cache.mark_write();
             return done;
         }
         if route == Route::Postgres || in_transaction(&mut self.inner) {
@@ -489,7 +557,7 @@ where
             }
         }
         let reservation = cache.reserve(&key);
-        match cache.subscriptions().subscribe_with(&key, &mut self.inner) {
+        let since = match cache.subscriptions().subscribe_with(&key, &mut self.inner) {
             Verdict::Refused(reason) => {
                 cache.refused(&key, &reason);
                 return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
@@ -504,8 +572,9 @@ where
                 self.served = Some(Served::Engine);
                 return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
             }
-            Verdict::Accepted => {}
-        }
+            Verdict::Accepted { since } => since,
+        };
+        let keep = self.replayed_past(&cache, since);
         let rows = LoadConnection::<DefaultLoadingMode>::load(&mut self.inner, source)
             .and_then(capture_all);
         let rows: Arc<[OwnedRow]> = match rows {
@@ -515,7 +584,11 @@ where
                 return Err(error);
             }
         };
-        cache.fill(reservation, Arc::clone(&rows));
+        if keep {
+            cache.fill(reservation, Arc::clone(&rows));
+        } else {
+            cache.stats.unreplayed.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(SyncedCursor::Cached(OwnedCursor::new(rows)))
     }
 }
@@ -545,13 +618,17 @@ where
     C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
 {
     match cache.after_writes(window) {
-        AfterWrites::Resolve(writes) => match wal_position(conn) {
-            Some(position) => {
+        AfterWrites::Resolve(writes) => match read_position(conn, WAL_POSITION_SQL) {
+            Some(Some(position)) => {
                 cache.resolve_writes(writes, position);
                 match cache.after_writes(window) {
                     AfterWrites::Resolve(_) => AfterWrites::Postgres,
                     decided => decided,
                 }
+            }
+            Some(None) => {
+                cache.saw_standby();
+                cache.by_window(window)
             }
             None => cache.by_window(window),
         },
@@ -559,18 +636,28 @@ where
     }
 }
 
-/// Where `conn`'s database will put its next WAL record
-/// ([`WAL_POSITION_SQL`]); `None` when it cannot be read.
-fn wal_position<C>(conn: &mut C) -> Option<u64>
+/// The position `sql` ([`WAL_POSITION_SQL`], [`REPLAY_POSITION_SQL`])
+/// reads on `conn`: `Some(None)` for its `NULL`, `None` when it cannot
+/// be read.
+fn read_position<C>(conn: &mut C, sql: &str) -> Option<Option<u64>>
 where
     C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
 {
     use diesel::RunQueryDsl;
-    diesel::sql_query(WAL_POSITION_SQL)
-        .load::<WalPosition>(conn)
-        .ok()?
-        .first()?
-        .position()
+    let read = diesel::sql_query(sql).load::<WalPosition>(conn).ok()?;
+    let read = read.first()?;
+    match read.lsn {
+        None => Some(None),
+        Some(_) => read.position().map(Some),
+    }
+}
+
+/// Whether `sql` ends a transaction with its writes: a `COMMIT` or an
+/// `END`, as the ANSI manager and hand-written SQL send them.
+pub(crate) fn commits(sql: &str) -> bool {
+    let word = sql.split_whitespace().next().unwrap_or("");
+    let word = word.trim_end_matches(';');
+    word.eq_ignore_ascii_case("COMMIT") || word.eq_ignore_ascii_case("END")
 }
 
 /// The SQL a statement renders to, for [`may_write`]; a statement that
@@ -636,7 +723,9 @@ where
 
 impl<C> R2D2Connection for SyncedConnection<C>
 where
-    C: R2D2Connection + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
+    C: R2D2Connection
+        + LoadConnection<DefaultLoadingMode>
+        + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
 {
     /// Pings the inner connection.
     fn ping(&mut self) -> QueryResult<()> {

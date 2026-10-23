@@ -105,7 +105,7 @@ impl Subscriptions for FakeEngine {
             return Outcome::Verdict(Verdict::Refused("not a config read".into()));
         }
         self.subscribed.lock().unwrap().push(key.clone());
-        Outcome::Verdict(Verdict::Accepted)
+        Outcome::Verdict(Verdict::Accepted { since: None })
     }
 
     /// Accepted, with no rows.
@@ -115,7 +115,7 @@ impl Subscriptions for FakeEngine {
         _: Snapshot,
         _: HashMap<String, Arc<TableTypes>>,
     ) -> Verdict {
-        Verdict::Accepted
+        Verdict::Accepted { since: None }
     }
 
     /// Records the key.

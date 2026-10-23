@@ -33,8 +33,12 @@ use crate::types::{TableTypes, TypeLookup};
 #[derive(Debug, Clone)]
 pub enum Verdict {
     /// The engine will report every change to this query's rows; the
-    /// cache reads Postgres for them and refills on each report.
-    Accepted,
+    /// cache reads Postgres for them and refills on each report. A read
+    /// from a standby must have replayed past `since`, the position of
+    /// the last change the engine will not report, for its rows to be
+    /// kept; `None` when the engine names none (one from before
+    /// positions, or one with no position yet).
+    Accepted { since: Option<u64> },
     /// The engine serves the rows itself: here is the result, built
     /// from `live`, which the cache keeps and builds the result from
     /// again on a read after each change. No Postgres read.

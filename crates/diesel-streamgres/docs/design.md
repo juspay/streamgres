@@ -231,9 +231,9 @@ Engine to client:
 | frame | meaning |
 |---|---|
 | `["hello", {"protocol": 1, "max_subscriptions": n, "database": {"system", "name"}}]` | first frame; `max_subscriptions` is the per-connection limit, `null` for none; `database` is what the engine streams (the cluster's `system_identifier` and the database's name); an engine that cannot read it closes the socket instead of greeting, and an older engine sends none |
-| `["accepted", {"id", "nodes", "columns", "names", "count", "order", "limit", "offset"}]` | the engine follows the query; the body is the hydrated result, `nodes` per table with `table`, `key`, `parent`, `parent_column`, `child_column`, `inner`, `rows` |
+| `["accepted", {"id", "lsn", "nodes", "columns", "names", "count", "order", "limit", "offset"}]` | the engine follows the query; in rows mode the body is the hydrated result, `nodes` per table with `table`, `key`, `parent`, `parent_column`, `child_column`, `inner`, `rows`; `lsn` is the position of the last change it will not report (its own at registration, or the one delivered since), which a refill from a standby must have replayed past (`null` before the engine has one) |
 | `["delta", {"id", "changes": [{"table", "put": [row], "del": [key]}]}]` | one transaction's change to a rows-mode result; one entry per key, its last state, never in both lists, so apply order does not matter |
-| `["touched", {"ids"}]` | one transaction changed these refill-mode subscriptions |
+| `["touched", {"ids", "lsn"}]` | one transaction changed these refill-mode subscriptions, at position `lsn` |
 | `["refused", {"id", "reason"}]` | the engine cannot follow the query; after an `accepted`, it stopped following it |
 | `["pong"]` | reply to `ping` |
 | `["lag", {"ms", "lsn"}]` | right after `hello`, every 500 ms, and within 10 ms of `lsn` moving: `ms` is how far at most the engine's applied changes trail the database, the age of the newest heartbeat it applied (`null` before the first heartbeat is sent); `lsn` is the WAL position up to which every change has been sent on this socket, frames being in order (`null` before any; an older engine sends none) |
@@ -287,6 +287,22 @@ subscriber's wait, so a delta right behind it queues there.
 
 **Late answers.** A subscribe the client gave up on is withdrawn. An
 `accepted` for an id nobody holds is answered with `unsubscribe`.
+
+**Refills from a standby.** Subscribe-before-read holds on the primary:
+a read after `accepted` sees every change the engine will not report.
+A standby read may not: if it has not replayed past those changes, it
+returns rows from before them, and nothing will ever report what it
+missed. So each refill-mode subscription keeps the position of the last
+change it will not report (`since`: the `accepted` frame's `lsn`, then
+each `touched` frame's), and a refill reads
+`pg_last_wal_replay_lsn()` before its query, keeping the rows only if
+the standby has replayed past `since`. Otherwise the read is served
+(as a plain replica read would be) and not kept, counted as
+`unreplayed`; the subscription stays, and the next read refills again,
+usually after the standby has caught up. A standby with no `since` to
+compare (an older engine) is never kept from. The check reads `NULL` on
+a primary, a promoted one included; a connection learns once that it
+is on one and never asks again. Rows mode reads no standby.
 
 ## The engine client
 
@@ -478,11 +494,19 @@ on the others.
   cache serves again: within a few milliseconds of the delta, however
   long that took. A write marked after the lookup sends the next read
   to look it up again.
+- **From the writer**, once reads through the cache have gone to a
+  standby, which has no insert position to read: a write that commits
+  on its own, or a `COMMIT`, reads the position on its own connection
+  (on the primary) right after; one more query per such write on the
+  blocking wrapper, pipelined behind it on the async one. The standby's
+  reads then go live (to the standby) until the engine side's position
+  reaches it, as above. Reads on a standby still see only what it has
+  replayed, as without the cache.
 - **By window**, when the engine side reports no position (an older
-  engine), the lookup fails, or the connection is to a standby (which
-  has no insert position): reads go live for
-  `STREAMGRES_READ_YOUR_WRITES_MS` (default 1000) after the last
-  write's end, however long it took.
+  engine), the lookup fails, or a write on a standby-reading cache has
+  not been looked up (the async wrapper skips a write pipelined behind
+  another future): reads go live for `STREAMGRES_READ_YOUR_WRITES_MS`
+  (default 1000) after the last write's end, however long it took.
 
 `STREAMGRES_READ_YOUR_WRITES_MS=0` (or `set_read_your_writes` per
 connection) turns both off. A Postgres read never writes into the
@@ -544,6 +568,7 @@ subscription, and a dropped `with_route` scope restores the outer route.
 | `tests/engine_live.rs`, `tests/async_live.rs` | the whole path against a running engine |
 | `tests/shape_coverage.rs` | production-shaped lookups compared with Postgres before and after a change |
 | `tests/engine_latency.rs` | commit-to-cache latency |
+| `tests/standby_reads.rs` | reads from a hot standby, writes to its primary: refills kept only once replayed past the engine, read-your-writes from the writer (needs `STREAMGRES_TEST_STANDBY_URL`) |
 | `tests/s2s_live.rs` (engine crate) | the protocol frame by frame |
 | `crates/streamgres-demo/tests/scenario.rs` | every lookup of the demo app through both wrappers under writes, an engine restart and migrations |
 
