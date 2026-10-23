@@ -70,7 +70,7 @@ use tokio_postgres::types::PgLsn;
 
 use super::ddl::{self, DdlSource};
 use crate::ivm::SchemaChange;
-use crate::log::{log_info, log_warn};
+use crate::log::{log_error, log_info, log_warn};
 use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, DeleteQuery, InsertQuery, Lsn,
     RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
@@ -826,7 +826,7 @@ impl Transport {
                 Ok(Some(event)) => event,
                 Ok(None) => return Ok(()),
                 Err(error) => {
-                    eprintln!("change feed ended: {error}");
+                    log_warn!("change feed ended: {error}");
                     return Ok(());
                 }
             };
@@ -1197,7 +1197,7 @@ impl PgStream {
         tokio::select! {
             outcome = transport.stream(every, &mut feed, &[], out) => {
                 if let Err(error) = outcome {
-                    eprintln!("change feed decoding failed: {error}");
+                    log_error!("change feed decoding failed: {error}");
                 }
             }
             _ = forward => {}
