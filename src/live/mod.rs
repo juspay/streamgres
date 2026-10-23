@@ -261,6 +261,12 @@ struct TableChanges<'a> {
 /// How often every connection is told the engine's lag.
 const LAG_EVERY: Duration = Duration::from_millis(500);
 
+/// How soon after the engine's position moves every connection is told,
+/// at most: a backend holding reads back until its own write is
+/// delivered waits on it, and a busy feed moves it on every commit, so
+/// one frame covers every move within this.
+const POSITION_EVERY: Duration = Duration::from_millis(10);
+
 /// How often a refused upgrade of one kind is logged at most; the ones
 /// in between are counted into the next line.
 pub(crate) const REFUSAL_LOG_EVERY: Duration = Duration::from_secs(60);
@@ -275,9 +281,20 @@ pub struct Hub {
     /// The database the engine streams, as `hello` names it, once read:
     /// it cannot change while the process runs.
     database: tokio::sync::OnceCell<Json>,
+    /// How far the engine's changes have been passed on to every session
+    /// ([`Hub::delivered`]); 0 before any.
+    delivered: Arc<AtomicU64>,
 }
 
 impl Hub {
+    /// The position up to which every change the engine committed has
+    /// been queued to every session that follows a query it touched: the
+    /// task advances it after each commit's changes are queued, and on
+    /// each heartbeat. A `lag` frame carries it, behind those changes.
+    pub fn delivered(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.delivered)
+    }
+
     /// A hub, and the requests its sessions send the task ([`run`]).
     pub fn new() -> (Hub, mpsc::Receiver<Request>) {
         let (requests, requests_rx) = mpsc::channel(REQUEST_QUEUE);
@@ -287,6 +304,7 @@ impl Hub {
                 next_conn: AtomicU64::new(1),
                 unidentified: Throttle::new(REFUSAL_LOG_EVERY),
                 database: tokio::sync::OnceCell::new(),
+                delivered: Arc::new(AtomicU64::new(0)),
             },
             requests_rx,
         )
@@ -534,6 +552,10 @@ struct Task {
     per_connection: usize,
     /// Where the engine's lag is measured ([`crate::sync::heartbeat`]).
     stats: Arc<Stats>,
+    /// The hub's position passed on ([`Hub::delivered`]).
+    delivered: Arc<AtomicU64>,
+    /// The position the last `lag` frame carried.
+    reported: u64,
 }
 
 /// Runs the task: the engine's events on one side, the connections'
@@ -551,6 +573,7 @@ pub async fn run(
     mut ready: watch::Receiver<bool>,
     per_connection: usize,
     stats: Arc<Stats>,
+    delivered: Arc<AtomicU64>,
 ) {
     while !*ready.borrow() {
         if ready.changed().await.is_err() {
@@ -570,12 +593,28 @@ pub async fn run(
         next_token: 1,
         per_connection,
         stats,
+        delivered,
+        reported: 0,
     };
     let mut lag = tokio::time::interval(LAG_EVERY);
     lag.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let moved = tokio::time::sleep(Duration::ZERO);
+    tokio::pin!(moved);
+    let mut armed = false;
     loop {
+        if !armed && task.moved() {
+            moved.as_mut().reset(tokio::time::Instant::now() + POSITION_EVERY);
+            armed = true;
+        }
         tokio::select! {
-            _ = lag.tick() => task.report_lag(),
+            _ = lag.tick() => {
+                task.report_lag();
+                armed = false;
+            }
+            () = &mut moved, if armed => {
+                task.report_lag();
+                armed = false;
+            }
             event = events.recv() => match event {
                 Some(event) => task.event(event).await,
                 None => return,
@@ -592,10 +631,16 @@ impl Task {
     /// Tells every connection how far behind the engine is, from its
     /// heartbeats: `null` while it sends none.
     fn report_lag(&mut self) {
-        let frame = lag_frame(&self.stats).to_string();
+        self.reported = self.delivered.load(Ordering::Acquire);
+        let frame = lag_frame(&self.stats, self.reported).to_string();
         for connection in self.conns.values_mut() {
             connection.send_text(frame.clone());
         }
+    }
+
+    /// Whether the position moved since the last `lag` frame.
+    fn moved(&self) -> bool {
+        self.delivered.load(Ordering::Acquire) > self.reported
     }
 
     /// Handles one connection's request.
@@ -725,13 +770,25 @@ impl Task {
                 self.drop_sub(sub, "the query has more rows than the engine follows")
                     .await;
             }
-            Event::Committed { updates, .. } | Event::Landed { updates } => self.changed(&updates),
+            Event::Committed {
+                updates, position, ..
+            } => {
+                self.changed(&updates);
+                self.delivered.fetch_max(position.0, Ordering::AcqRel);
+            }
+            Event::Landed { updates } => self.changed(&updates),
             Event::Heavy { sub, table, rows } => {
                 if let Some((conn, id)) = self.by_sub.get(&sub) {
                     log_warn!("s2s connection {conn}: query {id} holds {rows} rows of {table}");
                 }
             }
-            Event::Heartbeat(n) => self.stats.freshness.applied(n),
+            Event::Heartbeat {
+                heartbeat,
+                position,
+            } => {
+                self.stats.freshness.applied(heartbeat);
+                self.delivered.fetch_max(position.0, Ordering::AcqRel);
+            }
         }
     }
 
@@ -1050,7 +1107,10 @@ where
             "database": database,
         }]),
     );
-    send(&out, lag_frame(&context.stats));
+    send(
+        &out,
+        lag_frame(&context.stats, hub.delivered.load(Ordering::Acquire)),
+    );
     if hub
         .requests
         .send(Request::Connected {
@@ -1074,13 +1134,15 @@ where
 }
 
 /// The `lag` frame: how far the engine's applied changes trail the
-/// database, `null` before the first heartbeat is sent.
-fn lag_frame(stats: &Stats) -> Json {
+/// database (`ms`, `null` before the first heartbeat is sent), and the
+/// position every change up to which has been passed on (`lsn`,
+/// [`Hub::delivered`]; `null` before any).
+fn lag_frame(stats: &Stats, delivered: u64) -> Json {
     let ms = stats
         .freshness
         .lag()
         .map(|lag| u64::try_from(lag.as_millis()).unwrap_or(u64::MAX));
-    json!(["lag", {"ms": ms}])
+    json!(["lag", {"ms": ms, "lsn": (delivered > 0).then_some(delivered)}])
 }
 
 /// Reads frames until the backend closes, the task asks to close, or
@@ -1498,6 +1560,8 @@ mod tests {
             next_token: 1,
             per_connection,
             stats: Stats::shared_with_metric_prefix("test".to_owned()),
+            delivered: Arc::new(AtomicU64::new(0)),
+            reported: 0,
         };
         let frames = connect(&mut task, 1);
         (task, commands_rx, frames)
@@ -1654,13 +1718,14 @@ mod tests {
     /// Every connection hears the engine's lag from its heartbeats:
     /// `null` before the first, then the age of the first while none is
     /// applied, then the age of the newest one the engine's events said
-    /// was applied.
+    /// was applied; and the position passed on, which a heartbeat and a
+    /// commit move up and never back.
     #[tokio::test]
     async fn every_connection_hears_the_lag() {
         let (mut task, _commands, mut out) = task(0);
         let mut other = connect(&mut task, 2);
         task.report_lag();
-        assert_eq!(frames(&mut out), vec![json!(["lag", {"ms": null}])]);
+        assert_eq!(frames(&mut out), vec![json!(["lag", {"ms": null, "lsn": null}])]);
         task.stats
             .freshness
             .sent(1, std::time::Instant::now() - Duration::from_millis(1500));
@@ -1670,10 +1735,93 @@ mod tests {
             assert!((1500..2500).contains(&ms), "{ms}");
         }
         task.stats.freshness.sent(2, std::time::Instant::now());
-        task.event(Event::Heartbeat(2)).await;
+        task.event(Event::Heartbeat {
+            heartbeat: 2,
+            position: crate::model::Lsn(500),
+        })
+        .await;
         task.report_lag();
-        let ms = frames(&mut out)[0][1]["ms"].as_u64().expect("a lag");
+        let frame = frames(&mut out).remove(0);
+        let ms = frame[1]["ms"].as_u64().expect("a lag");
         assert!(ms < 500, "caught up: {ms}");
+        assert_eq!(frame[1]["lsn"], 500);
+        task.event(Event::Committed {
+            updates: Vec::new(),
+            position: crate::model::Lsn(700),
+            floor: crate::model::Lsn(1),
+            watched: Vec::new(),
+            received: std::time::Instant::now(),
+            routed: std::time::Instant::now(),
+        })
+        .await;
+        task.event(Event::Heartbeat {
+            heartbeat: 1,
+            position: crate::model::Lsn(600),
+        })
+        .await;
+        task.report_lag();
+        assert_eq!(frames(&mut out)[0][1]["lsn"], 700, "never back");
+    }
+
+    /// A moved position reaches every connection within a few
+    /// milliseconds, not at the next half-second tick; and a quiet engine
+    /// sends nothing more than the ticks. (The first tick may land
+    /// before or after the connection; whatever it sent is passed over.)
+    #[tokio::test]
+    async fn a_moved_position_is_told_at_once() {
+        let (commands, _commands) = mpsc::channel(64);
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let (requests, requests_rx) = mpsc::channel(64);
+        let (_ready, ready_rx) = watch::channel(true);
+        let delivered = Arc::new(AtomicU64::new(0));
+        let running = tokio::spawn(run(
+            Arc::new(CatalogHandle::new(test_catalog())),
+            0,
+            commands,
+            events_rx,
+            requests_rx,
+            ready_rx,
+            0,
+            Stats::shared_with_metric_prefix("test".to_owned()),
+            Arc::clone(&delivered),
+        ));
+        let (close, _closed) = oneshot::channel();
+        let (out, mut frames) = Outgoing::new();
+        requests
+            .send(Request::Connected {
+                conn: 1,
+                out,
+                close,
+                held: Arc::new(AtomicUsize::new(0)),
+            })
+            .await
+            .expect("connected");
+        let next = |frames: &mut mpsc::Receiver<String>| {
+            let frame = frames.try_recv().ok()?;
+            Some(serde_json::from_str::<Json>(&frame).expect("json"))
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        while next(&mut frames).is_some() {}
+        let sent = std::time::Instant::now();
+        events
+            .send(Event::Heartbeat {
+                heartbeat: 1,
+                position: crate::model::Lsn(500),
+            })
+            .expect("event");
+        let frame = loop {
+            if let Some(frame) = next(&mut frames) {
+                break frame;
+            }
+            assert!(sent.elapsed() < Duration::from_millis(200), "not told at once");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        assert_eq!(frame[1]["lsn"], 500);
+        assert_eq!(delivered.load(Ordering::Acquire), 500);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(next(&mut frames), None, "nothing moved, nothing told");
+        drop((events, requests));
+        running.await.expect("the task ends with its channels");
     }
 
     /// A queue takes frames until either bound is reached, always takes

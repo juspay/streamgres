@@ -288,6 +288,7 @@ pub fn serve(config: Config) -> Result<(), String> {
     let metrics_interval = config.metrics_interval;
     let (warmed_tx, warmed) = tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
     let (hub, s2s_requests) = crate::live::Hub::new();
+    let delivered = hub.delivered();
     let live = Arc::new(crate::live::Context {
         hub,
         catalog: catalog.clone(),
@@ -311,6 +312,7 @@ pub fn serve(config: Config) -> Result<(), String> {
         ready.clone(),
         config.s2s_connection_subscriptions,
         stats.clone(),
+        delivered,
     );
     #[cfg(tokio_unstable)]
     tokio::task::Builder::new()

@@ -178,10 +178,12 @@ impl Transaction {
 ///   least half the row limit: a query to report by name before it grows
 ///   into the limit and is refused. Sent once per read, to the owner of
 ///   one subscription of the tree.
-/// - `Heartbeat`: the engine's heartbeat `n` was applied
-///   ([`crate::sync::heartbeat`]), sent to every consumer behind the
-///   events of every transaction before it, so a consumer that has
-///   passed on those events can take it as applied.
+/// - `Heartbeat`: the engine's heartbeat `heartbeat` was applied
+///   ([`crate::sync::heartbeat`]), with the engine's `position` then;
+///   sent to every consumer behind the events of every transaction
+///   before it, so a consumer that has passed on those events can take
+///   the heartbeat as applied and every change up to the position as
+///   passed on, even one that has heard of no change for a while.
 #[derive(Debug)]
 pub enum Event {
     Registered {
@@ -214,7 +216,10 @@ pub enum Event {
         table: TableName,
         rows: u64,
     },
-    Heartbeat(u64),
+    Heartbeat {
+        heartbeat: u64,
+        position: Lsn,
+    },
 }
 
 /// How a step ended: what its deltas travel inside of.
@@ -570,7 +575,10 @@ where
         );
         if let Some(n) = heartbeat {
             for sink in &self.sinks {
-                let _ = sink.send(Event::Heartbeat(n));
+                let _ = sink.send(Event::Heartbeat {
+                    heartbeat: n,
+                    position,
+                });
             }
         }
         self.reap();

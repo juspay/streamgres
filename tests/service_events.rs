@@ -97,7 +97,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
             Event::Committed { .. } => "committed",
             Event::Capped { .. } => "capped",
             Event::Heavy { .. } => "heavy",
-            Event::Heartbeat(_) => "heartbeat",
+            Event::Heartbeat { .. } => "heartbeat",
         })
         .collect()
 }
@@ -112,7 +112,7 @@ fn updates_of(event: &Event) -> &[streamgres::ivm::Delta] {
         | Event::Refused { .. }
         | Event::Capped { .. }
         | Event::Heavy { .. }
-        | Event::Heartbeat(_) => &[],
+        | Event::Heartbeat { .. } => &[],
     }
 }
 
@@ -377,7 +377,10 @@ fn a_heartbeat_follows_the_transactions_before_it_to_every_consumer() {
         for seen in [&owner_seen, &other_seen] {
             assert_eq!(shapes(seen).first(), Some(&"committed"), "{:?}", shapes(seen));
             assert_eq!(shapes(seen).last(), Some(&"heartbeat"), "{:?}", shapes(seen));
-            assert!(matches!(seen.last(), Some(Event::Heartbeat(3))));
+            assert!(matches!(
+                seen.last(),
+                Some(Event::Heartbeat { heartbeat: 3, position: Lsn(10) })
+            ));
         }
     });
 }

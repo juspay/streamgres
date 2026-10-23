@@ -638,6 +638,7 @@ async fn launch(config: &Config, stats: &Arc<Stats>) -> Result<Running, String> 
     let (gated, gated_events) = mpsc::unbounded_channel();
     io.spawn(gate(events, gated, readiness));
     let (hub, requests) = live::Hub::new();
+    let delivered = hub.delivered();
     let context = Arc::new(live::Context {
         hub,
         catalog: Arc::clone(&catalog),
@@ -659,6 +660,7 @@ async fn launch(config: &Config, stats: &Arc<Stats>) -> Result<Running, String> 
         ready.clone(),
         config.limits.per_connection,
         Arc::clone(stats),
+        delivered,
     ));
     Ok(Running {
         instance: Arc::new(Instance {
