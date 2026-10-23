@@ -77,43 +77,27 @@ branch name and the short commit SHA.
 - **A direct connection, not PgBouncer.** Logical replication does not pass
   through PgBouncer.
 
-**The server writes nothing to the database it follows.** It reads rows and
-the replication stream. Its position in the stream comes from each commit and
-from the keepalives PostgreSQL sends anyway. So `STREAMGRES_PG_DSN` can point
-at:
+The change feed writes nothing to the database it follows. Its position comes
+from commits and PostgreSQL keepalives. `STREAMGRES_PG_DSN` can point at:
 - the primary,
 - a logical replica, or
 - a physical standby (PostgreSQL 16 or later, the first version that can do
   logical decoding on a standby).
 
-### One-time setup
+Startup setup uses `STREAMGRES_MASTER_PG_DSN` to connect to the writable primary.
+It creates the `<app>_<shard>` mutation schema, publication, DDL functions, and
+event triggers when absent. Existing objects are checked without replacement;
+a mismatch stops startup. The master role must be a PostgreSQL superuser to
+create the publication and event triggers.
 
-1. **Create the publication** on the primary. The server checks for it at
-   startup and exits if it is missing:
+### Startup setup
 
-   ```sql
-   CREATE PUBLICATION xyne_sync_pub FOR ALL TABLES;  -- needs a superuser
-   ```
-
-   The name is set by `STREAMGRES_PUBLICATION`. The publication must include
-   your application's mutation-tracking tables (section 4).
-
-2. **Install the schema-change event trigger** on the primary. The server
-   refuses to start without it:
-
-   ```bash
-   psql "$DATABASE_URL" < scripts/sql/ddl-triggers.sql
-   ```
-
-   The checked-in stack is for app `xyne`, shard 0 and publication
-   `xyne_sync_pub`. For another app, shard or publication, generate the
-   stack with `trigger_stack_sql` in `src/client/ddl_triggers.rs`.
-
-   This creates the event trigger `<app>_ddl_end_<shard>`. During every
-   migration, inside the migration's own transaction, it records the published
-   schema before and after into the WAL. The server therefore sees each schema
-   change at its commit, on any topology. Use the same app id and shard you set
-   in `STREAMGRES_APP_ID` and `STREAMGRES_SHARD`.
+Choose `STREAMGRES_PUBLICATION` and `STREAMGRES_SCHEMAS`. On first startup,
+Streamgres creates the publication and the schema-change trigger stack on the
+primary. Existing objects must match the configured app ID, shard, publication,
+and expected definitions. The trigger names and WAL prefix are derived from
+`STREAMGRES_APP_ID` and `STREAMGRES_SHARD`. During a migration, the triggers
+record the published schema before and after the DDL in that transaction's WAL.
 
 ### Replication slots
 
@@ -210,6 +194,7 @@ directory is read first, and variables already set take precedence.
 | variable | meaning |
 |---|---|
 | `STREAMGRES_PG_DSN` | the PostgreSQL to follow, reached directly (section 3) |
+| `STREAMGRES_MASTER_PG_DSN` | writable primary used during startup setup |
 | `STREAMGRES_QUERY_URL` | the application server's query endpoint |
 | `STREAMGRES_MUTATE_URL` | the application server's mutate endpoint |
 
@@ -244,8 +229,6 @@ depend on what the defaults happen to be:
 | `STREAMGRES_ADDR` | `0.0.0.0:4848` | listen address |
 | `STREAMGRES_SCHEMAS` | `public,<app>_<shard>` | schemas whose tables are served |
 | `STREAMGRES_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams |
-| `STREAMGRES_DDL_TRIGGER` | `<app>_ddl_end_<shard>` | the schema-change event trigger the server requires |
-| `STREAMGRES_DDL_PREFIX` | `<app>/<shard>/ddl` | the prefix of that trigger's messages |
 | `STREAMGRES_FORWARD_COOKIES` | `true` | forward the connection's cookies to the application server |
 | `STREAMGRES_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is created |
 | `STREAMGRES_SLOT_CLEANUP_AGE_MS` | `0` (off) | at startup, drop inactive slots of ended processes older than this (PostgreSQL 17+) |
