@@ -558,6 +558,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
             Err(error) => return std::future::ready(Err(error)).boxed(),
         };
         let Some(mut key) = key else {
+            self.observe(&rendered(&query));
             let live = self.inner.load(query);
             let live = self
                 .resolving(unknown, live)

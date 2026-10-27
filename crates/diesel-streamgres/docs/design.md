@@ -278,10 +278,13 @@ settings, so a tenant in `app.tenant` cannot be read back and compared.
 `session::SessionChanges` watches every statement instead: a `SET`
 (other than a few settings that change no rows, and `SET LOCAL`, which
 ends with its transaction, inside which reads go to Postgres anyway),
-`SET ROLE`, `SET SESSION AUTHORIZATION`, or any statement mentioning
-`set_config` takes the connection off the cache until the same setting
-is `RESET`, or `RESET ALL` or `DISCARD ALL` restores everything; then
-its context is read again. Settings made at connect time or inside a
+`SET ROLE`, `SET SESSION AUTHORIZATION`, a `DO` block, or any statement
+mentioning `set_config` takes the connection off the cache until the
+same setting is `RESET`, or `RESET ALL` or `DISCARD ALL` restores
+everything; then its context is read again. A batch is split only on
+the semicolons between statements, never on one in a literal, a quoted
+name, a dollar-quoted body or a comment: text there that reads like
+`RESET ALL` must not put a connection back on the cache. Settings made at connect time or inside a
 function are not seen: such connections need caches of their own.
 
 **No row-level security.** The engine reads as its own role. It refuses

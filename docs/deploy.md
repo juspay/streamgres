@@ -208,7 +208,9 @@ cannot apply a backend's policies, so the S2S endpoint refuses any query over a
 table with row-level security enabled, and the backend reads Postgres. Turning
 it on or off on a served table stops the server, which restarts knowing it. A
 table created while serving is taken as secured unless the trigger stack says
-otherwise, which a stack older than `rowSecurity` in its messages does not.
+otherwise, which a stack older than `rowSecurity` in its messages does not; such
+a stack also misses row-level security turned on while serving. The server
+warns at startup when its stack is that old: run the setup SQL again.
 
 **Any other change to a served table stops the server**, with one log line
 naming the change. That includes dropping or renaming a column or table,

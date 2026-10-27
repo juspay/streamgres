@@ -193,6 +193,11 @@ pub async fn require_ddl_trigger(dsn: &str, name: &str) -> Result<(), String> {
     let present = ddl::trigger_present(&client, name)
         .await
         .map_err(|error| format!("looking for the DDL event trigger `{name}`: {error}"))?;
+    if present && ddl::stack_outdated(&client, name).await.unwrap_or(false) {
+        log_warn!(
+            "the schema-change trigger stack behind `{name}` predates `rowSecurity`: row-level security turned on while serving goes unnoticed until a restart, and tables created meanwhile are taken as secured; run the setup SQL again (scripts/sql/ddl-triggers.sql) to update it"
+        );
+    }
     drop(client);
     let _ = handle.await;
     if present {

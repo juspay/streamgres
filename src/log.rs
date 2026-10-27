@@ -313,10 +313,12 @@ pub fn render(line: &Line, format: Format) -> String {
     }
 }
 
-/// Whether a character could break a text line or drive a terminal: an
-/// ASCII or C1 control, or a Unicode line or paragraph separator.
+/// Whether a character could break a text line, drive a terminal or
+/// reorder what it shows: an ASCII or C1 control, a Unicode line or
+/// paragraph separator, or a bidirectional embedding, override or
+/// isolate.
 fn is_control(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
 /// `text` with every [`is_control`] character written as an escape
@@ -482,7 +484,7 @@ mod tests {
     /// stays on its one line, escaped.
     #[test]
     fn what_a_client_chose_stays_on_its_line() {
-        let forged = "abc\n12:00:00.000 INFO  [main] FORGED_AUDIT_EVENT\u{1b}[31m\u{2028}x";
+        let forged = "abc\n12:00:00.000 INFO  [main] FORGED_AUDIT_EVENT\u{1b}[31m\u{2028}x\u{202e}gnp.exe";
         let mut hostile = line(Level::Warn);
         hostile.message = format!("connection from {forged}");
         hostile.fields = vec![
@@ -497,7 +499,7 @@ mod tests {
         let body = text.trim_end_matches('\n');
         assert!(!body.chars().any(is_control), "{text:?}");
         assert!(text.contains(r"from abc\n12:00:00.000 INFO"), "{text}");
-        assert!(text.contains(r"FORGED_AUDIT_EVENT\u{1b}[31m\u{2028}x"), "{text}");
+        assert!(text.contains(r"FORGED_AUDIT_EVENT\u{1b}[31m\u{2028}x\u{202e}gnp.exe"), "{text}");
         assert!(text.contains(r#"group="a=b""#), "{text}");
         assert!(text.contains(r#"client="say\"hi""#), "{text}");
         assert!(text.contains(r#"tab="a\tb""#), "{text}");

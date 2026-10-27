@@ -15,9 +15,9 @@
 //!   AUTHORIZATION`: changed, until `RESET` of the same name.
 //! - `SET LOCAL …`: lasts until the transaction ends, and reads inside a
 //!   transaction go to Postgres anyway, so it changes nothing here.
-//! - `set_config(…)` anywhere in a statement: changed, and only `RESET
-//!   ALL` or `DISCARD ALL` undoes it, the name and scope being in its
-//!   arguments.
+//! - `set_config(…)` anywhere in a statement, or a `DO` block: changed,
+//!   and only `RESET ALL` or `DISCARD ALL` undoes it, what it set being
+//!   in its arguments or its body.
 //! - `RESET ALL`, `DISCARD ALL`: back as established.
 //! - A few settings that change no query's rows ([`HARMLESS`]), which
 //!   pools often set on checkout: no change.
@@ -62,6 +62,9 @@ impl Scope {
     }
 }
 
+/// The name standing for a `DO` block, which may set anything.
+const DO_BLOCK: &str = "do";
+
 /// The name standing for a `set_config` call, whose setting is not known.
 const SET_CONFIG: &str = "set_config()";
 
@@ -90,12 +93,13 @@ impl SessionChanges {
     }
 
     /// Takes in what `sql`, one statement or a batch, does to the
-    /// session. A batch is split on every `;`, as [`crate::may_write`]
-    /// splits it.
+    /// session. A batch is split only on the semicolons between its
+    /// statements ([`statements`]): text in a literal that reads like
+    /// `RESET ALL` must not pass for one.
     pub(crate) fn apply(&mut self, sql: &str) -> Effect {
         let was = self.changed();
         let mut moved = false;
-        for statement in sql.split(';').map(str::trim).filter(|statement| !statement.is_empty()) {
+        for statement in statements(sql) {
             moved |= self.apply_one(statement);
         }
         match (moved, self.changed()) {
@@ -123,7 +127,9 @@ impl SessionChanges {
             changed.clear();
             had
         };
-        if head.eq_ignore_ascii_case("DISCARD") {
+        if head.eq_ignore_ascii_case("DO") {
+            self.changed.insert(DO_BLOCK.to_owned())
+        } else if head.eq_ignore_ascii_case("DISCARD") {
             words.next().is_some_and(|what| what.eq_ignore_ascii_case("ALL")) && everything(&mut self.changed)
         } else if head.eq_ignore_ascii_case("RESET") {
             match words.next().map(setting) {
@@ -137,6 +143,91 @@ impl SessionChanges {
             false
         }
     }
+}
+
+/// The statements of `sql`, trimmed, split on the semicolons between
+/// them. A semicolon inside a string (`'…'`, `E'…'` with its backslash
+/// escapes), a quoted name (`"…"`), a dollar-quoted body (`$tag$…$tag$`)
+/// or a comment (`-- …`, `/* … */`) ends nothing; a quote left open runs
+/// to the end.
+fn statements(sql: &str) -> Vec<&str> {
+    let bytes = sql.as_bytes();
+    let mut found = Vec::new();
+    let (mut start, mut at) = (0, 0);
+    while at < bytes.len() {
+        at = match bytes[at] {
+            b';' => {
+                found.push(&sql[start..at]);
+                start = at + 1;
+                at + 1
+            }
+            b'\'' => {
+                let escapes = at > 0
+                    && matches!(bytes[at - 1], b'E' | b'e')
+                    && (at < 2 || !is_word_byte(bytes[at - 2]));
+                past_quote(bytes, at + 1, b'\'', escapes)
+            }
+            b'"' => past_quote(bytes, at + 1, b'"', false),
+            b'-' if bytes.get(at + 1) == Some(&b'-') => {
+                position(bytes, at + 2, b"\n").map_or(bytes.len(), |end| end + 1)
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                position(bytes, at + 2, b"*/").map_or(bytes.len(), |end| end + 2)
+            }
+            b'$' => match dollar_tag(bytes, at) {
+                Some(tag) => position(bytes, at + tag.len(), tag).map_or(bytes.len(), |end| end + tag.len()),
+                None => at + 1,
+            },
+            _ => at + 1,
+        };
+    }
+    found.push(&sql[start..]);
+    found
+        .into_iter()
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .collect()
+}
+
+/// Where a quoted run that began before `from` ends: just past its
+/// closing `quote`, a doubled one being part of it (and with `escapes`,
+/// a backslash escaping the next byte); the end when it never closes.
+fn past_quote(bytes: &[u8], mut from: usize, quote: u8, escapes: bool) -> usize {
+    while from < bytes.len() {
+        match bytes[from] {
+            b'\\' if escapes => from += 2,
+            byte if byte == quote && bytes.get(from + 1) == Some(&quote) => from += 2,
+            byte if byte == quote => return from + 1,
+            _ => from += 1,
+        }
+    }
+    bytes.len()
+}
+
+/// The dollar-quote tag (`$$`, `$body$`) starting at `at`, if one does:
+/// a `$`, an optional name not starting with a digit, and a `$`. A
+/// parameter (`$1`) is not one.
+fn dollar_tag(bytes: &[u8], at: usize) -> Option<&[u8]> {
+    let name = &bytes[at + 1..];
+    if name.first().is_some_and(u8::is_ascii_digit) {
+        return None;
+    }
+    let length = name.iter().take_while(|byte| is_word_byte(**byte)).count();
+    (name.get(length) == Some(&b'$')).then(|| &bytes[at..at + length + 2])
+}
+
+/// Where `needle` next occurs in `bytes` from `from` on.
+fn position(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    bytes
+        .get(from..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|offset| from + offset)
+}
+
+/// Whether `byte` can be part of a name.
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || !byte.is_ascii()
 }
 
 /// The setting a `SET` (its words after `SET`) changes for the session;
@@ -263,6 +354,42 @@ mod tests {
             assert!(!session.changed(), "{sql}");
             assert_eq!(effects, [Effect::None], "{sql}");
         }
+    }
+
+    /// Text in a literal, a quoted name, a dollar-quoted body or a
+    /// comment is not a statement: it cannot reset a changed session.
+    #[test]
+    fn a_reset_inside_a_literal_resets_nothing() {
+        for sql in [
+            "INSERT INTO notes VALUES ('x; RESET ALL ')",
+            "INSERT INTO notes VALUES ('it''s; RESET ALL ')",
+            r"INSERT INTO notes VALUES (E'\'; RESET ALL; ')",
+            "SELECT 1 AS \"a; RESET ALL \"",
+            "SELECT $$; RESET ALL; $$",
+            "SELECT $body$; DISCARD ALL; $body$",
+            "SELECT 1 -- ; RESET ALL\n",
+            "SELECT 1 /* ; RESET ALL; */",
+        ] {
+            let (session, _) = after(&["SET app.tenant = 'bob'", sql]);
+            assert!(session.changed(), "{sql}");
+        }
+        assert_eq!(statements("SELECT $1; RESET ALL"), ["SELECT $1", "RESET ALL"], "a parameter is no tag");
+        assert_eq!(statements("SELECT 'a;b'; SELECT 2;"), ["SELECT 'a;b'", "SELECT 2"]);
+        let (session, _) = after(&["SET ROLE r", "SELECT 'x'; RESET ALL"]);
+        assert!(!session.changed(), "a real RESET ALL after a literal still resets");
+    }
+
+    /// A `DO` block may set anything: only a reset of everything undoes it.
+    #[test]
+    fn a_do_block_changes_the_session() {
+        let block = "DO $$ BEGIN EXECUTE 'SET ROLE reader'; END $$";
+        let (session, effects) = after(&[block]);
+        assert!(session.changed());
+        assert_eq!(effects, [Effect::Changed]);
+        let (session, _) = after(&[block, "RESET ROLE"]);
+        assert!(session.changed(), "the block's settings are not known");
+        let (session, _) = after(&[block, "DISCARD ALL"]);
+        assert!(!session.changed());
     }
 
     /// A batch's statements apply in order: the last word stands.

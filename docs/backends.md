@@ -266,9 +266,9 @@ answer to readers who would have read the same rows:
   settings such as `app.tenant`, so the wrapper watches the statements
   that set them. After `SET` (a role, a search path, a tenant setting,
   anything but a few timeouts and `application_name`), `SET ROLE`, `SET
-  SESSION AUTHORIZATION` or a call to `set_config`, the connection reads
-  Postgres until `RESET` of the same setting, `RESET ALL` or `DISCARD
-  ALL`. `SET LOCAL` needs nothing: reads inside a transaction go to
+  SESSION AUTHORIZATION`, a call to `set_config` or a `DO` block, the
+  connection reads Postgres until `RESET` of the same setting, `RESET
+  ALL` or `DISCARD ALL` (only the last two after `set_config` or `DO`). `SET LOCAL` needs nothing: reads inside a transaction go to
   Postgres anyway.
 - **No row-level security.** The engine reads as its own role, so it
   cannot apply a policy for a backend's. It refuses every query over a
@@ -276,11 +276,16 @@ answer to readers who would have read the same rows:
   Turning row-level security on or off on a followed table restarts the
   engine, which takes the change from the catalog it reads again. A
   table created while serving by a trigger stack older than this is
-  treated as secured until the engine restarts; re-run the setup SQL
-  (`scripts/sql/ddl-triggers.sql`, or `setup_sql`) to update it.
+  treated as secured until the engine restarts, and turning row-level
+  security on later goes unnoticed until one: re-run the setup SQL
+  (`scripts/sql/ddl-triggers.sql`, or `setup_sql`) to update it. The
+  server says so at startup; an embedded engine that installs its setup
+  updates it itself.
 - **Bare names mean `public`.** The engine reads a bare table name in
   `public`. A connection whose search path puts another schema it can
-  use first reads Postgres.
+  use first reads Postgres. Under the default path (`"$user", public`)
+  that includes a role with a schema of its own name: set the role's
+  `search_path` to `public` (or to `public` first) to cache its reads.
 
 What the wrapper cannot see, and the deployment must keep apart:
 
@@ -290,8 +295,9 @@ What the wrapper cannot see, and the deployment must keep apart:
 - **Privileges.** Rows the engine serves itself (rows mode) were read by
   the engine's role. Grant the backend's role `SELECT` on every followed
   table in full, or route reads of tables it may not read whole to
-  Postgres (`Route::Postgres`). Every column of a followed table reaches
-  the cache, whatever the query selects.
+  Postgres (`Route::Postgres`). The engine sends every column of a
+  followed table's rows to the backend's process, whatever the query
+  selects.
 
 ## 7. What to watch
 

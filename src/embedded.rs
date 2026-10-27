@@ -619,10 +619,10 @@ impl Supervisor {
         match dropped {
             Ok(Ok(())) => {}
             Ok(Err(error)) => log_warn!(
-                "could not drop the embedded engine's slot {slot}: {error}; a later engine's sweep drops it"
+                "could not drop the embedded engine's slot {slot}, if the start got as far as making it: {error}; a later engine's sweep drops it"
             ),
             Err(_) => log_warn!(
-                "dropping the embedded engine's slot {slot} took over {STOP_GRACE:?}; a later engine's sweep drops it"
+                "dropping the embedded engine's slot {slot}, if the start got as far as making it, took over {STOP_GRACE:?}; a later engine's sweep drops it"
             ),
         }
     }
@@ -956,7 +956,15 @@ async fn is_set_up(client: &tokio_postgres::Client, config: &Config) -> Result<b
     let triggered = ddl::trigger_present(client, &config.ddl_trigger)
         .await
         .map_err(|error| format!("looking for the event trigger: {error}"))?;
-    Ok(published && triggered)
+    Ok(published && triggered && !outdated(client, config).await?)
+}
+
+/// Whether the installed trigger stack predates what the engine reads
+/// in its messages ([`ddl::stack_outdated`]).
+async fn outdated(client: &tokio_postgres::Client, config: &Config) -> Result<bool, String> {
+    ddl::stack_outdated(client, &config.ddl_trigger)
+        .await
+        .map_err(|error| format!("looking at the trigger stack: {error}"))
 }
 
 /// Whether the publication `name` exists.
@@ -1000,12 +1008,16 @@ async fn install(client: &tokio_postgres::Client, config: &Config) -> Result<Vec
     let triggered = ddl::trigger_present(client, &config.ddl_trigger)
         .await
         .map_err(|error| format!("looking for the event trigger: {error}"))?;
-    if !triggered {
+    if !triggered || outdated(client, config).await? {
         client
             .batch_execute(&setup_sql(&config.app, config.shard, &config.publication))
             .await
             .map_err(failed)?;
-        installed.push("the schema-change trigger stack");
+        installed.push(if triggered {
+            "the schema-change trigger stack, updated"
+        } else {
+            "the schema-change trigger stack"
+        });
     }
     Ok(installed)
 }

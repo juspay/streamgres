@@ -392,6 +392,49 @@ fn a_table_with_row_level_security_is_refused() {
     });
 }
 
+/// A trigger stack from before the engine read `rowSecurity` is brought
+/// up to date by an engine that installs its setup.
+#[test]
+fn an_outdated_trigger_stack_is_updated() {
+    let Some(dsn) = dsn("stack") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("stack");
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        let old = setup_sql(&names.app, 0, &names.publication)
+            .replace("  pc.relrowsecurity AS \"rowSecurity\",\n", "")
+            .replace("  'rowSecurity', \"rowSecurity\",\n", "")
+            .replace(", \"rowSecurity\")", ")");
+        assert!(!old.contains("rowSecurity"), "an older stack");
+        client.batch_execute(&old).await.expect("the older stack");
+        let current = async || -> bool {
+            client
+                .query_one(
+                    "SELECT bool_or(prosrc LIKE '%\"rowSecurity\"%') FROM pg_proc p
+                     JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1",
+                    &[&format!("{}_0", names.app)],
+                )
+                .await
+                .expect("the stack's functions")
+                .get::<_, Option<bool>>(0)
+                .unwrap_or(false)
+        };
+        assert!(!current().await);
+
+        let mut installing = config(&dsn, &names);
+        installing.setup = Setup::Install;
+        let engine = Engine::start(installing);
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        assert!(current().await, "updated before serving");
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+    });
+}
+
 /// An engine on a database nobody set up sets it up itself: the
 /// publication and the trigger stack, once, however many engines start
 /// together; it then serves, and follows a schema change. One told to

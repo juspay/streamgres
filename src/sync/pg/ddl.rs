@@ -500,6 +500,27 @@ pub async fn trigger_present(client: &Client, name: &str) -> Result<bool, Storag
     Ok(row.is_some_and(|row| row.get::<_, String>(0) != "D"))
 }
 
+/// Whether the trigger stack behind the event trigger `name` predates
+/// what the engine now reads in its messages (`rowSecurity`): its
+/// schema's functions describe tables without it. Such a stack keeps
+/// working, but row-level security turned on while serving goes
+/// unnoticed until a restart; running the setup SQL again updates it.
+pub async fn stack_outdated(client: &Client, name: &str) -> Result<bool, StorageError> {
+    let row = client
+        .query_one(
+            r#"SELECT EXISTS (
+                 SELECT 1 FROM pg_event_trigger t
+                 JOIN pg_proc fired ON fired.oid = t.evtfoid
+                 JOIN pg_proc p ON p.pronamespace = fired.pronamespace
+                 WHERE t.evtname = $1
+                   AND p.prosrc LIKE '%"replicaIdentity"%'
+                   AND p.prosrc NOT LIKE '%"rowSecurity"%')"#,
+            &[&name],
+        )
+        .await?;
+    Ok(row.get(0))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
