@@ -71,13 +71,20 @@ impl Live {
                 "the engine did not connect (a migration left behind may have stopped it; set STREAMGRES_RESTART_CMD)"
             );
         }
-        let main = AsyncSyncedConnection::with_cache(
+        let mut main = AsyncSyncedConnection::with_cache(
             AsyncPgConnection::establish(&database_url)
                 .await
                 .expect("connect"),
             Arc::clone(&cache),
             Route::Streamgres,
         );
+        // An async connection's first read goes to Postgres beside reading
+        // what it reads as; the tests count from its second.
+        let one: i32 = diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>("1"))
+            .get_result(&mut main)
+            .await
+            .expect("a first read");
+        assert_eq!(one, 1);
         let sync = SyncedConnection::with_cache(
             PgConnection::establish(&database_url).expect("connect"),
             Arc::clone(&cache),

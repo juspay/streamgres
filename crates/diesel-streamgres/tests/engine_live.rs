@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_types::Text;
-use diesel_streamgres::cache::{Cache, DATABASE_SQL, Database};
+use diesel_streamgres::cache::Cache;
 use diesel_streamgres::engine::EngineClient;
 use diesel_streamgres::subscriptions::Subscriptions;
 use diesel_streamgres::{Consistency, Served, SyncedConnection};
@@ -49,8 +49,9 @@ struct Live {
 
 impl Live {
     /// Connects to the test's engine ([`transport`]); `None`, and the
-    /// test skipped, when none is given. The cache is told which database
-    /// it reads up front, so the statements a test counts are its own.
+    /// test skipped, when none is given. The connection makes its first
+    /// read up front (which reads what it reads as, and tells the cache
+    /// its database), so the statements a test counts are its own.
     fn start(name: &str) -> Option<Live> {
         let engine = transport::client(diesel_streamgres::engine::Config::from_env())?;
         let database = std::env::var("DATABASE_URL").expect("DATABASE_URL");
@@ -68,13 +69,16 @@ impl Live {
                     id serial PRIMARY KEY, key text NOT NULL UNIQUE, value text NOT NULL)",
             )
             .expect("schema");
-        let identity = diesel::sql_query(DATABASE_SQL)
-            .load::<Database>(&mut other)
-            .expect("the database's identity");
-        cache.learn_database(identity.into_iter().next());
         let prefix = format!("{name}-{}-", std::process::id());
         let inner = PgConnection::establish(&database).expect("connect");
-        let conn = SyncedConnection::with_cache(inner, cache.clone(), Consistency::Eventual);
+        let mut conn = SyncedConnection::with_cache(inner, cache.clone(), Consistency::Eventual);
+        let one: i32 = diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>("1"))
+            .get_result(&mut conn)
+            .expect("a first read, which reads what the connection reads as");
+        assert_eq!(one, 1);
+        assert!(cache.database().is_some(), "and tells the cache its database");
+        // The engine refused that `SELECT 1`; tests count their own.
+        cache.stats.refused.store(0, Ordering::Relaxed);
         Some(Live {
             conn,
             cache,

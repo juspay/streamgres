@@ -91,6 +91,13 @@ async fn rows_mode_through_the_async_wrapper() {
         .await
         .expect("connect");
     let mut conn = AsyncSyncedConnection::with_cache(inner, cache.clone(), Route::Streamgres);
+    let one: i32 = diesel_async::RunQueryDsl::get_result(
+        diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>("1")),
+        &mut conn,
+    )
+    .await
+    .expect("a first read, which reads what the connection reads as");
+    assert_eq!(one, 1);
     assert_eq!(read(&mut conn, &key).await.as_deref(), Some("1"));
     assert_eq!(
         engine.materialized(),
