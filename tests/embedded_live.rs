@@ -8,7 +8,7 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use streamgres::embedded::{Config, Engine, Session, Setup, State, setup_sql};
+use streamgres::embedded::{Config, Engine, Session, Setup, Slot, State, setup_sql};
 use tokio_postgres::{Client, NoTls};
 
 mod support;
@@ -201,35 +201,114 @@ fn a_stop_while_the_start_is_held_back_returns_at_once() {
         let names = names("stop");
         let client = admin(&dsn).await;
         set_up(&client, &names).await;
-        let holder = admin(&dsn).await;
-        holder
-            .batch_execute("BEGIN; SELECT pg_current_xact_id();")
+        for kind in [Slot::Temporary, Slot::Permanent { cleanup_age: Duration::from_secs(3600) }] {
+            let holder = admin(&dsn).await;
+            holder
+                .batch_execute("BEGIN; SELECT pg_current_xact_id();")
+                .await
+                .expect("an open transaction");
+            let mut held = config(&dsn, &names);
+            held.slot = kind;
+            let engine = Engine::start(held);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(engine.state(), State::Starting, "{kind:?}: held back by the transaction");
+            let called = Instant::now();
+            let stopping = engine.clone();
+            tokio::task::spawn_blocking(move || stopping.stop())
+                .await
+                .expect("stop");
+            assert!(
+                called.elapsed() < Duration::from_secs(3),
+                "{kind:?}: stop waited {:?} for the transaction",
+                called.elapsed()
+            );
+            assert_eq!(engine.state(), State::Stopped);
+            holder.batch_execute("COMMIT").await.expect("commit");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let leftover: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM pg_replication_slots WHERE database = current_database()",
+                    &[],
+                )
+                .await
+                .expect("slots")
+                .get(0);
+            assert_eq!(leftover, 0, "{kind:?}: no slot left behind");
+        }
+    });
+}
+
+/// On a permanent slot the engine serves on through a dropped feed
+/// connection, its sessions and slot kept; it drops a dead process's
+/// slot once inactive past the cleanup age, and its own when it stops.
+#[test]
+fn a_permanent_slot_keeps_the_engine_serving_through_a_dropped_feed() {
+    let Some(dsn) = dsn("permanent") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("permanent");
+        let table = &names.table;
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        let dead = "xyne_sync_slot_00000000000000000000000000000dead";
+        client
+            .execute("SELECT pg_create_logical_replication_slot($1, 'pgoutput')", &[&dead])
             .await
-            .expect("an open transaction");
-        let engine = Engine::start(config(&dsn, &names));
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        assert_eq!(engine.state(), State::Starting, "held back by the transaction");
-        let called = Instant::now();
+            .expect("a dead process's slot");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let mut permanent = config(&dsn, &names);
+        permanent.slot = Slot::Permanent { cleanup_age: Duration::from_millis(200) };
+        let engine = Engine::start(permanent);
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        assert_eq!(slot(&client, dead).await, None, "the dead process's slot is swept");
+        let own = engine.slot().expect("a slot while it runs");
+        assert_eq!(slot(&client, &own).await, Some(false), "a permanent slot");
+
+        let mut session = engine.connect().expect("a session");
+        assert_eq!(next(&mut session).await.expect("hello")[0], "hello");
+        let sql = format!(r#"SELECT "id", "name" FROM "{table}" WHERE "n" > $1 ORDER BY "id" ASC"#);
+        let bind = json!({"oid": 23, "bytes": "AAAAAQ=="});
+        session
+            .sender()
+            .send(json!(["subscribe", {"id": 1, "sql": sql, "binds": [bind], "rows": true}]).to_string())
+            .await
+            .expect("send");
+        assert_eq!(next(&mut session).await.expect("accepted")[0], "accepted");
+
+        client
+            .execute(
+                "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots
+                 WHERE slot_name = $1 AND active_pid IS NOT NULL",
+                &[&own],
+            )
+            .await
+            .expect("cut the feed");
+        client
+            .batch_execute(&format!("INSERT INTO {table} VALUES (4, 'four', 4)"))
+            .await
+            .expect("insert");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let delta = loop {
+            assert!(Instant::now() < deadline, "no delta after the feed reopened");
+            if let Some(frame) = next(&mut session).await
+                && frame[0] == "delta"
+            {
+                break frame;
+            }
+        };
+        assert_eq!(delta[1]["changes"][0]["put"][0]["id"], 4, "the change made while it was cut");
+        assert_eq!(engine.state(), State::Serving, "served on, no fresh start");
+        assert_eq!(engine.slot(), Some(own.clone()), "the same slot");
+
         let stopping = engine.clone();
         tokio::task::spawn_blocking(move || stopping.stop())
             .await
             .expect("stop");
-        assert!(
-            called.elapsed() < Duration::from_secs(3),
-            "stop waited {:?} for the transaction",
-            called.elapsed()
-        );
-        assert_eq!(engine.state(), State::Stopped);
-        holder.batch_execute("COMMIT").await.expect("commit");
-        let leftover: i64 = client
-            .query_one(
-                "SELECT count(*) FROM pg_replication_slots WHERE database = current_database() AND NOT active",
-                &[],
-            )
-            .await
-            .expect("slots")
-            .get(0);
-        assert_eq!(leftover, 0, "no slot left behind");
+        assert_eq!(slot(&client, &own).await, None, "its slot goes with it");
     });
 }
 

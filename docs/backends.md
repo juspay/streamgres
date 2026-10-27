@@ -91,15 +91,33 @@ application that does not configure through the environment.
   transaction open at that moment, so an engine started behind one stays
   `Starting` until it ends. The caller never waits, and `Engine::stop`
   returns at once even then.
-- **Its slot is temporary.** PostgreSQL drops it when the feed's
-  connection ends, however the process ends, so a crashed or killed
-  process leaves no slot holding WAL.
-- **A lost feed means a full restart.** A temporary slot cannot be
-  resumed, so the engine starts over on a fresh slot and snapshot. Its
-  sessions end, and the wrapper reconnects, resubscribes and refills
-  meanwhile reading Postgres. A failed start is retried after 1 s,
+- **Its slot is temporary by default.** PostgreSQL drops it when the
+  feed's connection ends, however the process ends, so a crashed or
+  killed process leaves no slot holding WAL.
+- **On a temporary slot, a lost feed means a full restart.** A temporary
+  slot cannot be resumed, so the engine starts over on a fresh slot and
+  snapshot. Its sessions end, and the wrapper reconnects, resubscribes
+  and refills meanwhile reading Postgres. A failed start is retried after 1 s,
   doubling up to 30 s while starts keep failing; an engine that served
   for 60 s starts the count again.
+- **A permanent slot rides out a lost feed instead**
+  (`STREAMGRES_EMBEDDED_SLOT=permanent`, or `Config::slot`). The feed
+  reopens the same slot and the engine serves on: sessions and the cache
+  stay as they are, and reads go to Postgres only while the lag the
+  heartbeats measure is past `STREAMGRES_S2S_MAX_LAG_MS`. The costs:
+  - The engine drops its slot when it stops or starts over, but a process
+    that dies without stopping leaves its slot holding WAL.
+  - Every engine on the database drops such slots once they have been
+    inactive for `STREAMGRES_SLOT_CLEANUP_AGE_MS` (default 5 minutes), at
+    its start and every minute after. This needs PostgreSQL 17 or later;
+    on 16, set it to `0` and rely on `max_slot_wal_keep_size` instead.
+  - Set `max_slot_wal_keep_size` either way, for the case where no
+    engine is left running to sweep.
+
+  A restart costs the same with either kind: every start makes a fresh
+  slot and snapshot, since the engine holds its rows in memory. Choose
+  permanent when the network to the database drops often or the rows
+  followed are slow to read again; otherwise keep the default.
 - **It owns its threads**: one for the engine, one for the feed, and a
   small runtime for reads and sessions. It never runs on the host's
   runtime, so blocking and async Diesel can both use it.
@@ -121,6 +139,8 @@ backend process:
 | `STREAMGRES_PUBLICATION` | `xyne_sync_pub` | |
 | `STREAMGRES_SCHEMAS` | `public,<app>_<shard>` | |
 | `STREAMGRES_EMBEDDED_SETUP` | `install` | or `require` |
+| `STREAMGRES_EMBEDDED_SLOT` | `temporary` | or `permanent` (section 2, How it runs) |
+| `STREAMGRES_SLOT_CLEANUP_AGE_MS` | 300000 | on a permanent slot: how long a dead process's slot stays before an engine drops it; 0 never (PostgreSQL 17+ otherwise) |
 | `STREAMGRES_READ_CONNECTIONS` | 4 | read connections the engine opens |
 | `STREAMGRES_READ_THREADS` | 1 | at least 1 |
 | `STREAMGRES_HEARTBEAT_MS` | 500 | how often the engine measures its lag; 0 off |

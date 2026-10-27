@@ -505,7 +505,9 @@ async fn beat(config: tokio_postgres::Config, slot: String, every: Duration, sta
 /// to `stats`. Must run inside a `LocalSet`. Making the slot and minting
 /// the first snapshot each wait for every transaction open at the time,
 /// so a long one holds them back; `shutdown` requested meanwhile gives
-/// up on either.
+/// up on either. A permanent slot given up on may still be made once the
+/// transaction ends: its maker drops it ([`Transport::drop_slot_only`]
+/// ends the backend making it).
 pub async fn start(
     settings: &Settings,
     catalog: Arc<CatalogHandle>,
@@ -534,9 +536,15 @@ pub async fn start(
             .map_err(|error| format!("opening the change feed: {error}"))?;
         Some((transactions, handle, first))
     } else {
-        Transport::prepare(&settings.dsn, &settings.slot, &settings.publication)
-            .await
-            .map_err(|error| format!("preparing the change feed: {error}"))?;
+        let prepared = Transport::prepare(&settings.dsn, &settings.slot, &settings.publication);
+        tokio::select! {
+            prepared = prepared => {
+                prepared.map_err(|error| format!("preparing the change feed: {error}"))?;
+            }
+            () = shutdown.wait() => {
+                return Err("stopped before the change feed's slot was made".to_owned());
+            }
+        }
         None
     };
     let mut config: tokio_postgres::Config = settings

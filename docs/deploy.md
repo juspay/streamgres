@@ -144,8 +144,8 @@ idle. PgBouncer's own pool settings control the PostgreSQL backend connections.
   nothing from the previous slot.
 - **A slot left behind by a crash holds WAL.** Either:
   - set `STREAMGRES_SLOT_CLEANUP_AGE_MS` so the next startup drops inactive
-    `xyne_sync_slot_*` slots older than that age (needs PostgreSQL 17+, which
-    records `inactive_since`), or
+    `xyne_sync_slot_*` slots on its database older than that age (needs
+    PostgreSQL 17+, which records `inactive_since`), or
   - drop them by hand: `SELECT pg_drop_replication_slot('<slot name>');`
   - Either way, set `max_slot_wal_keep_size` as a safety net.
 - **A process whose slot disappears while it runs stops.** It does not

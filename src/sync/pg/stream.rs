@@ -630,8 +630,9 @@ impl Transport {
         }
     }
 
-    /// Drop only our own permanent slots that PostgreSQL has reported
-    /// inactive for at least `age`. A zero age disables cleanup. PostgreSQL
+    /// Drop only our own permanent slots on this database that PostgreSQL
+    /// has reported inactive for at least `age`. A zero age disables
+    /// cleanup. PostgreSQL
     /// added `inactive_since` in version 17; refusing to guess on older
     /// versions is safer than deleting a slot during a live reconnect.
     pub async fn cleanup_inactive_slots(dsn: &str, age: Duration) -> Result<(), StorageError> {
@@ -655,6 +656,7 @@ impl Transport {
             .query(
                 "SELECT slot_name FROM pg_replication_slots \
                  WHERE left(slot_name, length($1)) = $1 \
+                   AND database = current_database() \
                    AND NOT temporary AND NOT active \
                  AND inactive_since <= clock_timestamp() - $2::bigint * interval '1 millisecond'",
                 &[&prefix, &age_ms],
