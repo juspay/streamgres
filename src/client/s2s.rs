@@ -180,7 +180,9 @@ async fn handle(socket: WebSocket, state: Arc<AppState>) {
     let inbound = stream
         .take_while(|frame| future::ready(open(frame)))
         .filter_map(|frame| future::ready(text(frame)));
-    live::session(&state.live, Box::pin(inbound), out).await;
+    if let Some(context) = &state.live {
+        live::session(context, Box::pin(inbound), out).await;
+    }
     if tokio::time::timeout(WRITER_DRAIN, &mut writer).await.is_err() {
         writer.abort();
         log_warn!("an s2s connection's frames were not read in time; cut off");

@@ -79,8 +79,9 @@ pub struct AppState {
     pub shutdown: Shutdown,
     /// Who may open the server-to-server endpoint.
     pub s2s: super::s2s::Admission,
-    /// What its sessions share with the task that follows their queries.
-    pub live: Arc<crate::live::Context>,
+    /// What the S2S endpoint's sessions share with the task that follows
+    /// their queries; `None`, and no such task, while the endpoint is off.
+    pub live: Option<Arc<crate::live::Context>>,
 }
 
 /// One desired-query change between the client's message and the group
