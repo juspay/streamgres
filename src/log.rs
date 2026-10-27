@@ -90,15 +90,11 @@ fn facade_level(level: Level) -> ::log::Level {
 }
 
 /// A line as the facade gets it: the message, then each field as
-/// `key=value`.
+/// `key=value`, escaped and quoted as a text line is ([`render`]): the
+/// host's logger may write it as it comes.
 fn facade_text(message: &str, fields: &[(&'static str, String)]) -> String {
-    let mut text = message.to_owned();
-    for (key, value) in fields {
-        text.push(' ');
-        text.push_str(key);
-        text.push('=');
-        text.push_str(value);
-    }
+    let mut text = escaped(message).into_owned();
+    push_fields(&mut text, fields);
     text
 }
 
@@ -176,11 +172,7 @@ pub fn event(level: Level, message: String, fields: Vec<(&'static str, String)>)
 /// hand it to the facade.
 fn submit(level: Level, message: String, fields: Vec<(&'static str, String)>) {
     if FACADE.load(Ordering::Relaxed) {
-        if fields.is_empty() {
-            ::log::log!(target: "streamgres", facade_level(level), "{message}");
-        } else {
-            ::log::log!(target: "streamgres", facade_level(level), "{}", facade_text(&message, &fields));
-        }
+        ::log::log!(target: "streamgres", facade_level(level), "{}", facade_text(&message, &fields));
         return;
     }
     let line = Line {
@@ -277,7 +269,12 @@ fn write_loop(receiver: Receiver<Item>) {
     }
 }
 
-/// One line as written, newline included.
+/// One line as written, newline included. A text line is one line
+/// whatever it carries: the message's and the fields' control
+/// characters (a line break, a terminal escape) are written escaped, so
+/// text a client chose cannot forge a line or drive a terminal; a field
+/// value that could be misread (empty, or holding whitespace, a quote,
+/// an `=` or a control character) is quoted.
 pub fn render(line: &Line, format: Format) -> String {
     match format {
         Format::Text => {
@@ -285,19 +282,10 @@ pub fn render(line: &Line, format: Format) -> String {
                 "{} {} [{}] {}",
                 line.at.format("%H:%M:%S%.3f"),
                 tag(line.level),
-                line.thread,
-                line.message
+                escaped(&line.thread),
+                escaped(&line.message)
             );
-            for (key, value) in &line.fields {
-                text.push(' ');
-                text.push_str(key);
-                text.push('=');
-                if value.contains(' ') || value.is_empty() {
-                    text.push_str(&serde_json::Value::String(value.clone()).to_string());
-                } else {
-                    text.push_str(value);
-                }
-            }
+            push_fields(&mut text, &line.fields);
             text.push('\n');
             text
         }
@@ -323,6 +311,57 @@ pub fn render(line: &Line, format: Format) -> String {
             text
         }
     }
+}
+
+/// Whether a character could break a text line or drive a terminal: an
+/// ASCII or C1 control, or a Unicode line or paragraph separator.
+fn is_control(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// `text` with every [`is_control`] character written as an escape
+/// (`\n`, `\r`, `\t`, else `\u{1b}` and the like), and nothing else
+/// changed.
+fn escaped(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(is_control) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if is_control(c) => out.push_str(&format!("\\u{{{:x}}}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// `fields` after `text`, each as ` key=value`, a value quoted when it
+/// must be ([`needs_quotes`]) and escaped ([`escaped`]).
+fn push_fields(text: &mut String, fields: &[(&'static str, String)]) {
+    for (key, value) in fields {
+        text.push(' ');
+        text.push_str(key);
+        text.push('=');
+        if needs_quotes(value) {
+            let quoted = serde_json::Value::String(value.clone()).to_string();
+            text.push_str(&escaped(&quoted));
+        } else {
+            text.push_str(value);
+        }
+    }
+}
+
+/// Whether a text field's value must be quoted to be read back as one
+/// value: empty, or holding whitespace, a quote, an `=` or a control.
+fn needs_quotes(value: &str) -> bool {
+    value.is_empty()
+        || value
+            .chars()
+            .any(|c| c.is_whitespace() || c == '"' || c == '=' || is_control(c))
 }
 
 /// A field's value as JSON: a number when it reads as one, else text.
@@ -436,6 +475,39 @@ mod tests {
         assert_eq!(parsed["rows"], 40);
         assert_eq!(parsed["reason"], "row budget hit");
         assert_eq!(parsed["ts"], "2026-09-19T12:00:00.123Z");
+    }
+
+    /// A message or a field a client chose cannot forge a line, drive a
+    /// terminal or pass for two fields, in either format: what it holds
+    /// stays on its one line, escaped.
+    #[test]
+    fn what_a_client_chose_stays_on_its_line() {
+        let forged = "abc\n12:00:00.000 INFO  [main] FORGED_AUDIT_EVENT\u{1b}[31m\u{2028}x";
+        let mut hostile = line(Level::Warn);
+        hostile.message = format!("connection from {forged}");
+        hostile.fields = vec![
+            ("wsid", forged.to_owned()),
+            ("group", "a=b".to_owned()),
+            ("client", "say\"hi".to_owned()),
+            ("tab", "a\tb".to_owned()),
+        ];
+        let text = render(&hostile, Format::Text);
+        assert_eq!(text.matches('\n').count(), 1, "one line: {text:?}");
+        assert!(text.ends_with('\n'));
+        let body = text.trim_end_matches('\n');
+        assert!(!body.chars().any(is_control), "{text:?}");
+        assert!(text.contains(r"from abc\n12:00:00.000 INFO"), "{text}");
+        assert!(text.contains(r"FORGED_AUDIT_EVENT\u{1b}[31m\u{2028}x"), "{text}");
+        assert!(text.contains(r#"group="a=b""#), "{text}");
+        assert!(text.contains(r#"client="say\"hi""#), "{text}");
+        assert!(text.contains(r#"tab="a\tb""#), "{text}");
+        let facade = facade_text(&hostile.message, &hostile.fields);
+        assert!(!facade.chars().any(is_control), "the host's logger gets it escaped too: {facade:?}");
+        assert!(facade.contains(r#"group="a=b""#), "{facade}");
+        let json = render(&hostile, Format::Json);
+        assert_eq!(json.matches('\n').count(), 1, "{json:?}");
+        let parsed: serde_json::Value = serde_json::from_str(json.trim()).unwrap();
+        assert_eq!(parsed["wsid"], forged, "JSON escapes it and reads it back whole");
     }
 
     /// A line below the level is neither formatted (`boom` would panic)
