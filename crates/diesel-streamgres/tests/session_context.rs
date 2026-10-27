@@ -16,6 +16,7 @@ use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel::sql_types::Text;
+use diesel::QueryResult;
 use diesel_streamgres::cache::Cache;
 use diesel_streamgres::key::QueryKey;
 use diesel_streamgres::subscriptions::{Outcome, Subscriptions, Verdict};
@@ -97,7 +98,10 @@ impl Tenants {
         tenants.drop_all(&mut admin);
         admin
             .batch_execute(&format!(
-                "CREATE TABLE {table} (id int PRIMARY KEY, tenant text NOT NULL, body text NOT NULL);
+                "BEGIN;
+                 -- Grants on one schema from tests side by side would race.
+                 SELECT pg_advisory_xact_lock(4242);
+                 CREATE TABLE {table} (id int PRIMARY KEY, tenant text NOT NULL, body text NOT NULL);
                  INSERT INTO {table} VALUES (1, 'alice', 'ALICE_ONLY'), (2, 'bob', 'BOB_ONLY');
                  ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;
                  CREATE POLICY tenant ON {table} USING (tenant = current_setting('app.tenant', true));
@@ -105,7 +109,8 @@ impl Tenants {
                  GRANT USAGE ON SCHEMA public TO {role};
                  GRANT SELECT ON {table} TO {role};
                  CREATE SCHEMA {schema};
-                 GRANT USAGE ON SCHEMA {schema} TO {role};"
+                 GRANT USAGE ON SCHEMA {schema} TO {role};
+                 COMMIT;"
             ))
             .expect("set up the tenants");
         tenants
@@ -133,24 +138,45 @@ impl Tenants {
 
     /// Every note `conn` reads.
     fn notes(&self, conn: &mut SyncedConnection<PgConnection>) -> Vec<String> {
-        let notes: Vec<Note> = sql_query(format!("SELECT body FROM {} ORDER BY id", self.table))
-            .load(conn)
-            .expect("read the notes");
-        notes.into_iter().map(|note| note.body).collect()
+        self.try_notes(conn).expect("read the notes")
+    }
+
+    /// Every note `conn` reads, or why it may not.
+    fn try_notes(&self, conn: &mut SyncedConnection<PgConnection>) -> QueryResult<Vec<String>> {
+        let notes: Vec<Note> =
+            sql_query(format!("SELECT body FROM {} ORDER BY id", self.table)).load(conn)?;
+        Ok(notes.into_iter().map(|note| note.body).collect())
+    }
+
+    /// A table of the same name in the test's schema, holding `SHADOW`,
+    /// which a bare name means once the schema comes before `public`.
+    fn shadow(&self) {
+        let mut admin = PgConnection::establish(&self.url).expect("connect");
+        let (table, role, schema) = (&self.table, &self.role, &self.schema);
+        admin
+            .batch_execute(&format!(
+                "CREATE TABLE {schema}.{table} (id int PRIMARY KEY, body text NOT NULL);
+                 INSERT INTO {schema}.{table} VALUES (1, 'SHADOW');
+                 GRANT SELECT ON {schema}.{table} TO {role};"
+            ))
+            .expect("a shadowing table");
     }
 
     /// Drops the table, the role and the schema.
     fn drop_all(&self, admin: &mut PgConnection) {
         let (table, role, schema) = (&self.table, &self.role, &self.schema);
         let _ = admin.batch_execute(&format!(
-            "DROP TABLE IF EXISTS {table};
-             DROP SCHEMA IF EXISTS {schema};
+            "SELECT pg_advisory_lock(4242);
+             DROP TABLE IF EXISTS {table};
+             DROP FUNCTION IF EXISTS {schema}_enter(text);
+             DROP SCHEMA IF EXISTS {schema} CASCADE;
              DO $$ BEGIN
                IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
                  EXECUTE 'DROP OWNED BY {role}';
                  EXECUTE 'DROP ROLE {role}';
                END IF;
-             END $$;"
+             END $$;
+             SELECT pg_advisory_unlock(4242);"
         ));
     }
 }
@@ -207,25 +233,28 @@ fn a_tenant_setting_is_never_served_another_tenants_rows() {
     assert_eq!(conn.last_served(), Some(Served::Cache), "the cache serves it again");
 }
 
-/// Two connections logged in as different roles never share an answer:
-/// the owner reads every note and the cache keeps them; the reader, who
-/// may see none without a tenant, reads Postgres and sees none.
+/// Connections logged in as different roles each get the cache, apart:
+/// the owner's answer (every note) and the reader's (none, without a
+/// tenant) are kept side by side, and neither is served the other's.
 #[test]
-fn another_role_reads_postgres() {
+fn each_role_is_served_its_own_answers() {
     let Some(url) = url() else { return };
     let tenants = Tenants::create(url, "role");
     let cache = cache();
     let mut owner = Tenants::connect(&tenants.url, &cache);
-    assert_eq!(tenants.notes(&mut owner), ["ALICE_ONLY", "BOB_ONLY"]);
-    assert_eq!(tenants.notes(&mut owner), ["ALICE_ONLY", "BOB_ONLY"]);
-    assert_eq!(owner.last_served(), Some(Served::Cache), "the owner's answer is cached");
-
     let mut reader = Tenants::connect(&tenants.reader_url(None), &cache);
     for _ in 0..2 {
-        assert_eq!(tenants.notes(&mut reader), Vec::<String>::new(), "not the owner's rows");
-        assert_eq!(reader.last_served(), Some(Served::Postgres));
+        assert_eq!(tenants.notes(&mut owner), ["ALICE_ONLY", "BOB_ONLY"]);
+        assert_eq!(tenants.notes(&mut reader), Vec::<String>::new(), "never the owner's rows");
     }
-    assert_eq!(other_context(&cache), 2);
+    assert_eq!(owner.last_served(), Some(Served::Cache));
+    assert_eq!(reader.last_served(), Some(Served::Cache), "the reader's own answer, cached");
+    assert_eq!(cache.len(), 2, "one entry per context");
+    let roles: Vec<String> = (0..2)
+        .map(|id| cache.context(id).expect("a context").role.clone())
+        .collect();
+    assert_ne!(roles[0], roles[1]);
+    assert_eq!(other_context(&cache), 0, "nobody skipped the cache");
 }
 
 /// `SET ROLE` takes the connection off the cache until `RESET ROLE`.
@@ -248,24 +277,100 @@ fn a_role_set_on_the_session_reads_postgres_until_reset() {
     assert_eq!(owner.last_served(), Some(Served::Cache));
 }
 
-/// A search path that puts another schema before `public` could make a
-/// bare name another table than the engine's: that connection reads
-/// Postgres, and its context is not the cache's. (A schema the role may
-/// not use is left out of its path, and would change nothing.)
+/// A schema before `public` on the search path keeps the cache unless it
+/// holds a relation by a name in `public`, which a bare name would then
+/// mean: a connection on such a path reads Postgres, and gets that
+/// table's rows.
 #[test]
-fn a_search_path_before_public_reads_postgres() {
+fn a_search_path_reads_postgres_only_where_a_name_is_shadowed() {
     let Some(url) = url() else { return };
     let tenants = Tenants::create(url, "path");
     let cache = cache();
     let options = format!("-c%20search_path%3D{}%2Cpublic", tenants.schema);
-    let mut elsewhere = Tenants::connect(&tenants.reader_url(Some(&options)), &cache);
-    elsewhere.batch_execute("SET app.tenant = 'alice'").ok();
-    elsewhere.batch_execute("RESET ALL").expect("reset");
+    let mut first = Tenants::connect(&tenants.reader_url(Some(&options)), &cache);
     for _ in 0..2 {
-        tenants.notes(&mut elsewhere);
-        assert_eq!(elsewhere.last_served(), Some(Served::Postgres));
+        assert_eq!(tenants.notes(&mut first), Vec::<String>::new());
     }
-    assert_eq!(cache.context(), None, "a context the engine does not share is never the cache's");
+    assert_eq!(first.last_served(), Some(Served::Cache), "nothing shadowed: cached");
+
+    tenants.shadow();
+    let mut shadowed = Tenants::connect(&tenants.reader_url(Some(&options)), &cache);
+    for _ in 0..2 {
+        assert_eq!(tenants.notes(&mut shadowed), ["SHADOW"], "the schema's own table");
+        assert_eq!(shadowed.last_served(), Some(Served::Postgres));
+    }
+    let mut temp = Tenants::connect(&tenants.url, &cache);
+    temp.batch_execute(&format!("CREATE TEMP TABLE {} (id int, body text); INSERT INTO {0} VALUES (1, 'TEMP')", tenants.table))
+        .expect("a temporary table by the same name");
+    for _ in 0..2 {
+        assert_eq!(tenants.notes(&mut temp), ["TEMP"], "the session's own temporary table");
+        assert_eq!(temp.last_served(), Some(Served::Postgres));
+    }
+}
+
+/// A function that moves the search path changes what a bare name means
+/// without a `SET` in sight: calling it has the context read again.
+#[test]
+fn a_function_that_moves_the_search_path_is_seen() {
+    let Some(url) = url() else { return };
+    let tenants = Tenants::create(url, "function");
+    tenants.shadow();
+    let mut admin = PgConnection::establish(&tenants.url).expect("connect");
+    admin
+        .batch_execute(&format!(
+            "CREATE FUNCTION {0}_enter(target text) RETURNS void LANGUAGE plpgsql AS $$
+             BEGIN PERFORM set_config('search_path', target || ',public', false); END $$;",
+            tenants.schema
+        ))
+        .expect("a function that moves the search path");
+    let cache = cache();
+    let mut owner = Tenants::connect(&tenants.url, &cache);
+    for _ in 0..2 {
+        assert_eq!(tenants.notes(&mut owner), ["ALICE_ONLY", "BOB_ONLY"]);
+    }
+    assert_eq!(owner.last_served(), Some(Served::Cache));
+
+    sql_query(format!("SELECT {0}_enter('{0}')", tenants.schema))
+        .execute(&mut owner)
+        .expect("enter the schema");
+    assert_eq!(tenants.notes(&mut owner), ["SHADOW"], "the table the name now means");
+    assert_eq!(owner.last_served(), Some(Served::Postgres));
+}
+
+/// What another session does is seen when the reader's context is read
+/// again, at least every 10 s. A table it creates that the reader may
+/// not read changes nothing cached: the reader keeps its answers. A
+/// `REVOKE` retires the reader's context: from then on its reads go to
+/// Postgres, which refuses them.
+#[test]
+fn a_revoke_by_another_session_is_seen_within_the_recheck_bound() {
+    let Some(url) = url() else { return };
+    let tenants = Tenants::create(url, "revoke");
+    let cache = cache();
+    let mut reader = Tenants::connect(&tenants.reader_url(None), &cache);
+    for _ in 0..2 {
+        assert_eq!(tenants.notes(&mut reader), Vec::<String>::new());
+    }
+    assert_eq!(reader.last_served(), Some(Served::Cache));
+
+    let mut admin = PgConnection::establish(&tenants.url).expect("connect");
+    admin
+        .batch_execute(&format!("CREATE TABLE {}.audit (id int PRIMARY KEY)", tenants.schema))
+        .expect("a table the reader may not read");
+    std::thread::sleep(std::time::Duration::from_secs(11));
+    assert_eq!(tenants.notes(&mut reader), Vec::<String>::new());
+    assert_eq!(reader.last_served(), Some(Served::Cache), "a new table costs the reader nothing");
+    let audit = format!("{}.audit", tenants.schema);
+    assert!(!cache.context(0).expect("the same context, updated").reads_whole(&audit));
+
+    admin
+        .batch_execute(&format!("REVOKE SELECT ON {} FROM {}", tenants.table, tenants.role))
+        .expect("revoke");
+    std::thread::sleep(std::time::Duration::from_secs(11));
+    let refused = tenants.try_notes(&mut reader).expect_err("read is refused now");
+    assert!(refused.to_string().contains("permission denied"), "{refused}");
+    let context = cache.context(1).expect("the reader's context as read again");
+    assert!(!context.reads_whole(&tenants.table), "{context:?}");
 }
 
 /// The async wrapper keeps to the same rules: a tenant set on the

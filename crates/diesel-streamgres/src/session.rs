@@ -22,9 +22,13 @@
 //! - A few settings that change no query's rows ([`HARMLESS`]), which
 //!   pools often set on checkout: no change.
 //!
-//! What a function or a procedure sets inside itself is not seen, nor
-//! settings passed when connecting (`options=-c …`); connections that
-//! differ there must not share a cache.
+//! A custom setting made where no statement shows it (inside a function,
+//! when connecting) cannot change an answer: it matters to a query only
+//! through row-level security or a function, both of which the engine
+//! refuses. What else such code could change (the search path, a table
+//! that shadows another, a privilege) is in the connection's context,
+//! read again after any statement that may have changed it unseen
+//! ([`Effect::Recheck`]) and at least every [`RECHECK_EVERY`].
 
 use std::collections::BTreeSet;
 
@@ -39,25 +43,40 @@ const HARMLESS: &[&str] = &[
     "work_mem",
 ];
 
-/// Whether a connection's reads may use its cache, as far as what it
-/// reads as goes ([`crate::cache::Cache::admits`]).
+/// How long a connection's context stands once read: past it, the next
+/// read through the cache reads it again. It bounds how long a change
+/// the connection cannot see goes unnoticed: a `GRANT`, `REVOKE` or
+/// table created by another session, or a setting a trigger made.
+pub(crate) const RECHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether a connection's reads may use its cache, and in which context
+/// ([`crate::cache::Cache::context_id`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Scope {
-    /// Not read yet, or not since its session was last restored.
-    Unchecked = 0,
-    /// It reads as the cache's answers are for.
-    Shared = 1,
-    /// It reads as something else.
-    Own = 2,
+    /// Not read yet, or to be read again.
+    Unchecked,
+    /// It reads in the context with this id.
+    In(u32),
+    /// Its readers must read Postgres.
+    Own,
 }
 
 impl Scope {
-    /// The scope stored as `value` ([`Scope`] as `u8`).
-    pub(crate) fn from_u8(value: u8) -> Scope {
-        match value {
-            1 => Scope::Shared,
-            2 => Scope::Own,
-            _ => Scope::Unchecked,
+    /// The scope as one number, for an atomic.
+    pub(crate) fn bits(self) -> u64 {
+        match self {
+            Scope::Unchecked => 0,
+            Scope::Own => 1,
+            Scope::In(id) => 2 + u64::from(id),
+        }
+    }
+
+    /// The scope [`Scope::bits`] gave.
+    pub(crate) fn from_bits(bits: u64) -> Scope {
+        match bits {
+            0 => Scope::Unchecked,
+            1 => Scope::Own,
+            n => u32::try_from(n - 2).map_or(Scope::Own, Scope::In),
         }
     }
 }
@@ -84,6 +103,10 @@ pub(crate) enum Effect {
     Changed,
     /// It is back as it was established, after having changed.
     Restored,
+    /// It may have changed in a way the statements do not say (a table
+    /// created or a privilege changed, a procedure or a function called):
+    /// what the connection reads as must be read again.
+    Recheck,
 }
 
 impl SessionChanges {
@@ -98,15 +121,16 @@ impl SessionChanges {
     /// `RESET ALL` must not pass for one.
     pub(crate) fn apply(&mut self, sql: &str) -> Effect {
         let was = self.changed();
-        let mut moved = false;
+        let (mut moved, mut unseen) = (false, false);
         for statement in statements(sql) {
             moved |= self.apply_one(statement);
+            unseen |= changes_unseen(statement);
         }
         match (moved, self.changed()) {
-            (false, _) => Effect::None,
             (true, true) => Effect::Changed,
             (true, false) if was => Effect::Restored,
-            (true, false) => Effect::None,
+            _ if unseen => Effect::Recheck,
+            _ => Effect::None,
         }
     }
 
@@ -143,6 +167,108 @@ impl SessionChanges {
             false
         }
     }
+}
+
+/// Statements that may change what a connection reads as without saying
+/// so: they create, alter or drop relations (a table that shadows one in
+/// `public`), change privileges, or run code of the database's own.
+const UNSEEN: &[&str] = &[
+    "ALTER", "CALL", "CREATE", "DROP", "GRANT", "IMPORT", "REASSIGN", "REVOKE",
+];
+
+/// Words that may stand before `(` in a read without calling a function
+/// of the database's own: keywords, type names used in a cast, and the
+/// built-in functions reads commonly call, none of which changes the
+/// session. Any other name before `(` may be a function that does.
+/// Sorted, for the binary search.
+const NOT_CALLS: &[&str] = &[
+    "abs", "age", "all", "and", "any", "array", "array_agg", "array_length", "array_position", "as",
+    "avg", "between", "bigint", "bool", "bool_and", "bool_or", "boolean", "btrim", "by",
+    "cardinality", "case", "cast", "ceil", "ceiling", "char", "char_length", "character",
+    "coalesce", "concat", "concat_ws", "count", "date", "date_part", "date_trunc", "decimal",
+    "dense_rank", "distinct", "double", "else", "end", "every", "except", "exists", "extract",
+    "fetch", "filter", "first_value", "float", "floor", "for", "from", "generate_series",
+    "greatest", "group", "groups", "having", "ilike", "in", "int", "integer", "intersect",
+    "interval", "into", "is", "join", "json_agg", "json_build_object", "json_extract_path_text",
+    "json_object_agg", "jsonb_agg", "jsonb_array_length", "jsonb_build_object",
+    "jsonb_extract_path", "jsonb_extract_path_text", "jsonb_object_agg", "lag", "last_value",
+    "lateral", "lead", "least", "left", "length", "like", "limit", "lower", "lpad", "ltrim", "max",
+    "md5", "min", "mod", "not", "now", "ntile", "nullif", "numeric", "octet_length", "offset",
+    "on", "only", "or", "order", "over", "partition", "position", "power", "range", "rank", "real",
+    "recursive", "regexp_match", "regexp_replace", "replace", "returning", "right", "round",
+    "row", "row_number", "row_to_json", "rows", "rpad", "rtrim", "select", "similar", "some",
+    "split_part", "sqrt", "string_agg", "strpos", "substr", "substring", "sum", "table",
+    "tablesample", "text", "then", "time", "timestamp", "timestamptz", "to_char", "to_date",
+    "to_json", "to_jsonb", "to_number", "to_timestamp", "trim", "trunc", "union", "unnest",
+    "upper", "using", "uuid", "values", "varchar", "when", "where", "window", "with", "within",
+];
+
+/// Whether `statement` may change what the connection reads as in a way
+/// it does not say ([`Effect::Recheck`]): one of [`UNSEEN`], or a read
+/// calling a function not among [`NOT_CALLS`]. A write is not looked at
+/// for calls (an `INSERT`'s column list reads like one); what its
+/// triggers might set is left to [`RECHECK_EVERY`].
+fn changes_unseen(statement: &str) -> bool {
+    let head = statement.trim_start_matches('(');
+    let word = head
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("");
+    if UNSEEN.iter().any(|unseen| word.eq_ignore_ascii_case(unseen)) {
+        return true;
+    }
+    let reads = ["SELECT", "WITH", "VALUES", "TABLE"]
+        .iter()
+        .any(|read| word.eq_ignore_ascii_case(read));
+    reads && calls_a_function(statement)
+}
+
+/// Whether `statement` calls a function not among [`NOT_CALLS`]: a name
+/// outside any literal or comment, bare or quoted, followed by `(`.
+fn calls_a_function(statement: &str) -> bool {
+    let bytes = statement.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        let (name, next) = match bytes[at] {
+            b'\'' => (None, past_quote(bytes, at + 1, b'\'', false)),
+            b'"' => {
+                let end = past_quote(bytes, at + 1, b'"', false);
+                let name = statement.get(at + 1..end.saturating_sub(1)).map(str::to_owned);
+                (name, end)
+            }
+            b'-' if bytes.get(at + 1) == Some(&b'-') => (
+                None,
+                position(bytes, at + 2, b"\n").map_or(bytes.len(), |end| end + 1),
+            ),
+            b'/' if bytes.get(at + 1) == Some(&b'*') => (
+                None,
+                position(bytes, at + 2, b"*/").map_or(bytes.len(), |end| end + 2),
+            ),
+            b'$' => match dollar_tag(bytes, at) {
+                Some(tag) => (
+                    None,
+                    position(bytes, at + tag.len(), tag)
+                        .map_or(bytes.len(), |end| end + tag.len()),
+                ),
+                None => (None, at + 1),
+            },
+            byte if byte.is_ascii_alphabetic() || byte == b'_' || !byte.is_ascii() => {
+                let end = at + bytes[at..].iter().take_while(|byte| is_word_byte(**byte)).count();
+                (Some(statement[at..end].to_ascii_lowercase()), end)
+            }
+            _ => (None, at + 1),
+        };
+        at = next;
+        let Some(name) = name else { continue };
+        let calls = bytes[at..]
+            .iter()
+            .find(|byte| !byte.is_ascii_whitespace())
+            .is_some_and(|byte| *byte == b'(');
+        if calls && NOT_CALLS.binary_search(&name.as_str()).is_err() {
+            return true;
+        }
+    }
+    false
 }
 
 /// The statements of `sql`, trimmed, split on the semicolons between
@@ -390,6 +516,53 @@ mod tests {
         assert!(session.changed(), "the block's settings are not known");
         let (session, _) = after(&[block, "DISCARD ALL"]);
         assert!(!session.changed());
+    }
+
+    /// What may change the context unseen asks for it to be read again:
+    /// DDL, privileges, a procedure, a read calling a function of the
+    /// database's own. Built-ins, keywords before `(`, an `INSERT`'s
+    /// column list and names inside literals or comments do not.
+    #[test]
+    fn what_may_change_the_context_unseen_asks_for_a_recheck() {
+        for sql in [
+            "CREATE TEMP TABLE tickets (id int)",
+            "create schema tenant",
+            "ALTER ROLE app SET search_path = tenant",
+            "DROP TABLE tenant.tickets",
+            "GRANT SELECT ON tickets TO app",
+            "REVOKE SELECT ON tickets FROM app",
+            "CALL switch_tenant('acme')",
+            "SELECT set_tenant('acme')",
+            r#"SELECT "tenants"."enter"($1)"#,
+            "WITH t AS (SELECT 1) SELECT my_fn() FROM t",
+        ] {
+            let (_, effects) = after(&[sql]);
+            assert_eq!(effects, [Effect::Recheck], "{sql}");
+        }
+        for sql in [
+            r#"SELECT "t"."id" FROM "t" WHERE (("t"."a" = $1) AND ("t"."b" IN ($2, $3))) LIMIT $4"#,
+            r#"SELECT COUNT(*) FROM ("a" INNER JOIN "b" ON ("a"."id" = "b"."a_id"))"#,
+            r#"SELECT "t"."id" FROM "t" WHERE "t"."id" = ANY($1) AND EXISTS (SELECT 1)"#,
+            "SELECT lower(name), coalesce(a, b), CAST(x AS numeric(10, 2)) FROM t",
+            r#"INSERT INTO "t" ("a", "b") VALUES ($1, $2)"#,
+            "UPDATE t SET a = 1",
+            "SELECT 'my_fn(1)' -- other_fn(2)",
+            "SELECT $$ evil() $$",
+        ] {
+            let (_, effects) = after(&[sql]);
+            assert_eq!(effects, [Effect::None], "{sql}");
+        }
+        let mut sorted = NOT_CALLS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, NOT_CALLS, "kept sorted, for the binary search");
+    }
+
+    /// A scope survives the trip through an atomic.
+    #[test]
+    fn a_scope_round_trips_through_its_bits() {
+        for scope in [Scope::Unchecked, Scope::Own, Scope::In(0), Scope::In(63), Scope::In(u32::MAX)] {
+            assert_eq!(Scope::from_bits(scope.bits()), scope);
+        }
     }
 
     /// A batch's statements apply in order: the last word stands.

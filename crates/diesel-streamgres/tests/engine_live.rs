@@ -1303,3 +1303,62 @@ fn a_row_inserted_and_deleted_in_one_transaction_is_not_kept() {
         "served from engine rows throughout"
     );
 }
+
+/// A reader whose role may not read a followed table is never served the
+/// engine's rows of it (the engine read them with its own role): the
+/// engine side builds no rows for that reader's context, and its read
+/// goes to Postgres, which refuses it. The owner's reads, in a context of
+/// their own, are served from the engine's rows as ever.
+#[test]
+fn a_role_that_may_not_read_a_table_is_not_served_its_rows() {
+    let Some(mut live) = Live::start("noread") else {
+        return;
+    };
+    live.put("n", "1");
+    assert_eq!(live.read("n").as_deref(), Some("1"));
+    assert_eq!(live.conn.last_served(), Some(Served::Engine));
+
+    let database = std::env::var("DATABASE_URL").expect("DATABASE_URL");
+    let role = format!("sg_noread_{}", std::process::id());
+    let setup = format!(
+        "DO $$ BEGIN
+           IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
+             EXECUTE 'DROP OWNED BY {role}'; EXECUTE 'DROP ROLE {role}';
+           END IF;
+         END $$;
+         CREATE ROLE {role} LOGIN PASSWORD 'noread';
+         GRANT USAGE ON SCHEMA public TO {role};"
+    );
+    live.other.batch_execute(&setup).expect("a role that may not read sg_configs");
+    let (scheme, rest) = database.split_once("://").expect("a URL");
+    let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    let inner = PgConnection::establish(&format!("{scheme}://{role}:noread@{host}"))
+        .expect("connect as the role");
+    let mut reader = SyncedConnection::with_cache(inner, live.cache.clone(), Consistency::Eventual);
+    for _ in 0..2 {
+        let read: QueryResult<String> = sg_configs::table
+            .filter(sg_configs::key.eq(live.key("n")))
+            .select(sg_configs::value)
+            .first(&mut reader);
+        let refused = read.expect_err("Postgres refuses the role");
+        assert!(refused.to_string().contains("permission denied"), "{refused}");
+        assert_ne!(reader.last_served(), Some(Served::Engine));
+    }
+    assert!(
+        live.engine
+            .fallbacks()
+            .iter()
+            .any(|reason| reason.contains("may not read `sg_configs`")),
+        "{:?}",
+        live.engine.fallbacks()
+    );
+    assert_eq!(live.read("n").as_deref(), Some("1"));
+    assert_eq!(
+        live.conn.last_served(),
+        Some(Served::Cache),
+        "the owner's answer from the engine's rows, still held in its own context"
+    );
+    live.other
+        .batch_execute(&format!("DROP OWNED BY {role}; DROP ROLE {role};"))
+        .expect("drop the role");
+}

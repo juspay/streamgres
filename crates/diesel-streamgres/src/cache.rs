@@ -232,10 +232,10 @@ pub struct Stats {
     /// Reads from a standby not kept: it had not replayed past the last
     /// change the engine will not report for the query.
     pub unreplayed: AtomicU64,
-    /// Reads sent to Postgres because their connection reads as another
-    /// database, role or search path than the cache's answers are for
-    /// ([`Cache::admits`]), or its session has changed since it was
-    /// established.
+    /// Reads sent to Postgres because their connection's context cannot
+    /// be served ([`Cache::context_id`]: a shadowed name, another
+    /// database, one context too many) or its session has changed since
+    /// it was established.
     pub other_context: AtomicU64,
 }
 
@@ -322,9 +322,8 @@ pub struct Cache {
     /// first connection that misses; `None` inside when it could not be
     /// read. The engine side compares it with the one its engine streams.
     database: OnceLock<Option<Database>>,
-    /// The context this cache's answers are for: the first a connection
-    /// was admitted with ([`Cache::admits`]).
-    context: OnceLock<Context>,
+    /// The contexts this cache keeps apart ([`Cache::context_id`]).
+    contexts: Mutex<Contexts>,
     pub stats: Arc<Stats>,
 }
 
@@ -344,12 +343,18 @@ pub struct Database {
 pub const DATABASE_SQL: &str = "SELECT system_identifier::text AS system, current_database()::text AS name FROM pg_control_system()";
 
 /// What a connection reads as: its database, the role whose privileges
-/// and row-level security apply (`current_user`), the role it logged in
-/// as, and the schemas a bare table name is looked for in. Connections
-/// share cached answers only when all of it matches. PostgreSQL lists
-/// no custom settings (`app.tenant`), so those are watched as the
-/// statements that set them instead (`crate::session`).
-#[derive(Debug, Clone, PartialEq, Eq, diesel::QueryableByName)]
+/// apply (`current_user`), the role it logged in as, its search path,
+/// the settings that can change a supported query's rows, whether a
+/// relation before `public` on its path shadows one in `public`, and the
+/// tables its role may not read whole. Connections share cached answers
+/// only within one context ([`Cache::context_id`]).
+///
+/// Custom settings (`app.tenant`) are not here: PostgreSQL does not list
+/// them, and they cannot change what a query the engine follows returns.
+/// The engine refuses tables with row-level security and runs no
+/// functions, so a setting has nothing to act on. The session's own
+/// statements are still watched for them (`crate::session`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, diesel::QueryableByName)]
 pub struct Context {
     #[diesel(sql_type = diesel::sql_types::Text)]
     pub system: String,
@@ -359,15 +364,116 @@ pub struct Context {
     pub role: String,
     #[diesel(sql_type = diesel::sql_types::Text)]
     pub login: String,
-    /// The search path's schemas that exist, in order, comma-separated.
+    /// The search path's schemas that exist and the role may use, in
+    /// order, comma-separated.
     #[diesel(sql_type = diesel::sql_types::Text)]
     pub schemas: String,
+    /// The settings that can change what a supported query means, as
+    /// `name=value` pairs: whether `= NULL` means `IS NULL`, and how a
+    /// string literal reads a backslash. (Not `TimeZone`: the engine takes
+    /// no time literal and calls no function, and rows travel binary.)
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub settings: String,
+    /// Whether a bare table name may mean a relation other than the
+    /// engine's: `public` is not on the path, or a relation of the same
+    /// name as one in `public` sits before it, or among the session's
+    /// temporary tables.
+    #[diesel(sql_type = diesel::sql_types::Bool)]
+    pub shadowed: bool,
+    /// The tables, named as the engine names them (bare in `public`,
+    /// `schema.table` elsewhere), the role may not `SELECT` whole, in
+    /// byte order.
+    #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::Text>)]
+    pub unreadable: Vec<String>,
+    /// Their OIDs, in the same order.
+    #[diesel(sql_type = diesel::sql_types::Array<diesel::sql_types::BigInt>)]
+    pub unreadable_oids: Vec<i64>,
+    /// The newest table's OID: a table unreadable now with an OID no
+    /// greater existed when this was read.
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pub newest: i64,
 }
 
 /// Reads a [`Context`] through a connection.
-pub const CONTEXT_SQL: &str = "SELECT system_identifier::text AS system, current_database()::text AS name, current_user::text AS role, session_user::text AS login, array_to_string(current_schemas(false), ',') AS schemas FROM pg_control_system()";
+pub const CONTEXT_SQL: &str = r#"SELECT
+  system_identifier::text AS system,
+  current_database()::text AS name,
+  current_user::text AS role,
+  session_user::text AS login,
+  array_to_string(current_schemas(false), ',') AS schemas,
+  concat_ws(',',
+    'transform_null_equals=' || current_setting('transform_null_equals'),
+    'standard_conforming_strings=' || current_setting('standard_conforming_strings')) AS settings,
+  (array_position(current_schemas(false), 'public'::name) IS NULL
+   OR EXISTS (
+     SELECT 1 FROM unnest(current_schemas(false)) WITH ORDINALITY AS path(schema, at)
+     JOIN pg_namespace n ON n.nspname = path.schema
+     JOIN pg_class shadow ON shadow.relnamespace = n.oid AND shadow.relkind NOT IN ('i', 'I')
+     JOIN pg_class own ON own.relname = shadow.relname AND own.relnamespace = to_regnamespace('public')
+     WHERE path.at < array_position(current_schemas(false), 'public'::name))
+   OR EXISTS (
+     SELECT 1 FROM pg_class temp
+     JOIN pg_class own ON own.relname = temp.relname AND own.relnamespace = to_regnamespace('public')
+     WHERE temp.relnamespace = pg_my_temp_schema() AND temp.relkind NOT IN ('i', 'I'))) AS shadowed,
+  unreadable.names AS unreadable,
+  unreadable.oids AS unreadable_oids,
+  (SELECT coalesce(max(oid::int8), 0) FROM pg_class WHERE relkind IN ('r', 'p')) AS newest
+FROM pg_control_system(), LATERAL (
+  SELECT
+    coalesce(array_agg(name ORDER BY name COLLATE "C"), '{}') AS names,
+    coalesce(array_agg(oid ORDER BY name COLLATE "C"), '{}') AS oids
+  FROM (
+    SELECT CASE WHEN n.nspname = 'public' THEN c.relname::text ELSE n.nspname || '.' || c.relname END AS name,
+           c.oid::int8 AS oid
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p')
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\_%'
+      AND NOT has_table_privilege(c.oid, 'SELECT')) AS table_
+) AS unreadable"#;
+
+/// The most identities (a database, role, search path and settings) one
+/// cache keeps apart; a connection with one more reads Postgres. A change
+/// of an identity's privileges gives it a fresh context, not one more.
+pub const MAX_CONTEXTS: usize = 64;
+
+/// The contexts a cache keeps apart: each identity's current context
+/// under its id. An identity is a context without its privileges. When a
+/// table it could read becomes unreadable (a `REVOKE`), the identity gets
+/// a fresh id and the old one is retired, so nothing read under the old
+/// privileges is served again. A table created since, or a grant, only
+/// updates the context under its id: nothing cached read the one, and
+/// the other takes nothing away. The count of contexts stays that of
+/// identities.
+#[derive(Default)]
+struct Contexts {
+    by_identity: HashMap<Context, u32>,
+    by_id: HashMap<u32, Arc<Context>>,
+    next: u32,
+}
 
 impl Context {
+    /// The context with no tables listed as unreadable: what identifies
+    /// a reader, apart from privileges that change while it reads.
+    fn identity(&self) -> Context {
+        Context {
+            unreadable: Vec::new(),
+            unreadable_oids: Vec::new(),
+            newest: 0,
+            ..self.clone()
+        }
+    }
+
+    /// Whether a table this context's role may not read was readable in
+    /// `before`, the same identity's context as read earlier: unreadable
+    /// now, not then, and no newer than the newest table then (a table
+    /// created since cannot have been read). A wrapped-around OID reads
+    /// as revoked, which costs a fresh id, never a stale answer.
+    fn revoked_since(&self, before: &Context) -> bool {
+        self.unreadable_oids
+            .iter()
+            .any(|oid| *oid <= before.newest && !before.unreadable_oids.contains(oid))
+    }
+
     /// The database it reads.
     pub fn database(&self) -> Database {
         Database {
@@ -376,11 +482,11 @@ impl Context {
         }
     }
 
-    /// Whether a bare table name resolves in `public` first, as the
-    /// engine resolves it: a search path that puts another schema first
-    /// could mean another table by the same name.
-    pub fn resolves_as_the_engine(&self) -> bool {
-        self.schemas.split(',').next() == Some("public")
+    /// Whether its role may read `table` (as the engine names it) whole.
+    pub fn reads_whole(&self, table: &str) -> bool {
+        self.unreadable
+            .binary_search_by(|unreadable| unreadable.as_str().cmp(table))
+            .is_err()
     }
 }
 
@@ -515,7 +621,7 @@ impl Cache {
             standby_reads: AtomicBool::new(false),
             type_metadata: Arc::new(Mutex::new(PgMetadataCache::new())),
             database: OnceLock::new(),
-            context: OnceLock::new(),
+            contexts: Mutex::new(Contexts::default()),
             stats,
         }
     }
@@ -676,26 +782,56 @@ impl Cache {
         let _ = self.database.set(database);
     }
 
-    /// Whether a connection reading as `context` may share this cache's
-    /// answers. The first context admitted is the one they are for, and
-    /// the cache learns its database from it; a connection with any
-    /// other context, or one whose bare table names would not resolve
-    /// as the engine's do, reads Postgres.
-    pub fn admits(&self, context: &Context) -> bool {
-        if !context.resolves_as_the_engine() {
-            return false;
+    /// The id of `context`, under which its readers share answers with
+    /// each other and with no one else; `None` when its readers must read
+    /// Postgres: a bare table name may mean another relation than the
+    /// engine's, it reads another database than the cache's first
+    /// context (the one the engine side checks its engine against), or
+    /// the cache already keeps [`MAX_CONTEXTS`] identities apart. When a
+    /// table a known identity could read has become unreadable, it gets a
+    /// fresh id and the old one is retired; a table created since, or a
+    /// grant, keeps the id.
+    pub fn context_id(&self, context: &Context) -> Option<u32> {
+        if context.shadowed {
+            return None;
         }
-        let ours = self.context.get_or_init(|| {
-            self.learn_database(Some(context.database()));
-            context.clone()
-        });
-        ours == context
+        let mut contexts = self.contexts.lock().expect("contexts");
+        let identity = context.identity();
+        let known = contexts.by_identity.get(&identity).copied();
+        if let Some(id) = known
+            && let Some(held) = contexts.by_id.get(&id).cloned()
+        {
+            if *held == *context {
+                return Some(id);
+            }
+            if !context.revoked_since(&held) {
+                contexts.by_id.insert(id, Arc::new(context.clone()));
+                return Some(id);
+            }
+        }
+        if known.is_none() {
+            let other_database = self.database().is_some_and(|database| *database != context.database());
+            if contexts.by_identity.len() >= MAX_CONTEXTS || other_database {
+                return None;
+            }
+            if contexts.by_identity.is_empty() {
+                self.learn_database(Some(context.database()));
+            }
+        }
+        let id = contexts.next;
+        contexts.next = contexts.next.checked_add(1)?;
+        if let Some(retired) = contexts.by_identity.insert(identity, id) {
+            contexts.by_id.remove(&retired);
+        }
+        contexts.by_id.insert(id, Arc::new(context.clone()));
+        Some(id)
     }
 
-    /// The context this cache's answers are for, once a connection has
-    /// been admitted.
-    pub fn context(&self) -> Option<&Context> {
-        self.context.get()
+    /// The context with id `id`, while it is current; `None` for one
+    /// retired, or never given.
+    pub fn context(&self, id: u32) -> Option<Arc<Context>> {
+        let contexts = self.contexts.lock().expect("contexts");
+        contexts.by_id.get(&id).cloned()
     }
 
     /// The engine changed a query it serves from its own rows: counted;
@@ -924,11 +1060,74 @@ mod tests {
     use crate::subscriptions::{Outcome, Unsynced, Verdict};
     use crate::types::TableTypes;
 
+    /// A context of `role` on database `app`, its role unable to read
+    /// the tables of `unreadable` (OID and name), the newest table's OID
+    /// 100.
+    fn context(role: &str, unreadable: &[(i64, &str)]) -> Context {
+        let mut unreadable = unreadable.to_vec();
+        unreadable.sort_by_key(|(_, table)| *table);
+        Context {
+            system: "1".to_owned(),
+            name: "app".to_owned(),
+            role: role.to_owned(),
+            login: role.to_owned(),
+            schemas: "public".to_owned(),
+            settings: String::new(),
+            shadowed: false,
+            unreadable: unreadable.iter().map(|(_, table)| (*table).to_owned()).collect(),
+            unreadable_oids: unreadable.iter().map(|(oid, _)| *oid).collect(),
+            newest: 100,
+        }
+    }
+
+    /// Each identity gets an id of its own and keeps it while nothing
+    /// changes; a change of its privileges gives it a fresh id and
+    /// retires the old, without counting as one more identity. A shadowed
+    /// context, one on another database, and one identity too many get
+    /// none.
+    #[test]
+    fn contexts_are_kept_apart_by_identity_and_privileges() {
+        let cache = Cache::new(1 << 20, Arc::new(Unsynced));
+        let app = cache.context_id(&context("app", &[])).expect("an id");
+        assert_eq!(cache.context_id(&context("app", &[])), Some(app), "the same context, the same id");
+        let admin = cache.context_id(&context("admin", &[])).expect("an id");
+        assert_ne!(admin, app, "another role, apart");
+        assert_eq!(cache.database().map(|database| database.name.as_str()), Some("app"));
+
+        let created = Context { newest: 101, ..context("app", &[(101, "audit")]) };
+        assert_eq!(cache.context_id(&created), Some(app), "a table created since keeps the id");
+        assert!(!cache.context(app).expect("current").reads_whole("audit"), "and is known unreadable");
+        let revoked = Context { newest: 101, ..context("app", &[(7, "secrets"), (101, "audit")]) };
+        let revoked = cache.context_id(&revoked).expect("an id");
+        assert_ne!(revoked, app, "a table revoked, a fresh id");
+        assert!(cache.context(app).is_none(), "the old one retired");
+        assert!(!cache.context(revoked).expect("current").reads_whole("secrets"));
+        assert!(cache.context(revoked).expect("current").reads_whole("tickets"));
+        let granted = Context { newest: 101, ..context("app", &[(101, "audit")]) };
+        assert_eq!(cache.context_id(&granted), Some(revoked), "a grant keeps the id");
+
+        let shadowed = Context { shadowed: true, ..context("app", &[]) };
+        assert_eq!(cache.context_id(&shadowed), None);
+        let elsewhere = Context { name: "other".to_owned(), ..context("app", &[]) };
+        assert_eq!(cache.context_id(&elsewhere), None, "another database than the engine's");
+
+        for at in 2..MAX_CONTEXTS {
+            assert!(cache.context_id(&context(&format!("role{at}"), &[])).is_some());
+        }
+        assert_eq!(cache.context_id(&context("one-too-many", &[])), None);
+        for change in 0..3 {
+            let table = format!("table{change}");
+            let changed = context("app", &[(change, table.as_str())]);
+            assert!(cache.context_id(&changed).is_some(), "a privilege change is no new identity");
+        }
+    }
+
     /// A key for `sql` with no binds.
     fn key(sql: &str) -> QueryKey {
         QueryKey {
             sql: sql.to_string(),
             binds: Vec::new(),
+            context: 0,
         }
     }
 

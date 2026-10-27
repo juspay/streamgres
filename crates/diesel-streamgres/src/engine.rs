@@ -1100,8 +1100,10 @@ impl Worker {
     /// Builds the store for an accepted subscription from its snapshot
     /// and the types already known, applies the deltas that landed
     /// while the types were looked up, and installs it. Falls back to
-    /// touches when a table's types are not known or the rows cannot be
-    /// encoded. A subscription that ended meanwhile gets nothing.
+    /// touches when a table's types are not known, the rows cannot be
+    /// encoded, or the context the subscription is read in may not read
+    /// one of its tables whole ([`Worker::unreadable`]). A subscription
+    /// that ended meanwhile gets nothing.
     ///
     /// The store is transitioned in place, under the state lock and its
     /// own: the one `Arc` lives for the subscription, so a delta handler
@@ -1118,6 +1120,11 @@ impl Worker {
             shared.fell_back(reason);
             Verdict::Accepted { since }
         };
+        if let Some(table) = self.unreadable(id, &snapshot) {
+            return fallback(format!(
+                "the reading role may not read `{table}` whole, so its rows come from Postgres"
+            ));
+        }
         let types: HashMap<String, Arc<TableTypes>> = {
             let known = shared.types.lock().expect("types");
             let mut types = HashMap::new();
@@ -1176,6 +1183,23 @@ impl Worker {
                 Verdict::Accepted { since }
             }
         }
+    }
+
+    /// A table of `snapshot` that the context subscription `id` is read in
+    /// may not read whole ([`crate::cache::Context::reads_whole`]); every
+    /// table, for a context no longer current (retired when its
+    /// privileges changed). The engine read its rows with its own role;
+    /// served to a reader whose role may not read them, they would hand
+    /// over what Postgres would refuse. Its reads refill from Postgres on
+    /// the reader's connection instead, where the role's privileges apply.
+    fn unreadable(&self, id: u64, snapshot: &Snapshot) -> Option<String> {
+        let key = self.state.lock().expect("state").by_id.get(&id).cloned()?;
+        let cache = self.shared.cache()?;
+        let context = cache.context(key.context);
+        snapshot
+            .tables()
+            .find(|table| context.as_ref().is_none_or(|context| !context.reads_whole(table)))
+            .map(str::to_owned)
     }
 
     /// Drops a subscription from this worker and from the routing map.
@@ -1979,6 +2003,7 @@ mod tests {
         QueryKey {
             sql: "SELECT id, name FROM t".to_string(),
             binds: Vec::new(),
+            context: 0,
         }
     }
 

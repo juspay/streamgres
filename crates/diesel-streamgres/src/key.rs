@@ -1,4 +1,5 @@
-//! What identifies a read: its SQL and its bind values.
+//! What identifies a read: its SQL, its bind values, and the context it
+//! is read in.
 //!
 //! Diesel's own statement cache keys a query by the `TypeId` of its shape,
 //! which is the same for `WHERE key = 'a'` and `WHERE key = 'b'`. A result
@@ -25,6 +26,11 @@ pub struct Bind {
 pub struct QueryKey {
     pub sql: String,
     pub binds: Vec<Bind>,
+    /// The context it is read in ([`crate::cache::Cache::context_id`]):
+    /// readers in different contexts (another role, search path or
+    /// setting) never share an answer, nor a subscription. 0 until the
+    /// connection's context is known.
+    pub context: u32,
 }
 
 /// Whether `text` starts with `word` as a whole word, case-insensitively.
@@ -65,7 +71,11 @@ impl QueryKey {
                 bytes,
             })
             .collect();
-        Ok(QueryKey { sql, binds })
+        Ok(QueryKey {
+            sql,
+            binds,
+            context: 0,
+        })
     }
 
     /// Splits a leading route marker off the SQL, if the query was flagged
@@ -136,6 +146,7 @@ mod tests {
         QueryKey {
             sql: sql.to_string(),
             binds: Vec::new(),
+            context: 0,
         }
     }
 

@@ -259,19 +259,48 @@ still cannot flush.
 ## Correctness rules
 
 **Context.** Equal keys get equal rows only for readers who would see the
-same rows, so a cache serves one context (`cache::Context`: database,
-`current_user`, `session_user`, the search path's usable schemas). A
-connection's first read through the cache reads its context
-(`CONTEXT_SQL`); the first connection admitted sets the cache's, and
-tells the cache its database for the engine check. A connection with
-another context, or whose search path puts a usable schema before
-`public` (the engine reads bare names there), never uses the cache:
-its reads go to Postgres, counted as `other_context`. The context is
-read once per connection, and again once its session is back as
-established. On the blocking wrapper the read is one more query before
-the first read; on the async one it runs beside the first read, which
-goes to Postgres (a query cannot be held across an await, not being
-`Send`).
+same rows, so every key carries the context it is read in
+(`QueryKey::context`), and readers in different contexts never share an
+entry or a subscription. A context (`cache::Context`, read with
+`CONTEXT_SQL`) is:
+- the database, `current_user` and `session_user`
+- the search path's usable schemas
+- the settings that change what accepted SQL means
+- whether a relation shadows a `public` one a bare name would mean
+- the tables the role may not `SELECT` whole
+
+The cache interns contexts (`Cache::context_id`). An identity is a
+context without its unreadable tables, and up to `MAX_CONTEXTS` are kept
+apart. When a table the identity could read becomes unreadable it gets
+a fresh id. The old id is retired, so entries keyed under it are never
+read again and age out, and the engine side treats an id it cannot find
+as reading nothing whole. Telling a revoke from a table created since
+takes the OIDs: a newly unreadable table no newer than the newest table
+at the last read (`Context::newest`) was revoked. A table created since,
+or a grant, only updates the context under its id. The cache refuses a context that is shadowed, reads another
+database than its first (the one the engine side checks its engine
+against), or would be one identity too many; that connection's reads go
+to Postgres, counted as `other_context`.
+
+A connection reads its context:
+- on its first read through the cache
+- again after a statement that may change it unseen
+  (`session::Effect::Recheck`: DDL, `GRANT`/`REVOKE`, `CALL`, a read
+  calling a function not among the built-ins it knows)
+- once its session is back as established
+- at least every `RECHECK_EVERY` (10 s), which bounds a change another
+  session makes
+
+On the blocking wrapper the read is one more query before the read; on
+the async one it runs beside the read, which goes to Postgres (a query
+cannot be held across an await, not being `Send`).
+
+**Privileges.** The engine reads with its own role. When it serves a
+subscription's rows (rows mode), the engine side checks the
+subscription's context may read each of its tables whole
+(`Context::reads_whole`). When it may not, the engine side builds no
+rows and the read refills from Postgres on the reader's connection,
+where its privileges apply.
 
 **The session as established.** PostgreSQL does not list custom
 settings, so a tenant in `app.tenant` cannot be read back and compared.
@@ -284,8 +313,10 @@ same setting is `RESET`, or `RESET ALL` or `DISCARD ALL` restores
 everything; then its context is read again. A batch is split only on
 the semicolons between statements, never on one in a literal, a quoted
 name, a dollar-quoted body or a comment: text there that reads like
-`RESET ALL` must not put a connection back on the cache. Settings made at connect time or inside a
-function are not seen: such connections need caches of their own.
+`RESET ALL` must not put a connection back on the cache. Custom
+settings made where no statement shows them (at connect time, inside a
+function) cannot change an answer: they matter to a query only through
+row-level security or a function, both of which the engine refuses.
 
 **No row-level security.** The engine reads as its own role. It refuses
 a query over a table with row-level security enabled, so the wrapper

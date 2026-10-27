@@ -59,7 +59,7 @@ pub mod types;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use diesel::connection::{
     AnsiTransactionManager, ConnectionSealed, DefaultLoadingMode, Instrumentation, LoadConnection,
@@ -77,7 +77,7 @@ use crate::cache::{
     AfterWrites, CONTEXT_SQL, Cache, Context, REPLAY_POSITION_SQL, Read, WAL_POSITION_SQL,
     WalPosition,
 };
-use crate::session::{Effect, Scope, SessionChanges};
+use crate::session::{Effect, RECHECK_EVERY, Scope, SessionChanges};
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
 pub use crate::route::{Route, RouteDsl, Served, Via};
@@ -199,8 +199,9 @@ pub struct SyncedConnection<C = diesel::PgConnection> {
     primary: bool,
     /// What its statements have changed in its session.
     session: SessionChanges,
-    /// Whether it reads as the cache's answers are for.
+    /// The context it reads in, and when that was read.
     scope: Scope,
+    checked: Instant,
 }
 
 impl<C> SyncedConnection<C> {
@@ -216,6 +217,7 @@ impl<C> SyncedConnection<C> {
             primary: false,
             session: SessionChanges::default(),
             scope: Scope::Unchecked,
+            checked: Instant::now(),
         }
     }
 
@@ -232,6 +234,7 @@ impl<C> SyncedConnection<C> {
             primary: false,
             session: SessionChanges::default(),
             scope: Scope::Unchecked,
+            checked: Instant::now(),
         }
     }
 
@@ -291,10 +294,13 @@ impl<C> SyncedConnection<C> {
     }
 
     /// Takes in what `sql` does to the connection's session
-    /// ([`SessionChanges`]): once it is back as established, what the
-    /// connection reads as is read again before the cache serves it.
+    /// ([`SessionChanges`]): once it is back as established, or may have
+    /// changed in a way the statement does not say, what the connection
+    /// reads as is read again before the cache serves it.
     fn observe(&mut self, sql: &str) {
-        if self.cache.is_some() && self.session.apply(sql) == Effect::Restored {
+        if self.cache.is_some()
+            && matches!(self.session.apply(sql), Effect::Restored | Effect::Recheck)
+        {
             self.scope = Scope::Unchecked;
         }
     }
@@ -343,26 +349,27 @@ where
     C: LoadConnection<DefaultLoadingMode>
         + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
 {
-    /// Whether this connection's reads may use `cache`: its session as it
-    /// was established, and what it reads as the cache's answers are for
-    /// ([`Cache::admits`]), read on its first read through the cache and
-    /// again once its session is back as established. When that cannot
-    /// be read, this read goes to Postgres and the next asks again.
-    fn shares(&mut self, cache: &Cache) -> bool {
+    /// The context this connection's reads share `cache` answers in
+    /// ([`Cache::context_id`]); `None` when they must read Postgres: its
+    /// session has changed since it was established, or its context is
+    /// one the cache cannot serve. The context is read on the first read
+    /// through the cache, again whenever a statement may have changed it
+    /// unseen ([`Effect::Recheck`]) or the session is back as established,
+    /// and at least every [`RECHECK_EVERY`]. When it cannot be read, this
+    /// read goes to Postgres and the next asks again.
+    fn context_in(&mut self, cache: &Cache) -> Option<u32> {
         if self.session.changed() {
-            return false;
+            return None;
         }
-        if self.scope == Scope::Unchecked {
-            let Some(context) = context_of(&mut self.inner) else {
-                return false;
-            };
-            self.scope = if cache.admits(&context) {
-                Scope::Shared
-            } else {
-                Scope::Own
-            };
+        if self.scope == Scope::Unchecked || self.checked.elapsed() >= RECHECK_EVERY {
+            let context = context_of(&mut self.inner)?;
+            self.scope = cache.context_id(&context).map_or(Scope::Own, Scope::In);
+            self.checked = Instant::now();
         }
-        self.scope == Scope::Shared
+        match self.scope {
+            Scope::In(id) => Some(id),
+            Scope::Own | Scope::Unchecked => None,
+        }
     }
 
     /// Once a write has committed, reads its WAL position on this
@@ -544,13 +551,12 @@ where
     /// there on, so what Postgres returns then is current until the
     /// first touch; a read that fails leaves no entry, and the
     /// subscription ends with it rather than being held for nothing. A
-    /// connection's first read through the cache first reads what the
-    /// connection reads as ([`Context`]): the cache serves it only if
-    /// that is what the cache's answers are for ([`Cache::admits`]), and
-    /// only while its session is as it was established
-    /// ([`SessionChanges`]). The first connection admitted also tells the
-    /// cache which database its reads go to, which the engine side checks
-    /// its engine streams. While the engine side is too far behind the
+    /// read is keyed in the context the connection reads in ([`Context`],
+    /// read on its first read through the cache and whenever it may have
+    /// changed), and shares answers only with readers in the same one
+    /// ([`Cache::context_id`]); while its session differs from how it was
+    /// established (the statements it has run), or its context cannot be served,
+    /// it reads Postgres. While the engine side is too far behind the
     /// database, reads go to Postgres.
     fn load<'conn, 'query, T>(
         &'conn mut self,
@@ -596,10 +602,11 @@ where
             cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
-        if !self.shares(&cache) {
+        let Some(context) = self.context_in(&cache) else {
             cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
-        }
+        };
+        key.context = context;
         if let Some(rows) = cache.get(&key) {
             self.served = Some(Served::Cache);
             return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));

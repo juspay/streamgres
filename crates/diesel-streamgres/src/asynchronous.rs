@@ -44,9 +44,9 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use diesel::QueryableByName;
 use diesel::connection::Instrumentation;
@@ -77,7 +77,7 @@ use crate::cache::{
 use crate::cursor::SyncedRow;
 use crate::key::QueryKey;
 use crate::route::{Route, Served};
-use crate::session::{Effect, Scope, SessionChanges};
+use crate::session::{Effect, RECHECK_EVERY, Scope, SessionChanges};
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::STALE_TYPES;
 use crate::materialized::Snapshot;
@@ -120,9 +120,11 @@ pub struct AsyncSyncedConnection {
     primary: Arc<AtomicBool>,
     /// What its statements have changed in its session.
     session: SessionChanges,
-    /// Whether it reads as the cache's answers are for ([`Scope`] as
-    /// `u8`), written by the read that asked.
-    scope: Arc<AtomicU8>,
+    /// The context it reads in ([`Scope::bits`]), and when that was read
+    /// (milliseconds after `born`), written by the read that asked.
+    scope: Arc<AtomicU64>,
+    checked: Arc<AtomicU64>,
+    born: Instant,
 }
 
 impl AsyncSyncedConnection {
@@ -140,16 +142,33 @@ impl AsyncSyncedConnection {
             served: Arc::new(AtomicU8::new(0)),
             primary: Arc::new(AtomicBool::new(false)),
             session: SessionChanges::default(),
-            scope: Arc::new(AtomicU8::new(Scope::Unchecked as u8)),
+            scope: Arc::new(AtomicU64::new(Scope::Unchecked.bits())),
+            checked: Arc::new(AtomicU64::new(0)),
+            born: Instant::now(),
         }
     }
 
     /// Takes in what `sql` does to the connection's session
-    /// ([`SessionChanges`]): once it is back as established, what the
-    /// connection reads as is read again before the cache serves it.
+    /// ([`SessionChanges`]): once it is back as established, or may have
+    /// changed in a way the statement does not say, what the connection
+    /// reads as is read again before the cache serves it.
     fn observe(&mut self, sql: &str) {
-        if self.cache.is_some() && self.session.apply(sql) == Effect::Restored {
-            self.scope.store(Scope::Unchecked as u8, Ordering::Release);
+        if self.cache.is_some()
+            && matches!(self.session.apply(sql), Effect::Restored | Effect::Recheck)
+        {
+            self.scope.store(Scope::Unchecked.bits(), Ordering::Release);
+        }
+    }
+
+    /// The context this connection reads in, as last read; unchecked
+    /// once [`RECHECK_EVERY`] has passed since.
+    fn scope(&self) -> Scope {
+        let since = self.born.elapsed().saturating_sub(Duration::from_millis(
+            self.checked.load(Ordering::Acquire),
+        ));
+        match Scope::from_bits(self.scope.load(Ordering::Acquire)) {
+            _ if since >= RECHECK_EVERY => Scope::Unchecked,
+            scope => scope,
         }
     }
 
@@ -527,13 +546,14 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
     /// types not known yet is read live this time, the types resolved
     /// for the next (one that cannot even be keyed until then too).
     ///
-    /// A connection's first read through the cache goes to Postgres,
-    /// pipelined with reading what the connection reads as ([`Context`]);
-    /// from the next on, the cache serves it only if that is what the
-    /// cache's answers are for ([`Cache::admits`]), and only while its
-    /// session is as it was established ([`SessionChanges`]). The first
-    /// connection admitted also tells the cache which database its reads
-    /// go to, for the engine side to check its engine streams the same.
+    /// A read is keyed in the context the connection reads in
+    /// ([`Context`]) and shares answers only with readers in the same one
+    /// ([`Cache::context_id`]). When that context is to be read (the
+    /// connection's first read through the cache, or once it may have
+    /// changed) the read goes to Postgres, pipelined with reading it.
+    /// While its session differs from how it was established
+    /// (the statements it has run), or its context cannot be served, it reads
+    /// Postgres.
     ///
     /// On a miss, the futures the read may need are built at once; which
     /// are polled depends on the engine's answer. The read's future owns
@@ -619,13 +639,13 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                 .boxed();
             return self.tracked(live);
         }
-        match Scope::from_u8(self.scope.load(Ordering::Acquire)) {
+        match self.scope() {
             _ if self.session.changed() => {
                 cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
                 let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
                 return self.tracked(live);
             }
-            Scope::Shared => {}
+            Scope::In(context) => key.context = context,
             Scope::Own => {
                 cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
                 let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
@@ -634,16 +654,14 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
             Scope::Unchecked => {
                 let probe = self.inner.load(sql_query(CONTEXT_SQL));
                 let live = self.inner.load(query);
-                let scope = Arc::clone(&self.scope);
+                let (scope, checked, born) = (Arc::clone(&self.scope), Arc::clone(&self.checked), self.born);
                 let live = async move {
                     let (context, live) = futures_util::join!(read_context(probe), live);
                     if let Some(context) = context {
-                        let shared = if cache.admits(&context) {
-                            Scope::Shared
-                        } else {
-                            Scope::Own
-                        };
-                        scope.store(shared as u8, Ordering::Release);
+                        let read = cache.context_id(&context).map_or(Scope::Own, Scope::In);
+                        let at = u64::try_from(born.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        checked.store(at, Ordering::Release);
+                        scope.store(read.bits(), Ordering::Release);
                     }
                     live.map(Self::live_stream)
                 }

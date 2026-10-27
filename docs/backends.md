@@ -250,54 +250,76 @@ the engine ships them, typically a few milliseconds after the commit.
 
 ## 6. Who a cached answer is for
 
-The cache keys a read by its SQL and binds, but who may see which rows
-also depends on the session that reads them. The wrapper keeps a cached
-answer to readers who would have read the same rows:
+The cache keys a read by its SQL and binds, but which rows a reader may
+see also depends on who reads, and how. The wrapper keeps every answer
+to readers who would have read the same rows.
 
-- **One context per cache.** A connection's first read through the cache
-  reads what it reads as: its database, its role (`current_user`), the
-  role it logged in as and its search path. The first connection to do so
-  sets the context the cache's answers are for. A connection that reads
-  as anything else reads Postgres for its whole life, counted as
-  `other_context`. On the blocking wrapper that is one more small query
-  per connection; the async one runs it beside the connection's first
-  read, which goes to Postgres.
-- **The session as it was established.** PostgreSQL cannot list custom
-  settings such as `app.tenant`, so the wrapper watches the statements
-  that set them. After `SET` (a role, a search path, a tenant setting,
-  anything but a few timeouts and `application_name`), `SET ROLE`, `SET
-  SESSION AUTHORIZATION`, a call to `set_config` or a `DO` block, the
-  connection reads Postgres until `RESET` of the same setting, `RESET
-  ALL` or `DISCARD ALL` (only the last two after `set_config` or `DO`). `SET LOCAL` needs nothing: reads inside a transaction go to
-  Postgres anyway.
+- **One partition per context.** A connection reads its context on its
+  first read through the cache. The context is:
+  - its database, its role (`current_user`) and the role it logged in as
+  - its search path
+  - the settings that change what an accepted query means
+    (`transform_null_equals`, `standard_conforming_strings`)
+  - the tables its role may not `SELECT` whole
+
+  Readers in one context share answers and subscriptions; readers in
+  different contexts never do. An admin connection and the application's
+  connections are each cached, apart. One cache keeps up to 64
+  identities (a database, role, search path and settings) apart. When a
+  table an identity could read becomes unreadable (a `REVOKE`), it gets a
+  fresh context rather than one more, and nothing cached under the old
+  privileges is served again. A table created since, or a `GRANT`, keeps
+  its answers: nothing cached read the one, and the other takes nothing
+  away.
+  On the blocking wrapper, reading the context is one more small query;
+  the async one runs it beside the read, which then goes to Postgres.
+- **Read again when it may have changed.** A connection reads its
+  context again:
+  - after a statement that may change it without saying so: DDL
+    (`CREATE`, `ALTER`, `DROP`), `GRANT`, `REVOKE`, `CALL`, or a read
+    that calls a function of the database's own (one that moves the
+    search path, say)
+  - at least every 10 s. This bounds how long a change made by another
+    session (a `REVOKE`, a table created) goes unnoticed.
+- **The session as it was established.** After `SET` (a role, a search
+  path, a tenant setting; anything but a few timeouts and
+  `application_name`), `SET ROLE`, `SET SESSION AUTHORIZATION`, a call
+  to `set_config` or a `DO` block, the connection reads Postgres until
+  `RESET` of the same setting, `RESET ALL` or `DISCARD ALL` (only the
+  last two after `set_config` or `DO`). `SET LOCAL` needs nothing:
+  reads inside a transaction go to Postgres anyway.
+- **Custom settings cannot change an answer.** A setting such as
+  `app.tenant`, from `SET`, the connection URL (`options=-c …`) or
+  `ALTER ROLE … SET`, only matters to a query through row-level security
+  or a function. The engine refuses both, so those reads go to Postgres.
 - **No row-level security.** The engine reads as its own role, so it
   cannot apply a policy for a backend's. It refuses every query over a
-  table with row-level security enabled, and those reads go to Postgres.
-  Turning row-level security on or off on a followed table restarts the
-  engine, which takes the change from the catalog it reads again. A
-  table created while serving by a trigger stack older than this is
-  treated as secured until the engine restarts, and turning row-level
-  security on later goes unnoticed until one: re-run the setup SQL
-  (`scripts/sql/ddl-triggers.sql`, or `setup_sql`) to update it. The
-  server says so at startup; an embedded engine that installs its setup
-  updates it itself.
+  table with row-level security enabled. Turning it off, or on in the
+  transaction that creates the table, is followed as it commits. Turning
+  it on for a table followed before restarts the engine, which takes the
+  change from the catalog it reads again, so no change made after it
+  reaches a backend. A trigger stack older than this misses
+  it until a restart: re-run the setup SQL (`scripts/sql/ddl-triggers.sql`,
+  or `setup_sql`). The server says so at startup; an embedded engine that
+  installs its setup updates it itself.
+- **Privileges.** The engine reads with its own role. For a context
+  whose role may not read one of a query's tables whole, the engine side
+  builds no rows. The read refills from Postgres on that reader's own
+  connection, where its privileges apply, and is cached for that context
+  only. The engine still sends every column of a followed table's rows
+  to the backend's process.
 - **Bare names mean `public`.** The engine reads a bare table name in
-  `public`. A connection whose search path puts another schema it can
-  use first reads Postgres. Under the default path (`"$user", public`)
-  that includes a role with a schema of its own name: set the role's
-  `search_path` to `public` (or to `public` first) to cache its reads.
+  `public`. A connection whose search path puts a relation of the same
+  name before it reads Postgres. That covers a table in an earlier
+  schema, or one of the session's temporary tables. A search path with
+  other schemas first, holding no such name, is cached as usual.
 
-What the wrapper cannot see, and the deployment must keep apart:
-
-- **Settings given when connecting** (`options=-c app.tenant=…` in the
-  URL, or `ALTER ROLE … SET`), and settings a function or procedure makes
-  inside itself. Give connections that differ there caches of their own.
-- **Privileges.** Rows the engine serves itself (rows mode) were read by
-  the engine's role. Grant the backend's role `SELECT` on every followed
-  table in full, or route reads of tables it may not read whole to
-  Postgres (`Route::Postgres`). The engine sends every column of a
-  followed table's rows to the backend's process, whatever the query
-  selects.
+`other_context` counts the reads sent to Postgres for any of these
+reasons:
+- a changed session
+- a shadowed name
+- another database than the cache's
+- a 65th identity
 
 ## 7. What to watch
 
@@ -306,7 +328,7 @@ What the wrapper cannot see, and the deployment must keep apart:
   `refused`, `after_write` (reads sent to Postgres for read-your-writes),
   `lagging` (sent there because the engine was behind), `unreplayed`
   (replica refills not kept), `other_context` (sent there because the
-  connection reads as another context than the cache's, section 6),
+  connection's context cannot be served, section 6),
   `oversized`, `evicted`, `expired`.
 - **`EngineClient`**: `is_connected()`, `lag()`, `subscribed()`,
   `materialized()` (queries served from rows), `fallbacks()` and
