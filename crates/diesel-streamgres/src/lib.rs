@@ -53,6 +53,7 @@ pub mod key;
 pub mod materialized;
 pub mod route;
 pub mod row;
+mod session;
 pub mod subscriptions;
 pub mod types;
 
@@ -73,9 +74,10 @@ use diesel::{Connection, ConnectionResult, QueryResult};
 #[cfg(feature = "async")]
 pub use crate::asynchronous::AsyncSyncedConnection;
 use crate::cache::{
-    AfterWrites, Cache, DATABASE_SQL, Database, REPLAY_POSITION_SQL, Read, WAL_POSITION_SQL,
+    AfterWrites, CONTEXT_SQL, Cache, Context, REPLAY_POSITION_SQL, Read, WAL_POSITION_SQL,
     WalPosition,
 };
+use crate::session::{Effect, Scope, SessionChanges};
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
 pub use crate::route::{Route, RouteDsl, Served, Via};
@@ -195,6 +197,10 @@ pub struct SyncedConnection<C = diesel::PgConnection> {
     /// Whether the connection is known to be to a primary, whose reads
     /// are current; learned on the first refill, and never asked again.
     primary: bool,
+    /// What its statements have changed in its session.
+    session: SessionChanges,
+    /// Whether it reads as the cache's answers are for.
+    scope: Scope,
 }
 
 impl<C> SyncedConnection<C> {
@@ -208,6 +214,8 @@ impl<C> SyncedConnection<C> {
             read_your_writes: Duration::ZERO,
             served: None,
             primary: false,
+            session: SessionChanges::default(),
+            scope: Scope::Unchecked,
         }
     }
 
@@ -222,6 +230,8 @@ impl<C> SyncedConnection<C> {
             read_your_writes: read_your_writes_from_env(),
             served: None,
             primary: false,
+            session: SessionChanges::default(),
+            scope: Scope::Unchecked,
         }
     }
 
@@ -280,6 +290,15 @@ impl<C> SyncedConnection<C> {
         }
     }
 
+    /// Takes in what `sql` does to the connection's session
+    /// ([`SessionChanges`]): once it is back as established, what the
+    /// connection reads as is read again before the cache serves it.
+    fn observe(&mut self, sql: &str) {
+        if self.cache.is_some() && self.session.apply(sql) == Effect::Restored {
+            self.scope = Scope::Unchecked;
+        }
+    }
+
 
     /// Runs `f` with every read inside it routed `route`, whatever the
     /// connection's own route; a flag on the query itself still wins.
@@ -324,6 +343,28 @@ where
     C: LoadConnection<DefaultLoadingMode>
         + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>,
 {
+    /// Whether this connection's reads may use `cache`: its session as it
+    /// was established, and what it reads as the cache's answers are for
+    /// ([`Cache::admits`]), read on its first read through the cache and
+    /// again once its session is back as established. When that cannot
+    /// be read, this read goes to Postgres and the next asks again.
+    fn shares(&mut self, cache: &Cache) -> bool {
+        if self.session.changed() {
+            return false;
+        }
+        if self.scope == Scope::Unchecked {
+            let Some(context) = context_of(&mut self.inner) else {
+                return false;
+            };
+            self.scope = if cache.admits(&context) {
+                Scope::Shared
+            } else {
+                Scope::Own
+            };
+        }
+        self.scope == Scope::Shared
+    }
+
     /// Once a write has committed, reads its WAL position on this
     /// connection, when reads through the cache go to standbys
     /// ([`Cache::reads_standbys`]): a standby cannot say where the
@@ -377,6 +418,7 @@ where
     /// Opening, naming a point in, or abandoning a transaction writes
     /// nothing.
     fn batch_execute(&mut self, query: &str) -> QueryResult<()> {
+        self.observe(query);
         let writes = may_write(query);
         if writes {
             self.wrote();
@@ -435,7 +477,9 @@ where
     where
         T: QueryFragment<Pg> + QueryId,
     {
-        let writes = may_write(&rendered(source));
+        let sql = rendered(source);
+        self.observe(&sql);
+        let writes = may_write(&sql);
         if writes {
             self.wrote();
         }
@@ -494,10 +538,15 @@ where
     /// updates. Once subscribed, the engine reports every change from
     /// there on, so what Postgres returns then is current until the
     /// first touch; a read that fails leaves no entry, and the
-    /// subscription ends with it rather than being held for nothing. The
-    /// first miss through a cache reads which database the cache's reads
-    /// go to, which the engine side checks its engine streams. While the
-    /// engine side is too far behind the database, reads go to Postgres.
+    /// subscription ends with it rather than being held for nothing. A
+    /// connection's first read through the cache first reads what the
+    /// connection reads as ([`Context`]): the cache serves it only if
+    /// that is what the cache's answers are for ([`Cache::admits`]), and
+    /// only while its session is as it was established
+    /// ([`SessionChanges`]). The first connection admitted also tells the
+    /// cache which database its reads go to, which the engine side checks
+    /// its engine streams. While the engine side is too far behind the
+    /// database, reads go to Postgres.
     fn load<'conn, 'query, T>(
         &'conn mut self,
         source: T,
@@ -511,6 +560,7 @@ where
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         };
         let mut key = QueryKey::of(&source, &mut self.inner)?;
+        self.observe(&key.sql);
         let route = key.take_route().or(self.scoped).unwrap_or(self.route);
         if !key.is_select() {
             self.wrote();
@@ -541,21 +591,16 @@ where
             cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
+        if !self.shares(&cache) {
+            cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
+            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+        }
         if let Some(rows) = cache.get(&key) {
             self.served = Some(Served::Cache);
             return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
         }
         if cache.refused_recently(&key).is_some() {
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
-        }
-        if !cache.knows_database() {
-            match database_of(&mut self.inner) {
-                Some(database) => cache.learn_database(Some(database)),
-                None => {
-                    return LoadConnection::<B>::load(&mut self.inner, source)
-                        .map(SyncedCursor::Live);
-                }
-            }
         }
         let reservation = cache.reserve(&key);
         let since = match cache.subscriptions().subscribe_with(&key, &mut self.inner) {
@@ -594,16 +639,14 @@ where
     }
 }
 
-/// The database `conn` reads, as the engine names the one it streams;
-/// `None` when it cannot be read, and the read goes live without asking
-/// the engine, the next miss reading it again.
-fn database_of<C>(conn: &mut C) -> Option<Database>
+/// What `conn` reads as ([`Context`]); `None` when it cannot be read.
+fn context_of<C>(conn: &mut C) -> Option<Context>
 where
     C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
 {
     use diesel::RunQueryDsl;
-    diesel::sql_query(DATABASE_SQL)
-        .load::<Database>(conn)
+    diesel::sql_query(CONTEXT_SQL)
+        .load::<Context>(conn)
         .ok()?
         .into_iter()
         .next()
@@ -700,6 +743,7 @@ fn reads_only(statement: &str) -> bool {
         "ROLLBACK",
         "SET",
         "RESET",
+        "DISCARD",
         "SHOW",
     ]
     .iter()
@@ -748,5 +792,44 @@ where
     /// The inner connection's type metadata cache.
     fn get_metadata_cache(&mut self) -> &mut PgMetadataCache {
         self.inner.get_metadata_cache()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reads and the statements that only move a transaction along or
+    /// change the session are not writes; anything else, or a batch with
+    /// anything else in it, is.
+    #[test]
+    fn what_counts_as_a_write() {
+        for sql in [
+            "SELECT 1",
+            "(SELECT 1) UNION (SELECT 2)",
+            "BEGIN",
+            "START TRANSACTION",
+            "SAVEPOINT a",
+            "RELEASE a",
+            "ROLLBACK",
+            "SET app.tenant = 'a'",
+            "RESET ALL",
+            "DISCARD ALL",
+            "SHOW search_path",
+            "SET ROLE r; SELECT 1;",
+        ] {
+            assert!(!may_write(sql), "{sql}");
+        }
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "COMMIT",
+            "SELECT 1; DELETE FROM t",
+            "WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone",
+            "CALL p()",
+        ] {
+            assert!(may_write(sql), "{sql}");
+        }
     }
 }

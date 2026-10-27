@@ -117,6 +117,7 @@ pub fn stats_json(app: &Stack) -> Value {
             "after_write": n(&s.after_write),
             "lagging": n(&s.lagging),
             "unreplayed": n(&s.unreplayed),
+            "other_context": n(&s.other_context),
             "locking": n(&s.locking),
             "stale_fills": n(&s.stale_fills),
             "evicted": n(&s.evicted),

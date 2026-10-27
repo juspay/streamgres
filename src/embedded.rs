@@ -1114,6 +1114,23 @@ mod tests {
         assert!(setup("maybe").is_err());
     }
 
+    /// The demo's trigger stack is this function's, as rendered for it:
+    /// a stack older than the engine misses what the engine reads.
+    #[test]
+    fn the_demos_trigger_stack_is_current() {
+        let checked_in = include_str!("../demo/ddl-triggers.sql");
+        let body: String = checked_in
+            .lines()
+            .skip_while(|line| line.starts_with("--"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(
+            body.trim(),
+            setup_sql("demo", 0, "demo_pub").trim(),
+            "demo/ddl-triggers.sql is stale: render it again with setup_sql(\"demo\", 0, \"demo_pub\")"
+        );
+    }
+
     /// Ready once the position covers a snapshot that has been taken.
     #[test]
     fn readiness_follows_the_first_snapshot() {

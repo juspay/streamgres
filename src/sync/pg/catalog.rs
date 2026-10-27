@@ -53,6 +53,14 @@ pub async fn load_catalog(
     let enums = client
         .query("SELECT oid, typarray FROM pg_type WHERE typtype = 'e'", &[])
         .await?;
+    let secured = client
+        .query(
+            "SELECT n.nspname, c.relname FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relrowsecurity AND c.relkind IN ('r', 'p') AND n.nspname = ANY($1)",
+            &[&schemas],
+        )
+        .await?;
     let database = client
         .query_one(
             "SELECT datcollate, to_jsonb(d) ->> 'datlocprovider'
@@ -132,7 +140,12 @@ pub async fn load_catalog(
         Catalog::new(tables)
             .with_enum_oids(enum_oids)
             .with_ordered_as_text(ordered)
-            .with_bytewise_default(default_collation.is_bytewise()),
+            .with_bytewise_default(default_collation.is_bytewise())
+            .with_row_secured(secured.iter().map(|row| {
+                let schema: String = row.get(0);
+                let table: String = row.get(1);
+                TableName::from(table_name(&schema, &table))
+            })),
         notes,
     ))
 }

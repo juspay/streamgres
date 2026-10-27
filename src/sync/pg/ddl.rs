@@ -22,7 +22,7 @@ use super::catalog::{published_orders_as_text, scalar_type, table_name};
 use super::text;
 use crate::ivm::SchemaChange;
 use crate::model::{Catalog, ColumnName, DbColumn, DbTable, TableName, Value, ValueType};
-use crate::sync::catalog::{with_column, with_ordered, with_table};
+use crate::sync::catalog::{with_column, with_ordered, with_row_security, with_table};
 use crate::sync::storage::StorageError;
 
 /// Where the feed hears of schema changes: the prefix of the trigger's
@@ -76,6 +76,10 @@ pub struct PublishedTable {
     pub columns: HashMap<String, PublishedColumn>,
     #[serde(rename = "primaryKey", default)]
     pub primary_key: Vec<String>,
+    /// Whether row-level security is enabled on it; absent from a
+    /// trigger stack older than it.
+    #[serde(rename = "rowSecurity", default)]
+    pub row_security: Option<bool>,
 }
 
 /// One published column: its type as `pg_type` names it (an array as
@@ -352,12 +356,20 @@ pub fn classify(
                             .filter(|(_, column)| column.orders_as_text(catalog.bytewise_default()))
                             .map(|(column, _)| ColumnName::from(column.as_str()));
                         catalog_now = with_ordered(&catalog_now, &added.name, ordered);
+                        let secured = table.row_security != Some(false);
+                        catalog_now = with_row_security(&catalog_now, &added.name, secured);
                         changes.push(SchemaChange::TableAdded { table: added });
                     }
                     Err(reason) => crate::log::log_warn!("new table not carried: {reason}"),
                 }
             }
             Some(held) => {
+                if let Some(secured) = table.row_security
+                    && secured != catalog.is_row_secured(&held.name)
+                {
+                    let turned = if secured { "enabled" } else { "disabled" };
+                    return Err(format!("row-level security was {turned} on `{name}`"));
+                }
                 for change in column_changes(held, table)? {
                     if let SchemaChange::ColumnAdded { column, .. } = &change
                         && let Some(current) = catalog_now.table(&name)
@@ -654,6 +666,45 @@ mod tests {
             .catalog;
         assert!(ordered(&bytewise, "label"), "a byte-order default does");
         assert!(bytewise.bytewise_default(), "carried into the next catalog");
+    }
+
+    /// Row-level security turned on or off on a served table stops the
+    /// engine, to start over on a catalog that knows it. A table created
+    /// while serving is held to be secured unless its message says
+    /// otherwise, as one from an older trigger stack does not.
+    #[test]
+    fn row_security_follows_the_messages() {
+        let secured = |table: String, on: &str| {
+            table.replace(r#""publications": {}"#, &format!(r#""publications": {{}}, "rowSecurity": {on}"#))
+        };
+        let tickets = published("tickets", TICKETS, &["id"]);
+        let schemas = ["public".to_owned()];
+        let name = TableName::from("tickets");
+
+        let enabled = message(&tickets, &secured(tickets.clone(), "true"));
+        let stopped = classify(&catalog(), &schemas, &enabled).map(drop).unwrap_err();
+        assert!(stopped.contains("row-level security"), "{stopped}");
+
+        let was = catalog().with_row_secured([name.clone()]);
+        let disabled = message(&tickets, &secured(tickets.clone(), "false"));
+        let stopped = classify(&was, &schemas, &disabled).map(drop).unwrap_err();
+        assert!(stopped.contains("disabled"), "{stopped}");
+        let unchanged = message(&tickets, &secured(tickets.clone(), "true"));
+        let kept = classify(&was, &schemas, &unchanged).expect("classified").catalog;
+        assert!(kept.is_row_secured(&name), "still secured: nothing to do");
+        let silent = message(&tickets, &tickets);
+        let kept = classify(&was, &schemas, &silent).expect("classified").catalog;
+        assert!(kept.is_row_secured(&name), "a message that does not say keeps it");
+
+        let notes = published("notes", TICKETS, &["id"]);
+        let notes_name = TableName::from("notes");
+        let created = |notes: String| {
+            let message = message(&tickets, &format!("{tickets}, {notes}"));
+            classify(&catalog(), &schemas, &message).expect("classified").catalog
+        };
+        assert!(created(notes.clone()).is_row_secured(&notes_name), "not known: secured");
+        assert!(created(secured(notes.clone(), "true")).is_row_secured(&notes_name));
+        assert!(!created(secured(notes, "false")).is_row_secured(&notes_name));
     }
 
     /// Published types map as the startup catalog maps them.

@@ -44,6 +44,7 @@ and changes nothing else.
 | `encode.rs` | engine JSON cells to Postgres binary, per column type |
 | `row.rs` | `OwnedRow`: a row that outlives its statement and decodes like a live one |
 | `cursor.rs` | one cursor type for rows from the cache and rows from Postgres |
+| `session.rs` | what a connection's statements changed in its session since it was established |
 
 ## The interception surface
 
@@ -109,6 +110,9 @@ argument values.)
 A refusal is remembered under the same key, values and all: the engine
 refuses on values too (a time at infinity, more rows than it follows for
 one user), so a refusal for one value says nothing of another.
+
+The key says nothing of who reads. That is the cache's to keep apart,
+by the rules under **Context** below.
 
 ## Two ways an entry is kept fresh
 
@@ -253,6 +257,36 @@ buffered for, and its socket is cut off 5 seconds later if its writer
 still cannot flush.
 
 ## Correctness rules
+
+**Context.** Equal keys get equal rows only for readers who would see the
+same rows, so a cache serves one context (`cache::Context`: database,
+`current_user`, `session_user`, the search path's usable schemas). A
+connection's first read through the cache reads its context
+(`CONTEXT_SQL`); the first connection admitted sets the cache's, and
+tells the cache its database for the engine check. A connection with
+another context, or whose search path puts a usable schema before
+`public` (the engine reads bare names there), never uses the cache:
+its reads go to Postgres, counted as `other_context`. The context is
+read once per connection, and again once its session is back as
+established. On the blocking wrapper the read is one more query before
+the first read; on the async one it runs beside the first read, which
+goes to Postgres (a query cannot be held across an await, not being
+`Send`).
+
+**The session as established.** PostgreSQL does not list custom
+settings, so a tenant in `app.tenant` cannot be read back and compared.
+`session::SessionChanges` watches every statement instead: a `SET`
+(other than a few settings that change no rows, and `SET LOCAL`, which
+ends with its transaction, inside which reads go to Postgres anyway),
+`SET ROLE`, `SET SESSION AUTHORIZATION`, or any statement mentioning
+`set_config` takes the connection off the cache until the same setting
+is `RESET`, or `RESET ALL` or `DISCARD ALL` restores everything; then
+its context is read again. Settings made at connect time or inside a
+function are not seen: such connections need caches of their own.
+
+**No row-level security.** The engine reads as its own role. It refuses
+a query over a table with row-level security enabled, so the wrapper
+reads Postgres for it, and remembers the refusal.
 
 **Subscribe before read.** The engine accepts first and the client reads
 second. A change after the read is reported; a change between the two

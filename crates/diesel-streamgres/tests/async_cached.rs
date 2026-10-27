@@ -161,7 +161,12 @@ impl World {
         let engine = Arc::new(FakeEngine::default());
         let cache = Arc::new(Cache::new(64 * 1024 * 1024, engine.clone()));
         let inner = AsyncPgConnection::establish(&url()).await.expect("connect");
-        let conn = AsyncSyncedConnection::with_cache(inner, cache.clone(), Route::Streamgres);
+        let mut conn = AsyncSyncedConnection::with_cache(inner, cache.clone(), Route::Streamgres);
+        let one: i32 = diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>("1"))
+            .get_result(&mut conn)
+            .await
+            .expect("a first read, which reads what the connection reads as");
+        assert_eq!(one, 1);
         let prefix = format!("{name}-{}-", std::process::id());
         diesel::delete(sg_configs::table.filter(sg_configs::key.like(format!("{prefix}%"))))
             .execute(&mut other)
@@ -284,7 +289,11 @@ async fn a_repeated_read_is_served_from_the_cache() {
 #[tokio::test]
 async fn the_connection_says_where_each_read_was_served_from() {
     let mut w = World::new("async-served").await;
-    assert_eq!(w.conn.last_served(), None, "nothing read yet");
+    assert_eq!(
+        w.conn.last_served(),
+        Some(Served::Postgres),
+        "the connection's first read, the harness's, reads Postgres beside what it reads as"
+    );
     w.put("k", "1").await;
 
     assert_eq!(w.read("k").await.as_deref(), Some("1"));
@@ -558,10 +567,12 @@ async fn an_enum_array_bind_is_live_once_then_cached() {
     let mut sibling =
         AsyncSyncedConnection::with_cache(inner, Arc::clone(&w.cache), Route::Streamgres);
     assert_eq!(read(&mut sibling, key.clone()).await, Some(Mood::Happy));
+    assert_eq!(w.hits(), 1, "a connection's first read reads what it reads as, live");
+    assert_eq!(read(&mut sibling, key.clone()).await, Some(Mood::Happy));
     assert_eq!(
         w.hits(),
         2,
-        "the sibling hit the same entry without a live read"
+        "the sibling, reading as the first did, hit the same entry"
     );
     let _ = diesel::sql_query("DELETE FROM sg_moods WHERE key = $1")
         .bind::<diesel::sql_types::Text, _>(&key)

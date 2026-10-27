@@ -30,6 +30,7 @@ WITH published_columns AS (SELECT
   pc.relnamespace::int8 AS "schemaOID" ,
   pc.relname AS "name",
   pc.relreplident AS "replicaIdentity",
+  pc.relrowsecurity AS "rowSecurity",
   attnum AS "pos",
   attname AS "col",
   pt.typname AS "type",
@@ -67,6 +68,7 @@ tables AS (SELECT json_build_object(
   'schemaOID', "schemaOID",
   'name', "name",
   'replicaIdentity', "replicaIdentity",
+  'rowSecurity', "rowSecurity",
   'columns', json_object_agg(
     DISTINCT
     col,
@@ -100,7 +102,7 @@ tables AS (SELECT json_build_object(
     jsonb_build_object('rowFilter', "rowFilter")
   )
 ) AS "table" FROM published_columns
-  GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity"),
+  GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity", "rowSecurity"),
 
   indexed_columns AS (SELECT
       pg_indexes.schemaname as "schema",

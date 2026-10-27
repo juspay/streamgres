@@ -70,12 +70,13 @@ use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use tokio::task::spawn_blocking;
 
 use crate::cache::{
-    AfterWrites, Cache, DATABASE_SQL, Database, REPLAY_POSITION_SQL, Read, WAL_POSITION_SQL,
+    AfterWrites, CONTEXT_SQL, Cache, Context, REPLAY_POSITION_SQL, Read, WAL_POSITION_SQL,
     WalPosition,
 };
 use crate::cursor::SyncedRow;
 use crate::key::QueryKey;
 use crate::route::{Route, Served};
+use crate::session::{Effect, Scope, SessionChanges};
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::STALE_TYPES;
 use crate::materialized::Snapshot;
@@ -116,6 +117,11 @@ pub struct AsyncSyncedConnection {
     /// Whether the connection is known to be to a primary, whose reads
     /// are current; learned on the first refill, and never asked again.
     primary: Arc<AtomicBool>,
+    /// What its statements have changed in its session.
+    session: SessionChanges,
+    /// Whether it reads as the cache's answers are for ([`Scope`] as
+    /// `u8`), written by the read that asked.
+    scope: Arc<AtomicU8>,
 }
 
 impl AsyncSyncedConnection {
@@ -132,6 +138,17 @@ impl AsyncSyncedConnection {
             inflight: Arc::new(()),
             served: Arc::new(AtomicU8::new(0)),
             primary: Arc::new(AtomicBool::new(false)),
+            session: SessionChanges::default(),
+            scope: Arc::new(AtomicU8::new(Scope::Unchecked as u8)),
+        }
+    }
+
+    /// Takes in what `sql` does to the connection's session
+    /// ([`SessionChanges`]): once it is back as established, what the
+    /// connection reads as is read again before the cache serves it.
+    fn observe(&mut self, sql: &str) {
+        if self.cache.is_some() && self.session.apply(sql) == Effect::Restored {
+            self.scope.store(Scope::Unchecked as u8, Ordering::Release);
         }
     }
 
@@ -469,6 +486,7 @@ impl SimpleAsyncConnection for AsyncSyncedConnection {
         &mut self,
         query: &str,
     ) -> impl std::future::Future<Output = QueryResult<()>> + Send {
+        self.observe(query);
         let cache = if may_write(query) {
             self.cache.clone()
         } else {
@@ -524,9 +542,13 @@ impl AsyncConnection for AsyncSyncedConnection {
     /// types not known yet is read live this time, the types resolved
     /// for the next (one that cannot even be keyed until then too).
     ///
-    /// The first miss through a cache reads which database the cache's
-    /// reads go to before it subscribes, for the engine side to check its
-    /// engine streams the same one.
+    /// A connection's first read through the cache goes to Postgres,
+    /// pipelined with reading what the connection reads as ([`Context`]);
+    /// from the next on, the cache serves it only if that is what the
+    /// cache's answers are for ([`Cache::admits`]), and only while its
+    /// session is as it was established ([`SessionChanges`]). The first
+    /// connection admitted also tells the cache which database its reads
+    /// go to, for the engine side to check its engine streams the same.
     ///
     /// On a miss, the futures the read may need are built at once; which
     /// are polled depends on the engine's answer. The read's future owns
@@ -558,6 +580,7 @@ impl AsyncConnection for AsyncSyncedConnection {
                 .boxed();
             return self.tracked(live);
         };
+        self.observe(&key.sql);
         let route = key.take_route().or(self.scoped).unwrap_or(self.route);
         if !key.is_select() {
             let resolve = self.resolves_writes();
@@ -610,6 +633,38 @@ impl AsyncConnection for AsyncSyncedConnection {
                 .boxed();
             return self.tracked(live);
         }
+        match Scope::from_u8(self.scope.load(Ordering::Acquire)) {
+            _ if self.session.changed() => {
+                cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
+                let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+                return self.tracked(live);
+            }
+            Scope::Shared => {}
+            Scope::Own => {
+                cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
+                let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+                return self.tracked(live);
+            }
+            Scope::Unchecked => {
+                let probe = self.inner.load(sql_query(CONTEXT_SQL));
+                let live = self.inner.load(query);
+                let scope = Arc::clone(&self.scope);
+                let live = async move {
+                    let (context, live) = futures_util::join!(read_context(probe), live);
+                    if let Some(context) = context {
+                        let shared = if cache.admits(&context) {
+                            Scope::Shared
+                        } else {
+                            Scope::Own
+                        };
+                        scope.store(shared as u8, Ordering::Release);
+                    }
+                    live.map(Self::live_stream)
+                }
+                .boxed();
+                return self.tracked(live);
+            }
+        }
         if let Some(rows) = cache.get(&key) {
             self.served.store(1, Ordering::Release);
             return std::future::ready(Ok(Self::cached_stream(rows))).boxed();
@@ -618,8 +673,6 @@ impl AsyncConnection for AsyncSyncedConnection {
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
             return self.tracked(live);
         }
-        let probe: Option<LoadFuture<'query>> = (!cache.knows_database())
-            .then(|| self.inner.load(sql_query(DATABASE_SQL)));
         let replay: Option<LoadFuture<'query>> = (!self.primary.load(Ordering::Acquire))
             .then(|| self.inner.load(sql_query(REPLAY_POSITION_SQL)));
         let live = self.inner.load(query);
@@ -635,12 +688,6 @@ impl AsyncConnection for AsyncSyncedConnection {
         let primary = Arc::clone(&self.primary);
         async move {
             let _pending = token;
-            if let Some(probe) = probe {
-                match read_database(probe).await {
-                    Some(database) => cache.learn_database(Some(database)),
-                    None => return live.await.map(Self::live_stream),
-                }
-            }
             let reservation = cache.reserve(&key);
             let guard = Unfilled {
                 cache: Arc::clone(&cache),
@@ -725,7 +772,9 @@ impl AsyncConnection for AsyncSyncedConnection {
     where
         T: QueryFragment<Pg> + QueryId + 'query,
     {
-        let writes = may_write(&rendered(&source));
+        let sql = rendered(&source);
+        self.observe(&sql);
+        let writes = may_write(&sql);
         let resolve = writes && self.resolves_writes();
         let future = self.inner.execute_returning_count(source);
         if writes {
@@ -756,13 +805,12 @@ impl AsyncConnection for AsyncSyncedConnection {
     }
 }
 
-/// The database `probe` ([`DATABASE_SQL`]) reads; `None` when it fails,
-/// and the read goes live without asking the engine, the next miss
-/// reading it again.
-async fn read_database(probe: LoadFuture<'_>) -> Option<Database> {
+/// What `probe` ([`CONTEXT_SQL`]) reads; `None` when it fails, and the
+/// next read asks again.
+async fn read_context(probe: LoadFuture<'_>) -> Option<Context> {
     let rows: Vec<PgRow> = probe.await.ok()?.try_collect().await.ok()?;
     rows.first()
-        .and_then(|row| <Database as FromSqlRow<Untyped, Pg>>::build_from_row(row).ok())
+        .and_then(|row| <Context as FromSqlRow<Untyped, Pg>>::build_from_row(row).ok())
 }
 
 /// What `probe` ([`WAL_POSITION_SQL`], [`REPLAY_POSITION_SQL`]) reads;

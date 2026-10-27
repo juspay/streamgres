@@ -345,6 +345,10 @@ pub struct Catalog {
     /// byte, so a string column a migration adds under it orders as its
     /// text; false when not known.
     bytewise_default: bool,
+    /// Tables with row-level security enabled: who may see a row depends
+    /// on the reader's role and session, which the engine, reading as
+    /// its own, cannot apply for a backend.
+    row_secured: std::collections::HashSet<TableName>,
 }
 
 impl Catalog {
@@ -358,7 +362,26 @@ impl Catalog {
             enum_oids: std::collections::HashSet::new(),
             ordered_as_text: std::collections::HashSet::new(),
             bytewise_default: false,
+            row_secured: std::collections::HashSet::new(),
         }
+    }
+
+    /// The same catalog knowing these tables have row-level security
+    /// enabled, and no others.
+    pub fn with_row_secured(mut self, tables: impl IntoIterator<Item = TableName>) -> Self {
+        self.row_secured = tables.into_iter().collect();
+        self
+    }
+
+    /// Whether `table` has row-level security enabled.
+    pub fn is_row_secured(&self, table: &TableName) -> bool {
+        self.row_secured.contains(table)
+    }
+
+    /// The tables this catalog knows have row-level security enabled,
+    /// for a catalog built from this one to carry.
+    pub fn row_secured(&self) -> impl Iterator<Item = &TableName> + '_ {
+        self.row_secured.iter()
     }
 
     /// The same catalog knowing whether the database's default collation

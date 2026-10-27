@@ -124,8 +124,8 @@ use crate::wire;
 use crate::ivm::Delta;
 use crate::log::{log_debug, log_info, log_warn};
 use crate::model::{
-    ComparisonOperator, DataFrameKey, DataFrameOperation, DataFrameRow, MultiTableReadQuery, Order,
-    OrderBy, SubId, TableName, Value, Where,
+    Catalog, ComparisonOperator, DataFrameKey, DataFrameOperation, DataFrameRow,
+    MultiTableReadQuery, Order, OrderBy, SubId, TableName, Value, Where,
 };
 use crate::parser::binds::decodes;
 use crate::parser::{BindValue, Projection, parse_select};
@@ -1266,7 +1266,8 @@ async fn serve<S>(
 /// type the catalog has not seen may be an enum created since it was
 /// loaded: those are looked up first ([`learn_enums`]). A query larger
 /// than the engine should take on its own thread is refused before it
-/// is planned ([`within_limits`]).
+/// is planned ([`within_limits`]), and so is one over a table with
+/// row-level security ([`row_secured`]).
 async fn prepare(
     context: &Context,
     conn: u64,
@@ -1285,6 +1286,11 @@ async fn prepare(
         catalog = context.catalog.load();
     }
     let select = parse_select(sql, binds, &catalog).map_err(|error| error.message)?;
+    if let Some(table) = row_secured(&select.query, &catalog) {
+        return Err(format!(
+            "`{table}` has row-level security, which the engine, reading as its own role, cannot apply for the backend's"
+        ));
+    }
     within_limits(
         &select.query,
         context.limits.max_disjuncts,
@@ -1342,6 +1348,22 @@ async fn database(context: &Context) -> Result<Json, String> {
 /// The identity [`database`] announces.
 const DATABASE_SQL: &str =
     "SELECT system_identifier::text, current_database()::text FROM pg_control_system()";
+
+/// The first table of `query`, joined ones included, that has row-level
+/// security enabled. Which of its rows a backend may see depends on the
+/// backend's role and session settings; the engine reads, and serves
+/// rows, as its own role, so it would hand back rows the backend's own
+/// read would not return.
+fn row_secured<'q>(query: &'q MultiTableReadQuery, catalog: &Catalog) -> Option<&'q TableName> {
+    let main = &query.main_table.table;
+    if catalog.is_row_secured(main) {
+        return Some(main);
+    }
+    query
+        .joins
+        .iter()
+        .find_map(|join| row_secured(&join.sub, catalog))
+}
 
 /// Refuses a query whose filters would normalize to more than
 /// `max_disjuncts` disjuncts, or whose `IN` and `NOT IN` lists hold more

@@ -321,38 +321,41 @@ fn the_connection_says_where_each_read_was_served_from() {
 }
 
 /// The subscription is registered before Postgres is read, so no commit in
-/// between goes unreported. The cache is told its database first, which
-/// its first miss would otherwise read, so the reads counted are the
-/// query's and, once per connection, whether it is on a primary.
+/// between goes unreported. The reads counted are the query's and, once
+/// per connection, what it reads as and whether it is on a primary.
 #[test]
 fn the_subscription_is_registered_before_postgres_is_read() {
     let mut w = World::new("order");
-    w.cache.learn_database(None);
     w.put("a", "1");
     let before = w.sent();
     w.read("a");
     let key = w.key_of("a");
     let subscribed = w.engine.subscribed.lock().unwrap();
     assert_eq!(subscribed.as_slice(), std::slice::from_ref(&key));
-    assert_eq!(w.sent(), before + 2, "whether it is a primary, then the read");
+    assert_eq!(
+        w.sent(),
+        before + 3,
+        "what it reads as, whether it is a primary, then the read"
+    );
     assert!(key.is_select());
     assert_eq!(key.binds.len(), 2, "the key's value and the LIMIT");
     assert_eq!(key.binds[0].type_oid, 25, "the first bind is a text");
     assert_eq!(key.binds[1].type_oid, 20, "the limit is an int8");
 }
 
-/// The first miss through a cache reads which database the cache's
-/// reads go to, once, beside the query (and the connection's first
-/// refill whether it is on a primary); later misses do not.
+/// A connection's first read through a cache reads what it reads as,
+/// once, beside the query (and the connection's first refill whether it
+/// is on a primary); the first admitted tells the cache its database.
+/// Later reads ask neither.
 #[test]
-fn the_first_miss_reads_the_database_once() {
+fn the_first_read_reads_the_context_once() {
     let mut w = World::new("database");
     w.put("a", "1");
     w.put("b", "2");
     assert!(!w.cache.knows_database());
     let before = w.sent();
     w.read("a");
-    assert_eq!(w.sent(), before + 3, "the database, the primary and the read");
+    assert_eq!(w.sent(), before + 3, "the context, the primary and the read");
     let database = w.cache.database().expect("read").clone();
     assert!(!database.system.is_empty() && !database.name.is_empty(), "{database:?}");
     w.read("b");

@@ -6,6 +6,7 @@ that uses Diesel, through the `diesel-streamgres` wrapper:
 - what each needs from PostgreSQL, and what it costs there
 - reading from replicas
 - read-your-writes
+- who a cached answer is for
 - what to watch
 
 The wrapper itself (routing, the cache, what is served from rows and what
@@ -35,7 +36,7 @@ process count:
 - About 7 to 10% of a core of walsender CPU on the database per engine at
   1,000 transactions a second.
 - Each process holds its own copy of the rows its queries follow, and
-  spends its own CPU applying every change to them (section 7).
+  spends its own CPU applying every change to them (section 8).
 
 **The S2S server is for anything larger.** Backend processes scale out
 freely and add no slots: only the engine servers hold them, so the cost on
@@ -247,13 +248,60 @@ cache holds the write, on every connection of the cache:
 processes or services are not covered: their changes reach the cache when
 the engine ships them, typically a few milliseconds after the commit.
 
-## 6. What to watch
+## 6. Who a cached answer is for
+
+The cache keys a read by its SQL and binds, but who may see which rows
+also depends on the session that reads them. The wrapper keeps a cached
+answer to readers who would have read the same rows:
+
+- **One context per cache.** A connection's first read through the cache
+  reads what it reads as: its database, its role (`current_user`), the
+  role it logged in as and its search path. The first connection to do so
+  sets the context the cache's answers are for. A connection that reads
+  as anything else reads Postgres for its whole life, counted as
+  `other_context`. On the blocking wrapper that is one more small query
+  per connection; the async one runs it beside the connection's first
+  read, which goes to Postgres.
+- **The session as it was established.** PostgreSQL cannot list custom
+  settings such as `app.tenant`, so the wrapper watches the statements
+  that set them. After `SET` (a role, a search path, a tenant setting,
+  anything but a few timeouts and `application_name`), `SET ROLE`, `SET
+  SESSION AUTHORIZATION` or a call to `set_config`, the connection reads
+  Postgres until `RESET` of the same setting, `RESET ALL` or `DISCARD
+  ALL`. `SET LOCAL` needs nothing: reads inside a transaction go to
+  Postgres anyway.
+- **No row-level security.** The engine reads as its own role, so it
+  cannot apply a policy for a backend's. It refuses every query over a
+  table with row-level security enabled, and those reads go to Postgres.
+  Turning row-level security on or off on a followed table restarts the
+  engine, which takes the change from the catalog it reads again. A
+  table created while serving by a trigger stack older than this is
+  treated as secured until the engine restarts; re-run the setup SQL
+  (`scripts/sql/ddl-triggers.sql`, or `setup_sql`) to update it.
+- **Bare names mean `public`.** The engine reads a bare table name in
+  `public`. A connection whose search path puts another schema it can
+  use first reads Postgres.
+
+What the wrapper cannot see, and the deployment must keep apart:
+
+- **Settings given when connecting** (`options=-c app.tenant=…` in the
+  URL, or `ALTER ROLE … SET`), and settings a function or procedure makes
+  inside itself. Give connections that differ there caches of their own.
+- **Privileges.** Rows the engine serves itself (rows mode) were read by
+  the engine's role. Grant the backend's role `SELECT` on every followed
+  table in full, or route reads of tables it may not read whole to
+  Postgres (`Route::Postgres`). Every column of a followed table reaches
+  the cache, whatever the query selects.
+
+## 7. What to watch
 
 - **`Cache::stats`**, per cache: `hits`, `misses`, `replaced` (rows the
   engine's deltas changed), `touched` (refills a change caused),
   `refused`, `after_write` (reads sent to Postgres for read-your-writes),
   `lagging` (sent there because the engine was behind), `unreplayed`
-  (replica refills not kept), `oversized`, `evicted`, `expired`.
+  (replica refills not kept), `other_context` (sent there because the
+  connection reads as another context than the cache's, section 6),
+  `oversized`, `evicted`, `expired`.
 - **`EngineClient`**: `is_connected()`, `lag()`, `subscribed()`,
   `materialized()` (queries served from rows), `fallbacks()` and
   `refusals()` (recent reasons), `warnings()` (configuration worth a log
@@ -263,7 +311,7 @@ the engine ships them, typically a few milliseconds after the commit.
 - **On the database**: `pg_replication_slots` and walsender counts
   against their limits, above all in embedded mode.
 
-## 7. Measured on one machine
+## 8. Measured on one machine
 
 Local PostgreSQL 17, the engine and the backend on one host:
 

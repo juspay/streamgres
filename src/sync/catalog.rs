@@ -73,6 +73,14 @@ pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
     .with_enum_oids(catalog.enum_oids())
     .with_ordered_as_text(catalog.ordered_as_text().cloned())
     .with_bytewise_default(catalog.bytewise_default())
+    .with_row_secured(catalog.row_secured().cloned())
+}
+
+/// `catalog` knowing whether `table` has row-level security enabled.
+pub fn with_row_security(catalog: &Catalog, table: &TableName, secured: bool) -> Catalog {
+    let others = catalog.row_secured().filter(|held| *held != table).cloned();
+    let this = secured.then(|| table.clone());
+    catalog.clone().with_row_secured(others.chain(this))
 }
 
 /// `catalog` knowing `columns` of `table` order as their text too.

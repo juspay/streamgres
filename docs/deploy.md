@@ -203,6 +203,13 @@ has; a stack installed before it did (no `collationName` in its messages) does
 not, and an `ORDER BY` on such a column is served from Postgres until the next
 restart. Re-run the setup SQL to update an older stack.
 
+**Row-level security is never served.** The engine reads as its own role and
+cannot apply a backend's policies, so the S2S endpoint refuses any query over a
+table with row-level security enabled, and the backend reads Postgres. Turning
+it on or off on a served table stops the server, which restarts knowing it. A
+table created while serving is taken as secured unless the trigger stack says
+otherwise, which a stack older than `rowSecurity` in its messages does not.
+
 **Any other change to a served table stops the server**, with one log line
 naming the change. That includes dropping or renaming a column or table,
 changing a type or key, and adding a column with an expression default such as

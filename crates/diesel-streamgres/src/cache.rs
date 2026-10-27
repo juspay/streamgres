@@ -232,6 +232,11 @@ pub struct Stats {
     /// Reads from a standby not kept: it had not replayed past the last
     /// change the engine will not report for the query.
     pub unreplayed: AtomicU64,
+    /// Reads sent to Postgres because their connection reads as another
+    /// database, role or search path than the cache's answers are for
+    /// ([`Cache::admits`]), or its session has changed since it was
+    /// established.
+    pub other_context: AtomicU64,
 }
 
 impl Stats {
@@ -317,6 +322,9 @@ pub struct Cache {
     /// first connection that misses; `None` inside when it could not be
     /// read. The engine side compares it with the one its engine streams.
     database: OnceLock<Option<Database>>,
+    /// The context this cache's answers are for: the first a connection
+    /// was admitted with ([`Cache::admits`]).
+    context: OnceLock<Context>,
     pub stats: Arc<Stats>,
 }
 
@@ -334,6 +342,47 @@ pub struct Database {
 /// Reads a [`Database`] through a connection; the engine announces the
 /// same in its `hello`.
 pub const DATABASE_SQL: &str = "SELECT system_identifier::text AS system, current_database()::text AS name FROM pg_control_system()";
+
+/// What a connection reads as: its database, the role whose privileges
+/// and row-level security apply (`current_user`), the role it logged in
+/// as, and the schemas a bare table name is looked for in. Connections
+/// share cached answers only when all of it matches. PostgreSQL lists
+/// no custom settings (`app.tenant`), so those are watched as the
+/// statements that set them instead (`crate::session`).
+#[derive(Debug, Clone, PartialEq, Eq, diesel::QueryableByName)]
+pub struct Context {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub system: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub name: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub role: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub login: String,
+    /// The search path's schemas that exist, in order, comma-separated.
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    pub schemas: String,
+}
+
+/// Reads a [`Context`] through a connection.
+pub const CONTEXT_SQL: &str = "SELECT system_identifier::text AS system, current_database()::text AS name, current_user::text AS role, session_user::text AS login, array_to_string(current_schemas(false), ',') AS schemas FROM pg_control_system()";
+
+impl Context {
+    /// The database it reads.
+    pub fn database(&self) -> Database {
+        Database {
+            system: self.system.clone(),
+            name: self.name.clone(),
+        }
+    }
+
+    /// Whether a bare table name resolves in `public` first, as the
+    /// engine resolves it: a search path that puts another schema first
+    /// could mean another table by the same name.
+    pub fn resolves_as_the_engine(&self) -> bool {
+        self.schemas.split(',').next() == Some("public")
+    }
+}
 
 /// Where the next WAL record will go, as [`WAL_POSITION_SQL`] reads it:
 /// past the commit record of every transaction that has committed; `None`
@@ -466,6 +515,7 @@ impl Cache {
             standby_reads: AtomicBool::new(false),
             type_metadata: Arc::new(Mutex::new(PgMetadataCache::new())),
             database: OnceLock::new(),
+            context: OnceLock::new(),
             stats,
         }
     }
@@ -624,6 +674,28 @@ impl Cache {
     /// live on a read that failed.
     pub fn learn_database(&self, database: Option<Database>) {
         let _ = self.database.set(database);
+    }
+
+    /// Whether a connection reading as `context` may share this cache's
+    /// answers. The first context admitted is the one they are for, and
+    /// the cache learns its database from it; a connection with any
+    /// other context, or one whose bare table names would not resolve
+    /// as the engine's do, reads Postgres.
+    pub fn admits(&self, context: &Context) -> bool {
+        if !context.resolves_as_the_engine() {
+            return false;
+        }
+        let ours = self.context.get_or_init(|| {
+            self.learn_database(Some(context.database()));
+            context.clone()
+        });
+        ours == context
+    }
+
+    /// The context this cache's answers are for, once a connection has
+    /// been admitted.
+    pub fn context(&self) -> Option<&Context> {
+        self.context.get()
     }
 
     /// The engine changed a query it serves from its own rows: counted;
