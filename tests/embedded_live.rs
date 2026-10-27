@@ -364,6 +364,7 @@ fn a_table_with_row_level_security_is_refused() {
 
         let mut id = 3;
         for (change, answer) in [("ENABLE", "refused"), ("DISABLE", "accepted")] {
+            let before = engine.slot().expect("a slot while it serves");
             client
                 .batch_execute(&format!("ALTER TABLE {table} {change} ROW LEVEL SECURITY"))
                 .await
@@ -373,7 +374,13 @@ fn a_table_with_row_level_security_is_refused() {
             })
             .await;
             assert!(ended.is_ok(), "{change}: the engine starts over, ending its sessions");
-            reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+            // The old engine may still say it serves while it stops: wait
+            // for the fresh one, on a slot of its own.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while engine.state() != State::Serving || engine.slot().is_none_or(|slot| slot == before) {
+                assert!(Instant::now() < deadline, "{change}: no fresh engine; {:?}", engine.state());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
             session = engine.connect().expect("a session on the fresh engine");
             assert_eq!(next(&mut session).await.expect("hello")[0], "hello");
             let got = subscribe(&mut session, id, &open).await;
