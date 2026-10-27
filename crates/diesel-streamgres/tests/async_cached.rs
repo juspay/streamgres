@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use diesel::prelude::*;
-use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
+use diesel_async::{
+    AsyncConnection, AsyncConnectionCore, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection,
+};
 use diesel_streamgres::cache::Cache;
 use diesel_streamgres::key::QueryKey;
 use diesel_streamgres::materialized::Snapshot;
@@ -599,8 +601,8 @@ async fn pipelined_reads_do_not_touch_the_transaction_state() {
             .limit(1)
     };
     let (key_a, key_b) = (w.key("a"), w.key("b"));
-    let first = AsyncConnection::load(&mut w.conn, query(key_a));
-    let second = AsyncConnection::load(&mut w.conn, query(key_b));
+    let first = AsyncConnectionCore::load(&mut w.conn, query(key_a));
+    let second = AsyncConnectionCore::load(&mut w.conn, query(key_b));
     let (first, second) = futures_util::join!(first, second);
     let first: Vec<String> = first
         .unwrap()
@@ -682,7 +684,7 @@ async fn a_read_dropped_after_subscribing_ends_its_subscription() {
         .filter(sg_configs::key.eq(w.key("mode")))
         .select(sg_configs::value)
         .limit(1);
-    let mut read = Box::pin(AsyncConnection::load(&mut w.conn, query));
+    let mut read = Box::pin(AsyncConnectionCore::load(&mut w.conn, query));
     assert!(
         futures_util::poll!(read.as_mut()).is_pending(),
         "a miss cannot complete in one poll"

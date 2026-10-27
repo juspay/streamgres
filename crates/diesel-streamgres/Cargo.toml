@@ -18,8 +18,8 @@ embedded = ["dep:streamgres"]
 [dependencies]
 streamgres = { path = "../..", default-features = false, optional = true }
 base64 = "0.23.1"
-diesel = { version = "2.2.10", features = ["postgres", "r2d2", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
-diesel-async = { version = "0.6", features = ["postgres"], optional = true }
+diesel = { version = "2.3.8", features = ["postgres", "r2d2", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+diesel-async = { version = "0.7", features = ["postgres"], optional = true }
 futures-util = "0.3.34"
 moka = { version = "0.12", features = ["sync"] }
 serde_json = "1.0.154"
@@ -33,5 +33,5 @@ rustls-native-certs = "0.8"
 [dev-dependencies]
 chrono = "0.4.45"
 scoped-futures = "0.1"
-diesel = { version = "2.2.10", features = ["chrono", "postgres", "r2d2", "serde_json"] }
+diesel = { version = "2.3.8", features = ["chrono", "postgres", "r2d2", "serde_json"] }
 serde_json = "1.0.154"

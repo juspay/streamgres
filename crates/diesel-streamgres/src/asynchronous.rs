@@ -61,9 +61,10 @@ use diesel::sql_query;
 use diesel::sql_types::{Oid, Text, Untyped};
 use diesel::{ConnectionResult, QueryResult};
 use diesel_async::pooled_connection::PoolableConnection;
+use diesel::connection::CacheSize;
 use diesel_async::{
-    AnsiTransactionManager, AsyncConnection, AsyncPgConnection, CacheSize, SimpleAsyncConnection,
-    TransactionManager,
+    AnsiTransactionManager, AsyncConnection, AsyncConnectionCore, AsyncPgConnection,
+    SimpleAsyncConnection, TransactionManager,
 };
 use futures_util::future::{BoxFuture, FutureExt, TryFutureExt};
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
@@ -85,7 +86,7 @@ use crate::types::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
 use crate::{Attachment, SETTINGS, commits, may_write, read_your_writes_from_env, rendered};
 
 /// diesel-async's Postgres row, which it does not export by name.
-pub type PgRow = <AsyncPgConnection as AsyncConnection>::Row<'static, 'static>;
+pub type PgRow = <AsyncPgConnection as AsyncConnectionCore>::Row<'static, 'static>;
 
 /// The row an `AsyncSyncedConnection` yields: diesel-async's own, or one
 /// the cache holds.
@@ -515,28 +516,12 @@ impl SimpleAsyncConnection for AsyncSyncedConnection {
     }
 }
 
-impl AsyncConnection for AsyncSyncedConnection {
+impl AsyncConnectionCore for AsyncSyncedConnection {
     type ExecuteFuture<'conn, 'query> = BoxFuture<'query, QueryResult<usize>>;
     type LoadFuture<'conn, 'query> = BoxFuture<'query, QueryResult<Self::Stream<'conn, 'query>>>;
     type Stream<'conn, 'query> = BoxStream<'static, QueryResult<AsyncSyncedRow>>;
     type Row<'conn, 'query> = AsyncSyncedRow;
     type Backend = Pg;
-    type TransactionManager = AnsiTransactionManager;
-
-    /// Connects, attached to the cache [`crate::install`] set up for
-    /// this URL, if any.
-    async fn establish(database_url: &str) -> ConnectionResult<Self> {
-        let inner = AsyncPgConnection::establish(database_url).await?;
-        Ok(
-            match SETTINGS
-                .get()
-                .and_then(|settings| settings.attachment_for(database_url))
-            {
-                Some(Attachment { cache, route }) => Self::with_cache(inner, cache, route),
-                None => Self::new(inner),
-            },
-        )
-    }
 
     /// A read, from the cache when it can be. A query whose binds name
     /// types not known yet is read live this time, the types resolved
@@ -782,6 +767,26 @@ impl AsyncConnection for AsyncSyncedConnection {
         } else {
             self.tracked(future)
         }
+    }
+
+}
+
+impl AsyncConnection for AsyncSyncedConnection {
+    type TransactionManager = AnsiTransactionManager;
+
+    /// Connects, attached to the cache [`crate::install`] set up for
+    /// this URL, if any.
+    async fn establish(database_url: &str) -> ConnectionResult<Self> {
+        let inner = AsyncPgConnection::establish(database_url).await?;
+        Ok(
+            match SETTINGS
+                .get()
+                .and_then(|settings| settings.attachment_for(database_url))
+            {
+                Some(Attachment { cache, route }) => Self::with_cache(inner, cache, route),
+                None => Self::new(inner),
+            },
+        )
     }
 
     /// The inner connection's transaction state.

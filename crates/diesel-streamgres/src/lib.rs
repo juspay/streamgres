@@ -507,6 +507,11 @@ where
     fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
         self.inner.set_instrumentation(instrumentation)
     }
+
+    /// Sizes the inner connection's statement cache.
+    fn set_prepared_statement_cache_size(&mut self, size: diesel::connection::CacheSize) {
+        self.inner.set_prepared_statement_cache_size(size)
+    }
 }
 
 impl<C, B> LoadConnection<B> for SyncedConnection<C>
