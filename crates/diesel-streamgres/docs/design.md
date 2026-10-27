@@ -491,6 +491,60 @@ of it go live meanwhile. One socket dropping affects only its keys. With
 the engine unreachable, every subscribe is refused at once, so an engine
 outage costs the application its cache and nothing else.
 
+## Callbacks
+
+`EngineClient::subscribe` (`listen.rs`) follows a query for a callback
+rather than for the cache. It reuses the rows-mode machinery: the same
+subscribe, snapshot, store and deltas. Three things differ.
+
+- **Its own key.** The key's context id is at or above
+  `LISTENING_BASE` (2^31). The cache's context ids stop below it, so
+  the key shares no entry with a reader. The worker keeps such keys in
+  `Shared::listeners`:
+  - their stores never reach the cache (no reserve, fill or reweigh)
+  - `Worker::unreadable` is skipped, since the rows are read with the
+    engine's privileges, by the backend's own code
+  - `wrong_database` checks the engine against the database the query
+    was rendered on, not the cache's
+- **Changes, not rows.** Each delta becomes changes for the
+  subscription's queue (`Listening::apply`):
+  - For a *plain* store (one table, no `LIMIT`/`OFFSET`, a column
+    projection; `Materialized::is_plain`), it reads which root rows the
+    delta names. It projects each before and after, so a delta costs
+    what it changes.
+  - Otherwise it builds the keyed result (`Materialized::keyed`) before
+    and after, and diffs them.
+
+  A result row's identity is the primary keys of the table rows it is
+  composed of. A NULL-extended side is marked, so the same row stays one
+  row while its values change. The first store built gives every row as
+  present.
+- **Reconnects.** On a dropped socket, `disconnected` hands each
+  listener's store to its subscription (`Listening::keep`) instead of
+  dropping it. When the engine accepts the resubscribe, the new store is
+  diffed against the kept one, and the difference is the changes.
+
+  The column types were forgotten with the socket. A resubscribe that
+  lacks them looks them up on a connection of the subscription's own, on
+  a thread of its own (`rebuild_off_thread`). Deltas queue in the
+  `Building` store meanwhile. The build checks the store it was accepted
+  into is still the one held, so a snapshot from before another drop is
+  never built. A lookup that fails lets the key go and records why in
+  `Subscription::errors()`.
+
+Delivery is a tokio task per subscription. It pops a change, decodes
+it as the query's Diesel type (through `CompatibleType`, as `load`
+does), and awaits the callback. The queue keeps changes in order up to
+`PENDING_LIMIT`. Past that it folds them into their net effect per row,
+in first-changed order, until the callback catches up; a fold that nets
+to nothing is dropped. Before subscribing, `subscribe` waits until the
+engine's position (from its `lag` frames) passes the database's current
+WAL insert position, so rows committed before the call are present, not
+added.
+
+Dropping the `Subscription` aborts the task, removes the listener and
+unsubscribes the key.
+
 ## Cache limits
 
 `cache::Limits`, from the environment (`Limits::from_env`) or in code
@@ -638,6 +692,7 @@ subscription, and a dropped `with_route` scope restores the outer route.
 | `tests/join_sql_shape.rs` | the exact join SQL Diesel renders, which the engine parser expects |
 | `tests/silent_engine.rs` | an engine that never answers, and one that drops every socket |
 | `tests/engine_live.rs`, `tests/async_live.rs` | the whole path against a running engine |
+| `tests/listen_live.rs` | callbacks against a running engine: present, added, updated, removed; a count; a refusal |
 | `tests/shape_coverage.rs` | production-shaped lookups compared with Postgres before and after a change |
 | `tests/engine_latency.rs` | commit-to-cache latency |
 | `tests/standby_reads.rs` | reads from a hot standby, writes to its primary: refills kept only once replayed past the engine, read-your-writes from the writer (needs `STREAMGRES_TEST_STANDBY_URL`) |

@@ -71,6 +71,7 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 
 use crate::cache::{Cache, Database, Live};
 use crate::key::QueryKey;
+use crate::listen::Listening;
 use crate::row::OwnedRow;
 use crate::materialized::{Materialized, Snapshot};
 use crate::subscriptions::{Outcome, Subscriptions, Verdict};
@@ -250,6 +251,10 @@ struct Shared {
     refusals: Mutex<Vec<String>>,
     /// The cache this client feeds, once one is attached.
     cache: Mutex<Option<Weak<Cache>>>,
+    /// The keys followed for a callback ([`EngineClient::subscribe`]),
+    /// not for the cache: their stores never reach it, and their deltas
+    /// are handed to the subscription as changes.
+    listeners: Mutex<HashMap<QueryKey, Arc<Listening>>>,
     /// Set when the pool is dropped; the worker threads then end.
     stopped: AtomicBool,
 }
@@ -276,6 +281,11 @@ impl Shared {
             })
             .map(str::to_string)
             .collect()
+    }
+
+    /// The subscription following `key` for a callback, if one does.
+    fn listening(&self, key: &QueryKey) -> Option<Arc<Listening>> {
+        self.listeners.lock().expect("listeners").get(key).cloned()
     }
 
     /// Notes why a subscription fell back from rows to refills.
@@ -603,6 +613,7 @@ impl EngineClient {
             fallbacks: Mutex::new(Vec::new()),
             refusals: Mutex::new(Vec::new()),
             cache: Mutex::new(None),
+            listeners: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
         });
         let workers = (0..config.connections)
@@ -629,6 +640,31 @@ impl EngineClient {
     /// weakly.
     pub fn attach(&self, cache: &Arc<Cache>) {
         *self.pool.shared.cache.lock().expect("cache") = Some(Arc::downgrade(cache));
+    }
+
+    /// Follows `key` for `listening` from here on: its rows never go to
+    /// the cache, and its changes go to the subscription.
+    pub(crate) fn start_listening(&self, key: &QueryKey, listening: Arc<Listening>) {
+        self.pool
+            .shared
+            .listeners
+            .lock()
+            .expect("listeners")
+            .insert(key.clone(), listening);
+    }
+
+    /// Stops following `key` for a callback, here and with the engine.
+    pub(crate) fn stop_listening(&self, key: &QueryKey) {
+        let held = self
+            .pool
+            .shared
+            .listeners
+            .lock()
+            .expect("listeners")
+            .remove(key);
+        if held.is_some() {
+            self.unsubscribe(key);
+        }
     }
 
     /// The configuration the client runs with.
@@ -942,12 +978,15 @@ impl Worker {
 
     /// Why this socket's engine must not be asked for `key`'s rows: it has
     /// not greeted yet, or it streams another database than the cache's
-    /// reads go to, whose rows would be served as this one's.
-    fn wrong_database(&self) -> Option<String> {
+    /// reads go to (or, for a key followed for a callback, than the
+    /// subscription's), whose rows would be served as this one's.
+    fn wrong_database(&self, key: &QueryKey) -> Option<String> {
         let greeting = self.greeting.lock().expect("greeting").clone();
-        let ours = self.shared.cache();
-        let ours = ours.as_ref().and_then(|cache| cache.database());
-        match (greeting, ours) {
+        let ours = match self.shared.listening(key) {
+            Some(listening) => Some(listening.database.clone()),
+            None => self.shared.cache().and_then(|cache| cache.database().cloned()),
+        };
+        match (greeting, ours.as_ref()) {
             (Greeting::Waiting, _) => Some("the engine has not said which database it streams".to_string()),
             (Greeting::Named(theirs), Some(ours)) if theirs != *ours => Some(format!(
                 "the engine streams database `{}` of system {}, but reads here go to `{}` of system {}",
@@ -984,7 +1023,7 @@ impl Worker {
                 }
                 return Outcome::Verdict(self.shared.refused(self.not_connected()));
             }
-            if let Some(reason) = self.wrong_database() {
+            if let Some(reason) = self.wrong_database(key) {
                 drop(state);
                 if held.is_none() {
                     self.shared.release(key, self.index);
@@ -1111,16 +1150,36 @@ impl Worker {
     /// applies to the live store, and no delta lands between taking the
     /// queue and installing the rows.
     fn materialize(&self, id: u64, snapshot: Snapshot) -> Verdict {
+        self.build(id, snapshot, None)
+    }
+
+    /// [`Worker::materialize`], into the store `expected` when one is
+    /// named: a snapshot whose types were looked up off the socket's
+    /// thread is built only if the store it was accepted into is still
+    /// the one held, not after the socket dropped and came back.
+    ///
+    /// A key followed for a callback ([`Shared::listeners`]) is read
+    /// whole, as its subscription's own code reads the engine's rows; its
+    /// store gives the subscription its first rows, or its changes since
+    /// the socket dropped, and the deltas queued meanwhile as changes.
+    fn build(&self, id: u64, snapshot: Snapshot, expected: Option<&Arc<LiveStore>>) -> Verdict {
         let shared = &self.shared;
+        let key = self.state.lock().expect("state").by_id.get(&id).cloned();
+        let listening = key.as_ref().and_then(|key| shared.listening(key));
         let fallback = |reason: String| {
             let mut state = self.state.lock().expect("state");
             state.materialized.remove(&id);
             let since = state.since.get(&id).copied();
             drop(state);
+            if let Some(listening) = &listening {
+                listening.failed(format!("the engine no longer serves the query's rows: {reason}"));
+            }
             shared.fell_back(reason);
             Verdict::Accepted { since }
         };
-        if let Some(table) = self.unreadable(id, &snapshot) {
+        if listening.is_none()
+            && let Some(table) = self.unreadable(id, &snapshot)
+        {
             return fallback(format!(
                 "the reading role may not read `{table}` whole, so its rows come from Postgres"
             ));
@@ -1152,6 +1211,14 @@ impl Worker {
                 "the subscription ended before its rows were built".to_string(),
             );
         };
+        if let Some(expected) = expected
+            && !state
+                .materialized
+                .get(&id)
+                .is_some_and(|held| Arc::ptr_eq(held, expected))
+        {
+            return Verdict::Refused("the engine connection dropped".to_string());
+        }
         let live = Arc::clone(
             state
                 .materialized
@@ -1163,6 +1230,24 @@ impl Worker {
             Store::Building(queued) => std::mem::take(queued),
             Store::Ready(_) => Vec::new(),
         };
+        if let Some(listening) = &listening {
+            if let Err(reason) = listening.built(&materialized) {
+                drop(store);
+                drop(state);
+                return fallback(reason);
+            }
+            for body in queued {
+                listening.apply(&mut materialized, body, apply_delta);
+            }
+            live.weighed
+                .store(materialized.byte_len(), Ordering::Relaxed);
+            *store = Store::Ready(materialized);
+            drop(store);
+            return Verdict::Rows {
+                rows: Arc::from(Vec::new()),
+                live,
+            };
+        }
         for body in queued {
             apply_delta(&mut materialized, body);
         }
@@ -1615,7 +1700,20 @@ fn disconnected(worker: &Worker) {
         *worker.greeting.lock().expect("greeting") = Greeting::Waiting;
         *worker.lag.lock().expect("lag") = None;
         worker.position.store(0, Ordering::Release);
-        state.materialized.clear();
+        for (id, live) in std::mem::take(&mut state.materialized) {
+            let listening = state
+                .by_id
+                .get(&id)
+                .and_then(|key| worker.shared.listening(key));
+            if let Some(listening) = listening
+                && let Store::Ready(materialized) = std::mem::replace(
+                    &mut *live.store.lock().expect("store"),
+                    Store::Building(Vec::new()),
+                )
+            {
+                listening.keep(materialized);
+            }
+        }
         let mut waiting: Vec<SyncSender<Reply>> = Vec::new();
         let mut released: Vec<QueryKey> = Vec::new();
         for (id, reply) in state.pending.drain().collect::<Vec<_>>() {
@@ -1729,7 +1827,7 @@ fn on_accepted(worker: &Worker, mut body: Json) {
         return;
     };
     if !matches!(waiter, Some(Some(_)))
-        && let Some(reason) = worker.wrong_database()
+        && let Some(reason) = worker.wrong_database(&key)
     {
         resubscribed_elsewhere(worker, id, &key, reason);
         return;
@@ -1742,7 +1840,16 @@ fn on_accepted(worker: &Worker, mut body: Json) {
             let _ = reply.try_send(Reply::Verdict(Verdict::Accepted { since }));
         }
         (Some(None) | None, Some(snapshot)) => {
-            if !shared.missing_types(&snapshot).is_empty() {
+            let missing = shared.missing_types(&snapshot);
+            if let Some(listening) = shared.listening(&key) {
+                if missing.is_empty() {
+                    worker.materialize(id, snapshot);
+                } else {
+                    rebuild_off_thread(worker, id, snapshot, missing, listening);
+                }
+                return;
+            }
+            if !missing.is_empty() {
                 let_go(worker, id, &key);
                 return;
             }
@@ -1754,6 +1861,49 @@ fn on_accepted(worker: &Worker, mut body: Json) {
             }
         }
         (Some(None) | None, None) => {}
+    }
+}
+
+/// A key followed for a callback, resubscribed after a reconnect, whose
+/// tables' types were forgotten with the socket: they are looked up on a
+/// connection of the subscription's own, on a thread of its own, while
+/// the deltas queue in the store being built, which is then built from
+/// them. A lookup that fails lets the key go, and the subscription says
+/// why.
+fn rebuild_off_thread(
+    worker: &Worker,
+    id: u64,
+    snapshot: Snapshot,
+    missing: Vec<String>,
+    listening: Arc<Listening>,
+) {
+    let Some(this) = worker.this.upgrade() else {
+        return;
+    };
+    let Some(expected) = worker.state.lock().expect("state").materialized.get(&id).cloned() else {
+        return;
+    };
+    let spawned = thread::Builder::new()
+        .name("streamgres-listen-types".to_string())
+        .spawn(move || {
+            let key = this.state.lock().expect("state").by_id.get(&id).cloned();
+            match listening.lookup_types(&missing) {
+                Ok(types) => {
+                    this.shared.types.lock().expect("types").extend(types);
+                    this.build(id, snapshot, Some(&expected));
+                }
+                Err(reason) => {
+                    listening.failed(reason);
+                    if let Some(key) = key {
+                        let_go(&this, id, &key);
+                    }
+                }
+            }
+        });
+    if spawned.is_err()
+        && let Some(key) = worker.state.lock().expect("state").by_id.get(&id).cloned()
+    {
+        let_go(worker, id, &key);
     }
 }
 
@@ -1771,6 +1921,9 @@ fn resubscribed_elsewhere(worker: &Worker, id: u64, key: &QueryKey, reason: Stri
 /// subscribes it afresh.
 fn let_go(worker: &Worker, id: u64, key: &QueryKey) {
     let shared = &worker.shared;
+    if let Some(listening) = shared.listening(key) {
+        listening.failed("the engine stopped following the query".to_string());
+    }
     {
         let mut state = worker.state.lock().expect("state");
         worker.drop_id(&mut state, id);
@@ -1830,6 +1983,9 @@ fn on_refused(worker: &Worker, body: &Json) {
             let _ = reply.try_send(Reply::Verdict(shared.refused(reason)));
         }
         Some(None) | None => {
+            if let Some(listening) = key.as_ref().and_then(|key| shared.listening(key)) {
+                listening.failed(format!("the engine stopped following the query: {reason}"));
+            }
             if let (Some(key), Some(cache)) = (key, shared.cache()) {
                 cache.touched(&key);
             }
@@ -1854,12 +2010,21 @@ fn on_delta(worker: &Worker, body: Json) {
         };
         (key, state.materialized.get(&id).cloned())
     };
+    let listening = shared.listening(&key);
     let Some(live) = live else {
         if let Some(cache) = shared.cache() {
             cache.touched(&key);
         }
         return;
     };
+    if let Some(listening) = listening {
+        let mut store = live.store.lock().expect("store");
+        match &mut *store {
+            Store::Building(queued) => queued.push(body),
+            Store::Ready(materialized) => listening.apply(materialized, body, apply_delta),
+        }
+        return;
+    }
     let reweigh = {
         let mut store = live.store.lock().expect("store");
         match &mut *store {
@@ -1967,6 +2132,7 @@ mod tests {
             fallbacks: Mutex::new(Vec::new()),
             refusals: Mutex::new(Vec::new()),
             cache: Mutex::new(None),
+            listeners: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
         });
         let (worker, outgoing) = Worker::new(
@@ -2050,6 +2216,138 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         handle
+    }
+
+    /// An `accepted` for `id` carrying `rows` of `t`.
+    fn accepted_holding(id: u64, rows: Json) -> String {
+        let mut frame: Json = serde_json::from_str(&accepted_with_rows(id)).unwrap();
+        frame[1]["nodes"][0]["rows"] = rows;
+        frame.to_string()
+    }
+
+    /// A `delta` for `id` with `put` rows and `del` keys of `t`.
+    fn delta_of(id: u64, put: Json, del: Json) -> String {
+        json!(["delta", {"id": id, "changes": [{"table": "t", "put": put, "del": del}]}]).to_string()
+    }
+
+    /// `key()` followed for a callback, through `listening`, its tables'
+    /// types known.
+    fn listened(shared: &Shared, url: &str) -> Arc<Listening> {
+        shared.types.lock().unwrap().insert("t".to_string(), t_types());
+        let listening = Listening::new(
+            url.to_string(),
+            crate::cache::Database {
+                system: "1".to_string(),
+                name: "test".to_string(),
+            },
+        );
+        shared
+            .listeners
+            .lock()
+            .unwrap()
+            .insert(key(), Arc::clone(&listening));
+        listening
+    }
+
+    /// A subscription's changes: its first rows as present, then each
+    /// delta's rows as added, updated and removed; after a reconnect,
+    /// what differs between the result before and the engine's new
+    /// snapshot. Its store never reaches a cache.
+    #[test]
+    fn a_listened_query_hands_its_changes_over() {
+        use crate::listen::Change;
+        let (worker, _outgoing, shared) = worker();
+        let listening = listened(&shared, "postgres://unused");
+        let changes = || listening.take::<(Integer, Text), (i32, String)>();
+        let handle = subscribing(&worker);
+        inbound(&worker, &accepted_with_rows(1));
+        let Outcome::Verdict(Verdict::Rows { .. }) = handle.join().unwrap() else {
+            panic!("rows mode");
+        };
+        assert_eq!(changes(), vec![Change::Present((1, "a".into()))]);
+
+        inbound(&worker, &delta(1));
+        inbound(&worker, &delta_of(1, json!([{"id": 1, "name": "z"}]), json!([])));
+        inbound(&worker, &delta_of(1, json!([]), json!([{"id": 2}])));
+        assert_eq!(
+            changes(),
+            vec![
+                Change::Added((2, "b".into())),
+                Change::Updated {
+                    old: (1, "a".into()),
+                    new: (1, "z".into())
+                },
+                Change::Removed((2, "b".into())),
+            ]
+        );
+
+        disconnected(&worker);
+        worker.up();
+        greeted(&worker);
+        shared.types.lock().unwrap().insert("t".to_string(), t_types());
+        inbound(
+            &worker,
+            &accepted_holding(1, json!([{"id": 1, "name": "y"}, {"id": 3, "name": "c"}])),
+        );
+        assert_eq!(
+            changes(),
+            vec![
+                Change::Updated {
+                    old: (1, "z".into()),
+                    new: (1, "y".into())
+                },
+                Change::Added((3, "c".into())),
+            ],
+            "the difference across the reconnect"
+        );
+        inbound(&worker, &delta_of(1, json!([]), json!([{"id": 3}])));
+        assert_eq!(changes(), vec![Change::Removed((3, "c".into()))], "followed again");
+    }
+
+    /// A subscription is checked against the database it was rendered
+    /// on, whatever a cache's is: an engine streaming another is not
+    /// asked.
+    #[test]
+    fn a_listened_query_is_not_asked_of_an_engine_on_another_database() {
+        let hello = |system: &str, name: &str| json!({"database": {"system": system, "name": name}});
+        let (worker, mut outgoing, shared) = worker();
+        listened(&shared, "postgres://unused");
+        on_hello(&worker, &hello("1", "elsewhere"));
+        let Outcome::Verdict(Verdict::Refused(reason)) = worker.subscribe(&key()) else {
+            panic!("refused");
+        };
+        assert!(reason.contains("reads here go to `test` of system 1"), "{reason}");
+        assert!(outgoing.try_recv().is_err(), "the engine was not asked");
+        on_hello(&worker, &hello("1", "test"));
+        assert!(worker.wrong_database(&key()).is_none());
+    }
+
+    /// After a reconnect, a subscription whose tables' types were
+    /// forgotten looks them up on its own connection; one that cannot
+    /// lets the key go and says why, rather than stopping silently.
+    #[test]
+    fn a_listened_query_that_cannot_relearn_its_types_says_so() {
+        let (worker, _outgoing, shared) = worker();
+        let listening = listened(&shared, "postgresql://nobody@127.0.0.1:1/none");
+        let handle = subscribing(&worker);
+        inbound(&worker, &accepted_with_rows(1));
+        let Outcome::Verdict(Verdict::Rows { .. }) = handle.join().unwrap() else {
+            panic!("rows mode");
+        };
+        disconnected(&worker);
+        worker.up();
+        greeted(&worker);
+        inbound(&worker, &accepted_with_rows(1));
+        let started = Instant::now();
+        while worker.state.lock().unwrap().by_key.contains_key(&key()) {
+            assert!(started.elapsed() < Duration::from_secs(10), "never let go");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let errors = listening.errors();
+        assert!(
+            errors.iter().any(|error| error.contains("connecting to look the column types up")),
+            "{errors:?}"
+        );
     }
 
     /// The reader thread handles `accepted` and a delta back to back;
@@ -2361,9 +2659,9 @@ mod tests {
         assert!(outgoing.try_recv().is_err(), "the engine was not asked");
 
         on_hello(&worker, &json!({}));
-        assert!(worker.wrong_database().is_none(), "an engine naming no database is trusted");
+        assert!(worker.wrong_database(&key()).is_none(), "an engine naming no database is trusted");
         on_hello(&worker, &hello(&ours.system, &ours.name));
-        assert!(worker.wrong_database().is_none());
+        assert!(worker.wrong_database(&key()).is_none());
         let handle = subscribing(&worker);
         inbound(&worker, &json!(["accepted", {"id": 1}]).to_string());
         assert!(matches!(handle.join().unwrap(), Outcome::Verdict(Verdict::Accepted { .. })));
@@ -2545,7 +2843,7 @@ mod tests {
             "{reason}"
         );
         assert!(!client.refusal_is_final(&reason));
-        match client.subscribe(&key()) {
+        match Subscriptions::subscribe(&client, &key()) {
             Outcome::Verdict(Verdict::Refused(refused)) => assert_eq!(refused, reason),
             _ => panic!("expected a refusal"),
         }

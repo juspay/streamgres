@@ -41,6 +41,28 @@ diesel_streamgres::install(Settings::single(
 //   conn.with_route(Route::Streamgres, |c| configs::table.find(key).first(c))
 ```
 
+## Callbacks on changes
+
+The same `EngineClient` calls back when a query's result changes, which
+makes a webhook on any query one subscription:
+
+```rust
+let subscription = engine
+    .subscribe(&database_url, payments::table.filter(payments::status.eq("SUCCESS")),
+        |change: Change<Payment>| async move {
+            if let Change::Added(payment) = change {
+                notify_merchant(&payment).await;
+            }
+        })
+    .await?;
+```
+
+The callback first gets `Change::Present` for each row already there.
+Then, per commit, it gets `Added`, `Updated { old, new }` and `Removed`,
+whoever made the change. It runs one change at a time. After a lost
+engine connection, the difference is delivered. See
+[`docs/backends.md`](../../docs/backends.md), section 7.
+
 ## The engine in this process
 
 With the `embedded` feature, `EngineClient::from_env()` runs the engine
@@ -70,7 +92,7 @@ local setup):
 ```sh
 STREAMGRES_S2S_URL=ws://127.0.0.1:4848/zero/s2s/v1 \
 DATABASE_URL=postgres://sg@127.0.0.1:5434/sg \
-cargo test --test engine_live
+cargo test --test engine_live --test listen_live
 ```
 
 ```sh

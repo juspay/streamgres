@@ -7,6 +7,7 @@ that uses Diesel, through the `diesel-streamgres` wrapper:
 - reading from replicas
 - read-your-writes
 - who a cached answer is for
+- callbacks on a query's changes (webhooks)
 - what to watch
 
 The wrapper itself (routing, the cache, what is served from rows and what
@@ -36,7 +37,7 @@ process count:
 - About 7 to 10% of a core of walsender CPU on the database per engine at
   1,000 transactions a second.
 - Each process holds its own copy of the rows its queries follow, and
-  spends its own CPU applying every change to them (section 8).
+  spends its own CPU applying every change to them (section 9).
 
 **The S2S server is for anything larger.** Backend processes scale out
 freely and add no slots: only the engine servers hold them, so the cost on
@@ -321,7 +322,69 @@ reasons:
 - another database than the cache's
 - a 65th identity
 
-## 7. What to watch
+## 7. Callbacks on a query's changes
+
+The engine that keeps the cache fresh can also call back when a query's
+result changes. A webhook on any query is one subscription:
+
+```rust
+let subscription = engine
+    .subscribe(&database_url, payments::table.filter(payments::status.eq("SUCCESS")),
+        |change: Change<Payment>| async move {
+            if let Change::Added(payment) = change {
+                notify_merchant(&payment).await;
+            }
+        })
+    .await?;
+// Changes are delivered while `subscription` lives; drop it to stop.
+```
+
+- **What arrives.** First `Change::Present` for each row the result
+  holds. The engine is given up to the verdict timeout to receive every
+  commit made before the call. Then, per commit and in commit order:
+  - `Added` for a row that entered the result
+  - `Updated { old, new }` for one that changed and stayed
+  - `Removed` for one that left
+
+  A row is a row of the result: one table row, or one composition of a
+  join. Whoever wrote the change does not matter: another service, a
+  migration, `psql`.
+- **One at a time.** The callback's future is awaited before the next
+  change is given. It runs on the runtime `subscribe` was called on.
+- **Behind and back.** Changes that pile up past 10,000 waiting are
+  kept as their net effect per row until the callback catches up
+  (`Subscription::lagged()` counts it). When the engine connection
+  drops and returns (an engine restart, a network failure), the result
+  before is compared with the engine's fresh one. The difference
+  arrives as changes. Nothing is missed, but a row that came and went
+  while the connection was down is not reported.
+- **Not across processes.** A new subscription starts from
+  `Change::Present`, so a process that restarts reconciles from there.
+  Deliver idempotently: a callback cut short by a restart is not
+  replayed.
+- **What can be subscribed.** Any query the engine serves from its own
+  rows:
+  - a single-table query without `LIMIT` is followed change by change,
+    whatever its size
+  - a join, a `LIMIT` or a `COUNT` is compared whole after each commit,
+    so keep those results small
+
+  `subscribe` returns an error, with the reason, for:
+  - a query the engine refuses
+  - one it only follows by refills (a column type it cannot encode)
+  - an engine streaming another database than `database_url`
+  - a table shadowed on the search path
+- **Privileges.** The rows are read with the engine's role, as an S2S
+  connection's are. Section 6's per-reader checks do not apply. The
+  subscription is the backend's own code, and a table with row-level
+  security is refused.
+- **Cost.** One subscription against the engine's cap (`subscribed()`)
+  and one copy of the result in memory. The connection to
+  `database_url` only renders the query and reads its column types. It
+  is closed when `subscribe` returns, and opened again only to relearn
+  the types after a reconnect.
+
+## 8. What to watch
 
 - **`Cache::stats`**, per cache: `hits`, `misses`, `replaced` (rows the
   engine's deltas changed), `touched` (refills a change caused),
@@ -334,12 +397,15 @@ reasons:
   `materialized()` (queries served from rows), `fallbacks()` and
   `refusals()` (recent reasons), `warnings()` (configuration worth a log
   line at startup).
+- **`Subscription`**, per callback subscription: `errors()` (a row that
+  would not decode, a value that cannot be encoded, a reconnect whose
+  types could not be looked up) and `lagged()`.
 - **Embedded**: `Engine::state()` and `Engine::states()` (a watch), and
   `Engine::slot()`, the slot it streams from.
 - **On the database**: `pg_replication_slots` and walsender counts
   against their limits, above all in embedded mode.
 
-## 8. Measured on one machine
+## 9. Measured on one machine
 
 Local PostgreSQL 17, the engine and the backend on one host:
 

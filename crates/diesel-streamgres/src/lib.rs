@@ -36,6 +36,14 @@
 //! and when the engine reports the query touched they are dropped and the
 //! next read refills them. Every other read goes to Postgres as before.
 //!
+//! # Callbacks on changes
+//!
+//! The same engine calls back on a query's changes:
+//! [`EngineClient::subscribe`](engine::EngineClient::subscribe) takes a
+//! Diesel query and an async callback, and gives it each row present,
+//! then each row added, updated or removed, per commit, whoever wrote it
+//! ([`listen`]). A webhook on any query is one subscription.
+//!
 //! # Why the opt-in feature
 //!
 //! Diesel seals `Connection` behind the cargo feature
@@ -50,6 +58,7 @@ pub mod cursor;
 pub mod encode;
 pub mod engine;
 pub mod key;
+pub mod listen;
 pub mod materialized;
 pub mod route;
 pub mod row;
@@ -80,6 +89,7 @@ use crate::cache::{
 use crate::session::{Effect, RECHECK_EVERY, Scope, SessionChanges};
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
+pub use crate::listen::{Change, Subscription, SubscribeError};
 pub use crate::route::{Route, RouteDsl, Served, Via};
 /// The engine inside this process ([`engine::EngineClient::embedded`]):
 /// its handle, its configuration and the SQL that sets a database up

@@ -467,44 +467,108 @@ impl Materialized {
 
     /// The result built from the rows held now.
     fn build(&self) -> Result<Arc<[OwnedRow]>, Unsupported> {
+        Ok(self
+            .keyed()?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>()
+            .into())
+    }
+
+    /// The result, each row with its identity: the primary keys of the
+    /// table rows it was composed from (a NULL-extended table marked as
+    /// such), so a row keeps its identity while its values change and no
+    /// two rows of one result share one. A count is one row, of one
+    /// identity.
+    pub fn keyed(&self) -> Result<Vec<(String, OwnedRow)>, Unsupported> {
         let combos = self.assemble();
         let limit = self.limit.unwrap_or(usize::MAX);
-        let pairs = match &self.projection {
-            Projection::Count => {
-                let count = OwnedValue::new(
-                    std::num::NonZeroU32::new(20).expect("int8"),
-                    (combos.len() as i64).to_be_bytes().to_vec(),
-                );
-                let row = OwnedRow::new(Arc::clone(&self.columns), vec![Some(count)]);
-                return Ok(std::iter::once(row)
-                    .skip(self.offset)
-                    .take(limit)
-                    .collect::<Vec<_>>()
-                    .into());
-            }
-            Projection::Columns(pairs) => pairs,
-        };
+        if let Projection::Count = &self.projection {
+            let count = OwnedValue::new(
+                std::num::NonZeroU32::new(20).expect("int8"),
+                (combos.len() as i64).to_be_bytes().to_vec(),
+            );
+            let row = OwnedRow::new(Arc::clone(&self.columns), vec![Some(count)]);
+            return Ok(std::iter::once((String::new(), row))
+                .skip(self.offset)
+                .take(limit)
+                .collect());
+        }
         combos
             .into_iter()
             .skip(self.offset)
             .take(limit)
-            .map(|combo| {
-                let values = pairs
-                    .iter()
-                    .map(|&(node, column)| {
-                        let column = &self.nodes[node].types.columns[column];
-                        match combo[node] {
-                            Some(row) => {
-                                encode(row.get(&column.name).unwrap_or(&Json::Null), column)
-                            }
-                            None => Ok(None),
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(OwnedRow::new(Arc::clone(&self.columns), values))
+            .map(|combo| Ok((self.identity(&combo), self.project(&combo)?)))
+            .collect()
+    }
+
+    /// Whether the result is the root table's rows alone, uncut: one
+    /// table, no `LIMIT` or `OFFSET`, not a count. A change of such a
+    /// result is the change of the rows the engine ships, which
+    /// [`Materialized::root_row`] and [`Materialized::project_root`] read
+    /// without building it.
+    pub fn is_plain(&self) -> bool {
+        self.nodes.len() == 1
+            && self.limit.is_none()
+            && self.offset == 0
+            && matches!(self.projection, Projection::Columns(_))
+    }
+
+    /// The identity, in [`Materialized::keyed`]'s terms, of the root
+    /// table's row with these key columns (a row, or the key object a
+    /// delete names); `None` for another table's.
+    pub fn root_identity(&self, table: &str, object: &Json) -> Option<String> {
+        (self.nodes[0].table == table).then(|| {
+            let mut identity = self.key_of(0, object);
+            identity.push('\u{1e}');
+            identity
+        })
+    }
+
+    /// The root table's row held under `identity`.
+    pub fn root_row(&self, identity: &str) -> Option<&Json> {
+        let key = identity.strip_suffix('\u{1e}')?;
+        self.nodes[0].rows.get(key)
+    }
+
+    /// A root table's row as the result's row, for a plain result
+    /// ([`Materialized::is_plain`]).
+    pub fn project_root(&self, row: &Json) -> Result<OwnedRow, Unsupported> {
+        self.project(&[Some(row)])
+    }
+
+    /// One result row's identity: each table's key, or a mark for a
+    /// table the row has no row of, each closed by U+001E.
+    fn identity(&self, combo: &[Option<&Json>]) -> String {
+        let mut identity = String::new();
+        for (node, row) in combo.iter().enumerate() {
+            if let Some(row) = row {
+                identity.push_str(&self.key_of(node, row));
+            } else {
+                identity.push('\u{1f}');
+            }
+            identity.push('\u{1e}');
+        }
+        identity
+    }
+
+    /// One result row: the projected columns of `combo`'s table rows,
+    /// each encoded for its type.
+    fn project(&self, combo: &[Option<&Json>]) -> Result<OwnedRow, Unsupported> {
+        let Projection::Columns(pairs) = &self.projection else {
+            return Err(Unsupported("a count has no rows to project".to_string()));
+        };
+        let values = pairs
+            .iter()
+            .map(|&(node, column)| {
+                let column = &self.nodes[node].types.columns[column];
+                match combo.get(node).copied().flatten() {
+                    Some(row) => encode(row.get(&column.name).unwrap_or(&Json::Null), column),
+                    None => Ok(None),
+                }
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Arc::from)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(OwnedRow::new(Arc::clone(&self.columns), values))
     }
 
     /// The joined rows: one entry per result row, holding each table's

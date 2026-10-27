@@ -819,7 +819,10 @@ impl Cache {
             }
         }
         let id = contexts.next;
-        contexts.next = contexts.next.checked_add(1)?;
+        if id >= crate::listen::LISTENING_BASE {
+            return None;
+        }
+        contexts.next += 1;
         if let Some(retired) = contexts.by_identity.insert(identity, id) {
             contexts.by_id.remove(&retired);
         }
