@@ -47,7 +47,7 @@
 //! slot, which resumes after the last position the server had confirmed.
 //! A server that cannot be asked proves nothing, and the feed waits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -305,8 +305,16 @@ impl Decoder {
         if !message.is_update() {
             return Ok(());
         }
-        let classified =
-            ddl::classify(&self.catalog, &source.schemas, &message).map_err(|reason| {
+        let fresh: HashSet<String> = self
+            .changes
+            .iter()
+            .filter_map(|change| match change {
+                SchemaChange::TableAdded { table } => Some(table.name.as_str().to_owned()),
+                _ => None,
+            })
+            .collect();
+        let classified = ddl::classify_in(&self.catalog, &source.schemas, &message, &fresh)
+            .map_err(|reason| {
                 StorageError(format!(
                     "schema change at {at} ({}) the server cannot follow: {reason}; the server stops here and, restarted, serves the schema as it is now",
                     message.tag()

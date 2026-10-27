@@ -322,6 +322,23 @@ pub fn classify(
     schemas: &[String],
     message: &DdlMessage,
 ) -> Result<Classified, String> {
+    classify_in(catalog, schemas, message, &HashSet::new())
+}
+
+/// [`classify`], within a transaction that has already added the tables
+/// named in `fresh`. Row-level security turned off is a change the
+/// engine follows: nothing of the table was served. Turned on for a table
+/// of `fresh`, as a migration that creates it then secures it does, it
+/// is one too: nothing can have subscribed to a table the transaction
+/// has not yet committed. Turned on for any other served table it stops
+/// the server, which restarts knowing it, so no change of the table made
+/// after it reaches a backend.
+pub fn classify_in(
+    catalog: &Catalog,
+    schemas: &[String],
+    message: &DdlMessage,
+    fresh: &HashSet<String>,
+) -> Result<Classified, String> {
     let Some(after) = &message.schema else {
         return Ok(Classified {
             changes: Vec::new(),
@@ -367,8 +384,14 @@ pub fn classify(
                 if let Some(secured) = table.row_security
                     && secured != catalog.is_row_secured(&held.name)
                 {
-                    let turned = if secured { "enabled" } else { "disabled" };
-                    return Err(format!("row-level security was {turned} on `{name}`"));
+                    if secured && !fresh.contains(&name) {
+                        return Err(format!("row-level security was enabled on `{name}`"));
+                    }
+                    catalog_now = with_row_security(&catalog_now, &held.name, secured);
+                    changes.push(SchemaChange::RowSecurity {
+                        table: held.name.clone(),
+                        secured,
+                    });
                 }
                 for change in column_changes(held, table)? {
                     if let SchemaChange::ColumnAdded { column, .. } = &change
@@ -689,8 +712,9 @@ mod tests {
         assert!(bytewise.bytewise_default(), "carried into the next catalog");
     }
 
-    /// Row-level security turned on or off on a served table stops the
-    /// engine, to start over on a catalog that knows it. A table created
+    /// Row-level security turned on for a served table stops the engine,
+    /// to start over on a catalog that knows it, unless the transaction
+    /// created the table; turned off, the catalog follows. A table created
     /// while serving is held to be secured unless its message says
     /// otherwise, as one from an older trigger stack does not.
     #[test]
@@ -706,10 +730,22 @@ mod tests {
         let stopped = classify(&catalog(), &schemas, &enabled).map(drop).unwrap_err();
         assert!(stopped.contains("row-level security"), "{stopped}");
 
+        let fresh: HashSet<String> = ["tickets".to_owned()].into();
+        let created = classify_in(&catalog(), &schemas, &enabled, &fresh).expect("followed");
+        assert!(created.catalog.is_row_secured(&name), "secured as it was created");
+        assert!(matches!(
+            created.changes.as_slice(),
+            [SchemaChange::RowSecurity { secured: true, .. }]
+        ));
+
         let was = catalog().with_row_secured([name.clone()]);
         let disabled = message(&tickets, &secured(tickets.clone(), "false"));
-        let stopped = classify(&was, &schemas, &disabled).map(drop).unwrap_err();
-        assert!(stopped.contains("disabled"), "{stopped}");
+        let opened = classify(&was, &schemas, &disabled).expect("followed");
+        assert!(!opened.catalog.is_row_secured(&name), "turned off: forgotten");
+        assert!(matches!(
+            opened.changes.as_slice(),
+            [SchemaChange::RowSecurity { secured: false, .. }]
+        ));
         let unchanged = message(&tickets, &secured(tickets.clone(), "true"));
         let kept = classify(&was, &schemas, &unchanged).expect("classified").catalog;
         assert!(kept.is_row_secured(&name), "still secured: nothing to do");

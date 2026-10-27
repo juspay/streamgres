@@ -206,7 +206,10 @@ restart. Re-run the setup SQL to update an older stack.
 **Row-level security is never served.** The engine reads as its own role and
 cannot apply a backend's policies, so the S2S endpoint refuses any query over a
 table with row-level security enabled, and the backend reads Postgres. Turning
-it on or off on a served table stops the server, which restarts knowing it. A
+it off, or on in the transaction that creates the table (a migration's usual
+`CREATE TABLE …; ALTER TABLE … ENABLE ROW LEVEL SECURITY`), is followed as it
+commits. Turning it on for a table served before stops the server, which
+restarts knowing it, so no change made after it reaches a backend. A
 table created while serving is taken as secured unless the trigger stack says
 otherwise, which a stack older than `rowSecurity` in its messages does not; such
 a stack also misses row-level security turned on while serving. The server

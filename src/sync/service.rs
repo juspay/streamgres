@@ -626,7 +626,9 @@ where
         for change in changes {
             let table = match change {
                 SchemaChange::TableAdded { table } => &table.name,
-                SchemaChange::ColumnAdded { table, .. } => table,
+                SchemaChange::ColumnAdded { table, .. } | SchemaChange::RowSecurity { table, .. } => {
+                    table
+                }
             };
             if !touched.contains(table) {
                 touched.push(table.clone());

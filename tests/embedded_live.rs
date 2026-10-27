@@ -321,8 +321,10 @@ fn a_permanent_slot_keeps_the_engine_serving_through_a_dropped_feed() {
 }
 
 /// A table with row-level security is refused: the engine reads as its
-/// own role and cannot apply a backend's policies. Turned on or off on a
-/// served table, the engine starts over on a catalog that knows it.
+/// own role and cannot apply a backend's policies. Turned on for a served
+/// table, the engine starts over on a catalog that knows it; turned off,
+/// or turned on in the transaction that creates a table, the engine
+/// follows it without starting over.
 #[test]
 fn a_table_with_row_level_security_is_refused() {
     let Some(dsn) = dsn("rls") else { return };
@@ -362,31 +364,57 @@ fn a_table_with_row_level_security_is_refused() {
         let open = format!(r#"SELECT "id", "name" FROM "{table}""#);
         assert_eq!(subscribe(&mut session, 2, &open).await[0], "accepted");
 
-        let mut id = 3;
-        for (change, answer) in [("ENABLE", "refused"), ("DISABLE", "accepted")] {
-            let before = engine.slot().expect("a slot while it serves");
-            client
-                .batch_execute(&format!("ALTER TABLE {table} {change} ROW LEVEL SECURITY"))
-                .await
-                .expect("row security changed");
-            let ended = tokio::time::timeout(Duration::from_secs(10), async {
-                while session.recv().await.is_some() {}
-            })
-            .await;
-            assert!(ended.is_ok(), "{change}: the engine starts over, ending its sessions");
-            // The old engine may still say it serves while it stops: wait
-            // for the fresh one, on a slot of its own.
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while engine.state() != State::Serving || engine.slot().is_none_or(|slot| slot == before) {
-                assert!(Instant::now() < deadline, "{change}: no fresh engine; {:?}", engine.state());
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            session = engine.connect().expect("a session on the fresh engine");
-            assert_eq!(next(&mut session).await.expect("hello")[0], "hello");
-            let got = subscribe(&mut session, id, &open).await;
-            assert_eq!(got[0], answer, "{change}: {got}");
-            id += 1;
+        let before = engine.slot().expect("a slot while it serves");
+        client
+            .batch_execute(&format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"))
+            .await
+            .expect("secure the served table");
+        let ended = tokio::time::timeout(Duration::from_secs(10), async {
+            while session.recv().await.is_some() {}
+        })
+        .await;
+        assert!(ended.is_ok(), "the engine starts over, ending its sessions");
+        // The old engine may still say it serves while it stops: wait for
+        // the fresh one, on a slot of its own.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while engine.state() != State::Serving || engine.slot().is_none_or(|slot| slot == before) {
+            assert!(Instant::now() < deadline, "no fresh engine; {:?}", engine.state());
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        let mut session = engine.connect().expect("a session on the fresh engine");
+        assert_eq!(next(&mut session).await.expect("hello")[0], "hello");
+        assert_eq!(subscribe(&mut session, 3, &open).await[0], "refused", "known once started over");
+
+        let serving = engine.slot();
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE {table} DISABLE ROW LEVEL SECURITY;
+                 BEGIN;
+                 CREATE TABLE secured_later (id int8 PRIMARY KEY, tenant text NOT NULL);
+                 ALTER TABLE secured_later ENABLE ROW LEVEL SECURITY;
+                 COMMIT;"
+            ))
+            .await
+            .expect("open one table, create and secure another");
+        let later = r#"SELECT "id", "tenant" FROM "secured_later""#;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut id = 4;
+        let reason = loop {
+            let opened = subscribe(&mut session, id, &open).await;
+            let created = subscribe(&mut session, id + 1, later).await;
+            id += 2;
+            if opened[0] == "accepted" && created[0] == "refused" {
+                let reason = created[1]["reason"].as_str().unwrap_or_default().to_owned();
+                if reason.contains("row-level security") {
+                    break reason;
+                }
+            }
+            assert!(Instant::now() < deadline, "not followed: {opened} {created}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(reason.contains("secured_later"), "{reason}");
+        assert_eq!(engine.slot(), serving, "followed without starting over");
+        assert_eq!(engine.state(), State::Serving);
         let stopping = engine.clone();
         tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
     });
