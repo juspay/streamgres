@@ -299,7 +299,9 @@ depend on what the defaults happen to be:
 | `STREAMGRES_GROUP_LOG_BYTES` | `262144` | recent updates kept per client group, so a briefly disconnected tab catches up instead of starting over. `0` keeps none |
 | `STREAMGRES_MAX_MESSAGE_BYTES` | `16777216` | largest message accepted from a client |
 | `STREAMGRES_BYTES_PER_PART` | `768000` | bytes of serialized row changes per message part (750 KiB) |
-| `STREAMGRES_S2S_TOKEN` | none | secret a backend must send as `Authorization: Bearer <token>` to open the S2S endpoint. Unset, the endpoint takes any connection |
+| `STREAMGRES_S2S_TOKEN` | none | secret a backend must send as `Authorization: Bearer <token>` to open the S2S endpoint; a comma-separated list while one is rotated, each at least 16 bytes. Unset, there is no S2S endpoint |
+| `STREAMGRES_S2S_ADDR` | none | a listener of the S2S endpoint's own; set, the client port has no S2S route |
+| `STREAMGRES_S2S_ALLOW_NO_TOKEN` | `false` | serve the S2S endpoint to anyone; development only |
 | `STREAMGRES_S2S_MAX_CONNECTIONS` | `64` | S2S connections open at once; past it an upgrade is answered `503`. Each backend process opens `STREAMGRES_S2S_CONNECTIONS` (2), so 64 serves 32 processes. `0` lifts the limit |
 | `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` | `10000` | subscriptions one S2S connection may hold; past it a subscribe is refused. The engine announces it, and the client stops short of it. `0` lifts the limit |
 | `STREAMGRES_HEARTBEAT_MS` | `500` | how often the engine writes a heartbeat into the WAL (`pg_logical_emit_message`, not transactional) and measures how long its stream takes to bring it back. S2S clients are told that lag and read Postgres past their `STREAMGRES_S2S_MAX_LAG_MS`. Needs `STREAMGRES_PG_DSN` to reach a primary; `0` turns it off |
@@ -313,18 +315,31 @@ depend on what the defaults happen to be:
 
 ## 6. Ports, probes and shutdown
 
-- **One port, 4848.** It serves:
+- **One port, 4848, and an optional private one.** It serves:
   - the WebSocket at `<base path>/sync/v51/connect`
   - the server-to-server WebSocket at `<base path>/s2s/v1`, for backends
-    that cache their own reads
+    that cache their own reads, only when `STREAMGRES_S2S_TOKEN` is set
   - `/health`, `/metrics` and `/stats`
 
-  Keep `/metrics` and `/stats` private. Do the same for `/s2s/v1`, and
-  set `STREAMGRES_S2S_TOKEN`. The endpoint carries no user: anyone who
-  can open it can subscribe to the rows of every table the engine
-  follows. The server speaks plain `ws://`, so the token crosses the
-  network as text: terminate TLS in front of it (an ingress, a mesh,
-  a sidecar) unless the backends share a private network with it. The
+  Keep `/metrics` and `/stats` private.
+- **The S2S endpoint reads with the engine's privileges.** It carries no
+  user: whoever opens it can subscribe to the rows of every table the
+  engine follows, every column of them. So:
+  - It is off unless `STREAMGRES_S2S_TOKEN` is set, and then admits only
+    that bearer token. Use a random one (`openssl rand -hex 32`); the
+    server refuses one under 16 bytes. To rotate, set
+    `new-token,old-token`, roll the backends over to the new one, then
+    drop the old.
+  - Set `STREAMGRES_S2S_ADDR` (say `10.0.0.5:4849`) to serve it on a
+    listener of its own, on a network only the backends reach, and keep
+    it off the client port altogether. A network policy admitting only
+    the backends' pods to that port is the second lock.
+  - The server speaks plain `ws://`, so the token crosses the network as
+    text: terminate TLS in front of it (an ingress, a mesh, a sidecar)
+    unless the backends share a private network with it.
+  - `STREAMGRES_S2S_ALLOW_NO_TOKEN=true` serves it to anyone, with a
+    warning at startup. It is for development on a machine no one else
+    reaches. The
   two S2S limits multiply: at most `STREAMGRES_S2S_MAX_CONNECTIONS` ×
   `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` subscriptions in all. Each
   S2S connection queues at most 4,096 frames and 64 MiB of them for a

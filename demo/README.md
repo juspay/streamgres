@@ -15,7 +15,7 @@ stats page, or walk through it with curl. If a port is taken on your
 machine, override it: `DEMO_PORT=8081 ENGINE_PORT=4850
 POSTGRES_PORT=5435 docker compose -f demo/docker-compose.yml up --build`.
 Every port is published on this machine only, and the engine's S2S
-endpoint asks for a token (`STREAMGRES_S2S_TOKEN`, `demo-token` unless
+endpoint asks for a token (`STREAMGRES_S2S_TOKEN`, `demo-token-not-for-production` unless
 set): the stack holds a well-known database password.
 
 ## 1. A read, twice

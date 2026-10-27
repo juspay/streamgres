@@ -35,7 +35,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use super::ast::{self, Ast, Translated};
 use super::backend::{Backend, Identity, PushOutcome, TransformOutcome};
-use super::config::Config;
+use super::config::{Config, S2sAccess};
 use super::groups::{ConnectReply, DesiredOp, MutationResult, Outbound, Request, Socket};
 use super::plan::{self, PlanCache};
 use super::protocol::{
@@ -144,23 +144,39 @@ struct ConnectParams {
 /// once queries are served), and
 /// the server's measurements (`/stats`; `?reset=1` also zeroes the
 /// histograms after reading them, so a load run measures itself alone).
+/// The S2S endpoint is among them when it is on and has no listener of
+/// its own ([`s2s_router`]).
 pub fn router(state: Arc<AppState>) -> Router {
     let base = state.config.base_path.clone();
-    let mut router =
-        Router::new()
-            .route(&format!("{base}/sync/v{{version}}/connect"), get(connect))
-            .route(&format!("{base}/s2s/v1"), get(super::s2s::connect));
-    for probe in ["health", "healthz", "readyz"] {
-        router = router
-            .route(&format!("{base}/{probe}"), get(health))
-            .route(&format!("/{probe}"), get(health));
+    let mut router = Router::new().route(&format!("{base}/sync/v{{version}}/connect"), get(connect));
+    if state.config.s2s_access != S2sAccess::Off && state.config.s2s_bind.is_none() {
+        router = router.route(&format!("{base}/s2s/v1"), get(super::s2s::connect));
     }
+    router = with_probes(router, &base);
     if state.config.admin_endpoints {
         router = router
             .route("/stats", get(stats))
             .route("/metrics", get(metrics));
     }
     router.with_state(state)
+}
+
+/// The routes of the S2S endpoint's own listener (`STREAMGRES_S2S_ADDR`):
+/// the endpoint and the health checks.
+pub fn s2s_router(state: Arc<AppState>) -> Router {
+    let base = state.config.base_path.clone();
+    let router = Router::new().route(&format!("{base}/s2s/v1"), get(super::s2s::connect));
+    with_probes(router, &base).with_state(state)
+}
+
+/// `router` with the health checks, under the base path and at the root.
+fn with_probes(mut router: Router<Arc<AppState>>, base: &str) -> Router<Arc<AppState>> {
+    for probe in ["health", "healthz", "readyz"] {
+        router = router
+            .route(&format!("{base}/{probe}"), get(health))
+            .route(&format!("/{probe}"), get(health));
+    }
+    router
 }
 
 /// The server's measurements in Prometheus exposition format.
@@ -231,6 +247,37 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
         "listening on http://{address}{}/sync/v{PROTOCOL_VERSION}/connect",
         state.config.base_path
     );
+    let s2s = match &state.config.s2s_bind {
+        Some(address) => Some(
+            tokio::net::TcpListener::bind(address)
+                .await
+                .map_err(|error| format!("binding the S2S listener {address}: {error}"))?
+                .tap_io(|socket| {
+                    if let Err(error) = socket.set_nodelay(true) {
+                        log_warn!("TCP_NODELAY could not be set on an S2S socket: {error}");
+                    }
+                }),
+        ),
+        None => None,
+    };
+    match (state.config.s2s_listener(), &state.config.s2s_access) {
+        (None, _) => log_info!(
+            "the S2S endpoint is off: set STREAMGRES_S2S_TOKEN to serve it"
+        ),
+        (Some(address), S2sAccess::Open) => log_warn!(
+            "the S2S endpoint at http://{address}{}/s2s/v1 takes any connection (STREAMGRES_S2S_ALLOW_NO_TOKEN): whoever reaches it reads every followed table with the engine's privileges",
+            state.config.base_path
+        ),
+        (Some(address), _) => log_info!(
+            "S2S endpoint at http://{address}{}/s2s/v1, for bearer tokens only",
+            state.config.base_path
+        ),
+    }
+    let s2s_serving = s2s.map(|listener| {
+        let stopping = state.shutdown.clone();
+        axum::serve(listener, s2s_router(Arc::clone(&state)))
+            .with_graceful_shutdown(async move { stopping.wait().await })
+    });
     let warm = state.warm.clone();
     let shutdown = state.shutdown.clone();
     let serving_shutdown = shutdown.clone();
@@ -249,8 +296,15 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
         shutdown.wait().await;
         tokio::time::sleep(DRAIN_GRACE).await;
     };
+    let s2s_serving = async move {
+        match s2s_serving {
+            Some(serving) => serving.await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         result = serving => result.map_err(|error| format!("serving: {error}")),
+        Err(error) = s2s_serving => Err(format!("serving S2S: {error}")),
         _ = grace => {
             log_warn!("drain grace elapsed with sockets still open; exiting");
             Ok(())

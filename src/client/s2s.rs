@@ -2,11 +2,16 @@
 //! WebSocket at `{base}/s2s/v1`, for backends that reach the engine over
 //! the network.
 //!
-//! Admission:
-//! - With `STREAMGRES_S2S_TOKEN` set, the upgrade must carry
-//!   `Authorization: Bearer <token>` and is answered 401 otherwise.
-//!   Unset, any connection is taken, so the port belongs on a trusted
-//!   network.
+//! Admission ([`S2sAccess`]):
+//! - The endpoint runs any query it supports with the engine's own
+//!   database privileges, for no user in particular, so it is served
+//!   only with `STREAMGRES_S2S_TOKEN` set: the upgrade must carry
+//!   `Authorization: Bearer <token>`, one of the tokens set, and is
+//!   answered 401 otherwise. `STREAMGRES_S2S_ALLOW_NO_TOKEN` serves it
+//!   to anyone, for development; with neither there is no endpoint.
+//! - `STREAMGRES_S2S_ADDR` gives it a listener of its own, for a network
+//!   the clients do not reach; the client listener then has no S2S
+//!   route.
 //! - At most `STREAMGRES_S2S_MAX_CONNECTIONS` connections are open at
 //!   once; past that the upgrade is answered 503. With each connection's
 //!   own subscription limit ([`crate::live::Limits`]) it bounds what one
@@ -27,6 +32,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt, future};
 
+use super::config::{S2sAccess, Secret};
 use super::connection::AppState;
 use crate::live::{self, Outgoing, REFUSAL_LOG_EVERY, Throttle, refusal};
 use crate::log::log_warn;
@@ -87,9 +93,12 @@ pub async fn connect(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    if let Some(token) = &state.config.s2s_token
-        && !authorized(&headers, &token.0)
-    {
+    let admitted = match &state.config.s2s_access {
+        S2sAccess::Off => return StatusCode::NOT_FOUND.into_response(),
+        S2sAccess::Open => true,
+        S2sAccess::Tokens(tokens) => authorized_by_any(&headers, tokens),
+    };
+    if !admitted {
         refusal(&state.s2s.unauthorized, "no valid bearer token");
         return (StatusCode::UNAUTHORIZED, "a bearer token is required").into_response();
     }
@@ -113,6 +122,15 @@ pub async fn connect(
         handle(socket, state).await;
         drop(admitted);
     })
+}
+
+/// Whether the request carries one of `tokens` as its bearer token.
+/// Every token is compared, whichever matched, so the time taken says
+/// nothing about which or how many.
+fn authorized_by_any(headers: &HeaderMap, tokens: &[Secret]) -> bool {
+    tokens
+        .iter()
+        .fold(false, |found, token| found | authorized(headers, &token.0))
 }
 
 /// Whether the request carries `Authorization: Bearer <token>`. The
@@ -221,6 +239,11 @@ mod tests {
         assert!(!authorized(&with("Bearer s3cret2"), "s3cret"));
         assert!(!authorized(&with("Bearer s3cre"), "s3cret"));
         assert!(!authorized(&with("Bearer "), "s3cret"));
+        let rotating = [Secret("new-token".to_owned()), Secret("old-token".to_owned())];
+        assert!(authorized_by_any(&with("Bearer new-token"), &rotating));
+        assert!(authorized_by_any(&with("Bearer old-token"), &rotating));
+        assert!(!authorized_by_any(&with("Bearer gone-token"), &rotating));
+        assert!(!authorized_by_any(&with("Bearer new-token"), &[]));
         assert!(!authorized(&with("Basic s3cret"), "s3cret"));
         assert!(!authorized(&with("s3cret"), "s3cret"));
         assert!(!authorized(&HeaderMap::new(), "s3cret"));

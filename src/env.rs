@@ -85,6 +85,17 @@ impl<F: Fn(&str) -> Option<String>> Env<F> {
         }
     }
 
+    /// `name` as a boolean (`true`/`yes`/`on`/`1` or
+    /// `false`/`no`/`off`/`0`), `default` when unset.
+    pub fn flag(&self, name: &str, default: bool) -> Result<bool, String> {
+        match self.value(name).as_deref().map(str::trim) {
+            None => Ok(default),
+            Some("true" | "yes" | "on" | "1") => Ok(true),
+            Some("false" | "no" | "off" | "0") => Ok(false),
+            Some(other) => Err(format!("{name} must be a boolean, got `{other}`")),
+        }
+    }
+
     /// `name` as a comma-separated list, blanks dropped; empty when unset.
     pub fn list(&self, name: &str) -> Vec<String> {
         self.value(name)

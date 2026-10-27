@@ -1377,6 +1377,9 @@ fn connect_failure(error: &tokio_tungstenite::tungstenite::Error) -> String {
         Error::Http(response) if response.status() == 401 => {
             "the engine refused the token (check STREAMGRES_S2S_TOKEN)".to_string()
         }
+        Error::Http(response) if response.status() == 404 => {
+            "the engine serves no S2S endpoint at this URL (it serves one only with STREAMGRES_S2S_TOKEN set, and only on STREAMGRES_S2S_ADDR when that is set)".to_string()
+        }
         Error::Http(response) if response.status() == 503 => {
             "the engine is not serving yet, or has no free connection".to_string()
         }

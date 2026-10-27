@@ -584,7 +584,7 @@ pub async fn run(
             return;
         }
     }
-    log_info!("s2s endpoint serving");
+    log_info!("live sessions served");
     let mut task = Task {
         catalog,
         sink,

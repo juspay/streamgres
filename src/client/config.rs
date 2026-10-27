@@ -14,7 +14,7 @@ use crate::model::TableName;
 use crate::sync::pg::{Keepalive, Settings, threads};
 
 /// A setting that must not reach a log: its `Debug` shows no value.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Secret(pub String);
 
 impl std::fmt::Debug for Secret {
@@ -22,6 +22,26 @@ impl std::fmt::Debug for Secret {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Secret(..)")
     }
+}
+
+/// The fewest bytes an S2S token may have: a token is the whole of the
+/// endpoint's admission, and the endpoint reads every followed table.
+pub const MIN_S2S_TOKEN_BYTES: usize = 16;
+
+/// Who may open the S2S endpoint. It runs any query it supports with the
+/// engine's own database privileges, for no user in particular, so it is
+/// off unless a token is set or an open endpoint is asked for by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S2sAccess {
+    /// No S2S endpoint: neither `STREAMGRES_S2S_TOKEN` nor
+    /// `STREAMGRES_S2S_ALLOW_NO_TOKEN` is set.
+    Off,
+    /// Backends presenting one of these as a bearer token
+    /// (`STREAMGRES_S2S_TOKEN`; more than one while a token is rotated).
+    Tokens(Vec<Secret>),
+    /// Any connection (`STREAMGRES_S2S_ALLOW_NO_TOKEN`): for development
+    /// on a machine no one else reaches.
+    Open,
 }
 
 /// Everything the server reads from the environment.
@@ -163,11 +183,16 @@ pub struct Config {
     /// `STREAMGRES_MAX_MESSAGE_BYTES`: the largest inbound WebSocket message
     /// accepted (16 MiB).
     pub max_message_bytes: usize,
-    /// `STREAMGRES_S2S_TOKEN`: the secret a backend must present as
-    /// `Authorization: Bearer <token>` to open the S2S endpoint. Unset or
-    /// empty, the endpoint takes any connection, which only a trusted
-    /// network should be given.
-    pub s2s_token: Option<Secret>,
+    /// Who may open the S2S endpoint ([`S2sAccess`]):
+    /// `STREAMGRES_S2S_TOKEN`, the secret a backend presents as
+    /// `Authorization: Bearer <token>` (a comma-separated list while one
+    /// is rotated, each at least [`MIN_S2S_TOKEN_BYTES`] long), or
+    /// `STREAMGRES_S2S_ALLOW_NO_TOKEN`; off with neither.
+    pub s2s_access: S2sAccess,
+    /// `STREAMGRES_S2S_ADDR`: a listener of the S2S endpoint's own, kept
+    /// off the client listener (unset: the endpoint shares
+    /// `STREAMGRES_ADDR`).
+    pub s2s_bind: Option<String>,
     /// `STREAMGRES_S2S_MAX_CONNECTIONS`: how many S2S connections may be
     /// open at once; past it an upgrade is answered 503 (64; 0 lifts the
     /// limit). A backend process opens `STREAMGRES_S2S_CONNECTIONS` (2).
@@ -246,6 +271,25 @@ pub struct Config {
     pub admin_endpoints: bool,
 }
 
+/// Who may open the S2S endpoint, from `STREAMGRES_S2S_TOKEN` and
+/// `STREAMGRES_S2S_ALLOW_NO_TOKEN`; an error for a token too short, or
+/// for both set, which would leave it unclear which was meant.
+fn s2s_access<F: Fn(&str) -> Option<String>>(env: &crate::env::Env<F>) -> Result<S2sAccess, String> {
+    let tokens = env.list("STREAMGRES_S2S_TOKEN");
+    let open = env.flag("STREAMGRES_S2S_ALLOW_NO_TOKEN", false)?;
+    match (tokens.is_empty(), open) {
+        (true, false) => Ok(S2sAccess::Off),
+        (true, true) => Ok(S2sAccess::Open),
+        (false, true) => Err(
+            "STREAMGRES_S2S_TOKEN and STREAMGRES_S2S_ALLOW_NO_TOKEN are both set; set one".to_owned(),
+        ),
+        (false, false) if tokens.iter().any(|token| token.len() < MIN_S2S_TOKEN_BYTES) => Err(format!(
+            "STREAMGRES_S2S_TOKEN: each token needs at least {MIN_S2S_TOKEN_BYTES} bytes (`openssl rand -hex 32` makes one)"
+        )),
+        (false, false) => Ok(S2sAccess::Tokens(tokens.into_iter().map(Secret).collect())),
+    }
+}
+
 impl Config {
     /// Read the configuration; an error names the missing or malformed
     /// variable.
@@ -321,7 +365,7 @@ impl Config {
         if base_path == "/" {
             base_path.clear();
         }
-        Ok(Config {
+        let config = Config {
             bind: first(&["STREAMGRES_ADDR"]).unwrap_or_else(|| "0.0.0.0:4848".to_owned()),
             base_path,
             dsn,
@@ -394,7 +438,8 @@ impl Config {
                 })?,
                 None => 16 * 1024 * 1024,
             },
-            s2s_token: first(&["STREAMGRES_S2S_TOKEN"]).map(Secret),
+            s2s_access: s2s_access(&env)?,
+            s2s_bind: first(&["STREAMGRES_S2S_ADDR"]),
             s2s_max_connections: match first(&["STREAMGRES_S2S_MAX_CONNECTIONS"]) {
                 Some(text) => text.parse().map_err(|_| {
                     format!("STREAMGRES_S2S_MAX_CONNECTIONS must be a number, got `{text}`")
@@ -451,19 +496,21 @@ impl Config {
             slow_query: millis("STREAMGRES_SLOW_QUERY_MS", 1_000)?,
             metrics_interval: millis("STREAMGRES_METRICS_INTERVAL_MS", 10_000)?,
             metrics_prefix,
-            admin_endpoints: match first(&["STREAMGRES_ENABLE_ADMIN_ENDPOINTS"])
-                .as_deref()
-            {
-                None => false,
-                Some("true") | Some("yes") | Some("on") | Some("1") => true,
-                Some("false") | Some("no") | Some("off") | Some("0") => false,
-                Some(other) => {
-                    return Err(format!(
-                        "STREAMGRES_ENABLE_ADMIN_ENDPOINTS must be a boolean, got `{other}`"
-                    ));
-                }
-            },
-        })
+            admin_endpoints: env.flag("STREAMGRES_ENABLE_ADMIN_ENDPOINTS", false)?,
+        };
+        if config.s2s_bind.is_some() && config.s2s_access == S2sAccess::Off {
+            return Err(
+                "STREAMGRES_S2S_ADDR is set but the S2S endpoint is off; set STREAMGRES_S2S_TOKEN".to_owned(),
+            );
+        }
+        Ok(config)
+    }
+
+    /// Where the S2S endpoint listens, when it is on: its own address,
+    /// or the client listener's.
+    pub fn s2s_listener(&self) -> Option<&str> {
+        (self.s2s_access != S2sAccess::Off)
+            .then(|| self.s2s_bind.as_deref().unwrap_or(&self.bind))
     }
 
     /// Whether `prefix` can safely begin a Prometheus metric name.
@@ -667,22 +714,45 @@ mod tests {
         assert_eq!(config.engine_settings().ddl_trigger, "my_trigger");
     }
 
-    /// The S2S endpoint takes any connection unless a token is set, and
-    /// the token never shows in the configuration's `Debug`.
+    /// The S2S endpoint is off without a token, open only when asked for
+    /// by name, takes several tokens while one rotates, refuses a short
+    /// one, and never shows a token in the configuration's `Debug`.
     #[test]
-    fn the_s2s_token_is_optional_and_kept_out_of_logs() {
-        assert!(config_with(&[]).s2s_token.is_none());
-        assert!(
-            config_with(&[("STREAMGRES_S2S_TOKEN", "")])
-                .s2s_token
-                .is_none()
-        );
-        let config = config_with(&[("STREAMGRES_S2S_TOKEN", "hunter2")]);
-        assert_eq!(
-            config.s2s_token.as_ref().map(|token| token.0.as_str()),
-            Some("hunter2")
-        );
-        assert!(!format!("{config:?}").contains("hunter2"));
+    fn the_s2s_endpoint_is_off_without_a_token() {
+        let off = config_with(&[]);
+        assert_eq!(off.s2s_access, S2sAccess::Off);
+        assert_eq!(off.s2s_listener(), None);
+        assert_eq!(config_with(&[("STREAMGRES_S2S_TOKEN", "")]).s2s_access, S2sAccess::Off);
+        let open = config_with(&[("STREAMGRES_S2S_ALLOW_NO_TOKEN", "true")]);
+        assert_eq!(open.s2s_access, S2sAccess::Open);
+        assert_eq!(open.s2s_listener(), Some("0.0.0.0:4848"));
+
+        let token = "0123456789abcdef-new";
+        let guarded = config_with(&[("STREAMGRES_S2S_TOKEN", token)]);
+        assert_eq!(guarded.s2s_access, S2sAccess::Tokens(vec![Secret(token.to_owned())]));
+        assert!(!format!("{guarded:?}").contains(token));
+        let rotating = config_with(&[("STREAMGRES_S2S_TOKEN", "0123456789abcdef-new, 0123456789abcdef-old")]);
+        let S2sAccess::Tokens(tokens) = rotating.s2s_access else { panic!("tokens") };
+        assert_eq!(tokens.len(), 2);
+
+        let short = config(&[("STREAMGRES_S2S_TOKEN", "hunter2")]).unwrap_err();
+        assert!(short.contains("at least 16 bytes"), "{short}");
+        let mixed = config(&[("STREAMGRES_S2S_TOKEN", "0123456789abcdef, hunter2")]);
+        assert!(mixed.is_err(), "every token is held to the length");
+        let both = config(&[
+            ("STREAMGRES_S2S_TOKEN", token),
+            ("STREAMGRES_S2S_ALLOW_NO_TOKEN", "yes"),
+        ]);
+        assert!(both.is_err(), "a token and an open endpoint contradict each other");
+        assert!(config(&[("STREAMGRES_S2S_ALLOW_NO_TOKEN", "maybe")]).is_err());
+
+        let own = config_with(&[
+            ("STREAMGRES_S2S_TOKEN", token),
+            ("STREAMGRES_S2S_ADDR", "10.0.0.5:4849"),
+        ]);
+        assert_eq!(own.s2s_listener(), Some("10.0.0.5:4849"));
+        let nowhere = config(&[("STREAMGRES_S2S_ADDR", "10.0.0.5:4849")]).unwrap_err();
+        assert!(nowhere.contains("off"), "{nowhere}");
     }
 
     /// 64 S2S connections may be open unless told otherwise.

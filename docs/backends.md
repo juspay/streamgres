@@ -154,12 +154,15 @@ for the server; see [`.env.example`](../.env.example).
 
 Run the server as [`deploy.md`](deploy.md) describes, with setup done once
 on the primary as a migration (the publication, and the event trigger
-from `scripts/sql/ddl-triggers.sql`). Backends connect with:
+from `scripts/sql/ddl-triggers.sql`), a token in `STREAMGRES_S2S_TOKEN`
+(the server serves no S2S endpoint without one), and preferably the
+endpoint on a private listener of its own (`STREAMGRES_S2S_ADDR`).
+Backends connect with:
 
 | variable | default | |
 |---|---|---|
 | `STREAMGRES_S2S_URL` | required | `ws://<host>:4848/<base>/s2s/v1`; `wss://` off a private network |
-| `STREAMGRES_S2S_TOKEN` | none | the server's bearer token |
+| `STREAMGRES_S2S_TOKEN` | required | the server's bearer token (one of them, while it rotates) |
 | `STREAMGRES_S2S_CONNECTIONS` | 2 | sockets per backend process |
 | `STREAMGRES_S2S_MAX_SUBSCRIPTIONS` | 10000 | per process; past it reads go to Postgres |
 | `STREAMGRES_S2S_MAX_LAG_MS` | 2000 | past it reads go to Postgres; 0 trusts the engine |

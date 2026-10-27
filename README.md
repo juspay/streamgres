@@ -129,8 +129,9 @@ keeping the data moving; `demo/README.md` walks through it with curl, and
 
 A backend that caches what it reads does not speak the Zero protocol. It
 connects to `ws://<host>:4848/<base>/s2s/v1` (with the bearer token in
-`STREAMGRES_S2S_TOKEN`, through TLS in front of the server off a private
-network) and subscribes the SQL its ORM rendered, `$n` binds and all;
+`STREAMGRES_S2S_TOKEN`, without which the server serves no such
+endpoint; through TLS in front of the server off a private network; on
+a listener of its own with `STREAMGRES_S2S_ADDR`) and subscribes the SQL its ORM rendered, `$n` binds and all;
 the server answers `accepted` with the hydrated rows (per table for a
 join; `bytea` as hex text, `OFFSET` left for the client to apply) or
 `refused`, then sends `delta` with the rows each committed transaction

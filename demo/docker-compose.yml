@@ -64,7 +64,7 @@ services:
       # The app the trigger stack and the publication are made for.
       STREAMGRES_APP_ID: demo
       STREAMGRES_PUBLICATION: demo_pub
-      STREAMGRES_S2S_TOKEN: "${STREAMGRES_S2S_TOKEN:-demo-token}"
+      STREAMGRES_S2S_TOKEN: "${STREAMGRES_S2S_TOKEN:-demo-token-not-for-production}"
       # The Zero side is not part of this demo; the endpoints are never
       # called, but the server wants them set.
       STREAMGRES_QUERY_URL: http://127.0.0.1:1/query
@@ -92,7 +92,7 @@ services:
     environment:
       DATABASE_URL: postgres://streamgres:streamgres@postgres:5432/tickets
       STREAMGRES_S2S_URL: ws://engine:4848/zero/s2s/v1
-      STREAMGRES_S2S_TOKEN: "${STREAMGRES_S2S_TOKEN:-demo-token}"
+      STREAMGRES_S2S_TOKEN: "${STREAMGRES_S2S_TOKEN:-demo-token-not-for-production}"
       DEMO_ADDR: 0.0.0.0:8080
       DEMO_WRITER_MS: "${DEMO_WRITER_MS:-1000}"
       DEMO_WRITER_MIX: "${DEMO_WRITER_MIX:-}"
