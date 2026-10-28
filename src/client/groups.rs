@@ -72,6 +72,9 @@
 //!   every replayed poke gets the same current ids, in its last part.
 //! - **Anything else** (a cookie older than the log, or from a server
 //!   that is gone): the client is told to start over, and syncs afresh.
+//! - **Before any of that**, the identity claim: a live group answers only
+//!   the claim that claimed it ([`super::backend::Identity::claim`]); a
+//!   connection with no claim joins only unclaimed groups.
 //!
 //! The application's mutation ids arrive as writes to its clients table,
 //! which the engine side carries inside the transaction's own
@@ -191,6 +194,10 @@ pub enum Request {
         wsid: String,
         socket: Socket,
         base_cookie: Option<String>,
+        /// The connection's identity claim, as [`super::backend::Identity::claim`]
+        /// derives it: used only to bind the group to its first claimant —
+        /// never forwarded.
+        claim: Option<u64>,
         lmids: Vec<(String, i64)>,
         results: Vec<MutationResult>,
         reply: oneshot::Sender<ConnectReply>,
@@ -383,6 +390,9 @@ fn release_rows(rows: &mut Ledger, sub: SubId) -> Vec<(TableName, DataFrameKey)>
 struct Group {
     version: u64,
     generation: u64,
+    /// The claim that owns this group, bound on the first connect that
+    /// carried one. None until then: an unclaimed group answers anyone.
+    claim: Option<u64>,
     sockets: HashMap<String, Socket>,
     desired: HashMap<String, HashSet<String>>,
     queries: HashMap<String, QueryState>,
@@ -481,6 +491,7 @@ impl Group {
         Group {
             version: 0,
             generation: 0,
+            claim: None,
             sockets: HashMap::new(),
             desired: HashMap::new(),
             queries: HashMap::new(),
@@ -646,11 +657,12 @@ impl Groups {
                 wsid,
                 socket,
                 base_cookie,
+                claim,
                 lmids,
                 results,
                 reply,
             } => {
-                let outcome = self.connect(&group, wsid, socket, base_cookie, lmids, results);
+                let outcome = self.connect(&group, wsid, socket, base_cookie, claim, lmids, results);
                 let _ = reply.send(outcome);
             }
             Request::Disconnect { group, wsid } => self.disconnect(&group, &wsid),
@@ -819,15 +831,34 @@ impl Groups {
     /// whole state when it has none and the group is under way, the logged
     /// pokes after an older cookie. A client that cannot be caught up is
     /// told to start over; no other connection of the group is touched.
+    #[allow(clippy::too_many_arguments)]
     fn connect(
         &mut self,
         group_id: &str,
         wsid: String,
         socket: Socket,
         base_cookie: Option<String>,
+        claim: Option<u64>,
         lmids: Vec<(String, i64)>,
         results: Vec<MutationResult>,
     ) -> ConnectReply {
+        // A live group answers only the identity that claimed it: a
+        // stranger holding the group id is turned away before any of its
+        // state is read. A connection with no claim joins only unclaimed
+        // groups, which is what deployments without credentials (and the
+        // test benches) do everywhere.
+        if self
+            .groups
+            .get(group_id)
+            .is_some_and(|group| group.claim.is_some_and(|bound| claim != Some(bound)))
+        {
+            log_info!(
+                "connection {wsid} refused client group {group_id}: the group is bound to another identity"
+            );
+            return ConnectReply::Reset {
+                reason: "this client group belongs to another identity".to_owned(),
+            };
+        }
         let offered = match base_cookie.as_deref().map(protocol::version_of) {
             None => 0,
             Some(Some(version)) => version,
@@ -869,6 +900,11 @@ impl Groups {
         self.next_generation += 1;
         let generation = self.next_generation;
         let group = self.groups.get_mut(group_id).expect("just ensured");
+        // The group is live and every check has passed: bind it to this
+        // claim now, so a failed connect never claims a group id alone.
+        if group.claim.is_none() {
+            group.claim = claim;
+        }
         for (client, lmid) in lmids {
             let known = group.lmids.entry(client.clone()).or_insert(0);
             if lmid > *known {
@@ -1021,7 +1057,8 @@ impl Groups {
         }
     }
 
-    /// Forget a group and every subscription it had.
+    /// Forget a group and every subscription it had. Its claim goes with
+    /// it: a stale group id claims nothing afterwards.
     fn drop_group(&mut self, group_id: &str) {
         if let Some(group) = self.groups.remove(group_id) {
             self.stats.client_groups.fetch_sub(1, Ordering::Relaxed);
@@ -2027,6 +2064,7 @@ mod tests {
                 wsid.to_owned(),
                 socket,
                 cookie.map(str::to_owned),
+                None,
                 lmids,
                 results,
             ) {
@@ -2731,6 +2769,98 @@ mod tests {
         });
     }
 
+    /// A group is bound to the identity claim that claimed it: the same
+    /// claim joins again, a stranger's is turned away, and once the group
+    /// has expired the id claims nothing — a fresh identity starts fresh.
+    #[test]
+    fn a_group_answers_only_the_identity_that_claimed_it() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let make_socket = |wsid: &str| {
+                let (sink, _frames) = mpsc::unbounded_channel();
+                Socket {
+                    client: format!("client-{wsid}"),
+                    sink,
+                }
+            };
+            let connect = |bench: &mut Bench, wsid: &str, claim: Option<u64>| {
+                bench.core.connect(
+                    "g",
+                    wsid.to_owned(),
+                    make_socket(wsid),
+                    None,
+                    claim,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+
+            assert!(matches!(
+                connect(&mut bench, "owner-1", Some(1)),
+                ConnectReply::Accepted
+            ));
+            assert!(matches!(
+                connect(&mut bench, "owner-2", Some(1)),
+                ConnectReply::Accepted
+            ), "the same identity joins its own group again");
+            assert!(
+                matches!(connect(&mut bench, "stranger", Some(2)), ConnectReply::Reset { .. }),
+                "a stranger holding the group id is turned away"
+            );
+            assert!(
+                matches!(connect(&mut bench, "anon", None), ConnectReply::Reset { .. }),
+                "an anonymous connection can not join a claimed group"
+            );
+
+            bench.core.drop_group("g");
+            assert!(matches!(
+                connect(&mut bench, "new-owner", Some(2)),
+                ConnectReply::Accepted
+            ), "an expired group id no longer claims anything");
+        });
+    }
+
+    /// A connection that claims a group id but fails validation (bad
+    /// cookie) must not leave the binding behind: the group id is still
+    /// free for the identity that is actually entitled to it.
+    #[test]
+    fn a_failed_connect_does_not_claim_a_group_id() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let make_socket = |wsid: &str| {
+                let (sink, _frames) = mpsc::unbounded_channel();
+                Socket {
+                    client: format!("client-{wsid}"),
+                    sink,
+                }
+            };
+            let connect = |bench: &mut Bench, wsid: &str, claim: Option<u64>, cookie: Option<&str>| {
+                bench.core.connect(
+                    "g",
+                    wsid.to_owned(),
+                    make_socket(wsid),
+                    cookie.map(str::to_owned),
+                    claim,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+
+            // Mallory tries to claim the group with a bad cookie: rejected.
+            assert!(matches!(
+                connect(&mut bench, "mallory", Some(2), Some("bogus")),
+                ConnectReply::Reset { .. }
+            ), "a bad cookie is rejected");
+
+            // Alice connects with a different identity: still accepted,
+            // because the failed connect left no binding behind.
+            assert!(matches!(
+                connect(&mut bench, "alice", Some(1), None),
+                ConnectReply::Accepted
+            ), "a failed connect must not claim a group id");
+        });
+    }
+
     /// The two ways of keeping what a client missed meet without a gap or
     /// an overlap. A socket dies unnoticed at cookie `c`: the pokes sent to
     /// it meanwhile are in the log. The server then learns of it and the
@@ -3412,6 +3542,7 @@ mod tests {
                             sink,
                         },
                         None,
+                        None,
                         Vec::new(),
                         Vec::new(),
                     );
@@ -4026,7 +4157,7 @@ mod tests {
                     readiness: watch::channel(true).0,
                     backlog: Vec::new(),
                     groups: HashMap::new(),
-                    by_sub: HashMap::new(),
+                        by_sub: HashMap::new(),
                     awaiting: HashMap::new(),
                     pending: HashMap::new(),
                     lmid_changes: HashMap::new(),
@@ -4116,6 +4247,7 @@ mod tests {
                                         client: format!("client-{g}"),
                                         sink,
                                     },
+                                    None,
                                     None,
                                     Vec::new(),
                                     Vec::new(),
