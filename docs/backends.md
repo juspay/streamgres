@@ -386,6 +386,46 @@ let subscription = engine
 
 ## 8. What to watch
 
+**Wire it to your metrics.** Install a `diesel_streamgres::metrics::Metrics`
+implementation once (`metrics::set_metrics`); every method has an empty
+default, so implement what you record:
+
+| hook | when | the indicator it gives |
+|---|---|---|
+| `served(Served)` | each read the cache could serve (not one routed to Postgres, in a transaction, or a write): `Cache`, `Engine` or `Postgres` | the share served without Postgres; alert when it drops |
+| `bypassed()` | a read the rollout share sent to Postgres | the rollout as it stands |
+| `fallback(reason)`, `refused(reason)` | a query turned to refills, or read from Postgres | the rate, by reason |
+| `connection(index, up)`, `lag(Duration)` | a socket up or down; each lag report | freshness against `STREAMGRES_S2S_MAX_LAG_MS` |
+| `missed(reason)`, `ended(reason)` | a callback subscription lost changes, or ended | subscriptions that stopped tracking |
+| `shadow(Outcome)` | a shadow read's outcome (below) | cached answers disagreeing with Postgres: alert on any `Mismatched` |
+
+The same events are logged through the `log` facade under the target
+`diesel_streamgres` (a repeated line at most once a minute, with a count
+of those held back), and kept with their times in `metrics::history()`
+(the latest 256), to read back what happened around an incident. An
+engine in the process exposes its own counters through
+`EngineClient::engine_stats()`.
+
+**Roll out by share.** `STREAMGRES_CACHE_SHARE` (0.0 to 1.0, default 1.0,
+or `rollout::set_cache_share`) sends that share of the reads a pool would
+serve from the cache there, and the rest to Postgres; a query that names
+its route is not sampled. Start low and raise it while the indicators
+hold.
+
+**Check answers against Postgres.** `STREAMGRES_SHADOW_SAMPLE` (0.0 to
+1.0, default 0, or `shadow::set_shadow_sample`) runs that share of the
+reads a blocking connection serves from the cache or the engine on
+Postgres too, and compares the answers (rows as a multiset, JSON by
+value). A difference is judged once the engine has passed the position
+Postgres had reached, re-reading the cache for up to two seconds:
+`Agreed`, `Lagged` (the same once caught up), `Mismatched` (still
+different: logged with both answers), or `Unverified` (no position to
+judge by, as on a standby, or the entry gone). The caller always gets the
+cached answer; a sampled read costs one more Postgres read. A write to
+the same rows in that moment can also make a mismatch, so read a lone
+one under heavy writes as a lead. `shadow::counts()` holds the totals.
+The async connection does not shadow yet.
+
 - **`Cache::stats`**, per cache: `hits`, `misses`, `replaced` (rows the
   engine's deltas changed), `touched` (refills a change caused),
   `refused`, `after_write` (reads sent to Postgres for read-your-writes),

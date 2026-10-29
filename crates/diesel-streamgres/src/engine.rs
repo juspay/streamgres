@@ -259,6 +259,9 @@ struct Shared {
     stopped: AtomicBool,
     /// The shared plain-SQL subscriptions ([`EngineClient::watch_sql`]).
     watches: crate::listen::Watches,
+    /// Whether the engine was last seen past the lag reads may trust, to
+    /// log the crossing each way once.
+    was_behind: AtomicBool,
 }
 
 impl Shared {
@@ -292,11 +295,23 @@ impl Shared {
 
     /// Notes why a subscription fell back from rows to refills.
     fn fell_back(&self, reason: String) {
+        crate::metrics::note(
+            log::Level::Warn,
+            &crate::metrics::reason_key("fallback", &reason),
+            format!("a query fell back from the engine's rows to Postgres refills: {reason}"),
+        );
+        crate::metrics::report(|metrics| metrics.fallback(&reason));
         Self::remember(&self.fallbacks, reason);
     }
 
     /// Notes a refusal and returns it as the verdict.
     fn refused(&self, reason: String) -> Verdict {
+        crate::metrics::note(
+            log::Level::Info,
+            &crate::metrics::reason_key("refused", &reason),
+            format!("a query is read from Postgres: {reason}"),
+        );
+        crate::metrics::report(|metrics| metrics.refused(&reason));
         Self::remember(&self.refusals, reason.clone());
         Verdict::Refused(reason)
     }
@@ -618,6 +633,7 @@ impl EngineClient {
             listeners: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
             watches: Default::default(),
+            was_behind: AtomicBool::new(false),
         });
         let workers = (0..config.connections)
             .map(|index| {
@@ -678,6 +694,19 @@ impl EngineClient {
     /// Whether any socket to the engine is up.
     pub fn is_connected(&self) -> bool {
         self.connections() > 0
+    }
+
+    /// The engine's own statistics, when it runs in this process
+    /// ([`EngineClient::embedded`]): its uptime, how busy its thread is,
+    /// and the counters the server would export, for the application's
+    /// metrics to read. `None` for an engine over a socket, which exports
+    /// its own.
+    #[cfg(feature = "embedded")]
+    pub fn engine_stats(&self) -> Option<Arc<streamgres::stats::Stats>> {
+        self.pool.workers.first().and_then(|worker| match &worker.target {
+            Target::Local(engine) => Some(Arc::clone(engine.stats())),
+            Target::Remote(_) => None,
+        })
     }
 
     /// The shared plain-SQL subscriptions of this client.
@@ -890,7 +919,27 @@ impl Subscriptions for EngineClient {
     /// [`Config::max_lag`] allows, on any socket that says how far.
     fn behind(&self) -> bool {
         let max = self.pool.shared.max_lag;
-        !max.is_zero() && self.lag().is_some_and(|lag| lag > max)
+        let lag = self.lag();
+        let behind = !max.is_zero() && lag.is_some_and(|lag| lag > max);
+        if self.pool.shared.was_behind.swap(behind, Ordering::AcqRel) != behind {
+            if behind {
+                crate::metrics::note(
+                    log::Level::Warn,
+                    "behind",
+                    format!(
+                        "the engine is {:?} behind, past {max:?}: reads go to Postgres until it catches up",
+                        lag.unwrap_or_default()
+                    ),
+                );
+            } else {
+                crate::metrics::note(
+                    log::Level::Info,
+                    "caught-up",
+                    "the engine caught up: reads are served from the cache again".to_string(),
+                );
+            }
+        }
+        behind
     }
 
     /// The least position every connected socket has received every
@@ -1344,6 +1393,12 @@ impl Worker {
     /// entries went when the socket did, and each is pending again until
     /// the engine accepts it, so nothing stale is served meanwhile.
     fn up(&self) -> Vec<(u64, QueryKey)> {
+        crate::metrics::note(
+            log::Level::Info,
+            &format!("up:{}", self.index),
+            format!("engine socket {} is up", self.index),
+        );
+        crate::metrics::report(|metrics| metrics.connection(self.index, true));
         let mut state = self.state.lock().expect("state");
         self.connected.store(true, Ordering::Release);
         let held: Vec<(u64, QueryKey)> = state
@@ -1371,6 +1426,13 @@ impl Worker {
 
     /// Records why the latest connect failed, or that one succeeded.
     fn connect_failed(&self, error: Option<String>) {
+        if let Some(error) = &error {
+            crate::metrics::note(
+                log::Level::Warn,
+                &format!("connect:{}", self.index),
+                format!("engine socket {} could not connect: {error}", self.index),
+            );
+        }
         *self.connect_error.lock().expect("connect_error") = error;
     }
 }
@@ -1702,6 +1764,15 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
 /// back may be a restarted one, after a migration that changed a
 /// column's type to one of the same width.
 fn disconnected(worker: &Worker) {
+    crate::metrics::note(
+        log::Level::Warn,
+        &format!("down:{}", worker.index),
+        format!(
+            "engine socket {} is down: its queries are read from Postgres until it is back",
+            worker.index
+        ),
+    );
+    crate::metrics::report(|metrics| metrics.connection(worker.index, false));
     let (waiting, released, keys) = {
         let mut state = worker.state.lock().expect("state");
         worker.connected.store(false, Ordering::Release);
@@ -2074,6 +2145,9 @@ fn on_lag(worker: &Worker, body: &Json) {
         .get("ms")
         .and_then(Json::as_u64)
         .map(|ms| (Duration::from_millis(ms), Instant::now()));
+    if let Some((lag, _)) = lag {
+        crate::metrics::report(|metrics| metrics.lag(lag));
+    }
     *worker.lag.lock().expect("lag") = lag;
     if let Some(position) = body.get("lsn").and_then(Json::as_u64) {
         worker.position.fetch_max(position, Ordering::AcqRel);
@@ -2143,6 +2217,7 @@ mod tests {
             listeners: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
             watches: Default::default(),
+            was_behind: AtomicBool::new(false),
         });
         let (worker, outgoing) = Worker::new(
             0,

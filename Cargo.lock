@@ -505,6 +505,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "futures-util",
+ "log",
  "moka",
  "rustls",
  "rustls-native-certs",

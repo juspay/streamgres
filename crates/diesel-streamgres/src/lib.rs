@@ -60,8 +60,11 @@ pub mod engine;
 pub mod key;
 pub mod listen;
 pub mod materialized;
+pub mod metrics;
 pub mod route;
+pub mod rollout;
 pub mod row;
+pub mod shadow;
 #[cfg(feature = "sse")]
 pub mod sse;
 mod session;
@@ -585,7 +588,8 @@ where
         };
         let mut key = QueryKey::of(&source, &mut self.inner)?;
         self.observe(&key.sql);
-        let route = key.take_route().or(self.scoped).unwrap_or(self.route);
+        let named = key.take_route();
+        let route = named.or(self.scoped).unwrap_or(self.route);
         if !key.is_select() {
             self.wrote();
             if cache.reads_standbys() && !in_transaction(&mut self.inner) {
@@ -603,49 +607,70 @@ where
         if route == Route::Postgres || in_transaction(&mut self.inner) {
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
+        // From here on the read is one the cache could serve: each way out
+        // reports where it was served.
+        if named.is_none() && !crate::rollout::through_cache() {
+            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+        }
         if key.is_locking() {
             cache.stats.locking.fetch_add(1, Ordering::Relaxed);
+            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
         if after_writes(&cache, self.read_your_writes, &mut self.inner) != AfterWrites::Serve {
             cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
+            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
         if cache.subscriptions().behind() {
             cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
+            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
         let Some(context) = self.context_in(&cache) else {
             cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
+            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         };
         key.context = context;
         if let Some(rows) = cache.get(&key) {
             self.served = Some(Served::Cache);
+            crate::metrics::report(|metrics| metrics.served(Served::Cache));
+            if crate::shadow::sampled() {
+                shadow_read(&mut self.inner, &cache, &key, &rows, source);
+            }
             return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
         }
         if cache.refused_recently(&key).is_some() {
+            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
         let reservation = cache.reserve(&key);
         let since = match cache.subscriptions().subscribe_with(&key, &mut self.inner) {
             Verdict::Refused(reason) => {
                 cache.refused(&key, &reason);
+                crate::metrics::report(|metrics| metrics.served(Served::Postgres));
                 return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
             }
             Verdict::Rows { rows, live } => {
                 cache.fill_live(reservation, live, &rows);
                 if cache.subscriptions().behind() {
                     cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
+                    crate::metrics::report(|metrics| metrics.served(Served::Postgres));
                     return LoadConnection::<B>::load(&mut self.inner, source)
                         .map(SyncedCursor::Live);
                 }
                 self.served = Some(Served::Engine);
+                crate::metrics::report(|metrics| metrics.served(Served::Engine));
+                if crate::shadow::sampled() {
+                    shadow_read(&mut self.inner, &cache, &key, &rows, source);
+                }
                 return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
             }
             Verdict::Accepted { since } => since,
         };
         let keep = self.replayed_past(&cache, since);
+        crate::metrics::report(|metrics| metrics.served(Served::Postgres));
         let rows = LoadConnection::<DefaultLoadingMode>::load(&mut self.inner, source)
             .and_then(capture_all);
         let rows: Arc<[OwnedRow]> = match rows {
@@ -661,6 +686,69 @@ where
             cache.stats.unreplayed.fetch_add(1, Ordering::Relaxed);
         }
         Ok(SyncedCursor::Cached(OwnedCursor::new(rows)))
+    }
+}
+
+/// A shadow read ([`crate::shadow`]): `source` run on Postgres beside the
+/// `cached` answer just served, the two compared, and a difference judged
+/// once the engine has passed the position Postgres had reached.
+fn shadow_read<C, T>(conn: &mut C, cache: &Cache, key: &QueryKey, cached: &[OwnedRow], source: T)
+where
+    C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
+    T: Query + QueryFragment<Pg> + QueryId,
+    Pg: QueryMetadata<T::SqlType>,
+{
+    use crate::shadow::{Outcome, SETTLE, conclude, same};
+    let live = LoadConnection::<DefaultLoadingMode>::load(conn, source).and_then(capture_all);
+    let reached = read_reached(conn);
+    let Ok(live) = live else {
+        conclude(Outcome::Unverified, &key.sql, cached, &[]);
+        return;
+    };
+    if same(cached, &live) {
+        conclude(Outcome::Agreed, &key.sql, cached, &live);
+        return;
+    }
+    let Some(reached) = reached else {
+        conclude(Outcome::Unverified, &key.sql, cached, &live);
+        return;
+    };
+    let deadline = Instant::now() + SETTLE;
+    loop {
+        match cache.subscriptions().position() {
+            Some(position) if position >= reached => {
+                let outcome = match cache.get(key) {
+                    Some(now) if same(&now, &live) => Outcome::Lagged,
+                    Some(now) => {
+                        conclude(Outcome::Mismatched, &key.sql, &now, &live);
+                        return;
+                    }
+                    None => Outcome::Unverified,
+                };
+                conclude(outcome, &key.sql, cached, &live);
+                return;
+            }
+            Some(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(2)),
+            _ => {
+                conclude(Outcome::Unverified, &key.sql, cached, &live);
+                return;
+            }
+        }
+    }
+}
+
+/// The WAL position the database `conn` reads has reached: inserted on a
+/// primary, replayed on a standby; `None` when it cannot say.
+fn read_reached<C>(conn: &mut C) -> Option<u64>
+where
+    C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
+{
+    match read_position(conn, WAL_POSITION_SQL)? {
+        Read::At(position) => Some(position),
+        Read::Null => match read_position(conn, REPLAY_POSITION_SQL)? {
+            Read::At(position) => Some(position),
+            Read::Null => None,
+        },
     }
 }
 

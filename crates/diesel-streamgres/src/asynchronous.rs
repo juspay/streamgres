@@ -587,7 +587,8 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
             return self.tracked(live);
         };
         self.observe(&key.sql);
-        let route = key.take_route().or(self.scoped).unwrap_or(self.route);
+        let named = key.take_route();
+        let route = named.or(self.scoped).unwrap_or(self.route);
         if !key.is_select() {
             let resolve = self.resolves_writes();
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
@@ -597,9 +598,16 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
             return self.tracked(live);
         }
+        // From here on the read is one the cache could serve: each way out
+        // reports where it was served.
+        if named.is_none() && !crate::rollout::through_cache() {
+            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            return self.tracked(live);
+        }
         if key.is_locking() {
             cache.stats.locking.fetch_add(1, Ordering::Relaxed);
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
             return self.tracked(live);
         }
         match cache.after_writes(self.read_your_writes) {
@@ -607,6 +615,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
             AfterWrites::Postgres => {
                 cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
                 let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+                crate::metrics::report(|metrics| metrics.served(Served::Postgres));
                 return self.tracked(live);
             }
             AfterWrites::Resolve(writes) => {
@@ -623,12 +632,14 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                     live.map(Self::live_stream)
                 }
                 .boxed();
+                crate::metrics::report(|metrics| metrics.served(Served::Postgres));
                 return self.tracked(live);
             }
         }
         if cache.subscriptions().behind() {
             cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
             return self.tracked(live);
         }
         if !unknown.is_empty() {
@@ -637,18 +648,21 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                 .resolving(unknown, live)
                 .map_ok(Self::live_stream)
                 .boxed();
+            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
             return self.tracked(live);
         }
         match self.scope() {
             _ if self.session.changed() => {
                 cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
                 let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+                crate::metrics::report(|metrics| metrics.served(Served::Postgres));
                 return self.tracked(live);
             }
             Scope::In(context) => key.context = context,
             Scope::Own => {
                 cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
                 let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+                crate::metrics::report(|metrics| metrics.served(Served::Postgres));
                 return self.tracked(live);
             }
             Scope::Unchecked => {
@@ -666,15 +680,18 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                     live.map(Self::live_stream)
                 }
                 .boxed();
+                crate::metrics::report(|metrics| metrics.served(Served::Postgres));
                 return self.tracked(live);
             }
         }
         if let Some(rows) = cache.get(&key) {
             self.served.store(1, Ordering::Release);
+            crate::metrics::report(|metrics| metrics.served(Served::Cache));
             return std::future::ready(Ok(Self::cached_stream(rows))).boxed();
         }
         if cache.refused_recently(&key).is_some() {
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
             return self.tracked(live);
         }
         let replay: Option<LoadFuture<'query>> = (!self.primary.load(Ordering::Acquire))
@@ -725,6 +742,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                 Verdict::Refused(reason) => {
                     guard.disarm();
                     cache.refused(&key, &reason);
+                    crate::metrics::report(|metrics| metrics.served(Served::Postgres));
                     live.await.map(Self::live_stream)
                 }
                 Verdict::Rows { rows, live: store } => {
@@ -732,12 +750,15 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                     cache.fill_live(reservation, store, &rows);
                     if subscriptions.behind() {
                         cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
+                        crate::metrics::report(|metrics| metrics.served(Served::Postgres));
                         return live.await.map(Self::live_stream);
                     }
                     served.store(2, Ordering::Release);
+                    crate::metrics::report(|metrics| metrics.served(Served::Engine));
                     Ok(Self::cached_stream(rows))
                 }
                 Verdict::Accepted { since } => {
+                    crate::metrics::report(|metrics| metrics.served(Served::Postgres));
                     let keep = match replay {
                         None => true,
                         Some(replay) => match read_position(replay).await {

@@ -94,6 +94,16 @@ whoever made the change. It runs one change at a time. After a lost
 engine connection, the difference is delivered. See
 [`docs/backends.md`](../../docs/backends.md), section 7.
 
+## Watching it, and rolling it out
+
+`metrics::set_metrics` installs a hook over your telemetry: where each
+read was served, fallbacks, refusals, connections, lag, lossy or ended
+subscriptions, and shadow-read outcomes. The same events are logged
+(`log` target `diesel_streamgres`) and kept in `metrics::history()`.
+`STREAMGRES_CACHE_SHARE` sends only a share of reads through the cache,
+and `STREAMGRES_SHADOW_SAMPLE` checks a share of cached answers against
+Postgres. See [`docs/backends.md`](../../docs/backends.md), section 8.
+
 ## The engine in this process
 
 With the `embedded` feature, `EngineClient::from_env()` runs the engine

@@ -288,6 +288,12 @@ impl Listening {
     /// A change was lost (`reason`): recorded, and passed on as a notice
     /// so a consumer can read the result afresh.
     pub(crate) fn failed(&self, reason: String) {
+        crate::metrics::note(
+            log::Level::Warn,
+            &crate::metrics::reason_key("missed", &reason),
+            format!("a subscription lost changes: {reason}"),
+        );
+        crate::metrics::report(|metrics| metrics.missed(&reason));
         self.record(&reason);
         let mut missed = self.missed.lock().expect("missed");
         if missed.len() >= 64 {
@@ -301,6 +307,12 @@ impl Listening {
     /// The engine no longer follows the query (`reason`): recorded, and
     /// the subscription ends once what is pending is delivered.
     pub(crate) fn end(&self, reason: String) {
+        crate::metrics::note(
+            log::Level::Warn,
+            &crate::metrics::reason_key("ended", &reason),
+            format!("a subscription ended, the engine no longer follows it: {reason}"),
+        );
+        crate::metrics::report(|metrics| metrics.ended(&reason));
         self.record(&reason);
         self.ended.lock().expect("ended").get_or_insert(reason);
         self.notify.notify_one();
@@ -1041,6 +1053,7 @@ async fn deliver<ST, T, F, Fut>(
                 Ok(None) => {}
                 Err(error) => {
                     let reason = format!("a row would not decode: {error}");
+                    crate::metrics::report(|metrics| metrics.missed(&reason));
                     listening.record(&reason);
                     callback(Delivery::Missed(reason)).await;
                 }
