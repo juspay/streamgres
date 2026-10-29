@@ -29,6 +29,11 @@ pub struct Config {
     /// Defaults to `dsn`; it must reach the same database as the direct DSN
     /// because reads import snapshots minted through the direct connection.
     pub read_dsn: String,
+    /// Dedicated, direct primary connection for periodic standby snapshot
+    /// records. When absent, the snapshot worker is disabled.
+    pub master_pg_dsn: Option<String>,
+    /// Time between primary standby snapshot records (5000 ms by default).
+    pub standby_snapshot_interval: Duration,
     /// `STREAMGRES_SCHEMAS`: the schemas whose tables the catalog carries
     /// (`public` plus the app's `zero_<shard>` schema by default).
     pub schemas: Vec<String>,
@@ -227,6 +232,11 @@ impl Config {
         let dsn = first(&["STREAMGRES_PG_DSN", "ZERO_UPSTREAM_DB"])
             .ok_or("STREAMGRES_PG_DSN (or ZERO_UPSTREAM_DB) must name the database")?;
         let read_dsn = first(&["STREAMGRES_READ_PG_DSN"]).unwrap_or_else(|| dsn.clone());
+        let master_pg_dsn = first(&["STREAMGRES_MASTER_PG_DSN"]);
+        let standby_snapshot_interval = millis("STREAMGRES_STANDBY_SNAPSHOT_INTERVAL_MS", 5_000)?;
+        if master_pg_dsn.is_some() && standby_snapshot_interval.is_zero() {
+            return Err("STREAMGRES_STANDBY_SNAPSHOT_INTERVAL_MS must be positive".to_owned());
+        }
         let query_url = first(&["STREAMGRES_QUERY_URL", "ZERO_QUERY_URL"])
             .ok_or("STREAMGRES_QUERY_URL (or ZERO_QUERY_URL) must name the query endpoint")?;
         let mutate_url = first(&["STREAMGRES_MUTATE_URL", "ZERO_MUTATE_URL"])
@@ -318,6 +328,8 @@ impl Config {
             base_path,
             dsn,
             read_dsn,
+            master_pg_dsn,
+            standby_snapshot_interval,
             schemas,
             slot: threads::slot_name(),
             slot_cleanup_age: millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
