@@ -78,15 +78,22 @@ stops it. With the `sse` feature, `sse::body` turns events into the text
 of a `text/event-stream` response for any web framework:
 
 ```rust
-let watch = engine.watch_sql(&database_url, "SELECT id, status FROM orders").await?;
-let events = watch.into_stream().filter_map(|change| async move {
-    match change {
-        Ok(Change::Present(_)) => None,
-        _ => Some(sse::Event::named("orders", "changed")),
-    }
-});
-let body = sse::body(events, sse::KEEP_ALIVE); // a Stream of String
+let feed = sse::Feed::new(engine, database_url);
+let body = feed.notifications([
+    sse::Query::new("orders", "SELECT id, status FROM orders"),
+    sse::Query::new("payments", "SELECT id, status FROM payments"),
+]).await?; // a Stream of String; serve it as text/event-stream
 ```
+
+The feed shares subscriptions, skips the initial rows, sends fifteen-second
+heartbeats, and closes the whole response if any query stops being followed.
+A missed-change notice becomes another refresh event. With the `embedded`
+feature, `sse::Feed::try_embedded(config)?` starts the engine inside the application
+with default client settings. Call `feed.ready(Duration::from_secs(30)).await?`
+at startup to report replication setup failures before accepting requests.
+`embedded_from_env(workspace_schemas)` intentionally loads both engine and client
+configuration from the environment; explicit constructors never do. The application supplies its authorized workspace queries and
+adapts the body to its HTTP framework; the library owns stream lifecycle.
 
 The callback first gets `Change::Present` for each row already there.
 Then, per commit, it gets `Added`, `Updated { old, new }` and `Removed`,
@@ -141,3 +148,17 @@ cargo test --test engine_live --test listen_live
 createdb diesel_streamgres_test
 cargo test
 ```
+
+Notification events are refresh hints, not durable delivery: refresh authoritative
+data on connection and after each event. Initial rows are skipped; added, updated
+and removed rows invalidate by default, including deletion of the last row.
+`Query::ignore_removals()` is only appropriate if a successor is guaranteed.
+
+To limit Postgres fallback bursts during an engine outage, set
+`STREAMGRES_FALLBACK_MAX_CONCURRENT` (per cache; default `0`, disabled).
+`STREAMGRES_FALLBACK_WAIT_MS` bounds admission waits (default `50` ms); exhaustion
+returns a Diesel error. Sync and async reads share the same capacity, held until
+the fallback cursor ends or is dropped. Cache/engine hits, explicit Postgres
+routes, transactions, locking queries and rollout bypasses do not consume it.
+Programmatic configuration uses `cache::Limits`. This bounds eligible fallback
+reads, not every database operation; size the normal connection pool separately.

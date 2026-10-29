@@ -1191,3 +1191,42 @@ fn a_hot_entry_outlives_cold_ones_under_the_budget() {
     );
     assert_eq!(w.cache.stats.hits.load(Ordering::Relaxed), hits + 1);
 }
+
+/// A cursor from one connection must hold the shared fallback slot until
+/// dropped; explicit Postgres reads remain usable while fallback is saturated.
+#[test]
+fn fallback_limit_holds_across_connections_until_cursor_drop() {
+    use diesel::connection::{DefaultLoadingMode, LoadConnection};
+    let mut w = World::with_limits(
+        "fallback-cap",
+        Limits {
+            fallback_max_concurrent: 1,
+            fallback_wait: std::time::Duration::ZERO,
+            ..Limits::default()
+        },
+    );
+    w.put("item", "value");
+    w.engine.refuse_all.store(true, Ordering::SeqCst);
+    let inner = PgConnection::establish(&url()).unwrap();
+    let mut first =
+        SyncedConnection::with_cache(inner, Arc::clone(&w.cache), Consistency::Eventual);
+    let query = sg_configs::table
+        .filter(sg_configs::key.eq(w.key("item")))
+        .select(sg_configs::value);
+    let cursor = LoadConnection::<DefaultLoadingMode>::load(&mut first, query).unwrap();
+    let result = sg_configs::table
+        .select(sg_configs::value)
+        .load::<String>(&mut w.conn);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("fallback concurrency limit")
+    );
+    assert_eq!(
+        w.read_via("item", Route::Postgres).as_deref(),
+        Some("value")
+    );
+    drop(cursor);
+    assert_eq!(w.read("item").as_deref(), Some("value"));
+}

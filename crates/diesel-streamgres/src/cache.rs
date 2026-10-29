@@ -132,9 +132,17 @@ const REFUSED_BYTES: u64 = 8 * 1024 * 1024;
 /// | `STREAMGRES_CACHE_TTL_MS`          | drop an entry this old however read; 0 never | 0         |
 /// | `STREAMGRES_REFUSED_TTL_MS`        | do not re-ask the engine about a refused query for this long; 0 always ask | 30000 |
 ///
+/// | `STREAMGRES_FALLBACK_MAX_CONCURRENT` | concurrent fallback reads; 0 disables limit | 0 |
+/// | `STREAMGRES_FALLBACK_WAIT_MS` | maximum fallback admission wait in milliseconds | 50 |
+///
 /// A value that is missing or not a number leaves the default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
+    /// Maximum simultaneous Postgres fallback reads per cache. Zero disables
+    /// this limit. Direct Postgres routes and transactions are unaffected.
+    pub fallback_max_concurrent: usize,
+    /// Maximum time a fallback may wait for capacity before returning an error.
+    pub fallback_wait: Duration,
     pub max_bytes: u64,
     /// A result larger than this is served but not kept, and its
     /// subscription ends: one query must not take the whole budget.
@@ -160,6 +168,8 @@ impl Default for Limits {
     /// The documented defaults: idle expiry on, time to live off.
     fn default() -> Limits {
         Limits {
+            fallback_max_concurrent: 0,
+            fallback_wait: Duration::from_millis(50),
             max_bytes: DEFAULT_MAX_BYTES,
             max_entry_bytes: DEFAULT_MAX_ENTRY_BYTES,
             time_to_idle: Some(DEFAULT_TIME_TO_IDLE),
@@ -180,6 +190,12 @@ impl Limits {
             None => default,
         };
         Limits {
+            fallback_max_concurrent: env_number("STREAMGRES_FALLBACK_MAX_CONCURRENT")
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(defaults.fallback_max_concurrent),
+            fallback_wait: env_number("STREAMGRES_FALLBACK_WAIT_MS")
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.fallback_wait),
             max_bytes: env_number("STREAMGRES_CACHE_MAX_BYTES").unwrap_or(defaults.max_bytes),
             max_entry_bytes: match env_number("STREAMGRES_CACHE_MAX_ENTRY_BYTES") {
                 Some(0) => u64::MAX,
@@ -190,6 +206,97 @@ impl Limits {
             time_to_live: millis("STREAMGRES_CACHE_TTL_MS", defaults.time_to_live),
             refused_for: millis("STREAMGRES_REFUSED_TTL_MS", defaults.refused_for),
         }
+    }
+}
+
+/// Capacity held until a fallback cursor is exhausted or dropped.
+/// Applications obtain this indirectly through their connection wrapper.
+pub struct FallbackPermit {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    gate: Arc<FallbackGate>,
+}
+
+impl Drop for FallbackPermit {
+    fn drop(&mut self) {
+        // Hold the lock through release so a synchronous waiter cannot miss
+        // the notification between checking capacity and going to sleep.
+        let _lock = self.gate.lock.lock().expect("fallback gate");
+        self.permit.take();
+        self.gate.changed.notify_one();
+    }
+}
+
+struct FallbackGate {
+    capacity: Option<Arc<tokio::sync::Semaphore>>,
+    lock: Mutex<()>,
+    changed: std::sync::Condvar,
+    wait: Duration,
+}
+
+fn fallback_busy() -> diesel::result::Error {
+    diesel::result::Error::QueryBuilderError(Box::new(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        "Postgres fallback concurrency limit reached",
+    )))
+}
+
+impl FallbackGate {
+    fn new(limits: &Limits) -> Self {
+        Self {
+            capacity: (limits.fallback_max_concurrent > 0).then(|| {
+                Arc::new(tokio::sync::Semaphore::new(
+                    limits
+                        .fallback_max_concurrent
+                        .min(tokio::sync::Semaphore::MAX_PERMITS),
+                ))
+            }),
+            lock: Mutex::new(()),
+            changed: std::sync::Condvar::new(),
+            wait: limits.fallback_wait,
+        }
+    }
+
+    fn acquire(self: &Arc<Self>) -> diesel::QueryResult<Option<FallbackPermit>> {
+        let Some(capacity) = &self.capacity else {
+            return Ok(None);
+        };
+        let started = Instant::now();
+        let mut lock = self.lock.lock().expect("fallback gate");
+        loop {
+            if let Ok(permit) = Arc::clone(capacity).try_acquire_owned() {
+                return Ok(Some(FallbackPermit {
+                    permit: Some(permit),
+                    gate: Arc::clone(self),
+                }));
+            }
+            let Some(remaining) = self.wait.checked_sub(started.elapsed()) else {
+                return Err(fallback_busy());
+            };
+            let (next, _) = self
+                .changed
+                .wait_timeout(lock, remaining)
+                .expect("fallback gate");
+            lock = next;
+        }
+    }
+
+    #[cfg(feature = "async")]
+    async fn acquire_async(self: &Arc<Self>) -> diesel::QueryResult<Option<FallbackPermit>> {
+        let Some(capacity) = &self.capacity else {
+            return Ok(None);
+        };
+        // Try first so a zero wait still admits an immediately available slot.
+        let permit = match Arc::clone(capacity).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => tokio::time::timeout(self.wait, Arc::clone(capacity).acquire_owned())
+                .await
+                .map_err(|_| fallback_busy())?
+                .map_err(|_| fallback_busy())?,
+        };
+        Ok(Some(FallbackPermit {
+            permit: Some(permit),
+            gate: Arc::clone(self),
+        }))
     }
 }
 
@@ -297,6 +404,7 @@ pub struct Cache {
     /// must not send every other value of the query to Postgres.
     refused: Option<moka::sync::Cache<QueryKey, Arc<str>>>,
     limits: Limits,
+    fallback: Arc<FallbackGate>,
     /// When a connection through this cache last wrote, as nanoseconds
     /// since `started` plus one; 0 is never.
     last_write: AtomicU64,
@@ -612,6 +720,7 @@ impl Cache {
             generations,
             subscriptions,
             refused,
+            fallback: Arc::new(FallbackGate::new(&limits)),
             limits,
             last_write: AtomicU64::new(0),
             started: Instant::now(),
@@ -624,6 +733,17 @@ impl Cache {
             contexts: Mutex::new(Contexts::default()),
             stats,
         }
+    }
+
+    pub(crate) fn fallback_permit(&self) -> diesel::QueryResult<Option<FallbackPermit>> {
+        self.fallback.acquire()
+    }
+
+    #[cfg(feature = "async")]
+    pub(crate) async fn fallback_permit_async(
+        &self,
+    ) -> diesel::QueryResult<Option<FallbackPermit>> {
+        self.fallback.acquire_async().await
     }
 
     /// Counts a refusal of `key`, and when the engine side says the
@@ -1058,6 +1178,91 @@ impl std::fmt::Debug for Cache {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallback_capacity_is_shared_and_released_on_drop() {
+        let gate = Arc::new(FallbackGate::new(&Limits {
+            fallback_max_concurrent: 1,
+            fallback_wait: Duration::from_millis(100),
+            ..Limits::default()
+        }));
+        let held = gate.acquire().unwrap();
+        let waiter = Arc::clone(&gate);
+        let task = std::thread::spawn(move || waiter.acquire().map(|permit| permit.is_some()));
+        drop(held);
+        assert!(task.join().unwrap().unwrap());
+        assert!(gate.acquire().unwrap().is_some());
+    }
+
+    #[test]
+    fn fallback_cursor_holds_capacity_until_exhaustion_or_drop() {
+        let gate = Arc::new(FallbackGate::new(&Limits {
+            fallback_max_concurrent: 1,
+            fallback_wait: Duration::ZERO,
+            ..Limits::default()
+        }));
+        let permit = gate.acquire().unwrap();
+        let mut cursor = crate::cursor::SyncedCursor::Limited(
+            std::iter::once(Ok::<(), diesel::result::Error>(())),
+            permit,
+        );
+        assert!(cursor.next().is_some());
+        assert!(
+            gate.acquire().is_err(),
+            "a partially read cursor holds its slot"
+        );
+        assert!(cursor.next().is_none());
+        let permit = gate.acquire().unwrap();
+        let cursor = crate::cursor::SyncedCursor::Limited(
+            std::iter::once(Ok::<(), diesel::result::Error>(())),
+            permit,
+        );
+        drop(cursor);
+        assert!(
+            gate.acquire().unwrap().is_some(),
+            "dropping an unread cursor releases its slot"
+        );
+    }
+
+    #[test]
+    fn fallback_zero_wait_admits_capacity_and_rejects_overload() {
+        let gate = Arc::new(FallbackGate::new(&Limits {
+            fallback_max_concurrent: 1,
+            fallback_wait: Duration::ZERO,
+            ..Limits::default()
+        }));
+        let held = gate.acquire().unwrap();
+        assert!(gate.acquire().is_err());
+        drop(held);
+        assert!(gate.acquire().unwrap().is_some());
+        let disabled = Arc::new(FallbackGate::new(&Limits::default()));
+        assert!(disabled.acquire().unwrap().is_none());
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn fallback_async_wait_is_bounded_and_cancellation_leaks_no_capacity() {
+        let gate = Arc::new(FallbackGate::new(&Limits {
+            fallback_max_concurrent: 1,
+            fallback_wait: Duration::from_millis(10),
+            ..Limits::default()
+        }));
+        let held = gate.acquire().unwrap();
+        assert!(gate.acquire_async().await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), gate.acquire_async())
+                .await
+                .is_err()
+        );
+        drop(held);
+        let async_held = gate.acquire_async().await.unwrap();
+        assert!(
+            gate.acquire().is_err(),
+            "async and sync use the same capacity"
+        );
+        drop(async_held);
+        assert!(gate.acquire().unwrap().is_some());
+    }
+
     use super::*;
     use crate::materialized::Snapshot;
     use crate::subscriptions::{Outcome, Unsynced, Verdict};

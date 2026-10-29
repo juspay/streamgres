@@ -374,6 +374,29 @@ impl AsyncSyncedConnection {
         stream.map_ok(SyncedRow::Live).boxed()
     }
 
+    /// Admit a fallback before polling its database future, retaining capacity
+    /// through the row stream. Cancellation releases both the future and slot.
+    fn fallback<'query>(cache: Arc<Cache>, live: LoadFuture<'query>) -> SyncedLoadFuture<'query> {
+        Self::limit_fallback(cache, live.map_ok(Self::live_stream).boxed())
+    }
+
+    fn limit_fallback<'query>(
+        cache: Arc<Cache>,
+        live: SyncedLoadFuture<'query>,
+    ) -> SyncedLoadFuture<'query> {
+        async move {
+            let permit = cache.fallback_permit_async().await?;
+            let rows = live.await?;
+            Ok(
+                stream::unfold((rows, permit), |(mut rows, permit)| async move {
+                    rows.next().await.map(|row| (row, (rows, permit)))
+                })
+                .boxed(),
+            )
+        }
+        .boxed()
+    }
+
     /// Cached rows as the wrapper's.
     fn cached_stream(rows: Arc<[OwnedRow]>) -> BoxStream<'static, QueryResult<AsyncSyncedRow>> {
         stream::iter(OwnedCursor::new(rows).map(|row| row.map(SyncedRow::Cached))).boxed()
@@ -493,6 +516,9 @@ fn type_oids_query(
 }
 
 /// A Postgres read in flight.
+type SyncedLoadFuture<'query> =
+    BoxFuture<'query, QueryResult<BoxStream<'static, QueryResult<AsyncSyncedRow>>>>;
+
 type LoadFuture<'query> = BoxFuture<'query, QueryResult<BoxStream<'static, QueryResult<PgRow>>>>;
 
 impl SimpleAsyncConnection for AsyncSyncedConnection {
@@ -616,12 +642,13 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                 cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
                 let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
                 crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                return self.tracked(live);
+                return self.tracked(Self::limit_fallback(Arc::clone(&cache), live));
             }
             AfterWrites::Resolve(writes) => {
                 cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
                 let probe = self.inner.load(sql_query(WAL_POSITION_SQL));
                 let live = self.inner.load(query);
+                let fallback_cache = Arc::clone(&cache);
                 let live = async move {
                     let (position, live) = futures_util::join!(read_position(probe), live);
                     match position {
@@ -633,14 +660,14 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                 }
                 .boxed();
                 crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                return self.tracked(live);
+                return self.tracked(Self::limit_fallback(fallback_cache, live));
             }
         }
         if cache.subscriptions().behind() {
             cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
             crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            return self.tracked(live);
+            return self.tracked(Self::limit_fallback(Arc::clone(&cache), live));
         }
         if !unknown.is_empty() {
             let live = self.inner.load(query);
@@ -649,26 +676,31 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                 .map_ok(Self::live_stream)
                 .boxed();
             crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            return self.tracked(live);
+            return self.tracked(Self::limit_fallback(Arc::clone(&cache), live));
         }
         match self.scope() {
             _ if self.session.changed() => {
                 cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
                 let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
                 crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                return self.tracked(live);
+                return self.tracked(Self::limit_fallback(Arc::clone(&cache), live));
             }
             Scope::In(context) => key.context = context,
             Scope::Own => {
                 cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
                 let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
                 crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                return self.tracked(live);
+                return self.tracked(Self::limit_fallback(Arc::clone(&cache), live));
             }
             Scope::Unchecked => {
                 let probe = self.inner.load(sql_query(CONTEXT_SQL));
                 let live = self.inner.load(query);
-                let (scope, checked, born) = (Arc::clone(&self.scope), Arc::clone(&self.checked), self.born);
+                let (scope, checked, born) = (
+                    Arc::clone(&self.scope),
+                    Arc::clone(&self.checked),
+                    self.born,
+                );
+                let fallback_cache = Arc::clone(&cache);
                 let live = async move {
                     let (context, live) = futures_util::join!(read_context(probe), live);
                     if let Some(context) = context {
@@ -681,7 +713,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                 }
                 .boxed();
                 crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                return self.tracked(live);
+                return self.tracked(Self::limit_fallback(fallback_cache, live));
             }
         }
         if let Some(rows) = cache.get(&key) {
@@ -692,7 +724,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
         if cache.refused_recently(&key).is_some() {
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
             crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            return self.tracked(live);
+            return self.tracked(Self::limit_fallback(Arc::clone(&cache), live));
         }
         let replay: Option<LoadFuture<'query>> = (!self.primary.load(Ordering::Acquire))
             .then(|| self.inner.load(sql_query(REPLAY_POSITION_SQL)));
@@ -743,7 +775,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                     guard.disarm();
                     cache.refused(&key, &reason);
                     crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                    live.await.map(Self::live_stream)
+                    Self::fallback(Arc::clone(&cache), live).await
                 }
                 Verdict::Rows { rows, live: store } => {
                     guard.disarm();
@@ -751,7 +783,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                     if subscriptions.behind() {
                         cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
                         crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                        return live.await.map(Self::live_stream);
+                        return Self::fallback(Arc::clone(&cache), live).await;
                     }
                     served.store(2, Ordering::Release);
                     crate::metrics::report(|metrics| metrics.served(Served::Engine));
@@ -773,6 +805,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                             None => false,
                         },
                     };
+                    let _permit = cache.fallback_permit_async().await?;
                     let pg_rows: Vec<PgRow> = live.await?.try_collect().await?;
                     let rows: Arc<[OwnedRow]> =
                         Arc::from(capture_all(pg_rows.into_iter().map(Ok))?);

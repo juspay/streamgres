@@ -15,6 +15,8 @@ use crate::row::{OwnedCursor, OwnedField, OwnedRow};
 pub enum SyncedCursor<I> {
     Live(I),
     Cached(OwnedCursor),
+    /// A live fallback holding its concurrency slot until exhaustion or drop.
+    Limited(I, Option<crate::cache::FallbackPermit>),
 }
 
 impl<I, R> Iterator for SyncedCursor<I>
@@ -28,13 +30,20 @@ where
         match self {
             SyncedCursor::Live(inner) => inner.next().map(|row| row.map(SyncedRow::Live)),
             SyncedCursor::Cached(inner) => inner.next().map(|row| row.map(SyncedRow::Cached)),
+            SyncedCursor::Limited(inner, permit) => {
+                let row = inner.next();
+                if row.is_none() {
+                    permit.take();
+                }
+                row.map(|row| row.map(SyncedRow::Live))
+            }
         }
     }
 
     /// The inner cursor's hint.
     fn size_hint(&self) -> (usize, Option<usize>) {
         match self {
-            SyncedCursor::Live(inner) => inner.size_hint(),
+            SyncedCursor::Live(inner) | SyncedCursor::Limited(inner, _) => inner.size_hint(),
             SyncedCursor::Cached(inner) => inner.size_hint(),
         }
     }

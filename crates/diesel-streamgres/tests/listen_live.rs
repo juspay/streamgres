@@ -258,7 +258,7 @@ async fn a_query_the_engine_cannot_follow_is_refused() {
     let Err(error) = refused else {
         panic!("a query on no table cannot be followed");
     };
-    assert!(!error.0.is_empty());
+    assert!(!error.to_string().is_empty());
 }
 
 /// A query given as plain SQL reports the same changes, its rows read by
@@ -418,4 +418,73 @@ async fn a_typed_query_on_another_schema_reports_its_rows_changes() {
     diesel::delete(sg_items::table.filter(sg_items::label.eq(&tag)))
         .execute(&mut other)
         .expect("clean up");
+}
+
+/// HTTP adapters declare named queries rather than assembling watcher
+/// streams themselves. Two responses share the watch, and setup failure
+/// and dropping the last response release their subscription ownership.
+#[cfg(feature = "sse")]
+#[tokio::test(flavor = "multi_thread")]
+async fn notification_bodies_share_and_release_their_watches() {
+    use diesel_streamgres::sse::{Feed, Query};
+    use futures_util::StreamExt;
+    let Some((engine, database, mut other)) = start() else {
+        return;
+    };
+    let tag = format!("notification-{}", std::process::id());
+    let sql = format!("SELECT id, key FROM sg_configs WHERE value = '{tag}'");
+    let watching = engine.watched().await;
+    let feed = Feed::new(engine.clone(), database);
+    feed.ready(Duration::from_secs(15)).await.expect("ready");
+    assert_eq!(format!("{feed:?}"), "Feed { .. }");
+    assert!(
+        feed.notifications([Query::new("bad\nname", &sql)])
+            .await
+            .is_err()
+    );
+    assert_eq!(engine.watched().await, watching);
+    assert!(
+        feed.notifications([
+            Query::new("config", &sql),
+            Query::new("bad", "SELECT unknown FROM no_such_notification_table")
+        ])
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        engine.watched().await,
+        watching,
+        "failed setup released its first watch"
+    );
+    let mut first = feed
+        .notifications([Query::new("config", &sql)])
+        .await
+        .unwrap()
+        .boxed();
+    let mut second = feed
+        .notifications([Query::new("config", &sql)])
+        .await
+        .unwrap()
+        .boxed();
+    assert_eq!(engine.watched().await, watching + 1);
+    assert_eq!(first.next().await.as_deref(), Some(": connected\n\n"));
+    assert_eq!(second.next().await.as_deref(), Some(": connected\n\n"));
+    diesel::insert_into(sg_configs::table)
+        .values((sg_configs::key.eq(&tag), sg_configs::value.eq(&tag)))
+        .execute(&mut other)
+        .unwrap();
+    for response in [&mut first, &mut second] {
+        let event = tokio::time::timeout(Duration::from_secs(10), response.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event, "event: config\ndata: config\n\n");
+    }
+    drop(first);
+    assert_eq!(engine.watched().await, watching + 1);
+    drop(second);
+    assert_eq!(engine.watched().await, watching);
+    diesel::delete(sg_configs::table.filter(sg_configs::value.eq(&tag)))
+        .execute(&mut other)
+        .unwrap();
 }

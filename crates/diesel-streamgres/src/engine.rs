@@ -48,8 +48,16 @@
 //! every key it still holds under the same ids. A rows-mode key refills
 //! from the engine's snapshot with no Postgres read; a refill-mode key
 //! refills on its next read. Keys the engine then refuses are forgotten.
+//! Failed attempts use exponential backoff with jitter: waits range from
+//! half a second to one second initially, doubling to a fifteen-to-thirty
+//! second range. A greeted connection alive for thirty seconds resets that
+//! range; a handshake immediately followed by another disconnect does not.
+//! Dropping the pool wakes a worker waiting to reconnect. Restored queries
+//! are sent in batches of at most 32 per ten milliseconds per connection,
+//! interleaved with incoming frames, pings and outgoing requests.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasher, RandomState};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -88,8 +96,45 @@ pub const DEFAULT_CONNECTIONS: usize = 2;
 /// environment says nothing.
 pub const DEFAULT_MAX_SUBSCRIPTIONS: usize = 10_000;
 
-/// How long to wait before trying the engine again after a lost socket.
-const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// A stream must have stayed open this long before a later disconnect
+/// starts again with the shortest delay. A successful handshake alone
+/// does not reset the budget: a server that keeps closing new connections
+/// must not make every client retry once a second forever.
+const STABLE_CONNECTION: Duration = Duration::from_secs(30);
+
+/// The ceiling doubles from one second to thirty. Each wait is chosen
+/// between half that ceiling and the ceiling, so clients spread their
+/// attempts without either a tight retry loop or an unbounded recovery wait.
+struct Backoff {
+    ceiling_ms: u64,
+}
+
+impl Backoff {
+    /// The first attempt is immediate; this is the delay after its failure.
+    fn new() -> Self {
+        Self { ceiling_ms: 1_000 }
+    }
+
+    /// A fresh per-attempt sample, independent across workers and processes.
+    /// It only staggers retries; it is not a cryptographic secret.
+    fn next_delay(&mut self) -> Duration {
+        self.with_sample(RandomState::new().hash_one(()))
+    }
+
+    /// The delay for a sample, kept separate so the bounds can be tested
+    /// without sleeping or depending on the random samples a run receives.
+    fn with_sample(&mut self, sample: u64) -> Duration {
+        let floor = self.ceiling_ms / 2;
+        let delay = floor + sample % (self.ceiling_ms - floor + 1);
+        self.ceiling_ms = (self.ceiling_ms * 2).min(30_000);
+        Duration::from_millis(delay)
+    }
+
+    /// A stable connection earns a short retry after its next disconnect.
+    fn reset(&mut self) {
+        self.ceiling_ms = 1_000;
+    }
+}
 
 /// How long one frame may take to go out before the socket is given up
 /// on: an engine that holds the socket open but stops reading would
@@ -257,6 +302,8 @@ struct Shared {
     listeners: Mutex<HashMap<QueryKey, Arc<Listening>>>,
     /// Set when the pool is dropped; the worker threads then end.
     stopped: AtomicBool,
+    /// Wakes retry waits when the pool is dropped.
+    stop: tokio::sync::Notify,
     /// The shared plain-SQL subscriptions ([`EngineClient::watch_sql`]).
     watches: crate::listen::Watches,
     /// Whether the engine was last seen past the lag reads may trust, to
@@ -539,6 +586,7 @@ impl Drop for Pool {
     /// Stops every worker's thread.
     fn drop(&mut self) {
         self.shared.stopped.store(true, Ordering::Release);
+        self.shared.stop.notify_waiters();
         for worker in &self.workers {
             let _ = worker.outgoing.send(Outgoing::Stop);
         }
@@ -565,9 +613,10 @@ impl EngineClient {
         if mode == "embedded" {
             #[cfg(feature = "embedded")]
             {
-                let engine = streamgres::embedded::Engine::start(
+                let engine = streamgres::embedded::Engine::try_start(
                     streamgres::embedded::Config::from_env()?,
-                );
+                )
+                .map_err(|error| error.to_string())?;
                 return Ok(EngineClient::embedded(engine, config));
             }
             #[cfg(not(feature = "embedded"))]
@@ -632,6 +681,7 @@ impl EngineClient {
             cache: Mutex::new(None),
             listeners: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
+            stop: tokio::sync::Notify::new(),
             watches: Default::default(),
             was_behind: AtomicBool::new(false),
         });
@@ -694,6 +744,35 @@ impl EngineClient {
     /// Whether any socket to the engine is up.
     pub fn is_connected(&self) -> bool {
         self.connections() > 0
+    }
+
+    /// Wait for startup and a client connection within one deadline.
+    pub async fn ready(&self, timeout: Duration) -> Result<(), crate::SubscribeError> {
+        tokio::time::timeout(timeout, async {
+            #[cfg(feature = "embedded")]
+            if let Some(worker) = self.pool.workers.first()
+                && let Target::Local(engine) = &worker.target
+            {
+                engine
+                    .ready(timeout)
+                    .await
+                    .map_err(|error| crate::SubscribeError::Unavailable(error.to_string()))?;
+            }
+            while !self.pool.workers.iter().any(|worker| {
+                worker.connected.load(Ordering::Acquire)
+                    && !matches!(
+                        *worker.greeting.lock().expect("greeting"),
+                        Greeting::Waiting
+                    )
+            }) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            crate::SubscribeError::Unavailable("timed out waiting for an engine connection".into())
+        })?
     }
 
     /// The engine's own statistics, when it runs in this process
@@ -1683,9 +1762,10 @@ impl Receiver {
 /// window, not at the next ping.
 async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedReceiver<Outgoing>) {
     let mut first = true;
+    let mut backoff = Backoff::new();
     loop {
-        if !first {
-            tokio::time::sleep(RECONNECT_DELAY).await;
+        if !first && !retry_wait(&worker.shared, backoff.next_delay()).await {
+            return;
         }
         first = false;
         if worker.shared.stopped.load(Ordering::Acquire) {
@@ -1701,7 +1781,8 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
                 continue;
             }
         };
-        let mut heard = Instant::now();
+        let opened = Instant::now();
+        let mut heard = opened;
         let silence = worker.shared.silence;
         let every = (silence / 3).max(Duration::from_millis(1));
         let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
@@ -1710,21 +1791,26 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
         let mut check = tokio::time::interval_at(tokio::time::Instant::now() + glance, glance);
         check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        let resubscribe = worker.up();
+        let mut resubscribe: std::collections::VecDeque<_> = worker.up().into();
+        let mut restore = tokio::time::interval(Duration::from_millis(10));
+        restore.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut up = true;
-        for (id, key) in resubscribe {
-            let frame = subscribe_frame(
-                id,
-                &key.sql,
-                &key.binds.iter().map(bind_json).collect::<Vec<_>>(),
-            );
-            if !sender.send(frame).await {
-                up = false;
-                break;
-            }
-        }
         while up {
             up = tokio::select! {
+                _ = restore.tick(), if !resubscribe.is_empty() => {
+                    let mut sent = true;
+                    for _ in 0..32 {
+                        let Some((id, key)) = resubscribe.pop_front() else { break };
+                        // An unsubscribe processed while restoring must not
+                        // resurrect a query that no consumer holds anymore.
+                        let held = worker.state.lock().expect("state").by_id.get(&id) == Some(&key);
+                        if held && !sender.send(subscribe_frame(id, &key.sql, &key.binds.iter().map(bind_json).collect::<Vec<_>>())).await {
+                            sent = false;
+                            break;
+                        }
+                    }
+                    sent
+                },
                 frame = receiver.next() => {
                     heard = Instant::now();
                     if let Some(text) = frame.text() {
@@ -1750,7 +1836,31 @@ async fn connection_loop(worker: Arc<Worker>, mut outgoing: mpsc::UnboundedRecei
                 },
             };
         }
+        if opened.elapsed() >= STABLE_CONNECTION
+            && !matches!(
+                *worker.greeting.lock().expect("greeting"),
+                Greeting::Waiting
+            )
+        {
+            backoff.reset();
+        }
         disconnected(&worker);
+    }
+}
+
+/// Waits for the next attempt without holding the worker alive through
+/// shutdown. Register the notification before checking the flag so a
+/// pool dropped at that boundary cannot leave a thirty-second sleep.
+async fn retry_wait(shared: &Shared, delay: Duration) -> bool {
+    let stopped = shared.stop.notified();
+    tokio::pin!(stopped);
+    stopped.as_mut().enable();
+    if shared.stopped.load(Ordering::Acquire) {
+        return false;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => !shared.stopped.load(Ordering::Acquire),
+        _ = stopped => false,
     }
 }
 
@@ -2184,6 +2294,35 @@ fn on_touched(worker: &Worker, body: &Json) {
 
 #[cfg(test)]
 mod tests {
+    /// Back-to-back failures grow the range, cap it, and never retry at zero.
+    #[test]
+    fn failures_back_off_with_bounded_jitter() {
+        let mut low = Backoff::new();
+        let mut high = Backoff::new();
+        for ceiling in [1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000] {
+            assert_eq!(low.with_sample(0), Duration::from_millis(ceiling / 2));
+            assert_eq!(
+                high.with_sample(ceiling / 2),
+                Duration::from_millis(ceiling)
+            );
+        }
+        for _ in 0..100 {
+            let delay = high.next_delay();
+            assert!((Duration::from_secs(15)..=Duration::from_secs(30)).contains(&delay));
+        }
+    }
+
+    /// A recovered stream restores the initial retry range.
+    #[test]
+    fn a_stable_connection_resets_the_retry_range() {
+        let mut backoff = Backoff::new();
+        for _ in 0..20 {
+            backoff.with_sample(0);
+        }
+        backoff.reset();
+        assert_eq!(backoff.with_sample(0), Duration::from_millis(500));
+    }
+
     use std::time::Instant;
 
     use super::*;
@@ -2192,6 +2331,25 @@ mod tests {
     use diesel::deserialize::FromSqlRow;
     use diesel::pg::Pg;
     use diesel::sql_types::{Integer, Text};
+
+    /// Dropping the pool wakes a long retry wait, including a drop that
+    /// happens before the worker has registered its notification.
+    #[tokio::test]
+    async fn shutdown_interrupts_reconnect_backoff() {
+        let (_, _, shared) = worker();
+        let waiting = Arc::clone(&shared);
+        let task = tokio::spawn(async move { retry_wait(&waiting, Duration::from_secs(30)).await });
+        tokio::task::yield_now().await;
+        shared.stopped.store(true, Ordering::Release);
+        shared.stop.notify_waiters();
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert!(!retry_wait(&shared, Duration::from_secs(30)).await);
+    }
 
     /// A worker with no socket: `connected` is set by hand and frames are
     /// fed to `inbound` directly, so the orderings the reader thread and
@@ -2216,6 +2374,7 @@ mod tests {
             cache: Mutex::new(None),
             listeners: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
+            stop: tokio::sync::Notify::new(),
             watches: Default::default(),
             was_behind: AtomicBool::new(false),
         });

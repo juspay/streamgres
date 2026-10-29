@@ -337,3 +337,26 @@ fn a_dropped_socket_is_tried_again_every_second() {
     assert!(!engine.is_connected(), "never up for long");
     drop(engine);
 }
+
+/// A peer that closes after every handshake must grow its retry delay:
+/// accepting TCP/WebSocket connections is not evidence of a recovery.
+#[test]
+fn repeated_handshakes_do_not_reset_reconnect_backoff() {
+    let fake = Fake::start(Answer::Close);
+    let engine = EngineClient::with_config(
+        fake.url.clone(),
+        Config {
+            connections: 1,
+            ..Config::default()
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while fake.accepts().len() < 3 {
+        assert!(Instant::now() < deadline, "only {:?}", fake.accepts());
+        thread::sleep(Duration::from_millis(10));
+    }
+    let accepts = fake.accepts();
+    assert!(accepts[1].duration_since(accepts[0]) >= Duration::from_millis(500));
+    assert!(accepts[2].duration_since(accepts[1]) >= Duration::from_secs(1));
+    drop(engine);
+}

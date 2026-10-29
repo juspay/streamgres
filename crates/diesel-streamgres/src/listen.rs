@@ -546,12 +546,28 @@ impl Drop for Subscription {
 
 /// Why a subscribe failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SubscribeError(pub String);
+#[non_exhaustive]
+pub enum SubscribeError {
+    InvalidInput(String),
+    Database(String),
+    Unsupported(String),
+    Unavailable(String),
+    Capacity(String),
+    Task(String),
+}
 
 impl std::fmt::Display for SubscribeError {
     /// The reason.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        let reason = match self {
+            Self::InvalidInput(reason)
+            | Self::Database(reason)
+            | Self::Unsupported(reason)
+            | Self::Unavailable(reason)
+            | Self::Capacity(reason)
+            | Self::Task(reason) => reason,
+        };
+        f.write_str(reason)
     }
 }
 
@@ -610,9 +626,11 @@ fn reads_as(conn: &mut PgConnection) -> Result<crate::cache::Database, Subscribe
     use diesel::RunQueryDsl;
     let context = diesel::sql_query(crate::cache::CONTEXT_SQL)
         .get_result::<crate::cache::Context>(conn)
-        .map_err(|error| SubscribeError(format!("reading what the connection reads: {error}")))?;
+        .map_err(|error| {
+            SubscribeError::Database(format!("reading what the connection reads: {error}"))
+        })?;
     if context.shadowed {
-        return Err(SubscribeError(
+        return Err(SubscribeError::InvalidInput(
             "a relation earlier on the search path than `public` shadows a table there, \
              which the engine would read instead"
                 .to_string(),
@@ -683,15 +701,19 @@ impl EngineClient {
         let context = u32::try_from(listener)
             .ok()
             .and_then(|listener| LISTENING_BASE.checked_add(listener))
-            .ok_or_else(|| SubscribeError("too many subscriptions in this process".to_string()))?;
+            .ok_or_else(|| {
+                SubscribeError::Capacity("too many subscriptions in this process".to_string())
+            })?;
         let engine = self.clone();
         let url = database_url.to_string();
         let started = tokio::task::spawn_blocking(move || {
-            let mut conn = PgConnection::establish(&url)
-                .map_err(|error| SubscribeError(format!("connecting to the database: {error}")))?;
+            let mut conn = PgConnection::establish(&url).map_err(|error| {
+                SubscribeError::Database(format!("connecting to the database: {error}"))
+            })?;
             let database = reads_as(&mut conn)?;
-            let mut key = QueryKey::of(&query, &mut conn)
-                .map_err(|error| SubscribeError(format!("rendering the query: {error}")))?;
+            let mut key = QueryKey::of(&query, &mut conn).map_err(|error| {
+                SubscribeError::InvalidInput(format!("rendering the query: {error}"))
+            })?;
             key.context = context;
             let listening = Listening::new(url, database);
             engine.catch_up(&mut conn);
@@ -700,19 +722,23 @@ impl EngineClient {
                 Verdict::Rows { .. } => Ok((key, listening)),
                 Verdict::Accepted { .. } => {
                     engine.stop_listening(&key);
-                    Err(SubscribeError(format!(
+                    Err(SubscribeError::Unsupported(format!(
                         "the engine follows this query only by refills, not with its rows: {}",
                         engine.fallbacks().last().cloned().unwrap_or_default()
                     )))
                 }
                 Verdict::Refused(reason) => {
                     engine.stop_listening(&key);
-                    Err(SubscribeError(reason))
+                    Err(if engine.refusal_is_final(&reason) {
+                        SubscribeError::Unsupported(reason)
+                    } else {
+                        SubscribeError::Unavailable(reason)
+                    })
                 }
             }
         })
         .await
-        .map_err(|error| SubscribeError(format!("subscribing: {error}")))?;
+        .map_err(|error| SubscribeError::Task(format!("subscribing: {error}")))?;
         let (key, listening) = started?;
         let delivered = Arc::clone(&listening);
         let task = tokio::spawn(deliver(delivered, callback, PhantomData::<fn() -> (ST, T)>));

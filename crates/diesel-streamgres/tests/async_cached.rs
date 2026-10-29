@@ -739,3 +739,51 @@ async fn a_write_on_a_sibling_connection_is_seen_through_the_shared_cache() {
 
 use diesel::deserialize::FromSqlRow;
 use futures_util::{StreamExt, TryStreamExt};
+
+#[tokio::test]
+async fn fallback_limit_holds_until_async_stream_drop() {
+    use diesel_streamgres::cache::Limits;
+    let cache = Arc::new(Cache::with_limits(
+        Limits {
+            fallback_max_concurrent: 1,
+            fallback_wait: Duration::ZERO,
+            ..Limits::default()
+        },
+        Arc::new(FakeEngine::default()),
+    ));
+    let mut first = AsyncSyncedConnection::with_cache(
+        AsyncPgConnection::establish(&url()).await.unwrap(),
+        Arc::clone(&cache),
+        Route::Streamgres,
+    );
+    let mut second = AsyncSyncedConnection::with_cache(
+        AsyncPgConnection::establish(&url()).await.unwrap(),
+        cache,
+        Route::Streamgres,
+    );
+    let rows = diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>("1"))
+        .load_stream::<i32>(&mut first)
+        .await
+        .unwrap();
+    let result = diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>("2"))
+        .get_result::<i32>(&mut second)
+        .await;
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("fallback concurrency limit")
+    );
+    let direct = diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>("2"))
+        .via(Route::Postgres)
+        .get_result::<i32>(&mut second)
+        .await
+        .unwrap();
+    assert_eq!(direct, 2);
+    drop(rows);
+    let retry = diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>("2"))
+        .get_result::<i32>(&mut second)
+        .await
+        .unwrap();
+    assert_eq!(retry, 2);
+}

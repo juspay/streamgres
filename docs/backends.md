@@ -384,6 +384,28 @@ let subscription = engine
   is closed when `subscribe` returns, and opened again only to relearn
   the types after a reconnect.
 
+### Lost connections and HTTP streams
+
+The first engine connection is attempted at once. After a failure, workers
+wait a random half-to-one second, then one-to-two, two-to-four, and so on,
+up to fifteen-to-thirty seconds between attempts. A greeted connection that
+stayed open for thirty seconds resets the range. A peer that accepts and
+immediately closes does not reset it. Dropping the client wakes retry waits.
+Reads keep using the existing Postgres fallback while the engine is down;
+this backoff does not cap that fallback load or pace resubscriptions.
+
+With the `sse` feature, `sse::body` sends a comment after fifteen seconds
+without an event. These are one-way keep-alives, not acknowledgements from
+the client. Configure the HTTP proxy to flush chunks and leave its idle
+timeout longer than this interval. `sse::Feed::notifications` accepts named `sse::Query` declarations and does
+this lifecycle work: it shares the watches, suppresses initial rows, turns
+missed changes into refresh hints, and ends the entire response if any watch
+fails or ends. Use `Query::ignore_removals` for a newest-version query whose
+successor arrival already invalidates the old row. Lower-level `watch_sql`
+and `sse::body` remain available for custom applications.
+The HTTP consumer must reconnect and refresh authoritative state, since this
+body does not persist events or implement Last-Event-ID replay.
+
 ## 8. What to watch
 
 **Wire it to your metrics.** Install a `diesel_streamgres::metrics::Metrics`

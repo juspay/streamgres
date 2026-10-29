@@ -42,7 +42,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::env::Env;
 use crate::live::{self, Drained, Limits, Outgoing};
-use crate::log::{log_error, log_info, log_warn};
+use crate::log::{log_info, log_warn};
 use crate::model::{Lsn, TableName};
 use crate::plan::{PlanCache, Policy, Side};
 use crate::shutdown::Shutdown;
@@ -376,6 +376,36 @@ pub enum State {
     Stopped,
 }
 
+/// Why an embedded engine could not start or become ready.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum StartError {
+    Spawn(std::io::Error),
+    Failed(String),
+    Stopped,
+    Timeout,
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Spawn(error) => write!(f, "starting the embedded engine thread: {error}"),
+            Self::Failed(reason) => write!(f, "embedded engine startup failed: {reason}"),
+            Self::Stopped => f.write_str("embedded engine stopped before becoming ready"),
+            Self::Timeout => f.write_str("timed out waiting for the embedded engine"),
+        }
+    }
+}
+
+impl std::error::Error for StartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spawn(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
 /// An embedded engine, cheap to clone. The last clone dropped stops it
 /// without waiting; [`Engine::stop`] waits.
 #[derive(Clone)]
@@ -405,6 +435,12 @@ impl Engine {
     /// once its feed has passed its first snapshot ([`Engine::state`]).
     /// The process's log lines go to the `log` facade from here on.
     pub fn start(config: Config) -> Engine {
+        Self::try_start(config).expect("starting the embedded engine thread")
+    }
+
+    /// Start in the background, reporting thread creation failures. Use
+    /// [`Engine::ready`] to check database and replication setup as well.
+    pub fn try_start(config: Config) -> Result<Engine, StartError> {
         crate::log::to_facade();
         let stats = Stats::shared_with_metric_prefix("streamgres".to_owned());
         Stats::install(&stats);
@@ -421,17 +457,37 @@ impl Engine {
         let supervisor = std::thread::Builder::new()
             .name("streamgres-embedded".to_owned())
             .spawn(move || supervised.run())
-            .map_err(|error| log_error!("the embedded engine's thread could not start: {error}"))
-            .ok();
-        Engine {
+            .map_err(StartError::Spawn)?;
+        Ok(Engine {
             inner: Arc::new(Inner {
                 states,
                 current,
                 stop,
-                supervisor: Mutex::new(supervisor),
+                supervisor: Mutex::new(Some(supervisor)),
                 stats,
             }),
-        }
+        })
+    }
+
+    /// Wait for the first ready engine, bounded by `timeout`. A failed
+    /// attempt is returned immediately; the supervisor continues retrying.
+    /// Cancelling this wait does not stop the engine.
+    pub async fn ready(&self, timeout: Duration) -> Result<(), StartError> {
+        let mut states = self.states();
+        tokio::time::timeout(timeout, async move {
+            loop {
+                let state = states.borrow_and_update().clone();
+                match state {
+                    State::Serving => return Ok(()),
+                    State::Down(reason) => return Err(StartError::Failed(reason)),
+                    State::Stopped => return Err(StartError::Stopped),
+                    State::Starting => {}
+                }
+                states.changed().await.map_err(|_| StartError::Stopped)?;
+            }
+        })
+        .await
+        .map_err(|_| StartError::Timeout)?
     }
 
     /// What the engine is doing now.
@@ -1046,6 +1102,54 @@ async fn room_for_slots(client: &tokio_postgres::Client) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    fn waiting_engine(state: State) -> (Engine, watch::Sender<State>) {
+        let (state_tx, states) = watch::channel(state);
+        let (stop, _) = watch::channel(false);
+        (
+            Engine {
+                inner: Arc::new(Inner {
+                    states,
+                    current: Arc::new(Mutex::new(None)),
+                    stop,
+                    supervisor: Mutex::new(None),
+                    stats: Stats::shared_with_metric_prefix("test".into()),
+                }),
+            },
+            state_tx,
+        )
+    }
+
+    #[tokio::test]
+    async fn startup_wait_reports_failure_stop_timeout_and_readiness() {
+        let (engine, states) = waiting_engine(State::Starting);
+        assert!(matches!(
+            engine.ready(Duration::from_millis(1)).await,
+            Err(StartError::Timeout)
+        ));
+        states.send_replace(State::Down("permission denied".into()));
+        assert!(
+            matches!(engine.ready(Duration::from_secs(1)).await, Err(StartError::Failed(reason)) if reason == "permission denied")
+        );
+        states.send_replace(State::Starting);
+        let ready = engine.ready(Duration::from_secs(1));
+        let change = async {
+            tokio::task::yield_now().await;
+            states.send_replace(State::Serving);
+        };
+        let (result, ()) = tokio::join!(ready, change);
+        assert!(result.is_ok());
+        states.send_replace(State::Stopped);
+        assert!(matches!(
+            engine.ready(Duration::from_secs(1)).await,
+            Err(StartError::Stopped)
+        ));
+        drop(states);
+        assert!(matches!(
+            engine.ready(Duration::from_secs(1)).await,
+            Err(StartError::Stopped)
+        ));
+    }
+
     use super::*;
 
     /// The server's names configure an embedded engine too, legacy ones

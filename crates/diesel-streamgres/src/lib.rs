@@ -620,17 +620,23 @@ where
         if after_writes(&cache, self.read_your_writes, &mut self.inner) != AfterWrites::Serve {
             cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
             crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+            let permit = cache.fallback_permit()?;
+            return LoadConnection::<B>::load(&mut self.inner, source)
+                .map(|cursor| SyncedCursor::Limited(cursor, permit));
         }
         if cache.subscriptions().behind() {
             cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
             crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+            let permit = cache.fallback_permit()?;
+            return LoadConnection::<B>::load(&mut self.inner, source)
+                .map(|cursor| SyncedCursor::Limited(cursor, permit));
         }
         let Some(context) = self.context_in(&cache) else {
             cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
             crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+            let permit = cache.fallback_permit()?;
+            return LoadConnection::<B>::load(&mut self.inner, source)
+                .map(|cursor| SyncedCursor::Limited(cursor, permit));
         };
         key.context = context;
         if let Some(rows) = cache.get(&key) {
@@ -643,22 +649,27 @@ where
         }
         if cache.refused_recently(&key).is_some() {
             crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+            let permit = cache.fallback_permit()?;
+            return LoadConnection::<B>::load(&mut self.inner, source)
+                .map(|cursor| SyncedCursor::Limited(cursor, permit));
         }
         let reservation = cache.reserve(&key);
         let since = match cache.subscriptions().subscribe_with(&key, &mut self.inner) {
             Verdict::Refused(reason) => {
                 cache.refused(&key, &reason);
                 crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+                let permit = cache.fallback_permit()?;
+                return LoadConnection::<B>::load(&mut self.inner, source)
+                    .map(|cursor| SyncedCursor::Limited(cursor, permit));
             }
             Verdict::Rows { rows, live } => {
                 cache.fill_live(reservation, live, &rows);
                 if cache.subscriptions().behind() {
                     cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
                     crate::metrics::report(|metrics| metrics.served(Served::Postgres));
+                    let permit = cache.fallback_permit()?;
                     return LoadConnection::<B>::load(&mut self.inner, source)
-                        .map(SyncedCursor::Live);
+                        .map(|cursor| SyncedCursor::Limited(cursor, permit));
                 }
                 self.served = Some(Served::Engine);
                 crate::metrics::report(|metrics| metrics.served(Served::Engine));
@@ -671,6 +682,13 @@ where
         };
         let keep = self.replayed_past(&cache, since);
         crate::metrics::report(|metrics| metrics.served(Served::Postgres));
+        let _permit = match cache.fallback_permit() {
+            Ok(permit) => permit,
+            Err(error) => {
+                cache.abandon(&key);
+                return Err(error);
+            }
+        };
         let rows = LoadConnection::<DefaultLoadingMode>::load(&mut self.inner, source)
             .and_then(capture_all);
         let rows: Arc<[OwnedRow]> = match rows {
