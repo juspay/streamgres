@@ -55,6 +55,12 @@
 //!     .await?;
 //! ```
 //!
+//! [`EngineClient::watch_sql`] shares one such subscription among every
+//! watcher of the same SQL, each with a [`Watch`] receiving its changes:
+//! a process that pushes changes to many clients (a Server-Sent Events
+//! endpoint, say, with the `sse` feature's [`crate::sse::body`]) follows
+//! each query once, however many clients watch it.
+//!
 //! The rows are the engine's, read with its own role: the subscription
 //! is the backend's own code, as an S2S connection is, and a table with
 //! row-level security is refused. Only a query the engine serves with its
@@ -84,8 +90,9 @@ use diesel::sql_types::Untyped;
 use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::query_dsl::CompatibleType;
 use diesel::{Connection, QueryResult};
+use futures_util::Stream;
 use serde_json::Value as Json;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, broadcast};
 
 use crate::engine::EngineClient;
 use crate::key::QueryKey;
@@ -118,6 +125,14 @@ pub enum Change<T> {
     Updated { old: T, new: T },
     /// A row that left the result, as it was last.
     Removed(T),
+}
+
+/// What a subscription's delivery task hands on: a change, a notice that
+/// changes were lost (read the result afresh), or the end.
+pub(crate) enum Delivery<T> {
+    Change(Change<T>),
+    Missed(String),
+    Ended(String),
 }
 
 /// One change as the engine side computes it: a result row's identity,
@@ -209,6 +224,12 @@ pub(crate) struct Listening {
     stopped: AtomicBool,
     lagged: AtomicU64,
     errors: Mutex<Vec<String>>,
+    /// Notices of changes lost (a delta that could not be applied, a row
+    /// that would not decode), for the delivery task to pass on.
+    missed: Mutex<VecDeque<String>>,
+    /// Why the engine no longer follows the query, once it does not: the
+    /// subscription has ended.
+    ended: Mutex<Option<String>>,
     /// The database the engine streams, to look column types up on when
     /// the engine connection comes back without them.
     database_url: String,
@@ -228,6 +249,8 @@ impl Listening {
             stopped: AtomicBool::new(false),
             lagged: AtomicU64::new(0),
             errors: Mutex::new(Vec::new()),
+            missed: Mutex::new(VecDeque::new()),
+            ended: Mutex::new(None),
             database_url,
             database,
         })
@@ -254,12 +277,38 @@ impl Listening {
     }
 
     /// Records why something could not be followed or delivered.
-    pub(crate) fn failed(&self, reason: String) {
+    fn record(&self, reason: &str) {
         let mut errors = self.errors.lock().expect("errors");
         if errors.len() >= 64 {
             errors.remove(0);
         }
-        errors.push(reason);
+        errors.push(reason.to_string());
+    }
+
+    /// A change was lost (`reason`): recorded, and passed on as a notice
+    /// so a consumer can read the result afresh.
+    pub(crate) fn failed(&self, reason: String) {
+        self.record(&reason);
+        let mut missed = self.missed.lock().expect("missed");
+        if missed.len() >= 64 {
+            missed.pop_front();
+        }
+        missed.push_back(reason);
+        drop(missed);
+        self.notify.notify_one();
+    }
+
+    /// The engine no longer follows the query (`reason`): recorded, and
+    /// the subscription ends once what is pending is delivered.
+    pub(crate) fn end(&self, reason: String) {
+        self.record(&reason);
+        self.ended.lock().expect("ended").get_or_insert(reason);
+        self.notify.notify_one();
+    }
+
+    /// Why the subscription ended, once it has.
+    pub(crate) fn ended(&self) -> Option<String> {
+        self.ended.lock().expect("ended").clone()
     }
 
     /// A store the engine side has just built for the subscription, from
@@ -462,6 +511,14 @@ impl Subscription {
         self.listening.errors()
     }
 
+    /// Why the engine no longer follows the query, once it does not (it
+    /// stopped serving the query's rows, or let it go after a reconnect):
+    /// no change arrives after the ones already pending. `None` while it
+    /// is followed.
+    pub fn ended(&self) -> Option<String> {
+        self.listening.ended()
+    }
+
     /// Ends the subscription now.
     pub fn stop(self) {}
 }
@@ -562,7 +619,9 @@ impl EngineClient {
     /// is the database the engine streams: a connection there renders
     /// the query and reads its tables' column types, and is closed
     /// before this returns. The callbacks run on the runtime this is
-    /// called on.
+    /// called on. Changes lost are named in [`Subscription::errors`]; once
+    /// the engine no longer follows the query, [`Subscription::ended`]
+    /// says why and no callback follows.
     pub async fn subscribe<Q, T, ST, F, Fut>(
         &self,
         database_url: &str,
@@ -575,6 +634,37 @@ impl EngineClient {
         T: FromSqlRow<ST, Pg> + Send + 'static,
         ST: Send + 'static,
         F: Fn(Change<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.subscribe_deliveries(database_url, query, move |delivery| {
+            let call = match delivery {
+                Delivery::Change(change) => Some(callback(change)),
+                Delivery::Missed(_) | Delivery::Ended(_) => None,
+            };
+            async move {
+                if let Some(call) = call {
+                    call.await;
+                }
+            }
+        })
+        .await
+    }
+
+    /// [`subscribe`](Self::subscribe), with the notices of changes lost
+    /// and of the end delivered too: each after the changes pending when
+    /// it was given, the end last.
+    pub(crate) async fn subscribe_deliveries<Q, T, ST, F, Fut>(
+        &self,
+        database_url: &str,
+        query: Q,
+        callback: F,
+    ) -> Result<Subscription, SubscribeError>
+    where
+        Q: Query + QueryFragment<Pg> + QueryId + Send + 'static,
+        Q::SqlType: CompatibleType<T, Pg, SqlType = ST>,
+        T: FromSqlRow<ST, Pg> + Send + 'static,
+        ST: Send + 'static,
+        F: Fn(Delivery<T>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         let listener = NEXT_LISTENER.fetch_add(1, Ordering::Relaxed);
@@ -641,6 +731,203 @@ impl EngineClient {
     {
         self.subscribe(database_url, diesel::sql_query(sql.into()), callback)
             .await
+    }
+}
+
+/// How many changes a [`Watch`] may fall behind before it is told it
+/// lagged and the oldest are dropped for it.
+pub const WATCH_CAPACITY: usize = 1024;
+
+/// One client's shared subscriptions, by database URL and SQL: a slot per
+/// key, locked while its subscription starts, so a slow subscribe holds
+/// up only the watchers of the same SQL.
+#[derive(Default)]
+pub(crate) struct Watches(Mutex<HashMap<(String, String), Arc<WatchSlot>>>);
+
+/// One key's shared subscription, once started.
+type WatchSlot = tokio::sync::Mutex<Option<std::sync::Weak<Watched>>>;
+
+impl Watches {
+    /// The slot for `key`, after dropping slots nobody holds whose
+    /// subscription has stopped.
+    fn slot(&self, key: (String, String)) -> Arc<WatchSlot> {
+        let mut slots = self.0.lock().expect("watches");
+        slots.retain(|_, slot| Arc::strong_count(slot) > 1 || live(slot).unwrap_or(true));
+        Arc::clone(slots.entry(key).or_default())
+    }
+}
+
+/// Whether a slot holds a running subscription; `None` while it is
+/// locked (one is starting).
+fn live(slot: &WatchSlot) -> Option<bool> {
+    let watched = slot.try_lock().ok()?;
+    Some(
+        watched
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|watched| !watched.ended.load(Ordering::Acquire)),
+    )
+}
+
+/// One shared subscription: the subscription and the channel its changes
+/// fan out on. It lives as long as some [`Watch`] of it does.
+struct Watched {
+    sender: broadcast::Sender<Fanned>,
+    /// Set when the subscription ended: a later watcher starts afresh.
+    ended: Arc<AtomicBool>,
+    _subscription: Subscription,
+}
+
+/// What a shared subscription fans out.
+#[derive(Clone)]
+enum Fanned {
+    Change(Change<SqlRow>),
+    Missed(String),
+    Failed(String),
+}
+
+impl EngineClient {
+    /// A watcher of `sql` on `database_url`, sharing one subscription
+    /// ([`subscribe_sql`](Self::subscribe_sql)) with every other watcher of
+    /// the same SQL on this client. The subscription starts with the first
+    /// watcher and stops when the last is dropped.
+    ///
+    /// A watcher receives the changes made after it joined:
+    /// [`Change::Present`] rows reach only the watchers there when the
+    /// subscription started. It is told when changes were lost
+    /// ([`WatchError::Missed`]: it fell [`WATCH_CAPACITY`] changes behind,
+    /// or a delta or row could not be followed), and when the engine no
+    /// longer follows the query ([`WatchError::Failed`]), after which its
+    /// stream ends and the next watcher of the SQL subscribes afresh.
+    pub async fn watch_sql(
+        &self,
+        database_url: &str,
+        sql: impl Into<String>,
+    ) -> Result<Watch, SubscribeError> {
+        let sql = sql.into();
+        let slot = self.watches().slot((database_url.to_string(), sql.clone()));
+        let mut current = slot.lock().await;
+        if let Some(watched) = current
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .filter(|watched| !watched.ended.load(Ordering::Acquire))
+        {
+            return Ok(Watch {
+                receiver: watched.sender.subscribe(),
+                done: false,
+                _watched: watched,
+            });
+        }
+        let (sender, receiver) = broadcast::channel(WATCH_CAPACITY);
+        let fan_out = sender.clone();
+        let ended = Arc::new(AtomicBool::new(false));
+        let ending = Arc::clone(&ended);
+        let subscription = self
+            .subscribe_deliveries(
+                database_url,
+                diesel::sql_query(sql),
+                move |delivery: Delivery<SqlRow>| {
+                    let fanned = match delivery {
+                        Delivery::Change(change) => Fanned::Change(change),
+                        Delivery::Missed(reason) => Fanned::Missed(reason),
+                        Delivery::Ended(reason) => {
+                            ending.store(true, Ordering::Release);
+                            Fanned::Failed(reason)
+                        }
+                    };
+                    let _ = fan_out.send(fanned);
+                    std::future::ready(())
+                },
+            )
+            .await?;
+        let watched = Arc::new(Watched {
+            sender,
+            ended,
+            _subscription: subscription,
+        });
+        *current = Some(Arc::downgrade(&watched));
+        Ok(Watch {
+            receiver,
+            done: false,
+            _watched: watched,
+        })
+    }
+
+    /// How many shared subscriptions are running ([`watch_sql`](Self::watch_sql)).
+    pub async fn watched(&self) -> usize {
+        let slots = self.watches().0.lock().expect("watches");
+        slots.values().filter(|slot| live(slot) == Some(true)).count()
+    }
+}
+
+/// Why a [`Watch`] could not hand on a change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchError {
+    /// Changes were lost (the watcher fell behind, or a delta or row could
+    /// not be followed): read the result afresh. More changes follow.
+    Missed(String),
+    /// The engine no longer follows the query; nothing follows, and the
+    /// watcher's stream ends.
+    Failed(String),
+}
+
+impl std::fmt::Display for WatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WatchError::Missed(reason) => write!(f, "changes were missed: {reason}"),
+            WatchError::Failed(reason) => write!(f, "the query is no longer followed: {reason}"),
+        }
+    }
+}
+
+/// One watcher of a shared subscription ([`EngineClient::watch_sql`]).
+/// Dropping the last watcher of a query stops its subscription.
+pub struct Watch {
+    receiver: broadcast::Receiver<Fanned>,
+    /// Set once [`WatchError::Failed`] was handed on.
+    done: bool,
+    _watched: Arc<Watched>,
+}
+
+impl Watch {
+    /// The next change, or why there is none: `Err(Missed)` when changes
+    /// were lost, `Err(Failed)` once the query is no longer followed, and
+    /// `None` after that.
+    pub async fn recv(&mut self) -> Option<Result<Change<SqlRow>, WatchError>> {
+        if self.done {
+            return None;
+        }
+        match self.receiver.recv().await {
+            Ok(Fanned::Change(change)) => Some(Ok(change)),
+            Ok(Fanned::Missed(reason)) => Some(Err(WatchError::Missed(reason))),
+            Ok(Fanned::Failed(reason)) => {
+                self.done = true;
+                Some(Err(WatchError::Failed(reason)))
+            }
+            Err(broadcast::error::RecvError::Lagged(missed)) => Some(Err(WatchError::Missed(
+                format!("the watcher fell {missed} changes behind"),
+            ))),
+            Err(broadcast::error::RecvError::Closed) => None,
+        }
+    }
+
+    /// The changes as a stream, ending after [`WatchError::Failed`].
+    pub fn into_stream(self) -> impl Stream<Item = Result<Change<SqlRow>, WatchError>> + Send + 'static {
+        futures_util::stream::unfold(self, |mut watch| async move {
+            let next = watch.recv().await?;
+            Some((next, watch))
+        })
+    }
+}
+
+impl Clone for Watch {
+    /// Another watcher of the same subscription, from now on.
+    fn clone(&self) -> Watch {
+        Watch {
+            receiver: self.receiver.resubscribe(),
+            done: self.done,
+            _watched: Arc::clone(&self._watched),
+        }
     }
 }
 
@@ -743,20 +1030,33 @@ async fn deliver<ST, T, F, Fut>(
     _types: PhantomData<fn() -> (ST, T)>,
 ) where
     T: FromSqlRow<ST, Pg>,
-    F: Fn(Change<T>) -> Fut,
+    F: Fn(Delivery<T>) -> Fut,
     Fut: Future<Output = ()>,
 {
     while !listening.stopped.load(Ordering::Acquire) {
         let next = listening.pending.lock().expect("pending").pop();
-        let Some(change) = next else {
-            listening.notify.notified().await;
+        if let Some(change) = next {
+            match decode::<ST, T>(change) {
+                Ok(Some(change)) => callback(Delivery::Change(change)).await,
+                Ok(None) => {}
+                Err(error) => {
+                    let reason = format!("a row would not decode: {error}");
+                    listening.record(&reason);
+                    callback(Delivery::Missed(reason)).await;
+                }
+            }
             continue;
-        };
-        match decode::<ST, T>(change) {
-            Ok(Some(change)) => callback(change).await,
-            Ok(None) => {}
-            Err(error) => listening.failed(format!("a row would not decode: {error}")),
         }
+        let missed = listening.missed.lock().expect("missed").pop_front();
+        if let Some(reason) = missed {
+            callback(Delivery::Missed(reason)).await;
+            continue;
+        }
+        if let Some(reason) = listening.ended() {
+            callback(Delivery::Ended(reason)).await;
+            return;
+        }
+        listening.notify.notified().await;
     }
 }
 
@@ -827,6 +1127,68 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    /// A subscription starting for one SQL holds up no watcher of another:
+    /// with one key's slot held, a watch of another still returns (here
+    /// with the database unreachable, at once).
+    #[tokio::test]
+    async fn a_starting_watch_holds_up_only_its_own_sql() {
+        let engine = EngineClient::connect("ws://127.0.0.1:1/zero/s2s/v1");
+        let url = "postgres://nobody@127.0.0.1:1/none?connect_timeout=1";
+        let held = engine.watches().slot((url.to_string(), "SELECT 1".to_string()));
+        let _starting = held.lock().await;
+        let other = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            engine.watch_sql(url, "SELECT 2"),
+        )
+        .await
+        .expect("another SQL is not held up");
+        assert!(other.is_err(), "the database is unreachable");
+        assert_eq!(engine.watched().await, 0);
+    }
+
+    /// A lost change and the end reach the callback as notices, in order
+    /// after the changes pending; nothing follows the end.
+    #[tokio::test]
+    async fn missed_and_ended_are_delivered_in_order() {
+        let listening = Listening::new(
+            "postgres:///unused".to_string(),
+            crate::cache::Database {
+                system: "1".to_string(),
+                name: "db".to_string(),
+            },
+        );
+        listening.push(vec![change("a", None, Some(1))]);
+        listening.failed("a delta could not be applied".to_string());
+        listening.end("the engine stopped following the query".to_string());
+        listening.push(vec![change("b", None, Some(2))]);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        deliver(
+            Arc::clone(&listening),
+            move |delivery: Delivery<i32>| {
+                record.lock().expect("seen").push(match delivery {
+                    Delivery::Change(change) => format!("{change:?}"),
+                    Delivery::Missed(reason) => format!("missed: {reason}"),
+                    Delivery::Ended(reason) => format!("ended: {reason}"),
+                });
+                std::future::ready(())
+            },
+            PhantomData::<fn() -> (diesel::sql_types::Integer, i32)>,
+        )
+        .await;
+        assert_eq!(
+            *seen.lock().expect("seen"),
+            vec![
+                "Added(1)".to_string(),
+                "Added(2)".to_string(),
+                "missed: a delta could not be applied".to_string(),
+                "ended: the engine stopped following the query".to_string(),
+            ]
+        );
+        assert_eq!(listening.ended().as_deref(), Some("the engine stopped following the query"));
+        assert_eq!(listening.errors().len(), 2);
     }
 
     /// A plain-SQL subscription's change decodes to a `SqlRow` of the same

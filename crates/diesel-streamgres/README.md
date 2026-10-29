@@ -72,6 +72,22 @@ let subscription = engine
     .await?;
 ```
 
+To push one query's changes to many clients, `watch_sql` shares a single
+subscription among every watcher of the same SQL; the last watcher dropped
+stops it. With the `sse` feature, `sse::body` turns events into the text
+of a `text/event-stream` response for any web framework:
+
+```rust
+let watch = engine.watch_sql(&database_url, "SELECT id, status FROM orders").await?;
+let events = watch.into_stream().filter_map(|change| async move {
+    match change {
+        Ok(Change::Present(_)) => None,
+        _ => Some(sse::Event::named("orders", "changed")),
+    }
+});
+let body = sse::body(events, sse::KEEP_ALIVE); // a Stream of String
+```
+
 The callback first gets `Change::Present` for each row already there.
 Then, per commit, it gets `Added`, `Updated { old, new }` and `Removed`,
 whoever made the change. It runs one change at a time. After a lost

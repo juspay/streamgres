@@ -17,6 +17,9 @@ diesel-2-3 = []
 # `AsyncSyncedConnection`, the same wrapper over diesel-async's
 # `AsyncPgConnection` (Diesel 2.3).
 async = ["diesel-2-3", "dep:diesel-async", "diesel-async/postgres", "diesel-async/pool"]
+# `sse::body`: changes as a Server-Sent Events body, a stream of text any
+# web framework serves. No dependencies of its own.
+sse = []
 # The engine inside this process (`EngineClient::embedded`): the same
 # frames as the S2S endpoint, over channels to an engine this process
 # runs, instead of a socket to one elsewhere.

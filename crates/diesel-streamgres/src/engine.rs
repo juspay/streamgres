@@ -257,6 +257,8 @@ struct Shared {
     listeners: Mutex<HashMap<QueryKey, Arc<Listening>>>,
     /// Set when the pool is dropped; the worker threads then end.
     stopped: AtomicBool,
+    /// The shared plain-SQL subscriptions ([`EngineClient::watch_sql`]).
+    watches: crate::listen::Watches,
 }
 
 impl Shared {
@@ -615,6 +617,7 @@ impl EngineClient {
             cache: Mutex::new(None),
             listeners: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
+            watches: Default::default(),
         });
         let workers = (0..config.connections)
             .map(|index| {
@@ -675,6 +678,11 @@ impl EngineClient {
     /// Whether any socket to the engine is up.
     pub fn is_connected(&self) -> bool {
         self.connections() > 0
+    }
+
+    /// The shared plain-SQL subscriptions of this client.
+    pub(crate) fn watches(&self) -> &crate::listen::Watches {
+        &self.pool.shared.watches
     }
 
     /// How many of the pool's sockets are up.
@@ -1172,7 +1180,7 @@ impl Worker {
             let since = state.since.get(&id).copied();
             drop(state);
             if let Some(listening) = &listening {
-                listening.failed(format!("the engine no longer serves the query's rows: {reason}"));
+                listening.end(format!("the engine no longer serves the query's rows: {reason}"));
             }
             shared.fell_back(reason);
             Verdict::Accepted { since }
@@ -1893,7 +1901,7 @@ fn rebuild_off_thread(
                     this.build(id, snapshot, Some(&expected));
                 }
                 Err(reason) => {
-                    listening.failed(reason);
+                    listening.end(reason);
                     if let Some(key) = key {
                         let_go(&this, id, &key);
                     }
@@ -1922,7 +1930,7 @@ fn resubscribed_elsewhere(worker: &Worker, id: u64, key: &QueryKey, reason: Stri
 fn let_go(worker: &Worker, id: u64, key: &QueryKey) {
     let shared = &worker.shared;
     if let Some(listening) = shared.listening(key) {
-        listening.failed("the engine stopped following the query".to_string());
+        listening.end("the engine stopped following the query".to_string());
     }
     {
         let mut state = worker.state.lock().expect("state");
@@ -1984,7 +1992,7 @@ fn on_refused(worker: &Worker, body: &Json) {
         }
         Some(None) | None => {
             if let Some(listening) = key.as_ref().and_then(|key| shared.listening(key)) {
-                listening.failed(format!("the engine stopped following the query: {reason}"));
+                listening.end(format!("the engine stopped following the query: {reason}"));
             }
             if let (Some(key), Some(cache)) = (key, shared.cache()) {
                 cache.touched(&key);
@@ -2134,6 +2142,7 @@ mod tests {
             cache: Mutex::new(None),
             listeners: Mutex::new(HashMap::new()),
             stopped: AtomicBool::new(false),
+            watches: Default::default(),
         });
         let (worker, outgoing) = Worker::new(
             0,

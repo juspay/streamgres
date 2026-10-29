@@ -62,6 +62,8 @@ pub mod listen;
 pub mod materialized;
 pub mod route;
 pub mod row;
+#[cfg(feature = "sse")]
+pub mod sse;
 mod session;
 pub mod subscriptions;
 pub mod types;
@@ -89,7 +91,7 @@ use crate::cache::{
 use crate::session::{Effect, RECHECK_EVERY, Scope, SessionChanges};
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
-pub use crate::listen::{Change, SqlRow, Subscription, SubscribeError};
+pub use crate::listen::{Change, SqlRow, Subscription, SubscribeError, Watch, WatchError};
 pub use crate::route::{Route, RouteDsl, Served, Via};
 /// The engine inside this process ([`engine::EngineClient::embedded`]):
 /// its handle, its configuration and the SQL that sets a database up

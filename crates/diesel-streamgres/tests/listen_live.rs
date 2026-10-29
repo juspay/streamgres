@@ -261,6 +261,116 @@ async fn a_query_the_engine_cannot_follow_is_refused() {
     assert!(!error.0.is_empty());
 }
 
+/// A query given as plain SQL reports the same changes, its rows read by
+/// column name: present, added, updated, removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plain_sql_query_reports_its_rows_changes() {
+    let Some((engine, database, mut other)) = start() else {
+        return;
+    };
+    let tag = format!("sql-{}", std::process::id());
+    let key = |name: &str| format!("{tag}-{name}");
+    diesel::insert_into(sg_configs::table)
+        .values((sg_configs::key.eq(key("a")), sg_configs::value.eq(&tag)))
+        .execute(&mut other)
+        .expect("insert a");
+
+    let (sender, mut changes) = mpsc::unbounded_channel();
+    let _subscription = engine
+        .subscribe_sql(
+            &database,
+            format!("SELECT id, key, value FROM sg_configs WHERE value = '{tag}'"),
+            move |change: Change<diesel_streamgres::SqlRow>| {
+                let sender = sender.clone();
+                async move {
+                    let _ = sender.send(change);
+                }
+            },
+        )
+        .await
+        .expect("subscribed");
+
+    let Change::Present(a) = next(&mut changes).await else {
+        panic!("the row there first is present");
+    };
+    assert_eq!(a.text("key"), Some(key("a")));
+    assert_eq!(a.columns(), ["id", "key", "value"]);
+    assert!(a.get::<diesel::sql_types::Integer, i32>("id").expect("id") > 0);
+
+    diesel::insert_into(sg_configs::table)
+        .values((sg_configs::key.eq(key("b")), sg_configs::value.eq(&tag)))
+        .execute(&mut other)
+        .expect("insert b");
+    let Change::Added(b) = next(&mut changes).await else {
+        panic!("an inserted row is added");
+    };
+    assert_eq!(b.text("key"), Some(key("b")));
+
+    diesel::update(sg_configs::table.filter(sg_configs::key.eq(key("b"))))
+        .set(sg_configs::key.eq(key("b2")))
+        .execute(&mut other)
+        .expect("update b");
+    let Change::Updated { old, new } = next(&mut changes).await else {
+        panic!("a changed row is updated");
+    };
+    assert_eq!((old.text("key"), new.text("key")), (Some(key("b")), Some(key("b2"))));
+
+    diesel::delete(sg_configs::table.filter(sg_configs::value.eq(&tag)))
+        .execute(&mut other)
+        .expect("delete");
+    for _ in 0..2 {
+        let change = next(&mut changes).await;
+        assert!(matches!(change, Change::Removed(_)), "a deleted row is removed: {change:?}");
+    }
+    quiet(&mut changes).await;
+}
+
+/// Watchers of the same SQL share one subscription and each receives its
+/// changes; another SQL has its own; the last watcher dropped stops it.
+#[tokio::test(flavor = "multi_thread")]
+async fn watchers_of_one_query_share_its_subscription() {
+    let Some((engine, database, mut other)) = start() else {
+        return;
+    };
+    let tag = format!("watch-{}", std::process::id());
+    let sql = format!("SELECT id, key FROM sg_configs WHERE value = '{tag}'");
+    let watching = engine.watched().await;
+    let subscribed = engine.subscribed();
+
+    let mut first = engine.watch_sql(&database, sql.clone()).await.expect("first watcher");
+    let mut second = engine.watch_sql(&database, sql.clone()).await.expect("second watcher");
+    let mut third = second.clone();
+    assert_eq!(engine.watched().await, watching + 1, "one shared subscription");
+    assert_eq!(engine.subscribed(), subscribed + 1, "the engine follows the query once");
+
+    let other_sql = format!("SELECT id FROM sg_configs WHERE value = '{tag}-other'");
+    let elsewhere = engine.watch_sql(&database, other_sql).await.expect("another query");
+    assert_eq!(engine.watched().await, watching + 2, "another SQL, another subscription");
+    drop(elsewhere);
+
+    diesel::insert_into(sg_configs::table)
+        .values((sg_configs::key.eq(format!("{tag}-a")), sg_configs::value.eq(&tag)))
+        .execute(&mut other)
+        .expect("insert");
+    for watch in [&mut first, &mut second, &mut third] {
+        let change = tokio::time::timeout(Duration::from_secs(10), watch.recv())
+            .await
+            .expect("a change within the wait")
+            .expect("running")
+            .expect("not lagged");
+        let Change::Added(row) = change else {
+            panic!("each watcher sees the row added: {change:?}");
+        };
+        assert_eq!(row.text("key"), Some(format!("{tag}-a")));
+    }
+
+    drop((first, second, third));
+    assert_eq!(engine.watched().await, watching, "the last watcher stops it");
+    diesel::delete(sg_configs::table.filter(sg_configs::value.eq(&tag)))
+        .execute(&mut other)
+        .expect("clean up");
+}
+
 /// A typed Diesel query on a table outside `public`, as Diesel renders it
 /// (`"s"."t"."c"` throughout), is followed like one in `public`. Needs the
 /// engine to follow `sg_live_ws` (`STREAMGRES_SCHEMAS`); skips otherwise.
