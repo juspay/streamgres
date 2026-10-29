@@ -57,6 +57,21 @@ let subscription = engine
     .await?;
 ```
 
+Without Diesel types of this crate's Diesel (an application on another
+Diesel version, a fork, or none), `subscribe_sql` takes the query as SQL
+and gives each row as a `SqlRow`, read by column name:
+
+```rust
+let subscription = engine
+    .subscribe_sql(&database_url, r#"SELECT id, status FROM payments"#,
+        |change: Change<SqlRow>| async move {
+            if let Change::Updated { new, .. } = change {
+                println!("{:?} is now {:?}", new.text("id"), new.text("status"));
+            }
+        })
+    .await?;
+```
+
 The callback first gets `Change::Present` for each row already there.
 Then, per commit, it gets `Added`, `Updated { old, new }` and `Removed`,
 whoever made the change. It runs one change at a time. After a lost

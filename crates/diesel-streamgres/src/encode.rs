@@ -23,7 +23,7 @@ use crate::types::{ColumnType, TypeKind};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unsupported(pub String);
 
-mod oid {
+pub(crate) mod oid {
     pub const BOOL: u32 = 16;
     pub const BYTEA: u32 = 17;
     pub const CHAR: u32 = 18;

@@ -40,14 +40,29 @@
 //! - Not across processes: a new subscription starts with
 //!   [`Change::Present`] rows, to reconcile from.
 //!
+//! [`EngineClient::subscribe_sql`] does the same for a query given as
+//! plain SQL, and hands back each row as a [`SqlRow`]: an application
+//! whose own Diesel is another version, or a fork, or none, subscribes
+//! without naming a Diesel type.
+//!
+//! ```ignore
+//! let subscription = engine
+//!     .subscribe_sql(&database_url, "SELECT id, status FROM payments", |change| async move {
+//!         if let Change::Updated { new, .. } = change {
+//!             println!("payment {:?} is now {:?}", new.text("id"), new.text("status"));
+//!         }
+//!     })
+//!     .await?;
+//! ```
+//!
 //! The rows are the engine's, read with its own role: the subscription
 //! is the backend's own code, as an S2S connection is, and a table with
 //! row-level security is refused. Only a query the engine serves with its
 //! rows can be subscribed: one it follows only by refills (a column type
 //! it cannot encode) is refused with the reason. The engine must stream
-//! the database `database_url` names, and the query's tables must be the
-//! ones `public` holds, as the engine reads them; otherwise subscribing
-//! is refused.
+//! the database `database_url` names, and the query's tables must be
+//! ones it follows, bare in `public` or as `schema.table` in another
+//! followed schema; otherwise subscribing is refused.
 //!
 //! A single-table query without `LIMIT` is followed change by change from
 //! each delta the engine sends, whatever the size of its result. A join,
@@ -62,8 +77,10 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use diesel::PgConnection;
-use diesel::deserialize::FromSqlRow;
+use diesel::deserialize::{self, FromSql, FromSqlRow};
 use diesel::pg::Pg;
+use diesel::row::{Field, Row};
+use diesel::sql_types::Untyped;
 use diesel::query_builder::{Query, QueryFragment, QueryId};
 use diesel::query_dsl::CompatibleType;
 use diesel::{Connection, QueryResult};
@@ -73,6 +90,7 @@ use tokio::sync::Notify;
 use crate::engine::EngineClient;
 use crate::key::QueryKey;
 use crate::materialized::Materialized;
+use crate::encode::oid;
 use crate::row::OwnedRow;
 use crate::subscriptions::{Subscriptions, Verdict};
 
@@ -605,6 +623,117 @@ impl EngineClient {
     }
 }
 
+impl EngineClient {
+    /// [`subscribe`](Self::subscribe) for a query given as plain SQL: each
+    /// change's rows as [`SqlRow`]s, read by column name, so the caller
+    /// needs no Diesel type of this crate's Diesel. Identifiers outside
+    /// `public` are written `"schema"."table"`; values are written into
+    /// the SQL (it takes no binds), so quote what is not the caller's own.
+    pub async fn subscribe_sql<F, Fut>(
+        &self,
+        database_url: &str,
+        sql: impl Into<String>,
+        callback: F,
+    ) -> Result<Subscription, SubscribeError>
+    where
+        F: Fn(Change<SqlRow>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.subscribe(database_url, diesel::sql_query(sql.into()), callback)
+            .await
+    }
+}
+
+/// One row of a plain-SQL subscription ([`EngineClient::subscribe_sql`]):
+/// its values by column name, as the engine has them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlRow(OwnedRow);
+
+impl SqlRow {
+    /// The row's columns, in the query's order.
+    pub fn columns(&self) -> &[String] {
+        self.0.columns()
+    }
+
+    /// Whether `column` is SQL `NULL` (or not a column of the row).
+    pub fn is_null(&self, column: &str) -> bool {
+        self.position(column)
+            .and_then(|index| self.0.value(index))
+            .is_none()
+    }
+
+    /// `column` as text, for the types whose text form needs no
+    /// conversion table: booleans, integers, text of every kind, `json`,
+    /// `jsonb` and `uuid`. `None` for `NULL`, another type, or no such
+    /// column; read those with [`get`](Self::get).
+    pub fn text(&self, column: &str) -> Option<String> {
+        let value = self.0.value(self.position(column)?)?;
+        let bytes = value.bytes();
+        let int = |width: usize| -> Option<String> {
+            let mut buffer = [0u8; 8];
+            if bytes.len() != width {
+                return None;
+            }
+            buffer[8 - width..].copy_from_slice(bytes);
+            let shift = 64 - 8 * width as u32;
+            Some(((i64::from_be_bytes(buffer) << shift) >> shift).to_string())
+        };
+        match value.type_oid().get() {
+            oid::BOOL => Some((bytes.first()? != &0).to_string()),
+            oid::INT2 => int(2),
+            oid::INT4 => int(4),
+            oid::INT8 => int(8),
+            oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::JSON => {
+                String::from_utf8(bytes.to_vec()).ok()
+            }
+            oid::JSONB => String::from_utf8(bytes.get(1..)?.to_vec()).ok(),
+            oid::UUID if bytes.len() == 16 => {
+                let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+                Some(format!(
+                    "{}-{}-{}-{}-{}",
+                    &hex[0..8],
+                    &hex[8..12],
+                    &hex[12..16],
+                    &hex[16..20],
+                    &hex[20..32]
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// `column` decoded as `T` from SQL type `ST`, as Diesel decodes it
+    /// (this crate's Diesel), for the types [`text`](Self::text) leaves out.
+    pub fn get<ST, T>(&self, column: &str) -> deserialize::Result<T>
+    where
+        T: FromSql<ST, Pg>,
+    {
+        let index = self
+            .position(column)
+            .ok_or_else(|| format!("no column `{column}`"))?;
+        let field = self.0.get(index).ok_or_else(|| format!("no column `{column}`"))?;
+        T::from_nullable_sql(field.value())
+    }
+
+    /// The row as the engine holds it.
+    pub fn owned(&self) -> &OwnedRow {
+        &self.0
+    }
+
+    fn position(&self, column: &str) -> Option<usize> {
+        self.0.columns().iter().position(|name| name == column)
+    }
+}
+
+impl FromSqlRow<Untyped, Pg> for SqlRow {
+    /// Copies the row: names and values as they are.
+    fn build_from_row<'a>(row: &impl Row<'a, Pg>) -> deserialize::Result<Self> {
+        OwnedRow::capture(row, None)
+            .map(SqlRow)
+            .ok_or_else(|| "a column of the row has no name".into())
+    }
+}
+
 /// The delivery task: each pending change, decoded as `T` from rows of
 /// SQL type `ST`, to `callback`, one at a time, until the subscription
 /// stops.
@@ -683,6 +812,87 @@ mod tests {
     /// What a change decodes to, as an `i32` query's.
     fn decoded(change: RowChange) -> Option<Change<i32>> {
         decode::<diesel::sql_types::Integer, i32>(change).expect("decodes")
+    }
+
+    /// A row of `(name, type oid, bytes)` columns, `None` bytes for NULL.
+    fn sql_row(columns: &[(&str, u32, Option<Vec<u8>>)]) -> OwnedRow {
+        OwnedRow::new(
+            Arc::from(columns.iter().map(|(name, _, _)| name.to_string()).collect::<Vec<_>>()),
+            columns
+                .iter()
+                .map(|(_, type_oid, bytes)| {
+                    bytes.clone().map(|bytes| {
+                        OwnedValue::new(std::num::NonZeroU32::new(*type_oid).expect("oid"), bytes)
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// A plain-SQL subscription's change decodes to a `SqlRow` of the same
+    /// columns, whatever their types.
+    #[test]
+    fn sql_rows_decode_whole() {
+        let row = sql_row(&[("id", 20, Some(7i64.to_be_bytes().to_vec())), ("note", 25, None)]);
+        let change = RowChange {
+            identity: "7".to_string(),
+            old: None,
+            new: Some(row.clone()),
+            present: false,
+        };
+        let decoded = decode::<Untyped, SqlRow>(change).expect("decodes");
+        assert_eq!(decoded, Some(Change::Added(SqlRow(row))));
+    }
+
+    /// `text` renders the types it knows from their binary form, and
+    /// leaves the rest, NULL and unknown columns to `None`.
+    #[test]
+    fn sql_row_text_reads_known_types() {
+        let row = SqlRow(sql_row(&[
+            ("flag", oid::BOOL, Some(vec![1])),
+            ("small", oid::INT2, Some((-3i16).to_be_bytes().to_vec())),
+            ("count", oid::INT4, Some(42i32.to_be_bytes().to_vec())),
+            ("big", oid::INT8, Some((-9_000_000_000i64).to_be_bytes().to_vec())),
+            ("name", oid::VARCHAR, Some(b"alpha".to_vec())),
+            ("doc", oid::JSON, Some(br#"{"a":1}"#.to_vec())),
+            ("docb", oid::JSONB, Some([&[1u8][..], br#"{"b":2}"#].concat())),
+            ("key", oid::UUID, Some((0u8..16).collect())),
+            ("at", oid::TIMESTAMP, Some(0i64.to_be_bytes().to_vec())),
+            ("gone", oid::TEXT, None),
+        ]));
+        assert_eq!(row.text("flag").as_deref(), Some("true"));
+        assert_eq!(row.text("small").as_deref(), Some("-3"));
+        assert_eq!(row.text("count").as_deref(), Some("42"));
+        assert_eq!(row.text("big").as_deref(), Some("-9000000000"));
+        assert_eq!(row.text("name").as_deref(), Some("alpha"));
+        assert_eq!(row.text("doc").as_deref(), Some(r#"{"a":1}"#));
+        assert_eq!(row.text("docb").as_deref(), Some(r#"{"b":2}"#));
+        assert_eq!(
+            row.text("key").as_deref(),
+            Some("00010203-0405-0607-0809-0a0b0c0d0e0f")
+        );
+        assert_eq!(row.text("at"), None);
+        assert_eq!(row.text("gone"), None);
+        assert!(row.is_null("gone"));
+        assert!(!row.is_null("count"));
+        assert_eq!(row.text("missing"), None);
+        assert_eq!(row.columns()[0], "flag");
+    }
+
+    /// `get` decodes through Diesel what `text` does not.
+    #[test]
+    fn sql_row_get_decodes_through_diesel() {
+        let row = SqlRow(sql_row(&[
+            ("count", oid::INT4, Some(42i32.to_be_bytes().to_vec())),
+            ("gone", oid::INT4, None),
+        ]));
+        assert_eq!(row.get::<diesel::sql_types::Integer, i32>("count").expect("int"), 42);
+        assert_eq!(
+            row.get::<diesel::sql_types::Nullable<diesel::sql_types::Integer>, Option<i32>>("gone")
+                .expect("null"),
+            None
+        );
+        assert!(row.get::<diesel::sql_types::Integer, i32>("missing").is_err());
     }
 
     /// Each kind of change decodes to its variant; no change to nothing.
