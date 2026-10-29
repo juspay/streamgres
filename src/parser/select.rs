@@ -68,6 +68,22 @@ struct Node<'c> {
     left_joined: bool,
 }
 
+/// Whether a condition compares by order (`<`, `<=`, `>`, `>=`), which
+/// only gives Postgres's answer on a column the engine orders as
+/// Postgres does.
+fn is_range(condition: &Where) -> bool {
+    matches!(
+        condition,
+        Where::Condition(Condition {
+            comparison_operator: ComparisonOperator::GT
+                | ComparisonOperator::GTE
+                | ComparisonOperator::LT
+                | ComparisonOperator::LTE,
+            ..
+        })
+    )
+}
+
 /// A column resolved to a node of the `FROM`.
 struct Ref {
     node: usize,
@@ -503,8 +519,12 @@ impl Parser<'_> {
         if self.eat_word("FALSE") {
             return Ok(vec![(scope[0], Where::OR(Vec::new()))]);
         }
+        let at = self.at();
         let column = self.column_ref(nodes, scope)?;
-        let condition = self.comparison(column.column)?;
+        let condition = self.comparison(column.column.clone())?;
+        if is_range(&condition) {
+            self.ranged.push((nodes[column.node].table.name.clone(), column.column, at));
+        }
         Ok(vec![(column.node, condition)])
     }
 

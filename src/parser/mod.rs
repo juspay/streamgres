@@ -119,6 +119,7 @@ pub fn parse_with_binds(
         depth: 0,
         binds,
         times: TimeUnit::Millis,
+        ranged: Vec::new(),
     };
     let parsed = parser.query(catalog)?;
     if !matches!(parser.peek(), Tok::Eof) {
@@ -157,7 +158,10 @@ pub struct Projected {
 /// An `ORDER BY` on a column Postgres orders differently from the
 /// engine (an enum, a string under a linguistic collation, JSON) is
 /// refused: the engine would keep, and the backend return, other rows
-/// in another order ([`Catalog::orders_as_engine`]). An enum label
+/// in another order ([`Catalog::orders_as_engine`]). So is a range
+/// comparison (`<`, `<=`, `>`, `>=`) on such a column in any filter:
+/// the engine would compare an enum's labels, or a string's bytes, and
+/// match other rows than Postgres does. An enum label
 /// travels in the binary format as its text, under the enum's own OID,
 /// which the catalog names; an array of enums likewise, under the
 /// array's OID.
@@ -182,6 +186,7 @@ pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result
         depth: 0,
         binds: &binds,
         times: TimeUnit::Micros,
+        ranged: Vec::new(),
     };
     if !parser.is_word("SELECT") {
         return parser.err(format!("expected SELECT, found {}", parser.describe()));
@@ -198,6 +203,18 @@ pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result
         return Err(ParseError {
             message: format!(
                 "ORDER BY `{table}`.`{column}`: Postgres orders this column by rules the engine does not follow (an enum, a collation other than C, JSON)"
+            ),
+            position: *position,
+        });
+    }
+    if let Some((table, column, position)) = parser
+        .ranged
+        .iter()
+        .find(|(table, column, _)| !catalog.orders_as_engine(table, column))
+    {
+        return Err(ParseError {
+            message: format!(
+                "`<`, `<=`, `>` or `>=` on `{table}`.`{column}`: Postgres compares this column by rules the engine does not follow (an enum, a collation other than C, JSON)"
             ),
             position: *position,
         });
@@ -487,6 +504,10 @@ struct Parser<'b> {
     /// the server-to-server path, reads every number there, literal or
     /// bound, as microseconds, Postgres's own unit and the engine's.
     times: TimeUnit,
+    /// Every column a filter compares with `<`, `<=`, `>` or `>=`, with
+    /// where it was named: [`parse_select`] refuses one the engine
+    /// orders differently from Postgres, as it does for `ORDER BY`.
+    ranged: Vec<(TableName, ColumnName, usize)>,
 }
 
 /// The unit of a number standing for a time, see [`Parser::times`].
@@ -1644,6 +1665,37 @@ mod tests {
         parse_select(sql, &[], &known).expect("a C-collated column");
         parse_select(r#"SELECT * FROM "tickets" ORDER BY "tickets"."points" LIMIT 5"#, &[], &catalog())
             .expect("a number");
+    }
+
+    /// A range comparison on a text-carried column (an enum, whose order
+    /// is its declaration's, or text under a linguistic collation) is
+    /// followed only where Postgres orders the column as its text, in
+    /// any filter: `WHERE`, inside `OR` and parentheses, and a join's
+    /// `ON`. Equality, lists and ranges on numbers are untouched.
+    #[test]
+    fn a_range_on_text_needs_a_byte_ordered_column() {
+        for sql in [
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" > 'z'"#,
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" <= $1"#,
+            r#"SELECT * FROM "tickets" WHERE ("tickets"."points" = 1 OR ("tickets"."status" < 'b'))"#,
+        ] {
+            let binds = [text_bind("b")];
+            let error = parse_select(sql, &binds, &catalog()).expect_err(sql);
+            assert!(error.message.contains("rules the engine does not follow"), "{}", error.message);
+            let known = catalog().with_ordered_as_text([(TableName::from("tickets"), ColumnName::from("status"))]);
+            parse_select(sql, &binds, &known).expect("a C-collated column");
+        }
+        for sql in [
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = 'z'"#,
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" != 'z'"#,
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" IN ('a', 'z')"#,
+            r#"SELECT * FROM "tickets" WHERE "tickets"."points" >= 3"#,
+        ] {
+            parse_select(sql, &[], &catalog()).expect(sql);
+        }
+        let joined = r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id" AND "books"."title" > 'm'))"#;
+        let error = parse_select(joined, &[], &join_catalog()).expect_err("a range in an ON");
+        assert!(error.message.contains("`books`.`title`"), "{}", error.message);
     }
 
     /// Diesel's joins become the engine's tree:
