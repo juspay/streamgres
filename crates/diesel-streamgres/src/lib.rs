@@ -526,6 +526,7 @@ where
     }
 
     /// Sizes the inner connection's statement cache.
+    #[cfg(feature = "diesel-2-3")]
     fn set_prepared_statement_cache_size(&mut self, size: diesel::connection::CacheSize) {
         self.inner.set_prepared_statement_cache_size(size)
     }

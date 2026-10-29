@@ -7,9 +7,16 @@ license = "Apache-2.0"
 description = "A Diesel connection wrapper serving reads from a cache the Streamgres engine keeps fresh"
 
 [features]
+default = ["diesel-2-3"]
+# What only Diesel 2.3 has (`Connection::set_prepared_statement_cache_size`).
+# Off, the crate builds on Diesel 2.2 as well, for an application whose
+# Diesel, or a fork of it such as juspay_diesel, still builds on
+# diesel_derives 2.2, which cannot share a build with 2.3's: depend with
+# `default-features = false` and the build resolves Diesel 2.2.
+diesel-2-3 = []
 # `AsyncSyncedConnection`, the same wrapper over diesel-async's
-# `AsyncPgConnection`.
-async = ["dep:diesel-async", "diesel-async/postgres", "diesel-async/pool"]
+# `AsyncPgConnection` (Diesel 2.3).
+async = ["diesel-2-3", "dep:diesel-async", "diesel-async/postgres", "diesel-async/pool"]
 # The engine inside this process (`EngineClient::embedded`): the same
 # frames as the S2S endpoint, over channels to an engine this process
 # runs, instead of a socket to one elsewhere.
@@ -18,7 +25,7 @@ embedded = ["dep:streamgres"]
 [dependencies]
 streamgres = { path = "../..", default-features = false, optional = true }
 base64 = "0.23.1"
-diesel = { version = "2.3.8", features = ["postgres", "r2d2", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+diesel = { version = ">=2.2.12, <2.4", features = ["postgres", "r2d2", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 diesel-async = { version = "0.7", features = ["postgres"], optional = true }
 futures-util = "0.3.34"
 moka = { version = "0.12", features = ["sync"] }
