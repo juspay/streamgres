@@ -1230,20 +1230,17 @@ mod tests {
         assert!(setup("maybe").is_err());
     }
 
-    /// The demo's trigger stack is this function's, as rendered for it:
-    /// a stack older than the engine misses what the engine reads.
+    /// The setup an operator runs by hand is the stack checked in for the
+    /// CI smoke (`scripts/sql/ddl-triggers.sql`), rendered for the same
+    /// app, shard and publication: a stack older than the engine misses
+    /// what the engine reads.
     #[test]
-    fn the_demos_trigger_stack_is_current() {
-        let checked_in = include_str!("../demo/ddl-triggers.sql");
-        let body: String = checked_in
-            .lines()
-            .skip_while(|line| line.starts_with("--"))
-            .map(|line| format!("{line}\n"))
-            .collect();
+    fn the_setup_is_the_checked_in_stack() {
+        let checked_in = include_str!("../scripts/sql/ddl-triggers.sql");
         assert_eq!(
-            body.trim(),
-            setup_sql("demo", 0, "demo_pub").trim(),
-            "demo/ddl-triggers.sql is stale: render it again with setup_sql(\"demo\", 0, \"demo_pub\")"
+            setup_sql("xyne", 0, "xyne_sync_pub"),
+            checked_in,
+            "scripts/sql/ddl-triggers.sql is stale: render it again with setup_sql(\"xyne\", 0, \"xyne_sync_pub\")"
         );
     }
 
