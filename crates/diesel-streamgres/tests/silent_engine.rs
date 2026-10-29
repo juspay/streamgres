@@ -37,15 +37,20 @@ enum Answer {
     GreetLate(Duration),
 }
 
-/// What a fake server records: when each handshake completed, and every
-/// frame received.
-type Seen = (Arc<Mutex<Vec<Instant>>>, Arc<Mutex<Vec<serde_json::Value>>>);
+/// What a fake server records: when each handshake completed, every
+/// frame received, and when each greeted socket ended.
+type Seen = (
+    Arc<Mutex<Vec<Instant>>>,
+    Arc<Mutex<Vec<serde_json::Value>>>,
+    Arc<Mutex<Vec<Instant>>>,
+);
 
 /// A WebSocket server on its own thread that behaves one way.
 struct Fake {
     url: String,
     accepts: Arc<Mutex<Vec<Instant>>>,
     frames: Arc<Mutex<Vec<serde_json::Value>>>,
+    closes: Arc<Mutex<Vec<Instant>>>,
 }
 
 impl Fake {
@@ -61,18 +66,25 @@ impl Fake {
         let port = listener.local_addr().expect("addr").port();
         let accepts = Arc::new(Mutex::new(Vec::new()));
         let frames = Arc::new(Mutex::new(Vec::new()));
-        let seen = (Arc::clone(&accepts), Arc::clone(&frames));
+        let closes = Arc::new(Mutex::new(Vec::new()));
+        let seen = (Arc::clone(&accepts), Arc::clone(&frames), Arc::clone(&closes));
         thread::spawn(move || runtime.block_on(serve(listener, answer, seen)));
         Fake {
             url: format!("ws://127.0.0.1:{port}/zero/s2s/v1"),
             accepts,
             frames,
+            closes,
         }
     }
 
     /// When each connection completed its handshake.
     fn accepts(&self) -> Vec<Instant> {
         self.accepts.lock().unwrap().clone()
+    }
+
+    /// When each greeted socket ended, the client having given it up.
+    fn closes(&self) -> Vec<Instant> {
+        self.closes.lock().unwrap().clone()
     }
 
     /// Every frame received so far, in order.
@@ -105,6 +117,7 @@ async fn serve(listener: TcpListener, answer: Answer, seen: Seen) {
             continue;
         }
         let frames = Arc::clone(&seen.1);
+        let closes = Arc::clone(&seen.2);
         tokio::spawn(async move {
             if let Answer::GreetLate(delay) = answer {
                 tokio::time::sleep(delay).await;
@@ -118,6 +131,7 @@ async fn serve(listener: TcpListener, answer: Answer, seen: Seen) {
                     frames.lock().unwrap().push(frame);
                 }
             }
+            closes.lock().unwrap().push(Instant::now());
         });
     }
 }
@@ -280,9 +294,11 @@ fn a_silent_engine_is_taken_for_dead() {
 
 /// A silent socket is given up when the silence window runs out, not
 /// at the next ping up to a third of a window later. The engine greets
-/// 2.9 s in and then says nothing; with a 6 s window it is dead at 8.9
-/// s, and the 1 s reconnect delay brings the second connection at
-/// about 9.9 s. Looking only at each ping (2, 4, ... s) it was 11 s.
+/// 2.9 s in and then says nothing; with a 6 s window, looked at every
+/// 0.2 s, it is dead between 8.9 and 9.1 s. Looking only at each ping
+/// (2, 4, ... s) it was 10 s. The redial follows the first reconnect
+/// wait, half a second to a second, which is timed apart from it: the
+/// connection lived under thirty seconds, so the backoff is not reset.
 #[test]
 fn a_silent_socket_is_given_up_on_time() {
     let fake = Fake::start(Answer::GreetLate(Duration::from_millis(2900)));
@@ -299,19 +315,25 @@ fn a_silent_socket_is_given_up_on_time() {
         assert!(started.elapsed() < Duration::from_secs(20), "never redialled");
         thread::sleep(Duration::from_millis(20));
     }
-    let accepts = fake.accepts();
-    let gap = accepts[1] - accepts[0];
+    let (accepts, closes) = (fake.accepts(), fake.closes());
+    let given_up = closes[0] - accepts[0];
     assert!(
-        gap >= Duration::from_millis(9800) && gap < Duration::from_millis(10_500),
-        "redialled {gap:?} after the first connection; silent from 2.9 s, the window is 6 s"
+        given_up >= Duration::from_millis(8900) && given_up < Duration::from_millis(9500),
+        "given up {given_up:?} after the first connection; silent from 2.9 s, the window is 6 s"
+    );
+    let wait = accepts[1] - closes[0];
+    assert!(
+        wait >= Duration::from_millis(500) && wait < Duration::from_millis(1300),
+        "redialled {wait:?} after giving up; the first wait is half a second to a second"
     );
     drop(engine);
 }
 
-/// An engine that closes every socket is dialled again about once a
-/// second, never faster.
+/// An engine that closes every socket is dialled again within the
+/// backoff's bounds, never faster: half a second to a second after the
+/// first close, one to two seconds after the second.
 #[test]
-fn a_dropped_socket_is_tried_again_every_second() {
+fn a_dropped_socket_is_tried_again_within_its_backoff() {
     let fake = Fake::start(Answer::Close);
     let engine = EngineClient::with_config(
         fake.url.clone(),
@@ -320,18 +342,17 @@ fn a_dropped_socket_is_tried_again_every_second() {
             ..Config::default()
         },
     );
-    thread::sleep(Duration::from_millis(3600));
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while fake.accepts().len() < 3 {
+        assert!(Instant::now() < deadline, "only {:?}", fake.accepts());
+        thread::sleep(Duration::from_millis(10));
+    }
     let accepts = fake.accepts();
-    assert!(
-        (3..=5).contains(&accepts.len()),
-        "{} connections in 3.6 seconds",
-        accepts.len()
-    );
-    for pair in accepts.windows(2) {
+    for (pair, (floor, ceiling)) in accepts.windows(2).zip([(500, 1000), (1000, 2000)]) {
         let gap = pair[1] - pair[0];
         assert!(
-            gap >= Duration::from_millis(900) && gap <= Duration::from_millis(2000),
-            "a reconnect came after {gap:?}"
+            gap >= Duration::from_millis(floor) && gap < Duration::from_millis(ceiling + 300),
+            "a reconnect came after {gap:?}, not within {floor} to {ceiling} ms"
         );
     }
     assert!(!engine.is_connected(), "never up for long");

@@ -16,7 +16,8 @@ use diesel::prelude::*;
 use diesel::sql_types::Text;
 use diesel_streamgres::cache::Cache;
 use diesel_streamgres::engine::EngineClient;
-use diesel_streamgres::subscriptions::Subscriptions;
+use diesel_streamgres::key::QueryKey;
+use diesel_streamgres::subscriptions::{Outcome, Subscriptions, Verdict};
 use diesel_streamgres::{Consistency, Served, SyncedConnection};
 
 diesel::table! {
@@ -114,6 +115,27 @@ impl Live {
             .first(&mut self.conn)
             .optional()
             .expect("read")
+    }
+
+    /// Waits until the engine knows the table `query` reads, one a test
+    /// created after the engine started: the engine takes a new table in
+    /// from the change feed a moment after its `CREATE`, and until then
+    /// refuses a query on it as on an unknown table. The engine is asked
+    /// directly, not through the cache, which would keep that refusal
+    /// and send the test's own reads to Postgres for a while.
+    fn adopted<Q: diesel::query_builder::QueryFragment<diesel::pg::Pg>>(&mut self, query: Q) {
+        let key = QueryKey::of(&query, &mut self.other).expect("key");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match Subscriptions::subscribe(&self.engine, &key) {
+                Outcome::Verdict(Verdict::Refused(reason)) if reason.contains("unknown table") => {
+                    assert!(Instant::now() < deadline, "the engine never took the table in: {reason}");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => break,
+            }
+        }
+        Subscriptions::unsubscribe(&self.engine, &key);
     }
 
     /// Reads until the value is seen or the wait runs out, returning how
@@ -794,6 +816,8 @@ fn joins_are_composed_from_the_engines_rows() {
              CREATE TABLE IF NOT EXISTS sg_books (id serial PRIMARY KEY, author_id int NOT NULL REFERENCES sg_authors(id), title text NOT NULL)",
         )
         .unwrap();
+    live.adopted(sg_authors::table.select(sg_authors::id));
+    live.adopted(sg_books::table.select(sg_books::id));
     let database = std::env::var("DATABASE_URL").unwrap();
     let mut plain = PgConnection::establish(&database).unwrap();
     let p = live.prefix.clone();
@@ -1151,6 +1175,7 @@ fn bytea_and_offset_are_served_from_engine_rows() {
                 id serial PRIMARY KEY, name text NOT NULL, data bytea, n int NOT NULL)",
         )
         .unwrap();
+    live.adopted(sg_blobs::table.select(sg_blobs::id));
     let prefix = live.key("b");
     diesel::delete(sg_blobs::table.filter(sg_blobs::name.like(format!("{prefix}%"))))
         .execute(&mut live.other)
