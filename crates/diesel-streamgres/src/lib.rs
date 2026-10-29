@@ -91,7 +91,7 @@ use crate::cache::{
     AfterWrites, CONTEXT_SQL, Cache, Context, REPLAY_POSITION_SQL, Read, WAL_POSITION_SQL,
     WalPosition,
 };
-use crate::session::{Effect, RECHECK_EVERY, Scope, SessionChanges};
+use crate::session::{Effect, RECHECK_EVERY, RawTransaction, Scope, SessionChanges};
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
 pub use crate::listen::{Change, SqlRow, Subscription, SubscribeError, Watch, WatchError};
@@ -214,6 +214,8 @@ pub struct SyncedConnection<C = diesel::PgConnection> {
     primary: bool,
     /// What its statements have changed in its session.
     session: SessionChanges,
+    /// Whether its raw SQL left a transaction block open.
+    raw: RawTransaction,
     /// The context it reads in, and when that was read.
     scope: Scope,
     checked: Instant,
@@ -231,6 +233,7 @@ impl<C> SyncedConnection<C> {
             served: None,
             primary: false,
             session: SessionChanges::default(),
+            raw: RawTransaction::default(),
             scope: Scope::Unchecked,
             checked: Instant::now(),
         }
@@ -248,6 +251,7 @@ impl<C> SyncedConnection<C> {
             served: None,
             primary: false,
             session: SessionChanges::default(),
+            raw: RawTransaction::default(),
             scope: Scope::Unchecked,
             checked: Instant::now(),
         }
@@ -311,8 +315,10 @@ impl<C> SyncedConnection<C> {
     /// Takes in what `sql` does to the connection's session
     /// ([`SessionChanges`]): once it is back as established, or may have
     /// changed in a way the statement does not say, what the connection
-    /// reads as is read again before the cache serves it.
+    /// reads as is read again before the cache serves it. A transaction
+    /// block it opens counts as open from here ([`RawTransaction`]).
     fn observe(&mut self, sql: &str) {
+        self.raw.before(sql);
         if self.cache.is_some()
             && matches!(self.session.apply(sql), Effect::Restored | Effect::Recheck)
         {
@@ -387,6 +393,12 @@ where
         }
     }
 
+    /// Whether a transaction is open on the connection, whether Diesel's
+    /// transaction manager or raw SQL ([`RawTransaction`]) opened it.
+    fn transaction_open(&mut self) -> bool {
+        self.raw.is_open() || in_transaction(&mut self.inner)
+    }
+
     /// Once a write has committed, reads its WAL position on this
     /// connection, when reads through the cache go to standbys
     /// ([`Cache::reads_standbys`]): a standby cannot say where the
@@ -397,7 +409,7 @@ where
         let Some(cache) = self.cache.clone() else {
             return;
         };
-        if !cache.reads_standbys() || (!committed && in_transaction(&mut self.inner)) {
+        if !cache.reads_standbys() || (!committed && self.transaction_open()) {
             return;
         }
         let writes = cache.write_count();
@@ -446,6 +458,9 @@ where
             self.wrote();
         }
         let done = self.inner.batch_execute(query);
+        if done.is_ok() {
+            self.raw.after(query);
+        }
         if writes {
             self.wrote();
             if done.is_ok() {
@@ -506,6 +521,9 @@ where
             self.wrote();
         }
         let done = self.inner.execute_returning_count(source);
+        if done.is_ok() {
+            self.raw.after(&sql);
+        }
         if writes {
             self.wrote();
             if done.is_ok() {
@@ -592,7 +610,7 @@ where
         let route = named.or(self.scoped).unwrap_or(self.route);
         if !key.is_select() {
             self.wrote();
-            if cache.reads_standbys() && !in_transaction(&mut self.inner) {
+            if cache.reads_standbys() && !self.transaction_open() {
                 let rows = LoadConnection::<DefaultLoadingMode>::load(&mut self.inner, source)
                     .and_then(capture_all);
                 self.wrote();
@@ -604,7 +622,7 @@ where
             cache.mark_write();
             return done;
         }
-        if route == Route::Postgres || in_transaction(&mut self.inner) {
+        if route == Route::Postgres || self.transaction_open() {
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
         // From here on the read is one the cache could serve: each way out

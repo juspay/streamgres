@@ -431,6 +431,47 @@ async fn inside_a_transaction_reads_see_the_connections_own_writes() {
     w.clean().await;
 }
 
+/// A transaction opened with raw SQL, by `batch_execute` or by an
+/// executed `sql_query`, keeps reads on Postgres until it ends: Diesel's
+/// transaction manager never saw its `BEGIN`.
+#[tokio::test]
+async fn a_raw_transaction_keeps_reads_on_postgres_until_it_ends() {
+    let mut w = World::new("async-rawtxn").await;
+    w.conn.set_read_your_writes(Duration::ZERO);
+    w.put("mood", "a").await;
+    assert_eq!(w.read("mood").await.as_deref(), Some("a"));
+    assert_eq!(w.read("mood").await.as_deref(), Some("a"));
+    assert_eq!(w.conn.last_served(), Some(Served::Cache), "cached before the block");
+
+    w.conn
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect("begin");
+    let key = w.key("mood");
+    w.conn
+        .batch_execute(&format!("UPDATE sg_configs SET value = 'own' WHERE key = '{key}'"))
+        .await
+        .expect("update");
+    assert_eq!(
+        w.read("mood").await.as_deref(),
+        Some("own"),
+        "a read in the block sees the block's own write"
+    );
+    assert_eq!(w.conn.last_served(), Some(Served::Postgres));
+    w.conn.batch_execute("ROLLBACK").await.expect("rollback");
+    assert_eq!(w.read("mood").await.as_deref(), Some("a"));
+
+    diesel::sql_query("BEGIN").execute(&mut w.conn).await.expect("begin");
+    assert_eq!(w.read("mood").await.as_deref(), Some("a"));
+    assert_eq!(
+        w.conn.last_served(),
+        Some(Served::Postgres),
+        "an executed BEGIN opens a block too"
+    );
+    diesel::sql_query("COMMIT").execute(&mut w.conn).await.expect("commit");
+    w.clean().await;
+}
+
 /// After its own write the connection reads Postgres for the read-your-
 /// writes window, and the cache again once it closes.
 #[tokio::test]

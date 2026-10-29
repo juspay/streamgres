@@ -77,7 +77,7 @@ use crate::cache::{
 use crate::cursor::SyncedRow;
 use crate::key::QueryKey;
 use crate::route::{Route, Served};
-use crate::session::{Effect, RECHECK_EVERY, Scope, SessionChanges};
+use crate::session::{Effect, RECHECK_EVERY, RawTransaction, Scope, SessionChanges};
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::STALE_TYPES;
 use crate::materialized::Snapshot;
@@ -120,6 +120,9 @@ pub struct AsyncSyncedConnection {
     primary: Arc<AtomicBool>,
     /// What its statements have changed in its session.
     session: SessionChanges,
+    /// Whether its raw SQL left a transaction block open, taken in by
+    /// each statement's future when it completes.
+    raw: Arc<Mutex<RawTransaction>>,
     /// The context it reads in ([`Scope::bits`]), and when that was read
     /// (milliseconds after `born`), written by the read that asked.
     scope: Arc<AtomicU64>,
@@ -142,6 +145,7 @@ impl AsyncSyncedConnection {
             served: Arc::new(AtomicU8::new(0)),
             primary: Arc::new(AtomicBool::new(false)),
             session: SessionChanges::default(),
+            raw: Arc::new(Mutex::new(RawTransaction::default())),
             scope: Arc::new(AtomicU64::new(Scope::Unchecked.bits())),
             checked: Arc::new(AtomicU64::new(0)),
             born: Instant::now(),
@@ -151,8 +155,10 @@ impl AsyncSyncedConnection {
     /// Takes in what `sql` does to the connection's session
     /// ([`SessionChanges`]): once it is back as established, or may have
     /// changed in a way the statement does not say, what the connection
-    /// reads as is read again before the cache serves it.
+    /// reads as is read again before the cache serves it. A transaction
+    /// block it opens counts as open from here ([`RawTransaction`]).
     fn observe(&mut self, sql: &str) {
+        self.raw.lock().expect("raw").before(sql);
         if self.cache.is_some()
             && matches!(self.session.apply(sql), Effect::Restored | Effect::Recheck)
         {
@@ -322,6 +328,24 @@ impl AsyncSyncedConnection {
         .boxed()
     }
 
+    /// `future`, taking in where `sql` left a raw transaction block once
+    /// it ran without error ([`RawTransaction::after`]).
+    fn ended<'a, T: Send + 'a>(
+        &self,
+        future: BoxFuture<'a, QueryResult<T>>,
+        sql: String,
+    ) -> BoxFuture<'a, QueryResult<T>> {
+        let raw = Arc::clone(&self.raw);
+        async move {
+            let done = future.await;
+            if done.is_ok() {
+                raw.lock().expect("raw").after(&sql);
+            }
+            done
+        }
+        .boxed()
+    }
+
     /// A read future with the in-flight token attached.
     fn tracked<'a, T: Send + 'a>(
         &self,
@@ -336,8 +360,13 @@ impl AsyncSyncedConnection {
     }
 
 
-    /// Whether a transaction is open; an unreadable state counts as one.
+    /// Whether a transaction is open, whether Diesel's transaction manager
+    /// or raw SQL ([`RawTransaction`]) opened it; an unreadable state
+    /// counts as one.
     fn in_transaction(&mut self) -> bool {
+        if self.raw.lock().expect("raw").is_open() {
+            return true;
+        }
         AnsiTransactionManager::transaction_manager_status_mut(self)
             .transaction_depth()
             .map(|depth| depth.is_some())
@@ -543,9 +572,13 @@ impl SimpleAsyncConnection for AsyncSyncedConnection {
         }
         let resolve = cache.as_ref().is_some_and(|cache| cache.reads_standbys())
             && (commits(query) || self.resolves_writes());
+        let raw = Arc::clone(&self.raw);
         let inner = &mut self.inner;
         async move {
             let result = inner.batch_execute(query).await;
+            if result.is_ok() {
+                raw.lock().expect("raw").after(query);
+            }
             if let Some(cache) = cache {
                 cache.mark_write();
                 if resolve && result.is_ok() {
@@ -835,6 +868,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
         let writes = may_write(&sql);
         let resolve = writes && self.resolves_writes();
         let future = self.inner.execute_returning_count(source);
+        let future = self.ended(future, sql);
         if writes {
             self.written(future, resolve)
         } else {

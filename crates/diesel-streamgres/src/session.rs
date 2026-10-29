@@ -171,6 +171,90 @@ impl SessionChanges {
     }
 }
 
+/// Whether hand-written SQL left a transaction block open on the
+/// connection. Diesel's transaction manager only counts the blocks it
+/// opened itself, but a `BEGIN` sent as raw SQL opens one in Postgres
+/// all the same, and a read inside it must see the block's snapshot and
+/// its own uncommitted writes, which no cache has.
+///
+/// The connection cannot be asked (Diesel keeps libpq's transaction
+/// status to itself), so the statements are watched, erring towards
+/// open: a statement that opens a block counts before it runs, so a
+/// batch that fails part-way leaves it open, and only a batch that ran
+/// without error closes one. A block whose end went unseen (a failed
+/// `COMMIT`, an end inside a function) keeps reads on Postgres until the
+/// next end that is seen, which costs cache hits but never an answer.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct RawTransaction {
+    open: bool,
+}
+
+impl RawTransaction {
+    /// Whether a block hand-written SQL opened may still be open.
+    pub(crate) fn is_open(self) -> bool {
+        self.open
+    }
+
+    /// Takes in `sql` before it runs: a block it opens counts as open
+    /// from here, whatever becomes of the rest of it.
+    pub(crate) fn before(&mut self, sql: &str) {
+        if statements(sql).into_iter().any(|statement| transaction_effect(statement) == Some(true)) {
+            self.open = true;
+        }
+    }
+
+    /// Takes in `sql` after it ran without error: the block is where its
+    /// last statement that opens or ends one left it. A batch with a
+    /// standard-SQL function body (`BEGIN ATOMIC … END`) is split inside
+    /// that body, so its `END` cannot be told from a transaction's and
+    /// the batch ends nothing.
+    pub(crate) fn after(&mut self, sql: &str) {
+        let statements = statements(sql);
+        if statements.iter().any(|statement| mentions_atomic(statement)) {
+            return;
+        }
+        if let Some(open) = statements.into_iter().rev().find_map(transaction_effect) {
+            self.open = open;
+        }
+    }
+}
+
+/// What one statement does to the transaction block: `Some(true)` when it
+/// opens one or leaves one open after ending it (`… AND CHAIN`),
+/// `Some(false)` when it ends it, `None` when it does neither (savepoints,
+/// `ROLLBACK TO`, the `… PREPARED` statements, which act on another
+/// transaction, and every other statement).
+fn transaction_effect(statement: &str) -> Option<bool> {
+    let mut words = statement
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .filter(|word| !word.is_empty());
+    let head = words.next()?;
+    let is = |word: &str, wanted: &str| word.eq_ignore_ascii_case(wanted);
+    if is(head, "BEGIN") || is(head, "START") {
+        return Some(true);
+    }
+    if is(head, "PREPARE") {
+        return words.next().is_some_and(|word| is(word, "TRANSACTION")).then_some(false);
+    }
+    if !["COMMIT", "END", "ROLLBACK", "ABORT"].iter().any(|end| is(head, end)) {
+        return None;
+    }
+    let rest: Vec<&str> = words.collect();
+    if rest.first().is_some_and(|word| is(word, "TO") || is(word, "PREPARED")) {
+        return None;
+    }
+    let chains = rest.windows(2).any(|pair| matches!(pair, [and, chain] if is(and, "AND") && is(chain, "CHAIN")));
+    Some(chains)
+}
+
+/// Whether a statement holds a standard-SQL function body, whose `END`
+/// reads like a transaction's.
+fn mentions_atomic(statement: &str) -> bool {
+    statement
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .any(|word| word.eq_ignore_ascii_case("ATOMIC"))
+}
+
 /// Statements that may change what a connection reads as without saying
 /// so: they create, alter or drop relations (a table that shadows one in
 /// `public`), change privileges, or run code of the database's own.
@@ -565,6 +649,65 @@ mod tests {
         for scope in [Scope::Unchecked, Scope::Own, Scope::In(0), Scope::In(63), Scope::In(u32::MAX)] {
             assert_eq!(Scope::from_bits(scope.bits()), scope);
         }
+    }
+
+    /// Where a run of raw SQL leaves the transaction block, each batch
+    /// taken in before it runs and, when `ran`, after.
+    fn raw_after(batches: &[(&str, bool)]) -> bool {
+        let mut raw = RawTransaction::default();
+        for (sql, ran) in batches {
+            raw.before(sql);
+            if *ran {
+                raw.after(sql);
+            }
+        }
+        raw.is_open()
+    }
+
+    /// A block opened by hand is open until an end of it runs; savepoints
+    /// and the prepared-transaction statements move nothing.
+    #[test]
+    fn a_raw_block_is_open_until_it_ends() {
+        assert!(raw_after(&[("BEGIN ISOLATION LEVEL REPEATABLE READ", true)]));
+        assert!(raw_after(&[("start transaction read only", true)]));
+        for end in ["COMMIT", "end", "ROLLBACK", "abort work", "COMMIT AND NO CHAIN", "PREPARE TRANSACTION 'x'"] {
+            assert!(!raw_after(&[("BEGIN", true), (end, true)]), "{end}");
+        }
+        for within in [
+            "SAVEPOINT a",
+            "ROLLBACK TO SAVEPOINT a",
+            "rollback to a",
+            "RELEASE a",
+            "COMMIT PREPARED 'x'",
+            "ROLLBACK PREPARED 'x'",
+            "COMMIT AND CHAIN",
+            "ROLLBACK AND CHAIN",
+            "SELECT 1",
+            "DO $$ BEGIN PERFORM 1; END $$",
+        ] {
+            assert!(raw_after(&[("BEGIN", true), (within, true)]), "{within}");
+        }
+        assert!(!raw_after(&[("DO $$ BEGIN PERFORM 1; END $$", true)]));
+        assert!(!raw_after(&[("SELECT 'BEGIN'", true)]));
+    }
+
+    /// A batch is read in order, and one that fails can open a block but
+    /// never ends one.
+    #[test]
+    fn a_failed_batch_never_ends_a_raw_block() {
+        assert!(!raw_after(&[("BEGIN; INSERT INTO t VALUES (1); COMMIT", true)]));
+        assert!(raw_after(&[("COMMIT; BEGIN", true)]));
+        assert!(raw_after(&[("BEGIN; INSERT INTO t VALUES (1); COMMIT", false)]));
+        assert!(raw_after(&[("BEGIN", true), ("COMMIT", false)]));
+        assert!(!raw_after(&[("BEGIN", true), ("COMMIT", false), ("ROLLBACK", true)]));
+    }
+
+    /// The `END` of a standard-SQL function body ends no transaction.
+    #[test]
+    fn a_function_body_ends_no_raw_block() {
+        let body = "CREATE FUNCTION one() RETURNS int LANGUAGE sql BEGIN ATOMIC SELECT 1; END";
+        assert!(raw_after(&[("BEGIN", true), (body, true)]));
+        assert!(!raw_after(&[(body, true)]));
     }
 
     /// A batch's statements apply in order: the last word stands.

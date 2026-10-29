@@ -216,6 +216,17 @@ impl World {
             .expect("read")
     }
 
+    /// `read(name)`, its error kept: a read in an aborted transaction
+    /// block fails in Postgres, and a cached answer would hide that.
+    fn read_raw(&mut self, name: &str) -> QueryResult<Option<String>> {
+        let key = self.key(name);
+        sg_configs::table
+            .filter(sg_configs::key.eq(key))
+            .select(sg_configs::value)
+            .first(&mut self.conn)
+            .optional()
+    }
+
     /// The key the cache uses for `read(name)`: `first` adds `LIMIT 1` as
     /// a bind, so the key carries two.
     fn key_of(&mut self, name: &str) -> QueryKey {
@@ -528,6 +539,62 @@ fn inside_a_transaction_reads_see_the_connections_own_writes() {
         Some("1"),
         "outside the window the cache still holds the old row until a touch"
     );
+}
+
+/// A transaction opened with raw SQL keeps reads on Postgres until it
+/// ends, as one opened through Diesel does: the cache has neither its
+/// snapshot nor its own writes. Diesel's transaction manager never saw
+/// the `BEGIN`, so only the statements say a block is open.
+#[test]
+fn a_raw_transaction_keeps_reads_on_postgres_until_it_ends() {
+    let mut w = World::new("rawtxn");
+    w.put("mood", "a");
+    w.conn.set_read_your_writes(std::time::Duration::ZERO);
+    assert_eq!(w.read("mood").as_deref(), Some("a"));
+    assert_eq!(w.read("mood").as_deref(), Some("a"));
+    assert_eq!(w.conn.last_served(), Some(Served::Cache), "cached before the block");
+
+    w.conn
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .expect("begin");
+    assert_eq!(w.read("mood").as_deref(), Some("a"));
+    assert_eq!(
+        w.conn.last_served(),
+        Some(Served::Postgres),
+        "a read in the block is the block's snapshot"
+    );
+    let key = w.key("mood");
+    w.conn
+        .batch_execute(&format!("UPDATE sg_configs SET value = 'own' WHERE key = '{key}'"))
+        .expect("update");
+    assert_eq!(
+        w.read("mood").as_deref(),
+        Some("own"),
+        "a read in the block sees the block's own write"
+    );
+    assert_eq!(w.conn.last_served(), Some(Served::Postgres));
+    w.conn.batch_execute("ROLLBACK").expect("rollback");
+
+    assert_eq!(w.read("mood").as_deref(), Some("a"));
+}
+
+/// A raw block that a failed batch opened stays open: the batch stopped
+/// at its error, and the `COMMIT` after it never ran.
+#[test]
+fn a_raw_transaction_a_failed_batch_opened_stays_open() {
+    let mut w = World::new("rawfail");
+    w.put("mood", "a");
+    w.conn.set_read_your_writes(std::time::Duration::ZERO);
+    assert_eq!(w.read("mood").as_deref(), Some("a"));
+    assert!(
+        w.conn
+            .batch_execute("BEGIN; SELECT 1/0; COMMIT")
+            .is_err(),
+        "the division fails the batch"
+    );
+    assert!(w.read_raw("mood").is_err(), "the block is aborted, in Postgres");
+    w.conn.batch_execute("ROLLBACK").expect("rollback");
+    assert_eq!(w.read("mood").as_deref(), Some("a"));
 }
 
 /// A write that returns rows is never cached.
