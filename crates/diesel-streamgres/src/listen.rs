@@ -642,6 +642,37 @@ fn reads_as(conn: &mut PgConnection) -> Result<crate::cache::Database, Subscribe
 /// Counts the subscriptions made, for their keys' context ids.
 static NEXT_LISTENER: AtomicU64 = AtomicU64::new(0);
 
+/// A query followed for a subscription no [`Subscription`] owns yet. It
+/// is made on a blocking thread, which runs on when the future that
+/// asked for it is dropped, and its result is then dropped unread.
+/// Armed until a [`Subscription`] claims the key; dropped armed (the
+/// engine refused or only accepted the query, the setup panicked, or
+/// nobody was left to read the result), it stops following the query,
+/// here and with the engine, so an abandoned subscribe holds no slot of
+/// the engine's subscription cap.
+struct Unclaimed {
+    engine: EngineClient,
+    key: QueryKey,
+    armed: bool,
+}
+
+impl Unclaimed {
+    /// The key, for the [`Subscription`] that stops following it from here.
+    fn claim(mut self) -> QueryKey {
+        self.armed = false;
+        self.key.clone()
+    }
+}
+
+impl Drop for Unclaimed {
+    /// Stops following the query unless a [`Subscription`] claimed it.
+    fn drop(&mut self) {
+        if self.armed {
+            self.engine.stop_listening(&self.key);
+        }
+    }
+}
+
 impl EngineClient {
     /// Follows `query` and calls `callback` with each change of its
     /// result, until the returned [`Subscription`] is dropped (see the
@@ -718,17 +749,24 @@ impl EngineClient {
             let listening = Listening::new(url, database);
             engine.catch_up(&mut conn);
             engine.start_listening(&key, Arc::clone(&listening));
-            match engine.subscribe_with(&key, &mut conn) {
-                Verdict::Rows { .. } => Ok((key, listening)),
+            let unclaimed = Unclaimed {
+                engine,
+                key,
+                armed: true,
+            };
+            match unclaimed.engine.subscribe_with(&unclaimed.key, &mut conn) {
+                Verdict::Rows { .. } => Ok((unclaimed, listening)),
                 Verdict::Accepted { .. } => {
-                    engine.stop_listening(&key);
+                    let engine = unclaimed.engine.clone();
+                    drop(unclaimed);
                     Err(SubscribeError::Unsupported(format!(
                         "the engine follows this query only by refills, not with its rows: {}",
                         engine.fallbacks().last().cloned().unwrap_or_default()
                     )))
                 }
                 Verdict::Refused(reason) => {
-                    engine.stop_listening(&key);
+                    let engine = unclaimed.engine.clone();
+                    drop(unclaimed);
                     Err(if engine.refusal_is_final(&reason) {
                         SubscribeError::Unsupported(reason)
                     } else {
@@ -739,12 +777,12 @@ impl EngineClient {
         })
         .await
         .map_err(|error| SubscribeError::Task(format!("subscribing: {error}")))?;
-        let (key, listening) = started?;
+        let (unclaimed, listening) = started?;
         let delivered = Arc::clone(&listening);
         let task = tokio::spawn(deliver(delivered, callback, PhantomData::<fn() -> (ST, T)>));
         Ok(Subscription {
             engine: self.clone(),
-            key,
+            key: unclaimed.claim(),
             listening,
             task,
         })

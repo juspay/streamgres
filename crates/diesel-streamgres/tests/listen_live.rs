@@ -261,6 +261,46 @@ async fn a_query_the_engine_cannot_follow_is_refused() {
     assert!(!error.to_string().is_empty());
 }
 
+/// A subscribe abandoned while the engine is still taking the query
+/// leaves no subscription behind: the setup, which runs on to its end
+/// on a blocking thread, lets the query go once nobody is left to own
+/// it, so repeated abandoned subscribes cannot fill the engine's cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abandoned_subscribe_leaves_no_subscription() {
+    let Some((engine, database, _other)) = start() else {
+        return;
+    };
+    let before = engine.subscribed();
+    let subscribing = tokio::spawn({
+        let engine = engine.clone();
+        async move {
+            engine
+                .subscribe(
+                    &database,
+                    sg_configs::table.select(Config::as_select()),
+                    |_: Change<Config>| async {},
+                )
+                .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while engine.subscribed() == before && !subscribing.is_finished() {
+        assert!(Instant::now() < deadline, "the subscribe never reached the engine");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    subscribing.abort();
+    drop(subscribing.await);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while engine.subscribed() != before {
+        assert!(
+            Instant::now() < deadline,
+            "an abandoned subscribe still holds {} of the engine's subscriptions",
+            engine.subscribed() - before
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// A query given as plain SQL reports the same changes, its rows read by
 /// column name: present, added, updated, removed.
 #[tokio::test(flavor = "multi_thread")]
