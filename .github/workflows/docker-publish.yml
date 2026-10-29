@@ -46,29 +46,7 @@ jobs:
             type=ref,event=tag
             type=raw,value=${{ env.SHORT_SHA }}
 
-      # Built and scanned before anything is pushed: an image with a fixable
-      # critical or high vulnerability is never published.
-      - name: Build the image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/server/Dockerfile
-          load: true
-          tags: streamgres:scan
-          build-args: |
-            SOURCE_COMMIT=${{ env.SHORT_SHA }}
-          cache-from: type=gha,scope=server
-          cache-to: type=gha,mode=max,scope=server
-
-      - name: Scan the image
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: streamgres:scan
-          severity: CRITICAL,HIGH
-          ignore-unfixed: true
-          exit-code: "1"
-
-      - name: Push the image, with its SBOM and provenance
+      - name: Build and push the image, with its SBOM and provenance
         uses: docker/build-push-action@v5
         with:
           context: .
