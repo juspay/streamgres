@@ -26,9 +26,9 @@ For a local first run, see the README's Quick start.
 docker build -f docker/server/Dockerfile -t streamgres .
 ```
 
-The image is built on Docker Hardened Images (`dhi.io/rust` to build,
-`dhi.io/debian-base` to run), so pulling them needs `docker login dhi.io`
-first. The runtime has no shell and no package manager:
+The image runs on Google's distroless `cc-debian13` (built on
+`rust:1.89-trixie`). The runtime has no shell, no package manager and no
+coreutils:
 - It has one binary, `/app/server`, run as the unprivileged user `nonroot`
   (uid 65532).
 - It listens on port 4848 and writes JSON log lines to stderr.

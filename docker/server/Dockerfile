@@ -1,23 +1,24 @@
-# The sync server as an image: built from the locked dependencies on Docker
-# Hardened Images, and run on a hardened Debian runtime that has no shell,
-# no package manager and no user but the unprivileged `nonroot` (uid 65532).
+# The sync server as an image: built from the locked dependencies, and run on
+# Google's distroless runtime, which has no shell, no package manager and no
+# coreutils, so a compromised server has no tools to run. The runtime is
+# `cc`: glibc and libgcc, which the binary links, and nothing else it needs;
+# TLS is rustls with its roots compiled in. It runs as `nonroot` (uid 65532).
 # Configured entirely by environment variables (docs/deploy.md lists every
 # one); nothing is baked in but the listen address and the JSON log format a
 # container platform expects.
 #
-# The runtime needs nothing installed: TLS roots are compiled into the binary
-# (rustls with webpki-roots). There is no HEALTHCHECK: the platform probes
-# `/healthz` and `/readyz` over HTTP (docs/deploy.md). Pulling from dhi.io
-# needs `docker login dhi.io` first.
+# There is no HEALTHCHECK, since there is no shell to run one: the platform
+# probes `/healthz` and `/readyz` over HTTP (docs/deploy.md).
 #
 #   docker build -f docker/server/Dockerfile -t streamgres .
 #
-# A mirror of the same images is given whole, not as a registry prefix:
+# Both stages are on Debian 13, so the binary is linked against the glibc it
+# runs on. A mirror of the same images is given whole:
 #
-#   docker build --build-arg BUILD_IMAGE=<mirror>/rust:<tag> \
-#     --build-arg RUNTIME_IMAGE=<mirror>/debian-base:<tag> ...
-ARG BUILD_IMAGE=dhi.io/rust:1.89-debian13-dev
-ARG RUNTIME_IMAGE=dhi.io/debian-base:debian13
+#   docker build --build-arg BUILD_IMAGE=<mirror>/rust:1.89-trixie \
+#     --build-arg RUNTIME_IMAGE=<mirror>/distroless/cc-debian13:nonroot ...
+ARG BUILD_IMAGE=docker.io/library/rust:1.89-trixie
+ARG RUNTIME_IMAGE=gcr.io/distroless/cc-debian13:nonroot
 
 FROM ${BUILD_IMAGE} AS builder
 WORKDIR /build
