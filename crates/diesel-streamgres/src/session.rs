@@ -61,6 +61,8 @@ pub(crate) enum Scope {
     Own,
 }
 
+// Only the async connection keeps its scope in an atomic.
+#[cfg_attr(not(feature = "async"), allow(dead_code))]
 impl Scope {
     /// The scope as one number, for an atomic.
     pub(crate) fn bits(self) -> u64 {

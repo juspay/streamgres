@@ -89,6 +89,18 @@ jobs:
       - name: Unit, scenario, randomized and live PostgreSQL tests, every crate
         run: cargo test --release --locked --workspace
 
+      # The Diesel wrapper against a running engine: its live tests skip
+      # without one, so run them again with an engine in the test process.
+      # watch_failure_live drops a table, which restarts that test binary's
+      # engine; each test binary has an engine of its own.
+      - name: The Diesel wrapper's live tests, against an embedded engine
+        env:
+          STREAMGRES_TEST_EMBEDDED: "1"
+          STREAMGRES_SCHEMAS: public,zero_0,sg_live_ws
+        run: |
+          docker exec pg psql -U postgres -c 'CREATE SCHEMA IF NOT EXISTS sg_live_ws'
+          cargo test --release --locked -p diesel-streamgres --features embedded,sse,async
+
   perf:
     name: Benchmark against the base branch (performance)
     runs-on: ubuntu-latest
