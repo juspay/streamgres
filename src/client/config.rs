@@ -181,7 +181,7 @@ pub struct Config {
     /// told to start over (262144; 0 keeps none).
     pub group_log_bytes: usize,
     /// `STREAMGRES_MAX_MESSAGE_BYTES`: the largest inbound WebSocket message
-    /// accepted (16 MiB).
+    /// accepted (16 MiB). Must be a positive number of bytes.
     pub max_message_bytes: usize,
     /// Who may open the S2S endpoint ([`S2sAccess`]):
     /// `STREAMGRES_S2S_TOKEN`, the secret a backend presents as
@@ -433,9 +433,15 @@ impl Config {
                 None => 256 * 1024,
             },
             max_message_bytes: match first(&["STREAMGRES_MAX_MESSAGE_BYTES"]) {
-                Some(text) => text.parse().map_err(|_| {
-                    format!("STREAMGRES_MAX_MESSAGE_BYTES must be a number, got `{text}`")
-                })?,
+                Some(text) => text
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|bytes| *bytes > 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "STREAMGRES_MAX_MESSAGE_BYTES must be a positive number of bytes, got `{text}`"
+                        )
+                    })?,
                 None => 16 * 1024 * 1024,
             },
             s2s_access: s2s_access(&env)?,
@@ -860,6 +866,13 @@ mod tests {
                 retries: 5,
             }
         );
+    }
+
+    /// Zero disables the message size cap, so it is refused.
+    #[test]
+    fn zero_max_message_bytes_is_refused() {
+        let error = config(&[("STREAMGRES_MAX_MESSAGE_BYTES", "0")]).unwrap_err();
+        assert!(error.contains("STREAMGRES_MAX_MESSAGE_BYTES"), "{error}");
     }
 
     /// A value that is not a number is refused by the variable's name.
