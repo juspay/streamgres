@@ -697,13 +697,6 @@ subscription, and a dropped `with_route` scope restores the outer route.
 | `tests/engine_latency.rs` | commit-to-cache latency |
 | `tests/standby_reads.rs` | reads from a hot standby, writes to its primary: refills kept only once replayed past the engine, read-your-writes from the writer (needs `STREAMGRES_TEST_STANDBY_URL`) |
 | `tests/s2s_live.rs` (engine crate) | the protocol frame by frame |
-| `crates/streamgres-demo/tests/scenario.rs` | every lookup of the demo app through both wrappers under writes, an engine restart and migrations |
-
-`crates/streamgres-demo` is a ticket desk built on the wrapper: a
-list of query shapes, each declaring rows, refill or refused; a writer
-that makes every kind of change; a verify loop comparing both routes;
-latency and migration commands. `demo/` runs it with Postgres and the
-engine under docker compose.
 
 ## Running it locally
 
@@ -711,13 +704,14 @@ engine under docker compose.
   `postgresql@16` on its own port works: `initdb`, set
   `wal_level = logical` and a short `unix_socket_directories`, `pg_ctl
   start`.
-- In the database: the demo's publication and schema-change trigger
-  stack, both for app `demo`: `psql -f demo/postgres-init.sql` and
-  `psql -f demo/ddl-triggers.sql`.
-- The engine: `STREAMGRES_APP_ID=demo STREAMGRES_PUBLICATION=demo_pub STREAMGRES_PG_DSN=... STREAMGRES_QUERY_URL=http://127.0.0.1:1/q STREAMGRES_MUTATE_URL=http://127.0.0.1:1/m cargo run --release --bin server`.
+- In the database: the publication and the schema-change trigger stack
+  for the default app (`xyne`, shard 0): `psql -c 'CREATE PUBLICATION
+  xyne_sync_pub FOR ALL TABLES'` and `psql -f scripts/sql/ddl-triggers.sql`.
+- The engine: `STREAMGRES_PG_DSN=... STREAMGRES_QUERY_URL=http://127.0.0.1:1/q STREAMGRES_MUTATE_URL=http://127.0.0.1:1/m STREAMGRES_S2S_ALLOW_NO_TOKEN=true cargo run --release --bin server`.
   The query and mutate URLs are required by the config and unused on
   the S2S path.
-- Or everything at once: `docker compose -f demo/docker-compose.yml up --build`.
+- Or no server at all: the live tests run an engine in the test process
+  (`STREAMGRES_TEST_EMBEDDED=1` with the `embedded` feature), as CI does.
 - tokio-console: build the server with
   `RUSTFLAGS="--cfg tokio_unstable" cargo build --release --bin server --features console`,
   run it, and `tokio-console` attaches on `127.0.0.1:6669`; the S2S

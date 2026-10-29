@@ -117,14 +117,6 @@ The server listens on `0.0.0.0:4848`. Point the client's `server` option at
 `.env.example`. `GET /health` returns `200` once the server is ready to serve
 queries.
 
-### Try it in five minutes
-
-`demo/docker-compose.yml` brings up Postgres, the server and a small
-ticket-desk backend built on the Diesel wrapper, with a background writer
-keeping the data moving; `demo/README.md` walks through it with curl, and
-<http://localhost:8080> shows the cache's counters live. The backend is
-`crates/streamgres-demo`, which is also the wrapper's test bed.
-
 ### Server-to-server clients
 
 A backend that caches what it reads does not speak the Zero protocol. It
@@ -312,7 +304,6 @@ src/
   bin/         server, bench and load binaries
 crates/
   diesel-streamgres/  the Diesel wrapper: a cache the engine keeps current
-  streamgres-demo/    a ticket desk built on the wrapper
 vendor/        pgwire-replication with temporary slots (VENDORED.md)
 tests/         scenario tests, live PostgreSQL tests, and a 283-query suite
                taken from a production application

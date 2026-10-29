@@ -60,8 +60,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       STREAMGRES_PG_DSN: postgresql://postgres:postgres@localhost:5432/postgres
-      # The Diesel wrapper's and the demo's tests read and write their own
-      # tables in the same database.
+      # The Diesel wrapper's tests read and write their own tables in the
+      # same database.
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
     steps:
       - name: Checkout repository

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/*"]
+members = ["crates/diesel-streamgres"]
 # A dependency of the engine, built as one but kept out of the
 # workspace's lints and tests.
 exclude = ["vendor/pgwire-replication"]
