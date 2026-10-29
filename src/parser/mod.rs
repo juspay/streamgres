@@ -630,10 +630,16 @@ impl Parser<'_> {
         }
     }
 
-    /// A table name, resolved against the catalog.
+    /// A table name, bare or qualified by its schema (`s.t`, `"s"."t"`),
+    /// resolved against the catalog, which names a table outside
+    /// `public` `s.t`.
     fn table<'c>(&mut self, catalog: &'c Catalog) -> Result<&'c DbTable, ParseError> {
         let at = self.at();
-        let name = self.ident()?;
+        let mut name = self.ident()?;
+        if self.eat_sym(".") {
+            let table = self.ident()?;
+            name = crate::sync::pg::catalog::table_name(&name, &table);
+        }
         catalog.table(&name).ok_or(ParseError {
             message: format!("unknown table `{name}`"),
             position: at,

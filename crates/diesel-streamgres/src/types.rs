@@ -121,13 +121,17 @@ where
     C: LoadConnection<DefaultLoadingMode> + Connection<Backend = Pg>,
 {
     /// Reads the table's columns from the catalog on this connection.
+    /// The engine names a table outside `public` `schema.table`; each part
+    /// is quoted on its own, a bare name resolves through the search path.
     fn table_types(&mut self, table: &str) -> QueryResult<TableTypes> {
         let attributes = sql_query(format!(
             "SELECT {ATTRIBUTE_COLUMNS} \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
              LEFT JOIN pg_type et ON et.oid = t.typelem AND t.typelem <> 0 \
-             WHERE a.attrelid = quote_ident($1)::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+             WHERE a.attrelid = (CASE WHEN strpos($1, '.') > 0 \
+                 THEN quote_ident(split_part($1, '.', 1)) || '.' || quote_ident(substr($1, strpos($1, '.') + 1)) \
+                 ELSE quote_ident($1) END)::regclass AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum"
         ))
         .bind::<Text, _>(table)
