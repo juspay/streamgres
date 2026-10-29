@@ -693,6 +693,7 @@ subscription, and a dropped `with_route` scope restores the outer route.
 | `tests/silent_engine.rs` | an engine that never answers, and one that drops every socket |
 | `tests/engine_live.rs`, `tests/async_live.rs` | the whole path against a running engine |
 | `tests/listen_live.rs` | callbacks against a running engine: present, added, updated, removed; a count; a refusal |
+| `tests/schema_types.rs` | column types of tables outside `public`, by both lookups |
 | `tests/shape_coverage.rs` | production-shaped lookups compared with Postgres before and after a change |
 | `tests/engine_latency.rs` | commit-to-cache latency |
 | `tests/standby_reads.rs` | reads from a hot standby, writes to its primary: refills kept only once replayed past the engine, read-your-writes from the writer (needs `STREAMGRES_TEST_STANDBY_URL`) |

@@ -31,6 +31,7 @@
 
 use super::{
     ParseError, Parser, Projected, Projection, Tok, collapse, default_order, differs_from_all,
+    names_table,
 };
 use crate::model::{
     Catalog, ColumnName, ComparisonOperator, Condition, DbTable, Join, MultiTableReadQuery,
@@ -579,18 +580,42 @@ impl Parser<'_> {
     /// A column, qualified by its table when the scope has several.
     fn column_ref(&mut self, nodes: &[Node<'_>], scope: &[usize]) -> Result<Ref, ParseError> {
         let at = self.at();
-        let first = self.ident()?;
-        let (node, name) = if self.eat_sym(".") {
-            let name = self.ident()?;
-            let node = scope
+        let (qualifier, first) = self.column_parts()?;
+        let (node, name) = if let Some(qualifier) = qualifier {
+            // The table's catalog name wins; failing that, the bare table
+            // of a schema-qualified one, if only one table has it.
+            let exact = scope
                 .iter()
                 .copied()
-                .find(|&n| nodes[n].table.name.as_str() == first)
-                .ok_or_else(|| ParseError {
-                    message: format!("`{first}` is not a table of this query"),
-                    position: at,
-                })?;
-            (node, name)
+                .find(|&n| nodes[n].table.name.as_str() == qualifier);
+            let node = match exact {
+                Some(node) => node,
+                None => {
+                    let bare: Vec<usize> = scope
+                        .iter()
+                        .copied()
+                        .filter(|&n| names_table(&qualifier, nodes[n].table.name.as_str()))
+                        .collect();
+                    match bare.as_slice() {
+                        [node] => *node,
+                        [] => {
+                            return Err(ParseError {
+                                message: format!("`{qualifier}` is not a table of this query"),
+                                position: at,
+                            });
+                        }
+                        _ => {
+                            return Err(ParseError {
+                                message: format!(
+                                    "`{qualifier}` names several tables of this query: qualify it by its schema"
+                                ),
+                                position: at,
+                            });
+                        }
+                    }
+                }
+            };
+            (node, first)
         } else if scope.len() == 1 {
             (scope[0], first)
         } else {

@@ -23,6 +23,21 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    sg_live_ws.sg_items (id) {
+        id -> Int4,
+        label -> Text,
+    }
+}
+
+/// A row of a table outside `public`.
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[diesel(table_name = sg_items)]
+struct Item {
+    id: i32,
+    label: String,
+}
+
 /// A config row.
 #[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
 #[diesel(table_name = sg_configs)]
@@ -244,4 +259,53 @@ async fn a_query_the_engine_cannot_follow_is_refused() {
         panic!("a query on no table cannot be followed");
     };
     assert!(!error.0.is_empty());
+}
+
+/// A typed Diesel query on a table outside `public`, as Diesel renders it
+/// (`"s"."t"."c"` throughout), is followed like one in `public`. Needs the
+/// engine to follow `sg_live_ws` (`STREAMGRES_SCHEMAS`); skips otherwise.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_typed_query_on_another_schema_reports_its_rows_changes() {
+    let followed = std::env::var("STREAMGRES_SCHEMAS").unwrap_or_default();
+    if !followed.split(',').any(|schema| schema.trim() == "sg_live_ws") {
+        eprintln!("STREAMGRES_SCHEMAS does not name sg_live_ws; skipping");
+        return;
+    }
+    let Some((engine, database, mut other)) = start() else {
+        return;
+    };
+    other
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS sg_live_ws.sg_items (id int PRIMARY KEY, label text NOT NULL)",
+        )
+        .expect("table");
+    let tag = format!("typed-{}", std::process::id());
+    let (sender, mut changes) = mpsc::unbounded_channel();
+    let _subscription = engine
+        .subscribe(
+            &database,
+            sg_items::table
+                .filter(sg_items::label.eq(tag.clone()))
+                .select(Item::as_select()),
+            move |change: Change<Item>| {
+                let sender = sender.clone();
+                async move {
+                    let _ = sender.send(change);
+                }
+            },
+        )
+        .await
+        .expect("a schema-qualified Diesel query is followed");
+    let id = i32::try_from(std::process::id() % 1_000_000).expect("id");
+    diesel::insert_into(sg_items::table)
+        .values((sg_items::id.eq(id), sg_items::label.eq(&tag)))
+        .execute(&mut other)
+        .expect("insert");
+    let Change::Added(item) = next(&mut changes).await else {
+        panic!("an inserted row is added");
+    };
+    assert_eq!(item, Item { id, label: tag.clone() });
+    diesel::delete(sg_items::table.filter(sg_items::label.eq(&tag)))
+        .execute(&mut other)
+        .expect("clean up");
 }

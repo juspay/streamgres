@@ -606,19 +606,38 @@ impl Parser<'_> {
         }
     }
 
-    /// A column, bare or qualified by its table (`t.c`, `"t"."c"`); a
-    /// qualifier must name the table being read.
+    /// A column reference as written: bare (`c`), qualified by its table
+    /// (`t.c`) or by its schema and table (`s.t.c`), each part bare or
+    /// quoted. The qualifier comes back as a catalog name for `s.t.c`
+    /// ([`crate::sync::pg::catalog::table_name`]), as written for `t.c`.
+    pub(super) fn column_parts(&mut self) -> Result<(Option<String>, String), ParseError> {
+        let first = self.ident()?;
+        if !self.eat_sym(".") {
+            return Ok((None, first));
+        }
+        let second = self.ident()?;
+        if !self.eat_sym(".") {
+            return Ok((Some(first), second));
+        }
+        let third = self.ident()?;
+        Ok((
+            Some(crate::sync::pg::catalog::table_name(&first, &second)),
+            third,
+        ))
+    }
+
+    /// A column, bare or qualified (`t.c`, `s.t.c`); a qualifier must name
+    /// the table being read ([`names_table`]).
     fn column_name(&mut self, table: &DbTable) -> Result<ColumnName, ParseError> {
         let at = self.at();
-        let mut name = self.ident()?;
-        if self.eat_sym(".") {
-            if name != table.name.as_str() {
-                return Err(ParseError {
-                    message: format!("`{name}` is not the table being read, `{}`", table.name),
-                    position: at,
-                });
-            }
-            name = self.ident()?;
+        let (qualifier, name) = self.column_parts()?;
+        if let Some(qualifier) = qualifier
+            && !names_table(&qualifier, table.name.as_str())
+        {
+            return Err(ParseError {
+                message: format!("`{qualifier}` is not the table being read, `{}`", table.name),
+                position: at,
+            });
         }
         if table.column(&name).is_some() {
             Ok(ColumnName::from(name))
@@ -1310,6 +1329,16 @@ pub(super) fn differs_from_all(column: ColumnName, list: Value) -> Where {
     }
 }
 
+/// Whether `qualifier` names the table whose catalog name is `table`: that
+/// name itself, or the bare table of one outside `public` (`t` for
+/// `s.t`), as SQL lets a query qualify a column by its table alone.
+pub(crate) fn names_table(qualifier: &str, table: &str) -> bool {
+    qualifier == table
+        || table
+            .split_once('.')
+            .is_some_and(|(_, bare)| bare == qualifier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1440,6 +1469,81 @@ mod tests {
                 ],
             ),
         ])
+    }
+
+    /// Tables outside `public`: `ws.configs`, and `configs` in `public`
+    /// beside `ws.notes`, for qualifiers by catalog name, by schema and
+    /// table, and by bare table.
+    fn schema_catalog() -> Catalog {
+        Catalog::new(vec![
+            DbTable::new(
+                "ws.configs",
+                ["id"],
+                vec![DbColumn::new("id", ValueType::Int), DbColumn::new("key", ValueType::String)],
+            ),
+            DbTable::new(
+                "ws.notes",
+                ["id"],
+                vec![DbColumn::new("id", ValueType::Int), DbColumn::new("config_id", ValueType::Int)],
+            ),
+            DbTable::new(
+                "configs",
+                ["id"],
+                vec![DbColumn::new("id", ValueType::Int), DbColumn::new("key", ValueType::String)],
+            ),
+            DbTable::new(
+                "other.configs",
+                ["id"],
+                vec![DbColumn::new("id", ValueType::Int), DbColumn::new("key", ValueType::String)],
+            ),
+        ])
+    }
+
+    /// A schema-qualified table's columns read as Diesel writes them
+    /// (`"s"."t"."c"`), by bare table (`t.c`) and bare; a qualifier naming
+    /// another table is refused.
+    #[test]
+    fn schema_qualified_columns_resolve() {
+        let catalog = schema_catalog();
+        for sql in [
+            r#"SELECT "ws"."configs"."id", "ws"."configs"."key" FROM "ws"."configs" WHERE ("ws"."configs"."id" = 1)"#,
+            r#"SELECT "notes"."id" FROM "ws"."notes" WHERE ("notes"."config_id" = 1)"#,
+            r#"SELECT id FROM ws.notes WHERE config_id = 1"#,
+        ] {
+            let select = parse_select(sql, &[], &catalog).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert!(select.query.main_table.table.as_str().starts_with("ws."), "{sql}");
+        }
+        let error = parse_select(r#"SELECT "elsewhere"."id" FROM "ws"."notes""#, &[], &catalog)
+            .expect_err("a qualifier of another table");
+        assert!(error.message.contains("not a table of this query"), "{error:?}");
+    }
+
+    /// In a join, the catalog name wins over a bare table: `configs` is
+    /// the one in `public`; a bare table two schemas share is ambiguous.
+    #[test]
+    fn schema_qualified_columns_in_joins() {
+        let catalog = schema_catalog();
+        let sql = r#"SELECT "ws"."notes"."id" FROM ("ws"."notes" INNER JOIN "ws"."configs" ON ("ws"."configs"."id" = "ws"."notes"."config_id"))"#;
+        parse_select(sql, &[], &catalog).expect("fully qualified join");
+        let sql = r#"SELECT "notes"."id" FROM ("ws"."notes" INNER JOIN "configs" ON ("configs"."id" = "notes"."config_id"))"#;
+        let select = parse_select(sql, &[], &catalog).expect("public configs by its catalog name");
+        assert_eq!(select.query.joins[0].sub.main_table.table.as_str(), "configs");
+        let sql = r#"SELECT "ws"."configs"."id" FROM ("ws"."configs" INNER JOIN "other"."configs" ON ("configs"."id" = "other"."configs"."id"))"#;
+        let error = parse_select(sql, &[], &catalog).expect_err("a bare table two schemas share");
+        assert!(error.message.contains("several tables"), "{error:?}");
+    }
+
+    /// Writes take the same qualifiers.
+    #[test]
+    fn schema_qualified_columns_in_writes() {
+        let catalog = schema_catalog();
+        parse_write(
+            r#"UPDATE "ws"."configs" SET "key" = 'a' WHERE ("ws"."configs"."id" = 1)"#,
+            &catalog,
+        )
+        .expect("qualified write");
+        parse_write(r#"DELETE FROM "ws"."configs" WHERE ("configs"."id" = 1)"#, &catalog)
+            .expect("bare-table qualifier in a write");
     }
 
     /// `authors.inner_join(books).order((authors::id, books::id))`: the

@@ -154,22 +154,29 @@ pub struct TableAttribute {
     attribute: Attribute,
 }
 
-/// Every column of every table in the search path, tables in no
-/// particular order, columns in declaration order. A table name present
-/// in several schemas resolves to the first in the search path, as a
-/// bare name does.
-pub const ALL_TABLES_SQL: &str = "SELECT c.relname, a.attname, a.atttypid, a.atttypmod, \
+/// Every column of every table in the search path, under its bare name,
+/// and of every table outside `public`, under its catalog name `s.t` (as
+/// the engine names it): tables in no particular order, columns in
+/// declaration order. A bare name present in several schemas of the path
+/// resolves to the first in the path, as a bare name does.
+pub const ALL_TABLES_SQL: &str = "SELECT rel.name AS relname, a.attname, a.atttypid, a.atttypmod, \
      t.typtype::text AS typtype, t.typelem, t.typcategory::text AS typcategory, \
      et.typtype::text AS elemtyptype \
-     FROM pg_class c \
-     JOIN pg_namespace n ON n.oid = c.relnamespace \
-     JOIN pg_attribute a ON a.attrelid = c.oid \
+     FROM ( \
+       SELECT c.oid, c.relname::text AS name, array_position(current_schemas(false), n.nspname) AS rank \
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+       WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname = ANY(current_schemas(false)) \
+       UNION ALL \
+       SELECT c.oid, n.nspname || '.' || c.relname, 0 \
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+       WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname <> 'public' \
+         AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_%' \
+     ) rel \
+     JOIN pg_attribute a ON a.attrelid = rel.oid \
      JOIN pg_type t ON t.oid = a.atttypid \
      LEFT JOIN pg_type et ON et.oid = t.typelem AND t.typelem <> 0 \
-     WHERE c.relkind IN ('r', 'p', 'v', 'm') \
-       AND n.nspname = ANY(current_schemas(false)) \
-       AND a.attnum > 0 AND NOT a.attisdropped \
-     ORDER BY array_position(current_schemas(false), n.nspname), c.relname, a.attnum";
+     WHERE a.attnum > 0 AND NOT a.attisdropped \
+     ORDER BY rel.rank, rel.name, a.attnum";
 
 /// Groups [`ALL_TABLES_SQL`]'s rows by table. Rows of one table are
 /// contiguous; a later run under a name already taken is the same name
