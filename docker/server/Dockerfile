@@ -1,33 +1,44 @@
-# The sync server as an image: built from the locked dependencies, run as an
-# unprivileged user on a slim Debian. Configured entirely by environment
-# variables (docs/deploy.md lists every one); nothing is baked in but the
-# listen address and the JSON log format a container platform expects.
+# The sync server as an image: built from the locked dependencies on Docker
+# Hardened Images, and run on a hardened Debian runtime that has no shell,
+# no package manager and no user but the unprivileged `nonroot` (uid 65532).
+# Configured entirely by environment variables (docs/deploy.md lists every
+# one); nothing is baked in but the listen address and the JSON log format a
+# container platform expects.
+#
+# The runtime needs nothing installed: TLS roots are compiled into the binary
+# (rustls with webpki-roots). There is no HEALTHCHECK: the platform probes
+# `/healthz` and `/readyz` over HTTP (docs/deploy.md). Pulling from dhi.io
+# needs `docker login dhi.io` first.
 #
 #   docker build -f docker/server/Dockerfile -t streamgres .
-ARG BASE_REGISTRY=docker.io/library
-FROM ${BASE_REGISTRY}/rust:1.89-bookworm AS builder
+#
+# A mirror of the same images is given whole, not as a registry prefix:
+#
+#   docker build --build-arg BUILD_IMAGE=<mirror>/rust:<tag> \
+#     --build-arg RUNTIME_IMAGE=<mirror>/debian-base:<tag> ...
+ARG BUILD_IMAGE=dhi.io/rust:1.89-debian13-dev
+ARG RUNTIME_IMAGE=dhi.io/debian-base:debian13
+
+FROM ${BUILD_IMAGE} AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock clippy.toml ./
 COPY src ./src
-RUN cargo build --release --locked --bin server
+RUN cargo build --release --locked --bin server \
+    && mkdir -p /out/app /out/var/lib/streamgres \
+    && cp target/release/server /out/app/server
 
-FROM ${BASE_REGISTRY}/debian:bookworm-slim AS runtime
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --uid 10001 --home-dir /app --shell /usr/sbin/nologin streamgres \
-    && mkdir -p /app /var/lib/streamgres /var/lib/xyne-sync \
-    && chown -R streamgres:streamgres /app /var/lib/streamgres /var/lib/xyne-sync
+FROM ${RUNTIME_IMAGE} AS runtime
+# The binary is root-owned and read-only to the server; only the plan
+# file's directory is its to write.
+COPY --from=builder --chown=0:0 /out/app /app
+COPY --from=builder --chown=65532:65532 /out/var/lib/streamgres /var/lib/streamgres
 WORKDIR /app
-COPY --from=builder /build/target/release/server /app/server
 
 ARG SOURCE_COMMIT=unknown
 ENV SOURCE_COMMIT=${SOURCE_COMMIT} \
     STREAMGRES_ADDR=0.0.0.0:4848 \
     STREAMGRES_LOG_FORMAT=json
 
-USER streamgres
+USER 65532:65532
 EXPOSE 4848
-HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=6 \
-    CMD curl -fsS http://127.0.0.1:4848/health || exit 1
 CMD ["/app/server"]

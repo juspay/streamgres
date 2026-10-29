@@ -26,12 +26,18 @@ For a local first run, see the README's Quick start.
 docker build -f docker/server/Dockerfile -t streamgres .
 ```
 
-The image is a slim Debian image of about 125 MB:
-- It has one binary, `/app/server`, run as the unprivileged user `streamgres`
-  (uid 10001).
+The image is built on Docker Hardened Images (`dhi.io/rust` to build,
+`dhi.io/debian-base` to run), so pulling them needs `docker login dhi.io`
+first. The runtime has no shell and no package manager:
+- It has one binary, `/app/server`, run as the unprivileged user `nonroot`
+  (uid 65532).
 - It listens on port 4848 and writes JSON log lines to stderr.
+- It has no Docker `HEALTHCHECK` (there is no curl to run one): probe
+  `/healthz` and `/readyz` over HTTP from the platform instead, which
+  answer 503 until the server is ready (section 6).
 - It needs no file system, except an optional writable directory for
-  `STREAMGRES_PLAN_FILE` (section 5).
+  `STREAMGRES_PLAN_FILE` (section 5), and a writable `/tmp` for heap
+  profiles when Pyroscope is on and the root file system is read-only.
 
 `.github/workflows/docker-publish.yml` publishes the image to the GitHub
 Container Registry as `ghcr.io/<owner>/streamgres`. It runs on pushes to the
