@@ -80,14 +80,21 @@ branch name and the short commit SHA.
   directly to PostgreSQL for the logical feed and snapshot minting.
   Replication must not use the read pool.
 
-**The server writes nothing to the database it follows.** It reads rows and
-the replication stream. Its position in the stream comes from each commit and
-from the keepalives PostgreSQL sends anyway. So `STREAMGRES_PG_DSN` can point
-at:
+**The server writes nothing to the database it follows but its
+heartbeats.** It reads rows and the replication stream. Its position in the
+stream comes from each commit and from the keepalives PostgreSQL sends
+anyway. Every `STREAMGRES_HEARTBEAT_MS` it writes a logical message (no
+table) to measure its lag, which only a primary accepts. So
+`STREAMGRES_PG_DSN` can point at:
 - the primary,
 - a logical replica, or
 - a physical standby (PostgreSQL 16 or later, the first version that can do
-  logical decoding on a standby).
+  logical decoding on a standby). There the heartbeats fail, the server
+  reports no lag, and backends trust it whatever its delay.
+
+Run the one-time setup below on the primary, as a migration. Backends that
+cache their reads through the Diesel wrapper may read from replicas; see
+[`backends.md`](backends.md).
 
 Ordinary SQL reads can optionally use a separate endpoint:
 `STREAMGRES_READ_PG_DSN` may point to PgBouncer configured for transaction
@@ -137,8 +144,8 @@ idle. PgBouncer's own pool settings control the PostgreSQL backend connections.
   nothing from the previous slot.
 - **A slot left behind by a crash holds WAL.** Either:
   - set `STREAMGRES_SLOT_CLEANUP_AGE_MS` so the next startup drops inactive
-    `xyne_sync_slot_*` slots older than that age (needs PostgreSQL 17+, which
-    records `inactive_since`), or
+    `xyne_sync_slot_*` slots on its database older than that age (needs
+    PostgreSQL 17+, which records `inactive_since`), or
   - drop them by hand: `SELECT pg_drop_replication_slot('<slot name>');`
   - Either way, set `max_slot_wal_keep_size` as a safety net.
 - **A process whose slot disappears while it runs stops.** It does not
@@ -147,11 +154,16 @@ idle. PgBouncer's own pool settings control the PostgreSQL backend connections.
 
 ### Physical standbys
 
-- A new read snapshot on a standby waits for the primary's next
-  running-transactions record. A busy primary writes one every 15 s;
-  `SELECT pg_log_standby_snapshot()` on the primary forces one. Until it
-  arrives, reads keep using the current snapshot, so the only cost is memory,
-  not correctness.
+- A new slot on a standby waits for the primary's next running-transactions
+  record. The primary writes one every 15 s while it has written anything
+  since the last, and none while it is idle; `SELECT pg_log_standby_snapshot()`
+  on the primary writes one at once.
+  - At startup the feed's slot and the first read snapshot each wait so. A
+    server that has waited 10 s on a slot logs what it is waiting for. On an
+    idle primary, run `pg_log_standby_snapshot()` there, or start the server
+    once the primary has writes.
+  - Later read snapshots wait the same way. Until one arrives, reads keep
+    using the current snapshot, so the only cost is memory, not correctness.
 - Set `hot_standby_feedback = on` on the standby, so the primary's vacuum does
   not cancel the snapshots.
 
@@ -183,6 +195,25 @@ Two kinds of change are followed while the server runs:
 
 The rows already in memory get the new column, and the new shape is served
 from the next snapshot on. Clients are sent nothing for the change.
+
+An `ORDER BY` on a new string column is followed when the column's collation
+orders bytes (`C`, `POSIX`, or the database's default when that does), as on a
+column loaded at startup. The trigger stack says which collation each column
+has; a stack installed before it did (no `collationName` in its messages) does
+not, and an `ORDER BY` on such a column is served from Postgres until the next
+restart. Re-run the setup SQL to update an older stack.
+
+**Row-level security is never served.** The engine reads as its own role and
+cannot apply a backend's policies, so the S2S endpoint refuses any query over a
+table with row-level security enabled, and the backend reads Postgres. Turning
+it off, or on in the transaction that creates the table (a migration's usual
+`CREATE TABLE …; ALTER TABLE … ENABLE ROW LEVEL SECURITY`), is followed as it
+commits. Turning it on for a table served before stops the server, which
+restarts knowing it, so no change made after it reaches a backend. A
+table created while serving is taken as secured unless the trigger stack says
+otherwise, which a stack older than `rowSecurity` in its messages does not; such
+a stack also misses row-level security turned on while serving. The server
+warns at startup when its stack is that old: run the setup SQL again.
 
 **Any other change to a served table stops the server**, with one log line
 naming the change. That includes dropping or renaming a column or table,
@@ -280,6 +311,14 @@ depend on what the defaults happen to be:
 | `STREAMGRES_GROUP_LOG_BYTES` | `262144` | recent updates kept per client group, so a briefly disconnected tab catches up instead of starting over. `0` keeps none |
 | `STREAMGRES_MAX_MESSAGE_BYTES` | `16777216` | largest message accepted from a client |
 | `STREAMGRES_BYTES_PER_PART` | `768000` | bytes of serialized row changes per message part (750 KiB) |
+| `STREAMGRES_S2S_TOKEN` | none | secret a backend must send as `Authorization: Bearer <token>` to open the S2S endpoint; a comma-separated list while one is rotated, each at least 16 bytes. Unset, there is no S2S endpoint |
+| `STREAMGRES_S2S_ADDR` | none | a listener of the S2S endpoint's own; set, the client port has no S2S route |
+| `STREAMGRES_S2S_ALLOW_NO_TOKEN` | `false` | serve the S2S endpoint to anyone; development only |
+| `STREAMGRES_S2S_MAX_CONNECTIONS` | `64` | S2S connections open at once; past it an upgrade is answered `503`. Each backend process opens `STREAMGRES_S2S_CONNECTIONS` (2), so 64 serves 32 processes. `0` lifts the limit |
+| `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` | `10000` | subscriptions one S2S connection may hold; past it a subscribe is refused. The engine announces it, and the client stops short of it. `0` lifts the limit |
+| `STREAMGRES_HEARTBEAT_MS` | `500` | how often the engine writes a heartbeat into the WAL (`pg_logical_emit_message`, not transactional) and measures how long its stream takes to bring it back. S2S clients are told that lag and read Postgres past their `STREAMGRES_S2S_MAX_LAG_MS`. Needs `STREAMGRES_PG_DSN` to reach a primary; `0` turns it off |
+| `STREAMGRES_S2S_MAX_DISJUNCTS` | `1024` | alternatives an S2S query's filters may expand to (an `AND` of `OR`s multiplies them); past it a subscribe is refused and the backend reads Postgres. The engine expands a filter on the thread every subscriber's changes go through: an `AND` of thirty `OR` pairs would hold them all up and exhaust its memory. `0` lifts the limit |
+| `STREAMGRES_S2S_MAX_LIST_VALUES` | `10000` | `IN` and `NOT IN` values an S2S query may hold in all; past it a subscribe is refused. The engine files each value on that same thread, about a second per 150,000. `0` lifts the limit |
 | `STREAMGRES_LOG` | `info` | `error`, `warn`, `info` or `debug`. `debug` costs throughput |
 | `STREAMGRES_SLOW_QUERY_MS` | `1000` | queries and pushes slower than this are logged at `warn` |
 | `STREAMGRES_METRICS_INTERVAL_MS` | `10000` | how often process metrics are sampled |
@@ -288,11 +327,42 @@ depend on what the defaults happen to be:
 
 ## 6. Ports, probes and shutdown
 
-- **One port, 4848.** It serves:
+- **One port, 4848, and an optional private one.** It serves:
   - the WebSocket at `<base path>/sync/v51/connect`
+  - the server-to-server WebSocket at `<base path>/s2s/v1`, for backends
+    that cache their own reads, only when `STREAMGRES_S2S_TOKEN` is set
   - `/health`, `/metrics` and `/stats`
 
   Keep `/metrics` and `/stats` private.
+- **The S2S endpoint reads with the engine's privileges.** It carries no
+  user: whoever opens it can subscribe to the rows of every table the
+  engine follows, every column of them. So:
+  - It is off unless `STREAMGRES_S2S_TOKEN` is set, and then admits only
+    that bearer token. Use a random one (`openssl rand -hex 32`); the
+    server refuses one under 16 bytes. To rotate, set
+    `new-token,old-token`, roll the backends over to the new one, then
+    drop the old.
+  - Set `STREAMGRES_S2S_ADDR` (say `10.0.0.5:4849`) to serve it on a
+    listener of its own, on a network only the backends reach, and keep
+    it off the client port altogether. A network policy admitting only
+    the backends' pods to that port is the second lock.
+  - The server speaks plain `ws://`, so the token crosses the network as
+    text: terminate TLS in front of it (an ingress, a mesh, a sidecar)
+    unless the backends share a private network with it.
+  - `STREAMGRES_S2S_ALLOW_NO_TOKEN=true` serves it to anyone, with a
+    warning at startup. It is for development on a machine no one else
+    reaches. The
+  two S2S limits multiply: at most `STREAMGRES_S2S_MAX_CONNECTIONS` ×
+  `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS` subscriptions in all. Each
+  S2S connection queues at most 4,096 frames and 64 MiB of them for a
+  backend that is slow to read; past that it is closed, and its socket
+  cut off 5 seconds later if it still cannot be flushed.
+- **Times.** The engine keeps every time in microseconds, Postgres's own
+  precision, and the S2S endpoint ships them so. Zero clients see a time
+  as its whole milliseconds, and a Zero query's filter or page cursor on
+  a time compares on the millisecond, as the client does. Rows of one
+  page that fall in the same millisecond are ordered by their
+  microseconds, then by key, where the client orders them by key alone.
 - **Health.** `GET /health` (also `/healthz`, `/readyz`, and each of them
   under the base path) returns `503` until the server is ready. That means
   the change feed has passed the first read snapshot, and the warm start, if

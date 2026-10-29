@@ -31,22 +31,24 @@ Build and test:
 
 ```bash
 cargo build
-cargo test                          # unit and scenario tests
-cargo clippy --all-targets -- -D warnings
+cargo test --workspace              # unit and scenario tests, every crate
+cargo clippy --workspace --all-targets -- -D warnings
 cargo run --bin streamgres           # Streamgres demo: every check must end in PASS
 cargo run --release --bin bench     # benchmarks
 cargo run --release --bin load      # the server over the wire: latency, cores, memory (needs STREAMGRES_PG_DSN)
 ```
 
 The tests against a real PostgreSQL run when `STREAMGRES_PG_DSN` is set and
-report themselves skipped otherwise. To run them the way CI does:
+report themselves skipped otherwise; the Diesel wrapper's and the demo's
+tests read `DATABASE_URL`. To run them the way CI does:
 
 ```bash
 docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17 \
   -c wal_level=logical -c max_replication_slots=32 -c max_wal_senders=32
 
 STREAMGRES_PG_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
-  cargo test --release
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/postgres \
+  cargo test --release --workspace
 ```
 
 To run the server locally, follow the [Quick start](README.md#quick-start) in
@@ -58,8 +60,8 @@ Every pull request runs:
 
 | Job | What it runs |
 | --- | --- |
-| Lints | `cargo clippy --all-targets --locked -- -D warnings` |
-| Tests | `cargo test --release --locked` against PostgreSQL 17 |
+| Lints | `cargo clippy --workspace --all-targets --locked -- -D warnings`, the same for the engine without its `server` feature, and `scripts/check-downstream.sh` (the crates built as another project's dependencies) |
+| Tests | `cargo test --release --locked --workspace` against PostgreSQL 17 |
 | Benchmark | `bench` on your branch and the base branch, five alternating rounds, compared by `scripts/bench-compare.py` |
 | Image | builds `docker/server/Dockerfile` and drives it end to end with `scripts/smoke.mjs` |
 

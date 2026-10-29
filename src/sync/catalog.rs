@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use crate::model::{Catalog, DbColumn, DbTable};
+use crate::model::{Catalog, ColumnName, DbColumn, DbTable, TableName};
 
 /// The catalog every thread reads through, replaced whole by the feed
 /// when the schema grows.
@@ -48,9 +48,19 @@ impl CatalogHandle {
     pub fn swap(&self, catalog: Arc<Catalog>) {
         self.current.store(catalog);
     }
+
+    /// Replace the catalog with `change` of it, retried on whatever a
+    /// concurrent swap put in, so neither change is lost to the other.
+    pub fn update(&self, change: impl Fn(&Catalog) -> Catalog) {
+        self.current.rcu(|current| Arc::new(change(current)));
+    }
 }
 
-/// `catalog` with `table` in it, replacing a table of the same name.
+/// `catalog` with `table` in it, replacing a table of the same name,
+/// and knowing the same enum types and text orderings: a bound enum
+/// label must stay readable after a migration, and a column's ordering
+/// does not change with it. The orderings of the columns a migration
+/// adds come from its message ([`with_ordered`]).
 pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
     let name = table.name.clone();
     Catalog::new(
@@ -60,6 +70,37 @@ pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
             .cloned()
             .chain(std::iter::once(table)),
     )
+    .with_enum_oids(catalog.enum_oids())
+    .with_ordered_as_text(catalog.ordered_as_text().cloned())
+    .with_bytewise_default(catalog.bytewise_default())
+    .with_row_secured(catalog.row_secured().cloned())
+}
+
+/// `catalog` knowing whether `table` has row-level security enabled.
+pub fn with_row_security(catalog: &Catalog, table: &TableName, secured: bool) -> Catalog {
+    let others = catalog.row_secured().filter(|held| *held != table).cloned();
+    let this = secured.then(|| table.clone());
+    catalog.clone().with_row_secured(others.chain(this))
+}
+
+/// `catalog` knowing `columns` of `table` order as their text too.
+pub fn with_ordered(
+    catalog: &Catalog,
+    table: &TableName,
+    columns: impl IntoIterator<Item = ColumnName>,
+) -> Catalog {
+    let added = columns.into_iter().map(|column| (table.clone(), column));
+    catalog
+        .clone()
+        .with_ordered_as_text(catalog.ordered_as_text().cloned().chain(added))
+}
+
+/// `catalog` knowing `oids` are enum types too, as a type created after
+/// the catalog was loaded is learned.
+pub fn with_enums(catalog: &Catalog, oids: impl IntoIterator<Item = u32>) -> Catalog {
+    catalog
+        .clone()
+        .with_enum_oids(catalog.enum_oids().chain(oids))
 }
 
 /// `table` with `column` added: the same name and key, one column more.
@@ -114,6 +155,19 @@ mod tests {
         assert!(after.table("users").is_some());
         assert!(after.table("tickets").unwrap().column("owner").is_some());
         assert!(before.table("tickets").unwrap().column("owner").is_none());
+        assert_eq!(after.tables().count(), 2);
+    }
+
+    /// A migration absorbed at runtime must not make the server forget
+    /// which bind types are enums: every enum bind after it was refused.
+    #[test]
+    fn a_table_added_keeps_the_enum_types() {
+        let tickets = DbTable::new("tickets", ["id"], vec![DbColumn::new("id", ValueType::Int)]);
+        let before = Catalog::new(vec![tickets]).with_enum_oids([19098, 19099]);
+        let users = DbTable::new("users", ["id"], vec![DbColumn::new("id", ValueType::Int)]);
+        let after = with_table(&before, users);
+        assert!(after.is_enum_oid(19098) && after.is_enum_oid(19099));
+        assert!(!after.is_enum_oid(23));
         assert_eq!(after.tables().count(), 2);
     }
 }

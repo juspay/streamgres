@@ -53,15 +53,15 @@ pub mod ast;
 pub mod backend;
 pub mod config;
 pub mod connection;
-pub mod ddl_triggers;
 pub mod groups;
-pub mod plan;
 pub mod protocol;
+pub mod s2s;
 pub mod sampler;
 pub mod schema;
 pub mod transform;
 pub mod warm;
-pub mod wire;
+
+pub use crate::{plan, wire};
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,7 +110,10 @@ async fn join_worker(
 }
 
 /// Run the server with `config` until ctrl-c; returns the reason it could
-/// not start.
+/// not start. The engine feeds one consumer per group thread and one for
+/// the server-to-server endpoint, the last sink. Tasks are named for
+/// `tokio-console` when the runtime is built with `--cfg tokio_unstable`,
+/// and spawned plainly otherwise.
 pub fn serve(config: Config) -> Result<(), String> {
     log::set_level(config.log);
     log::set_format(config.log_format);
@@ -141,7 +144,7 @@ pub fn serve(config: Config) -> Result<(), String> {
     crate::stats::Stats::install(&stats);
     let shards = config.group_threads.max(1);
     stats.read_row_limit.store(
-        crate::sync::pg::read_row_limit() as u64,
+        config.row_limit,
         std::sync::atomic::Ordering::Relaxed,
     );
 
@@ -150,6 +153,14 @@ pub fn serve(config: Config) -> Result<(), String> {
     let reads_handle = reads.handle().clone();
     let engine_shutdown = shutdown.clone();
     let (started_tx, started_rx) = std::sync::mpsc::channel::<Result<threads::Started, String>>();
+    // The S2S endpoint's consumer, after the groups', told of every
+    // commit; none when the endpoint is off.
+    let s2s_on = config.s2s_access != config::S2sAccess::Off;
+    let (consumers, every_commit) = if s2s_on {
+        (shards + 1, vec![shards])
+    } else {
+        (shards, Vec::new())
+    };
     let engine_thread = std::thread::Builder::new()
         .name("streamgres-engine".to_owned())
         .spawn(move || {
@@ -163,7 +174,8 @@ pub fn serve(config: Config) -> Result<(), String> {
                     &settings,
                     engine_catalog,
                     reads_handle,
-                    shards,
+                    consumers,
+                    &every_commit,
                     engine_stats,
                     engine_shutdown.clone(),
                 )
@@ -206,6 +218,16 @@ pub fn serve(config: Config) -> Result<(), String> {
         .map_err(|_| "the engine thread ended before it was up".to_owned())??;
 
     let (readiness, ready) = tokio::sync::watch::channel(false);
+    let mut events = events;
+    let s2s_events = if s2s_on {
+        Some(
+            events
+                .pop()
+                .ok_or("the engine started without the s2s sink".to_owned())?,
+        )
+    } else {
+        None
+    };
     let mut requests = Vec::with_capacity(shards);
     let mut group_threads = Vec::with_capacity(shards);
     for (shard, events) in events.into_iter().enumerate() {
@@ -280,6 +302,46 @@ pub fn serve(config: Config) -> Result<(), String> {
     let warm_budget = config.warm_start;
     let metrics_interval = config.metrics_interval;
     let (warmed_tx, warmed) = tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
+    let s2s = s2s::Admission::new(config.s2s_max_connections);
+    let live = match s2s_events {
+        Some(s2s_events) => {
+            let (hub, s2s_requests) = crate::live::Hub::new();
+            let delivered = hub.delivered();
+            let live = Arc::new(crate::live::Context {
+                hub,
+                catalog: catalog.clone(),
+                storage: storage.clone(),
+                plans: plans.clone(),
+                policy: config.policy(),
+                limits: crate::live::Limits {
+                    per_connection: config.s2s_connection_subscriptions,
+                    max_disjuncts: config.s2s_max_disjuncts,
+                    max_list_values: config.s2s_max_list_values,
+                },
+                stats: stats.clone(),
+            });
+            let s2s_task = crate::live::run(
+                catalog.clone(),
+                shards,
+                commands.clone(),
+                s2s_events,
+                s2s_requests,
+                ready.clone(),
+                config.s2s_connection_subscriptions,
+                stats.clone(),
+                delivered,
+            );
+            #[cfg(tokio_unstable)]
+            tokio::task::Builder::new()
+                .name("s2s")
+                .spawn_on(s2s_task, server.handle())
+                .map_err(|error| format!("spawning the s2s task: {error}"))?;
+            #[cfg(not(tokio_unstable))]
+            server.spawn(s2s_task);
+            Some(live)
+        }
+        None => None,
+    };
     let state = Arc::new(connection::AppState {
         config,
         requests,
@@ -294,6 +356,8 @@ pub fn serve(config: Config) -> Result<(), String> {
         warmed,
         transforms,
         shutdown: shutdown.clone(),
+        s2s,
+        live,
     });
     drop(readiness);
     if warm.enabled() {

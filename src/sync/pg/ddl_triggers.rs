@@ -6,7 +6,7 @@
 //! Ported statement for statement from zero-cache's
 //! `change-source/pg/schema/{ddl,published}.ts` (Rocicorp, Apache-2.0).
 
-use crate::sync::pg::sql::{quote_ident, quote_literal};
+use super::sql::{quote_ident, quote_literal};
 
 /// The advisory lock every DDL statement takes under zero-cache's start
 /// trigger, so that the schemas its messages carry diff in order.
@@ -29,7 +29,9 @@ const DDL_TAGS: [&str; 7] = [
 /// schema `<app>_<shard>`, the table holding the last published schema,
 /// and the two event triggers. A database zero-cache serves has it
 /// already. Ported statement for statement from zero-cache's
-/// `change-source/pg/schema/{ddl,published}.ts`.
+/// `change-source/pg/schema/{ddl,published}.ts`, with one field more:
+/// each column's collation name (`collationName`), which tells the
+/// engine whether a string column a migration adds orders as its text.
 pub fn trigger_stack_sql(app: &str, shard: u32, publications: &[&str]) -> String {
     let tags: Vec<String> = DDL_TAGS.iter().map(|tag| quote_literal(tag)).collect();
     let tags = tags.join(", ");
@@ -82,6 +84,7 @@ WITH published_columns AS (SELECT
   pc.relnamespace::int8 AS "schemaOID" ,
   pc.relname AS "name",
   pc.relreplident AS "replicaIdentity",
+  pc.relrowsecurity AS "rowSecurity",
   attnum AS "pos",
   attname AS "col",
   pt.typname AS "type",
@@ -89,6 +92,7 @@ WITH published_columns AS (SELECT
   pt.typtype,
   elem_pt.typtype AS "elemTyptype",
   coll.collisdeterministic AS "collationIsDeterministic",
+  coll.collname AS "collationName",
   NULLIF(atttypmod, -1) AS "maxLen",
   attndims "arrayDims",
   attnotnull AS "notNull",
@@ -118,6 +122,7 @@ tables AS (SELECT json_build_object(
   'schemaOID', "schemaOID",
   'name', "name",
   'replicaIdentity', "replicaIdentity",
+  'rowSecurity', "rowSecurity",
   'columns', json_object_agg(
     DISTINCT
     col,
@@ -130,6 +135,7 @@ tables AS (SELECT json_build_object(
       'elemPgTypeClass', "elemTyptype",
       'typeOID', "typeOID",
       'collationIsDeterministic', "collationIsDeterministic",
+      'collationName', "collationName",
       'characterMaximumLength', CASE WHEN "typeOID" = 1043 OR "typeOID" = 1042
                                      THEN "maxLen" - 4
                                      ELSE "maxLen" END,
@@ -150,7 +156,7 @@ tables AS (SELECT json_build_object(
     jsonb_build_object('rowFilter', "rowFilter")
   )
 ) AS "table" FROM published_columns
-  GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity"),
+  GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity", "rowSecurity"),
 
   indexed_columns AS (SELECT
       pg_indexes.schemaname as "schema",
@@ -382,7 +388,7 @@ mod tests {
     /// app, shard and publication, then check the output in.
     #[test]
     fn the_checked_in_stack_is_the_generators() {
-        let checked_in = include_str!("../../scripts/sql/ddl-triggers.sql");
+        let checked_in = include_str!("../../../scripts/sql/ddl-triggers.sql");
         assert_eq!(checked_in, trigger_stack_sql("xyne", 0, &["xyne_sync_pub"]));
     }
 

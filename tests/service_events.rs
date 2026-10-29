@@ -97,6 +97,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
             Event::Committed { .. } => "committed",
             Event::Capped { .. } => "capped",
             Event::Heavy { .. } => "heavy",
+            Event::Heartbeat { .. } => "heartbeat",
         })
         .collect()
 }
@@ -105,11 +106,13 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
 fn updates_of(event: &Event) -> &[streamgres::ivm::Delta] {
     match event {
         Event::Registered { updates, .. }
-        | Event::Landed { updates }
+        | Event::Landed { updates, .. }
         | Event::Committed { updates, .. } => updates,
-        Event::Hydrated(_) | Event::Refused { .. } | Event::Capped { .. } | Event::Heavy { .. } => {
-            &[]
-        }
+        Event::Hydrated(_)
+        | Event::Refused { .. }
+        | Event::Capped { .. }
+        | Event::Heavy { .. }
+        | Event::Heartbeat { .. } => &[],
     }
 }
 
@@ -309,6 +312,7 @@ fn a_commit_reports_the_position_and_the_watched_writes() {
                 catalog: None,
                 received: std::time::Instant::now(),
                 committed_at_micros: 0,
+                heartbeat: None,
                 decode: std::time::Duration::ZERO,
             }))
             .await
@@ -332,6 +336,52 @@ fn a_commit_reports_the_position_and_the_watched_writes() {
             "the commit is the one event; nobody subscribed, so it carries no delta, got {:?}",
             shapes(&seen)
         );
+    });
+}
+
+/// A heartbeat mark reaches every consumer as its own event, after the
+/// events of the transactions before it: a consumer that has passed
+/// those on may take the heartbeat as applied.
+#[test]
+fn a_heartbeat_follows_the_transactions_before_it_to_every_consumer() {
+    block_on(async {
+        let storage = Rc::new(MemoryStorage::new());
+        let (owner_tx, mut owner) = mpsc::unbounded_channel();
+        let (other_tx, mut other) = mpsc::unbounded_channel();
+        let (service, commands) =
+            Service::new(MultiTableIVM::new(), storage, owner_tx.clone());
+        let service = service.with_sinks(vec![owner_tx, other_tx]);
+        spawn_local(service.run());
+
+        let step = |writes: Vec<_>, at: u64, heartbeat: Option<u64>| Transaction {
+            writes,
+            at: Lsn(at),
+            progress: Lsn(at),
+            watched: Vec::new(),
+            schema: Vec::new(),
+            catalog: None,
+            received: std::time::Instant::now(),
+            committed_at_micros: 0,
+            heartbeat,
+            decode: Duration::ZERO,
+        };
+        commands
+            .send(Command::Transaction(step(vec![insert(1, "OPEN")], 10, None)))
+            .await
+            .expect("send");
+        commands
+            .send(Command::Transaction(step(Vec::new(), 10, Some(3))))
+            .await
+            .expect("send");
+        let (owner_seen, other_seen) = (drain(&mut owner).await, drain(&mut other).await);
+        for seen in [&owner_seen, &other_seen] {
+            assert_eq!(shapes(seen).first(), Some(&"committed"), "{:?}", shapes(seen));
+            assert_eq!(shapes(seen).last(), Some(&"heartbeat"), "{:?}", shapes(seen));
+            assert!(matches!(
+                seen.last(),
+                Some(Event::Heartbeat { heartbeat: 3, position: Lsn(10) })
+            ));
+        }
     });
 }
 
@@ -725,6 +775,7 @@ fn a_serving_consumer_is_not_woken_for_nothing() {
                 catalog: None,
                 received: std::time::Instant::now(),
                 committed_at_micros: 0,
+                heartbeat: None,
                 decode: Duration::ZERO,
             }
         };
@@ -767,5 +818,70 @@ fn a_serving_consumer_is_not_woken_for_nothing() {
             shapes(&other_seen)
         );
         assert_eq!(ids(&drain(&mut owner).await), vec![3]);
+    });
+}
+
+/// A consumer told of every commit hears one with nothing for it, with
+/// no changes and the commit's position, so its position keeps up with
+/// the engine's; the others are still not woken.
+#[test]
+fn a_consumer_told_of_every_commit_hears_each_position() {
+    block_on(async {
+        let storage = Rc::new(MemoryStorage::new());
+        let (owner_tx, mut owner) = mpsc::unbounded_channel();
+        let (idle_tx, mut idle) = mpsc::unbounded_channel();
+        let (follower_tx, mut follower) = mpsc::unbounded_channel();
+        let (service, commands) =
+            Service::new(MultiTableIVM::new(), storage, owner_tx.clone());
+        let service = service
+            .with_sinks(vec![owner_tx, idle_tx, follower_tx])
+            .with_every_commit(&[2]);
+        spawn_local(service.run());
+
+        let transaction = |id: i64, at: u64| {
+            let write = insert(id, "OPEN");
+            Transaction {
+                watched: Vec::new(),
+                writes: vec![write],
+                at: Lsn(at),
+                progress: Lsn(at),
+                schema: Vec::new(),
+                catalog: None,
+                received: std::time::Instant::now(),
+                committed_at_micros: 0,
+                heartbeat: None,
+                decode: Duration::ZERO,
+            }
+        };
+        commands
+            .send(Command::Transaction(transaction(1, 10)))
+            .await
+            .expect("send");
+        for events in [&mut owner, &mut idle, &mut follower] {
+            drain(events).await;
+        }
+        commands
+            .send(Command::Register {
+                sink: 0,
+                query: open_tickets(),
+                token: 1,
+            })
+            .await
+            .expect("send");
+        drain(&mut owner).await;
+
+        commands
+            .send(Command::Transaction(transaction(2, 20)))
+            .await
+            .expect("send");
+        assert_eq!(ids(&drain(&mut owner).await), vec![2]);
+        assert!(drain(&mut idle).await.is_empty(), "nothing for it");
+        let heard = drain(&mut follower).await;
+        assert!(
+            matches!(heard.as_slice(), [Event::Committed { updates, position, .. }]
+                if updates.is_empty() && *position == Lsn(20)),
+            "told of the commit's position: {:?}",
+            shapes(&heard)
+        );
     });
 }

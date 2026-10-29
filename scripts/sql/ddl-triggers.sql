@@ -30,6 +30,7 @@ WITH published_columns AS (SELECT
   pc.relnamespace::int8 AS "schemaOID" ,
   pc.relname AS "name",
   pc.relreplident AS "replicaIdentity",
+  pc.relrowsecurity AS "rowSecurity",
   attnum AS "pos",
   attname AS "col",
   pt.typname AS "type",
@@ -37,6 +38,7 @@ WITH published_columns AS (SELECT
   pt.typtype,
   elem_pt.typtype AS "elemTyptype",
   coll.collisdeterministic AS "collationIsDeterministic",
+  coll.collname AS "collationName",
   NULLIF(atttypmod, -1) AS "maxLen",
   attndims "arrayDims",
   attnotnull AS "notNull",
@@ -66,6 +68,7 @@ tables AS (SELECT json_build_object(
   'schemaOID', "schemaOID",
   'name', "name",
   'replicaIdentity', "replicaIdentity",
+  'rowSecurity', "rowSecurity",
   'columns', json_object_agg(
     DISTINCT
     col,
@@ -78,6 +81,7 @@ tables AS (SELECT json_build_object(
       'elemPgTypeClass', "elemTyptype",
       'typeOID', "typeOID",
       'collationIsDeterministic', "collationIsDeterministic",
+      'collationName', "collationName",
       'characterMaximumLength', CASE WHEN "typeOID" = 1043 OR "typeOID" = 1042
                                      THEN "maxLen" - 4
                                      ELSE "maxLen" END,
@@ -98,7 +102,7 @@ tables AS (SELECT json_build_object(
     jsonb_build_object('rowFilter', "rowFilter")
   )
 ) AS "table" FROM published_columns
-  GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity"),
+  GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity", "rowSecurity"),
 
   indexed_columns AS (SELECT
       pg_indexes.schemaname as "schema",

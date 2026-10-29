@@ -32,8 +32,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
-use streamgres::client::ast::Translated;
-use streamgres::client::plan::{Count, PlanCache, Planner, Policy, Side, plan};
+use streamgres::plan::Translated;
+use streamgres::plan::{Count, PlanCache, Planner, Policy, Side, plan};
 use streamgres::model::ComparisonOperator::{GT, IN};
 use streamgres::model::Order::DESC;
 use streamgres::model::{Catalog, Lsn, MultiTableReadQuery};

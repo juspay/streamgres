@@ -42,6 +42,12 @@ pub enum SchemaChange {
         value: Value,
         schema: Arc<RowSchema>,
     },
+    /// Row-level security turned on (`secured`) or off for `table`: what
+    /// the engine refuses to serve to a backend changes, its rows do not.
+    RowSecurity {
+        table: TableName,
+        secured: bool,
+    },
 }
 
 impl fmt::Display for SchemaChange {
@@ -64,6 +70,11 @@ impl fmt::Display for SchemaChange {
                 f,
                 "column `{}` ({:?}) added to `{table}`, existing rows {value:?}",
                 column.name, column.r#type
+            ),
+            SchemaChange::RowSecurity { table, secured } => write!(
+                f,
+                "row-level security {} on `{table}`",
+                if *secured { "enabled" } else { "disabled" }
             ),
         }
     }

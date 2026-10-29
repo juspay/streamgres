@@ -46,14 +46,23 @@ jobs:
       - name: Install rust cache
         uses: Swatinem/rust-cache@v2.7.7
 
-      - name: Clippy, warnings denied
-        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Clippy, warnings denied, every crate of the workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Clippy, warnings denied, the engine without the server
+        run: cargo clippy -p streamgres --no-default-features --lib --tests --bins --locked -- -D warnings
+
+      - name: The crates build as another project's dependencies
+        run: scripts/check-downstream.sh
 
   test:
     name: Tests (accuracy)
     runs-on: ubuntu-latest
     env:
       STREAMGRES_PG_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+      # The Diesel wrapper's tests read and write their own tables in the
+      # same database.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -77,8 +86,20 @@ jobs:
             -c wal_level=logical -c max_replication_slots=32 -c max_wal_senders=32
           until docker exec pg pg_isready -U postgres; do sleep 1; done
 
-      - name: Unit, scenario, randomized and live PostgreSQL tests
-        run: cargo test --release --locked
+      - name: Unit, scenario, randomized and live PostgreSQL tests, every crate
+        run: cargo test --release --locked --workspace
+
+      # The Diesel wrapper against a running engine: its live tests skip
+      # without one, so run them again with an engine in the test process.
+      # watch_failure_live drops a table, which restarts that test binary's
+      # engine; each test binary has an engine of its own.
+      - name: The Diesel wrapper's live tests, against an embedded engine
+        env:
+          STREAMGRES_TEST_EMBEDDED: "1"
+          STREAMGRES_SCHEMAS: public,zero_0,sg_live_ws
+        run: |
+          docker exec pg psql -U postgres -c 'CREATE SCHEMA IF NOT EXISTS sg_live_ws'
+          cargo test --release --locked -p diesel-streamgres --features embedded,sse,async
 
   perf:
     name: Benchmark against the base branch (performance)

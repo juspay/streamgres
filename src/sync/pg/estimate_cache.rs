@@ -32,10 +32,13 @@ use tokio::sync::watch;
 
 use super::estimate::ColumnStats;
 
-/// How long an answer is kept when `STREAMGRES_ESTIMATE_TTL_MS` is unset.
+/// How long an answer is kept unless the storage is told otherwise
+/// ([`super::PgStorage::with_estimates`], the server's
+/// `STREAMGRES_ESTIMATE_TTL_MS`).
 pub const DEFAULT_TTL: Duration = Duration::from_secs(86_400);
 
-/// How many answers are kept when `STREAMGRES_ESTIMATE_CACHE` is unset.
+/// How many answers are kept unless the storage is told otherwise (the
+/// server's `STREAMGRES_ESTIMATE_CACHE`).
 pub const DEFAULT_CAPACITY: usize = 300_000;
 
 /// How often the tables' sizes are read to find the tables whose
@@ -184,21 +187,6 @@ impl EstimateCache {
     pub fn with_sizes_every(mut self, every: Duration) -> Self {
         self.sizes_every = every;
         self
-    }
-
-    /// The cache `STREAMGRES_ESTIMATE_TTL_MS` and `STREAMGRES_ESTIMATE_CACHE`
-    /// describe ([`DEFAULT_TTL`] and [`DEFAULT_CAPACITY`] when unset or
-    /// not a number).
-    pub fn from_env() -> Self {
-        let number = |name: &str| {
-            std::env::var(name)
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
-        };
-        EstimateCache::new(
-            number("STREAMGRES_ESTIMATE_TTL_MS").map_or(DEFAULT_TTL, Duration::from_millis),
-            number("STREAMGRES_ESTIMATE_CACHE").map_or(DEFAULT_CAPACITY, |n| n as usize),
-        )
     }
 
     /// Each of `wanted` (`(table, key)`): its answer, the ask under way

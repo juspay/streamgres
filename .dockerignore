@@ -1,6 +1,12 @@
-# The image is built from the manifest and the sources alone.
+# The images are built from the manifests and the sources alone: the
+# workspace's crates and the vendored path dependency are part of the
+# manifest, their build output is not.
 *
 !Cargo.toml
 !Cargo.lock
 !clippy.toml
 !src
+!crates
+!vendor
+crates/*/target
+vendor/*/target

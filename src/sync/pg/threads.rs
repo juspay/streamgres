@@ -68,6 +68,18 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 /// - `ddl_trigger`: the event trigger on `ddl_command_end` through which
 ///   schema changes are heard; the server will not serve without it.
 /// - `ddl_prefix`: the prefix of that trigger's logical messages.
+/// - `temporary_slot`: the feed's slot is a temporary one its own
+///   replication connection makes, which PostgreSQL drops when that
+///   connection ends ([`spawn_temporary_feed`]); a feed that drops
+///   stops the engine, to start over on a fresh slot and snapshot.
+/// - `heartbeat`: how often the engine writes a heartbeat into the WAL
+///   to measure how far behind it is ([`crate::sync::heartbeat`]); zero
+///   for none.
+/// - `row_limit`: the most rows one read may return, and the planner's
+///   bound on a side it reads whole ([`super::DEFAULT_READ_ROW_LIMIT`]).
+/// - `memory_tables`: tables mirrored in memory and answered from there.
+/// - `estimate_ttl`, `estimate_capacity`: how long the planner's
+///   estimates are kept, and how many.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub dsn: String,
@@ -87,6 +99,12 @@ pub struct Settings {
     pub watched: Vec<TableName>,
     pub ddl_trigger: String,
     pub ddl_prefix: String,
+    pub heartbeat: Duration,
+    pub row_limit: usize,
+    pub memory_tables: Vec<TableName>,
+    pub estimate_ttl: Duration,
+    pub estimate_capacity: usize,
+    pub temporary_slot: bool,
 }
 
 /// What every slot a server names for itself starts with.
@@ -175,6 +193,11 @@ pub async fn require_ddl_trigger(dsn: &str, name: &str) -> Result<(), String> {
     let present = ddl::trigger_present(&client, name)
         .await
         .map_err(|error| format!("looking for the DDL event trigger `{name}`: {error}"))?;
+    if present && ddl::stack_outdated(&client, name).await.unwrap_or(false) {
+        log_warn!(
+            "the schema-change trigger stack behind `{name}` predates `rowSecurity`: row-level security turned on while serving goes unnoticed until a restart, and tables created meanwhile are taken as secured; run the setup SQL again (scripts/sql/ddl-triggers.sql) to update it"
+        );
+    }
     drop(client);
     let _ = handle.await;
     if present {
@@ -216,7 +239,8 @@ pub fn spawn_feed(
                     prefix: settings.ddl_prefix.clone(),
                     schemas: settings.schemas.clone(),
                 };
-                let mut feed = Feed::with_ddl(catalog, ddl);
+                let mut feed = Feed::with_ddl(catalog, ddl)
+                    .with_heartbeat(crate::sync::heartbeat::prefix(&settings.slot));
                 let mut start = Some(start);
                 let mut failures = 0u32;
                 loop {
@@ -312,6 +336,111 @@ pub fn spawn_feed(
     ))
 }
 
+/// A feed thread on a temporary slot, as [`spawn_temporary_feed`]
+/// starts it.
+pub struct TemporaryFeed {
+    /// The transactions it decodes.
+    pub transactions: mpsc::Receiver<Transaction>,
+    pub handle: FeedHandle,
+    /// Resolves once the slot exists, or with why it could not be made.
+    pub created: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    /// Where the first read snapshot's point goes, once it is taken
+    /// (after `created`); the feed drops what the snapshot holds.
+    pub first: tokio::sync::oneshot::Sender<Lsn>,
+}
+
+/// The feed thread on a temporary slot ([`Transport::open_temporary`]),
+/// which gives up making it once `shutdown` is requested. A stream that
+/// ends for any reason but a stop cannot be resumed, so it fails
+/// `shutdown`, for the engine to start over.
+pub fn spawn_temporary_feed(
+    settings: Settings,
+    catalog: Arc<Catalog>,
+    shutdown: Shutdown,
+) -> Result<TemporaryFeed, String> {
+    let (out, transactions) = mpsc::channel(1024);
+    let (stop, stop_rx) = watch::channel(false);
+    let (created_tx, created) = tokio::sync::oneshot::channel();
+    let (first, first_rx) = tokio::sync::oneshot::channel::<Lsn>();
+    let thread = std::thread::Builder::new()
+        .name("streamgres-feed".to_owned())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("feed runtime");
+            let slot = settings.slot.clone();
+            let starting = shutdown.clone();
+            let ended = runtime.block_on(async move {
+                let transport = match Transport::open_temporary(
+                    &settings.dsn,
+                    &settings.slot,
+                    &settings.publication,
+                    &starting,
+                )
+                .await
+                {
+                    Ok(transport) => {
+                        let _ = created_tx.send(Ok(()));
+                        transport
+                    }
+                    Err(error) => {
+                        let _ = created_tx.send(Err(error.to_string()));
+                        return None;
+                    }
+                };
+                let point = first_rx.await.ok()?;
+                log_info!(
+                    "change feed open on temporary slot {}, skipping through {point}",
+                    settings.slot
+                );
+                let ddl = DdlSource {
+                    prefix: settings.ddl_prefix.clone(),
+                    schemas: settings.schemas.clone(),
+                };
+                let mut feed = Feed::with_ddl(catalog, ddl)
+                    .with_heartbeat(crate::sync::heartbeat::prefix(&settings.slot))
+                    .skipping_through(point);
+                let outcome = transport
+                    .stream_with_shutdown(
+                        POSITION_EVERY,
+                        &mut feed,
+                        &settings.watched,
+                        out.clone(),
+                        stop_rx.clone(),
+                    )
+                    .await;
+                if *stop_rx.borrow() || out.is_closed() {
+                    return None;
+                }
+                Some(match outcome {
+                    Ok(()) => "the change feed's connection ended".to_owned(),
+                    Err(error) => format!("the change feed failed: {error}"),
+                })
+            });
+            if let Some(why) = ended {
+                log_error!(
+                    "{why}; its temporary slot {slot} went with it and cannot be resumed, so the engine stops to start over"
+                );
+                if !shutdown.requested() {
+                    shutdown.fail(format!("{why} on a temporary slot"));
+                }
+            } else {
+                log_info!("change feed thread stopped");
+            }
+        })
+        .map_err(|error| format!("feed thread: {error}"))?;
+    Ok(TemporaryFeed {
+        transactions,
+        handle: FeedHandle {
+            stop,
+            thread: Some(thread),
+        },
+        created,
+        first,
+    })
+}
+
 /// Stop the feed thread and wait until its replication connection is closed.
 pub async fn stop_feed(mut feed: FeedHandle) -> Result<(), String> {
     feed.stop.send_replace(true);
@@ -337,26 +466,92 @@ pub async fn stop_feed(mut feed: FeedHandle) -> Result<(), String> {
     }
 }
 
+/// Writes this engine's heartbeats into the WAL of the database `config`
+/// names, for as long as the process runs, reconnecting a second after a
+/// failure. It runs off the engine thread (on the reads runtime), so a
+/// stalled engine thread shows as a growing lag rather than as heartbeats
+/// that stop coming. Once heartbeats have been written, a stretch in
+/// which they cannot be makes the lag grow, so backends read Postgres
+/// until they are written again. Until the first is written the lag is
+/// unknown and backends trust the engine, as they would one that sends
+/// no lag: a standby cannot write them, and its engine keeps serving.
+/// A failure is logged once until heartbeats are written again.
+async fn beat(config: tokio_postgres::Config, slot: String, every: Duration, stats: Arc<Stats>) {
+    let prefix = crate::sync::heartbeat::prefix(&slot);
+    let mut warned = false;
+    let mut written = 0;
+    loop {
+        let outcome = match super::open(&config, &tokio::runtime::Handle::current()).await {
+            Ok(client) => crate::sync::heartbeat::emit(&client, &prefix, every, &stats.freshness)
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        if stats.freshness.written() != written {
+            written = stats.freshness.written();
+            warned = false;
+        }
+        if let Err(error) = outcome
+            && !warned
+        {
+            log_warn!("heartbeats stopped: {error}; retrying every second");
+            warned = true;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// Bring the engine side up on the current thread's local set: the slot
 /// made to exist, the storage over `settings` (its reads running on
 /// `reads`) with its first snapshot minted, the feed thread started at
 /// that snapshot's point, and the service, keeping `catalog` current,
-/// delivering its events to `consumers` streams and its timings to
-/// `stats`. Must run inside a `LocalSet`.
+/// delivering its events to `consumers` streams (those at `every_commit`
+/// told of every commit, [`Service::with_every_commit`]) and its timings
+/// to `stats`. Must run inside a `LocalSet`. Making the slot and minting
+/// the first snapshot each wait for every transaction open at the time,
+/// so a long one holds them back; `shutdown` requested meanwhile gives
+/// up on either. A permanent slot given up on may still be made once the
+/// transaction ends: its maker drops it ([`Transport::drop_slot_only`]
+/// ends the backend making it).
 pub async fn start(
     settings: &Settings,
     catalog: Arc<CatalogHandle>,
     reads: tokio::runtime::Handle,
     consumers: usize,
+    every_commit: &[usize],
     stats: Arc<Stats>,
     shutdown: Shutdown,
 ) -> Result<(Started, ServiceTask), String> {
     Transport::cleanup_inactive_slots(&settings.dsn, settings.slot_cleanup_age)
         .await
         .map_err(|error| format!("cleaning up inactive replication slots: {error}"))?;
-    Transport::prepare(&settings.dsn, &settings.slot, &settings.publication)
-        .await
-        .map_err(|error| format!("preparing the change feed: {error}"))?;
+    let temporary = if settings.temporary_slot {
+        Transport::require_publication(&settings.dsn, &settings.publication)
+            .await
+            .map_err(|error| format!("preparing the change feed: {error}"))?;
+        let TemporaryFeed {
+            transactions,
+            handle,
+            created,
+            first,
+        } = spawn_temporary_feed(settings.clone(), catalog.load(), shutdown.clone())?;
+        created
+            .await
+            .map_err(|_| "the change feed thread ended before its slot was made".to_owned())?
+            .map_err(|error| format!("opening the change feed: {error}"))?;
+        Some((transactions, handle, first))
+    } else {
+        let prepared = Transport::prepare(&settings.dsn, &settings.slot, &settings.publication);
+        tokio::select! {
+            prepared = prepared => {
+                prepared.map_err(|error| format!("preparing the change feed: {error}"))?;
+            }
+            () = shutdown.wait() => {
+                return Err("stopped before the change feed's slot was made".to_owned());
+            }
+        }
+        None
+    };
     let mut config: tokio_postgres::Config = settings
         .dsn
         .parse()
@@ -367,22 +562,41 @@ pub async fn start(
         .parse()
         .map_err(|error| format!("connecting the read pool: {error}"))?;
     settings.keepalive.apply(&mut read_config);
-    let pg =
-        PgStorage::connect_configured_with_read_config(config, read_config, catalog.load(), reads)
-            .await
-            .map_err(|error| format!("connecting the storage: {error}"))?
-            .with_rotation(settings.snapshot_rotation)
+    let connected = PgStorage::connect_configured_with_read_config(
+        config.clone(),
+        read_config,
+        catalog.load(),
+        reads.clone(),
+    );
+    let pg = tokio::select! {
+        connected = connected => {
+            connected.map_err(|error| format!("connecting the storage: {error}"))?
+        }
+        () = shutdown.wait() => {
+            return Err("stopped before the first snapshot was taken".to_owned());
+        }
+    };
+    let pg = Arc::new(
+        pg.with_rotation(settings.snapshot_rotation)
             .with_read_connections(settings.read_connections)
             .with_read_idle_connections(settings.read_idle_connections)
-            .with_read_timeout(settings.read_timeout);
-    let pg = Arc::new(pg);
-    let (feed, feed_handle) = spawn_feed(
-        settings.clone(),
-        catalog.load(),
-        pg.first_position(),
-        shutdown,
-    )?;
-    let cached = Sources::cached_from_env();
+            .with_read_timeout(settings.read_timeout)
+            .with_read_row_limit(settings.row_limit)
+            .with_estimates(settings.estimate_ttl, settings.estimate_capacity),
+    );
+    let (feed, feed_handle) = match temporary {
+        Some((feed, handle, first)) => {
+            let _ = first.send(pg.first_position());
+            (feed, handle)
+        }
+        None => spawn_feed(
+            settings.clone(),
+            catalog.load(),
+            pg.first_position(),
+            shutdown,
+        )?,
+    };
+    let cached = settings.memory_tables.clone();
     let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
     if !cached.is_empty() {
         let rows = storage
@@ -391,17 +605,21 @@ pub async fn start(
             .map_err(|error| format!("warming the memory tables: {error}"))?;
         log_info!("memory tables warmed with {rows} rows");
     }
+    if !settings.heartbeat.is_zero() {
+        reads.spawn(beat(config.clone(), settings.slot.clone(), settings.heartbeat, Arc::clone(&stats)));
+    }
     let (sinks, events): (Vec<_>, Vec<_>) = (0..consumers.max(1))
         .map(|_| mpsc::unbounded_channel())
         .unzip();
     let first = sinks[0].clone();
-    let engine = MultiTableIVM::new().with_row_limit(super::read_row_limit());
+    let engine = MultiTableIVM::new().with_row_limit(settings.row_limit);
     let (service, commands) = Service::new(engine, storage, first);
     let service = spawn_local(
         service
             .with_feed(feed)
             .with_catalog(catalog)
             .with_sinks(sinks)
+            .with_every_commit(every_commit)
             .with_stats(stats)
             .run(),
     );

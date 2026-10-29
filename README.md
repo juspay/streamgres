@@ -117,6 +117,27 @@ The server listens on `0.0.0.0:4848`. Point the client's `server` option at
 `.env.example`. `GET /health` returns `200` once the server is ready to serve
 queries.
 
+### Server-to-server clients
+
+A backend that caches what it reads does not speak the Zero protocol. It
+connects to `ws://<host>:4848/<base>/s2s/v1` (with the bearer token in
+`STREAMGRES_S2S_TOKEN`, without which the server serves no such
+endpoint; through TLS in front of the server off a private network; on
+a listener of its own with `STREAMGRES_S2S_ADDR`) and subscribes the SQL its ORM rendered, `$n` binds and all;
+the server answers `accepted` with the hydrated rows (per table for a
+join; `bytea` as hex text, `OFFSET` left for the client to apply) or
+`refused`, then sends `delta` with the rows each committed transaction
+put or deleted, so the backend never reads Postgres for a query it
+holds. The protocol is documented in
+`src/live/mod.rs` (the WebSocket endpoint that carries it is
+`src/client/s2s.rs`). The Diesel wrapper that uses it lives in this
+repository as [`crates/diesel-streamgres`](crates/diesel-streamgres):
+a drop-in `PgConnection` replacement whose reads come from an in-memory
+cache the engine keeps fresh. A small application can run the engine
+inside its own process instead (`STREAMGRES_ENGINE=embedded`), against
+its primary; [`docs/backends.md`](docs/backends.md) covers choosing
+between the two, replicas and read-your-writes.
+
 Configuration uses `STREAMGRES_*` environment variables, each documented in
 [`.env.example`](.env.example). Existing `XYNE_SYNC_*` variables are still
 accepted as fallbacks; a `STREAMGRES_*` value takes precedence when both are
@@ -271,17 +292,24 @@ streaming change feed.
 
 ```text
 src/
-  model/     values, schema, queries, rows and operations
-  parser/    SQL parser for single-table reads and writes
-  ivm/       the engine: routing index, frames, windows, join tree
-  sync/      runtime, storage trait, in-memory store, PostgreSQL reads and change feed
-  client/    the WebSocket server and Zero protocol, query planning, client groups
-  bin/       server, bench and load binaries
-tests/       scenario tests, live PostgreSQL tests, and a 283-query suite
-             taken from a production application
-scripts/     smoke, end-to-end and load scripts; CI helpers
-docker/      the server image
-docs/        deployment and observability guides
+  model/       values, schema, queries, rows and operations
+  parser/      SQL parser for single-table reads and writes
+  ivm/         the engine: routing index, frames, windows, join tree
+  sync/        runtime, storage trait, in-memory store, PostgreSQL reads and change feed
+  plan.rs      the join planner
+  live/        the S2S protocol over any transport, and the task that follows backends' SQL
+  embedded.rs  the engine inside a host process
+  client/      the WebSocket server, Zero protocol, client groups, the S2S endpoint
+               (feature `server`)
+  bin/         server, bench and load binaries
+crates/
+  diesel-streamgres/  the Diesel wrapper: a cache the engine keeps current
+vendor/        pgwire-replication with temporary slots (VENDORED.md)
+tests/         scenario tests, live PostgreSQL tests, and a 283-query suite
+               taken from a production application
+scripts/       smoke, end-to-end and load scripts; CI helpers
+docker/        the server image
+docs/          deployment, Diesel backend and observability guides
 ```
 
 ---

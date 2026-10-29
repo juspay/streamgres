@@ -8,32 +8,46 @@
 //! which columns form the primary key.
 //!
 //! ```text
-//! query     := read | write
-//! read      := SELECT '*' FROM ident [WHERE filter]
-//!              [ORDER BY column [ASC | DESC] (, column [ASC | DESC])*] [LIMIT integer]
-//! write     := INSERT INTO ident '(' ident (',' ident)* ')' VALUES row
-//!            | UPDATE ident SET assign (',' assign)* WHERE filter
-//!            | DELETE FROM ident WHERE filter
-//! row       := '(' value (',' value)* ')'
-//! assign    := ident '=' value
-//! filter    := conjunct (OR conjunct)*
-//! conjunct  := primary (AND primary)*
-//! primary   := '(' filter ')' | condition | TRUE | FALSE
-//! condition := column ('=' | '!=' | '<>' | '>' | '>=' | '<' | '<=') value
-//!            | column [NOT] IN '(' [value (',' value)*] ')'
-//!            | column IS [NOT] NULL
-//! column    := ident
-//! value     := NULL | TRUE | FALSE | number | string
-//!            | '[' [value (',' value)*] ']'
+//! query      := read | write
+//! read       := SELECT projection FROM from [WHERE filter]
+//!               [ORDER BY column [ASC | DESC] (, column [ASC | DESC])*]
+//!               [LIMIT count] [OFFSET count]
+//! projection := '*' | COUNT '(' '*' ')' [AS ident]
+//!             | column [AS ident] (',' column [AS ident])*
+//! from       := table | '(' from ')'
+//!             | from [INNER | LEFT [OUTER]] JOIN from ON filter
+//! count      := integer | bind
+//! write      := INSERT INTO ident '(' ident (',' ident)* ')' VALUES row
+//!             | UPDATE ident SET assign (',' assign)* WHERE filter
+//!             | DELETE FROM ident WHERE filter
+//! row        := '(' value (',' value)* ')'
+//! assign     := ident '=' value
+//! filter     := conjunct (OR conjunct)*
+//! conjunct   := primary (AND primary)*
+//! primary    := '(' filter ')' | condition | TRUE | FALSE
+//! condition  := column ('=' | '!=' | '<>' | '>' | '>=' | '<' | '<=') value
+//!             | column [NOT] IN '(' [value (',' value)*] ')'
+//!             | column '=' ANY '(' value ')' | column '!=' ALL '(' value ')'
+//!             | column IS [NOT] NULL
+//! column     := ident | ident '.' ident
+//! ident      := a bare word | a double-quoted name, `""` for a quote
+//! value      := NULL | TRUE | FALSE | number | string | bind
+//!             | '[' [value (',' value)*] ']'
+//! bind       := '$' integer
 //! ```
 //!
-//! Keywords are case-insensitive; identifiers are bare words; strings are
-//! single-quoted with `''` for an embedded quote; `TRUE` / `FALSE` as a
-//! filter parse to the vacuous `AND(vec![])` / `OR(vec![])`.
+//! Keywords are case-insensitive; strings are single-quoted with `''` for
+//! an embedded quote; `TRUE` / `FALSE` as a filter parse to the vacuous
+//! `AND(vec![])` / `OR(vec![])`. A bind is read from the parameters an
+//! ORM sends with the statement ([`parse_select`], [`binds`]); `= ANY`
+//! and `!= ALL` take an array, as ORMs render an `IN` list.
 //!
-//! # v1 restrictions (each rejected with a clear error, never narrowed silently)
+//! # Restrictions (each rejected with a clear error, never narrowed silently)
 //!
-//! - Single table only — `LEFT JOIN` is recognised and refused.
+//! - Joins, projections, `COUNT(*)` and `OFFSET` are read by
+//!   [`parse_select`], the server-to-server entry point, under the rules
+//!   in [`select`]; [`parse`] and [`parse_read`] take one table and
+//!   refuse a join or an `OFFSET`.
 //! - Writes address **exactly one row by primary key**: the `WHERE` of an
 //!   `UPDATE` / `DELETE` must be a conjunction of `pkey_column = value`
 //!   conditions covering the whole primary key. Predicate writes ("set all
@@ -59,7 +73,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::model::{
-    ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameRow, DbTable, DeleteQuery,
+    ColumnName, TableName, ComparisonOperator, Condition, DataFrameKey, DataFrameRow, DbTable, DeleteQuery,
     InsertQuery, Order, OrderBy, SingleTableReadQuery, UpdateQuery, Value, ValueType, Where,
     WriteQuery,
 };
@@ -73,6 +87,11 @@ pub const MAX_NESTING_DEPTH: usize = 128;
 /// because the parser is their primary consumer.
 pub use crate::model::Catalog;
 
+pub mod binds;
+mod select;
+pub use binds::BindValue;
+pub use select::Select;
+
 /// A successfully parsed statement — either side of the read/write split.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedQuery {
@@ -82,10 +101,25 @@ pub enum ParsedQuery {
 
 /// Parse one statement of either kind.
 pub fn parse(sql: &str, catalog: &Catalog) -> Result<ParsedQuery, ParseError> {
+    parse_with_binds(sql, &[], catalog)
+}
+
+/// Parse a statement whose `$n` placeholders stand for `binds`, numbered
+/// from `$1` as Postgres numbers them. Each is decoded by its type OID
+/// ([`binds::decode`]) and then coerced to its column's declared type
+/// exactly as a literal is.
+pub fn parse_with_binds(
+    sql: &str,
+    binds: &[BindValue],
+    catalog: &Catalog,
+) -> Result<ParsedQuery, ParseError> {
     let mut parser = Parser {
         tokens: lex(sql)?,
         pos: 0,
         depth: 0,
+        binds,
+        times: TimeUnit::Millis,
+        ranged: Vec::new(),
     };
     let parsed = parser.query(catalog)?;
     if !matches!(parser.peek(), Tok::Eof) {
@@ -96,7 +130,105 @@ pub fn parse(sql: &str, catalog: &Catalog) -> Result<ParsedQuery, ParseError> {
 
 /// Parse a statement that must be a `SELECT`.
 pub fn parse_read(sql: &str, catalog: &Catalog) -> Result<SingleTableReadQuery, ParseError> {
-    match parse(sql, catalog)? {
+    parse_read_with_binds(sql, &[], catalog)
+}
+
+/// What a `SELECT` asks for: everything, a count of the rows, or named
+/// columns in order. The engine follows whole rows whatever is selected;
+/// a client that ships rows uses this to shape them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Projection {
+    All,
+    /// `COUNT(*)`, under the output name it was given (`count` when none).
+    Count { name: String },
+    Columns(Vec<Projected>),
+}
+
+/// One projected column, the table it is of, and the name it comes out
+/// under: its alias, or the column's own name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Projected {
+    pub table: TableName,
+    pub column: ColumnName,
+    pub name: String,
+}
+
+/// A `SELECT` over one table or joined tables, with `$n` placeholders
+/// standing for `binds`: the engine's query tree and the projection.
+/// An `ORDER BY` on a column Postgres orders differently from the
+/// engine (an enum, a string under a linguistic collation, JSON) is
+/// refused: the engine would keep, and the backend return, other rows
+/// in another order ([`Catalog::orders_as_engine`]). So is a range
+/// comparison (`<`, `<=`, `>`, `>=`) on such a column in any filter:
+/// the engine would compare an enum's labels, or a string's bytes, and
+/// match other rows than Postgres does. An enum label
+/// travels in the binary format as its text, under the enum's own OID,
+/// which the catalog names; an array of enums likewise, under the
+/// array's OID.
+pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result<Select, ParseError> {
+    let binds: Vec<BindValue> = binds
+        .iter()
+        .map(|bind| match (catalog.is_enum_oid(bind.type_oid), bind.bytes.as_deref()) {
+            (true, Some(bytes)) if binds::looks_like_array(bytes) => BindValue {
+                type_oid: binds::oid::TEXT_ARRAY,
+                bytes: bind.bytes.clone(),
+            },
+            (true, _) => BindValue {
+                type_oid: binds::oid::TEXT,
+                bytes: bind.bytes.clone(),
+            },
+            (false, _) => bind.clone(),
+        })
+        .collect();
+    let mut parser = Parser {
+        tokens: lex(sql)?,
+        pos: 0,
+        depth: 0,
+        binds: &binds,
+        times: TimeUnit::Micros,
+        ranged: Vec::new(),
+    };
+    if !parser.is_word("SELECT") {
+        return parser.err(format!("expected SELECT, found {}", parser.describe()));
+    }
+    let select = parser.select(catalog)?;
+    if !matches!(parser.peek(), Tok::Eof) {
+        return parser.err(format!("unexpected trailing input: {}", parser.describe()));
+    }
+    if let Some((table, column, position)) = select
+        .ordered_by
+        .iter()
+        .find(|(table, column, _)| !catalog.orders_as_engine(table, column))
+    {
+        return Err(ParseError {
+            message: format!(
+                "ORDER BY `{table}`.`{column}`: Postgres orders this column by rules the engine does not follow (an enum, a collation other than C, JSON)"
+            ),
+            position: *position,
+        });
+    }
+    if let Some((table, column, position)) = parser
+        .ranged
+        .iter()
+        .find(|(table, column, _)| !catalog.orders_as_engine(table, column))
+    {
+        return Err(ParseError {
+            message: format!(
+                "`<`, `<=`, `>` or `>=` on `{table}`.`{column}`: Postgres compares this column by rules the engine does not follow (an enum, a collation other than C, JSON)"
+            ),
+            position: *position,
+        });
+    }
+    Ok(select)
+}
+
+/// [`parse_read`] with `$n` placeholders standing for `binds`.
+pub fn parse_read_with_binds(
+    sql: &str,
+    binds: &[BindValue],
+    catalog: &Catalog,
+) -> Result<SingleTableReadQuery, ParseError> {
+    match parse_with_binds(sql, binds, catalog)? {
         ParsedQuery::Read(read) => Ok(read),
         ParsedQuery::Write(_) => Err(ParseError {
             message: "expected a SELECT, found a write statement".into(),
@@ -151,6 +283,8 @@ pub fn point_at(source: &str, error: &ParseError) -> String {
 /// One lexed token.
 ///
 /// - `Word`: identifiers and keywords alike; keywords match case-insensitively.
+/// - `Quoted`: a double-quoted identifier, never a keyword, case kept.
+/// - `Bind`: a `$n` placeholder, numbered from 1.
 /// - `Str`: the unquoted content of a single-quoted string literal.
 /// - `Num`: raw numeric text; the parser decides int vs float.
 /// - `Sym`: operators and punctuation, normalised (`<>` lexes as `!=`).
@@ -158,6 +292,8 @@ pub fn point_at(source: &str, error: &ParseError) -> String {
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
     Word(String),
+    Quoted(String),
+    Bind(usize),
     Str(String),
     Num(String),
     Sym(&'static str),
@@ -208,14 +344,15 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
                 tok: Tok::Num(number),
                 at,
             });
-        } else if c == '\'' {
+        } else if c == '\'' || c == '"' {
+            let quote = c;
             chars.next();
             let mut text = String::new();
             loop {
                 match chars.next() {
-                    Some((_, '\'')) => {
-                        if peek_at_is(&chars, 0, '\'') {
-                            text.push('\'');
+                    Some((_, c)) if c == quote => {
+                        if peek_at_is(&chars, 0, quote) {
+                            text.push(quote);
                             chars.next();
                         } else {
                             break;
@@ -224,16 +361,41 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
                     Some((_, c)) => text.push(c),
                     None => {
                         return Err(ParseError {
-                            message: "unterminated string literal".into(),
+                            message: if quote == '"' {
+                                "unterminated quoted identifier".into()
+                            } else {
+                                "unterminated string literal".into()
+                            },
                             position: at,
                         });
                     }
                 }
             }
             tokens.push(Spanned {
-                tok: Tok::Str(text),
+                tok: if quote == '"' {
+                    Tok::Quoted(text)
+                } else {
+                    Tok::Str(text)
+                },
                 at,
             });
+        } else if c == '$' {
+            chars.next();
+            let mut number = String::new();
+            take_digits(&mut chars, &mut number);
+            let index = number.parse::<usize>().ok().filter(|index| *index > 0);
+            match index {
+                Some(index) => tokens.push(Spanned {
+                    tok: Tok::Bind(index),
+                    at,
+                }),
+                None => {
+                    return Err(ParseError {
+                        message: "expected a parameter number after `$`".into(),
+                        position: at,
+                    });
+                }
+            }
         } else {
             chars.next();
             let sym: &'static str = match c {
@@ -242,6 +404,7 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
                 '[' => "[",
                 ']' => "]",
                 ',' => ",",
+                '.' => ".",
                 '*' => "*",
                 '-' => "-",
                 '=' => "=",
@@ -329,13 +492,32 @@ fn next_is_digit(chars: &Chars<'_>, ahead: usize) -> bool {
 /// - `tokens`: the lexed input, always ending with [`Tok::Eof`].
 /// - `pos`: index of the current token.
 /// - `depth`: current `(` / `[` nesting depth, bounded by [`MAX_NESTING_DEPTH`].
-struct Parser {
+/// - `binds`: what `$n` placeholders stand for, `$1` first.
+struct Parser<'b> {
     tokens: Vec<Spanned>,
     pos: usize,
     depth: usize,
+    binds: &'b [BindValue],
+    /// What a number compared with a time column means, set by the
+    /// entry point: [`parse`] and [`parse_read`] (SQL by hand, in the
+    /// Zero protocol's terms) read it as milliseconds; [`parse_select`],
+    /// the server-to-server path, reads every number there, literal or
+    /// bound, as microseconds, Postgres's own unit and the engine's.
+    times: TimeUnit,
+    /// Every column a filter compares with `<`, `<=`, `>` or `>=`, with
+    /// where it was named: [`parse_select`] refuses one the engine
+    /// orders differently from Postgres, as it does for `ORDER BY`.
+    ranged: Vec<(TableName, ColumnName, usize)>,
 }
 
-impl Parser {
+/// The unit of a number standing for a time, see [`Parser::times`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeUnit {
+    Millis,
+    Micros,
+}
+
+impl Parser<'_> {
     /// The current token.
     fn peek(&self) -> &Tok {
         &self.tokens[self.pos].tok
@@ -379,6 +561,8 @@ impl Parser {
     fn describe(&self) -> String {
         match self.peek() {
             Tok::Word(word) => format!("`{word}`"),
+            Tok::Quoted(word) => format!("`\"{word}\"`"),
+            Tok::Bind(index) => format!("parameter `${index}`"),
             Tok::Str(text) => format!("string `{text}`"),
             Tok::Num(number) => format!("number `{number}`"),
             Tok::Sym(symbol) => format!("`{symbol}`"),
@@ -435,7 +619,7 @@ impl Parser {
     /// A bare-word identifier.
     fn ident(&mut self) -> Result<String, ParseError> {
         match self.peek().clone() {
-            Tok::Word(word) => {
+            Tok::Word(word) | Tok::Quoted(word) => {
                 self.bump();
                 Ok(word)
             }
@@ -443,20 +627,39 @@ impl Parser {
         }
     }
 
-    /// A table name, resolved against the catalog.
-    fn table<'c>(&mut self, catalog: &'c Catalog) -> Result<&'c DbTable, ParseError> {
-        let at = self.at();
-        let name = self.ident()?;
-        catalog.table(&name).ok_or(ParseError {
-            message: format!("unknown table `{name}`"),
-            position: at,
-        })
+    /// A column reference as written: bare (`c`), qualified by its table
+    /// (`t.c`) or by its schema and table (`s.t.c`), each part bare or
+    /// quoted. The qualifier comes back as a catalog name for `s.t.c`
+    /// ([`crate::sync::pg::catalog::table_name`]), as written for `t.c`.
+    pub(super) fn column_parts(&mut self) -> Result<(Option<String>, String), ParseError> {
+        let first = self.ident()?;
+        if !self.eat_sym(".") {
+            return Ok((None, first));
+        }
+        let second = self.ident()?;
+        if !self.eat_sym(".") {
+            return Ok((Some(first), second));
+        }
+        let third = self.ident()?;
+        Ok((
+            Some(crate::sync::pg::catalog::table_name(&first, &second)),
+            third,
+        ))
     }
 
-    /// A column name, validated to exist on `table`.
+    /// A column, bare or qualified (`t.c`, `s.t.c`); a qualifier must name
+    /// the table being read ([`names_table`]).
     fn column_name(&mut self, table: &DbTable) -> Result<ColumnName, ParseError> {
         let at = self.at();
-        let name = self.ident()?;
+        let (qualifier, name) = self.column_parts()?;
+        if let Some(qualifier) = qualifier
+            && !names_table(&qualifier, table.name.as_str())
+        {
+            return Err(ParseError {
+                message: format!("`{qualifier}` is not the table being read, `{}`", table.name),
+                position: at,
+            });
+        }
         if table.column(&name).is_some() {
             Ok(ColumnName::from(name))
         } else {
@@ -467,10 +670,35 @@ impl Parser {
         }
     }
 
-    /// Dispatch on the leading keyword to a read or a write.
+    /// A table name, bare or qualified by its schema (`s.t`, `"s"."t"`),
+    /// resolved against the catalog, which names a table outside
+    /// `public` `s.t`.
+    fn table<'c>(&mut self, catalog: &'c Catalog) -> Result<&'c DbTable, ParseError> {
+        let at = self.at();
+        let mut name = self.ident()?;
+        if self.eat_sym(".") {
+            let table = self.ident()?;
+            name = crate::sync::pg::catalog::table_name(&name, &table);
+        }
+        catalog.table(&name).ok_or(ParseError {
+            message: format!("unknown table `{name}`"),
+            position: at,
+        })
+    }
+
+    /// Dispatch on the leading keyword to a read or a write. A join or
+    /// an `OFFSET` is refused here: only a server-to-server client,
+    /// through [`parse_select`], skips rows itself.
     fn query(&mut self, catalog: &Catalog) -> Result<ParsedQuery, ParseError> {
         if self.is_word("SELECT") {
-            Ok(ParsedQuery::Read(self.read(catalog)?))
+            let select = self.select(catalog)?;
+            if !select.query.joins.is_empty() {
+                return self.err("a join parses through `parse_select`, not `parse`");
+            }
+            if select.offset > 0 {
+                return self.err("OFFSET is not supported");
+            }
+            Ok(ParsedQuery::Read(select.query.main_table))
         } else if self.is_word("INSERT") || self.is_word("UPDATE") || self.is_word("DELETE") {
             Ok(ParsedQuery::Write(self.write(catalog)?))
         } else {
@@ -481,80 +709,44 @@ impl Parser {
         }
     }
 
-    /// `SELECT * FROM …` with optional WHERE / ORDER BY / LIMIT.
-    ///
-    /// A missing WHERE subscribes to the whole table (the vacuously true
-    /// `AND(vec![])`). A missing ORDER BY defaults via [`default_order`],
-    /// and a missing LIMIT becomes `u32::MAX` — the model makes `limit`
-    /// mandatory, so absent means "no bound".
-    fn read(&mut self, catalog: &Catalog) -> Result<SingleTableReadQuery, ParseError> {
-        self.expect_word("SELECT")?;
-        self.expect_sym("*")?;
-        self.expect_word("FROM")?;
-        let table = self.table(catalog)?;
-
-        if self.is_word("LEFT") || self.is_word("JOIN") {
-            return self.err("joins are not supported yet — single-table queries only");
+    /// Advances past the projection without reading it, up to `FROM`.
+    fn skip_projection(&mut self) -> Result<(), ParseError> {
+        let mut depth = 0usize;
+        loop {
+            match self.peek() {
+                Tok::Eof => return self.err("expected FROM"),
+                Tok::Word(word) if depth == 0 && word.eq_ignore_ascii_case("FROM") => {
+                    return Ok(());
+                }
+                Tok::Sym("(") => depth += 1,
+                Tok::Sym(")") => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            self.bump();
         }
-
-        let filter = if self.eat_word("WHERE") {
-            self.filter(table)?
-        } else {
-            Where::AND(Vec::new())
-        };
-
-        let order_by = if self.eat_word("ORDER") {
-            self.expect_word("BY")?;
-            let mut clauses = Vec::new();
-            loop {
-                let column = self.column_name(table)?;
-                let direction = if self.eat_word("DESC") {
-                    Order::DESC
-                } else {
-                    self.eat_word("ASC");
-                    Order::ASC
-                };
-                clauses.push(OrderBy::new(column, direction));
-                if !self.eat_sym(",") {
-                    break;
-                }
-            }
-            clauses
-        } else {
-            vec![default_order(table, self.at())?]
-        };
-
-        let limit = if self.eat_word("LIMIT") {
-            match self.peek().clone() {
-                Tok::Num(number) => {
-                    let at = self.at();
-                    self.bump();
-                    number.parse::<u32>().map_err(|_| ParseError {
-                        message: format!("`{number}` is not a valid limit"),
-                        position: at,
-                    })?
-                }
-                _ => return self.err(format!("expected a limit, found {}", self.describe())),
-            }
-        } else {
-            u32::MAX
-        };
-
-        Ok(SingleTableReadQuery::new(
-            table.name.clone(),
-            filter,
-            order_by,
-            limit,
-        ))
     }
 
-    /// `INSERT` / `UPDATE` / `DELETE`, enforcing the v1 write restrictions.
-    ///
-    /// INSERT coerces each value while it still lines up with a named
-    /// column; a value/column count mismatch is reported only after the
-    /// whole row is read. UPDATE must SET every non-pkey column because
-    /// the engine evaluates predicates against `record` as the complete
-    /// new row image — a partial SET would corrupt the views.
+    /// An optional `AS name` or bare `name` after a projected column.
+    fn alias(&mut self) -> Result<Option<String>, ParseError> {
+        if self.eat_word("AS") {
+            return self.ident().map(Some);
+        }
+        if !self.is_word("FROM") && matches!(self.peek(), Tok::Word(_) | Tok::Quoted(_)) {
+            return self.ident().map(Some);
+        }
+        Ok(None)
+    }
+
+    /// `FROM` is next.
+    fn expect_from(&mut self) -> Result<(), ParseError> {
+        if self.is_word("FROM") {
+            Ok(())
+        } else {
+            self.err(format!("expected FROM after the projection, found {}", self.describe()))
+        }
+    }
+
+    /// `INSERT`, `UPDATE` or `DELETE` to the end of the statement.
     fn write(&mut self, catalog: &Catalog) -> Result<WriteQuery, ParseError> {
         if self.eat_word("INSERT") {
             self.expect_word("INTO")?;
@@ -577,7 +769,7 @@ impl Parser {
                 let value_at = self.at();
                 let value = self.value()?;
                 values.push(match columns.get(values.len()) {
-                    Some(column) => coerce_to_column_type(value, table, column, value_at)?,
+                    Some(column) => coerce_to_column_type(value, table, column, value_at, self.times)?,
                     None => value,
                 });
                 if !self.eat_sym(",") {
@@ -623,7 +815,7 @@ impl Parser {
                 self.expect_sym("=")?;
                 let value_at = self.at();
                 let value = self.value()?;
-                let value = coerce_to_column_type(value, table, &column, value_at)?;
+                let value = coerce_to_column_type(value, table, &column, value_at, self.times)?;
                 assignments.push((column, value));
                 if !self.eat_sym(",") {
                     break;
@@ -719,7 +911,7 @@ impl Parser {
                     position: at,
                 });
             }
-            let value = coerce_to_column_type(value, table, &column, at)?;
+            let value = coerce_to_column_type(value, table, &column, at, self.times)?;
             if pkey_value.insert(column.clone(), value).is_some() {
                 return Err(ParseError {
                     message: format!("primary-key column `{column}` appears twice in WHERE"),
@@ -753,7 +945,8 @@ impl Parser {
     /// A parenthesised filter, a `TRUE` / `FALSE` literal, or one condition.
     ///
     /// `TRUE` / `FALSE` parse to the identities: an empty `AND` is true, an
-    /// empty `OR` is false.
+    /// empty `OR` is false. `= ANY($1)` with an array parameter is how
+    /// ORMs render an `IN` list: one bind, many values.
     fn primary(&mut self, table: &DbTable) -> Result<Where, ParseError> {
         if self.eat_sym("(") {
             self.descend()?;
@@ -789,8 +982,18 @@ impl Parser {
             }));
         }
         let comparison_operator = if self.eat_sym("=") {
+            if self.eat_word("ANY") {
+                return Ok(Where::Condition(Condition {
+                    column,
+                    comparison_operator: ComparisonOperator::IN,
+                    value: self.quantified_list("ANY")?,
+                }));
+            }
             ComparisonOperator::EQ
         } else if self.eat_sym("!=") {
+            if self.eat_word("ALL") {
+                return Ok(differs_from_all(column, self.quantified_list("ALL")?));
+            }
             ComparisonOperator::NEQ
         } else if self.eat_sym(">=") {
             ComparisonOperator::GTE
@@ -824,6 +1027,22 @@ impl Parser {
             comparison_operator,
             value: self.value()?,
         }))
+    }
+
+    /// The `(value)` after `ANY` / `ALL`: a list literal or a bind that
+    /// decodes to one.
+    fn quantified_list(&mut self, quantifier: &str) -> Result<Value, ParseError> {
+        let at = self.at();
+        self.expect_sym("(")?;
+        let value = self.value()?;
+        self.expect_sym(")")?;
+        match value {
+            Value::List(_) => Ok(value),
+            other => Err(ParseError {
+                message: format!("{quantifier} needs an array, found {other:?}"),
+                position: at,
+            }),
+        }
     }
 
     /// The parenthesised value list of `IN` / `NOT IN`.
@@ -885,6 +1104,20 @@ impl Parser {
             Tok::Str(text) => {
                 self.bump();
                 Ok(Value::String(text))
+            }
+            Tok::Bind(index) => {
+                self.bump();
+                let bind = self.binds.get(index - 1).ok_or(ParseError {
+                    message: format!(
+                        "`${index}` has no parameter; {} were given",
+                        self.binds.len()
+                    ),
+                    position: at,
+                })?;
+                binds::decode(bind).map_err(|message| ParseError {
+                    message: format!("`${index}`: {message}"),
+                    position: at,
+                })
             }
             Tok::Word(word) if word.eq_ignore_ascii_case("NULL") => {
                 self.bump();
@@ -1003,12 +1236,13 @@ fn coerce_to_column_type(
     table: &DbTable,
     column: &ColumnName,
     at: usize,
+    times: TimeUnit,
 ) -> Result<Value, ParseError> {
     let declared = table
         .column(column.as_str())
         .map(|candidate| &candidate.r#type)
         .expect("column names are validated against the table before coercion");
-    coerce_to_type(value, declared, column.as_str(), at)
+    coerce_to_type(value, declared, column.as_str(), at, times)
 }
 
 /// Recursive worker for [`coerce_to_column_type`], matching a value (and
@@ -1020,6 +1254,7 @@ fn coerce_to_type(
     declared: &ValueType,
     column: &str,
     at: usize,
+    times: TimeUnit,
 ) -> Result<Value, ParseError> {
     Ok(match (value, declared) {
         (Value::Null, _) => Value::Null,
@@ -1027,7 +1262,10 @@ fn coerce_to_type(
         (value @ Value::Float(_), ValueType::Float) => value,
         (value @ Value::String(_), ValueType::String) => value,
         (value @ Value::Bool(_), ValueType::Bool) => value,
-        (value @ Value::Int(_), ValueType::Timestamp) => value,
+        (Value::Int(int), ValueType::Timestamp) => Value::Int(match times {
+            TimeUnit::Millis => int.saturating_mul(1000),
+            TimeUnit::Micros => int,
+        }),
         (value @ Value::String(_), ValueType::Json) => value,
         (Value::Int(int), ValueType::Float) => Value::Float(int as f64),
         (Value::Float(float), ValueType::Int)
@@ -1038,7 +1276,7 @@ fn coerce_to_type(
         (Value::List(items), ValueType::List(inner)) => Value::List(
             items
                 .into_iter()
-                .map(|item| coerce_to_type(item, inner, column, at))
+                .map(|item| coerce_to_type(item, inner, column, at, times))
                 .collect::<Result<_, _>>()?,
         ),
         (Value::String(_), ValueType::Date | ValueType::Datetime) => {
@@ -1097,13 +1335,709 @@ fn collect_pkey_equalities(filter: &Where, out: &mut Vec<(ColumnName, Value)>) -
     }
 }
 
+/// `column != ALL(list)`. Postgres holds it for every row when the list
+/// is empty, a `NULL` in the column included, which is no condition at
+/// all; the engine's `NOT IN` leaves `NULL` out, as its `NULL` rule
+/// does everywhere, so an empty list must not become one.
+pub(super) fn differs_from_all(column: ColumnName, list: Value) -> Where {
+    match &list {
+        Value::List(items) if items.is_empty() => Where::AND(Vec::new()),
+        _ => Where::Condition(Condition {
+            column,
+            comparison_operator: ComparisonOperator::NOT_IN,
+            value: list,
+        }),
+    }
+}
+
+/// Whether `qualifier` names the table whose catalog name is `table`: that
+/// name itself, or the bare table of one outside `public` (`t` for
+/// `s.t`), as SQL lets a query qualify a column by its table alone.
+pub(crate) fn names_table(qualifier: &str, table: &str) -> bool {
+    qualifier == table
+        || table
+            .split_once('.')
+            .is_some_and(|(_, bare)| bare == qualifier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{DbColumn, ValueType};
 
+    /// A `text` bind.
+    fn text_bind(text: &str) -> BindValue {
+        BindValue {
+            type_oid: 25,
+            bytes: Some(text.as_bytes().to_vec()),
+        }
+    }
+
+    /// An `int8` bind.
+    fn int8_bind(value: i64) -> BindValue {
+        BindValue {
+            type_oid: 20,
+            bytes: Some(value.to_be_bytes().to_vec()),
+        }
+    }
+
+    /// An `int4` bind.
+    fn int4_bind(value: i32) -> BindValue {
+        BindValue {
+            type_oid: 23,
+            bytes: Some(value.to_be_bytes().to_vec()),
+        }
+    }
+
+    /// What Diesel renders for
+    /// `tickets.filter(status.eq("OPEN")).filter(points.gt(3)).order(id.desc()).first()`
+    /// parses as its literal twin does.
+    #[test]
+    fn a_diesel_query_parses_like_its_literal_twin() {
+        let diesel = r#"SELECT "tickets"."id", "tickets"."status", "tickets"."priority", "tickets"."points" FROM "tickets" WHERE (("tickets"."status" = $1) AND ("tickets"."points" > $2)) ORDER BY "tickets"."id" DESC LIMIT $3"#;
+        let bound = parse_read_with_binds(
+            diesel,
+            &[text_bind("OPEN"), int4_bind(3), int8_bind(1)],
+            &catalog(),
+        )
+        .expect("diesel shape parses");
+        let literal = parse_read(
+            "SELECT * FROM tickets WHERE status = 'OPEN' AND points > 3 ORDER BY id DESC LIMIT 1",
+            &catalog(),
+        )
+        .expect("literal parses");
+        assert_eq!(bound, literal);
+    }
+
+    /// `parse_select` says what is selected: every column, a count under
+    /// its name, or the columns under their aliases.
+    #[test]
+    fn parse_select_tells_what_is_selected() {
+        let all = parse_select("SELECT * FROM tickets", &[], &catalog()).unwrap().projection;
+        assert_eq!(all, Projection::All);
+        let count = parse_select(r#"SELECT COUNT(*) FROM "tickets""#, &[], &catalog()).unwrap().projection;
+        assert_eq!(count, Projection::Count { name: "count".into() });
+        let count = parse_select(r#"SELECT COUNT(*) AS n FROM "tickets""#, &[], &catalog()).unwrap().projection;
+        assert_eq!(count, Projection::Count { name: "n".into() });
+        let Select { query: q, projection: columns, .. } = parse_select(
+            r#"SELECT "tickets"."points" AS p, "tickets"."id" FROM "tickets" LIMIT $1"#,
+            &[int8_bind(5)],
+            &catalog(),
+        )
+        .unwrap();
+        assert_eq!(
+            columns,
+            Projection::Columns(vec![
+                Projected {
+                    table: TableName::from("tickets"),
+                    column: ColumnName::from("points"),
+                    name: "p".into()
+                },
+                Projected {
+                    table: TableName::from("tickets"),
+                    column: ColumnName::from("id"),
+                    name: "id".into()
+                },
+            ])
+        );
+        assert_eq!(q.main_table.limit, 5);
+        assert!(parse_select("UPDATE tickets SET status = 'x' WHERE id = 1", &[], &catalog()).is_err());
+    }
+
+    /// A projection may alias its columns, with or without `AS`; a
+    /// literal where a column list belongs is refused.
+    #[test]
+    fn projected_columns_may_be_aliased() {
+        let aliased = parse_read(
+            r#"SELECT "tickets"."status" AS s, "tickets"."points" p FROM "tickets" WHERE "tickets"."id" = 1"#,
+            &catalog(),
+        )
+        .expect("aliases parse");
+        let plain = parse_read("SELECT * FROM tickets WHERE id = 1", &catalog()).expect("plain");
+        assert_eq!(aliased, plain);
+        let junk = parse_read(r#"SELECT "tickets"."status" 'x' FROM "tickets""#, &catalog())
+            .expect_err("a literal where a column list belongs");
+        assert!(junk.message.contains("expected FROM"), "{}", junk.message);
+    }
+
+    /// Authors, their books, and the books' reviews.
+    fn join_catalog() -> Catalog {
+        Catalog::new(vec![
+            DbTable::new(
+                "authors",
+                ["id"],
+                vec![
+                    DbColumn::new("id", ValueType::Int),
+                    DbColumn::new("name", ValueType::String),
+                ],
+            ),
+            DbTable::new(
+                "books",
+                ["id"],
+                vec![
+                    DbColumn::new("id", ValueType::Int),
+                    DbColumn::new("author_id", ValueType::Int),
+                    DbColumn::new("title", ValueType::String),
+                ],
+            ),
+            DbTable::new(
+                "reviews",
+                ["id"],
+                vec![
+                    DbColumn::new("id", ValueType::Int),
+                    DbColumn::new("book_id", ValueType::Int),
+                    DbColumn::new("stars", ValueType::Int),
+                ],
+            ),
+        ])
+    }
+
+    /// Tables outside `public`: `ws.configs`, and `configs` in `public`
+    /// beside `ws.notes`, for qualifiers by catalog name, by schema and
+    /// table, and by bare table.
+    fn schema_catalog() -> Catalog {
+        Catalog::new(vec![
+            DbTable::new(
+                "ws.configs",
+                ["id"],
+                vec![DbColumn::new("id", ValueType::Int), DbColumn::new("key", ValueType::String)],
+            ),
+            DbTable::new(
+                "ws.notes",
+                ["id"],
+                vec![DbColumn::new("id", ValueType::Int), DbColumn::new("config_id", ValueType::Int)],
+            ),
+            DbTable::new(
+                "configs",
+                ["id"],
+                vec![DbColumn::new("id", ValueType::Int), DbColumn::new("key", ValueType::String)],
+            ),
+            DbTable::new(
+                "other.configs",
+                ["id"],
+                vec![DbColumn::new("id", ValueType::Int), DbColumn::new("key", ValueType::String)],
+            ),
+        ])
+    }
+
+    /// A schema-qualified table's columns read as Diesel writes them
+    /// (`"s"."t"."c"`), by bare table (`t.c`) and bare; a qualifier naming
+    /// another table is refused.
+    #[test]
+    fn schema_qualified_columns_resolve() {
+        let catalog = schema_catalog();
+        for sql in [
+            r#"SELECT "ws"."configs"."id", "ws"."configs"."key" FROM "ws"."configs" WHERE ("ws"."configs"."id" = 1)"#,
+            r#"SELECT "notes"."id" FROM "ws"."notes" WHERE ("notes"."config_id" = 1)"#,
+            r#"SELECT id FROM ws.notes WHERE config_id = 1"#,
+        ] {
+            let select = parse_select(sql, &[], &catalog).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            assert!(select.query.main_table.table.as_str().starts_with("ws."), "{sql}");
+        }
+        let error = parse_select(r#"SELECT "elsewhere"."id" FROM "ws"."notes""#, &[], &catalog)
+            .expect_err("a qualifier of another table");
+        assert!(error.message.contains("not a table of this query"), "{error:?}");
+    }
+
+    /// In a join, the catalog name wins over a bare table: `configs` is
+    /// the one in `public`; a bare table two schemas share is ambiguous.
+    #[test]
+    fn schema_qualified_columns_in_joins() {
+        let catalog = schema_catalog();
+        let sql = r#"SELECT "ws"."notes"."id" FROM ("ws"."notes" INNER JOIN "ws"."configs" ON ("ws"."configs"."id" = "ws"."notes"."config_id"))"#;
+        parse_select(sql, &[], &catalog).expect("fully qualified join");
+        let sql = r#"SELECT "notes"."id" FROM ("ws"."notes" INNER JOIN "configs" ON ("configs"."id" = "notes"."config_id"))"#;
+        let select = parse_select(sql, &[], &catalog).expect("public configs by its catalog name");
+        assert_eq!(select.query.joins[0].sub.main_table.table.as_str(), "configs");
+        let sql = r#"SELECT "ws"."configs"."id" FROM ("ws"."configs" INNER JOIN "other"."configs" ON ("configs"."id" = "other"."configs"."id"))"#;
+        let error = parse_select(sql, &[], &catalog).expect_err("a bare table two schemas share");
+        assert!(error.message.contains("several tables"), "{error:?}");
+    }
+
+    /// Writes take the same qualifiers.
+    #[test]
+    fn schema_qualified_columns_in_writes() {
+        let catalog = schema_catalog();
+        parse_write(
+            r#"UPDATE "ws"."configs" SET "key" = 'a' WHERE ("ws"."configs"."id" = 1)"#,
+            &catalog,
+        )
+        .expect("qualified write");
+        parse_write(r#"DELETE FROM "ws"."configs" WHERE ("configs"."id" = 1)"#, &catalog)
+            .expect("bare-table qualifier in a write");
+    }
+
+    /// `authors.inner_join(books).order((authors::id, books::id))`: the
+    /// backend composes books under each author by their key, so the
+    /// clause is met and dropped from the tree's order. A joined table
+    /// orders only by its key, only ascending, only after the root's
+    /// columns.
+    #[test]
+    fn a_joined_tables_primary_key_may_order_it() {
+        let sql = r#"SELECT "authors"."id", "books"."title" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) WHERE ("authors"."id" = $1) ORDER BY "authors"."id" ASC, "books"."id" ASC"#;
+        let select = parse_select(sql, &[int8_bind(1)], &join_catalog()).expect("ordered by the child's key");
+        let order: Vec<&str> = select.query.main_table.order_by.iter().map(|clause| clause.column.as_str()).collect();
+        assert_eq!(order, vec!["id"], "only the root's order reaches the tree");
+        for (sql, expect) in [
+            (
+                r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) ORDER BY "books"."title""#,
+                "primary key",
+            ),
+            (
+                r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) ORDER BY "books"."id" DESC"#,
+                "primary key",
+            ),
+            (
+                r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) ORDER BY "books"."id", "authors"."id""#,
+                "must come before",
+            ),
+        ] {
+            let error = parse_select(sql, &[], &join_catalog()).expect_err(sql);
+            assert!(error.message.contains(expect), "{}", error.message);
+        }
+    }
+
+    /// The composition orders each root row's result rows together and
+    /// the joined tables depth first by key: an ORDER BY is accepted
+    /// only where it asks for that, so a key alone, a root order that
+    /// leaves ties, or siblings named out of order are refused.
+    #[test]
+    fn a_joined_order_must_be_the_composition_order() {
+        let catalog = join_catalog();
+        let books_then_reviews = r#"SELECT * FROM (("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) INNER JOIN "reviews" ON ("reviews"."book_id" = "books"."id"))"#;
+        let order = |clauses: &str| format!("{books_then_reviews} ORDER BY {clauses}");
+        parse_select(
+            &order(r#""authors"."id", "books"."id", "reviews"."id""#),
+            &[],
+            &catalog,
+        )
+        .expect("the composition order");
+        for (clauses, expect) in [
+            (r#""books"."id""#, "whole primary key"),
+            (r#""authors"."name", "books"."id""#, "whole primary key"),
+            (r#""authors"."id", "reviews"."id""#, "in the order the tables are joined"),
+            (r#""authors"."id", "reviews"."id", "books"."id""#, "in the order the tables are joined"),
+        ] {
+            let error = parse_select(&order(clauses), &[], &catalog).expect_err(clauses);
+            assert!(error.message.contains(expect), "{clauses}: {}", error.message);
+        }
+    }
+
+    /// An INNER JOIN written after a LEFT JOIN onto its table would drop
+    /// the rows the LEFT JOIN keeps; inside its parentheses it does not.
+    /// A WHERE on any table under a LEFT JOIN is refused, a grandchild
+    /// included.
+    #[test]
+    fn an_inner_join_under_a_left_join_must_be_nested() {
+        let catalog = join_catalog();
+        let flat = r#"SELECT * FROM (("authors" LEFT OUTER JOIN "books" ON ("books"."author_id" = "authors"."id")) INNER JOIN "reviews" ON ("reviews"."book_id" = "books"."id"))"#;
+        let error = parse_select(flat, &[], &catalog).expect_err("flat");
+        assert!(error.message.contains("under a LEFT JOIN"), "{}", error.message);
+        let nested = r#"SELECT * FROM ("authors" LEFT OUTER JOIN ("books" INNER JOIN "reviews" ON ("reviews"."book_id" = "books"."id")) ON ("books"."author_id" = "authors"."id"))"#;
+        parse_select(nested, &[], &catalog).expect("nested");
+        let error = parse_select(&format!(r#"{nested} WHERE "reviews"."stars" = 5"#), &[], &catalog)
+            .expect_err("a grandchild under the LEFT JOIN");
+        assert!(error.message.contains("LEFT JOIN inner"), "{}", error.message);
+    }
+
+    /// A COUNT counts every row: its LIMIT and OFFSET cut the one row it
+    /// returns, not the rows it counts.
+    #[test]
+    fn a_count_is_not_cut_by_its_limit() {
+        let select = parse_select(
+            r#"SELECT COUNT(*) FROM "tickets" LIMIT $1 OFFSET $2"#,
+            &[int8_bind(1), int8_bind(1)],
+            &catalog(),
+        )
+        .expect("a count with a limit");
+        assert_eq!(select.query.main_table.limit, u32::MAX);
+        assert_eq!((select.limit, select.offset), (1, 1));
+    }
+
+    /// An ORDER BY on a text column is followed only where Postgres
+    /// orders it as its text, which the catalog says per column.
+    #[test]
+    fn an_order_on_text_needs_a_byte_ordered_column() {
+        let sql = r#"SELECT * FROM "tickets" ORDER BY "tickets"."status" LIMIT 5"#;
+        let error = parse_select(sql, &[], &catalog()).expect_err("an unknown collation");
+        assert!(error.message.contains("rules the engine does not follow"), "{}", error.message);
+        let known = catalog().with_ordered_as_text([(TableName::from("tickets"), ColumnName::from("status"))]);
+        parse_select(sql, &[], &known).expect("a C-collated column");
+        parse_select(r#"SELECT * FROM "tickets" ORDER BY "tickets"."points" LIMIT 5"#, &[], &catalog())
+            .expect("a number");
+    }
+
+    /// A range comparison on a text-carried column (an enum, whose order
+    /// is its declaration's, or text under a linguistic collation) is
+    /// followed only where Postgres orders the column as its text, in
+    /// any filter: `WHERE`, inside `OR` and parentheses, and a join's
+    /// `ON`. Equality, lists and ranges on numbers are untouched.
+    #[test]
+    fn a_range_on_text_needs_a_byte_ordered_column() {
+        for sql in [
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" > 'z'"#,
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" <= $1"#,
+            r#"SELECT * FROM "tickets" WHERE ("tickets"."points" = 1 OR ("tickets"."status" < 'b'))"#,
+        ] {
+            let binds = [text_bind("b")];
+            let error = parse_select(sql, &binds, &catalog()).expect_err(sql);
+            assert!(error.message.contains("rules the engine does not follow"), "{}", error.message);
+            let known = catalog().with_ordered_as_text([(TableName::from("tickets"), ColumnName::from("status"))]);
+            parse_select(sql, &binds, &known).expect("a C-collated column");
+        }
+        for sql in [
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = 'z'"#,
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" != 'z'"#,
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" IN ('a', 'z')"#,
+            r#"SELECT * FROM "tickets" WHERE "tickets"."points" >= 3"#,
+        ] {
+            parse_select(sql, &[], &catalog()).expect(sql);
+        }
+        let joined = r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id" AND "books"."title" > 'm'))"#;
+        let error = parse_select(joined, &[], &join_catalog()).expect_err("a range in an ON");
+        assert!(error.message.contains("`books`.`title`"), "{}", error.message);
+    }
+
+    /// Diesel's joins become the engine's tree:
+    /// `authors.inner_join(books).filter(authors::name.eq("x")).order(authors::id.desc()).limit(5)`;
+    /// `authors.left_join(books)`; `authors.inner_join(books.inner_join(reviews))`
+    /// in nested parentheses; an explicit `ON` with a condition on the
+    /// joined table, which filters it; and an inner join's `WHERE`
+    /// conjuncts, which go to the table they name.
+    #[test]
+    fn diesel_joins_become_the_engines_tree() {
+        use crate::model::{Driver, Join};
+        let sql = r#"SELECT "authors"."id", "books"."title" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) WHERE ("authors"."name" = $1) ORDER BY "authors"."id" DESC LIMIT $2"#;
+        let select = parse_select(sql, &[text_bind("x"), int8_bind(5)], &join_catalog()).expect("inner join");
+        let root = &select.query.main_table;
+        assert_eq!(root.table.as_str(), "authors");
+        assert_eq!(root.limit, 5);
+        assert_eq!(root.order_by, vec![OrderBy::new("id", Order::DESC)]);
+        assert_eq!(
+            root.filter,
+            Where::Condition(Condition {
+                column: ColumnName::from("name"),
+                comparison_operator: ComparisonOperator::EQ,
+                value: Value::String("x".into()),
+            })
+        );
+        assert_eq!(select.query.joins.len(), 1);
+        let join: &Join = &select.query.joins[0];
+        assert_eq!(join.sub.main_table.table.as_str(), "books");
+        assert_eq!((join.main_table_column.as_str(), join.sub_table_column.as_str()), ("id", "author_id"));
+        assert!(join.is_inner);
+        assert_eq!(join.driver, Driver::Sub, "inner edges start sub-driven; the planner may flip");
+        assert_eq!(join.sub.main_table.filter, Where::AND(vec![]));
+        assert_eq!(join.sub.main_table.limit, u32::MAX);
+        assert_eq!(
+            select.projection,
+            Projection::Columns(vec![
+                Projected { table: TableName::from("authors"), column: ColumnName::from("id"), name: "id".into() },
+                Projected { table: TableName::from("books"), column: ColumnName::from("title"), name: "title".into() },
+            ])
+        );
+
+        let left = parse_select(
+            r#"SELECT "authors"."name", "books"."title" FROM ("authors" LEFT OUTER JOIN "books" ON ("books"."author_id" = "authors"."id"))"#,
+            &[],
+            &join_catalog(),
+        )
+        .expect("left join");
+        assert!(!left.query.joins[0].is_inner);
+        assert_eq!(left.query.joins[0].driver, Driver::Main);
+
+        let three = parse_select(
+            r#"SELECT "authors"."name", "reviews"."stars" FROM ("authors" INNER JOIN ("books" INNER JOIN "reviews" ON ("reviews"."book_id" = "books"."id")) ON ("books"."author_id" = "authors"."id"))"#,
+            &[],
+            &join_catalog(),
+        )
+        .expect("nested join");
+        let books = &three.query.joins[0];
+        assert_eq!(books.sub.main_table.table.as_str(), "books");
+        let reviews = &books.sub.joins[0];
+        assert_eq!(reviews.sub.main_table.table.as_str(), "reviews");
+        assert_eq!((reviews.main_table_column.as_str(), reviews.sub_table_column.as_str()), ("id", "book_id"));
+
+        let explicit = parse_select(
+            r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON (("books"."author_id" = "authors"."id") AND ("books"."title" = $1)))"#,
+            &[text_bind("t")],
+            &join_catalog(),
+        )
+        .expect("explicit on");
+        assert_eq!(
+            explicit.query.joins[0].sub.main_table.filter,
+            Where::Condition(Condition {
+                column: ColumnName::from("title"),
+                comparison_operator: ComparisonOperator::EQ,
+                value: Value::String("t".into()),
+            })
+        );
+
+        let split = parse_select(
+            r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) WHERE (("books"."title" = $1) AND ("authors"."name" = $2))"#,
+            &[text_bind("t"), text_bind("a")],
+            &join_catalog(),
+        )
+        .expect("split where");
+        assert!(matches!(split.query.main_table.filter, Where::Condition(Condition { ref column, .. }) if column.as_str() == "name"));
+        assert!(matches!(split.query.joins[0].sub.main_table.filter, Where::Condition(Condition { ref column, .. }) if column.as_str() == "title"));
+    }
+
+    /// Each join shape the engine cannot follow is refused with its
+    /// reason.
+    #[test]
+    fn join_shapes_the_engine_cannot_follow_are_named() {
+        let catalog = join_catalog();
+        let refuse = |sql: &str, want: &str| {
+            let error = parse_select(sql, &[text_bind("x")], &catalog).expect_err(sql);
+            assert!(error.message.contains(want), "{sql}: {}", error.message);
+        };
+        refuse(
+            r#"SELECT * FROM ("authors" LEFT OUTER JOIN "books" ON ("books"."author_id" = "authors"."id")) WHERE "books"."title" = $1"#,
+            "would turn its LEFT JOIN inner",
+        );
+        refuse(
+            r#"SELECT * FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) ORDER BY "books"."title""#,
+            "on a joined table",
+        );
+        refuse(
+            r#"SELECT * FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id")) WHERE ("books"."title" = $1 OR "authors"."name" = $1)"#,
+            "OR across tables",
+        );
+        refuse(
+            r#"SELECT * FROM ("authors" RIGHT JOIN "books" ON ("books"."author_id" = "authors"."id"))"#,
+            "only INNER and LEFT",
+        );
+        refuse(
+            r#"SELECT * FROM ("authors" INNER JOIN "books" ON ("books"."title" = $1))"#,
+            "needs an equality",
+        );
+        refuse(
+            r#"SELECT "name" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id"))"#,
+            "must be qualified",
+        );
+        refuse(
+            r#"SELECT * FROM ("authors" INNER JOIN "books" ON (("books"."author_id" = "authors"."id") AND ("books"."id" = "authors"."id")))"#,
+            "compound join keys",
+        );
+    }
+
+    /// A `text[]` of `["OPEN", "DONE"]`, as Diesel binds `eq_any`, makes
+    /// `= ANY` an `IN` list.
+    #[test]
+    fn eq_any_with_an_array_bind_is_an_in_list() {
+        let mut bytes = Vec::new();
+        for word in [1i32, 0, 25, 2, 1] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        for item in ["OPEN", "DONE"] {
+            bytes.extend_from_slice(&(item.len() as i32).to_be_bytes());
+            bytes.extend_from_slice(item.as_bytes());
+        }
+        let array = BindValue {
+            type_oid: 1009,
+            bytes: Some(bytes),
+        };
+        let any = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE ("tickets"."status" = ANY($1))"#,
+            std::slice::from_ref(&array),
+            &catalog(),
+        )
+        .expect("= ANY parses");
+        let literal = parse_read(
+            "SELECT * FROM tickets WHERE status IN ('OPEN', 'DONE')",
+            &catalog(),
+        )
+        .unwrap();
+        assert_eq!(any, literal);
+        let all = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE ("tickets"."status" != ALL($1))"#,
+            &[array],
+            &catalog(),
+        )
+        .expect("!= ALL parses");
+        let literal = parse_read(
+            "SELECT * FROM tickets WHERE status NOT IN ('OPEN', 'DONE')",
+            &catalog(),
+        )
+        .unwrap();
+        assert_eq!(all, literal);
+        let scalar = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = ANY($1)"#,
+            &[text_bind("OPEN")],
+            &catalog(),
+        )
+        .expect_err("a scalar after ANY");
+        assert!(scalar.message.contains("needs an array"), "{}", scalar.message);
+    }
+
+    /// `!= ALL` of an empty array holds for every row in Postgres, `NULL`
+    /// included, so it is no condition; `= ANY` of one holds for none.
+    #[test]
+    fn an_empty_array_under_all_is_no_condition() {
+        let mut bytes = Vec::new();
+        for word in [0i32, 0, 25] {
+            bytes.extend_from_slice(&word.to_be_bytes());
+        }
+        let empty = BindValue {
+            type_oid: 1009,
+            bytes: Some(bytes),
+        };
+        let all = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE ("tickets"."status" != ALL($1))"#,
+            std::slice::from_ref(&empty),
+            &catalog(),
+        )
+        .expect("!= ALL parses");
+        assert_eq!(all.filter, Where::AND(Vec::new()));
+        let any = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE ("tickets"."status" = ANY($1))"#,
+            &[empty],
+            &catalog(),
+        )
+        .expect("= ANY parses");
+        assert_eq!(
+            any.filter,
+            Where::condition("status", ComparisonOperator::IN, Value::List(Vec::new()))
+        );
+    }
+
+    /// A `COUNT(*)` with an `IN` list of binds reads as the list of
+    /// literals does.
+    #[test]
+    fn a_count_and_an_in_list_of_binds() {
+        let count = parse_read_with_binds(
+            r#"SELECT COUNT(*) FROM "tickets" WHERE ("tickets"."status" IN ($1, $2))"#,
+            &[text_bind("OPEN"), text_bind("DONE")],
+            &catalog(),
+        )
+        .expect("count parses");
+        let literal = parse_read(
+            "SELECT * FROM tickets WHERE status IN ('OPEN', 'DONE')",
+            &catalog(),
+        )
+        .expect("literal parses");
+        assert_eq!(count, literal);
+    }
+
+    /// Reads keep a literal as spelled and compare by equality folding; a
+    /// bind is decoded by its OID and kept the same way, `NULL` included.
+    #[test]
+    fn a_bind_takes_the_value_its_literal_would() {
+        let q = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."points" = $1"#,
+            &[int8_bind(7)],
+            &catalog(),
+        )
+        .expect("int8 bind");
+        assert_eq!(
+            q.filter,
+            Where::Condition(Condition {
+                column: ColumnName::from("points"),
+                comparison_operator: ComparisonOperator::EQ,
+                value: Value::Int(7),
+            })
+        );
+        let null = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = $1"#,
+            &[BindValue {
+                type_oid: 25,
+                bytes: None,
+            }],
+            &catalog(),
+        )
+        .expect("a NULL bind");
+        assert!(matches!(
+            null.filter,
+            Where::Condition(Condition {
+                value: Value::Null,
+                ..
+            })
+        ));
+    }
+
+    /// A bind or a projection that cannot be read is refused with its
+    /// reason.
+    #[test]
+    fn bind_and_projection_mistakes_are_named() {
+        let missing = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = $2"#,
+            &[text_bind("OPEN")],
+            &catalog(),
+        )
+        .expect_err("$2 with one bind");
+        assert!(missing.message.contains("`$2` has no parameter"), "{}", missing.message);
+
+        let other_table = parse_read(
+            r#"SELECT "users"."id" FROM "tickets""#,
+            &catalog(),
+        )
+        .expect_err("a column of another table");
+        assert!(other_table.message.contains("not a table of this query"), "{}", other_table.message);
+
+        let unknown = parse_read(r#"SELECT "tickets"."owner" FROM "tickets""#, &catalog())
+            .expect_err("an unknown column");
+        assert!(unknown.message.contains("unknown column `owner`"), "{}", unknown.message);
+
+        let offset = parse_read(r#"SELECT * FROM "tickets" LIMIT 10 OFFSET 5"#, &catalog())
+            .expect_err("offset on the single-table API");
+        assert!(offset.message.contains("OFFSET"), "{}", offset.message);
+
+        let unsupported = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = $1"#,
+            &[BindValue {
+                type_oid: 600,
+                bytes: Some(vec![0; 16]),
+            }],
+            &catalog(),
+        )
+        .expect_err("a point bind");
+        assert!(unsupported.message.contains("oid 600"), "{}", unsupported.message);
+
+        let null_limit = parse_read_with_binds(
+            r#"SELECT * FROM "tickets" LIMIT $1"#,
+            &[BindValue {
+                type_oid: 20,
+                bytes: None,
+            }],
+            &catalog(),
+        )
+        .expect_err("a NULL limit");
+        assert!(null_limit.message.contains("limit parameter"), "{}", null_limit.message);
+    }
+
+    /// A quoted identifier keeps its case, spaces and doubled quotes.
+    #[test]
+    fn quoted_identifiers_keep_their_case_and_escapes() {
+        let catalog = Catalog::new(vec![DbTable::new(
+            "Mixed Case",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("a\"b", ValueType::String),
+            ],
+        )]);
+        let q = parse_read(
+            r#"SELECT "Mixed Case"."a""b" FROM "Mixed Case" WHERE "a""b" = 'x'"#,
+            &catalog,
+        )
+        .expect("quoted names parse");
+        assert_eq!(q.table.as_str(), "Mixed Case");
+        assert_eq!(
+            q.filter,
+            Where::Condition(Condition {
+                column: ColumnName::from("a\"b"),
+                comparison_operator: ComparisonOperator::EQ,
+                value: Value::String("x".into()),
+            })
+        );
+        let error = parse_read(r#"SELECT "unterminated FROM t"#, &catalog)
+            .expect_err("unterminated");
+        assert!(error.message.contains("quoted identifier"));
+    }
+
     /// A one-table catalog (`tickets`, pkey `id`) shared by most tests.
-    fn catalog() -> Catalog {
+    pub(super) fn catalog() -> Catalog {
         Catalog::new(vec![DbTable::new(
             "tickets",
             ["id"],
@@ -1348,7 +2282,7 @@ mod tests {
         let cases = [
             (
                 "SELECT * FROM tickets LEFT JOIN tickets",
-                "joins are not supported",
+                "appears twice",
             ),
             ("SELECT * FROM nope", "unknown table"),
             ("SELECT * FROM tickets WHERE ghost = 1", "unknown column"),
@@ -1552,5 +2486,145 @@ mod tests {
         let error = read_err("SELECT * FROM tickets LIMIT 1 garbage");
         assert!(error.message.contains("unexpected trailing input"));
         assert_eq!(error.position, 30);
+    }
+}
+
+#[cfg(test)]
+mod s2s_shapes {
+    use super::*;
+    use crate::model::Value;
+
+    /// The parser tests' catalog.
+    fn catalog() -> Catalog {
+        super::tests::catalog()
+    }
+
+    /// A one-dimensional array of `labels`, no nulls, lower bound 1,
+    /// under element type `element`: the binary format Diesel sends.
+    fn label_array(element: i32, labels: &[&str]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for word in [1, 0, element, labels.len() as i32, 1] {
+            bytes.extend(word.to_be_bytes());
+        }
+        for label in labels {
+            bytes.extend((label.len() as i32).to_be_bytes());
+            bytes.extend(label.as_bytes());
+        }
+        bytes
+    }
+
+    /// An `OFFSET` widens the tree's limit to `limit + offset` and
+    /// travels beside it for the client to skip; with no `LIMIT` the
+    /// tree has none.
+    #[test]
+    fn an_offset_widens_the_limit_and_travels_separately() {
+        let select = parse_select(
+            r#"SELECT "tickets"."id" FROM "tickets" ORDER BY "tickets"."id" ASC LIMIT $1 OFFSET $2"#,
+            &[
+                BindValue {
+                    type_oid: 20,
+                    bytes: Some(10i64.to_be_bytes().to_vec()),
+                },
+                BindValue {
+                    type_oid: 20,
+                    bytes: Some(5i64.to_be_bytes().to_vec()),
+                },
+            ],
+            &catalog(),
+        )
+        .expect("offset");
+        assert_eq!(select.query.main_table.limit, 15, "the engine keeps limit + offset rows");
+        assert_eq!(select.offset, 5);
+
+        let no_limit = parse_select(r#"SELECT * FROM "tickets" OFFSET 5"#, &[], &catalog()).expect("offset only");
+        assert_eq!(no_limit.query.main_table.limit, u32::MAX);
+        assert_eq!(no_limit.offset, 5);
+    }
+
+    /// An enum bind is read as its label once the catalog knows its OID,
+    /// and refused before. An array of labels under the enum's array OID
+    /// carries the enum's own OID as its element type, as Diesel sends
+    /// it.
+    #[test]
+    fn an_enum_bind_is_its_label() {
+        let catalog = catalog().with_enum_oids([777, 778]);
+        let select = parse_select(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = $1"#,
+            &[BindValue {
+                type_oid: 777,
+                bytes: Some(b"open".to_vec()),
+            }],
+            &catalog,
+        )
+        .expect("an enum bind");
+        let shown = format!("{:?}", select.query.main_table.filter);
+        assert!(shown.contains("open"), "{shown}");
+        let unknown = parse_select(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = $1"#,
+            &[BindValue {
+                type_oid: 777,
+                bytes: Some(b"open".to_vec()),
+            }],
+            &super::tests::catalog(),
+        )
+        .expect_err("an unknown oid");
+        assert!(unknown.message.contains("oid 777"), "{}", unknown.message);
+        let bytes = label_array(777, &["open", "done"]);
+        let any = parse_select(
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = ANY($1)"#,
+            &[BindValue {
+                type_oid: 778,
+                bytes: Some(bytes),
+            }],
+            &catalog,
+        )
+        .expect("an enum array bind");
+        let shown = format!("{:?}", any.query.main_table.filter);
+        assert!(shown.contains("open") && shown.contains("done"), "{shown}");
+        let _ = Value::Null;
+    }
+
+    /// An infinite time has no microsecond value: refused, not wrapped.
+    #[test]
+    fn an_infinite_time_bind_is_refused_not_wrapped() {
+        let catalog = catalog();
+        for (oid, bytes) in [
+            (binds::oid::TIMESTAMP, i64::MAX.to_be_bytes().to_vec()),
+            (binds::oid::TIMESTAMPTZ, i64::MIN.to_be_bytes().to_vec()),
+            (binds::oid::DATE, i32::MAX.to_be_bytes().to_vec()),
+        ] {
+            let error = parse_select(
+                r#"SELECT * FROM "tickets" WHERE "tickets"."points" < $1"#,
+                &[BindValue {
+                    type_oid: oid,
+                    bytes: Some(bytes),
+                }],
+                &catalog,
+            )
+            .expect_err("infinity has no microsecond value");
+            assert!(error.message.contains("infinite"), "{}", error.message);
+        }
+    }
+
+    /// A `LIMIT` and `OFFSET` whose sum would reach the no-limit value
+    /// are refused rather than registering an unbounded query.
+    #[test]
+    fn a_limit_and_offset_that_saturate_are_refused() {
+        let catalog = catalog();
+        let error = parse_select(
+            r#"SELECT * FROM "tickets" ORDER BY "tickets"."id" LIMIT 10 OFFSET 4294967290"#,
+            &[],
+            &catalog,
+        )
+        .expect_err("would register an unbounded query");
+        assert!(error.message.contains("more rows"), "{}", error.message);
+        let fine = parse_select(
+            r#"SELECT * FROM "tickets" ORDER BY "tickets"."id" LIMIT 10 OFFSET 5"#,
+            &[],
+            &catalog,
+        )
+        .expect("a sane pair");
+        assert_eq!(fine.query.main_table.limit, 15);
+        assert_eq!(fine.offset, 5);
     }
 }

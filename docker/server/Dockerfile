@@ -9,6 +9,11 @@ FROM ${BASE_REGISTRY}/rust:1.89-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock clippy.toml ./
 COPY src ./src
+# The workspace's other crates (the Diesel wrapper) are not part of the
+# server, but the locked workspace must resolve to build it.
+COPY crates ./crates
+# The engine's path dependency (vendor/pgwire-replication/VENDORED.md).
+COPY vendor ./vendor
 RUN cargo build --release --locked --bin server
 
 FROM ${BASE_REGISTRY}/debian:bookworm-slim AS runtime

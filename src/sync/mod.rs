@@ -15,6 +15,7 @@
 //! runtime, the engine's rules, and both drivers are shared.
 
 pub mod catalog;
+pub mod heartbeat;
 mod local;
 pub mod pg;
 mod runtime;
@@ -28,5 +29,5 @@ pub use catalog::CatalogHandle;
 pub use local::Local;
 pub use runtime::{Runtime, Step, SyncStats};
 pub use service::{Command, Event, Service, Transaction};
-pub use sources::{MEMORY_TABLES_VAR, Sources};
+pub use sources::Sources;
 pub use storage::{MemoryStorage, Storage, StorageError};

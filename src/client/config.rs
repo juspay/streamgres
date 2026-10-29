@@ -13,6 +13,37 @@ use crate::log::{Format, Level};
 use crate::model::TableName;
 use crate::sync::pg::{Keepalive, Settings, threads};
 
+/// A setting that must not reach a log: its `Debug` shows no value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    /// `Secret(..)`, never the value.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
+/// The fewest bytes an S2S token may have: a token is the whole of the
+/// endpoint's admission, and the endpoint reads every followed table.
+pub const MIN_S2S_TOKEN_BYTES: usize = 16;
+
+/// Who may open the S2S endpoint. It runs any query it supports with the
+/// engine's own database privileges, for no user in particular, so it is
+/// off unless a token is set or an open endpoint is asked for by name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum S2sAccess {
+    /// No S2S endpoint: neither `STREAMGRES_S2S_TOKEN` nor
+    /// `STREAMGRES_S2S_ALLOW_NO_TOKEN` is set.
+    Off,
+    /// Backends presenting one of these as a bearer token
+    /// (`STREAMGRES_S2S_TOKEN`; more than one while a token is rotated).
+    Tokens(Vec<Secret>),
+    /// Any connection (`STREAMGRES_S2S_ALLOW_NO_TOKEN`): for development
+    /// on a machine no one else reaches.
+    Open,
+}
+
 /// Everything the server reads from the environment.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -51,6 +82,26 @@ pub struct Config {
     /// `STREAMGRES_DDL_PREFIX`: the prefix of that trigger's logical
     /// messages (`<app>/<shard>/ddl`, so `zero/0/ddl`).
     pub ddl_prefix: String,
+    /// `STREAMGRES_HEARTBEAT_MS`: how often the engine writes a heartbeat
+    /// into the WAL to measure, end to end, how far behind it is (500; 0
+    /// sends none, and the S2S endpoint then reports no lag). Any role
+    /// may emit one; it needs the primary.
+    pub heartbeat: Duration,
+    /// `STREAMGRES_MEMORY_TABLES`: tables mirrored in memory, comma
+    /// separated, and answered from there rather than read (none).
+    pub memory_tables: Vec<TableName>,
+    /// `STREAMGRES_ESTIMATE_TTL_MS`: how long the planner keeps a
+    /// statement's estimate (a day); not a number keeps the default.
+    pub estimate_ttl: Duration,
+    /// `STREAMGRES_ESTIMATE_CACHE`: how many estimates it keeps (300000);
+    /// not a number keeps the default.
+    pub estimate_capacity: usize,
+    /// `STREAMGRES_FEED_SLOT=temporary`: the feed streams from a
+    /// temporary slot that PostgreSQL drops when its connection ends, so
+    /// a process killed outright leaves no slot holding WAL; a feed that
+    /// drops then restarts the engine from a fresh snapshot. Anything
+    /// else keeps the permanent slot, which a reconnect resumes.
+    pub temporary_slot: bool,
     /// `STREAMGRES_SNAPSHOT_ROTATION_MS`: how often a fresh exported
     /// snapshot (a temporary replication slot) is minted for reads (1000).
     pub snapshot_rotation: Duration,
@@ -132,6 +183,36 @@ pub struct Config {
     /// `STREAMGRES_MAX_MESSAGE_BYTES`: the largest inbound WebSocket message
     /// accepted (16 MiB). Must be a positive number of bytes.
     pub max_message_bytes: usize,
+    /// Who may open the S2S endpoint ([`S2sAccess`]):
+    /// `STREAMGRES_S2S_TOKEN`, the secret a backend presents as
+    /// `Authorization: Bearer <token>` (a comma-separated list while one
+    /// is rotated, each at least [`MIN_S2S_TOKEN_BYTES`] long), or
+    /// `STREAMGRES_S2S_ALLOW_NO_TOKEN`; off with neither.
+    pub s2s_access: S2sAccess,
+    /// `STREAMGRES_S2S_ADDR`: a listener of the S2S endpoint's own, kept
+    /// off the client listener (unset: the endpoint shares
+    /// `STREAMGRES_ADDR`).
+    pub s2s_bind: Option<String>,
+    /// `STREAMGRES_S2S_MAX_CONNECTIONS`: how many S2S connections may be
+    /// open at once; past it an upgrade is answered 503 (64; 0 lifts the
+    /// limit). A backend process opens `STREAMGRES_S2S_CONNECTIONS` (2).
+    pub s2s_max_connections: usize,
+    /// `STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS`: how many subscriptions
+    /// one S2S connection may hold, those still registering included; past
+    /// it a subscribe is refused (10000; 0 lifts the limit).
+    pub s2s_connection_subscriptions: usize,
+    /// `STREAMGRES_S2S_MAX_DISJUNCTS`: how many disjuncts an S2S query's
+    /// filters may normalize to, counted without expanding them; past it
+    /// a subscribe is refused (1024; 0 lifts the limit). The engine
+    /// expands a filter into its disjuncts on its own thread, so an `AND`
+    /// of thirty `OR` pairs would otherwise stall every subscriber and
+    /// exhaust memory.
+    pub s2s_max_disjuncts: u64,
+    /// `STREAMGRES_S2S_MAX_LIST_VALUES`: how many `IN` and `NOT IN` values
+    /// an S2S query may hold in all; past it a subscribe is refused
+    /// (10000; 0 lifts the limit). The engine files each value in its
+    /// routing index on its own thread, about a second per 150,000.
+    pub s2s_max_list_values: usize,
     /// `STREAMGRES_BYTES_PER_PART`: how many bytes of serialized row
     /// operations one poke part carries at most (768000, i.e. 750 KiB).
     pub bytes_per_part: usize,
@@ -190,6 +271,25 @@ pub struct Config {
     pub admin_endpoints: bool,
 }
 
+/// Who may open the S2S endpoint, from `STREAMGRES_S2S_TOKEN` and
+/// `STREAMGRES_S2S_ALLOW_NO_TOKEN`; an error for a token too short, or
+/// for both set, which would leave it unclear which was meant.
+fn s2s_access<F: Fn(&str) -> Option<String>>(env: &crate::env::Env<F>) -> Result<S2sAccess, String> {
+    let tokens = env.list("STREAMGRES_S2S_TOKEN");
+    let open = env.flag("STREAMGRES_S2S_ALLOW_NO_TOKEN", false)?;
+    match (tokens.is_empty(), open) {
+        (true, false) => Ok(S2sAccess::Off),
+        (true, true) => Ok(S2sAccess::Open),
+        (false, true) => Err(
+            "STREAMGRES_S2S_TOKEN and STREAMGRES_S2S_ALLOW_NO_TOKEN are both set; set one".to_owned(),
+        ),
+        (false, false) if tokens.iter().any(|token| token.len() < MIN_S2S_TOKEN_BYTES) => Err(format!(
+            "STREAMGRES_S2S_TOKEN: each token needs at least {MIN_S2S_TOKEN_BYTES} bytes (`openssl rand -hex 32` makes one)"
+        )),
+        (false, false) => Ok(S2sAccess::Tokens(tokens.into_iter().map(Secret).collect())),
+    }
+}
+
 impl Config {
     /// Read the configuration; an error names the missing or malformed
     /// variable.
@@ -200,30 +300,9 @@ impl Config {
     /// The configuration `lookup` describes (the environment's, or a
     /// test's): an unset or empty variable takes its default.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, String> {
-        let value = |name: &str| {
-            lookup(name)
-                .filter(|value| !value.is_empty())
-                .or_else(|| {
-                    name.strip_prefix("STREAMGRES_")
-                        .and_then(|suffix| lookup(&format!("STREAMGRES_SYNC_{suffix}")))
-                        .filter(|value| !value.is_empty())
-                })
-                .or_else(|| {
-                    name.strip_prefix("STREAMGRES_")
-                        .and_then(|suffix| lookup(&format!("XYNE_SYNC_{suffix}")))
-                        .filter(|value| !value.is_empty())
-                })
-        };
-        let first = |names: &[&str]| names.iter().find_map(|name| value(name));
-        let millis = |name: &str, default: u64| -> Result<Duration, String> {
-            match first(&[name]) {
-                Some(text) => text
-                    .parse::<u64>()
-                    .map(Duration::from_millis)
-                    .map_err(|_| format!("{name} must be a number of milliseconds, got `{text}`")),
-                None => Ok(Duration::from_millis(default)),
-            }
-        };
+        let env = crate::env::Env::new(lookup);
+        let first = |names: &[&str]| env.first(names);
+        let millis = |name: &str, default: u64| env.millis(name, default);
         let dsn = first(&["STREAMGRES_PG_DSN", "ZERO_UPSTREAM_DB"])
             .ok_or("STREAMGRES_PG_DSN (or ZERO_UPSTREAM_DB) must name the database")?;
         let read_dsn = first(&["STREAMGRES_READ_PG_DSN"]).unwrap_or_else(|| dsn.clone());
@@ -243,39 +322,12 @@ impl Config {
             .unwrap_or_else(|| format!("{app_id}_ddl_end_{shard}"));
         let ddl_prefix =
             first(&["STREAMGRES_DDL_PREFIX"]).unwrap_or_else(|| format!("{app_id}/{shard}/ddl"));
-        let schemas = match first(&["STREAMGRES_SCHEMAS"]) {
-            Some(text) => text
-                .split(',')
-                .map(|schema| schema.trim().to_owned())
-                .filter(|schema| !schema.is_empty())
-                .collect(),
-            None => vec!["public".to_owned(), format!("{app_id}_{shard}")],
-        };
+        let schemas = env.schemas(&app_id, shard);
         let forward_cookies = first(&["STREAMGRES_FORWARD_COOKIES", "ZERO_QUERY_FORWARD_COOKIES"])
             .is_none_or(|value| value != "false" && value != "0");
-        let row_limit = match first(&[
-            "STREAMGRES_ROW_LIMIT",
-            "STREAMGRES_READ_ROW_LIMIT",
-            "STREAMGRES_JOIN_LIMIT",
-        ]) {
-            Some(text) => text
-                .parse::<u64>()
-                .ok()
-                .filter(|limit| *limit > 0)
-                .ok_or_else(|| {
-                    format!("STREAMGRES_ROW_LIMIT must be a positive number of rows, got `{text}`")
-                })?,
-            None => 100_000,
-        };
-        let join_preferred_side = match first(&["STREAMGRES_JOIN_PREFERRED_SIDE"]).as_deref() {
-            None | Some("parent") => Side::Parent,
-            Some("child") => Side::Child,
-            Some(other) => {
-                return Err(format!(
-                    "STREAMGRES_JOIN_PREFERRED_SIDE must be child or parent, got `{other}`"
-                ));
-            }
-        };
+        let row_limit = u64::try_from(env.row_limit()?).unwrap_or(u64::MAX);
+        let join_preferred_side = env.join_preferred()?;
+        let (estimate_ttl, estimate_capacity) = env.estimates();
         let log = match first(&["STREAMGRES_LOG"]).as_deref() {
             None | Some("info") => Level::Info,
             Some("debug") => Level::Debug,
@@ -313,7 +365,7 @@ impl Config {
         if base_path == "/" {
             base_path.clear();
         }
-        Ok(Config {
+        let config = Config {
             bind: first(&["STREAMGRES_ADDR"]).unwrap_or_else(|| "0.0.0.0:4848".to_owned()),
             base_path,
             dsn,
@@ -321,6 +373,12 @@ impl Config {
             schemas,
             slot: threads::slot_name(),
             slot_cleanup_age: millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
+            heartbeat: millis("STREAMGRES_HEARTBEAT_MS", 500)?,
+            memory_tables: env.memory_tables(),
+            estimate_ttl,
+            estimate_capacity,
+            temporary_slot: first(&["STREAMGRES_FEED_SLOT"])
+                .is_some_and(|value| value.trim() == "temporary"),
             publication: first(&["STREAMGRES_PUBLICATION"])
                 .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
             ddl_trigger,
@@ -339,16 +397,7 @@ impl Config {
                 None => 16,
             },
             read_timeout: millis("STREAMGRES_READ_TIMEOUT_MS", 10_000)?,
-            read_threads: match first(&["STREAMGRES_READ_THREADS"]) {
-                Some(text) => text
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|threads| *threads > 0)
-                    .ok_or_else(|| {
-                        format!("STREAMGRES_READ_THREADS must be a positive number, got `{text}`")
-                    })?,
-                None => 2,
-            },
+            read_threads: env.positive("STREAMGRES_READ_THREADS", 2)?,
             pg_keepalive_idle: millis("STREAMGRES_PG_KEEPALIVE_IDLE_MS", 30_000)?,
             pg_keepalive_interval: millis("STREAMGRES_PG_KEEPALIVE_INTERVAL_MS", 10_000)?,
             pg_keepalive_retries: match first(&["STREAMGRES_PG_KEEPALIVE_RETRIES"]) {
@@ -395,6 +444,35 @@ impl Config {
                     })?,
                 None => 16 * 1024 * 1024,
             },
+            s2s_access: s2s_access(&env)?,
+            s2s_bind: first(&["STREAMGRES_S2S_ADDR"]),
+            s2s_max_connections: match first(&["STREAMGRES_S2S_MAX_CONNECTIONS"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("STREAMGRES_S2S_MAX_CONNECTIONS must be a number, got `{text}`")
+                })?,
+                None => 64,
+            },
+            s2s_connection_subscriptions: match first(&["STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS"])
+            {
+                Some(text) => text.parse().map_err(|_| {
+                    format!(
+                        "STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS must be a number, got `{text}`"
+                    )
+                })?,
+                None => 10_000,
+            },
+            s2s_max_disjuncts: match first(&["STREAMGRES_S2S_MAX_DISJUNCTS"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("STREAMGRES_S2S_MAX_DISJUNCTS must be a number, got `{text}`")
+                })?,
+                None => 1024,
+            },
+            s2s_max_list_values: match first(&["STREAMGRES_S2S_MAX_LIST_VALUES"]) {
+                Some(text) => text.parse().map_err(|_| {
+                    format!("STREAMGRES_S2S_MAX_LIST_VALUES must be a number, got `{text}`")
+                })?,
+                None => 10_000,
+            },
             bytes_per_part: match first(&["STREAMGRES_BYTES_PER_PART"]) {
                 Some(text) => text.parse().map_err(|_| {
                     format!("STREAMGRES_BYTES_PER_PART must be a number of bytes, got `{text}`")
@@ -424,19 +502,21 @@ impl Config {
             slow_query: millis("STREAMGRES_SLOW_QUERY_MS", 1_000)?,
             metrics_interval: millis("STREAMGRES_METRICS_INTERVAL_MS", 10_000)?,
             metrics_prefix,
-            admin_endpoints: match first(&["STREAMGRES_ENABLE_ADMIN_ENDPOINTS"])
-                .as_deref()
-            {
-                None => false,
-                Some("true") | Some("yes") | Some("on") | Some("1") => true,
-                Some("false") | Some("no") | Some("off") | Some("0") => false,
-                Some(other) => {
-                    return Err(format!(
-                        "STREAMGRES_ENABLE_ADMIN_ENDPOINTS must be a boolean, got `{other}`"
-                    ));
-                }
-            },
-        })
+            admin_endpoints: env.flag("STREAMGRES_ENABLE_ADMIN_ENDPOINTS", false)?,
+        };
+        if config.s2s_bind.is_some() && config.s2s_access == S2sAccess::Off {
+            return Err(
+                "STREAMGRES_S2S_ADDR is set but the S2S endpoint is off; set STREAMGRES_S2S_TOKEN".to_owned(),
+            );
+        }
+        Ok(config)
+    }
+
+    /// Where the S2S endpoint listens, when it is on: its own address,
+    /// or the client listener's.
+    pub fn s2s_listener(&self) -> Option<&str> {
+        (self.s2s_access != S2sAccess::Off)
+            .then(|| self.s2s_bind.as_deref().unwrap_or(&self.bind))
     }
 
     /// Whether `prefix` can safely begin a Prometheus metric name.
@@ -503,6 +583,12 @@ impl Config {
             ],
             ddl_trigger: self.ddl_trigger.clone(),
             ddl_prefix: self.ddl_prefix.clone(),
+            heartbeat: self.heartbeat,
+            row_limit: usize::try_from(self.row_limit).unwrap_or(usize::MAX),
+            memory_tables: self.memory_tables.clone(),
+            estimate_ttl: self.estimate_ttl,
+            estimate_capacity: self.estimate_capacity,
+            temporary_slot: self.temporary_slot,
         }
     }
 }
@@ -510,6 +596,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::pg::estimate_cache;
 
     /// The configuration `vars` describe, over the three variables that
     /// have no default.
@@ -631,6 +718,113 @@ mod tests {
         assert_eq!(config.ddl_trigger, "my_trigger");
         assert_eq!(config.ddl_prefix, "mine/ddl");
         assert_eq!(config.engine_settings().ddl_trigger, "my_trigger");
+    }
+
+    /// The S2S endpoint is off without a token, open only when asked for
+    /// by name, takes several tokens while one rotates, refuses a short
+    /// one, and never shows a token in the configuration's `Debug`.
+    #[test]
+    fn the_s2s_endpoint_is_off_without_a_token() {
+        let off = config_with(&[]);
+        assert_eq!(off.s2s_access, S2sAccess::Off);
+        assert_eq!(off.s2s_listener(), None);
+        assert_eq!(config_with(&[("STREAMGRES_S2S_TOKEN", "")]).s2s_access, S2sAccess::Off);
+        let open = config_with(&[("STREAMGRES_S2S_ALLOW_NO_TOKEN", "true")]);
+        assert_eq!(open.s2s_access, S2sAccess::Open);
+        assert_eq!(open.s2s_listener(), Some("0.0.0.0:4848"));
+
+        let token = "0123456789abcdef-new";
+        let guarded = config_with(&[("STREAMGRES_S2S_TOKEN", token)]);
+        assert_eq!(guarded.s2s_access, S2sAccess::Tokens(vec![Secret(token.to_owned())]));
+        assert!(!format!("{guarded:?}").contains(token));
+        let rotating = config_with(&[("STREAMGRES_S2S_TOKEN", "0123456789abcdef-new, 0123456789abcdef-old")]);
+        let S2sAccess::Tokens(tokens) = rotating.s2s_access else { panic!("tokens") };
+        assert_eq!(tokens.len(), 2);
+
+        let short = config(&[("STREAMGRES_S2S_TOKEN", "hunter2")]).unwrap_err();
+        assert!(short.contains("at least 16 bytes"), "{short}");
+        let mixed = config(&[("STREAMGRES_S2S_TOKEN", "0123456789abcdef, hunter2")]);
+        assert!(mixed.is_err(), "every token is held to the length");
+        let both = config(&[
+            ("STREAMGRES_S2S_TOKEN", token),
+            ("STREAMGRES_S2S_ALLOW_NO_TOKEN", "yes"),
+        ]);
+        assert!(both.is_err(), "a token and an open endpoint contradict each other");
+        assert!(config(&[("STREAMGRES_S2S_ALLOW_NO_TOKEN", "maybe")]).is_err());
+
+        let own = config_with(&[
+            ("STREAMGRES_S2S_TOKEN", token),
+            ("STREAMGRES_S2S_ADDR", "10.0.0.5:4849"),
+        ]);
+        assert_eq!(own.s2s_listener(), Some("10.0.0.5:4849"));
+        let nowhere = config(&[("STREAMGRES_S2S_ADDR", "10.0.0.5:4849")]).unwrap_err();
+        assert!(nowhere.contains("off"), "{nowhere}");
+    }
+
+    /// 64 S2S connections may be open unless told otherwise.
+    #[test]
+    fn the_s2s_connection_count_has_a_default() {
+        assert_eq!(config_with(&[]).s2s_max_connections, 64);
+        let limited = config_with(&[("STREAMGRES_S2S_MAX_CONNECTIONS", "0")]);
+        assert_eq!(limited.s2s_max_connections, 0);
+        assert!(config(&[("STREAMGRES_S2S_MAX_CONNECTIONS", "many")]).is_err());
+    }
+
+    /// One S2S connection holds 10000 subscriptions unless told otherwise.
+    #[test]
+    fn the_s2s_connection_limit_has_a_default() {
+        assert_eq!(config_with(&[]).s2s_connection_subscriptions, 10_000);
+        let limited = config_with(&[("STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS", "3")]);
+        assert_eq!(limited.s2s_connection_subscriptions, 3);
+        assert!(config(&[("STREAMGRES_S2S_CONNECTION_SUBSCRIPTIONS", "x")]).is_err());
+    }
+
+    /// An S2S query's size is bounded unless told otherwise: 1024
+    /// disjuncts and 10000 list values, 0 lifting either.
+    #[test]
+    fn the_s2s_query_size_limits_have_defaults() {
+        let defaults = config_with(&[]);
+        assert_eq!((defaults.s2s_max_disjuncts, defaults.s2s_max_list_values), (1024, 10_000));
+        let set = config_with(&[
+            ("STREAMGRES_S2S_MAX_DISJUNCTS", "0"),
+            ("STREAMGRES_S2S_MAX_LIST_VALUES", "7"),
+        ]);
+        assert_eq!((set.s2s_max_disjuncts, set.s2s_max_list_values), (0, 7));
+        assert!(config(&[("STREAMGRES_S2S_MAX_DISJUNCTS", "lots")]).is_err());
+    }
+
+    /// The memory tables, the row limit and the estimate cache are read
+    /// here, legacy names included, so the engine core reads no
+    /// environment of its own; a number that does not parse keeps the
+    /// estimate defaults, as it always did.
+    #[test]
+    fn the_engine_settings_come_from_the_configuration() {
+        let defaults = config_with(&[]).engine_settings();
+        assert!(defaults.memory_tables.is_empty());
+        assert_eq!(defaults.row_limit, 100_000);
+        assert_eq!(defaults.estimate_ttl, estimate_cache::DEFAULT_TTL);
+        assert_eq!(defaults.estimate_capacity, estimate_cache::DEFAULT_CAPACITY);
+        let set = config_with(&[
+            ("XYNE_SYNC_MEMORY_TABLES", " orgs, ,agents "),
+            ("STREAMGRES_SYNC_ROW_LIMIT", "500"),
+            ("STREAMGRES_ESTIMATE_TTL_MS", "60000"),
+            ("STREAMGRES_ESTIMATE_CACHE", "lots"),
+        ])
+        .engine_settings();
+        assert_eq!(
+            set.memory_tables,
+            vec![TableName::from("orgs"), TableName::from("agents")]
+        );
+        assert_eq!(set.row_limit, 500);
+        assert_eq!(set.estimate_ttl, Duration::from_secs(60));
+        assert_eq!(set.estimate_capacity, estimate_cache::DEFAULT_CAPACITY);
+    }
+
+    /// The engine beats every 500 ms unless told otherwise; 0 stops it.
+    #[test]
+    fn the_heartbeat_has_a_default() {
+        assert_eq!(config_with(&[]).heartbeat, Duration::from_millis(500));
+        assert_eq!(config_with(&[("STREAMGRES_HEARTBEAT_MS", "0")]).heartbeat, Duration::ZERO);
     }
 
     /// [`config`], expected to parse.

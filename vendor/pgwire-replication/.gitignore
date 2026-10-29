@@ -1,0 +1,19 @@
+/target
+Cargo.lock
+
+# cargo-mutants output
+/mutants.out/
+/mutants.out.old/
+
+.docker
+docker-data
+testcontainers
+
+*.log
+
+.idea/
+.vscode/
+*.iml
+
+.DS_Store
+Thumbs.db
