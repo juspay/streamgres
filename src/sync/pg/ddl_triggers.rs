@@ -91,6 +91,9 @@ pub fn trigger_stack_sql(app: &str, shard: u32, publications: &[&str]) -> String
         .replace("@APP@", &app_literal)
 }
 
+/// One function of the stack as [`trigger_stack_sql`] writes it, for
+/// startup setup to check an installed stack against.
+#[cfg(feature = "server")]
 pub(crate) struct FunctionSpec {
     pub name: String,
     pub args: Vec<String>,
@@ -98,6 +101,8 @@ pub(crate) struct FunctionSpec {
     pub language: String,
 }
 
+/// The functions [`trigger_stack_sql`] defines, read back out of its SQL.
+#[cfg(feature = "server")]
 pub(crate) fn function_specs(app: &str, shard: u32, publications: &[&str]) -> Vec<FunctionSpec> {
     let sql = trigger_stack_sql(app, shard, publications);
     let mut specs = Vec::new();
