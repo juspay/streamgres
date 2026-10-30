@@ -86,6 +86,29 @@ branch name and the short commit SHA.
   directly to PostgreSQL for the logical feed and snapshot minting.
   Replication must not use the read pool.
 
+When the feed runs on a physical standby, set `STREAMGRES_MASTER_PG_DSN` to
+the same database on its primary. Each server opens one additional direct
+connection. One server holds a session advisory lock and calls
+`pg_log_standby_snapshot()` immediately on leadership, then every
+`STREAMGRES_STANDBY_SNAPSHOT_INTERVAL_MS` milliseconds (default 5000).
+Other servers wait for that lock and take over when the leader's database
+session closes. Leave the primary DSN unset to disable the worker. Do not
+route this connection through PgBouncer transaction pooling. All servers
+must use the same database and interval.
+
+The primary connection can use a separate login without replication or table
+write privileges. Grant it only the additional function privilege it needs:
+
+```sql
+CREATE ROLE streamgres_snapshot LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_log_standby_snapshot()
+  TO streamgres_snapshot;
+```
+
+Set its password and connection rules separately. If the role has a connection
+limit, allow at least one connection per server so followers can wait for the
+lock.
+
 **The server writes nothing to the database it follows.** It reads rows and
 the replication stream. Its position in the stream comes from each commit and
 from the keepalives PostgreSQL sends anyway. So `STREAMGRES_PG_DSN` can point

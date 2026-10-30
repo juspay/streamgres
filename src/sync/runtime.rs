@@ -21,14 +21,14 @@
 //! anything. Nothing waits: a read behind the stream is caught up, and a
 //! read ahead of it cannot exist.
 //!
-//! The delivered writes are kept in a buffer bounded below by the
+//! The delivered writes are kept by table in buffers bounded below by the
 //! **floor**: the lowest location a read can still be positioned at,
 //! which the driver learns from the storage and sets here, taken together
 //! with the floors the reads in flight were issued under. A read the
 //! driver could not run (no snapshot available yet) is parked and handed
 //! out again the next time the stream moves.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
 use crate::ivm::{
@@ -77,6 +77,7 @@ struct Delivered {
 /// - `rows_completed`: such writes' images the feed left columns out of,
 ///   completed from the result's image of the row.
 /// - `writes_buffered`: writes remembered for reads to be brought up.
+/// - `writes_scanned`: retained writes examined while bringing reads up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncStats {
     pub reads_issued: u64,
@@ -88,6 +89,7 @@ pub struct SyncStats {
     pub rows_completed: u64,
     pub rows_added: u64,
     pub writes_buffered: u64,
+    pub writes_scanned: u64,
 }
 
 impl fmt::Display for SyncStats {
@@ -107,7 +109,8 @@ impl fmt::Display for SyncStats {
         )?;
         writeln!(f, "rows completed ............. {}", self.rows_completed)?;
         writeln!(f, "rows added late ............ {}", self.rows_added)?;
-        write!(f, "writes buffered ............ {}", self.writes_buffered)
+        writeln!(f, "writes buffered ............ {}", self.writes_buffered)?;
+        write!(f, "writes scanned ............. {}", self.writes_scanned)
     }
 }
 
@@ -115,7 +118,10 @@ impl fmt::Display for SyncStats {
 ///
 /// - `engine`: the engine, exclusively owned.
 /// - `in_flight`: reads handed to the driver and not yet landed, by id.
-/// - `recent`: delivered writes above the floor, oldest first.
+/// - `recent`: delivered writes above the floor, grouped by table and in
+///   commit order within each table.
+/// - `recent_order`: the same writes' positions and tables in global commit
+///   order, so trimming touches only writes it removes.
 /// - `position`: the location of the last write routed (or progress mark
 ///   seen): where the engine is.
 /// - `floor`: the lowest location a read issued from now on can be at.
@@ -127,7 +133,8 @@ pub struct Runtime<E: Engine> {
     /// their freeing (an allocation per row) happens off the engine's
     /// thread; the frames hold the ones that matter by reference.
     landed: Vec<Vec<(DataFrameKey, DataFrameRow)>>,
-    recent: VecDeque<Delivered>,
+    recent: HashMap<TableName, VecDeque<Delivered>>,
+    recent_order: VecDeque<(Lsn, TableName)>,
     position: Lsn,
     floor: Lsn,
     stats: SyncStats,
@@ -140,7 +147,8 @@ impl<E: Engine> Runtime<E> {
             engine,
             in_flight: IdMap::default(),
             landed: Vec::new(),
-            recent: VecDeque::new(),
+            recent: HashMap::new(),
+            recent_order: VecDeque::new(),
             position: Lsn(0),
             floor: Lsn(0),
             stats: SyncStats::default(),
@@ -187,7 +195,7 @@ impl<E: Engine> Runtime<E> {
 
     /// How many delivered writes are kept for bringing reads up.
     pub fn buffered(&self) -> usize {
-        self.recent.len()
+        self.recent_order.len()
     }
 
     /// How many reads are out (parked ones included).
@@ -219,10 +227,12 @@ impl<E: Engine> Runtime<E> {
         debug_assert!(at >= self.position, "the stream delivers in commit order");
         self.position = self.position.max(at);
         self.stats.writes_buffered += 1;
-        self.recent.push_back(Delivered {
+        let table = write.table().clone();
+        self.recent.entry(table.clone()).or_default().push_back(Delivered {
             at,
             write: write.clone(),
         });
+        self.recent_order.push_back((at, table));
         let mut step = Step {
             updates: self.engine.route(write),
             selects: Vec::new(),
@@ -418,10 +428,10 @@ impl<E: Engine> Runtime<E> {
                 order_rows(&query.order_by, image, worst) == std::cmp::Ordering::Greater
             })
         };
-        for delivered in &self.recent {
-            if delivered.at <= at || delivered.write.table() != table {
-                continue;
-            }
+        let writes = self.recent.get(table);
+        let start = writes.map_or(0, |writes| writes.partition_point(|write| write.at <= at));
+        self.stats.writes_scanned += writes.map_or(0, |writes| writes.len() - start) as u64;
+        for delivered in writes.into_iter().flat_map(|writes| writes.iter().skip(start)) {
             let key = delivered.write.pkey_value();
             let position = index.get(key).copied();
             let Some(image) = delivered.write.new_row_image() else {
@@ -476,12 +486,24 @@ impl<E: Engine> Runtime<E> {
             .values()
             .map(|flight| flight.floor)
             .fold(self.floor, Lsn::min);
-        while self
-            .recent
-            .front()
-            .is_some_and(|delivered| delivered.at <= keep_above)
-        {
-            self.recent.pop_front();
+        // One table visit removes all its old writes; later order entries
+        // for that table only need to leave the global queue.
+        let mut pruned_tables = HashSet::new();
+        while self.recent_order.front().is_some_and(|(at, _)| *at <= keep_above) {
+            let (_, table) = self.recent_order.pop_front().expect("front was present");
+            if !pruned_tables.insert(table.clone()) {
+                continue;
+            }
+            let empty = {
+                let writes = self.recent.get_mut(&table).expect("write has a table queue");
+                while writes.front().is_some_and(|write| write.at <= keep_above) {
+                    writes.pop_front();
+                }
+                writes.is_empty()
+            };
+            if empty {
+                self.recent.remove(&table);
+            }
         }
     }
 }
