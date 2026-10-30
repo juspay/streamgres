@@ -811,6 +811,169 @@ fn the_stack_writes_one_message_per_change_and_none_for_a_noop() {
     });
 }
 
+/// The tables a publication of `name` holds, as `schema.table`, sorted.
+async fn publication_tables(client: &Client, name: &str) -> Vec<String> {
+    client
+        .query(
+            "SELECT schemaname || '.' || tablename FROM pg_publication_tables
+             WHERE pubname = $1 ORDER BY 1",
+            &[&name],
+        )
+        .await
+        .expect("the publication's tables")
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+/// The engine's answer to subscribing `sql` with no binds.
+async fn answer(session: &mut Session, id: u64, sql: &str) -> Value {
+    session
+        .sender()
+        .send(json!(["subscribe", {"id": id, "sql": sql, "binds": [], "rows": true}]).to_string())
+        .await
+        .expect("send");
+    next(session).await.expect("an answer")
+}
+
+/// An engine told which tables to publish (`publication_tables`) creates
+/// its publication of those alone, a bare name standing for that table
+/// in every served schema, and follows only them: a query on another
+/// table of a served schema is refused as unknown, not served from a
+/// snapshot that would never change. A listed table created later, a new
+/// workspace's say, is added on the next start, and none is taken out.
+#[test]
+fn a_publication_of_listed_tables_follows_only_them() {
+    let Some(dsn) = dsn("listed") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("listed");
+        let client = admin(&dsn).await;
+        client
+            .batch_execute(
+                "CREATE SCHEMA ws_a; CREATE SCHEMA ws_b;
+                 CREATE TABLE ws_a.followed (id int8 PRIMARY KEY);
+                 CREATE TABLE ws_a.ignored (id int8 PRIMARY KEY);
+                 CREATE TABLE ws_b.ignored (id int8 PRIMARY KEY);",
+            )
+            .await
+            .expect("the workspaces");
+        let mut listing = config(&dsn, &names);
+        listing.setup = Setup::Install;
+        listing.schemas = vec!["ws_a".to_owned(), "ws_b".to_owned()];
+        listing.publication_tables = vec!["followed".to_owned()];
+
+        let engine = Engine::start(listing.clone());
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        assert_eq!(publication_tables(&client, &names.publication).await, ["ws_a.followed"]);
+        let recorded: i32 = client
+            .query_one(
+                &format!(
+                    "SELECT json_array_length(current->'tables') FROM \"{}_0\".\"publishedSchema\"",
+                    names.app
+                ),
+                &[],
+            )
+            .await
+            .expect("the recorded schema")
+            .get(0);
+        assert_eq!(recorded, 1, "the stack records the publication's one table, not every table");
+        let mut session = engine.connect().expect("a session");
+        assert_eq!(next(&mut session).await.expect("hello")[0], "hello");
+        let followed = answer(&mut session, 1, r#"SELECT "id" FROM "ws_a"."followed""#).await;
+        assert_eq!(followed[0], "accepted", "{followed}");
+        let ignored = answer(&mut session, 2, r#"SELECT "id" FROM "ws_a"."ignored""#).await;
+        assert_eq!(ignored[0], "refused", "{ignored}");
+        assert!(ignored.to_string().contains("unknown table"), "{ignored}");
+        drop(session);
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+
+        client
+            .batch_execute("CREATE TABLE ws_b.followed (id int8 PRIMARY KEY)")
+            .await
+            .expect("a new workspace's table");
+        let listing_again = listing.clone();
+        let engine = Engine::start(listing);
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        assert_eq!(
+            publication_tables(&client, &names.publication).await,
+            ["ws_a.followed", "ws_b.followed"],
+            "added on the next start, none taken out"
+        );
+        tokio::task::spawn_blocking(move || engine.stop()).await.expect("stop");
+
+        // A migration drops the publication, as narrowing one of every
+        // table does, while the stack stays: the engine creates it again
+        // and has the stack record its tables, not what it held before.
+        client
+            .batch_execute(&format!(
+                "DROP PUBLICATION {pub};
+                 CREATE PUBLICATION {pub} FOR ALL TABLES;
+                 SELECT \"{app}_0\".update_schemas();
+                 DROP PUBLICATION {pub};",
+                pub = names.publication,
+                app = names.app
+            ))
+            .await
+            .expect("the migration");
+        let recorded = async || -> i32 {
+            client
+                .query_one(
+                    &format!(
+                        "SELECT json_array_length(current->'tables') FROM \"{}_0\".\"publishedSchema\"",
+                        names.app
+                    ),
+                    &[],
+                )
+                .await
+                .expect("the recorded schema")
+                .get(0)
+        };
+        assert!(recorded().await > 2, "the record still has every table");
+        let engine = Engine::start(listing_again);
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        assert_eq!(
+            publication_tables(&client, &names.publication).await,
+            ["ws_a.followed", "ws_b.followed"]
+        );
+        assert_eq!(recorded().await, 2, "the record taken afresh");
+        tokio::task::spawn_blocking(move || engine.stop()).await.expect("stop");
+    });
+}
+
+/// A publication of every table is not narrowed by listing tables: the
+/// engine serves on it as it is, since narrowing it is a migration's to
+/// do, and says so.
+#[test]
+fn a_publication_of_every_table_is_left_as_it_is() {
+    let Some(dsn) = dsn("alltables") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("alltables");
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        let mut listing = config(&dsn, &names);
+        listing.setup = Setup::Install;
+        listing.publication_tables = vec![names.table.clone()];
+        let engine = Engine::start(listing);
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        let all: bool = client
+            .query_one("SELECT puballtables FROM pg_publication WHERE pubname = $1", &[&names.publication])
+            .await
+            .expect("the publication")
+            .get(0);
+        assert!(all, "still every table");
+        tokio::task::spawn_blocking(move || engine.stop()).await.expect("stop");
+    });
+}
+
 /// An engine on a database nobody set up sets it up itself: the
 /// publication and the trigger stack, once, however many engines start
 /// together; it then serves, and follows a schema change. One told to

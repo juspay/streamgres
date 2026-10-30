@@ -82,7 +82,34 @@ application that does not configure through the environment.
   install them by migration (`streamgres::embedded::setup_sql(app, shard,
   publication)` gives the trigger stack's SQL) and set
   `STREAMGRES_EMBEDDED_SETUP=require`.
-- **Whose trigger stack it is.** The stack streamgres installs is not
+- **Which tables it follows.** Only the tables the publication streams:
+  a table of a served schema the publication leaves out is unknown to
+  the engine, so a query on it reads Postgres, rather than a snapshot
+  that would never hear of a change. By default the engine publishes
+  every table (`FOR ALL TABLES`). With `STREAMGRES_PUBLICATION_TABLES`
+  it publishes only the tables listed: a bare name stands for that table
+  in every served schema that has it (a workspace's `config_versions`),
+  `schema.table` for one table. List what the backend's queries read,
+  joined tables included. Everything else is then off the engine: its
+  writes are not decoded, and its DDL takes the trigger's cheap path,
+  since the published schema the trigger records holds only the listed
+  tables. On a backend with 100 workspaces of some 43 tables each, 3 of
+  them read:
+
+  | | every table | the 3 listed |
+  |---|---:|---:|
+  | tables published and followed | 4,301 | 303 |
+  | the trigger's record of the published schema | 14 MB | 1.25 MB |
+  | a real `CREATE TABLE` (of a table not listed) | 1.27 s, 29 MB of WAL | 28 ms, under 0.1 MB |
+  | creating a workspace (about 40 tables) | 154 s, 3.3 GB of WAL | 21 s, 4.2 MB |
+  | the backend's restart; its memory | 2.3 s; 100 MiB | 2.1 s; 87 MiB |
+
+  Each start adds the listed tables the publication lacks (a workspace
+  created since); none is ever taken out. A publication that already
+  publishes every table is left as it is, with a warning: to narrow it,
+  drop it by migration while no engine runs, and the next start creates
+  it with the listed tables and has the trigger stack record them.
+
   zero-cache's: its start trigger only takes a lock (zero-cache's also
   writes the whole published schema into the WAL, which zero-cache
   reads and streamgres does not), and it also fires on `DROP SCHEMA`. So
@@ -176,6 +203,7 @@ backend process:
 | `STREAMGRES_READ_PG_DSN` | `STREAMGRES_PG_DSN` | where ordinary reads go; may be PgBouncer in transaction mode |
 | `STREAMGRES_APP_ID`, `STREAMGRES_SHARD` | `streamgres`, `0` | name the trigger stack (`<app>_ddl_end_<shard>`); never set up for `zero` (section 2) |
 | `STREAMGRES_PUBLICATION` | `xyne_sync_pub` | |
+| `STREAMGRES_PUBLICATION_TABLES` | none (every table) | the tables the engine publishes: a bare name in every served schema, or `schema.table` (section 2) |
 | `STREAMGRES_SCHEMAS` | `public,<app>_<shard>` | |
 | `STREAMGRES_EMBEDDED_SETUP` | `install` | `adopt` to also replace an unmarked stack, or `require` (section 2) |
 | `STREAMGRES_EMBEDDED_SLOT` | `temporary` | or `permanent` (section 2, How it runs) |

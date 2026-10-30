@@ -9,8 +9,13 @@
 //! ([`orders_as_text`]). Tables of
 //! the `public` schema keep their bare names; any other table is named
 //! `schema.table`, which is also how the change feed matches it.
+//!
+//! With a publication named, only the tables it streams are taken: a
+//! table of a served schema the publication leaves out would otherwise be
+//! read from a snapshot once and never hear of a change, and its rows
+//! served stale.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tokio_postgres::Client;
 
@@ -20,11 +25,28 @@ use crate::model::{Catalog, ColumnName, DbColumn, DbTable, TableName, ValueType}
 /// What the load left out and why, one line per table or column.
 pub type Notes = Vec<String>;
 
-/// Read the catalog of `schemas` through `client`.
+/// Read the catalog of `schemas` through `client`: every table of theirs
+/// that `publication` streams, or every table with no publication named.
 pub async fn load_catalog(
     client: &Client,
     schemas: &[String],
+    publication: Option<&str>,
 ) -> Result<(Catalog, Notes), StorageError> {
+    let published: Option<BTreeSet<(String, String)>> = match publication {
+        Some(name) => Some(
+            client
+                .query(
+                    "SELECT schemaname::text, tablename::text FROM pg_publication_tables
+                     WHERE pubname = $1 AND schemaname = ANY($2)",
+                    &[&name, &schemas],
+                )
+                .await?
+                .iter()
+                .map(|row| (row.get(0), row.get(1)))
+                .collect(),
+        ),
+        None => None,
+    };
     let columns = client
         .query(
             "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.udt_name,
@@ -116,7 +138,15 @@ pub async fn load_catalog(
         }
     }
     let mut tables = Vec::new();
+    let mut unpublished = 0_usize;
     for ((schema, table), columns) in declared {
+        if published
+            .as_ref()
+            .is_some_and(|published| !published.contains(&(schema.clone(), table.clone())))
+        {
+            unpublished += 1;
+            continue;
+        }
         let Some(pkey) = pkeys.get(&(schema.clone(), table.clone())) else {
             notes.push(format!("{schema}.{table}: no primary key, left out"));
             continue;
@@ -134,6 +164,11 @@ pub async fn load_catalog(
             table_name(&schema, &table),
             pkey.iter().map(String::as_str),
             columns,
+        ));
+    }
+    if let (Some(name), true) = (publication, unpublished > 0) {
+        notes.push(format!(
+            "{unpublished} tables of the served schemas are not in publication `{name}`, so they are not followed"
         ));
     }
     Ok((

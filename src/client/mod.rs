@@ -132,7 +132,11 @@ pub fn serve(mut config: Config) -> Result<(), String> {
     let cleanup_settings = settings.clone();
     let _profiler = crate::profile::start(crate::profile::Config::from_env()?)?;
     let catalog = Arc::new(CatalogHandle::new(
-        server.block_on(threads::load_catalog_at(&settings.dsn, &settings.schemas))?,
+        server.block_on(threads::load_catalog_at(
+            &settings.dsn,
+            &settings.schemas,
+            &settings.publication,
+        ))?,
     ));
     server.block_on(threads::require_ddl_trigger(
         &settings.dsn,

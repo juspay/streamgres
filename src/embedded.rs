@@ -84,9 +84,14 @@ const SETUP_LOCK: i64 = 0x5354_5245_414d_5350; // "STREAMSP"
 /// How an engine gets the database set up for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setup {
-    /// Creates the publication (`FOR ALL TABLES`) and installs the
-    /// schema-change trigger stack ([`setup_sql`]) when either is
-    /// missing, once, under an advisory lock, and updates a stack an
+    /// Creates the publication and installs the schema-change trigger
+    /// stack ([`setup_sql`]) when either is missing, once, under an
+    /// advisory lock. The publication holds [`Config::publication_tables`],
+    /// or every table (`FOR ALL TABLES`) when none is listed; a listed
+    /// table it lacks is added on a later start (a workspace's, say),
+    /// none is ever taken out, and a publication of every table is left
+    /// as it is, since narrowing it is a migration's to do. It updates a
+    /// stack an
     /// older setup of this crate installed and marked as its own. Any
     /// other stack is left alone: it may be zero-cache's, which reads
     /// what this crate's no longer writes. Needs a role allowed to create
@@ -147,6 +152,14 @@ pub struct Config {
     pub slot: Slot,
     /// The publication the feed streams.
     pub publication: String,
+    /// The tables a publication the engine sets up holds
+    /// (`STREAMGRES_PUBLICATION_TABLES`): a bare name is that table in
+    /// every served schema that has it, `schema.table` that one table.
+    /// Empty, it publishes every table (`FOR ALL TABLES`). Only the
+    /// tables it streams are followed, so listing what the backend's
+    /// queries read keeps every other table's writes, and its DDL, off
+    /// the engine ([`Setup::Install`]).
+    pub publication_tables: Vec<String>,
     /// The schemas whose tables are followed.
     pub schemas: Vec<String>,
     /// The schema-change event trigger the engine requires
@@ -199,6 +212,7 @@ impl Config {
             setup: Setup::Install,
             slot: Slot::Temporary,
             publication: "xyne_sync_pub".to_owned(),
+            publication_tables: Vec::new(),
             schemas: vec!["public".to_owned(), format!("{DEFAULT_APP}_0")],
             ddl_trigger: format!("{DEFAULT_APP}_ddl_end_0"),
             ddl_prefix: format!("{DEFAULT_APP}/0/ddl"),
@@ -288,6 +302,7 @@ impl Config {
             publication: env
                 .value("STREAMGRES_PUBLICATION")
                 .unwrap_or(defaults.publication.clone()),
+            publication_tables: env.list("STREAMGRES_PUBLICATION_TABLES"),
             schemas: env.schemas(&app_id, shard),
             ddl_trigger: env
                 .value("STREAMGRES_DDL_TRIGGER")
@@ -787,7 +802,7 @@ async fn launch(
 ) -> Result<Running, String> {
     prepare(config).await?;
     let catalog = Arc::new(CatalogHandle::new(
-        threads::load_catalog_at(&settings.dsn, &settings.schemas).await?,
+        threads::load_catalog_at(&settings.dsn, &settings.schemas, &settings.publication).await?,
     ));
     threads::require_ddl_trigger(&settings.dsn, &settings.ddl_trigger).await?;
     let io = tokio::runtime::Builder::new_multi_thread()
@@ -999,6 +1014,12 @@ async fn prepare_on(client: &tokio_postgres::Client, config: &Config) -> Result<
     if standby {
         return Err("the database is a standby; an embedded engine runs against the primary its backend writes to (an engine on a standby is an S2S server's choice)".to_owned());
     }
+    if !config.publication_tables.is_empty() && publishes_all(client, &config.publication).await? {
+        log_warn!(
+            "the publication `{}` publishes every table, so STREAMGRES_PUBLICATION_TABLES does not narrow it; to follow only the listed tables, drop it by migration and let the engine create it",
+            config.publication
+        );
+    }
     if config.setup == Setup::Require || is_set_up(client, config).await? {
         return Ok(());
     }
@@ -1033,9 +1054,9 @@ async fn prepare_on(client: &tokio_postgres::Client, config: &Config) -> Result<
     Ok(())
 }
 
-/// Whether the database has the publication and an enabled trigger
-/// whose stack this engine has nothing to do to: the current setup, or a
-/// stack that is not this crate's, left as it is.
+/// Whether the database has the publication, holding every listed table,
+/// and an enabled trigger whose stack this engine has nothing to do to:
+/// the current setup, or a stack that is not this crate's, left as it is.
 async fn is_set_up(client: &tokio_postgres::Client, config: &Config) -> Result<bool, String> {
     let published = publication_exists(client, &config.publication)
         .await
@@ -1043,7 +1064,56 @@ async fn is_set_up(client: &tokio_postgres::Client, config: &Config) -> Result<b
     let triggered = ddl::trigger_present(client, &config.ddl_trigger)
         .await
         .map_err(|error| format!("looking for the event trigger: {error}"))?;
-    Ok(published && triggered && !outdated(client, config).await?)
+    Ok(published
+        && triggered
+        && !outdated(client, config).await?
+        && unpublished(client, config).await?.is_empty())
+}
+
+/// The tables [`Config::publication_tables`] names in the served schemas
+/// that the publication does not hold yet, as `(schema, table)`. None
+/// for a publication of every table, which holds them all, or when none
+/// is listed.
+async fn unpublished(
+    client: &tokio_postgres::Client,
+    config: &Config,
+) -> Result<Vec<(String, String)>, String> {
+    if config.publication_tables.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = client
+        .query(
+            "SELECT n.nspname::text, c.relname::text FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE c.relkind IN ('r', 'p') AND n.nspname = ANY($1)
+                AND (c.relname = ANY($2) OR n.nspname || '.' || c.relname = ANY($2))
+                AND NOT EXISTS (
+                  SELECT 1 FROM pg_publication_tables p
+                   WHERE p.pubname = $3 AND p.schemaname = n.nspname AND p.tablename = c.relname)
+              ORDER BY 1, 2",
+            &[&config.schemas, &config.publication_tables, &config.publication],
+        )
+        .await
+        .map_err(|error| format!("looking for the tables to publish: {error}"))?;
+    Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+}
+
+/// Whether the publication `name` publishes every table.
+async fn publishes_all(client: &tokio_postgres::Client, name: &str) -> Result<bool, String> {
+    Ok(client
+        .query_opt("SELECT puballtables FROM pg_publication WHERE pubname = $1", &[&name])
+        .await
+        .map_err(|error| format!("looking at the publication: {error}"))?
+        .is_some_and(|row| row.get(0)))
+}
+
+/// `tables` as a `TABLE` list for `CREATE` or `ALTER PUBLICATION`.
+fn table_list(tables: &[(String, String)]) -> String {
+    tables
+        .iter()
+        .map(|(schema, table)| format!("{}.{}", quote_ident(schema), quote_ident(table)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether the installed trigger stack is this engine's to replace: this
@@ -1098,18 +1168,54 @@ async fn install(client: &tokio_postgres::Client, config: &Config) -> Result<Vec
         .await
         .map_err(failed)?;
     let mut installed = Vec::new();
+    let publication = quote_ident(&config.publication);
     if !publication_exists(client, &config.publication)
         .await
         .map_err(failed)?
     {
+        let tables = unpublished(client, config).await?;
+        let scope = match (config.publication_tables.is_empty(), tables.is_empty()) {
+            (true, _) => "FOR ALL TABLES".to_owned(),
+            (false, false) => format!("FOR TABLE {}", table_list(&tables)),
+            (false, true) => {
+                return Err(format!(
+                    "none of STREAMGRES_PUBLICATION_TABLES ({}) is a table of the served schemas ({}), so there is nothing to publish",
+                    config.publication_tables.join(", "),
+                    config.schemas.join(", ")
+                ));
+            }
+        };
         client
-            .batch_execute(&format!(
-                "CREATE PUBLICATION {} FOR ALL TABLES",
-                quote_ident(&config.publication)
-            ))
+            .batch_execute(&format!("CREATE PUBLICATION {publication} {scope}"))
             .await
             .map_err(failed)?;
         installed.push("the publication");
+        // `CREATE PUBLICATION` fires no schema-change trigger, so a stack
+        // of this crate's already there would keep the schema it last
+        // recorded, every table of the publication before, and diff the
+        // next change against it. Its record is taken afresh; any other
+        // stack is not this engine's to run.
+        if installed_version(client, config).await?.is_some() {
+            client
+                .batch_execute(&format!(
+                    "SELECT {}.update_schemas()",
+                    quote_ident(&format!("{}_{}", config.app, config.shard))
+                ))
+                .await
+                .map_err(failed)?;
+        }
+    } else {
+        let tables = unpublished(client, config).await?;
+        if !tables.is_empty() {
+            client
+                .batch_execute(&format!(
+                    "ALTER PUBLICATION {publication} ADD TABLE {}",
+                    table_list(&tables)
+                ))
+                .await
+                .map_err(failed)?;
+            installed.push("the listed tables the publication lacked");
+        }
     }
     let triggered = ddl::trigger_present(client, &config.ddl_trigger)
         .await
@@ -1283,6 +1389,14 @@ mod tests {
         assert_eq!(setup("require"), Ok(Setup::Require));
         assert_eq!(setup("install"), Ok(Setup::Install));
         assert_eq!(setup("adopt"), Ok(Setup::Adopt));
+        assert!(config.publication_tables.is_empty(), "every table unless listed");
+        let listed = Config::from_lookup(&Env::new(|name: &str| match name {
+            "STREAMGRES_PG_DSN" => Some("postgres://primary/app".to_owned()),
+            "STREAMGRES_PUBLICATION_TABLES" => Some(" config_versions, ws_1.experiments ,".to_owned()),
+            _ => None,
+        }))
+        .unwrap();
+        assert_eq!(listed.publication_tables, ["config_versions", "ws_1.experiments"]);
         assert!(setup("maybe").is_err());
     }
 

@@ -124,6 +124,10 @@ Trigger names and the WAL message prefix come from `STREAMGRES_APP_ID` and
 `STREAMGRES_SHARD`; the triggers record the published schema before and after
 DDL in that transaction's WAL.
 
+The engine follows only the tables the publication streams: a table of a
+served schema the publication leaves out is unknown to it, so its queries
+read Postgres.
+
 The stack is streamgres's own, not zero-cache's: its start trigger only takes
 a lock (zero-cache's also writes the whole published schema into the WAL, which
 zero-cache reads), and its triggers also fire on `DROP SCHEMA`. It marks itself
