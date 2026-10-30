@@ -58,6 +58,7 @@ pub mod protocol;
 pub mod s2s;
 pub mod sampler;
 pub mod schema;
+mod setup;
 pub mod transform;
 pub mod warm;
 
@@ -114,19 +115,22 @@ async fn join_worker(
 /// the server-to-server endpoint, the last sink. Tasks are named for
 /// `tokio-console` when the runtime is built with `--cfg tokio_unstable`,
 /// and spawned plainly otherwise.
-pub fn serve(config: Config) -> Result<(), String> {
+pub fn serve(mut config: Config) -> Result<(), String> {
     log::set_level(config.log);
     log::set_format(config.log_format);
-    let _profiler = crate::profile::start(crate::profile::Config::from_env()?)?;
-    let config = Arc::new(config);
-    let shutdown = Shutdown::new();
-    let settings = config.engine_settings();
-    let cleanup_settings = settings.clone();
+    let master_dsn = std::mem::take(&mut config.master_dsn);
     let server = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("streamgres-server")
         .build()
         .map_err(|error| format!("tokio: {error}"))?;
+    server.block_on(setup::ensure(&master_dsn, &config))?;
+    drop(master_dsn);
+    let config = Arc::new(config);
+    let shutdown = Shutdown::new();
+    let settings = config.engine_settings();
+    let cleanup_settings = settings.clone();
+    let _profiler = crate::profile::start(crate::profile::Config::from_env()?)?;
     let catalog = Arc::new(CatalogHandle::new(
         server.block_on(threads::load_catalog_at(&settings.dsn, &settings.schemas))?,
     ));

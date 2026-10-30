@@ -1951,6 +1951,7 @@ mod tests {
         fn new(log_bytes: &str) -> Self {
             let vars: HashMap<&str, &str> = HashMap::from([
                 ("STREAMGRES_PG_DSN", "postgresql://none/none"),
+                ("STREAMGRES_MASTER_PG_DSN", "postgresql://none/none"),
                 ("STREAMGRES_QUERY_URL", "http://none/query"),
                 ("STREAMGRES_MUTATE_URL", "http://none/push"),
                 ("STREAMGRES_GROUP_LOG_BYTES", log_bytes),
@@ -3306,6 +3307,7 @@ mod tests {
 
         let vars: HashMap<&str, &str> = HashMap::from([
             ("STREAMGRES_PG_DSN", "postgresql://none/none"),
+            ("STREAMGRES_MASTER_PG_DSN", "postgresql://none/none"),
             ("STREAMGRES_QUERY_URL", "http://none/query"),
             ("STREAMGRES_MUTATE_URL", "http://none/push"),
         ]);
@@ -3991,6 +3993,7 @@ mod tests {
 
         let vars: HashMap<&str, &str> = HashMap::from([
             ("STREAMGRES_PG_DSN", "postgresql://none/none"),
+            ("STREAMGRES_MASTER_PG_DSN", "postgresql://none/none"),
             ("STREAMGRES_QUERY_URL", "http://none/query"),
             ("STREAMGRES_MUTATE_URL", "http://none/push"),
         ]);

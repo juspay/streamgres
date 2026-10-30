@@ -1143,7 +1143,7 @@ impl Stats {
                     "name": name,
                     "table": entry.table,
                     "rows": entry.rows,
-                    "percent_of_limit": if limit == 0 { 0 } else { entry.rows.saturating_mul(100) / limit },
+                    "percent_of_limit": entry.rows.saturating_mul(100).checked_div(limit).unwrap_or(0),
                     "count": entry.count,
                     "last_ms": entry.last_ms,
                 })
