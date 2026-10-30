@@ -82,6 +82,22 @@ application that does not configure through the environment.
   install them by migration (`streamgres::embedded::setup_sql(app, shard,
   publication)` gives the trigger stack's SQL) and set
   `STREAMGRES_EMBEDDED_SETUP=require`.
+- **Whose trigger stack it is.** The stack streamgres installs marks
+  itself as streamgres's, with its setup version (`<app>_<shard>.streamgres_stack()`).
+  An engine that installs its setup updates only a stack with that
+  marker. A stack without it is left as it is, with a warning at
+  startup: it may be zero-cache's, which still needs what streamgres's
+  stack no longer does. Stacks streamgres installed before it marked them
+  have no marker either, and their start trigger builds the whole
+  published schema, and writes it into the WAL, on every `CREATE TABLE`,
+  `CREATE INDEX` and `ALTER TABLE`, an `IF NOT EXISTS` that does nothing
+  included. On a database with many tables that costs each such
+  statement a quarter of a second or more, so a startup that runs many
+  of them can take minutes. When only streamgres uses the stack, adopt
+  it by running the setup SQL again (`setup_sql`, or
+  `scripts/sql/ddl-triggers.sql`) as a migration, **before** restarting
+  the backend: a backend that runs DDL while it starts would otherwise
+  run it under the old stack before its engine could replace it.
 
 ### How it runs
 
@@ -302,7 +318,7 @@ to readers who would have read the same rows.
   reaches a backend. A trigger stack older than this misses
   it until a restart: re-run the setup SQL (`scripts/sql/ddl-triggers.sql`,
   or `setup_sql`). The server says so at startup; an embedded engine that
-  installs its setup updates it itself.
+  installs its setup updates a stack marked as streamgres's itself (§2).
 - **Privileges.** The engine reads with its own role. For a context
   whose role may not read one of a query's tables whole, the engine side
   builds no rows. The read refills from Postgres on that reader's own

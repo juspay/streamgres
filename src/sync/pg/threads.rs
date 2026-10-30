@@ -35,6 +35,7 @@ use tokio::sync::watch;
 use tokio::task::spawn_local;
 
 use super::ddl::{self, DdlSource};
+use super::ddl_triggers;
 use super::{Feed, Keepalive, PgStorage, Transport, load_catalog};
 use crate::ivm::MultiTableIVM;
 use crate::log::{log_error, log_info, log_warn};
@@ -193,6 +194,16 @@ pub async fn require_ddl_trigger(dsn: &str, name: &str) -> Result<(), String> {
     let present = ddl::trigger_present(&client, name)
         .await
         .map_err(|error| format!("looking for the DDL event trigger `{name}`: {error}"))?;
+    match ddl::stack_version(&client, name).await {
+        Ok(Some(version)) if present && version < ddl_triggers::STACK_VERSION => log_warn!(
+            "the schema-change trigger stack behind `{name}` is streamgres's setup {version}, older than {}; run the setup SQL again (setup_sql, or scripts/sql/ddl-triggers.sql) to update it",
+            ddl_triggers::STACK_VERSION
+        ),
+        Ok(None) if present => log_warn!(
+            "the schema-change trigger stack behind `{name}` is not marked as streamgres's, so it is left as it is. If zero-cache uses it, that is right. If streamgres installed it, before it marked its stacks, its start trigger builds the whole published schema on every DDL statement, an `IF NOT EXISTS` that does nothing included, which slows migrations and startup bootstraps on a database with many tables: adopt it by running the setup SQL as a migration (setup_sql, or scripts/sql/ddl-triggers.sql)"
+        ),
+        _ => {}
+    }
     if present && ddl::stack_outdated(&client, name).await.unwrap_or(false) {
         log_warn!(
             "the schema-change trigger stack behind `{name}` predates `rowSecurity`: row-level security turned on while serving goes unnoticed until a restart, and tables created meanwhile are taken as secured; run the setup SQL again (scripts/sql/ddl-triggers.sql) to update it"

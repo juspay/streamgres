@@ -189,8 +189,6 @@ BEGIN
 
   IF prev_schema_specs::text != schema_specs::text THEN
     UPDATE "xyne_0"."publishedSchema" SET current = schema_specs;
-  ELSIF event_type = 'ddlStart' THEN
-    prev_schema_specs = NULL;
   ELSIF event_type = 'ddlUpdate' THEN
     PERFORM "xyne_0".notice_ignore('noop', tag, target);
     RETURN;
@@ -221,12 +219,8 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION "xyne_0".emit_ddl_start()
 RETURNS event_trigger AS $$
-DECLARE
-  schema_specs JSON;
-  message TEXT;
 BEGIN
   PERFORM pg_advisory_xact_lock(4353719051050729648);
-  PERFORM "xyne_0".update_schemas('ddlStart', TG_TAG, NULL);
 END
 $$ LANGUAGE plpgsql;
 
@@ -321,3 +315,8 @@ CREATE EVENT TRIGGER "xyne_ddl_end_0"
   ON ddl_command_end
   WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'DROP TABLE', 'DROP INDEX', 'ALTER PUBLICATION', 'ALTER SCHEMA', 'COMMENT')
   EXECUTE PROCEDURE "xyne_0".emit_ddl_end();
+
+CREATE OR REPLACE FUNCTION "xyne_0".streamgres_stack()
+RETURNS int
+IMMUTABLE
+AS $$ SELECT 1 $$ LANGUAGE sql;

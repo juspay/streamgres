@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use streamgres::embedded::{Config, Engine, Session, Setup, Slot, State, setup_sql};
+use streamgres::sync::pg::ddl::stack_version;
+use streamgres::sync::pg::ddl_triggers::STACK_VERSION;
 use tokio_postgres::{Client, NoTls};
 
 mod support;
@@ -420,8 +422,9 @@ fn a_table_with_row_level_security_is_refused() {
     });
 }
 
-/// A trigger stack from before the engine read `rowSecurity` is brought
-/// up to date by an engine that installs its setup.
+/// A trigger stack an older setup of this crate installed, and marked as
+/// its own, is brought up to date by an engine that installs its setup:
+/// here one from before the engine read `rowSecurity`.
 #[test]
 fn an_outdated_trigger_stack_is_updated() {
     let Some(dsn) = dsn("stack") else { return };
@@ -433,33 +436,205 @@ fn an_outdated_trigger_stack_is_updated() {
         let names = names("stack");
         let client = admin(&dsn).await;
         set_up(&client, &names).await;
-        let old = setup_sql(&names.app, 0, &names.publication)
-            .replace("  pc.relrowsecurity AS \"rowSecurity\",\n", "")
-            .replace("  'rowSecurity', \"rowSecurity\",\n", "")
-            .replace(", \"rowSecurity\")", ")");
-        assert!(!old.contains("rowSecurity"), "an older stack");
+        let old = older_stack(&names).replace(
+            &format!("SELECT {STACK_VERSION} $$"),
+            &format!("SELECT {} $$", STACK_VERSION - 1),
+        );
         client.batch_execute(&old).await.expect("the older stack");
-        let current = async || -> bool {
-            client
-                .query_one(
-                    "SELECT bool_or(prosrc LIKE '%\"rowSecurity\"%') FROM pg_proc p
-                     JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1",
-                    &[&format!("{}_0", names.app)],
-                )
-                .await
-                .expect("the stack's functions")
-                .get::<_, Option<bool>>(0)
-                .unwrap_or(false)
-        };
-        assert!(!current().await);
+        assert!(!reads_row_security(&client, &names).await);
+        assert_eq!(marked(&client, &names).await, Some(STACK_VERSION - 1));
 
         let mut installing = config(&dsn, &names);
         installing.setup = Setup::Install;
         let engine = Engine::start(installing);
         reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
-        assert!(current().await, "updated before serving");
+        assert!(reads_row_security(&client, &names).await, "updated before serving");
+        assert_eq!(marked(&client, &names).await, Some(STACK_VERSION));
         let stopping = engine.clone();
         tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+    });
+}
+
+/// A trigger stack without the ownership marker, zero-cache's or one an
+/// unmarked older setup installed, is not this crate's to replace: an
+/// engine that installs its setup serves on it as it is.
+#[test]
+fn an_unmarked_trigger_stack_is_left_alone() {
+    let Some(dsn) = dsn("unmarked") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("unmarked");
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        client
+            .batch_execute(&older_stack(&names))
+            .await
+            .expect("the older stack");
+        client
+            .batch_execute(&format!("DROP FUNCTION \"{}_0\".streamgres_stack()", names.app))
+            .await
+            .expect("unmarked");
+        assert_eq!(marked(&client, &names).await, None);
+
+        let mut installing = config(&dsn, &names);
+        installing.setup = Setup::Install;
+        let engine = Engine::start(installing);
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        assert!(!reads_row_security(&client, &names).await, "left as it was");
+        assert_eq!(marked(&client, &names).await, None);
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+    });
+}
+
+/// The stack as it was before the engine read `rowSecurity`.
+fn older_stack(names: &Names) -> String {
+    let old = setup_sql(&names.app, 0, &names.publication)
+        .replace("  pc.relrowsecurity AS \"rowSecurity\",\n", "")
+        .replace("  'rowSecurity', \"rowSecurity\",\n", "")
+        .replace(", \"rowSecurity\")", ")");
+    assert!(!old.contains("rowSecurity"), "an older stack");
+    old
+}
+
+/// Whether the test's stack describes tables with `rowSecurity`.
+async fn reads_row_security(client: &Client, names: &Names) -> bool {
+    client
+        .query_one(
+            "SELECT bool_or(prosrc LIKE '%\"rowSecurity\"%') FROM pg_proc p
+             JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = $1",
+            &[&format!("{}_0", names.app)],
+        )
+        .await
+        .expect("the stack's functions")
+        .get::<_, Option<bool>>(0)
+        .unwrap_or(false)
+}
+
+/// The setup version the test's stack is marked with, if any.
+async fn marked(client: &Client, names: &Names) -> Option<i32> {
+    stack_version(client, &format!("{}_ddl_end_0", names.app))
+        .await
+        .expect("the stack's marker")
+}
+
+/// What the stack writes into the WAL, read through a `test_decoding`
+/// slot: nothing for a statement that changes nothing (`IF NOT EXISTS`,
+/// a rolled back change) and never a `ddlStart`; one `ddlUpdate` per
+/// change otherwise, each starting from the schema the one before it
+/// left, through several statements in a transaction, statements a `DO`
+/// block runs, and two migrations at once (the second waits for the
+/// first's lock). Setting the stack up twice changes nothing.
+#[test]
+fn the_stack_writes_one_message_per_change_and_none_for_a_noop() {
+    let Some(dsn) = dsn("messages") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("messages");
+        let (table, more) = (names.table.clone(), format!("{}_more", names.table));
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        client
+            .batch_execute(&setup_sql(&names.app, 0, &names.publication))
+            .await
+            .expect("set up again");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {more} (id int8 PRIMARY KEY);
+                 CREATE INDEX {table}_name ON {table} (name);"
+            ))
+            .await
+            .expect("the second table and an index");
+        client
+            .batch_execute("SELECT pg_create_logical_replication_slot('embedded_messages', 'test_decoding')")
+            .await
+            .expect("a slot");
+
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE IF NOT EXISTS {table} (id int8 PRIMARY KEY);
+                 CREATE TABLE IF NOT EXISTS {table} (id int8 PRIMARY KEY);
+                 CREATE INDEX IF NOT EXISTS {table}_name ON {table} (name);
+                 CREATE INDEX IF NOT EXISTS {table}_name ON {table} (name);
+                 BEGIN; ALTER TABLE {table} ADD COLUMN gone int4; ROLLBACK;
+                 BEGIN;
+                 ALTER TABLE {table} ADD COLUMN a int4;
+                 ALTER TABLE {table} ADD COLUMN b int4;
+                 COMMIT;
+                 DO $$ BEGIN
+                   EXECUTE 'ALTER TABLE {table} ADD COLUMN c int4';
+                   EXECUTE 'ALTER TABLE {table} ADD COLUMN d int4';
+                 END $$;
+                 BEGIN; ALTER TABLE {table} ADD COLUMN e int4;"
+            ))
+            .await
+            .expect("the migrations");
+        let other = admin(&dsn).await;
+        let second = format!("ALTER TABLE {more} ADD COLUMN f int4");
+        let waiting = tokio::spawn(async move { other.batch_execute(&second).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "the second migration waits for the first's lock");
+        client.batch_execute("COMMIT").await.expect("commit the first");
+        waiting.await.expect("join").expect("the second migration");
+
+        let messages: Vec<Value> = client
+            .query(
+                "SELECT data FROM pg_logical_slot_get_changes('embedded_messages', NULL, NULL)
+                 WHERE data LIKE 'message:%'",
+                &[],
+            )
+            .await
+            .expect("the slot's changes")
+            .iter()
+            .map(|row| {
+                let data: String = row.get(0);
+                assert!(data.contains(&format!("prefix: {}/0/ddl,", names.app)), "{data}");
+                let (_, content) = data.split_once("content:").expect("a message's content");
+                serde_json::from_str(content).expect("a message's JSON")
+            })
+            .collect();
+        let kinds: Vec<&str> = messages.iter().filter_map(|m| m["type"].as_str()).collect();
+        assert_eq!(kinds, ["ddlUpdate"; 6], "one update per change, no start");
+
+        let columns = |schema: &Value, name: &str| -> Vec<String> {
+            let mut columns: Vec<String> = schema["tables"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|t| t["name"] == name)
+                .flat_map(|t| t["columns"].as_object().into_iter().flatten())
+                .map(|(column, _)| column.clone())
+                .collect();
+            columns.sort();
+            columns
+        };
+        let added: Vec<Vec<String>> = messages
+            .iter()
+            .map(|message| {
+                let (before, after) = (&message["previousSchema"], &message["schema"]);
+                [&table, &more]
+                    .into_iter()
+                    .flat_map(|name| {
+                        let before = columns(before, name);
+                        columns(after, name).into_iter().filter(move |c| !before.contains(c))
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(added, [["a"], ["b"], ["c"], ["d"], ["e"], ["f"]], "in order, one each");
+        for pair in messages.windows(2) {
+            assert_eq!(pair[1]["previousSchema"], pair[0]["schema"], "each starts where the last ended");
+        }
+        assert!(
+            messages.iter().all(|m| !m.to_string().contains("\"gone\"")),
+            "a rolled back change writes nothing"
+        );
     });
 }
 

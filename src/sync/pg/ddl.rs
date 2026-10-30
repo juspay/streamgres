@@ -544,6 +544,39 @@ pub async fn stack_outdated(client: &Client, name: &str) -> Result<bool, Storage
     Ok(row.get(0))
 }
 
+/// The setup version of the trigger stack behind the event trigger
+/// `name`, when the stack says it is this crate's: what the
+/// `streamgres_stack()` beside the trigger's function returns
+/// ([`super::ddl_triggers::STACK_VERSION`] for the current setup). `None`
+/// for a stack without the marker: zero-cache's, or one this crate
+/// installed before it marked its own. Only a marked stack is this
+/// crate's to replace; how a stack's functions read says nothing about
+/// whose it is.
+pub async fn stack_version(client: &Client, name: &str) -> Result<Option<i32>, StorageError> {
+    let schema = client
+        .query_opt(
+            "SELECT n.nspname::text FROM pg_event_trigger t
+               JOIN pg_proc fired ON fired.oid = t.evtfoid
+               JOIN pg_namespace n ON n.oid = fired.pronamespace
+               JOIN pg_proc marker ON marker.pronamespace = n.oid
+                AND marker.proname = 'streamgres_stack' AND marker.pronargs = 0
+              WHERE t.evtname = $1",
+            &[&name],
+        )
+        .await?;
+    let Some(schema) = schema else {
+        return Ok(None);
+    };
+    let schema: String = schema.get(0);
+    let version = client
+        .query_one(
+            &format!("SELECT {}.streamgres_stack()", super::sql::quote_ident(&schema)),
+            &[],
+        )
+        .await?;
+    Ok(Some(version.get(0)))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;

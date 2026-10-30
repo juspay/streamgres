@@ -103,7 +103,7 @@ psql "$DATABASE_URL" < scripts/sql/ddl-triggers.sql
 
 The checked-in stack is for app `xyne`, shard 0 and publication
 `xyne_sync_pub`. For another app, shard or publication, generate the stack
-with `trigger_stack_sql` in `src/client/ddl_triggers.rs`.
+with `trigger_stack_sql` in `src/sync/pg/ddl_triggers.rs`.
 
 ### 2. Configure and run
 

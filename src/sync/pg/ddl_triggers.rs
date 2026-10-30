@@ -1,12 +1,32 @@
-//! The DDL event-trigger stack zero-cache 1.9 installs, as SQL, for a
-//! database zero-cache has never run against (a lab, a test database), so
-//! the server hears of schema changes there the way it does on a database
-//! zero-cache serves ([`crate::sync::pg::ddl`] reads the messages).
+//! The DDL event-trigger stack, as SQL, for a database zero-cache does
+//! not run against, so the engine hears of schema changes there in the
+//! messages zero-cache 1.9's stack writes ([`crate::sync::pg::ddl`] reads
+//! them).
 //!
-//! Ported statement for statement from zero-cache's
-//! `change-source/pg/schema/{ddl,published}.ts` (Rocicorp, Apache-2.0).
+//! Ported from zero-cache's `change-source/pg/schema/{ddl,published}.ts`
+//! (Rocicorp, Apache-2.0), with two differences, which make it this
+//! crate's stack rather than zero-cache's:
+//!
+//! - The start trigger only takes the DDL lock. zero-cache's also builds
+//!   the whole published schema and writes it into the WAL as a
+//!   `ddlStart` message, on every `CREATE TABLE`, `CREATE INDEX` or
+//!   `ALTER TABLE`, an `IF NOT EXISTS` that does nothing included. The
+//!   engine reads no `ddlStart`, and with many tables that cost a
+//!   migration's every statement a quarter of a second or more and
+//!   megabytes of WAL. zero-cache does read `ddlStart`, so a stack it
+//!   shares must stay its own.
+//! - The schema holds `streamgres_stack()`, which returns
+//!   [`STACK_VERSION`]: who owns the stack, and which setup it is. An
+//!   engine updates only a stack that says it is this crate's
+//!   ([`super::ddl::stack_version`]); one without the marker may be
+//!   zero-cache's, and is adopted only by running this SQL as a migration.
 
 use super::sql::{quote_ident, quote_literal};
+
+/// The setup [`trigger_stack_sql`] installs, as `streamgres_stack()`
+/// returns it. Raise it whenever the stack's SQL changes, so engines that
+/// install their setup bring an older stack of theirs up to date.
+pub const STACK_VERSION: i32 = 1;
 
 /// The advisory lock every DDL statement takes under zero-cache's start
 /// trigger, so that the schemas its messages carry diff in order.
@@ -23,15 +43,17 @@ const DDL_TAGS: [&str; 7] = [
     "ALTER SCHEMA",
 ];
 
-/// The event-trigger stack zero-cache 1.9 installs for app `app`, shard
-/// `shard`, over `publications`, as SQL to run on a database zero-cache
-/// has never run against (a lab, a test database): the functions in the
+/// The event-trigger stack for app `app`, shard `shard`, over
+/// `publications`, as SQL to run on a database zero-cache does not run
+/// against: the functions in the
 /// schema `<app>_<shard>`, the table holding the last published schema,
-/// and the two event triggers. A database zero-cache serves has it
-/// already. Ported statement for statement from zero-cache's
-/// `change-source/pg/schema/{ddl,published}.ts`, with one field more:
-/// each column's collation name (`collationName`), which tells the
-/// engine whether a string column a migration adds orders as its text.
+/// the two event triggers, and the ownership marker (`streamgres_stack()`).
+/// Ported from zero-cache's `change-source/pg/schema/{ddl,published}.ts`
+/// with one field more, each column's collation name (`collationName`),
+/// which tells the engine whether a string column a migration adds
+/// orders as its text; and with a start trigger that only takes the
+/// lock (the module doc says why). Running it again is harmless, and is
+/// how a migration adopts a stack an older setup installed unmarked.
 pub fn trigger_stack_sql(app: &str, shard: u32, publications: &[&str]) -> String {
     let tags: Vec<String> = DDL_TAGS.iter().map(|tag| quote_literal(tag)).collect();
     let tags = tags.join(", ");
@@ -49,6 +71,7 @@ pub fn trigger_stack_sql(app: &str, shard: u32, publications: &[&str]) -> String
         .replace("@TAGS_AND_COMMENT@", &format!("{tags}, 'COMMENT'"))
         .replace("@TAGS@", &tags)
         .replace("@LOCK@", &DDL_LOCK.to_string())
+        .replace("@VERSION@", &STACK_VERSION.to_string())
 }
 
 /// [`trigger_stack_sql`]'s text, with the names to fill in marked.
@@ -243,8 +266,6 @@ BEGIN
 
   IF prev_schema_specs::text != schema_specs::text THEN
     UPDATE @SCHEMA@."publishedSchema" SET current = schema_specs;
-  ELSIF event_type = 'ddlStart' THEN
-    prev_schema_specs = NULL;
   ELSIF event_type = 'ddlUpdate' THEN
     PERFORM @SCHEMA@.notice_ignore('noop', tag, target);
     RETURN;
@@ -275,12 +296,8 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION @SCHEMA@.emit_ddl_start()
 RETURNS event_trigger AS $$
-DECLARE
-  schema_specs JSON;
-  message TEXT;
 BEGIN
   PERFORM pg_advisory_xact_lock(@LOCK@);
-  PERFORM @SCHEMA@.update_schemas('ddlStart', TG_TAG, NULL);
 END
 $$ LANGUAGE plpgsql;
 
@@ -375,6 +392,11 @@ CREATE EVENT TRIGGER @END@
   ON ddl_command_end
   WHEN TAG IN (@TAGS_AND_COMMENT@)
   EXECUTE PROCEDURE @SCHEMA@.emit_ddl_end();
+
+CREATE OR REPLACE FUNCTION @SCHEMA@.streamgres_stack()
+RETURNS int
+IMMUTABLE
+AS $$ SELECT @VERSION@ $$ LANGUAGE sql;
 "#;
 
 #[cfg(test)]
@@ -412,5 +434,25 @@ mod tests {
             .filter(|rest| rest.starts_with(|c: char| c.is_ascii_uppercase()))
             .count();
         assert_eq!(unfilled, 0, "every placeholder is filled: {sql}");
+    }
+
+    /// The start trigger takes the lock and nothing else: no schema built,
+    /// no `ddlStart` written. The stack says it is this crate's, and which
+    /// setup it is.
+    #[test]
+    fn the_start_trigger_only_locks_and_the_stack_is_marked() {
+        let sql = trigger_stack_sql("zero", 0, &["zero_public_0"]);
+        let start = sql
+            .split("FUNCTION \"zero_0\".emit_ddl_start()")
+            .nth(1)
+            .and_then(|rest| rest.split("$$ LANGUAGE plpgsql;").next())
+            .expect("the start function");
+        assert!(start.contains(&format!("pg_advisory_xact_lock({DDL_LOCK})")), "{start}");
+        assert!(!start.contains("update_schemas"), "{start}");
+        assert!(!start.contains("schema_specs"), "{start}");
+        assert!(!sql.contains("ddlStart"), "{sql}");
+        assert!(sql.contains(&format!(
+            "FUNCTION \"zero_0\".streamgres_stack()\nRETURNS int\nIMMUTABLE\nAS $$ SELECT {STACK_VERSION} $$"
+        )));
     }
 }

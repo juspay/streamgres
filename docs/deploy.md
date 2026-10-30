@@ -129,13 +129,20 @@ idle. PgBouncer's own pool settings control the PostgreSQL backend connections.
 
    The checked-in stack is for app `xyne`, shard 0 and publication
    `xyne_sync_pub`. For another app, shard or publication, generate the
-   stack with `trigger_stack_sql` in `src/client/ddl_triggers.rs`.
+   stack with `trigger_stack_sql` in `src/sync/pg/ddl_triggers.rs`.
 
    This creates the event trigger `<app>_ddl_end_<shard>`. During every
    migration, inside the migration's own transaction, it records the published
    schema before and after into the WAL. The server therefore sees each schema
    change at its commit, on any topology. Use the same app id and shard you set
    in `STREAMGRES_APP_ID` and `STREAMGRES_SHARD`.
+
+   The stack marks itself as streamgres's (`<app>_<shard>.streamgres_stack()`
+   returns its setup version). Running the SQL again is harmless, and is how
+   to update a stack after an upgrade: the server warns at startup when its
+   stack is older, or has no marker. A stack with no marker was installed by
+   zero-cache, or by streamgres before it marked its stacks; re-run the SQL
+   over it only when no zero-cache uses it.
 
 ### Replication slots
 

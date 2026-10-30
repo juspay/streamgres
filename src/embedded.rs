@@ -47,6 +47,7 @@ use crate::model::{Lsn, TableName};
 use crate::plan::{PlanCache, Policy, Side};
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
+use crate::sync::pg::ddl_triggers::STACK_VERSION;
 use crate::sync::pg::sql::quote_ident;
 use crate::sync::pg::{
     DEFAULT_READ_ROW_LIMIT, Keepalive, Settings, Transport, ddl, estimate_cache, threads,
@@ -85,9 +86,11 @@ const SETUP_LOCK: i64 = 0x5354_5245_414d_5350; // "STREAMSP"
 pub enum Setup {
     /// Creates the publication (`FOR ALL TABLES`) and installs the
     /// schema-change trigger stack ([`setup_sql`]) when either is
-    /// missing, once, under an advisory lock; what is there is left
-    /// alone. Needs a role allowed to create both: a superuser, or a
-    /// managed database's admin role.
+    /// missing, once, under an advisory lock, and updates a stack an
+    /// older setup of this crate installed and marked as its own. Any
+    /// other stack is left alone: it may be zero-cache's, which reads
+    /// what this crate's no longer writes. Needs a role allowed to create
+    /// both: a superuser, or a managed database's admin role.
     Install,
     /// Requires both, as the S2S server does, for a database a migration
     /// sets up.
@@ -1004,7 +1007,9 @@ async fn prepare_on(client: &tokio_postgres::Client, config: &Config) -> Result<
     Ok(())
 }
 
-/// Whether the database has the publication and an enabled trigger.
+/// Whether the database has the publication and an enabled trigger
+/// whose stack this engine has nothing to do to: the current setup, or a
+/// stack that is not this crate's, left as it is.
 async fn is_set_up(client: &tokio_postgres::Client, config: &Config) -> Result<bool, String> {
     let published = publication_exists(client, &config.publication)
         .await
@@ -1015,11 +1020,14 @@ async fn is_set_up(client: &tokio_postgres::Client, config: &Config) -> Result<b
     Ok(published && triggered && !outdated(client, config).await?)
 }
 
-/// Whether the installed trigger stack predates what the engine reads
-/// in its messages ([`ddl::stack_outdated`]).
+/// Whether the installed trigger stack is this crate's, from an older
+/// setup than [`STACK_VERSION`] ([`ddl::stack_version`]). A stack
+/// without the marker is not outdated here: it is not this engine's to
+/// replace (the start check warns about it instead).
 async fn outdated(client: &tokio_postgres::Client, config: &Config) -> Result<bool, String> {
-    ddl::stack_outdated(client, &config.ddl_trigger)
+    ddl::stack_version(client, &config.ddl_trigger)
         .await
+        .map(|version| version.is_some_and(|version| version < STACK_VERSION))
         .map_err(|error| format!("looking at the trigger stack: {error}"))
 }
 
