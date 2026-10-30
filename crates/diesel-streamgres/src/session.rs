@@ -225,9 +225,7 @@ impl RawTransaction {
 /// `ROLLBACK TO`, the `… PREPARED` statements, which act on another
 /// transaction, and every other statement).
 fn transaction_effect(statement: &str) -> Option<bool> {
-    let mut words = statement
-        .split(|c: char| c.is_whitespace() || c == ';')
-        .filter(|word| !word.is_empty());
+    let mut words = transaction_words(statement);
     let head = words.next()?;
     let is = |word: &str, wanted: &str| word.eq_ignore_ascii_case(wanted);
     if is(head, "BEGIN") || is(head, "START") {
@@ -239,12 +237,47 @@ fn transaction_effect(statement: &str) -> Option<bool> {
     if !["COMMIT", "END", "ROLLBACK", "ABORT"].iter().any(|end| is(head, end)) {
         return None;
     }
-    let rest: Vec<&str> = words.collect();
-    if rest.first().is_some_and(|word| is(word, "TO") || is(word, "PREPARED")) {
+    let mut next = words.next();
+    if next.is_some_and(|word| is(word, "WORK") || is(word, "TRANSACTION")) {
+        next = words.next();
+    }
+    if next.is_some_and(|word| is(word, "TO") || is(word, "PREPARED")) {
         return None;
     }
-    let chains = rest.windows(2).any(|pair| matches!(pair, [and, chain] if is(and, "AND") && is(chain, "CHAIN")));
-    Some(chains)
+    Some(
+        next.is_some_and(|word| is(word, "AND"))
+            && words.next().is_some_and(|word| is(word, "CHAIN")),
+    )
+}
+
+/// Unquoted words in a transaction-control prefix. Comments are whitespace,
+/// including nested block comments; literals and quoted names end the prefix
+/// so their contents cannot be mistaken for transaction keywords.
+fn transaction_words(statement: &str) -> impl Iterator<Item = &str> {
+    let bytes = statement.as_bytes();
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        loop {
+            match bytes.get(at).copied()? {
+                byte if byte.is_ascii_whitespace() => at += 1,
+                b'-' if bytes.get(at + 1) == Some(&b'-') => {
+                    at = position(bytes, at + 2, b"\n").map_or(bytes.len(), |end| end + 1);
+                }
+                b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                    at = past_block_comment(bytes, at + 2);
+                }
+                byte if is_word_byte(byte) => {
+                    let start = at;
+                    at += bytes[at..]
+                        .iter()
+                        .take_while(|byte| is_word_byte(**byte))
+                        .count();
+                    return Some(&statement[start..at]);
+                }
+                _ => return None,
+            }
+        }
+    })
 }
 
 /// Whether a statement holds a standard-SQL function body, whose `END`
@@ -326,10 +359,7 @@ fn calls_a_function(statement: &str) -> bool {
                 None,
                 position(bytes, at + 2, b"\n").map_or(bytes.len(), |end| end + 1),
             ),
-            b'/' if bytes.get(at + 1) == Some(&b'*') => (
-                None,
-                position(bytes, at + 2, b"*/").map_or(bytes.len(), |end| end + 2),
-            ),
+            b'/' if bytes.get(at + 1) == Some(&b'*') => (None, past_block_comment(bytes, at + 2)),
             b'$' => match dollar_tag(bytes, at) {
                 Some(tag) => (
                     None,
@@ -383,9 +413,7 @@ fn statements(sql: &str) -> Vec<&str> {
             b'-' if bytes.get(at + 1) == Some(&b'-') => {
                 position(bytes, at + 2, b"\n").map_or(bytes.len(), |end| end + 1)
             }
-            b'/' if bytes.get(at + 1) == Some(&b'*') => {
-                position(bytes, at + 2, b"*/").map_or(bytes.len(), |end| end + 2)
-            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => past_block_comment(bytes, at + 2),
             b'$' => match dollar_tag(bytes, at) {
                 Some(tag) => position(bytes, at + tag.len(), tag).map_or(bytes.len(), |end| end + tag.len()),
                 None => at + 1,
@@ -399,6 +427,30 @@ fn statements(sql: &str) -> Vec<&str> {
         .map(str::trim)
         .filter(|statement| !statement.is_empty())
         .collect()
+}
+
+/// Just past a block comment whose opening `/*` precedes `from`.
+/// PostgreSQL permits nesting; semicolons in any nested level are not
+/// statement boundaries. An unfinished comment extends to the end.
+fn past_block_comment(bytes: &[u8], mut from: usize) -> usize {
+    let mut depth = 1;
+    while from + 1 < bytes.len() {
+        match &bytes[from..from + 2] {
+            b"/*" => {
+                depth += 1;
+                from += 2;
+            }
+            b"*/" => {
+                depth -= 1;
+                from += 2;
+                if depth == 0 {
+                    return from;
+                }
+            }
+            _ => from += 1,
+        }
+    }
+    bytes.len()
 }
 
 /// Where a quoted run that began before `from` ends: just past its
@@ -689,6 +741,61 @@ mod tests {
         }
         assert!(!raw_after(&[("DO $$ BEGIN PERFORM 1; END $$", true)]));
         assert!(!raw_after(&[("SELECT 'BEGIN'", true)]));
+    }
+
+    #[test]
+    fn transaction_controls_ignore_comments_without_reading_their_contents() {
+        for begin in [
+            "/* trace */ BEGIN",
+            "-- trace\nSTART/* trace */ TRANSACTION",
+            "/* outer /* nested */ ; COMMIT; */BEGIN",
+        ] {
+            assert!(raw_after(&[(begin, true)]), "{begin}");
+            assert!(
+                raw_after(&[(begin, false)]),
+                "a failed batch may still open a block: {begin}"
+            );
+        }
+        for within in [
+            "COMMIT/* trace */AND/* trace */CHAIN",
+            "ROLLBACK WORK AND -- trace\nCHAIN",
+            "/* outer /* nested */ ; ROLLBACK; */ SELECT 1",
+        ] {
+            assert!(raw_after(&[("BEGIN", true), (within, true)]), "{within}");
+        }
+        for end in [
+            "/* trace */ COMMIT",
+            "-- trace\nROLLBACK WORK",
+            "COMMIT AND/* trace */NO CHAIN",
+        ] {
+            assert!(!raw_after(&[("BEGIN", true), (end, true)]), "{end}");
+        }
+        assert!(!raw_after(&[(
+            "/* BEGIN /* nested */ ; BEGIN; */ SELECT 1",
+            true
+        )]));
+    }
+
+    #[test]
+    fn optional_transaction_words_preserve_savepoint_rollbacks() {
+        for rollback in [
+            "ROLLBACK WORK TO SAVEPOINT s",
+            "ROLLBACK TRANSACTION TO s",
+            "ROLLBACK/* trace */WORK/* trace */TO/* trace */SAVEPOINT s",
+        ] {
+            assert!(
+                raw_after(&[("BEGIN", true), (rollback, true)]),
+                "{rollback}"
+            );
+        }
+        assert!(raw_after(&[
+            ("BEGIN", true),
+            ("COMMIT TRANSACTION AND CHAIN", true)
+        ]));
+        assert!(!raw_after(&[
+            ("BEGIN", true),
+            ("COMMIT WORK AND NO CHAIN", true)
+        ]));
     }
 
     /// A batch is read in order, and one that fails can open a block but

@@ -828,3 +828,91 @@ async fn fallback_limit_holds_until_async_stream_drop() {
         .unwrap();
     assert_eq!(retry, 2);
 }
+
+#[tokio::test]
+async fn commented_and_savepoint_transactions_keep_their_snapshot() {
+    let mut w = World::new("async-raw-snapshot").await;
+    w.conn.set_read_your_writes(Duration::ZERO);
+    let mut sibling = AsyncSyncedConnection::with_cache(
+        AsyncPgConnection::establish(&url()).await.unwrap(),
+        Arc::clone(&w.cache),
+        Route::Streamgres,
+    );
+    sibling.set_read_your_writes(Duration::ZERO);
+    let _: i32 = diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>("1"))
+        .get_result(&mut sibling)
+        .await
+        .unwrap();
+    for (i, (begin, within)) in [
+        (
+            "/* trace /* nested */ ; COMMIT; */ BEGIN ISOLATION LEVEL REPEATABLE READ",
+            "SELECT 1",
+        ),
+        (
+            "-- trace\nBEGIN ISOLATION LEVEL REPEATABLE READ",
+            "SELECT 1",
+        ),
+        (
+            "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            "SAVEPOINT s; ROLLBACK WORK TO SAVEPOINT s",
+        ),
+        (
+            "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            "SAVEPOINT s; ROLLBACK TRANSACTION TO s",
+        ),
+        (
+            "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            "COMMIT/* trace */AND/* trace */CHAIN",
+        ),
+        (
+            "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            "/* outer /* nested */ ; ROLLBACK; */ SELECT 1",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("case-{i}");
+        w.put(&name, "a").await;
+        assert_eq!(w.read(&name).await.as_deref(), Some("a"));
+        assert_eq!(w.read(&name).await.as_deref(), Some("a"));
+        assert_eq!(w.conn.last_served(), Some(Served::Cache));
+        w.conn.batch_execute(begin).await.unwrap();
+        w.conn.batch_execute(within).await.unwrap();
+        let key = w.key(&name);
+        let snapshot: String = sg_configs::table
+            .filter(sg_configs::key.eq(&key))
+            .select(sg_configs::value)
+            .first(w.conn.inner())
+            .await
+            .unwrap();
+        assert_eq!(snapshot, "a");
+        w.put(&name, "b").await;
+        let query_key = w.key_of(&name);
+        w.cache.touched(&query_key);
+        let latest: String = sg_configs::table
+            .filter(sg_configs::key.eq(&key))
+            .select(sg_configs::value)
+            .first(&mut sibling)
+            .await
+            .unwrap();
+        assert_eq!(latest, "b");
+        assert_eq!(
+            w.read(&name).await.as_deref(),
+            Some("a"),
+            "{begin}; {within}"
+        );
+        assert_eq!(w.conn.last_served(), Some(Served::Postgres));
+        w.conn
+            .batch_execute("/* finished */ ROLLBACK")
+            .await
+            .unwrap();
+        assert_eq!(w.read(&name).await.as_deref(), Some("b"));
+        assert_eq!(
+            w.conn.last_served(),
+            Some(Served::Cache),
+            "cache resumes after the block"
+        );
+    }
+    w.clean().await;
+}

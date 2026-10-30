@@ -1297,3 +1297,79 @@ fn fallback_limit_holds_across_connections_until_cursor_drop() {
     drop(cursor);
     assert_eq!(w.read("item").as_deref(), Some("value"));
 }
+
+/// Comments, savepoint rollbacks and chained blocks must preserve the
+/// PostgreSQL snapshot even when a sibling refreshes the shared cache.
+#[test]
+fn commented_and_savepoint_transactions_keep_their_snapshot() {
+    let mut w = World::new("raw-snapshot");
+    w.conn.set_read_your_writes(std::time::Duration::ZERO);
+    let mut sibling = SyncedConnection::with_cache(
+        PgConnection::establish(&url()).unwrap(),
+        Arc::clone(&w.cache),
+        Consistency::Eventual,
+    );
+    sibling.set_read_your_writes(std::time::Duration::ZERO);
+    for (i, (begin, within)) in [
+        (
+            "/* trace /* nested */ ; COMMIT; */ BEGIN ISOLATION LEVEL REPEATABLE READ",
+            "SELECT 1",
+        ),
+        (
+            "-- trace\nBEGIN ISOLATION LEVEL REPEATABLE READ",
+            "SELECT 1",
+        ),
+        (
+            "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            "SAVEPOINT s; ROLLBACK WORK TO SAVEPOINT s",
+        ),
+        (
+            "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            "SAVEPOINT s; ROLLBACK TRANSACTION TO s",
+        ),
+        (
+            "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            "COMMIT/* trace */AND/* trace */CHAIN",
+        ),
+        (
+            "BEGIN ISOLATION LEVEL REPEATABLE READ",
+            "/* outer /* nested */ ; ROLLBACK; */ SELECT 1",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let name = format!("case-{i}");
+        w.put(&name, "a");
+        assert_eq!(w.read(&name).as_deref(), Some("a"));
+        assert_eq!(w.read(&name).as_deref(), Some("a"));
+        assert_eq!(w.conn.last_served(), Some(Served::Cache));
+        w.conn.batch_execute(begin).unwrap();
+        w.conn.batch_execute(within).unwrap();
+        let key = w.key(&name);
+        let snapshot: String = sg_configs::table
+            .filter(sg_configs::key.eq(&key))
+            .select(sg_configs::value)
+            .first(w.conn.inner())
+            .unwrap();
+        assert_eq!(snapshot, "a");
+        w.put(&name, "b");
+        let query_key = w.key_of(&name);
+        w.cache.touched(&query_key);
+        let latest: String = sg_configs::table
+            .filter(sg_configs::key.eq(&key))
+            .select(sg_configs::value)
+            .first(&mut sibling)
+            .unwrap();
+        assert_eq!(latest, "b");
+        assert_eq!(w.read(&name).as_deref(), Some("a"), "{begin}; {within}");
+        assert_eq!(w.conn.last_served(), Some(Served::Postgres));
+        w.conn.batch_execute("/* finished */ ROLLBACK").unwrap();
+        assert_eq!(w.read(&name).as_deref(), Some("b"));
+        assert_eq!(
+            w.conn.last_served(),
+            Some(Served::Cache),
+            "cache resumes after the block"
+        );
+    }
+}
