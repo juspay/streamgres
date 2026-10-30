@@ -68,10 +68,12 @@ pub struct Config {
     /// The replication slot of the change feed, not configurable: each
     /// process names its own using the existing compatible naming scheme.
     pub slot: String,
-    /// `STREAMGRES_SLOT_CLEANUP_AGE_MS`: how long a Streamgres feed slot
-    /// must have stayed inactive before startup drops it (zero disables
-    /// cleanup). PostgreSQL 17 or later is required when this is enabled,
-    /// because that is where `inactive_since` is available.
+    /// `STREAMGRES_SLOT_CLEANUP_AGE_MS`: besides the slots no live process
+    /// owns, which every start and every minute drops on any version
+    /// ([`crate::sync::pg::slots`]), how long any inactive Streamgres feed
+    /// slot may stay before it is dropped (zero, the default, for no such
+    /// age). PostgreSQL 17 or later is required when this is set, because
+    /// that is where `inactive_since` is available.
     pub slot_cleanup_age: Duration,
     /// `STREAMGRES_PUBLICATION`: the publication the change feed streams;
     /// startup creates it when absent and validates it when present.
@@ -94,12 +96,6 @@ pub struct Config {
     /// `STREAMGRES_ESTIMATE_CACHE`: how many estimates it keeps (300000);
     /// not a number keeps the default.
     pub estimate_capacity: usize,
-    /// `STREAMGRES_FEED_SLOT=temporary`: the feed streams from a
-    /// temporary slot that PostgreSQL drops when its connection ends, so
-    /// a process killed outright leaves no slot holding WAL; a feed that
-    /// drops then restarts the engine from a fresh snapshot. Anything
-    /// else keeps the permanent slot, which a reconnect resumes.
-    pub temporary_slot: bool,
     /// `STREAMGRES_SNAPSHOT_ROTATION_MS`: how often a fresh exported
     /// snapshot (a temporary replication slot) is minted for reads (1000).
     pub snapshot_rotation: Duration,
@@ -376,8 +372,6 @@ impl Config {
             memory_tables: env.memory_tables(),
             estimate_ttl,
             estimate_capacity,
-            temporary_slot: first(&["STREAMGRES_FEED_SLOT"])
-                .is_some_and(|value| value.trim() == "temporary"),
             publication: first(&["STREAMGRES_PUBLICATION"])
                 .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
             ddl_trigger,
@@ -587,7 +581,6 @@ impl Config {
             memory_tables: self.memory_tables.clone(),
             estimate_ttl: self.estimate_ttl,
             estimate_capacity: self.estimate_capacity,
-            temporary_slot: self.temporary_slot,
         }
     }
 }

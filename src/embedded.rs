@@ -14,14 +14,18 @@
 //! sessions. It never runs on the host's runtime, so a host with none, or
 //! a blocking Diesel connection, can use it as well as an async one.
 //!
-//! By default the feed streams from a temporary slot, which PostgreSQL
-//! drops when the feed's connection ends, however it ends: a process
-//! killed outright leaves no slot holding WAL, and dropping an [`Engine`]
-//! needs no cleanup. The price is that a lost feed cannot be resumed, so
-//! the engine starts over on a fresh slot and snapshot; sessions end with
-//! it, and their backends reconnect. A permanent slot ([`Slot`]) outlives
-//! a dropped connection instead, so the engine serves on through it, at
-//! the price of a slot a dead process leaves behind until it is swept.
+//! The feed streams from a permanent slot of each start's own, which
+//! outlives a dropped connection: the feed reopens it and the engine
+//! serves on, its sessions and caches kept. The engine drops the slot
+//! when it stops or starts over. A process that dies without stopping
+//! (killed outright, out of memory, its machine gone) leaves the slot
+//! holding WAL until another engine on the database sweeps it: each
+//! process owns its slot through an advisory lock it holds while it runs,
+//! and any engine, at its start and every minute, drops the inactive
+//! slots whose owner is gone ([`crate::sync::pg::slots`]). On a database
+//! no engine runs against any more, nothing does; `max_slot_wal_keep_size`
+//! bounds what such a slot can hold, and the engine warns when it is
+//! unlimited.
 //!
 //! An embedded engine runs against the primary, the database its backend
 //! writes to: it is for an application of one or a few processes, each
@@ -73,10 +77,6 @@ const STEADY: Duration = Duration::from_secs(60);
 /// says (`connect_timeout`).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often an engine on a permanent slot drops the slots ended
-/// processes left behind ([`Slot::Permanent`]).
-const SWEEP_EVERY: Duration = Duration::from_secs(60);
-
 /// The advisory lock the engines of one database take to set it up, so
 /// processes starting together install the setup once.
 const SETUP_LOCK: i64 = 0x5354_5245_414d_5350; // "STREAMSP"
@@ -111,26 +111,6 @@ pub enum Setup {
     Require,
 }
 
-/// The kind of replication slot an engine's feed streams from. Each
-/// start makes a fresh one either way: the engine holds its rows in
-/// memory, so a start always begins from a fresh snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Slot {
-    /// Dropped by PostgreSQL when the feed's connection ends, however it
-    /// ends, so nothing is ever left holding WAL; but a dropped
-    /// connection costs a fresh start: a new snapshot, the sessions
-    /// ended, their caches refilled.
-    Temporary,
-    /// Kept through a dropped connection: the feed reopens it and the
-    /// engine serves on. The engine drops it when it stops or starts
-    /// over. A process that dies without stopping leaves it holding WAL
-    /// until an engine on the same database drops it, at its start and
-    /// every minute after, once it has been inactive for `cleanup_age`
-    /// (PostgreSQL 17 or later; zero never drops it, leaving the WAL to
-    /// `max_slot_wal_keep_size`).
-    Permanent { cleanup_age: Duration },
-}
-
 /// An embedded engine's configuration. [`Config::new`] gives the
 /// defaults for a database; [`Config::from_env`] reads the same
 /// variables the server does, with defaults sized for a backend's
@@ -148,8 +128,12 @@ pub struct Config {
     pub shard: u32,
     /// How the database gets set up.
     pub setup: Setup,
-    /// The kind of slot the feed streams from.
-    pub slot: Slot,
+    /// Besides the slots of ended processes no live one owns, which every
+    /// start and every minute drops, how long any inactive slot of the
+    /// prefix may stay before it is dropped too
+    /// (`STREAMGRES_SLOT_CLEANUP_AGE_MS`; zero, the default, for no such
+    /// age; PostgreSQL 17 or later when set).
+    pub slot_cleanup_age: Duration,
     /// The publication the feed streams.
     pub publication: String,
     /// The tables a publication the engine sets up holds
@@ -210,7 +194,7 @@ impl Config {
             app: DEFAULT_APP.to_owned(),
             shard: 0,
             setup: Setup::Install,
-            slot: Slot::Temporary,
+            slot_cleanup_age: Duration::ZERO,
             publication: "xyne_sync_pub".to_owned(),
             publication_tables: Vec::new(),
             schemas: vec!["public".to_owned(), format!("{DEFAULT_APP}_0")],
@@ -256,9 +240,7 @@ impl Config {
     /// included, an embedded engine's defaults otherwise (app
     /// [`DEFAULT_APP`], not the server's `zero`); and its own,
     /// `STREAMGRES_EMBEDDED_SETUP` (`install`, the default, `adopt` or
-    /// `require`) and `STREAMGRES_EMBEDDED_SLOT` (`temporary`, the
-    /// default, or `permanent`, swept after
-    /// `STREAMGRES_SLOT_CLEANUP_AGE_MS`, 5 minutes by default).
+    /// `require`).
     pub fn from_lookup<F: Fn(&str) -> Option<String>>(env: &Env<F>) -> Result<Config, String> {
         let dsn = env
             .first(&["STREAMGRES_PG_DSN", "ZERO_UPSTREAM_DB"])
@@ -284,21 +266,15 @@ impl Config {
                 ));
             }
         };
-        let slot = match env.value("STREAMGRES_EMBEDDED_SLOT").as_deref() {
-            None | Some("temporary") => Slot::Temporary,
-            Some("permanent") => Slot::Permanent {
-                cleanup_age: env.millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 300_000)?,
-            },
-            Some(other) => {
-                return Err(format!(
-                    "STREAMGRES_EMBEDDED_SLOT must be `temporary` or `permanent`, got `{other}`"
-                ));
-            }
-        };
+        if env.value("STREAMGRES_EMBEDDED_SLOT").is_some() {
+            return Err(
+                "STREAMGRES_EMBEDDED_SLOT is gone: the feed always streams from a permanent slot its process owns, and engines drop the slots of ended processes; unset it".to_owned(),
+            );
+        }
         Ok(Config {
             read_dsn: env.value("STREAMGRES_READ_PG_DSN").unwrap_or_else(|| dsn.clone()),
             setup,
-            slot,
+            slot_cleanup_age: env.millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
             publication: env
                 .value("STREAMGRES_PUBLICATION")
                 .unwrap_or(defaults.publication.clone()),
@@ -350,18 +326,14 @@ impl Config {
         })
     }
 
-    /// The engine's settings for one start: a fresh slot name, the feed
-    /// on a slot of the configured kind, no table watched.
+    /// The engine's settings for one start: a fresh slot name, no table
+    /// watched.
     fn settings(&self) -> Settings {
-        let (temporary_slot, slot_cleanup_age) = match self.slot {
-            Slot::Temporary => (true, Duration::ZERO),
-            Slot::Permanent { cleanup_age } => (false, cleanup_age),
-        };
         Settings {
             dsn: self.dsn.clone(),
             read_dsn: self.read_dsn.clone(),
             slot: threads::slot_name(),
-            slot_cleanup_age,
+            slot_cleanup_age: self.slot_cleanup_age,
             publication: self.publication.clone(),
             schemas: self.schemas.clone(),
             snapshot_rotation: self.snapshot_rotation,
@@ -378,7 +350,6 @@ impl Config {
             memory_tables: self.memory_tables.clone(),
             estimate_ttl: self.estimate_ttl,
             estimate_capacity: self.estimate_capacity,
-            temporary_slot,
         }
     }
 }
@@ -701,13 +672,11 @@ impl Supervisor {
         log_info!("the embedded engine stopped");
     }
 
-    /// Drops `slot`, an ended start's permanent slot, if it made one
-    /// (ending a backend still making it); the next start makes a fresh
-    /// one. One that cannot be dropped now is left to a later sweep.
+    /// Drops `slot`, an ended start's slot, if it made one (ending a
+    /// backend still making it); the next start makes a fresh one. One
+    /// that cannot be dropped now is left to a later sweep, its owner
+    /// lock gone with the start.
     fn release(&self, runtime: &tokio::runtime::Runtime, slot: &str) {
-        if self.config.slot == Slot::Temporary {
-            return;
-        }
         let dropped = runtime.block_on(async {
             tokio::time::timeout(STOP_GRACE, Transport::drop_slot_only(&self.config.dsn, slot)).await
         });
@@ -756,8 +725,8 @@ impl Running {
         }
     }
 
-    /// Stops the feed (a temporary slot goes with its connection; the
-    /// supervisor drops a permanent one), then the engine thread and the
+    /// Stops the feed (the supervisor drops its slot after), then the
+    /// engine thread and the
     /// runtime its sessions run on, each given [`STOP_GRACE`].
     fn tear_down(self, runtime: &tokio::runtime::Runtime) {
         self.shutdown.request();
@@ -849,9 +818,6 @@ async fn launch(
         io.shutdown_background();
         return Err("the engine started without its sink".to_owned());
     };
-    if !settings.temporary_slot && !settings.slot_cleanup_age.is_zero() {
-        io.spawn(sweep(settings.dsn.clone(), settings.slot_cleanup_age));
-    }
     let (readiness, ready) = watch::channel(false);
     let (gated, gated_events) = mpsc::unbounded_channel();
     io.spawn(gate(events, gated, readiness));
@@ -953,18 +919,6 @@ async fn gate(
         }
         if out.send(event).is_err() {
             return;
-        }
-    }
-}
-
-/// Every [`SWEEP_EVERY`], drops the permanent slots of ended processes on
-/// the database `dsn` once they have been inactive for `age`, as the
-/// engine's start did: a process that died leaves its slot holding WAL.
-async fn sweep(dsn: String, age: Duration) {
-    loop {
-        tokio::time::sleep(SWEEP_EVERY).await;
-        if let Err(error) = Transport::cleanup_inactive_slots(&dsn, age).await {
-            log_warn!("dropping the inactive slots of ended processes: {error}");
         }
     }
 }
@@ -1337,7 +1291,6 @@ mod tests {
         assert_eq!(config.read_threads, 3);
         assert_eq!(config.limits.max_disjuncts, 64);
         let settings = config.settings();
-        assert!(settings.temporary_slot);
         assert!(settings.slot.starts_with(threads::SLOT_PREFIX));
         assert_ne!(settings.slot, config.settings().slot, "a fresh slot per start");
         assert!(Config::from_lookup(&Env::new(|_: &str| None)).is_err(), "a database is required");
@@ -1357,8 +1310,7 @@ mod tests {
             _ => None,
         }));
         assert!(zero_threads.is_err(), "no threads is refused, as the server refuses it");
-        assert_eq!(config.slot, Slot::Temporary, "a temporary slot by default");
-        let slot = |pairs: &'static [(&'static str, &'static str)]| {
+        let cleanup = |pairs: &'static [(&'static str, &'static str)]| {
             Config::from_lookup(&Env::new(move |name: &str| match name {
                 "STREAMGRES_PG_DSN" => Some("postgres://primary/app".to_owned()),
                 _ => pairs
@@ -1366,26 +1318,19 @@ mod tests {
                     .find(|(key, _)| *key == name)
                     .map(|(_, value)| (*value).to_owned()),
             }))
-            .map(|config| config.slot)
+            .map(|config| config.slot_cleanup_age)
         };
+        assert_eq!(config.slot_cleanup_age, Duration::ZERO, "no age: the owner lock decides");
+        assert_eq!(settings.slot_cleanup_age, Duration::ZERO);
         assert_eq!(
-            slot(&[("STREAMGRES_EMBEDDED_SLOT", "permanent")]),
-            Ok(Slot::Permanent { cleanup_age: Duration::from_secs(300) })
+            cleanup(&[("STREAMGRES_SLOT_CLEANUP_AGE_MS", "60000")]),
+            Ok(Duration::from_secs(60))
         );
-        assert_eq!(
-            slot(&[("STREAMGRES_EMBEDDED_SLOT", "permanent"), ("STREAMGRES_SLOT_CLEANUP_AGE_MS", "0")]),
-            Ok(Slot::Permanent { cleanup_age: Duration::ZERO })
+        assert!(
+            cleanup(&[("STREAMGRES_EMBEDDED_SLOT", "temporary")])
+                .is_err_and(|error| error.contains("STREAMGRES_EMBEDDED_SLOT is gone")),
+            "the slot kind is no longer a choice"
         );
-        assert_eq!(slot(&[("STREAMGRES_EMBEDDED_SLOT", "temporary")]), Ok(Slot::Temporary));
-        assert!(slot(&[("STREAMGRES_EMBEDDED_SLOT", "durable")]).is_err());
-        let permanent = Config {
-            slot: Slot::Permanent { cleanup_age: Duration::from_secs(60) },
-            ..config.clone()
-        }
-        .settings();
-        assert!(!permanent.temporary_slot);
-        assert_eq!(permanent.slot_cleanup_age, Duration::from_secs(60));
-        assert_eq!(settings.slot_cleanup_age, Duration::ZERO, "nothing to sweep on a temporary slot");
         assert_eq!(setup("require"), Ok(Setup::Require));
         assert_eq!(setup("install"), Ok(Setup::Install));
         assert_eq!(setup("adopt"), Ok(Setup::Adopt));

@@ -294,7 +294,6 @@ src/
   bin/         server, bench and load binaries
 crates/
   diesel-streamgres/  the Diesel wrapper: a cache the engine keeps current
-vendor/        pgwire-replication with temporary slots (VENDORED.md)
 tests/         scenario tests, live PostgreSQL tests, and a 283-query suite
                taken from a production application
 scripts/       smoke, end-to-end and load scripts; CI helpers

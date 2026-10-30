@@ -65,7 +65,6 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tokio_postgres::Client;
 use tokio_postgres::config::Host;
-use tokio_postgres::error::SqlState;
 use tokio_postgres::types::PgLsn;
 
 use super::ddl::{self, DdlSource};
@@ -75,7 +74,6 @@ use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, DeleteQuery, InsertQuery, Lsn,
     RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
 };
-use crate::shutdown::Shutdown;
 use crate::sync::service::{Command, Transaction as Committed};
 use crate::sync::storage::StorageError;
 
@@ -104,11 +102,6 @@ const SILENCE: Duration = Duration::from_secs(10);
 /// How long the server is given to say whether the slot is held; no
 /// answer proves nothing.
 const ASK_WAIT: Duration = Duration::from_secs(5);
-
-/// How long opening a feed on a temporary slot waits for the slot to be
-/// made. Making a logical slot waits for every transaction open at the
-/// time to end, so a long one holds it back.
-const TEMPORARY_SLOT_WAIT: Duration = Duration::from_secs(60);
 
 /// One poll's yield: the writes delivered since the last poll, in commit
 /// order, each at its position; and the position the feed is known to
@@ -522,11 +515,6 @@ impl Watch {
 pub struct Feed {
     decoder: Decoder,
     progress: Lsn,
-    /// Transactions at or before this point are dropped
-    /// ([`Feed::skipping_through`]).
-    skip_through: Option<Lsn>,
-    /// How many have been, logged once the first one past it arrives.
-    skipped: u64,
 }
 
 impl Transport {
@@ -569,138 +557,20 @@ impl Transport {
         prepare_slot(&config, slot, publication).await.map(drop)
     }
 
-    /// Check that the deployment-provided `publication` exists, for a feed
-    /// whose slot is temporary and made when it opens
-    /// ([`Transport::open_temporary`]).
-    pub async fn require_publication(dsn: &str, publication: &str) -> Result<(), StorageError> {
-        let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
-        require_publication(&client, publication).await
-    }
-
-    /// Open the replication connection on a temporary `slot` it creates
-    /// itself, streaming `publication` from the slot's consistent point.
-    /// PostgreSQL drops the slot when this connection ends, however it
-    /// ends, so a process killed outright leaves nothing holding WAL; the
-    /// stream cannot be resumed, so a feed that drops must start over on
-    /// a fresh slot and snapshot. Returns once the slot exists, so a read
-    /// snapshot taken after it holds nothing the stream will not bring,
-    /// asking on one connection every 20 ms; gives up when `shutdown` is
-    /// requested meanwhile.
-    pub async fn open_temporary(
-        dsn: &str,
-        slot: &str,
-        publication: &str,
-        shutdown: &Shutdown,
-    ) -> Result<Self, StorageError> {
-        let config: tokio_postgres::Config = dsn.parse()?;
-        let feed = ReplicationClient::connect(
-            replication_config(&config, slot, publication).with_temporary_slot(true),
-        )
-        .await
-        .map_err(|error| StorageError(format!("replication connection: {error}")))?;
-        let transport = Transport {
-            feed,
-            config,
-            slot: slot.to_owned(),
-        };
-        let watcher = super::open(&transport.config, &tokio::runtime::Handle::current()).await?;
-        let deadline = tokio::time::Instant::now() + TEMPORARY_SLOT_WAIT;
-        loop {
-            if !transport.feed.is_running() {
-                return Err(StorageError(format!(
-                    "the replication connection ended before temporary slot {slot} was made"
-                )));
-            }
-            let made = watcher
-                .query_opt(
-                    "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
-                    &[&slot],
-                )
-                .await?
-                .is_some();
-            if made {
-                return Ok(transport);
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(StorageError(format!(
-                    "temporary slot {slot} was not made within {TEMPORARY_SLOT_WAIT:?}; a long-running transaction holds slot creation back"
-                )));
-            }
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_millis(20)) => {}
-                () = shutdown.wait() => {
-                    return Err(StorageError(format!(
-                        "stopped before temporary slot {slot} was made"
-                    )));
-                }
-            }
-        }
-    }
-
-    /// Drop only our own permanent slots on this database that PostgreSQL
-    /// has reported inactive for at least `age`. A zero age disables
-    /// cleanup. PostgreSQL
-    /// added `inactive_since` in version 17; refusing to guess on older
-    /// versions is safer than deleting a slot during a live reconnect.
-    pub async fn cleanup_inactive_slots(dsn: &str, age: Duration) -> Result<(), StorageError> {
-        if age.is_zero() {
-            return Ok(());
-        }
-        let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
-        let version: i32 = client
-            .query_one("SELECT current_setting('server_version_num')::int", &[])
-            .await?
-            .get(0);
-        if version < 170_000 {
-            return Err(StorageError(format!(
-                "STREAMGRES_SLOT_CLEANUP_AGE_MS requires PostgreSQL 17 or later (server is {version}); PostgreSQL 16 has no inactive_since timestamp, so safe age-bounded cleanup is impossible"
-            )));
-        }
-        let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
-        let prefix = super::threads::SLOT_PREFIX;
-        let slots = client
-            .query(
-                "SELECT slot_name FROM pg_replication_slots \
-                 WHERE left(slot_name, length($1)) = $1 \
-                   AND database = current_database() \
-                   AND NOT temporary AND NOT active \
-                 AND inactive_since <= clock_timestamp() - $2::bigint * interval '1 millisecond'",
-                &[&prefix, &age_ms],
-            )
-            .await?;
-        for row in slots {
-            let slot: String = row.get(0);
-            match client
-                .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
-                .await
-            {
-                Ok(_) => log_info!("dropped inactive replication slot {slot} after {age:?}"),
-                // A feed may have claimed the slot after the candidate query.
-                // PostgreSQL refuses to drop an active slot; leave it alone.
-                Err(error) if error.code() == Some(&SqlState::OBJECT_IN_USE) => {
-                    log_info!(
-                        "inactive replication slot {slot} became active during cleanup; keeping it"
-                    )
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
-    }
-
-    /// Whether `slot` exists at `dsn`.
+    /// Whether `slot` exists at `dsn` and can still be streamed from:
+    /// PostgreSQL invalidates a slot that came to hold more WAL than
+    /// `max_slot_wal_keep_size` (`wal_status` `lost`), and one so
+    /// invalidated is as good as gone.
     pub async fn slot_exists(dsn: &str, slot: &str) -> Result<bool, StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
         Ok(client
             .query_opt(
-                "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
+                "SELECT wal_status IS DISTINCT FROM 'lost' FROM pg_replication_slots WHERE slot_name = $1",
                 &[&slot],
             )
             .await?
-            .is_some())
+            .is_some_and(|row| row.get(0)))
     }
 
     /// Drop `slot`, ending the walsender holding it first (the drop is
@@ -1020,26 +890,12 @@ fn heard() {
 }
 
 impl Feed {
-    /// The feed dropping every transaction committed at or before `point`,
-    /// and the heartbeats met before it gets there: a read snapshot taken
-    /// at `point` already holds them. A temporary slot cannot be moved up
-    /// to the snapshot the way a permanent one is, so its stream starts
-    /// earlier and this skips the overlap.
-    pub fn skipping_through(self, point: Lsn) -> Self {
-        Feed {
-            skip_through: Some(point),
-            ..self
-        }
-    }
-
     /// A decoder for `catalog`, at position zero until the first event,
     /// hearing of no schema change.
     pub fn new(catalog: Arc<Catalog>) -> Self {
         Feed {
             decoder: Decoder::new(catalog),
             progress: Lsn(0),
-            skip_through: None,
-            skipped: 0,
         }
     }
 
@@ -1050,8 +906,6 @@ impl Feed {
         Feed {
             decoder: Decoder::with_ddl(catalog, ddl),
             progress: Lsn(0),
-            skip_through: None,
-            skipped: 0,
         }
     }
 
@@ -1084,21 +938,6 @@ impl Feed {
                 transaction.at = self.progress;
             }
             self.progress = self.progress.max(transaction.at);
-        }
-        if let Some(point) = self.skip_through
-            && let Some(passed) = &transaction
-        {
-            if passed.at <= point {
-                self.skipped += 1;
-                return Ok(None);
-            }
-            if passed.heartbeat.is_none() {
-                log_info!(
-                    "the feed passed the first snapshot's point {point}, after dropping {} transactions it held",
-                    self.skipped
-                );
-                self.skip_through = None;
-            }
         }
         Ok(transaction)
     }
@@ -1740,30 +1579,6 @@ mod tests {
         }
         let mut deaf = Feed::new(catalog());
         assert!(deaf.absorb(logical("slot_a/heartbeat", "7", false)).unwrap().is_none());
-    }
-
-    /// A feed skipping through a snapshot's point drops every transaction
-    /// committed at or before it and the heartbeats met before it, keeps
-    /// what comes after, and still moves its position over what it drops.
-    #[test]
-    fn a_feed_skips_what_the_first_snapshot_holds() {
-        let mut feed = Feed::new(catalog())
-            .with_heartbeat("slot_a/heartbeat".to_owned())
-            .skipping_through(Lsn::parse("0/150").unwrap());
-        assert!(feed.absorb(begin()).unwrap().is_none());
-        assert!(feed.absorb(commit("0/100")).unwrap().is_none(), "held by the snapshot");
-        assert_eq!(feed.progress(), Lsn::parse("0/100").unwrap());
-        assert!(feed.absorb(logical("slot_a/heartbeat", "1", false)).unwrap().is_none());
-        assert!(feed.absorb(begin()).unwrap().is_none());
-        assert!(feed.absorb(commit("0/150")).unwrap().is_none(), "at the point: held too");
-        assert!(feed.absorb(begin()).unwrap().is_none());
-        let after = feed.absorb(commit("0/200")).unwrap().expect("past the point");
-        assert_eq!(after.at, Lsn::parse("0/200").unwrap());
-        let beat = feed
-            .absorb(logical("slot_a/heartbeat", "2", false))
-            .unwrap()
-            .expect("a heartbeat past the point");
-        assert_eq!(beat.heartbeat, Some(2));
     }
 
     /// A JSON cell is decoded into the standard form whichever kind of

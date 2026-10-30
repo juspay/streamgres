@@ -144,12 +144,21 @@ shard or publication), and only when no zero-cache uses that app id.
 - **Each server process creates its own slot** at startup, on the database
   `STREAMGRES_PG_DSN` names. On `SIGTERM` it drops the slot. A restart needs
   nothing from the previous slot.
-- **A slot left behind by a crash holds WAL.** Either:
-  - set `STREAMGRES_SLOT_CLEANUP_AGE_MS` so the next startup drops inactive
-    `xyne_sync_slot_*` slots on its database older than that age (needs
-    PostgreSQL 17+, which records `inactive_since`), or
-  - drop them by hand: `SELECT pg_drop_replication_slot('<slot name>');`
-  - Either way, set `max_slot_wal_keep_size` as a safety net.
+- **A slot left behind by a crash holds WAL until it is swept.** Each
+  process owns its slot through an advisory lock it holds while it runs,
+  taken before the slot is made. Every process, at its start and every
+  minute, drops the inactive `xyne_sync_slot_*` slots on its database whose
+  lock it can take, their owner being gone. This works on PostgreSQL 16 and
+  later alike; `STREAMGRES_SLOT_CLEANUP_AGE_MS` can also drop any slot
+  inactive for that long (17+, which records `inactive_since`). A process
+  whose lock connection drops stops, for a restart on a fresh slot.
+- **Set `max_slot_wal_keep_size`.** With no process left running on the
+  database nothing sweeps, and PostgreSQL's default keeps WAL for a slot
+  without bound; the server warns at startup when it is `-1`. Past the size
+  set, PostgreSQL invalidates the slot rather than fill the disk, and a
+  running process whose slot is invalidated stops, for a restart on a fresh
+  one. A slot can also be dropped by hand:
+  `SELECT pg_drop_replication_slot('<slot name>');`.
 - **A process whose slot disappears while it runs stops.** It does not
   silently recreate the slot, which would skip the changes in between. The
   restarted process begins on a fresh slot and snapshot.
@@ -299,7 +308,7 @@ depend on what the defaults happen to be:
 | `STREAMGRES_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams |
 | `STREAMGRES_FORWARD_COOKIES` | `true` | forward the connection's cookies to the application server |
 | `STREAMGRES_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is created |
-| `STREAMGRES_SLOT_CLEANUP_AGE_MS` | `0` (off) | at startup, drop inactive slots of ended processes older than this (PostgreSQL 17+) |
+| `STREAMGRES_SLOT_CLEANUP_AGE_MS` | `0` (no age) | besides the slots no live process owns, which every start and every minute drops: drop any inactive slot after this long (PostgreSQL 17+) |
 | `STREAMGRES_READ_TIMEOUT_MS` | `10000` | longest a database read may take before it is cancelled and its query refused. `0` means no limit |
 | `STREAMGRES_BACKEND_TIMEOUT_MS` | `30000` | longest a call to the application server may take. `0` means no limit |
 | `STREAMGRES_PG_KEEPALIVE_IDLE_MS`, `_INTERVAL_MS`, `_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on database connections. `0` idle time turns it off |

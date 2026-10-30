@@ -8,8 +8,9 @@
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use streamgres::embedded::{Config, Engine, Session, Setup, Slot, State, setup_sql};
+use streamgres::embedded::{Config, Engine, Session, Setup, State, setup_sql};
 use streamgres::sync::pg::ddl::stack_version;
+use streamgres::sync::pg::slots::{OWNER_LOCK, sweep};
 use streamgres::sync::pg::ddl_triggers::STACK_VERSION;
 use tokio_postgres::{Client, NoTls};
 
@@ -113,7 +114,24 @@ async fn next(session: &mut Session) -> Option<Value> {
     }
 }
 
-/// The engine's whole life: start, serve, a cut feed, a fresh start, stop.
+/// The backend holding the owner lock of `slot`, if one does.
+async fn owner_of(client: &Client, slot: &str) -> Option<i32> {
+    client
+        .query_opt(
+            "SELECT pid FROM pg_locks
+              WHERE locktype = 'advisory' AND granted AND objsubid = 2
+                AND classid::int8 = $1::int8
+                AND objid::int8 = (hashtext($2)::int8 + 4294967296) % 4294967296",
+            &[&i64::from(OWNER_LOCK), &slot],
+        )
+        .await
+        .expect("the owner lock")
+        .map(|row| row.get(0))
+}
+
+/// The engine's whole life: start on a permanent slot it owns, serve,
+/// start over on a fresh slot when its hold on the slot is lost, stop
+/// with no slot left behind.
 #[test]
 fn an_embedded_engine_serves_restarts_and_leaves_no_slot() {
     let Some(dsn) = dsn("life") else { return };
@@ -129,7 +147,8 @@ fn an_embedded_engine_serves_restarts_and_leaves_no_slot() {
         let engine = Engine::start(config(&dsn, &names));
         reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
         let first = engine.slot().expect("a slot while it runs");
-        assert_eq!(slot(&client, &first).await, Some(true), "a temporary slot");
+        assert_eq!(slot(&client, &first).await, Some(false), "a permanent slot");
+        let owner = owner_of(&client, &first).await.expect("the engine owns its slot");
 
         let mut session = engine.connect().expect("a session");
         let hello = next(&mut session).await.expect("hello");
@@ -154,14 +173,12 @@ fn an_embedded_engine_serves_restarts_and_leaves_no_slot() {
         assert_eq!(delta[0], "delta", "{delta}");
         assert_eq!(delta[1]["changes"][0]["put"][0]["id"], 4);
 
+        // A sweep may drop a slot whose owner lock is gone, so an engine
+        // that loses its hold starts over rather than stream on.
         client
-            .execute(
-                "SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots
-                 WHERE slot_name = $1 AND active_pid IS NOT NULL",
-                &[&first],
-            )
+            .execute("SELECT pg_terminate_backend($1)", &[&owner])
             .await
-            .expect("cut the feed");
+            .expect("cut the owner lock's connection");
         let ended = tokio::time::timeout(Duration::from_secs(10), async {
             while session.recv().await.is_some() {}
         })
@@ -173,7 +190,8 @@ fn an_embedded_engine_serves_restarts_and_leaves_no_slot() {
         assert_eq!(next(&mut again).await.expect("hello")[0], "hello");
         let second = engine.slot().expect("a slot while it runs");
         assert_ne!(second, first, "a fresh slot");
-        assert_eq!(slot(&client, &first).await, None, "the cut slot is gone");
+        assert!(owner_of(&client, &second).await.is_some(), "owned too");
+        assert_eq!(slot(&client, &first).await, None, "the old slot is dropped");
 
         let stopping = engine.clone();
         tokio::task::spawn_blocking(move || stopping.stop())
@@ -203,67 +221,54 @@ fn a_stop_while_the_start_is_held_back_returns_at_once() {
         let names = names("stop");
         let client = admin(&dsn).await;
         set_up(&client, &names).await;
-        let mut kinds = vec![Slot::Temporary];
-        // A cleanup age needs `inactive_since`, which PostgreSQL 17 added.
-        if dsn.at_least(17, "the permanent-slot case of a_stop_while_the_start_is_held_back") {
-            kinds.push(Slot::Permanent { cleanup_age: Duration::from_secs(3600) });
-        }
-        for kind in kinds {
-            let holder = admin(&dsn).await;
-            holder
-                .batch_execute("BEGIN; SELECT pg_current_xact_id();")
+        let holder = admin(&dsn).await;
+        holder
+            .batch_execute("BEGIN; SELECT pg_current_xact_id();")
+            .await
+            .expect("an open transaction");
+        let engine = Engine::start(config(&dsn, &names));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(engine.state(), State::Starting, "held back by the transaction");
+        let called = Instant::now();
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop())
+            .await
+            .expect("stop");
+        assert!(
+            called.elapsed() < Duration::from_secs(3),
+            "stop waited {:?} for the transaction",
+            called.elapsed()
+        );
+        assert_eq!(engine.state(), State::Stopped);
+        holder.batch_execute("COMMIT").await.expect("commit");
+        // The slot whose making was abandoned may still be made once
+        // the transaction ends, before its maker notices it is gone.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let leftover: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM pg_replication_slots WHERE database = current_database()",
+                    &[],
+                )
                 .await
-                .expect("an open transaction");
-            let mut held = config(&dsn, &names);
-            held.slot = kind;
-            let engine = Engine::start(held);
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            assert_eq!(engine.state(), State::Starting, "{kind:?}: held back by the transaction");
-            let called = Instant::now();
-            let stopping = engine.clone();
-            tokio::task::spawn_blocking(move || stopping.stop())
-                .await
-                .expect("stop");
-            assert!(
-                called.elapsed() < Duration::from_secs(3),
-                "{kind:?}: stop waited {:?} for the transaction",
-                called.elapsed()
-            );
-            assert_eq!(engine.state(), State::Stopped);
-            holder.batch_execute("COMMIT").await.expect("commit");
-            // The slot whose making was abandoned may still be made once
-            // the transaction ends, before its maker notices it is gone.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let leftover: i64 = client
-                    .query_one(
-                        "SELECT count(*) FROM pg_replication_slots WHERE database = current_database()",
-                        &[],
-                    )
-                    .await
-                    .expect("slots")
-                    .get(0);
-                if leftover == 0 {
-                    break;
-                }
-                assert!(Instant::now() < deadline, "{kind:?}: {leftover} slot(s) left behind");
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                .expect("slots")
+                .get(0);
+            if leftover == 0 {
+                break;
             }
+            assert!(Instant::now() < deadline, "{leftover} slot(s) left behind");
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     });
 }
 
-/// On a permanent slot the engine serves on through a dropped feed
-/// connection, its sessions and slot kept; it drops a dead process's
-/// slot once inactive past the cleanup age, and its own when it stops.
+/// On its permanent slot the engine serves on through a dropped feed
+/// connection, its sessions and slot kept; at its start it drops the slot
+/// a dead process left, whose owner lock nobody holds, on any version;
+/// and its own when it stops.
 #[test]
 fn a_permanent_slot_keeps_the_engine_serving_through_a_dropped_feed() {
     let Some(dsn) = dsn("permanent") else { return };
-    // Sweeping a dead process's slot by age needs PostgreSQL 17's
-    // `inactive_since`.
-    if !dsn.at_least(17, "a_permanent_slot_keeps_the_engine_serving_through_a_dropped_feed") {
-        return;
-    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -278,11 +283,8 @@ fn a_permanent_slot_keeps_the_engine_serving_through_a_dropped_feed() {
             .execute("SELECT pg_create_logical_replication_slot($1, 'pgoutput')", &[&dead])
             .await
             .expect("a dead process's slot");
-        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let mut permanent = config(&dsn, &names);
-        permanent.slot = Slot::Permanent { cleanup_age: Duration::from_millis(200) };
-        let engine = Engine::start(permanent);
+        let engine = Engine::start(config(&dsn, &names));
         reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
         assert_eq!(slot(&client, dead).await, None, "the dead process's slot is swept");
         let own = engine.slot().expect("a slot while it runs");
@@ -329,6 +331,55 @@ fn a_permanent_slot_keeps_the_engine_serving_through_a_dropped_feed() {
             .await
             .expect("stop");
         assert_eq!(slot(&client, &own).await, None, "its slot goes with it");
+    });
+}
+
+/// A sweep drops a slot of the prefix only once nobody holds its owner
+/// lock: one whose owner lives is kept however long it sits idle, one
+/// whose owner is gone is dropped, and so is the first once its owner's
+/// connection ends. A slot of another name is never the sweep's.
+#[test]
+fn a_slot_is_swept_only_once_its_owner_is_gone() {
+    let Some(dsn) = dsn("sweep") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let client = admin(&dsn).await;
+        let (owned, dead, other) = (
+            "xyne_sync_slot_000000000000000000000000000000owned",
+            "xyne_sync_slot_0000000000000000000000000000000dead",
+            "someone_elses_slot",
+        );
+        let owner = admin(&dsn).await;
+        owner
+            .execute("SELECT pg_advisory_lock($1, hashtext($2))", &[&OWNER_LOCK, &owned])
+            .await
+            .expect("the owner's lock");
+        for name in [owned, dead, other] {
+            client
+                .execute("SELECT pg_create_logical_replication_slot($1, 'pgoutput')", &[&name])
+                .await
+                .expect("a slot");
+        }
+
+        assert_eq!(sweep(&dsn, Duration::ZERO).await.expect("a sweep"), 1);
+        assert_eq!(slot(&client, owned).await, Some(false), "its owner lives");
+        assert_eq!(slot(&client, dead).await, None, "its owner is gone");
+        assert_eq!(slot(&client, other).await, Some(false), "not the sweep's");
+
+        drop(owner);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sweep(&dsn, Duration::ZERO).await.expect("a sweep") == 0 {
+            assert!(Instant::now() < deadline, "the owner's lock outlived its connection");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(slot(&client, owned).await, None, "dropped once its owner went");
+        client
+            .execute("SELECT pg_drop_replication_slot($1)", &[&other])
+            .await
+            .expect("drop the other slot");
     });
 }
 

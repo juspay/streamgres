@@ -21,7 +21,7 @@
 //! | [`plan`] | The join planner: which side of each join is read whole and how a page is read, from PostgreSQL's estimates. |
 //! | [`live`] | Following a backend's SQL: the S2S protocol over any transport (a WebSocket, or channels in the same process), and the task that maps the engine's events onto each connection's subscriptions. |
 //! | [`wire`] | Rows and keys as the JSON both protocols send. |
-//! | [`embedded`] | The engine inside a host process: started and restarted in the background on a temporary slot, reached through sessions of S2S frames over channels. |
+//! | [`embedded`] | The engine inside a host process: started and restarted in the background on a permanent slot it owns, reached through sessions of S2S frames over channels. |
 //! | [`env`] | Settings from the environment, legacy names included, as the server and an embedded engine both read them. |
 //! | `client` (feature `server`) | The client side: the WebSocket server the sync client connects to, the sync protocol, the AST translation, and each client group's view. It drives the engine only through [`sync::Service`]'s two channels. |
 //! | [`log`] | The leveled log the engine writes to: a log thread and stderr in the server, the `log` facade in a host process. |

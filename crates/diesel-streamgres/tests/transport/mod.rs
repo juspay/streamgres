@@ -63,8 +63,9 @@ mod embedded {
     use streamgres::embedded::{Config, Engine, State};
 
     /// The engine, started on first use and serving: one for every test
-    /// of the binary, stopped with the process (its temporary slot goes
-    /// with its connection).
+    /// of the binary, never stopped. Its slot outlives the process, and the
+    /// next engine on the database drops it, its owner lock gone with the
+    /// process.
     pub fn engine() -> Engine {
         static ENGINE: OnceLock<Engine> = OnceLock::new();
         ENGINE

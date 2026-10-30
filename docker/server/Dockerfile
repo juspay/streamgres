@@ -27,8 +27,6 @@ COPY src ./src
 # The workspace's other crates (the Diesel wrapper) are not part of the
 # server, but the locked workspace must resolve to build it.
 COPY crates ./crates
-# The engine's path dependency (vendor/pgwire-replication/VENDORED.md).
-COPY vendor ./vendor
 RUN cargo build --release --locked --bin server \
     && mkdir -p /out/app /out/var/lib/streamgres \
     && cp target/release/server /out/app/server
