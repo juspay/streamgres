@@ -81,7 +81,7 @@ use crate::cache::{Cache, Database, Live};
 use crate::key::QueryKey;
 use crate::listen::Listening;
 use crate::row::OwnedRow;
-use crate::materialized::{Materialized, Snapshot};
+use crate::materialized::{BuildError, Materialized, Snapshot};
 use crate::subscriptions::{Outcome, Subscriptions, Verdict};
 use crate::types::TableTypes;
 
@@ -166,6 +166,7 @@ const REWEIGH_BYTES: usize = 64 * 1024;
 /// | `STREAMGRES_S2S_SILENCE_MS`         | a silent socket is taken for dead  | 10000   |
 /// | `STREAMGRES_S2S_MAX_LAG_MS`         | the engine's lag the cache allows; 0 trusts it | 2000 |
 /// | `STREAMGRES_S2S_TOKEN`              | bearer token the engine asks for   | none    |
+/// | `STREAMGRES_S2S_MAX_JOIN_WORK`      | steps one build of a joined result may take | 1000000 |
 ///
 /// A number that is missing, not a number, or zero leaves the default;
 /// an empty token is no token.
@@ -182,6 +183,10 @@ pub struct Config {
     /// Sent as `Authorization: Bearer <token>` when each socket opens,
     /// for an engine started with `STREAMGRES_S2S_TOKEN`.
     pub token: Option<String>,
+    /// How many steps one build of a joined result may take
+    /// ([`crate::materialized::Materialized::keyed`]). A cached read over
+    /// it goes to Postgres; a callback over it ends.
+    pub max_join_work: u64,
 }
 
 impl std::fmt::Debug for Config {
@@ -194,6 +199,7 @@ impl std::fmt::Debug for Config {
             .field("silence", &self.silence)
             .field("max_lag", &self.max_lag)
             .field("token", &self.token.as_ref().map(|_| ".."))
+            .field("max_join_work", &self.max_join_work)
             .finish()
     }
 }
@@ -208,6 +214,7 @@ impl Default for Config {
             silence: DEFAULT_SILENCE,
             max_lag: DEFAULT_MAX_LAG,
             token: None,
+            max_join_work: crate::materialized::DEFAULT_JOIN_WORK,
         }
     }
 }
@@ -235,6 +242,9 @@ impl Config {
             token: std::env::var("STREAMGRES_S2S_TOKEN")
                 .ok()
                 .filter(|token| !token.is_empty()),
+            max_join_work: env_number("STREAMGRES_S2S_MAX_JOIN_WORK")
+                .and_then(|steps| u64::try_from(steps).ok())
+                .unwrap_or(defaults.max_join_work),
         }
     }
 }
@@ -283,6 +293,8 @@ struct Shared {
     silence: Duration,
     /// How far behind the engine may be before reads go to Postgres.
     max_lag: Duration,
+    /// How many steps one build of a joined result may take.
+    max_join_work: u64,
     /// Column types by table, learnt on the first rows-mode subscribe of
     /// a table and reused for every delta and resubscribe after; looked
     /// up again when a snapshot names a column they lack, which is how a
@@ -495,7 +507,7 @@ impl Live for LiveStore {
             Ok(rows) => Some(rows),
             Err(error) => {
                 if let Some(worker) = self.worker.upgrade() {
-                    worker.fall_back(self.id, &self.key, error.0);
+                    worker.fall_back(self.id, &self.key, error.to_string());
                 }
                 None
             }
@@ -675,6 +687,7 @@ impl EngineClient {
             token: config.token.clone(),
             silence: config.silence,
             max_lag: config.max_lag,
+            max_join_work: config.max_join_work,
             types: Mutex::new(HashMap::new()),
             fallbacks: Mutex::new(Vec::new()),
             refusals: Mutex::new(Vec::new()),
@@ -1340,6 +1353,7 @@ impl Worker {
             Ok(materialized) => materialized,
             Err(error) => return fallback(error.0),
         };
+        materialized.set_work_budget(shared.max_join_work);
         let mut state = self.state.lock().expect("state");
         let Some(key) = state.by_id.get(&id).cloned() else {
             state.materialized.remove(&id);
@@ -1367,10 +1381,13 @@ impl Worker {
             Store::Ready(_) => Vec::new(),
         };
         if let Some(listening) = &listening {
-            if let Err(reason) = listening.built(&materialized) {
+            if let Err(error) = listening.built(&materialized) {
                 drop(store);
                 drop(state);
-                return fallback(reason);
+                if let BuildError::OverBudget(_) = error {
+                    listening.end_over_budget(error.to_string());
+                }
+                return fallback(error.to_string());
             }
             for body in queued {
                 listening.apply(&mut materialized, body, apply_delta);
@@ -1400,7 +1417,7 @@ impl Worker {
                 state.materialized.remove(&id);
                 let since = state.since.get(&id).copied();
                 drop(state);
-                shared.fell_back(error.0);
+                shared.fell_back(error.to_string());
                 Verdict::Accepted { since }
             }
         }
@@ -2362,12 +2379,21 @@ mod tests {
     fn worker_waiting(
         wait: Duration,
     ) -> (Arc<Worker>, mpsc::UnboundedReceiver<Outgoing>, Arc<Shared>) {
+        worker_budgeted(wait, crate::materialized::DEFAULT_JOIN_WORK)
+    }
+
+    /// [`worker_waiting`] whose joined results may take `join_work` steps.
+    fn worker_budgeted(
+        wait: Duration,
+        join_work: u64,
+    ) -> (Arc<Worker>, mpsc::UnboundedReceiver<Outgoing>, Arc<Shared>) {
         let shared = Arc::new(Shared {
             by_key: Mutex::new(HashMap::new()),
             max_subscriptions: 100,
             token: None,
             silence: DEFAULT_SILENCE,
             max_lag: DEFAULT_MAX_LAG,
+            max_join_work: join_work,
             types: Mutex::new(HashMap::new()),
             fallbacks: Mutex::new(Vec::new()),
             refusals: Mutex::new(Vec::new()),
@@ -2545,6 +2571,122 @@ mod tests {
         );
         inbound(&worker, &delta_of(1, json!([]), json!([{"id": 3}])));
         assert_eq!(changes(), vec![Change::Removed((3, "c".into()))], "followed again");
+    }
+
+    /// The types of table `c`, joined under `t` on `t.id = c.up`.
+    fn c_types() -> Arc<TableTypes> {
+        let base = |name: &str| ColumnType {
+            name: name.into(),
+            oid: 23,
+            typmod: -1,
+            kind: TypeKind::Base,
+        };
+        Arc::new(TableTypes {
+            columns: vec![base("id"), base("up")],
+        })
+    }
+
+    /// An `accepted` in rows mode for `t` row 1 joined to `children`
+    /// rows of `c`, projecting `t.id` and `c.id`.
+    fn accepted_join(id: u64, children: i32) -> String {
+        let rows: Vec<Json> = (0..children).map(|c| json!({"id": c, "up": 1})).collect();
+        json!(["accepted", {
+            "id": id,
+            "nodes": [
+                {"table": "t", "key": ["id"], "parent": null, "rows": [{"id": 1, "name": "a"}]},
+                {"table": "c", "key": ["id"], "parent": "t", "parent_column": "id",
+                 "child_column": "up", "inner": true, "rows": rows}
+            ],
+            "columns": [["t", "id"], ["c", "id"]],
+            "names": ["id", "child"],
+            "count": false,
+            "order": [["id", "asc"]],
+            "limit": null,
+            "offset": 0
+        }])
+        .to_string()
+    }
+
+    /// A cached join whose result needs more work than the budget goes
+    /// to Postgres refills, its reason recorded as a fallback: not a
+    /// refusal, which would keep the query from the engine for a while,
+    /// since the rows may shrink.
+    #[test]
+    fn a_cached_join_over_its_budget_falls_back_without_a_refusal() {
+        let (worker, _outgoing, shared) = worker_budgeted(Duration::from_secs(5), 10);
+        shared.types.lock().unwrap().insert("t".to_string(), t_types());
+        shared.types.lock().unwrap().insert("c".to_string(), c_types());
+        let handle = subscribing(&worker);
+        inbound(&worker, &accepted_join(1, 20));
+        let Outcome::Verdict(Verdict::Accepted { .. }) = handle.join().unwrap() else {
+            panic!("refills");
+        };
+        let fallbacks = shared.fallbacks.lock().unwrap().clone();
+        assert!(
+            fallbacks
+                .last()
+                .is_some_and(|reason| reason.contains("needs more work than its budget allows")),
+            "{fallbacks:?}"
+        );
+        assert!(shared.refusals.lock().unwrap().is_empty(), "not refused");
+        assert!(!worker.state.lock().unwrap().materialized.contains_key(&1), "its store went");
+    }
+
+    /// A callback on a join is followed while its result fits the
+    /// budget; once a change takes it past, there is no Postgres to read
+    /// instead, so the subscription ends and says why, and later deltas
+    /// build nothing.
+    #[test]
+    fn a_listened_join_past_its_budget_ends_and_says_why() {
+        use crate::listen::Change;
+        let (worker, _outgoing, shared) = worker_budgeted(Duration::from_secs(5), 40);
+        let listening = listened(&shared, "postgres://unused");
+        shared.types.lock().unwrap().insert("c".to_string(), c_types());
+        let changes = || listening.take::<(Integer, Integer), (i32, i32)>();
+        let handle = subscribing(&worker);
+        inbound(&worker, &accepted_join(1, 3));
+        let Outcome::Verdict(Verdict::Rows { .. }) = handle.join().unwrap() else {
+            panic!("rows mode");
+        };
+        assert_eq!(
+            changes(),
+            vec![
+                Change::Present((1, 0)),
+                Change::Present((1, 1)),
+                Change::Present((1, 2))
+            ]
+        );
+        assert!(listening.ended().is_none());
+
+        let more: Vec<Json> = (3..40).map(|c| json!({"id": c, "up": 1})).collect();
+        let delta = |put: Vec<Json>| {
+            json!(["delta", {"id": 1, "changes": [{"table": "c", "put": put, "del": []}]}]).to_string()
+        };
+        inbound(&worker, &delta(more));
+        let reason = listening.ended().expect("ended");
+        assert!(reason.contains("needs more work than its budget allows"), "{reason}");
+        assert!(listening.over_budget());
+        assert_eq!(changes(), Vec::new(), "no changes past the budget");
+        inbound(&worker, &delta(vec![json!({"id": 99, "up": 1})]));
+        assert_eq!(changes(), Vec::new(), "nothing after it ended");
+    }
+
+    /// A callback on a join whose first result is already past the
+    /// budget is not started: the subscribe learns it ended over budget,
+    /// which it reports apart from a query the engine cannot serve.
+    #[test]
+    fn a_listened_join_that_starts_past_its_budget_is_refused_as_such() {
+        let (worker, _outgoing, shared) = worker_budgeted(Duration::from_secs(5), 40);
+        let listening = listened(&shared, "postgres://unused");
+        shared.types.lock().unwrap().insert("c".to_string(), c_types());
+        let handle = subscribing(&worker);
+        inbound(&worker, &accepted_join(1, 40));
+        let Outcome::Verdict(Verdict::Accepted { .. }) = handle.join().unwrap() else {
+            panic!("not in rows mode");
+        };
+        assert!(listening.over_budget());
+        let reason = listening.ended().expect("ended");
+        assert!(reason.contains("needs more work than its budget allows"), "{reason}");
     }
 
     /// A subscription is checked against the database it was rendered

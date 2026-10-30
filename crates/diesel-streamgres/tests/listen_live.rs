@@ -528,3 +528,58 @@ async fn notification_bodies_share_and_release_their_watches() {
         .execute(&mut other)
         .unwrap();
 }
+
+/// A join whose result needs more work than the client's budget is
+/// refused as over budget (`SubscribeError::WorkBudget`), not as a query
+/// the engine cannot follow: with the default budget the same subscribe
+/// succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_past_the_work_budget_is_refused_as_such() {
+    let Some((engine, database, mut other)) = start() else {
+        return;
+    };
+    let config = diesel_streamgres::engine::Config {
+        max_join_work: 5,
+        ..diesel_streamgres::engine::Config::from_env()
+    };
+    let Some(tight) = transport::client(config) else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !tight.is_connected() {
+        assert!(Instant::now() < deadline, "the engine did not connect");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    other
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS sg_budget_parent (id int4 PRIMARY KEY);
+             CREATE TABLE IF NOT EXISTS sg_budget_child (id int4 PRIMARY KEY, parent_id int4 NOT NULL);
+             INSERT INTO sg_budget_parent VALUES (1) ON CONFLICT DO NOTHING;
+             INSERT INTO sg_budget_child SELECT n, 1 FROM generate_series(1, 10) n ON CONFLICT DO NOTHING;",
+        )
+        .expect("the joined tables");
+    let sql = "SELECT sg_budget_parent.id, sg_budget_child.id FROM sg_budget_parent \
+               INNER JOIN sg_budget_child ON (sg_budget_child.parent_id = sg_budget_parent.id)";
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let reason = loop {
+        match tight
+            .subscribe_sql(&database, sql, |_: Change<diesel_streamgres::SqlRow>| async {})
+            .await
+        {
+            Err(diesel_streamgres::SubscribeError::WorkBudget(reason)) => break reason,
+            Err(error) if Instant::now() < deadline => {
+                // The engine may not have taken the new tables in yet.
+                let _ = error;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!("refused, but not over budget: {error}"),
+            Ok(_) => panic!("ten joined rows fit a budget of five steps"),
+        }
+    };
+    assert!(reason.contains("needs more work than its budget allows"), "{reason}");
+
+    let subscribed = engine
+        .subscribe_sql(&database, sql, |_: Change<diesel_streamgres::SqlRow>| async {})
+        .await;
+    assert!(subscribed.is_ok(), "the default budget takes it: {:?}", subscribed.err());
+}

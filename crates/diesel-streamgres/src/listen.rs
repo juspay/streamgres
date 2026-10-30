@@ -96,7 +96,7 @@ use tokio::sync::{Notify, broadcast};
 
 use crate::engine::EngineClient;
 use crate::key::QueryKey;
-use crate::materialized::Materialized;
+use crate::materialized::{BuildError, Materialized};
 use crate::encode::oid;
 use crate::row::OwnedRow;
 use crate::subscriptions::{Subscriptions, Verdict};
@@ -230,6 +230,10 @@ pub(crate) struct Listening {
     /// Why the engine no longer follows the query, once it does not: the
     /// subscription has ended.
     ended: Mutex<Option<String>>,
+    /// Whether it ended because its result needs more work than the
+    /// budget allows ([`BuildError::OverBudget`]), which a subscribe
+    /// reports apart from a query the engine cannot serve.
+    over_budget: AtomicBool,
     /// The database the engine streams, to look column types up on when
     /// the engine connection comes back without them.
     database_url: String,
@@ -251,6 +255,7 @@ impl Listening {
             errors: Mutex::new(Vec::new()),
             missed: Mutex::new(VecDeque::new()),
             ended: Mutex::new(None),
+            over_budget: AtomicBool::new(false),
             database_url,
             database,
         })
@@ -323,13 +328,27 @@ impl Listening {
         self.ended.lock().expect("ended").clone()
     }
 
+    /// The result needs more work than the budget allows: there is no
+    /// Postgres to read it from instead, as a cached read has, so the
+    /// subscription ends ([`Listening::end`]) and says why. Its rows may
+    /// shrink back under the budget, so a later subscribe may succeed.
+    pub(crate) fn end_over_budget(&self, reason: String) {
+        self.over_budget.store(true, Ordering::Release);
+        self.end(reason);
+    }
+
+    /// Whether the subscription ended over its work budget.
+    pub(crate) fn over_budget(&self) -> bool {
+        self.over_budget.load(Ordering::Acquire)
+    }
+
     /// A store the engine side has just built for the subscription, from
     /// the engine's snapshot. The first one starts it: its rows are
     /// [`Change::Present`]. One built after the connection came back is
     /// compared with the result last known, and the difference is the
     /// changes. A result that cannot be encoded is the reason the engine
     /// side stops serving the query's rows.
-    pub(crate) fn built(&self, store: &Materialized) -> Result<(), String> {
+    pub(crate) fn built(&self, store: &Materialized) -> Result<(), BuildError> {
         let previous = self.previous.lock().expect("previous").take();
         let changes = if self.started.swap(true, Ordering::AcqRel) {
             match previous {
@@ -348,8 +367,7 @@ impl Listening {
                     .collect()
             })
         };
-        let changes = changes.map_err(|error| error.0)?;
-        self.push(changes);
+        self.push(changes?);
         Ok(())
     }
 
@@ -391,36 +409,41 @@ impl Listening {
         body: Json,
         apply: impl FnOnce(&mut Materialized, Json),
     ) {
+        if self.ended().is_some() {
+            apply(store, body);
+            return;
+        }
         let changes = if store.is_plain() {
-            plain_changes(store, &body).map(|changes| {
-                apply(store, body);
-                changes
-                    .into_iter()
-                    .map(|(identity, old)| {
-                        let new = store
-                            .root_row(&identity)
-                            .map(|row| store.project_root(row))
-                            .transpose()?;
-                        Ok(RowChange {
-                            identity,
-                            old,
-                            new,
-                            present: false,
+            plain_changes(store, &body)
+                .map_err(BuildError::from)
+                .and_then(|changes| {
+                    apply(store, body);
+                    changes
+                        .into_iter()
+                        .map(|(identity, old)| {
+                            let new = store
+                                .root_row(&identity)
+                                .map(|row| store.project_root(row))
+                                .transpose()?;
+                            Ok(RowChange {
+                                identity,
+                                old,
+                                new,
+                                present: false,
+                            })
                         })
-                    })
-                    .collect::<Result<Vec<_>, crate::encode::Unsupported>>()
-            })
+                        .collect::<Result<Vec<_>, crate::encode::Unsupported>>()
+                        .map_err(BuildError::from)
+                })
         } else {
             let before = store.keyed();
             apply(store, body);
-            Ok(before.and_then(|before| {
-                let after = store.keyed()?;
-                Ok(difference(before, after))
-            }))
+            before.and_then(|before| Ok(difference(before, store.keyed()?)))
         };
-        match changes.and_then(|changes| changes) {
+        match changes {
             Ok(changes) => self.push(changes),
-            Err(error) => self.failed(error.0),
+            Err(error @ BuildError::OverBudget(_)) => self.end_over_budget(error.to_string()),
+            Err(error @ BuildError::Unsupported(_)) => self.failed(error.to_string()),
         }
     }
 }
@@ -492,10 +515,7 @@ fn difference(before: Vec<(String, OwnedRow)>, after: Vec<(String, OwnedRow)>) -
 }
 
 /// The changes from the result of `before` to that of `after`.
-fn compare(
-    before: &Materialized,
-    after: &Materialized,
-) -> Result<Vec<RowChange>, crate::encode::Unsupported> {
+fn compare(before: &Materialized, after: &Materialized) -> Result<Vec<RowChange>, BuildError> {
     Ok(difference(before.keyed()?, after.keyed()?))
 }
 
@@ -551,6 +571,10 @@ pub enum SubscribeError {
     InvalidInput(String),
     Database(String),
     Unsupported(String),
+    /// The query's result needs more work than the engine client's join
+    /// budget allows (`STREAMGRES_S2S_MAX_JOIN_WORK`). Unlike
+    /// [`SubscribeError::Unsupported`] it can pass: the rows may shrink.
+    WorkBudget(String),
     Unavailable(String),
     Capacity(String),
     Task(String),
@@ -563,6 +587,7 @@ impl std::fmt::Display for SubscribeError {
             Self::InvalidInput(reason)
             | Self::Database(reason)
             | Self::Unsupported(reason)
+            | Self::WorkBudget(reason)
             | Self::Unavailable(reason)
             | Self::Capacity(reason)
             | Self::Task(reason) => reason,
@@ -759,10 +784,15 @@ impl EngineClient {
                 Verdict::Accepted { .. } => {
                     let engine = unclaimed.engine.clone();
                     drop(unclaimed);
-                    Err(SubscribeError::Unsupported(format!(
-                        "the engine follows this query only by refills, not with its rows: {}",
-                        engine.fallbacks().last().cloned().unwrap_or_default()
-                    )))
+                    Err(match listening.ended() {
+                        Some(reason) if listening.over_budget() => {
+                            SubscribeError::WorkBudget(reason)
+                        }
+                        _ => SubscribeError::Unsupported(format!(
+                            "the engine follows this query only by refills, not with its rows: {}",
+                            engine.fallbacks().last().cloned().unwrap_or_default()
+                        )),
+                    })
                 }
                 Verdict::Refused(reason) => {
                     let engine = unclaimed.engine.clone();

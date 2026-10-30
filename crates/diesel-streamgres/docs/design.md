@@ -178,15 +178,36 @@ between. The build:
    come out in primary-key order by value (9 before 10).
 2. A hash join down each edge, the joined tables depth first. An inner
    edge drops a parent with no match; a left edge extends it with NULLs.
+   Each child's matching rows come in key order, and earlier children
+   vary slowest, as Postgres composes the join.
 3. `OFFSET` rows skipped, then `LIMIT` applied over the joined rows. The
    engine keeps `limit + offset` root rows so there is enough to skip.
+   Only the rows kept are made: a root whose rows the offset skips whole
+   is skipped by its count, and the composition stops at the limit.
 4. Projection to the selected columns and names, each cell encoded. A
    `COUNT(*)` counts every joined row (the engine keeps every row for
-   it), and its `LIMIT` and `OFFSET` cut the one `int8` row it is, as
+   it) without making them: per row, the sum of what each child's
+   matching rows make, through every level below, multiplied across the
+   children. Its `LIMIT` and `OFFSET` cut the one `int8` row it is, as
    Postgres applies them after counting.
 
 A value that cannot be encoded after all (a delta brings one) falls the
 query back to refill mode at the read that meets it.
+
+**A work budget bounds each build.** A join's rows can multiply: one
+root over two children of a thousand rows each makes a million. Counting
+and composing spend from `STREAMGRES_S2S_MAX_JOIN_WORK` steps (a row
+looked at, or a result row made; a million by default), and a count past
+what `int8` holds is over budget too, never a wrapped number. Over budget:
+
+- a cached read falls back to refill mode for that subscription, with
+  its own fallback reason (`the join's result needs more work than its
+  budget allows`). It is not remembered as a refusal: the rows may
+  shrink, and the next subscription of the query tries rows mode again;
+- a callback has no Postgres to read instead, so its subscription ends
+  with that reason, and later deltas build nothing for it. A subscribe
+  whose first result is already over budget fails with
+  `SubscribeError::WorkBudget`, apart from `Unsupported`.
 
 ### Refill mode
 
@@ -390,6 +411,7 @@ the environment (`Config::from_env`) or explicitly
 | `STREAMGRES_S2S_SILENCE_MS`         | a socket silent this long is taken for dead | 10000 |
 | `STREAMGRES_S2S_MAX_LAG_MS`         | the engine's lag past which reads go live; 0 trusts the cache | 2000 |
 | `STREAMGRES_S2S_TOKEN`              | bearer token sent when a socket opens     | none    |
+| `STREAMGRES_S2S_MAX_JOIN_WORK`      | steps one build of a joined result may take (Rows mode) | 1000000 |
 
 The token goes out as `Authorization: Bearer <token>` on each socket's
 upgrade, for an engine started with the same `STREAMGRES_S2S_TOKEN`. An

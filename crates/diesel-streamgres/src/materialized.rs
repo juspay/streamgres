@@ -30,6 +30,54 @@ use crate::encode::{Unsupported, encode, supports};
 use crate::row::{Columns, OwnedRow, OwnedValue};
 use crate::types::TableTypes;
 
+/// How many steps one build of a result may take unless the engine
+/// client says otherwise: a row a join's composition looks at, or a
+/// result row it makes, is a step.
+pub const DEFAULT_JOIN_WORK: u64 = 1_000_000;
+
+/// The OID of `int8`, a count's type.
+const INT8: std::num::NonZeroU32 = std::num::NonZeroU32::new(20).expect("20 is not zero");
+
+/// Why a result could not be built from the engine's rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildError {
+    /// Something rows mode cannot serve: a value that cannot be encoded,
+    /// a column the known types lack.
+    Unsupported(Unsupported),
+    /// Composing the join would take more steps than the work budget
+    /// allows, or more rows than a count can hold. The rows may shrink,
+    /// so this says nothing lasting about the query.
+    OverBudget(OverBudget),
+}
+
+/// A build that stopped at its work budget of `budget` steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverBudget {
+    pub budget: u64,
+}
+
+impl From<Unsupported> for BuildError {
+    fn from(error: Unsupported) -> BuildError {
+        BuildError::Unsupported(error)
+    }
+}
+
+impl std::fmt::Display for BuildError {
+    /// The reason, as metrics and logs name it. An over-budget reason
+    /// leads with words, so its metric label is one for every budget.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::Unsupported(Unsupported(reason)) => f.write_str(reason),
+            BuildError::OverBudget(OverBudget { budget }) => write!(
+                f,
+                "the join's result needs more work than its budget allows (a budget of {budget} steps)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {}
+
 /// One table of the query as the engine's `accepted` describes it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeSnapshot {
@@ -233,6 +281,8 @@ pub struct Materialized {
     bytes: usize,
     /// The result as last built, until a change.
     built: Option<Arc<[OwnedRow]>>,
+    /// How many steps one build may take ([`Materialized::keyed`]).
+    work_budget: u64,
 }
 
 impl Materialized {
@@ -386,6 +436,7 @@ impl Materialized {
             columns,
             bytes: 0,
             built: None,
+            work_budget: DEFAULT_JOIN_WORK,
         };
         for node in snapshot.nodes {
             for row in node.rows {
@@ -456,7 +507,7 @@ impl Materialized {
     /// The result as Diesel rows, built if a change came since it last
     /// was. A count's `LIMIT` and `OFFSET` cut the one row it is, as
     /// Postgres applies them after counting.
-    pub fn rows(&mut self) -> Result<Arc<[OwnedRow]>, Unsupported> {
+    pub fn rows(&mut self) -> Result<Arc<[OwnedRow]>, BuildError> {
         if let Some(built) = &self.built {
             return Ok(Arc::clone(built));
         }
@@ -466,7 +517,7 @@ impl Materialized {
     }
 
     /// The result built from the rows held now.
-    fn build(&self) -> Result<Arc<[OwnedRow]>, Unsupported> {
+    fn build(&self) -> Result<Arc<[OwnedRow]>, BuildError> {
         Ok(self
             .keyed()?
             .into_iter()
@@ -475,31 +526,80 @@ impl Materialized {
             .into())
     }
 
+    /// How many steps one build of the result may take
+    /// ([`DEFAULT_JOIN_WORK`] until set).
+    pub fn set_work_budget(&mut self, budget: u64) {
+        self.work_budget = budget;
+        self.built = None;
+    }
+
     /// The result, each row with its identity: the primary keys of the
     /// table rows it was composed from (a NULL-extended table marked as
     /// such), so a row keeps its identity while its values change and no
     /// two rows of one result share one. A count is one row, of one
     /// identity.
-    pub fn keyed(&self) -> Result<Vec<(String, OwnedRow)>, Unsupported> {
-        let combos = self.assemble();
+    ///
+    /// Only the rows the `OFFSET` and `LIMIT` keep are made: a root whose
+    /// rows the offset skips whole is skipped by its count, and the
+    /// composition stops at the limit. Counting and composing both spend
+    /// from the work budget, so a join whose combinations multiply stops
+    /// at [`BuildError::OverBudget`] rather than building them all.
+    pub fn keyed(&self) -> Result<Vec<(String, OwnedRow)>, BuildError> {
+        let by_value = self.by_value();
+        let roots = self.roots();
+        let mut tally = Tally::new(self.work_budget);
         let limit = self.limit.unwrap_or(usize::MAX);
         if let Projection::Count = &self.projection {
-            let count = OwnedValue::new(
-                std::num::NonZeroU32::new(20).expect("int8"),
-                (combos.len() as i64).to_be_bytes().to_vec(),
-            );
+            let mut total: u64 = 0;
+            for &root in &roots {
+                let count = self.count(0, root, &by_value, &mut tally)?;
+                total = total.checked_add(count).ok_or_else(|| tally.over())?;
+            }
+            let total = i64::try_from(total).ok().ok_or_else(|| tally.over())?;
+            let count = OwnedValue::new(INT8, total.to_be_bytes().to_vec());
             let row = OwnedRow::new(Arc::clone(&self.columns), vec![Some(count)]);
             return Ok(std::iter::once((String::new(), row))
                 .skip(self.offset)
                 .take(limit)
                 .collect());
         }
-        combos
-            .into_iter()
-            .skip(self.offset)
-            .take(limit)
-            .map(|combo| Ok((self.identity(&combo), self.project(&combo)?)))
-            .collect()
+        let mut out = Vec::new();
+        if limit == 0 {
+            return Ok(out);
+        }
+        let mut skip = self.offset;
+        let mut assignment: Vec<Option<&Json>> = vec![None; self.nodes.len()];
+        for &root in &roots {
+            let count = self.count(0, root, &by_value, &mut tally)?;
+            let count = usize::try_from(count).unwrap_or(usize::MAX);
+            if skip >= count {
+                skip -= count;
+                continue;
+            }
+            assignment[0] = Some(root);
+            let flow = self.walk(
+                0,
+                root,
+                0,
+                &mut assignment,
+                &by_value,
+                &mut tally,
+                &mut |combo, tally| {
+                    tally.spend()?;
+                    if skip > 0 {
+                        skip -= 1;
+                        return Ok(Flow::Go);
+                    }
+                    out.push((self.identity(combo), self.project(combo)?));
+                    Ok(if out.len() >= limit { Flow::Stop } else { Flow::Go })
+                },
+            )?;
+            assignment[0] = None;
+            if flow == Flow::Stop {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Whether the result is the root table's rows alone, uncut: one
@@ -571,22 +671,19 @@ impl Materialized {
         Ok(OwnedRow::new(Arc::clone(&self.columns), values))
     }
 
-    /// The joined rows: one entry per result row, holding each table's
-    /// row or `None` where a left edge found no match. Root rows in the
-    /// query's order; everything else in key order.
-    ///
-    /// Each child node's rows are indexed by the value of its join
-    /// column, in primary-key order by value: `ORDER BY child.id` in
-    /// Postgres puts 9 before 10, and so must this.
-    fn assemble(&self) -> Vec<Vec<Option<&Json>>> {
-        let mut by_value: Vec<HashMap<String, Vec<&Json>>> = Vec::with_capacity(self.nodes.len());
+    /// Each child node's rows indexed by the value of its join column, in
+    /// primary-key order by value: `ORDER BY child.id` in Postgres puts 9
+    /// before 10, and so must this. The root has no join column and no
+    /// index.
+    fn by_value(&self) -> ByValue<'_> {
+        let mut by_value: ByValue<'_> = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let mut index: HashMap<String, Vec<&Json>> = HashMap::new();
             if let Some(child_column) = node.child_column {
                 let name = &node.types.columns[child_column].name;
-                let mut keyed: Vec<(&String, &Json)> = node.rows.iter().collect();
-                keyed.sort_by(|(_, a), (_, b)| self.key_order(node, a, b));
-                for (_, row) in keyed {
+                let mut keyed: Vec<&Json> = node.rows.values().collect();
+                keyed.sort_by(|a, b| self.key_order(node, a, b));
+                for row in keyed {
                     match row.get(name) {
                         Some(value) if !value.is_null() => {
                             index.entry(value.to_string()).or_default().push(row);
@@ -597,10 +694,14 @@ impl Materialized {
             }
             by_value.push(index);
         }
+        by_value
+    }
 
+    /// The root table's rows in the query's order, ties in key order.
+    fn roots(&self) -> Vec<&Json> {
         let root = &self.nodes[0];
-        let mut roots: Vec<(&String, &Json)> = root.rows.iter().collect();
-        roots.sort_by(|(_, a), (_, b)| {
+        let mut roots: Vec<&Json> = root.rows.values().collect();
+        roots.sort_by(|a, b| {
             for &(index, ascending) in &self.order {
                 let name = &root.types.columns[index].name;
                 let ordering = compare(a.get(name), b.get(name), ascending);
@@ -610,12 +711,7 @@ impl Materialized {
             }
             self.key_order(root, a, b)
         });
-
-        let mut out = Vec::new();
-        for (_, row) in roots {
-            self.combos(0, row, &by_value, &mut out);
-        }
-        out
+        roots
     }
 
     /// Two rows of `node` by their primary key, column by column, as
@@ -631,56 +727,166 @@ impl Materialized {
         Ordering::Equal
     }
 
-    /// Every result row the subtree under `node` makes with `row` as that
-    /// node's row, appended to `out`. An inner edge with no match makes
-    /// none; a left edge with no match leaves its subtree NULL.
-    fn combos<'a>(
+    /// The rows of `child` that join `row` of its parent `node`, in key
+    /// order. A NULL join value matches nothing, as in Postgres.
+    fn matches<'a, 'b>(
+        &self,
+        node: usize,
+        row: &'a Json,
+        child: usize,
+        by_value: &'b ByValue<'a>,
+    ) -> Result<&'b [&'a Json], BuildError> {
+        let parent_column = self.nodes[child].parent_column.ok_or_else(|| {
+            Unsupported(format!("`{}` has no join column", self.nodes[child].table))
+        })?;
+        Ok(
+            match row.get(&self.nodes[node].types.columns[parent_column].name) {
+                Some(value) if !value.is_null() => by_value[child]
+                    .get(&value.to_string())
+                    .map_or(&[][..], Vec::as_slice),
+                _ => &[],
+            },
+        )
+    }
+
+    /// How many result rows the subtree under `node` makes with `row` as
+    /// that node's row: for each child, the sum of what its matching rows
+    /// make, through every level below; an inner child with none makes
+    /// the row drop (0), a left child with none NULL-extends it (1); the
+    /// children's results multiplied. Remembered per row for the build,
+    /// so each row is counted once however many parents reach it; every
+    /// match looked at is a step.
+    fn count<'a>(
         &'a self,
         node: usize,
         row: &'a Json,
-        by_value: &[HashMap<String, Vec<&'a Json>>],
-        out: &mut Vec<Vec<Option<&'a Json>>>,
-    ) {
-        let mut partial: Vec<Vec<Option<&'a Json>>> = vec![vec![None; self.nodes.len()]];
-        partial[0][node] = Some(row);
+        by_value: &ByValue<'a>,
+        tally: &mut Tally,
+    ) -> Result<u64, BuildError> {
+        let at = (node, std::ptr::from_ref(row));
+        if let Some(&count) = tally.counts.get(&at) {
+            return Ok(count);
+        }
+        tally.spend()?;
+        let mut count: u64 = 1;
         for &child in &self.nodes[node].children {
-            let child_node = &self.nodes[child];
-            let parent_column = child_node
-                .parent_column
-                .expect("a child has a parent column");
-            let value = row.get(&self.nodes[node].types.columns[parent_column].name);
-            let matches: &[&Json] = match value {
-                Some(value) if !value.is_null() => by_value[child]
-                    .get(&value.to_string())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-                _ => &[],
-            };
-            let mut child_combos: Vec<Vec<Option<&'a Json>>> = Vec::new();
-            for &child_row in matches {
-                self.combos(child, child_row, by_value, &mut child_combos);
+            let mut made: u64 = 0;
+            for &child_row in self.matches(node, row, child, by_value)? {
+                tally.spend()?;
+                let under = self.count(child, child_row, by_value, tally)?;
+                made = made.checked_add(under).ok_or_else(|| tally.over())?;
             }
-            if child_combos.is_empty() {
-                if child_node.inner {
-                    return;
-                }
+            let factor = match (made, self.nodes[child].inner) {
+                (0, true) => 0,
+                (0, false) => 1,
+                (made, _) => made,
+            };
+            count = count.checked_mul(factor).ok_or_else(|| tally.over())?;
+            if count == 0 {
+                break;
+            }
+        }
+        tally.counts.insert(at, count);
+        Ok(count)
+    }
+
+    /// Makes the result rows of the subtree under `node`, whose row is
+    /// `row`, from its child at `next_child` on, handing each complete
+    /// one to `then`: each child's matching rows in key order, the
+    /// earlier children varying slowest, a left child with no row NULL,
+    /// as Postgres composes the join. `assignment` holds each table's row
+    /// of the row being made. Stops when `then` says so.
+    #[allow(clippy::too_many_arguments, reason = "one recursion, each argument a different part of its state")]
+    fn walk<'a>(
+        &'a self,
+        node: usize,
+        row: &'a Json,
+        next_child: usize,
+        assignment: &mut Vec<Option<&'a Json>>,
+        by_value: &ByValue<'a>,
+        tally: &mut Tally,
+        then: &mut Then<'_, 'a>,
+    ) -> Result<Flow, BuildError> {
+        let Some(&child) = self.nodes[node].children.get(next_child) else {
+            return then(assignment, tally);
+        };
+        tally.spend()?;
+        let mut made = false;
+        for &child_row in self.matches(node, row, child, by_value)? {
+            tally.spend()?;
+            if self.count(child, child_row, by_value, tally)? == 0 {
                 continue;
             }
-            let mut next = Vec::with_capacity(partial.len() * child_combos.len());
-            for left in &partial {
-                for right in &child_combos {
-                    let mut merged = left.clone();
-                    for (slot, value) in merged.iter_mut().zip(right) {
-                        if value.is_some() {
-                            *slot = *value;
-                        }
-                    }
-                    next.push(merged);
-                }
+            made = true;
+            assignment[child] = Some(child_row);
+            let flow = self.walk(
+                child,
+                child_row,
+                0,
+                assignment,
+                by_value,
+                tally,
+                &mut |assignment, tally| {
+                    self.walk(node, row, next_child + 1, assignment, by_value, tally, then)
+                },
+            );
+            assignment[child] = None;
+            if flow? == Flow::Stop {
+                return Ok(Flow::Stop);
             }
-            partial = next;
         }
-        out.extend(partial);
+        if made || self.nodes[child].inner {
+            return Ok(Flow::Go);
+        }
+        self.walk(node, row, next_child + 1, assignment, by_value, tally, then)
+    }
+}
+
+/// Each node's rows by the text of their join column's value
+/// ([`Materialized::by_value`]).
+type ByValue<'a> = Vec<HashMap<String, Vec<&'a Json>>>;
+
+/// What [`Materialized::walk`] hands each complete result row to: the
+/// row's table rows, one per node, and the build's tally.
+type Then<'f, 'a> =
+    dyn FnMut(&mut Vec<Option<&'a Json>>, &mut Tally) -> Result<Flow, BuildError> + 'f;
+
+/// Whether a composition goes on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Go,
+    Stop,
+}
+
+/// One build's work: the steps left of its budget, and the subtree counts
+/// worked out so far, by node and row.
+struct Tally {
+    budget: u64,
+    left: u64,
+    counts: HashMap<(usize, *const Json), u64>,
+}
+
+impl Tally {
+    fn new(budget: u64) -> Tally {
+        Tally {
+            budget,
+            left: budget,
+            counts: HashMap::new(),
+        }
+    }
+
+    /// One step, or [`BuildError::OverBudget`] once none is left.
+    fn spend(&mut self) -> Result<(), BuildError> {
+        self.left = self.left.checked_sub(1).ok_or_else(|| self.over())?;
+        Ok(())
+    }
+
+    /// The error a build that ran out of budget, or of room to count in,
+    /// stops with.
+    fn over(&self) -> BuildError {
+        BuildError::OverBudget(OverBudget {
+            budget: self.budget,
+        })
     }
 }
 
@@ -1263,5 +1469,329 @@ mod tests {
             <i64 as FromSqlRow<BigInt, Pg>>::build_from_row(&rows[0]).unwrap(),
             3
         );
+    }
+
+
+    /// The types of every table the generated joins use: an `int4` id,
+    /// an `int4` join column to the parent and a `text` name.
+    fn tree_types(tables: &[&str]) -> HashMap<String, Arc<TableTypes>> {
+        tables
+            .iter()
+            .map(|table| {
+                (
+                    (*table).to_string(),
+                    Arc::new(TableTypes {
+                        columns: vec![base("id", 23), base("up", 23), base("name", 25)],
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    /// A node of a generated tree: `table` under `parent` on
+    /// `parent.id = table.up`.
+    fn under(table: &str, parent: &str, inner: bool, rows: Vec<Json>) -> NodeSnapshot {
+        child(table, parent, "id", "up", inner, rows)
+    }
+
+    /// The rows the result was built from before composition was bounded:
+    /// every combination, built eagerly. The reference the bounded
+    /// composition must agree with, row for row and in order.
+    fn eager(m: &Materialized) -> Vec<Vec<Option<&Json>>> {
+        fn combos<'a>(
+            m: &'a Materialized,
+            node: usize,
+            row: &'a Json,
+            by_value: &ByValue<'a>,
+            out: &mut Vec<Vec<Option<&'a Json>>>,
+        ) {
+            let mut partial: Vec<Vec<Option<&'a Json>>> = vec![vec![None; m.nodes.len()]];
+            partial[0][node] = Some(row);
+            for &child in &m.nodes[node].children {
+                let mut child_combos = Vec::new();
+                for &child_row in m.matches(node, row, child, by_value).unwrap() {
+                    combos(m, child, child_row, by_value, &mut child_combos);
+                }
+                if child_combos.is_empty() {
+                    if m.nodes[child].inner {
+                        return;
+                    }
+                    continue;
+                }
+                let mut next = Vec::new();
+                for left in &partial {
+                    for right in &child_combos {
+                        let mut merged = left.clone();
+                        for (slot, value) in merged.iter_mut().zip(right) {
+                            if value.is_some() {
+                                *slot = *value;
+                            }
+                        }
+                        next.push(merged);
+                    }
+                }
+                partial = next;
+            }
+            out.extend(partial);
+        }
+        let by_value = m.by_value();
+        let mut out = Vec::new();
+        for root in m.roots() {
+            combos(m, 0, root, &by_value, &mut out);
+        }
+        out
+    }
+
+    /// A small deterministic generator, so a failing case can be run again.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: u64) -> u64 {
+            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % n
+        }
+    }
+
+    /// The bounded composition agrees with the eager one on generated
+    /// joins: a nested chain and a sibling under the root, each inner or
+    /// left, rows joining a random parent (or none, through a NULL or an
+    /// absent parent), ordered both ways, under offsets and limits, over
+    /// some ten thousand rows in all. Same
+    /// rows in the same order, and the same count.
+    #[test]
+    fn bounded_composition_agrees_with_the_eager_one() {
+        let tables = ["t", "a", "b", "c"];
+        let types = tree_types(&tables);
+        let mut lcg = Lcg(7);
+        let (mut compared, mut left_extended) = (0, 0);
+        for case in 0..1_500 {
+            let rows = |count: u64, parents: usize, lcg: &mut Lcg| -> Vec<Json> {
+                let parents = u64::try_from(parents).unwrap();
+                (0..2 + lcg.below(count))
+                    .map(|id| {
+                        let up = match lcg.below(parents + 1) {
+                            parent if parent == parents => Json::Null,
+                            parent => json!(parent),
+                        };
+                        json!({"id": id, "up": up, "name": format!("n{}", lcg.below(3))})
+                    })
+                    .collect()
+            };
+            let inner = |lcg: &mut Lcg| lcg.below(2) == 0;
+            let t = rows(8, 0, &mut lcg);
+            let a = rows(12, t.len(), &mut lcg);
+            let b = rows(12, a.len(), &mut lcg);
+            let c = rows(8, t.len(), &mut lcg);
+            let (inner_a, inner_b, inner_c) = (inner(&mut lcg), inner(&mut lcg), inner(&mut lcg));
+            let snapshot = Snapshot {
+                nodes: vec![
+                    NodeSnapshot {
+                        table: "t".into(),
+                        key: vec!["id".into()],
+                        parent: None,
+                        parent_column: None,
+                        child_column: None,
+                        inner: true,
+                        rows: t,
+                    },
+                    under("a", "t", inner_a, a),
+                    under("b", "a", inner_b, b),
+                    under("c", "t", inner_c, c),
+                ],
+                columns: Some(tables.iter().map(|table| ((*table).into(), "id".into())).collect()),
+                names: None,
+                count: false,
+                order: vec![("name".into(), lcg.below(2) == 0)],
+                limit: None,
+                offset: 0,
+            };
+            let all = Materialized::new(snapshot.clone(), &types).unwrap();
+            let reference: Vec<String> = eager(&all).iter().map(|combo| all.identity(combo)).collect();
+            compared += reference.len();
+            left_extended += eager(&all).iter().filter(|combo| combo.iter().any(Option::is_none)).count();
+
+            let mut counted = snapshot.clone();
+            counted.count = true;
+            counted.columns = None;
+            let counted = Materialized::new(counted, &types).unwrap();
+            let count = counted.keyed().unwrap();
+            assert_eq!(
+                <i64 as FromSqlRow<BigInt, Pg>>::build_from_row(&count[0].1).unwrap(),
+                i64::try_from(reference.len()).unwrap(),
+                "case {case}: the count"
+            );
+
+            for (offset, limit) in [(0, None), (0, Some(1)), (1, Some(2)), (3, Some(4)), (2, None), (50, Some(1))] {
+                let mut cut = snapshot.clone();
+                cut.offset = offset;
+                cut.limit = limit;
+                let cut = Materialized::new(cut, &types).unwrap();
+                let made: Vec<String> = cut.keyed().unwrap().into_iter().map(|(identity, _)| identity).collect();
+                let expected: Vec<String> = reference
+                    .iter()
+                    .skip(offset)
+                    .take(limit.unwrap_or(usize::MAX))
+                    .cloned()
+                    .collect();
+                assert_eq!(made, expected, "case {case}, offset {offset}, limit {limit:?}");
+            }
+        }
+        assert!(compared > 10_000, "the cases make rows to compare: {compared}");
+        assert!(left_extended > 1_000, "and NULL-extended ones: {left_extended}");
+    }
+
+    /// One root under two children of a thousand rows each: a million
+    /// combinations, of which `LIMIT 1` wants one. The composition stops
+    /// there, so a budget of a few thousand steps is plenty; built
+    /// eagerly, the million would be made first.
+    #[test]
+    fn a_limit_stops_the_composition_early() {
+        let types = tree_types(&["t", "a", "c"]);
+        let children = |table: &str| -> Vec<Json> {
+            (0..1000).map(|id| json!({"id": id, "up": 0, "name": table})).collect()
+        };
+        let snapshot = Snapshot {
+            nodes: vec![
+                NodeSnapshot {
+                    table: "t".into(),
+                    key: vec!["id".into()],
+                    parent: None,
+                    parent_column: None,
+                    child_column: None,
+                    inner: true,
+                    rows: vec![json!({"id": 0, "up": null, "name": "root"})],
+                },
+                under("a", "t", true, children("a")),
+                under("c", "t", true, children("c")),
+            ],
+            columns: Some(vec![("t".into(), "id".into())]),
+            names: None,
+            count: false,
+            order: vec![],
+            limit: Some(1),
+            offset: 0,
+        };
+        let mut m = Materialized::new(snapshot.clone(), &types).unwrap();
+        m.set_work_budget(10_000);
+        assert_eq!(m.keyed().unwrap().len(), 1);
+
+        let mut counted = snapshot;
+        counted.count = true;
+        counted.columns = None;
+        counted.limit = None;
+        let mut m = Materialized::new(counted, &types).unwrap();
+        m.set_work_budget(10_000);
+        let count = m.keyed().unwrap();
+        assert_eq!(
+            <i64 as FromSqlRow<BigInt, Pg>>::build_from_row(&count[0].1).unwrap(),
+            1_000_000,
+            "counted without making the rows"
+        );
+    }
+
+    /// An offset skips a root whose rows it covers by that root's count,
+    /// without making them: a hundred roots of a hundred rows each, and
+    /// an offset into the last one, fit a budget far below the 9,999 rows
+    /// skipped times the steps each would take.
+    #[test]
+    fn an_offset_skips_whole_roots_by_their_count() {
+        let types = tree_types(&["t", "a"]);
+        let snapshot = Snapshot {
+            nodes: vec![
+                NodeSnapshot {
+                    table: "t".into(),
+                    key: vec!["id".into()],
+                    parent: None,
+                    parent_column: None,
+                    child_column: None,
+                    inner: true,
+                    rows: (0..100).map(|id| json!({"id": id, "up": null, "name": "t"})).collect(),
+                },
+                under(
+                    "a",
+                    "t",
+                    true,
+                    (0..10_000).map(|id| json!({"id": id, "up": id / 100, "name": "a"})).collect(),
+                ),
+            ],
+            columns: Some(vec![("t".into(), "id".into()), ("a".into(), "id".into())]),
+            names: None,
+            count: false,
+            order: vec![],
+            limit: Some(1),
+            offset: 9_999,
+        };
+        let mut m = Materialized::new(snapshot, &types).unwrap();
+        m.set_work_budget(25_000);
+        let rows = m.keyed().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            <(i32, i32) as FromSqlRow<(Integer, Integer), Pg>>::build_from_row(&rows[0].1).unwrap(),
+            (99, 9_999),
+            "the last row of the last root"
+        );
+    }
+
+    /// A build that needs more steps than its budget stops with
+    /// `OverBudget`, whose reason leads with words (one metric label for
+    /// every budget); with the budget raised it succeeds.
+    #[test]
+    fn a_build_past_its_budget_stops_and_says_so() {
+        let mut m = Materialized::new(authors_books(true, None), &types()).unwrap();
+        m.set_work_budget(3);
+        let error = m.rows().unwrap_err();
+        assert_eq!(error, BuildError::OverBudget(OverBudget { budget: 3 }));
+        let reason = error.to_string();
+        assert!(reason.starts_with("the join's result needs more work than its budget allows"), "{reason}");
+        assert_eq!(
+            crate::metrics::reason_key("fallback", &reason),
+            "fallback:the join's result needs more work than its budget allows (a budget of "
+        );
+        m.set_work_budget(DEFAULT_JOIN_WORK);
+        assert_eq!(m.rows().unwrap().len(), 3, "the budget raised, it builds");
+    }
+
+    /// A count past what `int8` holds, or past what a `u64` holds while
+    /// it is multiplied, is over budget, never a wrapped number: `n`
+    /// children of the root, two matching rows each, make 2^n rows.
+    #[test]
+    fn a_count_too_large_to_hold_is_over_budget() {
+        let count_of = |n: usize| -> Result<i64, BuildError> {
+            let names: Vec<String> = (0..n).map(|i| format!("c{i}")).collect();
+            let mut tables: Vec<&str> = vec!["t"];
+            tables.extend(names.iter().map(String::as_str));
+            let types = tree_types(&tables);
+            let mut nodes = vec![NodeSnapshot {
+                table: "t".into(),
+                key: vec!["id".into()],
+                parent: None,
+                parent_column: None,
+                child_column: None,
+                inner: true,
+                rows: vec![json!({"id": 0, "up": null, "name": "t"})],
+            }];
+            for name in &names {
+                nodes.push(under(
+                    name,
+                    "t",
+                    true,
+                    vec![json!({"id": 0, "up": 0, "name": "x"}), json!({"id": 1, "up": 0, "name": "y"})],
+                ));
+            }
+            let snapshot = Snapshot {
+                nodes,
+                columns: None,
+                names: None,
+                count: true,
+                order: vec![],
+                limit: None,
+                offset: 0,
+            };
+            let rows = Materialized::new(snapshot, &types).unwrap().keyed()?;
+            Ok(<i64 as FromSqlRow<BigInt, Pg>>::build_from_row(&rows[0].1).unwrap())
+        };
+        assert_eq!(count_of(62), Ok(1 << 62));
+        assert!(matches!(count_of(63), Err(BuildError::OverBudget(_))), "past i64::MAX");
+        assert!(matches!(count_of(64), Err(BuildError::OverBudget(_))), "past u64::MAX");
     }
 }

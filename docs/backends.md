@@ -205,6 +205,7 @@ Backends connect with:
 | `STREAMGRES_S2S_CONNECTIONS` | 2 | sockets per backend process |
 | `STREAMGRES_S2S_MAX_SUBSCRIPTIONS` | 10000 | per process; past it reads go to Postgres |
 | `STREAMGRES_S2S_MAX_LAG_MS` | 2000 | past it reads go to Postgres; 0 trusts the engine |
+| `STREAMGRES_S2S_MAX_JOIN_WORK` | 1000000 | steps one build of a joined result may take; past it a read goes to Postgres and a callback ends |
 
 The cache's own limits (`STREAMGRES_CACHE_MAX_BYTES`,
 `STREAMGRES_CACHE_IDLE_MS`, `STREAMGRES_CACHE_TTL_MS`,
