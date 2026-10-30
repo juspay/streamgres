@@ -138,11 +138,13 @@ idle. PgBouncer's own pool settings control the PostgreSQL backend connections.
    in `STREAMGRES_APP_ID` and `STREAMGRES_SHARD`.
 
    The stack marks itself as streamgres's (`<app>_<shard>.streamgres_stack()`
-   returns its setup version). Running the SQL again is harmless, and is how
-   to update a stack after an upgrade: the server warns at startup when its
-   stack is older, or has no marker. A stack with no marker was installed by
-   zero-cache, or by streamgres before it marked its stacks; re-run the SQL
-   over it only when no zero-cache uses it.
+   returns its setup version and a fingerprint of its functions; it stays
+   streamgres's while they match). Running the SQL again is harmless, and is
+   how to update a stack after an upgrade: the server warns at startup when
+   its stack is older, or is not marked as streamgres's. Such a stack was
+   installed by zero-cache, or by streamgres before it marked its stacks;
+   re-run the SQL over it only when no zero-cache uses it, since streamgres's
+   stack does not write the `ddlStart` messages zero-cache reads.
 
 ### Replication slots
 

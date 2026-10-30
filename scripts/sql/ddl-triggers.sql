@@ -308,15 +308,25 @@ DROP EVENT TRIGGER IF EXISTS "xyne_ddl_end_0";
 
 CREATE EVENT TRIGGER "xyne_ddl_start_0"
   ON ddl_command_start
-  WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'DROP TABLE', 'DROP INDEX', 'ALTER PUBLICATION', 'ALTER SCHEMA')
+  WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'DROP TABLE', 'DROP INDEX', 'ALTER PUBLICATION', 'ALTER SCHEMA', 'DROP SCHEMA')
   EXECUTE PROCEDURE "xyne_0".emit_ddl_start();
 
 CREATE EVENT TRIGGER "xyne_ddl_end_0"
   ON ddl_command_end
-  WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'DROP TABLE', 'DROP INDEX', 'ALTER PUBLICATION', 'ALTER SCHEMA', 'COMMENT')
+  WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'DROP TABLE', 'DROP INDEX', 'ALTER PUBLICATION', 'ALTER SCHEMA', 'DROP SCHEMA', 'COMMENT')
   EXECUTE PROCEDURE "xyne_0".emit_ddl_end();
 
-CREATE OR REPLACE FUNCTION "xyne_0".streamgres_stack()
-RETURNS int
-IMMUTABLE
-AS $$ SELECT 1 $$ LANGUAGE sql;
+DO $marker$
+DECLARE
+  fingerprint TEXT;
+BEGIN
+  SELECT encode(sha256(convert_to(string_agg(p.prosrc, E'\n' ORDER BY p.proname, p.prosrc), 'UTF8')), 'hex')
+    FROM pg_proc p
+    JOIN pg_namespace ns ON ns.oid = p.pronamespace
+    WHERE ns.nspname = 'xyne_0' AND p.proname IN ('emit_ddl_end', 'emit_ddl_start', 'schema_specs', 'update_schemas')
+    INTO fingerprint;
+  EXECUTE format(
+    'CREATE OR REPLACE FUNCTION "xyne_0".streamgres_stack() RETURNS jsonb IMMUTABLE AS %L LANGUAGE sql',
+    format('SELECT %L::jsonb', json_build_object('version', 1, 'fingerprint', fingerprint)::text));
+END
+$marker$;

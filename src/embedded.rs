@@ -90,8 +90,17 @@ pub enum Setup {
     /// older setup of this crate installed and marked as its own. Any
     /// other stack is left alone: it may be zero-cache's, which reads
     /// what this crate's no longer writes. Needs a role allowed to create
-    /// both: a superuser, or a managed database's admin role.
+    /// both: a superuser, or a managed database's admin role. Refused for
+    /// app [`ZERO_APP`], whose names are zero-cache's.
     Install,
+    /// [`Setup::Install`], and also replaces a stack at this engine's
+    /// names that is not marked as this crate's: one an older setup of
+    /// this crate installed unmarked, which the operator knows no
+    /// zero-cache uses. The stack is replaced when the engine starts, so a
+    /// backend that runs DDL before it starts its engine runs it under
+    /// the old stack once more; a migration running [`setup_sql`] before
+    /// the restart avoids that.
+    Adopt,
     /// Requires both, as the S2S server does, for a database a migration
     /// sets up.
     Require,
@@ -179,20 +188,20 @@ pub struct Config {
 }
 
 impl Config {
-    /// The defaults for the database at `dsn`, app `zero`, shard 0.
+    /// The defaults for the database at `dsn`, app [`DEFAULT_APP`], shard 0.
     pub fn new(dsn: impl Into<String>) -> Config {
         let dsn = dsn.into();
         Config {
             read_dsn: dsn.clone(),
             dsn,
-            app: "zero".to_owned(),
+            app: DEFAULT_APP.to_owned(),
             shard: 0,
             setup: Setup::Install,
             slot: Slot::Temporary,
             publication: "xyne_sync_pub".to_owned(),
-            schemas: vec!["public".to_owned(), "zero_0".to_owned()],
-            ddl_trigger: "zero_ddl_end_0".to_owned(),
-            ddl_prefix: "zero/0/ddl".to_owned(),
+            schemas: vec!["public".to_owned(), format!("{DEFAULT_APP}_0")],
+            ddl_trigger: format!("{DEFAULT_APP}_ddl_end_0"),
+            ddl_prefix: format!("{DEFAULT_APP}/0/ddl"),
             heartbeat: Duration::from_millis(500),
             row_limit: DEFAULT_READ_ROW_LIMIT,
             memory_tables: Vec::new(),
@@ -230,8 +239,9 @@ impl Config {
     /// (`STREAMGRES_PG_DSN`, `STREAMGRES_APP_ID`, `STREAMGRES_SHARD`,
     /// `STREAMGRES_PUBLICATION`, `STREAMGRES_SCHEMAS`,
     /// `STREAMGRES_READ_CONNECTIONS` and the rest), legacy names
-    /// included, an embedded engine's defaults otherwise; and its own,
-    /// `STREAMGRES_EMBEDDED_SETUP` (`install`, the default, or
+    /// included, an embedded engine's defaults otherwise (app
+    /// [`DEFAULT_APP`], not the server's `zero`); and its own,
+    /// `STREAMGRES_EMBEDDED_SETUP` (`install`, the default, `adopt` or
     /// `require`) and `STREAMGRES_EMBEDDED_SLOT` (`temporary`, the
     /// default, or `permanent`, swept after
     /// `STREAMGRES_SLOT_CLEANUP_AGE_MS`, 5 minutes by default).
@@ -242,7 +252,7 @@ impl Config {
         let defaults = Config::new(dsn.clone());
         let app_id = env
             .first(&["STREAMGRES_APP_ID", "ZERO_APP_ID"])
-            .unwrap_or_else(|| "zero".to_owned());
+            .unwrap_or_else(|| DEFAULT_APP.to_owned());
         let shard: u32 = match env.first(&["STREAMGRES_SHARD", "ZERO_SHARD_NUM"]) {
             Some(text) => text
                 .parse()
@@ -252,10 +262,11 @@ impl Config {
         let (estimate_ttl, estimate_capacity) = env.estimates();
         let setup = match env.value("STREAMGRES_EMBEDDED_SETUP").as_deref() {
             None | Some("install") => Setup::Install,
+            Some("adopt") => Setup::Adopt,
             Some("require") => Setup::Require,
             Some(other) => {
                 return Err(format!(
-                    "STREAMGRES_EMBEDDED_SETUP must be `install` or `require`, got `{other}`"
+                    "STREAMGRES_EMBEDDED_SETUP must be `install`, `adopt` or `require`, got `{other}`"
                 ));
             }
         };
@@ -356,6 +367,16 @@ impl Config {
         }
     }
 }
+
+/// zero-cache's default app id. An engine installs or adopts no trigger
+/// stack under it: a zero-cache started later with its defaults would
+/// take this crate's stack, which writes no `ddlStart`, for its own.
+pub const ZERO_APP: &str = "zero";
+
+/// The app id an embedded engine sets its trigger stack up for unless
+/// told otherwise: not zero-cache's, so the two never share names by
+/// default.
+pub const DEFAULT_APP: &str = "streamgres";
 
 /// The SQL that sets a database up for an engine of app `app`, shard
 /// `shard`, streaming `publication`: the schema-change event trigger
@@ -989,6 +1010,11 @@ async fn prepare_on(client: &tokio_postgres::Client, config: &Config) -> Result<
             config.ddl_trigger, config.ddl_prefix, config.app, config.shard
         ));
     }
+    if config.app == ZERO_APP {
+        return Err(format!(
+            "the database is not set up for app `{ZERO_APP}`, and an engine does not set one up under zero-cache's default app id: a zero-cache started with its defaults would take the stack for its own; set STREAMGRES_APP_ID to another app (the default is `{DEFAULT_APP}`), or install the stack by migration and set STREAMGRES_EMBEDDED_SETUP=require"
+        ));
+    }
     client
         .batch_execute("BEGIN")
         .await
@@ -1020,14 +1046,30 @@ async fn is_set_up(client: &tokio_postgres::Client, config: &Config) -> Result<b
     Ok(published && triggered && !outdated(client, config).await?)
 }
 
-/// Whether the installed trigger stack is this crate's, from an older
-/// setup than [`STACK_VERSION`] ([`ddl::stack_version`]). A stack
-/// without the marker is not outdated here: it is not this engine's to
-/// replace (the start check warns about it instead).
+/// Whether the installed trigger stack is this engine's to replace: this
+/// crate's, from an older setup than [`STACK_VERSION`]
+/// ([`ddl::stack_version`]); or, told to adopt it ([`Setup::Adopt`]),
+/// one that is not this crate's. Otherwise a stack that is not this
+/// crate's is left alone (the start check warns about it instead).
 async fn outdated(client: &tokio_postgres::Client, config: &Config) -> Result<bool, String> {
+    Ok(replaces(installed_version(client, config).await?, config.setup))
+}
+
+/// [`outdated`] for a stack whose [`ddl::stack_version`] is `version`.
+fn replaces(version: Option<i32>, setup: Setup) -> bool {
+    match version {
+        Some(version) => version < STACK_VERSION,
+        None => setup == Setup::Adopt,
+    }
+}
+
+/// [`ddl::stack_version`] of the stack behind the engine's trigger.
+async fn installed_version(
+    client: &tokio_postgres::Client,
+    config: &Config,
+) -> Result<Option<i32>, String> {
     ddl::stack_version(client, &config.ddl_trigger)
         .await
-        .map(|version| version.is_some_and(|version| version < STACK_VERSION))
         .map_err(|error| format!("looking at the trigger stack: {error}"))
 }
 
@@ -1072,15 +1114,20 @@ async fn install(client: &tokio_postgres::Client, config: &Config) -> Result<Vec
     let triggered = ddl::trigger_present(client, &config.ddl_trigger)
         .await
         .map_err(|error| format!("looking for the event trigger: {error}"))?;
-    if !triggered || outdated(client, config).await? {
+    let version = if triggered {
+        installed_version(client, config).await?
+    } else {
+        None
+    };
+    if !triggered || replaces(version, config.setup) {
         client
             .batch_execute(&setup_sql(&config.app, config.shard, &config.publication))
             .await
             .map_err(failed)?;
-        installed.push(if triggered {
-            "the schema-change trigger stack, updated"
-        } else {
-            "the schema-change trigger stack"
+        installed.push(match (triggered, version) {
+            (false, _) => "the schema-change trigger stack",
+            (true, None) => "the schema-change trigger stack, adopted",
+            (true, Some(_)) => "the schema-change trigger stack, updated",
         });
     }
     Ok(installed)
@@ -1235,7 +1282,38 @@ mod tests {
         assert_eq!(settings.slot_cleanup_age, Duration::ZERO, "nothing to sweep on a temporary slot");
         assert_eq!(setup("require"), Ok(Setup::Require));
         assert_eq!(setup("install"), Ok(Setup::Install));
+        assert_eq!(setup("adopt"), Ok(Setup::Adopt));
         assert!(setup("maybe").is_err());
+    }
+
+    /// Without an app id, the stack is set up for [`DEFAULT_APP`], not
+    /// zero-cache's `zero`, in `Config::new` and from the environment alike.
+    #[test]
+    fn the_default_app_is_not_zero_caches() {
+        let from_env = Config::from_lookup(&Env::new(|name: &str| {
+            (name == "STREAMGRES_PG_DSN").then(|| "postgres://primary/app".to_owned())
+        }))
+        .unwrap();
+        for config in [Config::new("postgres://primary/app"), from_env] {
+            assert_eq!(config.app, DEFAULT_APP);
+            assert_ne!(config.app, ZERO_APP);
+            assert_eq!(config.ddl_trigger, "streamgres_ddl_end_0");
+            assert_eq!(config.ddl_prefix, "streamgres/0/ddl");
+            assert_eq!(config.schemas, vec!["public".to_owned(), "streamgres_0".to_owned()]);
+        }
+    }
+
+    /// A stack of this crate's is replaced only from an older setup; one
+    /// that is not this crate's only when told to adopt it.
+    #[test]
+    fn only_an_older_own_stack_or_an_adopted_one_is_replaced() {
+        for setup in [Setup::Install, Setup::Adopt] {
+            assert!(replaces(Some(STACK_VERSION - 1), setup));
+            assert!(!replaces(Some(STACK_VERSION), setup));
+            assert!(!replaces(Some(STACK_VERSION + 1), setup), "a newer setup is left to its engines");
+        }
+        assert!(!replaces(None, Setup::Install));
+        assert!(replaces(None, Setup::Adopt));
     }
 
     /// The setup an operator runs by hand is the stack checked in for the

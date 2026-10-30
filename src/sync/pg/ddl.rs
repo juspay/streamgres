@@ -545,36 +545,40 @@ pub async fn stack_outdated(client: &Client, name: &str) -> Result<bool, Storage
 }
 
 /// The setup version of the trigger stack behind the event trigger
-/// `name`, when the stack says it is this crate's: what the
-/// `streamgres_stack()` beside the trigger's function returns
-/// ([`super::ddl_triggers::STACK_VERSION`] for the current setup). `None`
-/// for a stack without the marker: zero-cache's, or one this crate
-/// installed before it marked its own. Only a marked stack is this
-/// crate's to replace; how a stack's functions read says nothing about
-/// whose it is.
+/// `name`, when the stack is this crate's: the version its ownership
+/// marker (`streamgres_stack()`, beside the trigger's function) records,
+/// while the stack's functions still have the source the marker
+/// fingerprinted when it was installed
+/// ([`super::ddl_triggers::FINGERPRINTED`]). `None` for a stack without
+/// the marker, zero-cache's or one this crate installed before it marked
+/// its own, and for one whose functions changed since: a zero-cache that
+/// installed its stack over this crate's left the marker behind, but the
+/// stack is zero-cache's again. One query, which reads the marker's
+/// source rather than calling it, so that the schema need not be known
+/// first.
 pub async fn stack_version(client: &Client, name: &str) -> Result<Option<i32>, StorageError> {
-    let schema = client
+    let fingerprinted: Vec<&str> = super::ddl_triggers::FINGERPRINTED.to_vec();
+    let row = client
         .query_opt(
-            "SELECT n.nspname::text FROM pg_event_trigger t
-               JOIN pg_proc fired ON fired.oid = t.evtfoid
-               JOIN pg_namespace n ON n.oid = fired.pronamespace
-               JOIN pg_proc marker ON marker.pronamespace = n.oid
-                AND marker.proname = 'streamgres_stack' AND marker.pronargs = 0
-              WHERE t.evtname = $1",
-            &[&name],
+            r#"WITH stack AS (
+                 SELECT fired.pronamespace AS ns FROM pg_event_trigger t
+                   JOIN pg_proc fired ON fired.oid = t.evtfoid
+                  WHERE t.evtname = $1
+               ), marker AS (
+                 SELECT (regexp_match(p.prosrc, '^SELECT ''(.*)''::jsonb$'))[1]::jsonb AS value
+                   FROM pg_proc p JOIN stack ON p.pronamespace = stack.ns
+                  WHERE p.proname = 'streamgres_stack' AND p.pronargs = 0
+               ), installed AS (
+                 SELECT encode(sha256(convert_to(string_agg(p.prosrc, E'\n' ORDER BY p.proname, p.prosrc), 'UTF8')), 'hex') AS fingerprint
+                   FROM pg_proc p JOIN stack ON p.pronamespace = stack.ns
+                  WHERE p.proname = ANY($2)
+               )
+               SELECT (marker.value->>'version')::int4 FROM marker, installed
+                WHERE marker.value->>'fingerprint' = installed.fingerprint"#,
+            &[&name, &fingerprinted],
         )
         .await?;
-    let Some(schema) = schema else {
-        return Ok(None);
-    };
-    let schema: String = schema.get(0);
-    let version = client
-        .query_one(
-            &format!("SELECT {}.streamgres_stack()", super::sql::quote_ident(&schema)),
-            &[],
-        )
-        .await?;
-    Ok(Some(version.get(0)))
+    Ok(row.and_then(|row| row.get(0)))
 }
 
 #[cfg(test)]

@@ -4,8 +4,8 @@
 //! them).
 //!
 //! Ported from zero-cache's `change-source/pg/schema/{ddl,published}.ts`
-//! (Rocicorp, Apache-2.0), with two differences, which make it this
-//! crate's stack rather than zero-cache's:
+//! (Rocicorp, Apache-2.0), with differences that make it this crate's
+//! stack rather than zero-cache's:
 //!
 //! - The start trigger only takes the DDL lock. zero-cache's also builds
 //!   the whole published schema and writes it into the WAL as a
@@ -15,11 +15,19 @@
 //!   migration's every statement a quarter of a second or more and
 //!   megabytes of WAL. zero-cache does read `ddlStart`, so a stack it
 //!   shares must stay its own.
-//! - The schema holds `streamgres_stack()`, which returns
-//!   [`STACK_VERSION`]: who owns the stack, and which setup it is. An
-//!   engine updates only a stack that says it is this crate's
-//!   ([`super::ddl::stack_version`]); one without the marker may be
-//!   zero-cache's, and is adopted only by running this SQL as a migration.
+//! - The triggers also fire on `DROP SCHEMA`. zero-cache's start trigger
+//!   took the schema a `DROP SCHEMA … CASCADE` left into its record
+//!   unannounced; without it, the tables such a drop removed would show
+//!   up as removed at the next unrelated migration and stop the engine
+//!   there. Now the drop itself reports them.
+//! - The schema holds `streamgres_stack()`, the ownership marker: the
+//!   setup version ([`STACK_VERSION`]) and a fingerprint of the stack's
+//!   functions ([`FINGERPRINTED`]) as they were installed. A stack is
+//!   this crate's only while its functions still match the fingerprint
+//!   ([`super::ddl::stack_version`]), so a zero-cache that installs its
+//!   own functions over it takes it back. An engine updates only a stack
+//!   that is this crate's; any other is adopted only on purpose (a
+//!   migration running this SQL, or an engine told to adopt it).
 
 use super::sql::{quote_ident, quote_literal};
 
@@ -28,12 +36,17 @@ use super::sql::{quote_ident, quote_literal};
 /// install their setup bring an older stack of theirs up to date.
 pub const STACK_VERSION: i32 = 1;
 
-/// The advisory lock every DDL statement takes under zero-cache's start
-/// trigger, so that the schemas its messages carry diff in order.
+/// The stack's functions whose source the ownership marker fingerprints:
+/// the ones zero-cache's stack also defines, and defines differently.
+pub const FINGERPRINTED: [&str; 4] = ["emit_ddl_end", "emit_ddl_start", "schema_specs", "update_schemas"];
+
+/// The advisory lock the start trigger takes for every DDL statement, held
+/// to the end of its transaction, so that the schemas the end trigger's
+/// messages carry diff in commit order.
 const DDL_LOCK: i64 = 0x3c6b_8468_f1ba_c0b0;
 
-/// The command tags zero-cache's triggers fire on.
-const DDL_TAGS: [&str; 7] = [
+/// The command tags the triggers fire on: zero-cache's, and `DROP SCHEMA`.
+const DDL_TAGS: [&str; 8] = [
     "CREATE TABLE",
     "ALTER TABLE",
     "CREATE INDEX",
@@ -41,19 +54,19 @@ const DDL_TAGS: [&str; 7] = [
     "DROP INDEX",
     "ALTER PUBLICATION",
     "ALTER SCHEMA",
+    "DROP SCHEMA",
 ];
 
 /// The event-trigger stack for app `app`, shard `shard`, over
 /// `publications`, as SQL to run on a database zero-cache does not run
-/// against: the functions in the
-/// schema `<app>_<shard>`, the table holding the last published schema,
-/// the two event triggers, and the ownership marker (`streamgres_stack()`).
-/// Ported from zero-cache's `change-source/pg/schema/{ddl,published}.ts`
-/// with one field more, each column's collation name (`collationName`),
-/// which tells the engine whether a string column a migration adds
-/// orders as its text; and with a start trigger that only takes the
-/// lock (the module doc says why). Running it again is harmless, and is
-/// how a migration adopts a stack an older setup installed unmarked.
+/// against: the functions in the schema `<app>_<shard>`, the table holding
+/// the last published schema, the two event triggers, and the ownership
+/// marker (`streamgres_stack()`). Ported from zero-cache's
+/// `change-source/pg/schema/{ddl,published}.ts` with one field more, each
+/// column's collation name (`collationName`), which tells the engine
+/// whether a string column a migration adds orders as its text; and with
+/// the differences the module doc lists. Running it again is harmless, and
+/// is how a migration adopts a stack an older setup installed unmarked.
 pub fn trigger_stack_sql(app: &str, shard: u32, publications: &[&str]) -> String {
     let tags: Vec<String> = DDL_TAGS.iter().map(|tag| quote_literal(tag)).collect();
     let tags = tags.join(", ");
@@ -61,8 +74,10 @@ pub fn trigger_stack_sql(app: &str, shard: u32, publications: &[&str]) -> String
         .iter()
         .map(|name| quote_literal(name))
         .collect();
+    let fingerprinted: Vec<String> = FINGERPRINTED.iter().map(|name| quote_literal(name)).collect();
     TRIGGER_STACK
         .replace("@SCHEMA@", &quote_ident(&format!("{app}_{shard}")))
+        .replace("@SCHEMA_NAME@", &quote_literal(&format!("{app}_{shard}")))
         .replace("@START@", &quote_ident(&format!("{app}_ddl_start_{shard}")))
         .replace("@END@", &quote_ident(&format!("{app}_ddl_end_{shard}")))
         .replace("@APP@", app)
@@ -72,6 +87,7 @@ pub fn trigger_stack_sql(app: &str, shard: u32, publications: &[&str]) -> String
         .replace("@TAGS@", &tags)
         .replace("@LOCK@", &DDL_LOCK.to_string())
         .replace("@VERSION@", &STACK_VERSION.to_string())
+        .replace("@FINGERPRINTED@", &fingerprinted.join(", "))
 }
 
 /// [`trigger_stack_sql`]'s text, with the names to fill in marked.
@@ -393,10 +409,20 @@ CREATE EVENT TRIGGER @END@
   WHEN TAG IN (@TAGS_AND_COMMENT@)
   EXECUTE PROCEDURE @SCHEMA@.emit_ddl_end();
 
-CREATE OR REPLACE FUNCTION @SCHEMA@.streamgres_stack()
-RETURNS int
-IMMUTABLE
-AS $$ SELECT @VERSION@ $$ LANGUAGE sql;
+DO $marker$
+DECLARE
+  fingerprint TEXT;
+BEGIN
+  SELECT encode(sha256(convert_to(string_agg(p.prosrc, E'\n' ORDER BY p.proname, p.prosrc), 'UTF8')), 'hex')
+    FROM pg_proc p
+    JOIN pg_namespace ns ON ns.oid = p.pronamespace
+    WHERE ns.nspname = @SCHEMA_NAME@ AND p.proname IN (@FINGERPRINTED@)
+    INTO fingerprint;
+  EXECUTE format(
+    'CREATE OR REPLACE FUNCTION @SCHEMA@.streamgres_stack() RETURNS jsonb IMMUTABLE AS %L LANGUAGE sql',
+    format('SELECT %L::jsonb', json_build_object('version', @VERSION@, 'fingerprint', fingerprint)::text));
+END
+$marker$;
 "#;
 
 #[cfg(test)]
@@ -451,8 +477,20 @@ mod tests {
         assert!(!start.contains("update_schemas"), "{start}");
         assert!(!start.contains("schema_specs"), "{start}");
         assert!(!sql.contains("ddlStart"), "{sql}");
-        assert!(sql.contains(&format!(
-            "FUNCTION \"zero_0\".streamgres_stack()\nRETURNS int\nIMMUTABLE\nAS $$ SELECT {STACK_VERSION} $$"
-        )));
+        assert!(sql.contains("FUNCTION \"zero_0\".streamgres_stack() RETURNS jsonb"), "{sql}");
+        assert!(sql.contains(&format!("json_build_object('version', {STACK_VERSION}, 'fingerprint', fingerprint)")));
+        assert!(sql.contains("WHERE ns.nspname = 'zero_0' AND p.proname IN ('emit_ddl_end', 'emit_ddl_start', 'schema_specs', 'update_schemas')"), "{sql}");
+        assert!(sql.ends_with("$marker$;\n"), "the marker comes last, after the functions it fingerprints");
+    }
+
+    /// `DROP SCHEMA` fires both triggers, so a drop's tables are reported
+    /// by the drop itself.
+    #[test]
+    fn the_triggers_fire_on_drop_schema() {
+        let sql = trigger_stack_sql("zero", 0, &["zero_public_0"]);
+        for trigger in ["ON ddl_command_start\n  WHEN TAG IN (", "ON ddl_command_end\n  WHEN TAG IN ("] {
+            let tags = sql.split(trigger).nth(1).and_then(|rest| rest.split(')').next()).expect(trigger);
+            assert!(tags.contains("'DROP SCHEMA'"), "{trigger}: {tags}");
+        }
     }
 }

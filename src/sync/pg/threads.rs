@@ -180,6 +180,29 @@ pub async fn load_catalog_at(dsn: &str, schemas: &[String]) -> Result<Catalog, S
     Ok(catalog)
 }
 
+/// What to warn of, at startup, about the trigger stack behind the event
+/// trigger `name`, whose [`ddl::stack_version`] is `version`: a stack of
+/// this crate's from an older setup, or one not marked as this crate's
+/// (and whether that one also predates `rowSecurity`). Nothing for the
+/// current setup.
+fn stack_warning(name: &str, version: Option<i32>, predates_row_security: bool) -> Option<String> {
+    let current = ddl_triggers::STACK_VERSION;
+    match version {
+        Some(version) if version < current => Some(format!(
+            "the schema-change trigger stack behind `{name}` is streamgres's setup {version}, older than {current}; run the setup SQL again (setup_sql, or scripts/sql/ddl-triggers.sql) to update it"
+        )),
+        Some(_) => None,
+        None => Some(format!(
+            "the schema-change trigger stack behind `{name}` is not marked as streamgres's, so it is left as it is{}. If zero-cache uses it, that is right. If streamgres installed it, before it marked its stacks, its start trigger builds the whole published schema on every DDL statement, an `IF NOT EXISTS` that does nothing included, which slows migrations and startup bootstraps on a database with many tables: adopt it by running the setup SQL as a migration (setup_sql, or scripts/sql/ddl-triggers.sql), or, for an embedded engine, with STREAMGRES_EMBEDDED_SETUP=adopt",
+            if predates_row_security {
+                ", and it predates `rowSecurity`: row-level security turned on while serving goes unnoticed until a restart, and tables created meanwhile are taken as secured"
+            } else {
+                ""
+            }
+        )),
+    }
+}
+
 /// Refuse to serve without the event trigger `name` on `ddl_command_end`
 /// at `dsn`: it is how the server hears of schema changes, and a server
 /// that would not hear of them could go on serving rows in a shape the
@@ -194,20 +217,12 @@ pub async fn require_ddl_trigger(dsn: &str, name: &str) -> Result<(), String> {
     let present = ddl::trigger_present(&client, name)
         .await
         .map_err(|error| format!("looking for the DDL event trigger `{name}`: {error}"))?;
-    match ddl::stack_version(&client, name).await {
-        Ok(Some(version)) if present && version < ddl_triggers::STACK_VERSION => log_warn!(
-            "the schema-change trigger stack behind `{name}` is streamgres's setup {version}, older than {}; run the setup SQL again (setup_sql, or scripts/sql/ddl-triggers.sql) to update it",
-            ddl_triggers::STACK_VERSION
-        ),
-        Ok(None) if present => log_warn!(
-            "the schema-change trigger stack behind `{name}` is not marked as streamgres's, so it is left as it is. If zero-cache uses it, that is right. If streamgres installed it, before it marked its stacks, its start trigger builds the whole published schema on every DDL statement, an `IF NOT EXISTS` that does nothing included, which slows migrations and startup bootstraps on a database with many tables: adopt it by running the setup SQL as a migration (setup_sql, or scripts/sql/ddl-triggers.sql)"
-        ),
-        _ => {}
-    }
-    if present && ddl::stack_outdated(&client, name).await.unwrap_or(false) {
-        log_warn!(
-            "the schema-change trigger stack behind `{name}` predates `rowSecurity`: row-level security turned on while serving goes unnoticed until a restart, and tables created meanwhile are taken as secured; run the setup SQL again (scripts/sql/ddl-triggers.sql) to update it"
-        );
+    if present && let Ok(version) = ddl::stack_version(&client, name).await {
+        let predates_row_security =
+            version.is_none() && ddl::stack_outdated(&client, name).await.unwrap_or(false);
+        if let Some(warning) = stack_warning(name, version, predates_row_security) {
+            log_warn!("{warning}");
+        }
     }
     drop(client);
     let _ = handle.await;
@@ -643,4 +658,27 @@ pub async fn start(
         },
         service,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One warning at most: for an older stack of this crate's, or for a
+    /// stack not marked as this crate's, which also says when that stack
+    /// predates `rowSecurity`; none for the current setup.
+    #[test]
+    fn the_stack_warning_names_what_is_wrong_once() {
+        let current = ddl_triggers::STACK_VERSION;
+        assert_eq!(stack_warning("t", Some(current), false), None);
+        assert_eq!(stack_warning("t", Some(current + 1), false), None, "a newer setup is not ours to warn of");
+        let older = stack_warning("t", Some(current - 1), false).expect("an older setup");
+        assert!(older.contains(&format!("setup {}, older than {current}", current - 1)), "{older}");
+        let unmarked = stack_warning("t", None, false).expect("an unmarked stack");
+        assert!(unmarked.contains("not marked as streamgres's"), "{unmarked}");
+        assert!(unmarked.contains("STREAMGRES_EMBEDDED_SETUP=adopt"), "{unmarked}");
+        assert!(!unmarked.contains("rowSecurity"), "{unmarked}");
+        let old = stack_warning("t", None, true).expect("an unmarked, older stack");
+        assert!(old.contains("not marked as streamgres's") && old.contains("predates `rowSecurity`"), "{old}");
+    }
 }

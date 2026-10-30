@@ -437,8 +437,8 @@ fn an_outdated_trigger_stack_is_updated() {
         let client = admin(&dsn).await;
         set_up(&client, &names).await;
         let old = older_stack(&names).replace(
-            &format!("SELECT {STACK_VERSION} $$"),
-            &format!("SELECT {} $$", STACK_VERSION - 1),
+            &format!("'version', {STACK_VERSION},"),
+            &format!("'version', {},", STACK_VERSION - 1),
         );
         client.batch_execute(&old).await.expect("the older stack");
         assert!(!reads_row_security(&client, &names).await);
@@ -478,6 +478,11 @@ fn an_unmarked_trigger_stack_is_left_alone() {
             .await
             .expect("unmarked");
         assert_eq!(marked(&client, &names).await, None);
+        assert_eq!(
+            stack_version(&client, "no_such_trigger").await.expect("a missing trigger"),
+            None,
+            "no trigger, no stack"
+        );
 
         let mut installing = config(&dsn, &names);
         installing.setup = Setup::Install;
@@ -487,6 +492,121 @@ fn an_unmarked_trigger_stack_is_left_alone() {
         assert_eq!(marked(&client, &names).await, None);
         let stopping = engine.clone();
         tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+    });
+}
+
+/// An engine told to adopt the stack at its names replaces one that is
+/// not marked as this crate's, and marks it.
+#[test]
+fn an_engine_told_to_adopt_replaces_an_unmarked_stack() {
+    let Some(dsn) = dsn("adopt") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("adopt");
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        client
+            .batch_execute(&older_stack(&names))
+            .await
+            .expect("the older stack");
+        client
+            .batch_execute(&format!("DROP FUNCTION \"{}_0\".streamgres_stack()", names.app))
+            .await
+            .expect("unmarked");
+
+        let mut adopting = config(&dsn, &names);
+        adopting.setup = Setup::Adopt;
+        let engine = Engine::start(adopting);
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        assert!(reads_row_security(&client, &names).await, "replaced before serving");
+        assert_eq!(marked(&client, &names).await, Some(STACK_VERSION));
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+    });
+}
+
+/// A stack this crate installed is zero-cache's again once zero-cache
+/// installs its own functions over it: the marker left behind no longer
+/// matches them, and an engine leaves the stack alone.
+#[test]
+fn a_stack_zero_cache_installed_over_is_not_this_crates() {
+    let Some(dsn) = dsn("retaken") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("retaken");
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        assert_eq!(marked(&client, &names).await, Some(STACK_VERSION));
+        let schema = format!("{}_0", names.app);
+        let zero_cache_start = format!(
+            "CREATE OR REPLACE FUNCTION \"{schema}\".emit_ddl_start()
+             RETURNS event_trigger AS $$
+             BEGIN
+               PERFORM pg_advisory_xact_lock(4353719051050729648);
+               PERFORM \"{schema}\".update_schemas('ddlStart', TG_TAG, NULL);
+             END
+             $$ LANGUAGE plpgsql;"
+        );
+        client.batch_execute(&zero_cache_start).await.expect("zero-cache's start trigger");
+        assert_eq!(marked(&client, &names).await, None, "the marker no longer matches");
+
+        let mut installing = config(&dsn, &names);
+        installing.setup = Setup::Install;
+        let engine = Engine::start(installing);
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        let start: String = client
+            .query_one(
+                "SELECT prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                 WHERE n.nspname = $1 AND p.proname = 'emit_ddl_start'",
+                &[&schema],
+            )
+            .await
+            .expect("the start function")
+            .get(0);
+        assert!(start.contains("ddlStart"), "left as zero-cache installed it: {start}");
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+    });
+}
+
+/// An engine sets up no stack under zero-cache's default app id: one for
+/// app `zero` on a database nobody set up stays down, and says why.
+#[test]
+fn an_engine_sets_nothing_up_under_zero_caches_app() {
+    let Some(dsn) = dsn("zeroapp") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("zeroapp");
+        let mut zero = config(&dsn, &names);
+        zero.app = "zero".to_owned();
+        zero.ddl_trigger = "zero_ddl_end_0".to_owned();
+        zero.ddl_prefix = "zero/0/ddl".to_owned();
+        zero.setup = Setup::Install;
+        let engine = Engine::start(zero);
+        reach(
+            &engine,
+            |state| matches!(state, State::Down(reason) if reason.contains("zero-cache's default app id")),
+            Duration::from_secs(30),
+        )
+        .await;
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+        let client = admin(&dsn).await;
+        let triggers: i64 = client
+            .query_one("SELECT count(*) FROM pg_event_trigger", &[])
+            .await
+            .expect("the event triggers")
+            .get(0);
+        assert_eq!(triggers, 0, "nothing installed");
     });
 }
 
@@ -582,6 +702,17 @@ fn the_stack_writes_one_message_per_change_and_none_for_a_noop() {
         assert!(!waiting.is_finished(), "the second migration waits for the first's lock");
         client.batch_execute("COMMIT").await.expect("commit the first");
         waiting.await.expect("join").expect("the second migration");
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA dropped;
+                 CREATE TABLE dropped.items (id int8 PRIMARY KEY);
+                 DROP SCHEMA dropped CASCADE;
+                 DROP TABLE {more};
+                 COMMENT ON PUBLICATION {} IS 'followed';",
+                names.publication
+            ))
+            .await
+            .expect("drops and a comment");
 
         let messages: Vec<Value> = client
             .query(
@@ -600,7 +731,39 @@ fn the_stack_writes_one_message_per_change_and_none_for_a_noop() {
             })
             .collect();
         let kinds: Vec<&str> = messages.iter().filter_map(|m| m["type"].as_str()).collect();
-        assert_eq!(kinds, ["ddlUpdate"; 6], "one update per change, no start");
+        let mut expected = vec!["ddlUpdate"; 9];
+        expected.push("schemaSnapshot");
+        assert_eq!(kinds, expected, "one update per change, no start, a snapshot for the comment");
+        let tables = |schema: &Value| -> Vec<String> {
+            let mut tables: Vec<String> = schema["tables"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|t| format!("{}.{}", t["schema"].as_str().unwrap_or(""), t["name"].as_str().unwrap_or("")))
+                .collect();
+            tables.sort();
+            tables
+        };
+        let moved: Vec<(Vec<String>, Vec<String>)> = messages[6..9]
+            .iter()
+            .map(|message| {
+                let (before, after) = (tables(&message["previousSchema"]), tables(&message["schema"]));
+                (
+                    after.iter().filter(|t| !before.contains(t)).cloned().collect(),
+                    before.iter().filter(|t| !after.contains(t)).cloned().collect(),
+                )
+            })
+            .collect();
+        let none = Vec::<String>::new();
+        assert_eq!(
+            moved,
+            [
+                (vec!["dropped.items".to_owned()], none.clone()),
+                (none.clone(), vec!["dropped.items".to_owned()]),
+                (none.clone(), vec![format!("public.{more}")]),
+            ],
+            "a table created, then reported gone by DROP SCHEMA itself, then a DROP TABLE"
+        );
 
         let columns = |schema: &Value, name: &str| -> Vec<String> {
             let mut columns: Vec<String> = schema["tables"]
@@ -614,7 +777,7 @@ fn the_stack_writes_one_message_per_change_and_none_for_a_noop() {
             columns.sort();
             columns
         };
-        let added: Vec<Vec<String>> = messages
+        let added: Vec<Vec<String>> = messages[..6]
             .iter()
             .map(|message| {
                 let (before, after) = (&message["previousSchema"], &message["schema"]);

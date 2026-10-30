@@ -82,22 +82,43 @@ application that does not configure through the environment.
   install them by migration (`streamgres::embedded::setup_sql(app, shard,
   publication)` gives the trigger stack's SQL) and set
   `STREAMGRES_EMBEDDED_SETUP=require`.
-- **Whose trigger stack it is.** The stack streamgres installs marks
-  itself as streamgres's, with its setup version (`<app>_<shard>.streamgres_stack()`).
-  An engine that installs its setup updates only a stack with that
-  marker. A stack without it is left as it is, with a warning at
-  startup: it may be zero-cache's, which still needs what streamgres's
-  stack no longer does. Stacks streamgres installed before it marked them
-  have no marker either, and their start trigger builds the whole
-  published schema, and writes it into the WAL, on every `CREATE TABLE`,
-  `CREATE INDEX` and `ALTER TABLE`, an `IF NOT EXISTS` that does nothing
-  included. On a database with many tables that costs each such
-  statement a quarter of a second or more, so a startup that runs many
-  of them can take minutes. When only streamgres uses the stack, adopt
-  it by running the setup SQL again (`setup_sql`, or
-  `scripts/sql/ddl-triggers.sql`) as a migration, **before** restarting
-  the backend: a backend that runs DDL while it starts would otherwise
-  run it under the old stack before its engine could replace it.
+- **Whose trigger stack it is.** The stack streamgres installs is not
+  zero-cache's: its start trigger only takes a lock (zero-cache's also
+  writes the whole published schema into the WAL, which zero-cache
+  reads and streamgres does not), and it also fires on `DROP SCHEMA`. So
+  the two must not share a stack:
+  - **Its own names.** An embedded engine's app id defaults to
+    `streamgres` (stack `streamgres_ddl_end_0`, schema `streamgres_0`),
+    not zero-cache's default `zero`, and an engine sets up nothing for
+    app `zero`: with `STREAMGRES_APP_ID=zero` on a database not set up
+    for it, it refuses to start and says why. (Before this, the default
+    was `zero`.)
+  - **A marker.** The stack marks itself as streamgres's
+    (`<app>_<shard>.streamgres_stack()`) with its setup version and a
+    fingerprint of its functions as installed. It stays streamgres's only
+    while its functions match: a zero-cache that installs its own over it
+    takes it back. An engine on `install` updates only a stack of its own
+    from an older setup, and leaves any other as it is, with a warning at
+    startup.
+  - **Adopting an unmarked stack.** Stacks streamgres installed before it
+    marked them have no marker either, and their start trigger builds the
+    whole published schema, and writes it into the WAL, on every
+    `CREATE TABLE`, `CREATE INDEX` and `ALTER TABLE`, an `IF NOT EXISTS`
+    that does nothing included. On a database with many tables that costs
+    each such statement a quarter of a second or more, so a startup that
+    runs many of them can take minutes. When only streamgres uses the
+    stack, either run the setup SQL again (`setup_sql`, or
+    `scripts/sql/ddl-triggers.sql`) as a migration **before** restarting
+    the backend, or set `STREAMGRES_EMBEDDED_SETUP=adopt`, which replaces
+    it when the engine starts. A backend that runs DDL before it starts
+    its engine runs that DDL under the old stack once more with `adopt`;
+    the migration avoids even that.
+  - **Moving off `zero`.** A database an embedded engine set up under the
+    old default has an unmarked `zero_*` stack. With the new default the
+    engine installs a `streamgres_*` stack beside it, but the old one
+    keeps costing every DDL statement. When no zero-cache uses it, drop
+    it by migration before the restart:
+    `DROP EVENT TRIGGER zero_ddl_start_0; DROP EVENT TRIGGER zero_ddl_end_0; DROP SCHEMA zero_0 CASCADE;`
 
 ### How it runs
 
@@ -153,10 +174,10 @@ backend process:
 | `STREAMGRES_ENGINE` | | `embedded` to run the engine in this process |
 | `STREAMGRES_PG_DSN` | required | the primary, a direct connection (not a pooler) |
 | `STREAMGRES_READ_PG_DSN` | `STREAMGRES_PG_DSN` | where ordinary reads go; may be PgBouncer in transaction mode |
-| `STREAMGRES_APP_ID`, `STREAMGRES_SHARD` | `zero`, `0` | name the trigger stack (`<app>_ddl_end_<shard>`) |
+| `STREAMGRES_APP_ID`, `STREAMGRES_SHARD` | `streamgres`, `0` | name the trigger stack (`<app>_ddl_end_<shard>`); never set up for `zero` (section 2) |
 | `STREAMGRES_PUBLICATION` | `xyne_sync_pub` | |
 | `STREAMGRES_SCHEMAS` | `public,<app>_<shard>` | |
-| `STREAMGRES_EMBEDDED_SETUP` | `install` | or `require` |
+| `STREAMGRES_EMBEDDED_SETUP` | `install` | `adopt` to also replace an unmarked stack, or `require` (section 2) |
 | `STREAMGRES_EMBEDDED_SLOT` | `temporary` | or `permanent` (section 2, How it runs) |
 | `STREAMGRES_SLOT_CLEANUP_AGE_MS` | 300000 | on a permanent slot: how long a dead process's slot stays before an engine drops it; 0 never (PostgreSQL 17+ otherwise) |
 | `STREAMGRES_READ_CONNECTIONS` | 4 | read connections the engine opens |
