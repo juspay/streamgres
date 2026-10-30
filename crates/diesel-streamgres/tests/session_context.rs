@@ -22,11 +22,13 @@ use diesel_streamgres::key::QueryKey;
 use diesel_streamgres::subscriptions::{Outcome, Subscriptions, Verdict};
 use diesel_streamgres::{Route, Served, SyncedConnection};
 
+mod require;
+
 /// The test database's URL.
 fn url() -> Option<String> {
     let url = std::env::var("DATABASE_URL").ok();
     if url.is_none() {
-        eprintln!("DATABASE_URL not set: session context checks skipped");
+        require::skip("postgres", "DATABASE_URL not set: session context checks");
     }
     url
 }

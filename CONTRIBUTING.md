@@ -40,7 +40,13 @@ cargo run --release --bin load      # the server over the wire: latency, cores, 
 
 The tests against a real PostgreSQL run when `STREAMGRES_PG_DSN` is set and
 report themselves skipped otherwise; the Diesel wrapper's and the demo's
-tests read `DATABASE_URL`. To run them the way CI does:
+tests read `DATABASE_URL`. A live test also skips without an engine (an
+S2S server's `STREAMGRES_S2S_URL`, or `STREAMGRES_TEST_EMBEDDED` with the
+`embedded` feature). CI lists what it gives in `STREAMGRES_REQUIRE_LIVE`
+(`postgres`, `engine`, `embedded`, `s2s`, `s2s-token`), and a test that
+would skip for want of one listed fails instead; `STREAMGRES_TEST_PG_MAJOR`
+names the server version a run is for, and a test that needs a later one
+says so and skips. To run them the way CI does:
 
 ```bash
 docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17 \
@@ -61,7 +67,7 @@ Every pull request runs:
 | Job | What it runs |
 | --- | --- |
 | Lints | `cargo clippy --workspace --all-targets --locked -- -D warnings`, the same for the engine without its `server` feature, and `scripts/check-downstream.sh` (the crates built as another project's dependencies) |
-| Tests | `cargo test --release --locked --workspace` against PostgreSQL 17 |
+| Tests | against PostgreSQL 16 and 17: `cargo test --release --locked --workspace`; the Diesel wrapper's live tests against an embedded engine; and a server started for `s2s_live` and the wrapper's engine tests over its S2S socket |
 | Benchmark | `bench` on your branch and the base branch, five alternating rounds, compared by `scripts/bench-compare.py` |
 | Image | builds `docker/server/Dockerfile` and drives it end to end with `scripts/smoke.mjs` |
 

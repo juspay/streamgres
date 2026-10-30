@@ -203,7 +203,12 @@ fn a_stop_while_the_start_is_held_back_returns_at_once() {
         let names = names("stop");
         let client = admin(&dsn).await;
         set_up(&client, &names).await;
-        for kind in [Slot::Temporary, Slot::Permanent { cleanup_age: Duration::from_secs(3600) }] {
+        let mut kinds = vec![Slot::Temporary];
+        // A cleanup age needs `inactive_since`, which PostgreSQL 17 added.
+        if dsn.at_least(17, "the permanent-slot case of a_stop_while_the_start_is_held_back") {
+            kinds.push(Slot::Permanent { cleanup_age: Duration::from_secs(3600) });
+        }
+        for kind in kinds {
             let holder = admin(&dsn).await;
             holder
                 .batch_execute("BEGIN; SELECT pg_current_xact_id();")
@@ -254,6 +259,11 @@ fn a_stop_while_the_start_is_held_back_returns_at_once() {
 #[test]
 fn a_permanent_slot_keeps_the_engine_serving_through_a_dropped_feed() {
     let Some(dsn) = dsn("permanent") else { return };
+    // Sweeping a dead process's slot by age needs PostgreSQL 17's
+    // `inactive_since`.
+    if !dsn.at_least(17, "a_permanent_slot_keeps_the_engine_serving_through_a_dropped_feed") {
+        return;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

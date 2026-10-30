@@ -418,7 +418,7 @@ async fn watchers_of_one_query_share_its_subscription() {
 async fn a_typed_query_on_another_schema_reports_its_rows_changes() {
     let followed = std::env::var("STREAMGRES_SCHEMAS").unwrap_or_default();
     if !followed.split(',').any(|schema| schema.trim() == "sg_live_ws") {
-        eprintln!("STREAMGRES_SCHEMAS does not name sg_live_ws; skipping");
+        transport::require::skip("engine", "STREAMGRES_SCHEMAS does not name sg_live_ws");
         return;
     }
     let Some((engine, database, mut other)) = start() else {
@@ -431,21 +431,35 @@ async fn a_typed_query_on_another_schema_reports_its_rows_changes() {
         .expect("table");
     let tag = format!("typed-{}", std::process::id());
     let (sender, mut changes) = mpsc::unbounded_channel();
-    let _subscription = engine
-        .subscribe(
-            &database,
-            sg_items::table
-                .filter(sg_items::label.eq(tag.clone()))
-                .select(Item::as_select()),
-            move |change: Change<Item>| {
-                let sender = sender.clone();
-                async move {
-                    let _ = sender.send(change);
-                }
-            },
-        )
-        .await
-        .expect("a schema-qualified Diesel query is followed");
+    // The engine takes the table in from the change feed a moment after
+    // its `CREATE`, and refuses a query on it as on an unknown table until
+    // then: on a fresh database, the first subscribe can come too soon.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let _subscription = loop {
+        let sender = sender.clone();
+        let subscribed = engine
+            .subscribe(
+                &database,
+                sg_items::table
+                    .filter(sg_items::label.eq(tag.clone()))
+                    .select(Item::as_select()),
+                move |change: Change<Item>| {
+                    let sender = sender.clone();
+                    async move {
+                        let _ = sender.send(change);
+                    }
+                },
+            )
+            .await;
+        match subscribed {
+            Err(diesel_streamgres::SubscribeError::Unsupported(reason))
+                if reason.contains("unknown table") && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            subscribed => break subscribed.expect("a schema-qualified Diesel query is followed"),
+        }
+    };
     let id = i32::try_from(std::process::id() % 1_000_000).expect("id");
     diesel::insert_into(sg_items::table)
         .values((sg_items::id.eq(id), sg_items::label.eq(&tag)))
@@ -567,10 +581,12 @@ async fn a_join_past_the_work_budget_is_refused_as_such() {
             .await
         {
             Err(diesel_streamgres::SubscribeError::WorkBudget(reason)) => break reason,
-            Err(error) if Instant::now() < deadline => {
-                // The engine may not have taken the new tables in yet.
-                let _ = error;
-                tokio::time::sleep(Duration::from_millis(100)).await;
+            // The engine takes the new tables in from the change feed a
+            // moment after their `CREATE`.
+            Err(diesel_streamgres::SubscribeError::Unsupported(reason))
+                if reason.contains("unknown table") && Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(error) => panic!("refused, but not over budget: {error}"),
             Ok(_) => panic!("ten joined rows fit a budget of five steps"),

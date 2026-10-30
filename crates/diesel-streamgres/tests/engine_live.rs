@@ -16,8 +16,7 @@ use diesel::prelude::*;
 use diesel::sql_types::Text;
 use diesel_streamgres::cache::Cache;
 use diesel_streamgres::engine::EngineClient;
-use diesel_streamgres::key::QueryKey;
-use diesel_streamgres::subscriptions::{Outcome, Subscriptions, Verdict};
+use diesel_streamgres::subscriptions::Subscriptions;
 use diesel_streamgres::{Consistency, Served, SyncedConnection};
 
 diesel::table! {
@@ -124,18 +123,7 @@ impl Live {
     /// directly, not through the cache, which would keep that refusal
     /// and send the test's own reads to Postgres for a while.
     fn adopted<Q: diesel::query_builder::QueryFragment<diesel::pg::Pg>>(&mut self, query: Q) {
-        let key = QueryKey::of(&query, &mut self.other).expect("key");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match Subscriptions::subscribe(&self.engine, &key) {
-                Outcome::Verdict(Verdict::Refused(reason)) if reason.contains("unknown table") => {
-                    assert!(Instant::now() < deadline, "the engine never took the table in: {reason}");
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                _ => break,
-            }
-        }
-        Subscriptions::unsubscribe(&self.engine, &key);
+        transport::adopted(&self.engine, &mut self.other, query);
     }
 
     /// Reads until the value is seen or the wait runs out, returning how

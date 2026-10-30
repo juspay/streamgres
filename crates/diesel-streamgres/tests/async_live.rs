@@ -83,6 +83,14 @@ async fn rows_mode_through_the_async_wrapper() {
         )
         .await
         .expect("schema");
+    let adopting = engine.clone();
+    let url = database.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut conn = diesel::PgConnection::establish(&url).expect("connect");
+        transport::adopted(&adopting, &mut conn, sg_configs::table.select(sg_configs::id));
+    })
+    .await
+    .expect("the engine takes the table in");
     let prefix = format!("async-live-{}-", std::process::id());
     let key = format!("{prefix}r");
     put(&mut other, &key, "1").await;

@@ -17,7 +17,10 @@ use diesel_streamgres::{Change, WatchError};
 #[tokio::test(flavor = "multi_thread")]
 async fn a_watcher_of_a_dropped_table_is_told_and_its_stream_ends() {
     if std::env::var_os("STREAMGRES_TEST_EMBEDDED").is_none() {
-        eprintln!("STREAMGRES_TEST_EMBEDDED not set; skipping (the drop restarts the engine)");
+        transport::require::skip(
+            "embedded",
+            "STREAMGRES_TEST_EMBEDDED not set (the drop restarts the engine, so only an embedded one)",
+        );
         return;
     }
     let Some(engine) = transport::client(diesel_streamgres::engine::Config::from_env()) else {

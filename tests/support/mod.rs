@@ -3,6 +3,15 @@
 //! trip over each other's schema-change trigger stacks: one dropping its
 //! stack while another's DDL runs fails that DDL. Each test that installs
 //! a stack, or follows schema changes, takes a [`Database`] instead.
+//!
+//! A live test skips itself when what it needs is not given, so the suite
+//! runs on a laptop with nothing set up. CI says what it gives instead:
+//! `STREAMGRES_REQUIRE_LIVE` lists requirements (`postgres`, `s2s`,
+//! `s2s-token`), and a test that would skip for want of one listed fails
+//! ([`skip`]). `STREAMGRES_TEST_PG_MAJOR` names the major version the
+//! server must be, so a job meant for one version cannot run on another;
+//! a test that needs a later one than the server skips by saying so
+//! ([`Database::at_least`]).
 
 use std::fmt;
 use std::ops::Deref;
@@ -10,20 +19,42 @@ use std::time::{Duration, Instant};
 
 use tokio_postgres::NoTls;
 
+/// Whether `STREAMGRES_REQUIRE_LIVE` lists `requirement`.
+fn required(requirement: &str) -> bool {
+    std::env::var("STREAMGRES_REQUIRE_LIVE")
+        .is_ok_and(|list| list.split(',').any(|listed| listed.trim() == requirement))
+}
+
+/// A live test skips itself for want of `requirement`, saying `why`; or,
+/// when `STREAMGRES_REQUIRE_LIVE` lists the requirement, fails instead,
+/// so a run that was meant to exercise it cannot pass without doing so.
+#[allow(dead_code, reason = "each test binary uses what it needs of the support module")]
+pub fn skip(requirement: &str, why: &str) {
+    assert!(
+        !required(requirement),
+        "{why}; STREAMGRES_REQUIRE_LIVE lists `{requirement}`, so this test must run here"
+    );
+    eprintln!("{why}: skipped");
+}
+
 /// A fresh database on the server `STREAMGRES_PG_DSN` names, dropped with
 /// its slots when this goes. Dereferences to its own DSN.
 pub struct Database {
     dsn: String,
     name: String,
     server: String,
+    /// The server's major version (16, 17).
+    major: u32,
 }
 
 impl Database {
     /// A fresh database for the test tagged `tag`; `None`, and the test
-    /// skipped, when no server is named.
+    /// skipped, when no server is named ([`skip`], requirement
+    /// `postgres`). A server of another major version than
+    /// `STREAMGRES_TEST_PG_MAJOR` names fails the test.
     pub fn create(tag: &str) -> Option<Database> {
         let Ok(server) = std::env::var("STREAMGRES_PG_DSN") else {
-            eprintln!("STREAMGRES_PG_DSN not set: live Postgres scenario skipped");
+            skip("postgres", "STREAMGRES_PG_DSN not set: live Postgres scenario");
             return None;
         };
         let name = format!("sg_test_{tag}_{}", std::process::id());
@@ -32,17 +63,47 @@ impl Database {
             format!("CREATE DATABASE {name}"),
         ];
         let on = server.clone();
+        let (sender, version) = std::sync::mpsc::channel();
         on_own_runtime(async move {
             let client = connect(&on).await;
             for statement in statements {
                 client.batch_execute(&statement).await.expect("a database of its own");
             }
+            let number: i32 = client
+                .query_one("SELECT current_setting('server_version_num')::int4", &[])
+                .await
+                .expect("the server's version")
+                .get(0);
+            let _ = sender.send(number);
         });
+        let major = u32::try_from(version.recv().expect("the server's version") / 10_000)
+            .expect("a positive version");
+        if let Ok(expected) = std::env::var("STREAMGRES_TEST_PG_MAJOR") {
+            assert_eq!(
+                expected.trim(),
+                major.to_string(),
+                "STREAMGRES_TEST_PG_MAJOR names the server this run is for, and it is {major}"
+            );
+        }
         Some(Database {
             dsn: with_database(&server, &name),
             name,
             server,
+            major,
         })
+    }
+
+    /// Whether the server is PostgreSQL `major` or later; a test that
+    /// needs it skips itself otherwise, saying what it needs. Not a
+    /// requirement [`skip`] can insist on: the run for that version
+    /// (`STREAMGRES_TEST_PG_MAJOR`) is the one that covers it.
+    #[allow(dead_code, reason = "each test binary uses what it needs of the support module")]
+    pub fn at_least(&self, major: u32, test: &str) -> bool {
+        if self.major >= major {
+            return true;
+        }
+        eprintln!("{test} needs PostgreSQL {major}, and the server is {}: skipped", self.major);
+        false
     }
 }
 

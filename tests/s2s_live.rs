@@ -27,22 +27,26 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::{Error, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+#[allow(dead_code, reason = "this binary takes only `skip` from the support module")]
+mod support;
+
 const TABLE: &str = "live_s2s_items";
 
 /// The socket to the endpoint.
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// The endpoint and the database, when both are given.
+/// The endpoint and the database, when both are given; the test skipped
+/// otherwise ([`support::skip`], requirements `postgres` and `s2s`).
 fn targets() -> Option<(String, String)> {
-    let url = std::env::var("STREAMGRES_S2S_URL").ok();
-    let dsn = std::env::var("STREAMGRES_PG_DSN").ok();
-    match (url, dsn) {
-        (Some(url), Some(dsn)) => Some((url, dsn)),
-        _ => {
-            eprintln!("STREAMGRES_S2S_URL or STREAMGRES_PG_DSN not set: s2s live scenario skipped");
-            None
-        }
-    }
+    let Ok(dsn) = std::env::var("STREAMGRES_PG_DSN") else {
+        support::skip("postgres", "STREAMGRES_PG_DSN not set: s2s live scenario");
+        return None;
+    };
+    let Ok(url) = std::env::var("STREAMGRES_S2S_URL") else {
+        support::skip("s2s", "STREAMGRES_S2S_URL not set: s2s live scenario");
+        return None;
+    };
+    Some((url, dsn))
 }
 
 /// The upgrade request for `url`, with `token` as a bearer when given.
@@ -53,6 +57,14 @@ fn request(url: &str, token: Option<&str>) -> Request {
         request.headers_mut().insert(AUTHORIZATION, value);
     }
     request
+}
+
+/// `frame` touches subscription `id` alone, and says where the change
+/// committed, for a refill from a standby to wait for.
+fn assert_touch(frame: &Value, id: u64) {
+    assert_eq!(frame[0], "touched", "{frame}");
+    assert_eq!(frame[1]["ids"], json!([id]), "{frame}");
+    assert!(frame[1]["lsn"].as_u64().is_some_and(|lsn| lsn > 0), "a touch carries its position: {frame}");
 }
 
 /// The token the engine was started with, if the test was given one.
@@ -328,7 +340,7 @@ async fn the_endpoint_speaks_its_protocol() {
         .expect("update");
     let frames = frames_for(&mut socket, Duration::from_secs(2)).await;
     assert_eq!(frames.len(), 1, "only the touch: {frames:?}");
-    assert_eq!(frames[0], json!(["touched", {"ids": [touch_id]}]));
+    assert_touch(&frames[0], touch_id);
 
     send(&mut socket, json!(["bogus"])).await;
     let error = expect(&mut socket, "an error").await;
@@ -338,10 +350,7 @@ async fn the_endpoint_speaks_its_protocol() {
         .execute(&format!("DELETE FROM {TABLE} WHERE id = 4"), &[])
         .await
         .expect("delete");
-    assert_eq!(
-        expect(&mut socket, "the touch for the delete").await,
-        json!(["touched", {"ids": [touch_id]}])
-    );
+    assert_touch(&expect(&mut socket, "the touch for the delete").await, touch_id);
     send(&mut socket, json!(["unsubscribe", {"id": touch_id}])).await;
     client
         .execute(
@@ -367,7 +376,7 @@ async fn a_token_guards_the_endpoint() {
         return;
     };
     let Some(token) = token() else {
-        eprintln!("STREAMGRES_S2S_TOKEN not set: the token check is skipped");
+        support::skip("s2s-token", "STREAMGRES_S2S_TOKEN not set: the token check");
         return;
     };
     let wrong = format!("{token}-not");
