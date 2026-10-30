@@ -210,6 +210,17 @@ jobs:
           docker logs server
           exit 1
 
+      # The image's HEALTHCHECK is the binary itself (no shell or curl in
+      # the image): Docker must see it pass once the server is ready.
+      - name: The image's health check reports healthy
+        run: |
+          for _ in $(seq 1 30); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' server)" = healthy ] && exit 0
+            sleep 1
+          done
+          docker inspect -f '{{json .State.Health}}' server
+          exit 1
+
       - name: Sync, schema refusal, heavy reads and the OTLP push, end to end
         env:
           SMOKE_COLLECTOR: http://127.0.0.1:9464/metrics

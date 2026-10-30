@@ -32,9 +32,10 @@ coreutils:
 - It has one binary, `/app/server`, run as the unprivileged user `nonroot`
   (uid 65532).
 - It listens on port 4848 and writes JSON log lines to stderr.
-- It has no Docker `HEALTHCHECK` (there is no curl to run one): probe
-  `/healthz` and `/readyz` over HTTP from the platform instead, which
-  answer 503 until the server is ready (section 6).
+- Its Docker `HEALTHCHECK` is the binary itself: `/app/server --health`
+  asks the server for `/health` and exits 0 on a 200. Kubernetes ignores
+  it: probe `/healthz` and `/readyz` over HTTP instead, which answer 503
+  until the server is ready (section 6).
 - It needs no file system, except an optional writable directory for
   `STREAMGRES_PLAN_FILE` (section 5), and a writable `/tmp` for heap
   profiles when Pyroscope is on and the root file system is read-only.

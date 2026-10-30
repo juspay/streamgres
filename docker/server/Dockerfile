@@ -7,8 +7,9 @@
 # one); nothing is baked in but the listen address and the JSON log format a
 # container platform expects.
 #
-# There is no HEALTHCHECK, since there is no shell to run one: the platform
-# probes `/healthz` and `/readyz` over HTTP (docs/deploy.md).
+# The health check is the binary itself (`server --health`), since there is
+# no shell or curl to run one. Kubernetes ignores it and probes `/healthz`
+# and `/readyz` over HTTP instead (docs/deploy.md).
 #
 #   docker build -f docker/server/Dockerfile -t streamgres .
 #
@@ -42,4 +43,6 @@ ENV SOURCE_COMMIT=${SOURCE_COMMIT} \
 
 USER 65532:65532
 EXPOSE 4848
+HEALTHCHECK --interval=10s --timeout=3s --start-period=30s --retries=6 \
+    CMD ["/app/server", "--health"]
 CMD ["/app/server"]

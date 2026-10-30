@@ -7,6 +7,10 @@
 //! Configured by `STREAMGRES_*` environment variables (see `.env.example`);
 //! a `.env` file in the working directory is read first, without
 //! overriding variables already set.
+//!
+//! `server --health` asks a server already running on `STREAMGRES_ADDR`'s
+//! port for `/health` and exits 0 if it answers 200, 1 otherwise: the
+//! image's health check, which has no shell or curl to run instead.
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -21,12 +25,45 @@ unsafe impl Sync for MallocConf {}
 
 fn main() {
     load_dotenv(".env");
+    if std::env::args().nth(1).as_deref() == Some("--health") {
+        std::process::exit(if healthy() { 0 } else { 1 });
+    }
     raise_file_limit();
     let outcome = streamgres::client::Config::from_env().and_then(streamgres::client::serve);
     if let Err(error) = outcome {
         eprintln!("{error}");
         streamgres::log::exit(1);
     }
+}
+
+/// Whether the server on this host answers `GET /health` with 200, within
+/// a few seconds. The port is `STREAMGRES_ADDR`'s; the host is always the
+/// loopback, since the listen address may be `0.0.0.0`.
+fn healthy() -> bool {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    let addr = std::env::var("STREAMGRES_ADDR").unwrap_or_else(|_| "0.0.0.0:4848".to_owned());
+    let Some(port) = addr.rsplit_once(':').and_then(|(_, port)| port.parse::<u16>().ok()) else {
+        return false;
+    };
+    let timeout = Duration::from_secs(2);
+    let target = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&target, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    let request = "GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    // The status line alone decides: `HTTP/1.x 200 ...`.
+    let mut head = [0u8; 12];
+    if stream.read_exact(&mut head).is_err() {
+        return false;
+    }
+    head.starts_with(b"HTTP/1.") && &head[8..12] == b" 200"
 }
 
 /// Set every `KEY=VALUE` line of `path` that is not already set; a
