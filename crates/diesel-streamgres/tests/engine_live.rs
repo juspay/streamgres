@@ -69,6 +69,10 @@ impl Live {
                     id serial PRIMARY KEY, key text NOT NULL UNIQUE, value text NOT NULL)",
             )
             .expect("schema");
+        // On a fresh database the first test creates the table while the
+        // engine serves: wait for the engine to take it in, or the first
+        // reads go to Postgres as reads of an unknown table.
+        transport::adopted(&engine, &mut other, sg_configs::table.select(sg_configs::id));
         let prefix = format!("{name}-{}-", std::process::id());
         let inner = PgConnection::establish(&database).expect("connect");
         let mut conn = SyncedConnection::with_cache(inner, cache.clone(), Route::Streamgres);
