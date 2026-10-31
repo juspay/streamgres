@@ -36,6 +36,13 @@ diesel_streamgres::install(Settings::single(
 )).ok();
 // Several databases: Settings::by_url(|url| Some(Attachment { cache: ..., route: ... }))
 // then use SyncedConnection<PgConnection> where PgConnection was, pools included.
+//
+// Or without process-wide state, from the settings themselves:
+//   let settings = Settings::single(cache, |_| Route::Streamgres);
+//   let pool = r2d2::Pool::builder().build(settings.manager::<PgConnection>(url))?;
+//   let conn = settings.establish::<PgConnection>(url)?;
+//   // diesel-async: settings.async_manager(url) for bb8 or deadpool,
+//   // settings.establish_async(url).await for one connection.
 // One query can override its pool's route:
 //   configs::table.find(key).via(Route::Postgres).first(conn)
 //   conn.with_route(Route::Streamgres, |c| configs::table.find(key).first(c))

@@ -63,6 +63,14 @@ engine.attach(&cache);
 diesel_streamgres::install(Settings::single(cache, |_| Route::Streamgres)).ok();
 ```
 
+`install` puts the settings in place for every connection Diesel
+establishes, pools included. A backend that would rather keep no global
+state builds its pools from the settings instead:
+`settings.manager::<PgConnection>(url)` for r2d2,
+`settings.async_manager(url)` for bb8 or deadpool on diesel-async, and
+`settings.establish(url)` for a single connection. Several settings can
+live side by side, each with its own caches.
+
 `EngineClient::embedded(engine, config)` takes an engine started by hand
 (`diesel_streamgres::embedded::Engine::start(Config { ... })`), for an
 application that does not configure through the environment.

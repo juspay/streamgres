@@ -60,7 +60,9 @@ use diesel::result::Error;
 use diesel::sql_query;
 use diesel::sql_types::{Oid, Text, Untyped};
 use diesel::{ConnectionResult, QueryResult};
-use diesel_async::pooled_connection::PoolableConnection;
+use diesel_async::pooled_connection::{
+    AsyncDieselConnectionManager, ManagerConfig, PoolableConnection,
+};
 use diesel::connection::CacheSize;
 use diesel_async::{
     AnsiTransactionManager, AsyncConnection, AsyncConnectionCore, AsyncPgConnection,
@@ -84,7 +86,7 @@ use crate::materialized::Snapshot;
 use crate::subscriptions::{Outcome, Subscriptions, Verdict};
 use crate::types::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
 use super::policy::{self, Bypass, Replayed, commits, may_write, rendered};
-use super::{Attachment, SETTINGS, read_your_writes_from_env};
+use super::{Attachment, SETTINGS, Settings, read_your_writes_from_env};
 
 /// diesel-async's Postgres row, which it does not export by name.
 pub type PgRow = <AsyncPgConnection as AsyncConnectionCore>::Row<'static, 'static>;
@@ -92,6 +94,42 @@ pub type PgRow = <AsyncPgConnection as AsyncConnectionCore>::Row<'static, 'stati
 /// The row an `AsyncSyncedConnection` yields: diesel-async's own, or one
 /// the cache holds.
 pub type AsyncSyncedRow = SyncedRow<PgRow>;
+
+impl Settings {
+    /// `inner`, already established with `url`, attached as these
+    /// settings attach that URL: to its cache and route, or as a
+    /// passthrough when they give it none.
+    pub fn attach_async(&self, inner: AsyncPgConnection, url: &str) -> AsyncSyncedConnection {
+        match self.attachment_for(url) {
+            Some(Attachment { cache, route }) => {
+                AsyncSyncedConnection::with_cache(inner, cache, route)
+            }
+            None => AsyncSyncedConnection::new(inner),
+        }
+    }
+
+    /// A diesel-async connection to `url`, attached by these settings.
+    pub async fn establish_async(&self, url: &str) -> ConnectionResult<AsyncSyncedConnection> {
+        let inner = AsyncPgConnection::establish(url).await?;
+        Ok(self.attach_async(inner, url))
+    }
+
+    /// A diesel-async connection manager for `url` whose connections
+    /// these settings attach, for a bb8, deadpool or mobc pool.
+    pub fn async_manager(
+        &self,
+        url: impl Into<String>,
+    ) -> AsyncDieselConnectionManager<AsyncSyncedConnection> {
+        let settings = self.clone();
+        let mut config = ManagerConfig::default();
+        config.custom_setup = Box::new(move |url| {
+            let settings = settings.clone();
+            let url = url.to_owned();
+            async move { settings.establish_async(&url).await }.boxed()
+        });
+        AsyncDieselConnectionManager::new_with_config(url, config)
+    }
+}
 
 /// A diesel-async Postgres connection whose reads can be served from a
 /// synced local copy. See [`crate::SyncedConnection`] for what is
@@ -875,19 +913,13 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
 impl AsyncConnection for AsyncSyncedConnection {
     type TransactionManager = AnsiTransactionManager;
 
-    /// Connects, attached to the cache [`crate::install`] set up for
-    /// this URL, if any.
+    /// Connects, attached by the settings [`crate::install`] put in
+    /// place ([`Settings::establish_async`]); a passthrough without.
     async fn establish(database_url: &str) -> ConnectionResult<Self> {
-        let inner = AsyncPgConnection::establish(database_url).await?;
-        Ok(
-            match SETTINGS
-                .get()
-                .and_then(|settings| settings.attachment_for(database_url))
-            {
-                Some(Attachment { cache, route }) => Self::with_cache(inner, cache, route),
-                None => Self::new(inner),
-            },
-        )
+        match SETTINGS.get() {
+            Some(settings) => settings.establish_async(database_url).await,
+            None => AsyncPgConnection::establish(database_url).await.map(Self::new),
+        }
     }
 
     /// The inner connection's transaction state.

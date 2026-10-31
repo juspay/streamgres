@@ -1,6 +1,7 @@
 //! [`SyncedConnection`]: the wrapper over a blocking Diesel connection.
 
 use std::sync::atomic::Ordering;
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,7 @@ use diesel::connection::{
 use diesel::expression::QueryMetadata;
 use diesel::pg::{GetPgMetadataCache, Pg, PgMetadataCache};
 use diesel::query_builder::{Query, QueryFragment, QueryId};
-use diesel::r2d2::R2D2Connection;
+use diesel::r2d2::{ManageConnection, R2D2Connection};
 use diesel::{Connection, ConnectionResult, QueryResult};
 
 use crate::cache::{
@@ -27,7 +28,73 @@ use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::Verdict;
 
 use super::policy::{self, Bypass, Replayed, commits, may_write, rendered};
-use super::{Attachment, SETTINGS, read_your_writes_from_env};
+use super::{Attachment, SETTINGS, Settings, read_your_writes_from_env};
+
+impl Settings {
+    /// `inner`, already established with `url`, attached as these
+    /// settings attach that URL: to its cache and route, or as a
+    /// passthrough when they give it none.
+    pub fn attach<C>(&self, inner: C, url: &str) -> SyncedConnection<C> {
+        match self.attachment_for(url) {
+            Some(Attachment { cache, route }) => SyncedConnection::with_cache(inner, cache, route),
+            None => SyncedConnection::new(inner),
+        }
+    }
+
+    /// A connection to `url`, attached by these settings.
+    pub fn establish<C: Connection>(&self, url: &str) -> ConnectionResult<SyncedConnection<C>> {
+        let inner = C::establish(url)?;
+        Ok(self.attach(inner, url))
+    }
+
+    /// An r2d2 connection manager for `url` whose connections these
+    /// settings attach, for `r2d2::Pool::builder().build(manager)`.
+    pub fn manager<C>(&self, url: impl Into<String>) -> SyncedManager<C> {
+        SyncedManager {
+            url: url.into(),
+            settings: self.clone(),
+            connection: PhantomData,
+        }
+    }
+}
+
+/// An r2d2 connection manager whose connections a [`Settings`] attaches
+/// ([`Settings::manager`]); otherwise Diesel's own `ConnectionManager`.
+pub struct SyncedManager<C> {
+    url: String,
+    settings: Settings,
+    connection: PhantomData<fn() -> C>,
+}
+
+impl<C> ManageConnection for SyncedManager<C>
+where
+    C: R2D2Connection
+        + LoadConnection<DefaultLoadingMode>
+        + Connection<Backend = Pg, TransactionManager = AnsiTransactionManager>
+        + Send
+        + 'static,
+{
+    type Connection = SyncedConnection<C>;
+    type Error = diesel::r2d2::Error;
+
+    /// Establishes a connection to the manager's URL, attached.
+    fn connect(&self) -> Result<SyncedConnection<C>, diesel::r2d2::Error> {
+        self.settings
+            .establish(&self.url)
+            .map_err(diesel::r2d2::Error::ConnectionError)
+    }
+
+    /// Pings the connection.
+    fn is_valid(&self, conn: &mut SyncedConnection<C>) -> Result<(), diesel::r2d2::Error> {
+        conn.ping().map_err(diesel::r2d2::Error::QueryError)
+    }
+
+    /// Whether the connection is broken, or was in use by a thread that
+    /// panicked.
+    fn has_broken(&self, conn: &mut SyncedConnection<C>) -> bool {
+        std::thread::panicking() || conn.is_broken()
+    }
+}
 
 /// A Postgres connection whose reads can be served from a synced local copy.
 ///
@@ -314,21 +381,13 @@ where
     /// One transaction state, not two that could disagree.
     type TransactionManager = AnsiTransactionManager;
 
-    /// Connects, attached to the cache [`install`](crate::install) set up for this URL,
-    /// if any.
+    /// Connects, attached by the settings [`install`](crate::install)
+    /// put in place ([`Settings::establish`]); a passthrough without.
     fn establish(database_url: &str) -> ConnectionResult<Self> {
-        let inner = C::establish(database_url)?;
-        Ok(
-            match SETTINGS
-                .get()
-                .and_then(|settings| settings.attachment_for(database_url))
-            {
-                Some(Attachment { cache, route }) => {
-                    SyncedConnection::with_cache(inner, cache, route)
-                }
-                None => SyncedConnection::new(inner),
-            },
-        )
+        match SETTINGS.get() {
+            Some(settings) => settings.establish(database_url),
+            None => C::establish(database_url).map(SyncedConnection::new),
+        }
     }
 
     /// Begins Diesel's test transaction on the inner connection.

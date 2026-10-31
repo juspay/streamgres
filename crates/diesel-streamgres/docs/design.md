@@ -33,7 +33,7 @@ and changes nothing else.
 | module | role |
 |---|---|
 | `lib.rs` | the crate's documentation and what it exports |
-| `connection/mod.rs` | `Settings`, `Attachment`, `install`: which cache a connection reads through, by its URL |
+| `connection/mod.rs` | `Settings`, `Attachment`, `install`: which cache a connection reads through, by its URL; the settings make connections and pools (`SyncedManager`, `async_manager`) without `install` |
 | `connection/synchronous.rs` | `SyncedConnection`, the interception of Diesel's three connection methods |
 | `connection/asynchronous.rs` | `AsyncSyncedConnection`, the same wrapper over diesel-async (feature `async`) |
 | `connection/policy.rs` | what both wrappers decide from what they know: a read's route, why it bypasses the cache and what that counts, whether a refill may be kept, what counts as a write |

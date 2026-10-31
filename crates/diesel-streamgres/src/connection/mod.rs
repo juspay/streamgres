@@ -5,7 +5,9 @@
 //! [`asynchronous::AsyncSyncedConnection`] a diesel-async one; both
 //! follow the same rules. [`Settings`] says, by the URL a connection is
 //! established with, which cache it reads through and the route its
-//! reads take.
+//! reads take, and makes such connections and pools of them. [`install`]
+//! puts one in place for the whole process, for code that establishes
+//! connections through Diesel's own `establish` and pools.
 
 #[cfg(feature = "async")]
 pub mod asynchronous;
@@ -18,7 +20,7 @@ use std::time::Duration;
 use crate::cache::Cache;
 use crate::route::Route;
 
-pub use self::synchronous::SyncedConnection;
+pub use self::synchronous::{SyncedConnection, SyncedManager};
 
 /// What a connection established with some URL gets: the cache its
 /// reads go through and the route they take by default.
@@ -38,8 +40,17 @@ pub struct Attachment {
 /// database. The route is
 /// per pool: a master pool can go to Postgres while a replica pool goes
 /// through Streamgres.
+///
+/// Settings make connections and pools themselves
+/// ([`Settings::establish`], [`Settings::manager`], and their async
+/// twins), so a process may hold several, each with its own caches, and
+/// a test its own, with no global state. [`install`] puts one in place
+/// for every connection Diesel establishes, for an application whose
+/// pools call `establish` themselves. A clone shares the same
+/// attachments.
+#[derive(Clone)]
 pub struct Settings {
-    for_url: Box<AttachmentFor>,
+    for_url: Arc<AttachmentFor>,
 }
 
 /// What [`Settings`] asks of a URL.
@@ -65,7 +76,7 @@ impl Settings {
         for_url: impl Fn(&str) -> Option<Attachment> + Send + Sync + 'static,
     ) -> Settings {
         Settings {
-            for_url: Box::new(for_url),
+            for_url: Arc::new(for_url),
         }
     }
 
@@ -102,7 +113,9 @@ pub fn read_your_writes_from_env() -> Duration {
 /// Installs the process-wide settings. Connections established after this
 /// (including by pools, which call [`Connection::establish`](diesel::Connection::establish)) use them;
 /// before it, every connection is a passthrough. Returns the settings back
-/// if some were already installed.
+/// if some were already installed. A convenience over the settings' own
+/// [`Settings::establish`] and [`Settings::manager`], which need no
+/// install.
 pub fn install(settings: Settings) -> Result<(), Settings> {
     SETTINGS.set(settings)
 }

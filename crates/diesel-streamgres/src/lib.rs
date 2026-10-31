@@ -78,7 +78,7 @@ pub use crate::postgres::{cursor, encode, row, types};
 #[cfg(feature = "async")]
 pub use crate::connection::asynchronous::AsyncSyncedConnection;
 pub use crate::connection::{
-    Attachment, DEFAULT_READ_YOUR_WRITES, Settings, SyncedConnection, install,
+    Attachment, DEFAULT_READ_YOUR_WRITES, Settings, SyncedConnection, SyncedManager, install,
     read_your_writes_from_env,
 };
 pub use crate::listen::{Change, SqlRow, Subscription, SubscribeError, Watch, WatchError};
