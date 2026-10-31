@@ -51,25 +51,25 @@
 //! Consumers that already wrap their connection enable it, so this crate
 //! does too rather than reaching into Diesel's hidden derive re-exports.
 
-#[cfg(feature = "async")]
-pub mod asynchronous;
 pub mod cache;
-pub mod cursor;
-pub mod encode;
+mod connection;
 pub mod engine;
 pub mod key;
 pub mod listen;
 pub mod materialized;
 pub mod metrics;
+pub mod postgres;
 pub mod route;
 pub mod rollout;
-pub mod row;
 pub mod shadow;
 #[cfg(feature = "sse")]
 pub mod sse;
 mod session;
 pub mod subscriptions;
-pub mod types;
+
+#[cfg(feature = "async")]
+pub use crate::connection::asynchronous;
+pub use crate::postgres::{cursor, encode, row, types};
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};

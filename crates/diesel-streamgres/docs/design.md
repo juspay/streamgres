@@ -33,17 +33,17 @@ and changes nothing else.
 | module | role |
 |---|---|
 | `lib.rs` | `SyncedConnection`, `Settings`, `install`, the interception of Diesel's three connection methods |
-| `asynchronous.rs` | `AsyncSyncedConnection`, the same wrapper over diesel-async (feature `async`) |
+| `connection/asynchronous.rs` | `AsyncSyncedConnection`, the same wrapper over diesel-async (feature `async`) |
 | `route.rs` | `Route`, `RouteDsl`, `Via`, `Served`: where a read goes and where it came from |
 | `key.rs` | `QueryKey`: what identifies a read, and a refusal |
 | `cache.rs` | `Cache`, `Limits`, `Stats`, the `Live` trait, reservations and generations |
 | `subscriptions.rs` | the `Subscriptions` trait between the cache and the engine side |
-| `engine.rs` | `EngineClient`: the pool of sockets to the engine, `Config` |
+| `engine/` | `EngineClient`: the pool of sockets to the engine, `Config` |
 | `materialized.rs` | a query's result kept from the engine's rows; joins composed here |
-| `types.rs` | exact column types of a table, from `pg_attribute` |
-| `encode.rs` | engine JSON cells to Postgres binary, per column type |
-| `row.rs` | `OwnedRow`: a row that outlives its statement and decodes like a live one |
-| `cursor.rs` | one cursor type for rows from the cache and rows from Postgres |
+| `postgres/types.rs` | exact column types of a table, from `pg_attribute` |
+| `postgres/encode.rs` | engine JSON cells to Postgres binary, per column type |
+| `postgres/row.rs` | `OwnedRow`: a row that outlives its statement and decodes like a live one |
+| `postgres/cursor.rs` | one cursor type for rows from the cache and rows from Postgres |
 | `session.rs` | what a connection's statements changed in its session since it was established |
 
 ## The interception surface
