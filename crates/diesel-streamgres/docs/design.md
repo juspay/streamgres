@@ -624,6 +624,17 @@ added.
 Dropping the `Subscription` aborts the task, removes the listener and
 unsubscribes the key.
 
+**What this guarantees, and what it does not.** The queue, the fold and
+the reconnect diff make a subscription converge: the result its callback
+last saw catches up with the query's. Nothing is stored, a change folded
+or made while the socket was down is never delivered on its own, a
+restart replays nothing (the next subscription starts from `Present`),
+and the subscription can end (`Ended`). Callbacks, `watch_sql` and the
+SSE feed are therefore change signals for a running process, and the
+public docs say so (`listen` module docs, `docs/backends.md` section 7):
+durable once-per-event delivery is the application's own outbox, not
+this.
+
 ## Cache limits
 
 `cache::Limits`, from the environment (`Limits::from_env`) or in code

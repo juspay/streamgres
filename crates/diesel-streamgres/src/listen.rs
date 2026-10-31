@@ -1,4 +1,5 @@
-//! Callbacks on a query's changes: a webhook is a subscription.
+//! Callbacks on a query's changes: a signal that a result moved, not a
+//! durable event.
 //!
 //! [`EngineClient::subscribe`] follows a Diesel query through the engine
 //! and calls back with each change of its result, whoever wrote it (a
@@ -7,9 +8,15 @@
 //! ```ignore
 //! let subscription = engine
 //!     .subscribe(&database_url, payments::table.filter(payments::status.eq("SUCCESS")),
-//!         |change: Change<Payment>| async move {
-//!             if let Change::Added(payment) = change {
-//!                 notify_merchant(&payment).await;
+//!         move |change: Change<Payment>| {
+//!             let outbox = outbox.clone();
+//!             async move {
+//!                 // Recorded idempotently in the application's own outbox, which
+//!                 // a worker delivers from with retries; Present rows too, so a
+//!                 // restarted process records what succeeded meanwhile.
+//!                 if let Change::Present(payment) | Change::Added(payment) = change {
+//!                     outbox.record_success(payment.id).await;
+//!                 }
 //!             }
 //!         })
 //!     .await?;
@@ -30,15 +37,30 @@
 //! - When the engine connection drops and comes back (the engine
 //!   restarted, the network failed), the result as the engine has it then
 //!   is compared with the last one known, and the difference arrives as
-//!   changes. Nothing is lost, but changes made while the connection was
-//!   down arrive as their net effect: a row that entered and left
-//!   meanwhile is not reported.
+//!   changes. The result catches up, but changes made while the
+//!   connection was down arrive as their net effect: a row that entered
+//!   and left meanwhile is not reported.
 //! - The same holds when the callback falls more than [`PENDING_LIMIT`]
 //!   changes behind: from then on the pending changes are kept as their
 //!   net effect per row until it catches up, and [`Subscription::lagged`]
 //!   counts the times.
 //! - Not across processes: a new subscription starts with
 //!   [`Change::Present`] rows, to reconcile from.
+//! - Not forever: when the engine stops following the query,
+//!   [`Subscription::ended`] says why ([`Ended`]) and nothing follows.
+//!
+//! What that adds up to: while a subscription lives, the result it last
+//! delivered converges on the query's current one. It does not promise
+//! every intermediate change, nor a change once only (rows already
+//! handled arrive again as [`Change::Present`] after a restart), nor any
+//! delivery to a process that is not running: nothing is stored. A
+//! callback should act idempotently on the rows it is given, and
+//! anything that must happen once per business event (a payment webhook,
+//! an email) needs a durable record of its own, such as an outbox row
+//! written in the event's own transaction, the callback at most a way to
+//! act on it sooner. The example above records into such an outbox,
+//! idempotently; it still misses a payment that succeeded and was
+//! refunded while no process was subscribed.
 //!
 //! [`EngineClient::subscribe_sql`] does the same for a query given as
 //! plain SQL, and hands back each row as a [`SqlRow`]: an application

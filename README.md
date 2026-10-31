@@ -128,6 +128,12 @@ inside its own process instead (`STREAMGRES_ENGINE=embedded`), against
 its primary; [`docs/backends.md`](docs/backends.md) covers choosing
 between the two, replicas and read-your-writes.
 
+The S2S endpoint is for trusted backends, never end users: it runs every
+query as the engine's role over every followed row, so the backend
+scopes what it reads in its own code, and no browser or third party
+reaches it or picks its SQL. See [`docs/deploy.md`](docs/deploy.md),
+*Who may use the S2S endpoint*.
+
 Configuration uses `STREAMGRES_*` environment variables, each documented in
 [`.env.example`](.env.example). Existing `XYNE_SYNC_*` variables are still
 accepted as fallbacks; a `STREAMGRES_*` value takes precedence when both are

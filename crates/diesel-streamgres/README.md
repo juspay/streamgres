@@ -23,6 +23,10 @@ about what was refused. See `docs/design.md`.
 // token from STREAMGRES_S2S_TOKEN when the engine asks for one. Use
 // wss:// (or a TLS-terminating proxy) unless the engine is on this
 // machine or a private network: the token travels in the upgrade.
+// The endpoint is for trusted backends: every query runs as the engine's
+// role, so scope what you read in your own code, and never let an end
+// user, a browser or a provider choose the SQL (docs/deploy.md, "Who may
+// use the S2S endpoint").
 let engine = EngineClient::connect("wss://engine:4848/zero/s2s/v1");
 for warning in engine.warnings() {
     log::warn!("{warning}");
@@ -50,19 +54,35 @@ diesel_streamgres::install(Settings::single(
 
 ## Callbacks on changes
 
-The same `EngineClient` calls back when a query's result changes, which
-makes a webhook on any query one subscription:
+The same `EngineClient` calls back when a query's result changes. A
+callback is a signal that the result moved, not a durable event: changes
+coalesce when it falls behind or the engine reconnects, nothing is stored
+for a process that is down, and rows arrive again as `Present` after a
+restart. A webhook sender built on it keeps its own durable record of
+what to send:
 
 ```rust
 let subscription = engine
     .subscribe(&database_url, payments::table.filter(payments::status.eq("SUCCESS")),
-        |change: Change<Payment>| async move {
-            if let Change::Added(payment) = change {
-                notify_merchant(&payment).await;
+        move |change: Change<Payment>| {
+            let outbox = outbox.clone();
+            async move {
+                // Recorded idempotently in the application's own outbox, which
+                // a worker delivers from with retries; Present rows too, so a
+                // restarted process records what succeeded meanwhile.
+                if let Change::Present(payment) | Change::Added(payment) = change {
+                    outbox.record_success(payment.id).await;
+                }
             }
         })
     .await?;
 ```
+
+When every business event must be sent, even one that came and went
+while no process was subscribed, write the outbox row in the event's own
+transaction and use the subscription only to wake the worker. See
+[`docs/backends.md`](../../docs/backends.md), section 7, *What a callback
+promises*.
 
 Without Diesel types of this crate's Diesel (an application on another
 Diesel version, a fork, or none), `subscribe_sql` takes the query as SQL

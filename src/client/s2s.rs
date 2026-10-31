@@ -2,6 +2,13 @@
 //! WebSocket at `{base}/s2s/v1`, for backends that reach the engine over
 //! the network.
 //!
+//! The endpoint is a trust boundary drawn around backends, not users: the
+//! token admits a backend, and nothing here knows whom that backend acts
+//! for, so nothing here can narrow what a query sees. A backend scopes
+//! what it reads in its own code, and must not let an untrusted caller
+//! reach the endpoint or choose the SQL it sends (`docs/deploy.md`, "Who
+//! may use the S2S endpoint").
+//!
 //! Admission ([`S2sAccess`]):
 //! - The endpoint runs any query it supports with the engine's own
 //!   database privileges, for no user in particular, so it is served

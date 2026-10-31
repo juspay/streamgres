@@ -46,7 +46,9 @@
 //! [`EngineClient::subscribe`](engine::EngineClient::subscribe) takes a
 //! Diesel query and an async callback, and gives it each row present,
 //! then each row added, updated or removed, per commit, whoever wrote it
-//! ([`listen`]). A webhook on any query is one subscription.
+//! ([`listen`]). These are signals that a result moved, which coalesce
+//! and are not stored: a webhook sender keeps its own durable outbox, and
+//! uses them to fill it or to act on it sooner.
 //!
 //! # Why the opt-in feature
 //!

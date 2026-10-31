@@ -346,7 +346,8 @@ depend on what the defaults happen to be:
   Keep `/metrics` and `/stats` private.
 - **The S2S endpoint reads with the engine's privileges.** It carries no
   user: whoever opens it can subscribe to the rows of every table the
-  engine follows, every column of them. So:
+  engine follows, every column of them. It is for trusted backends, not
+  for end users (see *Who may use the S2S endpoint* below). So:
   - It is off unless `STREAMGRES_S2S_TOKEN` is set, and then admits only
     that bearer token. Use a random one (`openssl rand -hex 32`); the
     server refuses one under 16 bytes. To rotate, set
@@ -373,6 +374,40 @@ depend on what the defaults happen to be:
   a time compares on the millisecond, as the client does. Rows of one
   page that fall in the same millisecond are ordered by their
   microseconds, then by key, where the client orders them by key alone.
+
+### Who may use the S2S endpoint
+
+The S2S endpoint is a trust boundary of its own, and it is drawn around
+backends, not users.
+
+- **The token admits a backend, not a user or a tenant.** Every query
+  runs as the engine's database role, over every row and column the
+  engine follows. Nothing on the endpoint knows who the backend is
+  acting for, so nothing there can narrow what a query sees.
+- **Authorization is the backend's job.** A backend decides what it
+  reads for whom, in its own code, before the query is sent, exactly as
+  it would before reading Postgres with its own pool: the tenant or
+  workspace filter goes in the query it builds. The engine's per-reader
+  checks (section 6 of [`backends.md`](backends.md)) keep a cached
+  answer from crossing roles and search paths; they are not row-level
+  authorization, and callbacks do not have them at all.
+- **Never put it in front of untrusted callers.** Do not expose the
+  endpoint, or a proxy that passes SQL or query parameters through to
+  it, to browsers, mobile apps, third-party providers or end users. A
+  typed query builder in front of it does not change that: it shapes
+  queries, it does not scope them. Serving end users their own changes
+  needs a separate authorization and query-scoping design. The Zero
+  endpoint is the one this server offers for that: a client asks for a
+  query by name, and the application server turns it into the query that
+  user may run (section 4).
+- **The same holds for what a backend builds on it.** An SSE feed or a
+  webhook sender built on `diesel-streamgres` serves queries the
+  application chose for an authenticated request, never SQL taken from
+  the request.
+
+Row-level security is a database policy the engine cannot apply for a
+backend, so the endpoint refuses those tables instead (section 3).
+
 - **Health.** `GET /health` (also `/healthz`, `/readyz`, and each of them
   under the base path) returns `503` until the server is ready. That means
   the change feed has passed the first read snapshot, and the warm start, if

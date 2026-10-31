@@ -2,7 +2,15 @@
 //! their queries; this module shares watches, skips initial rows, turns
 //! lost changes into refresh hints and closes the whole stream when any
 //! query stops being followed. The application still authenticates the
-//! request and chooses its workspace queries before calling `notifications`.
+//! request and chooses its workspace queries before calling `notifications`:
+//! every query runs with the engine's privileges, so never take SQL or a
+//! table name from the request, and scope each query to what the
+//! requester may see.
+//!
+//! An event is a refresh hint, not a durable message: several changes may
+//! arrive as one, none is kept for a client that is not connected (there
+//! is no `Last-Event-ID` replay), and the stream can end. A client reads
+//! the authoritative state when it connects and after each event.
 
 //!
 //! With the `embedded` feature, start and check readiness once at startup,

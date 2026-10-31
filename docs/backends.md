@@ -7,7 +7,7 @@ that uses Diesel, through the `diesel-streamgres` wrapper:
 - reading from replicas
 - read-your-writes
 - who a cached answer is for
-- callbacks on a query's changes (webhooks)
+- callbacks on a query's changes: signals, not durable events
 - what to watch
 
 The wrapper itself (routing, the cache, what is served from rows and what
@@ -232,6 +232,14 @@ on the primary as a migration (the publication, and the event trigger
 from `scripts/sql/ddl-triggers.sql`), a token in `STREAMGRES_S2S_TOKEN`
 (the server serves no S2S endpoint without one), and preferably the
 endpoint on a private listener of its own (`STREAMGRES_S2S_ADDR`).
+
+The endpoint is for trusted backends only. Its token admits a backend,
+not a user or a tenant: every query runs as the engine's role, over
+every followed row and column, so a backend scopes what it reads in its
+own code, and never lets a browser, a provider or any other untrusted
+caller reach the endpoint or choose the SQL it sends there. See
+[`deploy.md`](deploy.md), *Who may use the S2S endpoint*.
+
 Backends connect with:
 
 | variable | default | |
@@ -399,19 +407,39 @@ reasons:
 ## 7. Callbacks on a query's changes
 
 The engine that keeps the cache fresh can also call back when a query's
-result changes. A webhook on any query is one subscription:
+result changes. A callback is a signal that the result moved, delivered
+to a process that is running: what it starts must not depend on seeing
+every change, or on seeing one only once (*What a callback promises*,
+below).
+
+A webhook sender built on it keeps its own durable record of what to
+send. Here a payment that succeeded is recorded in the application's
+outbox, keyed by the payment, and a separate worker delivers from the
+outbox with retries:
 
 ```rust
 let subscription = engine
     .subscribe(&database_url, payments::table.filter(payments::status.eq("SUCCESS")),
-        |change: Change<Payment>| async move {
-            if let Change::Added(payment) = change {
-                notify_merchant(&payment).await;
+        move |change: Change<Payment>| {
+            let outbox = outbox.clone();
+            async move {
+                // Present rows too: a process that restarts records what
+                // succeeded while it was down. The insert is idempotent
+                // (ON CONFLICT (payment_id) DO NOTHING), so a row seen
+                // twice is recorded once.
+                if let Change::Present(payment) | Change::Added(payment) = change {
+                    outbox.record_success(payment.id).await;
+                }
             }
         })
     .await?;
 // Changes are delivered while `subscription` lives; drop it to stop.
 ```
+
+This still misses a payment that succeeded and left the result (it was
+refunded, say) while no process was subscribed. When every such event
+must be sent, write the outbox row in the payment's own transaction, and
+use the subscription only to wake the worker sooner.
 
 - **What arrives.** First `Change::Present` for each row the result
   holds. The engine is given up to the verdict timeout to receive every
@@ -430,12 +458,16 @@ let subscription = engine
   (`Subscription::lagged()` counts it). When the engine connection
   drops and returns (an engine restart, a network failure), the result
   before is compared with the engine's fresh one. The difference
-  arrives as changes. Nothing is missed, but a row that came and went
-  while the connection was down is not reported.
+  arrives as changes: the result catches up, but a row that came and
+  went while the connection was down is not reported.
 - **Not across processes.** A new subscription starts from
   `Change::Present`, so a process that restarts reconciles from there.
   Deliver idempotently: a callback cut short by a restart is not
   replayed.
+- **It can end.** When the engine stops following the query,
+  `Subscription::ended()` says why (`Ended::Stopped`, `Unserved` or
+  `WorkBudget`) and no change follows. Subscribe again, or read
+  Postgres, from there.
 - **What can be subscribed.** Any query the engine serves from its own
   rows:
   - a single-table query without `LIMIT` is followed change by change,
@@ -458,6 +490,31 @@ let subscription = engine
   is closed when `subscribe` returns, and opened again only to relearn
   the types after a reconnect.
 
+### What a callback promises
+
+A subscription converges: while it lives, the result it last delivered
+catches up with the query's current result. That is the whole promise.
+
+- **Not every change.** Changes coalesce into their net effect per row
+  when the callback falls behind and across a lost engine connection,
+  so an intermediate state, or a row that came and went, may never be
+  delivered.
+- **Not durable.** Nothing is stored. A change delivered to a process
+  that dies before its callback finishes is not delivered again; one
+  made while no process is subscribed is never delivered as a change,
+  only reflected in the `Present` rows of the next subscription.
+- **Not exactly once.** Across a restart, rows already handled arrive
+  again as `Present`.
+- **Not forever.** A subscription can end (`Subscription::ended()`).
+
+So a callback should read as "this result changed; here is how it looks
+now", and what it starts should be idempotent and derived from the rows
+it is given, or from a fresh read. Anything that must happen once per
+business event (a payment webhook, an email, a ledger entry) needs a
+durable record of its own, such as an outbox written in the event's own
+transaction, with the callback at most a way to act on it sooner. The
+same holds for `watch_sql` and the SSE feed below.
+
 ### Lost connections and HTTP streams
 
 The first engine connection is attempted at once. After a failure, workers
@@ -478,7 +535,12 @@ fails or ends. Use `Query::ignore_removals` for a newest-version query whose
 successor arrival already invalidates the old row. Lower-level `watch_sql`
 and `sse::body` remain available for custom applications.
 The HTTP consumer must reconnect and refresh authoritative state, since this
-body does not persist events or implement Last-Event-ID replay.
+body does not persist events or implement Last-Event-ID replay. An event
+is a refresh hint, as a callback is: several changes may arrive as one,
+none is stored for a client that is not connected, and the stream can end.
+The queries are the application's, chosen for the authenticated request:
+never take SQL or table names from the request, since every query runs
+with the engine's privileges.
 
 ## 8. What to watch
 
