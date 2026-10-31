@@ -493,7 +493,7 @@ pub fn classify_in(
                             .is_some_and(|published| published.compares_as_text() == Some(false))
                 }) {
                     return Err(format!(
-                        "column `{column}` of `{name}` now compares by rules of its own (a nondeterministic collation, citext, char(n))"
+                        "column `{column}` of `{name}` now compares by rules of its own (a nondeterministic collation, citext, char(n), a numeric)"
                     ));
                 }
                 for change in column_changes(held, table)? {
@@ -827,9 +827,10 @@ mod tests {
     #[test]
     fn a_created_tables_orderings_come_from_its_message() {
         let column = |name: &str, data_type: &str, collation: Option<&str>| {
+            let deterministic = if collation.is_some() { "true" } else { "null" };
             let collation = collation.map_or("null".to_owned(), |name| format!("\"{name}\""));
             format!(
-                r#""{name}": {{"pos": 1, "dataType": "{data_type}", "pgTypeClass": "b", "typeOID": 1, "notNull": false, "dflt": null, "collationName": {collation}}}"#
+                r#""{name}": {{"pos": 1, "dataType": "{data_type}", "pgTypeClass": "b", "typeOID": 1, "notNull": false, "dflt": null, "collationName": {collation}, "collationIsDeterministic": {deterministic}}}"#
             )
         };
         let notes = format!(

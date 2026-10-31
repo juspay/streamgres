@@ -1359,6 +1359,48 @@ fn an_action_turned_off_and_on_again_starts_the_engine_over() {
     });
 }
 
+/// A `numeric`, which the engine carries as a `float8`, is refused in a
+/// filter and an `ORDER BY`: two values past 2^53 that Postgres tells
+/// apart would compare equal, so an update of the row that matches would
+/// leave it, or take in the one that does not. A `float8` is followed.
+#[test]
+fn a_numeric_is_neither_compared_nor_ordered() {
+    let Some(dsn) = dsn("numeric") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("numeric");
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        client
+            .batch_execute(
+                "CREATE TABLE amounts (id int8 PRIMARY KEY, n numeric NOT NULL, f float8 NOT NULL, value int4 NOT NULL);
+                 INSERT INTO amounts VALUES (1, 9007199254740992, 1.5, 10), (2, 9007199254740993, 2.5, 20);",
+            )
+            .await
+            .expect("the amounts");
+        let engine = Engine::start(config(&dsn, &names));
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        let mut session = engine.connect().expect("a session");
+        assert_eq!(next(&mut session).await.expect("hello")[0], "hello");
+        for (id, sql) in [
+            (1, r#"SELECT "id", "value" FROM "amounts" WHERE "amounts"."n" = 9007199254740993"#),
+            (2, r#"SELECT "id", "value" FROM "amounts" WHERE "amounts"."n" > 9007199254740992"#),
+            (3, r#"SELECT "id", "value" FROM "amounts" ORDER BY "amounts"."n" LIMIT 1"#),
+        ] {
+            let refused = answer(&mut session, id, sql).await;
+            assert_eq!(refused[0], "refused", "{sql}: {refused}");
+            assert!(refused.to_string().contains("numeric"), "{refused}");
+        }
+        let followed = answer(&mut session, 4, r#"SELECT "id", "value" FROM "amounts" WHERE "amounts"."f" = 2.5"#).await;
+        assert_eq!(followed[0], "accepted", "{followed}");
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+    });
+}
+
 /// A column whose equality Postgres decides by rules the engine does not
 /// follow is refused in a filter: here a nondeterministic ICU collation,
 /// under which `'a'` equals `'A'`, on a table loaded at start and on one

@@ -166,7 +166,8 @@ pub struct Projected {
 /// join, on a column whose equality Postgres decides by rules of its own
 /// (a nondeterministic collation, `citext`, `char(n)`) is refused too:
 /// the engine would call distinct texts different that Postgres calls
-/// equal ([`Catalog::equals_as_engine`]). An enum label
+/// equal ([`Catalog::equals_as_engine`]). So is one on a `numeric`, which
+/// the engine carries as a `float8` and so can call distinct values equal. An enum label
 /// travels in the binary format as its text, under the enum's own OID,
 /// which the catalog names; an array of enums likewise, under the
 /// array's OID.
@@ -208,7 +209,7 @@ pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result
     {
         return Err(ParseError {
             message: format!(
-                "ORDER BY `{table}`.`{column}`: Postgres orders this column by rules the engine does not follow (an enum, a collation other than C, JSON)"
+                "ORDER BY `{table}`.`{column}`: Postgres orders this column by rules the engine does not follow (an enum, a collation other than C, JSON, a numeric)"
             ),
             position: *position,
         });
@@ -220,7 +221,7 @@ pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result
     {
         return Err(ParseError {
             message: format!(
-                "`<`, `<=`, `>` or `>=` on `{table}`.`{column}`: Postgres compares this column by rules the engine does not follow (an enum, a collation other than C, JSON)"
+                "`<`, `<=`, `>` or `>=` on `{table}`.`{column}`: Postgres compares this column by rules the engine does not follow (an enum, a collation other than C, JSON, a numeric)"
             ),
             position: *position,
         });
@@ -232,7 +233,7 @@ pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result
     {
         return Err(ParseError {
             message: format!(
-                "a comparison or join on `{table}`.`{column}`: Postgres decides its equality by rules the engine does not follow (a nondeterministic collation, citext, char(n), an interval or network address)"
+                "a comparison or join on `{table}`.`{column}`: Postgres decides its equality by rules the engine does not follow (a nondeterministic collation, citext, char(n), an interval or network address, a numeric)"
             ),
             position: *position,
         });
@@ -1758,6 +1759,31 @@ mod tests {
         let error = parse_select(joined, &[], &keyed).expect_err("a join key");
         assert!(error.message.contains("`books`.`author_id`"), "{}", error.message);
         parse_select(joined, &[], &join_catalog()).expect("compared as values");
+    }
+
+    /// A `numeric`, which the engine carries as a `float8`, is refused in
+    /// a comparison, a range and an `ORDER BY`; a `float8` is followed.
+    #[test]
+    fn a_numeric_is_neither_compared_nor_ordered() {
+        let catalog = Catalog::new(vec![DbTable::new(
+            "prices",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("amount", ValueType::Float),
+                DbColumn::new("ratio", ValueType::Float),
+            ],
+        )])
+        .with_compared_otherwise([(TableName::from("prices"), ColumnName::from("amount"))]);
+        for sql in [
+            r#"SELECT "id" FROM "prices" WHERE "prices"."amount" = 9007199254740993"#,
+            r#"SELECT "id" FROM "prices" WHERE "prices"."amount" > 1"#,
+            r#"SELECT "id" FROM "prices" ORDER BY "prices"."amount" LIMIT 1"#,
+        ] {
+            let error = parse_select(sql, &[], &catalog).expect_err(sql);
+            assert!(error.message.contains("numeric"), "{sql}: {}", error.message);
+            parse_select(&sql.replace("amount", "ratio"), &[], &catalog).expect("a float8");
+        }
     }
 
     /// Diesel's joins become the engine's tree:

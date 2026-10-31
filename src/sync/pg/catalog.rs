@@ -356,11 +356,17 @@ pub fn published_orders_as_text(
 /// deterministic collation does: such a collation calls texts equal only
 /// when their bytes are. So do an enum's label, a `uuid`, a `bytea` and a
 /// `time`, each carried in one spelling, and every type the engine
-/// carries as a value of its own (a number, a time, JSON). A string under
-/// a nondeterministic collation does not, nor `citext`, nor `char(n)`,
-/// whose trailing spaces do not count, nor any other text-carried type
-/// (an interval, a network address, an unknown type), where texts spelled
-/// differently can be equal.
+/// carries exactly as a value of its own (an integer, a `float8`, a
+/// boolean, a time, JSON). A string under a nondeterministic collation
+/// does not, nor `citext`, nor `char(n)`, whose trailing spaces do not
+/// count, nor any other text-carried type (an interval, a network
+/// address, an unknown type), where texts spelled differently can be
+/// equal. Nor does a `numeric`, a `money` or a `real`, which the engine
+/// carries as a `float8`: a `numeric` past 2^53 or of more than fifteen
+/// digits loses its last ones, so distinct values compare equal, and a
+/// `real` widened is not the `float8` its text reads as. The same holds of
+/// their order, which [`crate::model::Catalog::orders_as_engine`] refuses
+/// for them too.
 pub fn compares_as_text(type_name: &str, is_enum: bool, deterministic: Option<bool>) -> Option<bool> {
     if is_enum {
         return Some(true);
@@ -371,6 +377,7 @@ pub fn compares_as_text(type_name: &str, is_enum: bool, deterministic: Option<bo
             "uuid" | "bytea" | "time" => Some(true),
             _ => Some(false),
         },
+        Some(ValueType::Float) => Some(matches!(type_name, "float8" | "double precision")),
         Some(_) => Some(true),
         None => Some(false),
     }
@@ -491,6 +498,10 @@ mod tests {
         assert_eq!(compares_as_text("TicketStatus", true, None), Some(true));
         assert_eq!(compares_as_text("uuid", false, None), Some(true));
         assert_eq!(compares_as_text("int8", false, None), Some(true));
+        assert_eq!(compares_as_text("float8", false, None), Some(true));
+        for inexact in ["numeric", "money", "float4"] {
+            assert_eq!(compares_as_text(inexact, false, None), Some(false), "{inexact}");
+        }
         let c = DefaultCollation {
             name: "C".to_owned(),
             provider: Some("c".to_owned()),

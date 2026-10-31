@@ -341,10 +341,11 @@ pub struct Catalog {
     /// the `C` collation. Any other text-carried column (an enum, a
     /// string under a linguistic collation, an `inet`) orders otherwise.
     ordered_as_text: std::collections::HashSet<(TableName, ColumnName)>,
-    /// Text-carried columns whose equality Postgres decides by rules other
-    /// than their text's bytes, as the engine compares them: a string under
-    /// a nondeterministic collation, `citext`, `char(n)`, an interval, a
-    /// network address. A column not named here compares as its text.
+    /// Columns Postgres compares by rules other than the engine's: a
+    /// string under a nondeterministic collation, `citext`, `char(n)`, an
+    /// interval, a network address, whose distinct texts can be equal; a
+    /// `numeric`, `money` or `real`, which the engine carries inexactly as
+    /// a `float8`. A column not named here compares as the engine does.
     compared_otherwise: std::collections::HashSet<(TableName, ColumnName)>,
     /// Whether the database's default collation orders strings byte by
     /// byte, so a string column a migration adds under it orders as its
@@ -433,9 +434,17 @@ impl Catalog {
     }
 
     /// Whether Postgres orders `table.column` as the engine compares it.
-    /// Numbers, booleans and times always do; a text-carried column only
-    /// when the catalog was told so; JSON and lists never do.
+    /// Numbers, booleans and times do, unless the catalog was told they
+    /// compare by rules of their own (a `numeric`, carried inexactly); a
+    /// text-carried column only when the catalog was told so; JSON and
+    /// lists never do.
     pub fn orders_as_engine(&self, table: &TableName, column: &ColumnName) -> bool {
+        if self
+            .compared_otherwise
+            .contains(&(table.clone(), column.clone()))
+        {
+            return false;
+        }
         match self
             .table(table.as_str())
             .and_then(|held| held.column(column.as_str()))
@@ -466,9 +475,8 @@ impl Catalog {
     }
 
     /// Whether Postgres decides `table.column = value` as the engine
-    /// does. Numbers, booleans, times and JSON compare as values; a
-    /// text-carried column, or a list of them, unless the catalog was
-    /// told it compares by rules of its own.
+    /// does: unless the catalog was told the column compares by rules of
+    /// its own.
     pub fn equals_as_engine(&self, table: &TableName, column: &ColumnName) -> bool {
         match self
             .table(table.as_str())

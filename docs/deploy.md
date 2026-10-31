@@ -233,7 +233,10 @@ Equality is held to the same standard. A comparison or join on a column whose
 equality Postgres decides by rules of its own (a string under a
 nondeterministic collation, `citext`, `char(n)`, an interval, a network
 address) is refused and read from Postgres, on a column loaded at startup and
-on one a migration adds. A served column a migration gives such a collation
+on one a migration adds. So is a comparison, join or `ORDER BY` on a `numeric`,
+`money` or `real` column: the engine carries them as a `float8`, so a
+`numeric` past 2^53, or of more than fifteen digits, loses its last digits and
+distinct values compare equal. A served column a migration gives such a collation
 or type stops the server, which restarts knowing it.
 
 **Row-level security is never served.** The engine reads as its own role and
