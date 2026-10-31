@@ -3,13 +3,12 @@
 //!
 //! The engine ships a subscription's rows per table: every column of
 //! each row, and afterwards the rows that entered or changed and the keys
-//! of those that left. [`Materialized`] keeps them by primary key per
+//! of those that left. `Materialized` keeps them by primary key per
 //! table and, on demand, produces the result as Diesel rows: the join
 //! composed from the root table down each edge (an inner edge drops a
 //! parent row with no match, a left edge extends it with NULLs), ordered
 //! as the query orders its root table, cut to its limit, projected to its
-//! columns, each cell encoded for its Postgres type
-//! ([`crate::encode`]).
+//! columns, each cell encoded for its Postgres type.
 //!
 //! Ordering follows Postgres's defaults: `ASC` puts NULLs last, `DESC`
 //! first. Strings compare bytewise, which is Postgres's `C` collation; a
@@ -26,9 +25,9 @@ use std::sync::Arc;
 
 use serde_json::Value as Json;
 
-use crate::encode::{Unsupported, encode, supports};
-use crate::row::{Columns, OwnedRow, OwnedValue};
-use crate::types::TableTypes;
+use crate::postgres::encode::{Unsupported, encode, supports};
+use crate::postgres::{Columns, OwnedRow, OwnedValue};
+use crate::postgres::TableTypes;
 
 /// How many steps one build of a result may take unless the engine
 /// client says otherwise: a row a join's composition looks at, or a
@@ -40,7 +39,7 @@ const INT8: std::num::NonZeroU32 = std::num::NonZeroU32::new(20).expect("20 is n
 
 /// Why a result could not be built from the engine's rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BuildError {
+pub(crate) enum BuildError {
     /// Something rows mode cannot serve: a value that cannot be encoded,
     /// a column the known types lack.
     Unsupported(Unsupported),
@@ -52,7 +51,7 @@ pub enum BuildError {
 
 /// A build that stopped at its work budget of `budget` steps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OverBudget {
+pub(crate) struct OverBudget {
     pub budget: u64,
 }
 
@@ -115,7 +114,7 @@ pub struct Snapshot {
 impl Snapshot {
     /// Reads an `accepted` body, its rows moved out of it; `None` when it
     /// carries no rows.
-    pub fn from_json(body: &mut Json) -> Option<Snapshot> {
+    pub(crate) fn from_json(body: &mut Json) -> Option<Snapshot> {
         let strings = |value: Option<&Json>| -> Option<Vec<String>> {
             value?
                 .as_array()?
@@ -206,14 +205,14 @@ impl Snapshot {
     }
 
     /// The tables whose column types the store needs.
-    pub fn tables(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn tables(&self) -> impl Iterator<Item = &str> {
         self.nodes.iter().map(|node| node.table.as_str())
     }
 
     /// Every column of `table` the snapshot names: its key, the columns
     /// of its joins, the root's order, and the projection. The column
     /// types known for the table must cover them, or they are stale.
-    pub fn columns_of<'a>(&'a self, table: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+    pub(crate) fn columns_of<'a>(&'a self, table: &'a str) -> impl Iterator<Item = &'a str> + 'a {
         let keys = self
             .nodes
             .iter()
@@ -269,7 +268,7 @@ struct Node {
 /// One query's rows and how to present them. The result is built from
 /// the rows when it is asked for and kept until the next change, so a
 /// burst of deltas costs one build, by whichever read comes next.
-pub struct Materialized {
+pub(crate) struct Materialized {
     nodes: Vec<Node>,
     projection: Projection,
     order: Vec<(usize, bool)>,
@@ -291,7 +290,7 @@ impl Materialized {
     /// the snapshot. `types` must cover every table of the snapshot.
     /// Without a projection (`SELECT *`) the result is every column of
     /// every table, in `FROM` order.
-    pub fn new(
+    pub(crate) fn new(
         snapshot: Snapshot,
         types: &HashMap<String, Arc<TableTypes>>,
     ) -> Result<Materialized, Unsupported> {
@@ -447,7 +446,7 @@ impl Materialized {
     }
 
     /// A row of `table` entered or changed.
-    pub fn put(&mut self, table: &str, row: Json) {
+    pub(crate) fn put(&mut self, table: &str, row: Json) {
         if let Some(index) = self.nodes.iter().position(|node| node.table == table) {
             let key = self.key_of(index, &row);
             let (key_bytes, row_bytes) = (key.len(), json_bytes(&row));
@@ -462,7 +461,7 @@ impl Materialized {
     }
 
     /// A row of `table` left; `key` is the JSON object of its key columns.
-    pub fn del(&mut self, table: &str, key: &Json) {
+    pub(crate) fn del(&mut self, table: &str, key: &Json) {
         if let Some(index) = self.nodes.iter().position(|node| node.table == table) {
             let key = self.key_of(index, key);
             if let Some(old) = self.nodes[index].rows.remove(&key) {
@@ -473,20 +472,16 @@ impl Materialized {
     }
 
     /// What the store weighs, roughly: every row's JSON as it is held.
-    pub fn byte_len(&self) -> usize {
+    pub(crate) fn byte_len(&self) -> usize {
         self.bytes
     }
 
-
     /// How many rows are held, over every table.
-    pub fn len(&self) -> usize {
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.nodes.iter().map(|node| node.rows.len()).sum()
     }
 
-    /// Whether no row is held.
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 
     /// The row's primary key as one string: each key column's JSON text,
     /// each followed by U+001F. Two keys cannot run together into one,
@@ -507,7 +502,7 @@ impl Materialized {
     /// The result as Diesel rows, built if a change came since it last
     /// was. A count's `LIMIT` and `OFFSET` cut the one row it is, as
     /// Postgres applies them after counting.
-    pub fn rows(&mut self) -> Result<Arc<[OwnedRow]>, BuildError> {
+    pub(crate) fn rows(&mut self) -> Result<Arc<[OwnedRow]>, BuildError> {
         if let Some(built) = &self.built {
             return Ok(Arc::clone(built));
         }
@@ -528,7 +523,7 @@ impl Materialized {
 
     /// How many steps one build of the result may take
     /// ([`DEFAULT_JOIN_WORK`] until set).
-    pub fn set_work_budget(&mut self, budget: u64) {
+    pub(crate) fn set_work_budget(&mut self, budget: u64) {
         self.work_budget = budget;
         self.built = None;
     }
@@ -544,7 +539,7 @@ impl Materialized {
     /// composition stops at the limit. Counting and composing both spend
     /// from the work budget, so a join whose combinations multiply stops
     /// at [`BuildError::OverBudget`] rather than building them all.
-    pub fn keyed(&self) -> Result<Vec<(String, OwnedRow)>, BuildError> {
+    pub(crate) fn keyed(&self) -> Result<Vec<(String, OwnedRow)>, BuildError> {
         let by_value = self.by_value();
         let roots = self.roots();
         let mut tally = Tally::new(self.work_budget);
@@ -607,7 +602,7 @@ impl Materialized {
     /// result is the change of the rows the engine ships, which
     /// [`Materialized::root_row`] and [`Materialized::project_root`] read
     /// without building it.
-    pub fn is_plain(&self) -> bool {
+    pub(crate) fn is_plain(&self) -> bool {
         self.nodes.len() == 1
             && self.limit.is_none()
             && self.offset == 0
@@ -617,7 +612,7 @@ impl Materialized {
     /// The identity, in [`Materialized::keyed`]'s terms, of the root
     /// table's row with these key columns (a row, or the key object a
     /// delete names); `None` for another table's.
-    pub fn root_identity(&self, table: &str, object: &Json) -> Option<String> {
+    pub(crate) fn root_identity(&self, table: &str, object: &Json) -> Option<String> {
         (self.nodes[0].table == table).then(|| {
             let mut identity = self.key_of(0, object);
             identity.push('\u{1e}');
@@ -626,14 +621,14 @@ impl Materialized {
     }
 
     /// The root table's row held under `identity`.
-    pub fn root_row(&self, identity: &str) -> Option<&Json> {
+    pub(crate) fn root_row(&self, identity: &str) -> Option<&Json> {
         let key = identity.strip_suffix('\u{1e}')?;
         self.nodes[0].rows.get(key)
     }
 
     /// A root table's row as the result's row, for a plain result
     /// ([`Materialized::is_plain`]).
-    pub fn project_root(&self, row: &Json) -> Result<OwnedRow, Unsupported> {
+    pub(crate) fn project_root(&self, row: &Json) -> Result<OwnedRow, Unsupported> {
         self.project(&[Some(row)])
     }
 
@@ -955,7 +950,7 @@ fn compare(a: Option<&Json>, b: Option<&Json>, ascending: bool) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ColumnType, TypeKind};
+    use crate::postgres::{ColumnType, TypeKind};
     use diesel::deserialize::FromSqlRow;
     use diesel::pg::Pg;
     use diesel::sql_types::{BigInt, Integer, Nullable, Text};

@@ -23,7 +23,7 @@ use diesel::sql_query;
 use diesel::sql_types::Text;
 use diesel_streamgres::cache::Cache;
 use diesel_streamgres::engine::EngineClient;
-use diesel_streamgres::{Consistency, SyncedConnection};
+use diesel_streamgres::{Route, SyncedConnection};
 
 /// The value column, read by name.
 #[derive(QueryableByName)]
@@ -69,7 +69,7 @@ fn commit_to_refilled_read_latency() {
     let mut conn = SyncedConnection::with_cache(
         PgConnection::establish(&database).expect("connect"),
         cache.clone(),
-        Consistency::Eventual,
+        Route::Streamgres,
     );
 
     let select = format!(

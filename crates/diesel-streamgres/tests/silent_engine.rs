@@ -12,7 +12,7 @@ use diesel::prelude::*;
 use diesel_streamgres::cache::{Cache, Limits};
 use diesel_streamgres::engine::{Config, EngineClient};
 use diesel_streamgres::key::QueryKey;
-use diesel_streamgres::{Consistency, Served, SyncedConnection};
+use diesel_streamgres::{Route, Served, SyncedConnection};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
@@ -186,7 +186,7 @@ fn reader(cache: Arc<Cache>, key: &str) -> (SyncedConnection<PgConnection>, Stri
         .expect("put");
     let inner = PgConnection::establish(&url()).expect("connect");
     (
-        SyncedConnection::with_cache(inner, cache, Consistency::Eventual),
+        SyncedConnection::with_cache(inner, cache, Route::Streamgres),
         key,
     )
 }

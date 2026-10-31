@@ -10,7 +10,7 @@ use diesel::sql_types::{Integer, Text};
 use diesel_streamgres::cache::{Cache, Limits};
 use diesel_streamgres::key::QueryKey;
 use diesel_streamgres::subscriptions::{Outcome, Subscriptions, Verdict};
-use diesel_streamgres::{Consistency, Route, RouteDsl, Served, SyncedConnection};
+use diesel_streamgres::{Route, RouteDsl, Served, SyncedConnection};
 
 diesel::table! {
     sg_configs (id) {
@@ -59,7 +59,7 @@ struct NoRows;
 
 impl diesel_streamgres::cache::Live for NoRows {
     /// Always empty.
-    fn rows(&self) -> Option<Arc<[diesel_streamgres::row::OwnedRow]>> {
+    fn rows(&self) -> Option<Arc<[diesel_streamgres::postgres::OwnedRow]>> {
         Some(Arc::from(Vec::new()))
     }
 
@@ -92,7 +92,7 @@ impl Subscriptions for FakeEngine {
         &self,
         _: &QueryKey,
         _: diesel_streamgres::materialized::Snapshot,
-        _: std::collections::HashMap<String, Arc<diesel_streamgres::types::TableTypes>>,
+        _: std::collections::HashMap<String, Arc<diesel_streamgres::postgres::TableTypes>>,
     ) -> Verdict {
         Verdict::Accepted { since: None }
     }
@@ -172,7 +172,7 @@ impl World {
         let mut inner = PgConnection::establish(&url()).expect("connect");
         let sent = Arc::new(AtomicUsize::new(0));
         inner.set_instrumentation(CountQueries(sent.clone()));
-        let conn = SyncedConnection::with_cache(inner, cache.clone(), Consistency::Eventual);
+        let conn = SyncedConnection::with_cache(inner, cache.clone(), Route::Streamgres);
         let mut other = PgConnection::establish(&url()).expect("connect");
         let prefix = format!("{name}-{}-", std::process::id());
         diesel::delete(sg_configs::table.filter(sg_configs::key.like(format!("{prefix}%"))))
@@ -363,7 +363,7 @@ fn the_first_read_reads_the_context_once() {
     let mut w = World::new("database");
     w.put("a", "1");
     w.put("b", "2");
-    assert!(!w.cache.knows_database());
+    assert!(w.cache.database().is_none());
     let before = w.sent();
     w.read("a");
     assert_eq!(w.sent(), before + 3, "the context, the primary and the read");
@@ -459,7 +459,7 @@ fn a_touch_during_the_read_is_not_lost() {
     let reservation = w.cache.reserve(&key);
     w.put("flag", "on");
     w.cache.touched(&key);
-    let stale_rows: Arc<[diesel_streamgres::row::OwnedRow]> = Arc::from(Vec::new());
+    let stale_rows: Arc<[diesel_streamgres::postgres::OwnedRow]> = Arc::from(Vec::new());
     assert!(
         !w.cache.fill(reservation, stale_rows),
         "the fill is refused"
@@ -482,9 +482,9 @@ fn a_strong_connection_never_reads_the_cache() {
     assert_eq!(w.read("mode").as_deref(), Some("a"));
     w.put("mode", "b");
 
-    w.conn.set_consistency(Consistency::Strong);
+    w.conn.set_route(Route::Postgres);
     assert_eq!(w.read("mode").as_deref(), Some("b"));
-    w.conn.set_consistency(Consistency::Eventual);
+    w.conn.set_route(Route::Streamgres);
     assert_eq!(
         w.read("mode").as_deref(),
         Some("a"),
@@ -1116,7 +1116,7 @@ fn a_write_on_one_connection_is_seen_by_reads_on_another_of_the_same_cache() {
     let mut sibling = SyncedConnection::with_cache(
         PgConnection::establish(&url()).expect("connect"),
         Arc::clone(&w.cache),
-        Consistency::Eventual,
+        Route::Streamgres,
     );
     let key = w.key("mode");
     diesel::update(sg_configs::table.filter(sg_configs::key.eq(&key)))
@@ -1276,7 +1276,7 @@ fn fallback_limit_holds_across_connections_until_cursor_drop() {
     w.engine.refuse_all.store(true, Ordering::SeqCst);
     let inner = PgConnection::establish(&url()).unwrap();
     let mut first =
-        SyncedConnection::with_cache(inner, Arc::clone(&w.cache), Consistency::Eventual);
+        SyncedConnection::with_cache(inner, Arc::clone(&w.cache), Route::Streamgres);
     let query = sg_configs::table
         .filter(sg_configs::key.eq(w.key("item")))
         .select(sg_configs::value);
@@ -1307,7 +1307,7 @@ fn commented_and_savepoint_transactions_keep_their_snapshot() {
     let mut sibling = SyncedConnection::with_cache(
         PgConnection::establish(&url()).unwrap(),
         Arc::clone(&w.cache),
-        Consistency::Eventual,
+        Route::Streamgres,
     );
     sibling.set_read_your_writes(std::time::Duration::ZERO);
     for (i, (begin, within)) in [

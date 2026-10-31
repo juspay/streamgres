@@ -37,8 +37,9 @@ use super::transport::{Backoff, connect_failure, retry_wait, tls, upgrade_reques
 use super::worker::{disconnected, inbound, on_hello};
 use super::*;
 use crate::cache::Database;
-use crate::row::OwnedRow;
-use crate::types::{ColumnType, TypeKind};
+use crate::listen::Ended;
+use crate::postgres::OwnedRow;
+use crate::postgres::{ColumnType, TypeKind};
 use diesel::deserialize::FromSqlRow;
 use diesel::pg::Pg;
 use diesel::sql_types::{Integer, Text};
@@ -357,9 +358,10 @@ fn a_listened_join_past_its_budget_ends_and_says_why() {
         json!(["delta", {"id": 1, "changes": [{"table": "c", "put": put, "del": []}]}]).to_string()
     };
     inbound(&worker, &delta(more));
-    let reason = listening.ended().expect("ended");
+    let Some(Ended::WorkBudget(reason)) = listening.ended() else {
+        panic!("not ended over budget: {:?}", listening.ended());
+    };
     assert!(reason.contains("needs more work than its budget allows"), "{reason}");
-    assert!(listening.over_budget());
     assert_eq!(changes(), Vec::new(), "no changes past the budget");
     inbound(&worker, &delta(vec![json!({"id": 99, "up": 1})]));
     assert_eq!(changes(), Vec::new(), "nothing after it ended");
@@ -378,8 +380,9 @@ fn a_listened_join_that_starts_past_its_budget_is_refused_as_such() {
     let Outcome::Verdict(Verdict::Accepted { .. }) = handle.join().unwrap() else {
         panic!("not in rows mode");
     };
-    assert!(listening.over_budget());
-    let reason = listening.ended().expect("ended");
+    let Some(Ended::WorkBudget(reason)) = listening.ended() else {
+        panic!("not ended over budget: {:?}", listening.ended());
+    };
     assert!(reason.contains("needs more work than its budget allows"), "{reason}");
 }
 

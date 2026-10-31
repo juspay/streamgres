@@ -18,11 +18,11 @@ use tokio::sync::mpsc;
 
 use crate::cache::{Cache, Database, Live};
 use crate::key::QueryKey;
-use crate::listen::Listening;
-use crate::row::OwnedRow;
+use crate::listen::{Ended, Listening};
+use crate::postgres::OwnedRow;
 use crate::materialized::{BuildError, Materialized, Snapshot};
 use crate::subscriptions::{Outcome, Verdict};
-use crate::types::TableTypes;
+use crate::postgres::TableTypes;
 
 use super::transport::connection_loop;
 
@@ -614,7 +614,9 @@ impl Worker {
             let since = state.since.get(&id).copied();
             drop(state);
             if let Some(listening) = &listening {
-                listening.end(format!("the engine no longer serves the query's rows: {reason}"));
+                listening.end(Ended::Unserved(format!(
+                    "the engine no longer serves the query's rows: {reason}"
+                )));
             }
             shared.fell_back(reason);
             Verdict::Accepted { since }
@@ -678,7 +680,7 @@ impl Worker {
                 drop(store);
                 drop(state);
                 if let BuildError::OverBudget(_) = error {
-                    listening.end_over_budget(error.to_string());
+                    listening.end(Ended::WorkBudget(error.to_string()));
                 }
                 return fallback(error.to_string());
             }
@@ -1099,7 +1101,7 @@ fn rebuild_off_thread(
                     this.build(id, snapshot, Some(&expected));
                 }
                 Err(reason) => {
-                    listening.end(reason);
+                    listening.end(Ended::Unserved(reason));
                     if let Some(key) = key {
                         let_go(&this, id, &key);
                     }
@@ -1128,7 +1130,7 @@ fn resubscribed_elsewhere(worker: &Worker, id: u64, key: &QueryKey, reason: Stri
 fn let_go(worker: &Worker, id: u64, key: &QueryKey) {
     let shared = &worker.shared;
     if let Some(listening) = shared.listening(key) {
-        listening.end("the engine stopped following the query".to_string());
+        listening.end(Ended::Stopped("the engine stopped following the query".to_string()));
     }
     {
         let mut state = worker.state.lock().expect("state");
@@ -1190,7 +1192,9 @@ fn on_refused(worker: &Worker, body: &Json) {
         }
         Some(None) | None => {
             if let Some(listening) = key.as_ref().and_then(|key| shared.listening(key)) {
-                listening.end(format!("the engine stopped following the query: {reason}"));
+                listening.end(Ended::Stopped(format!(
+                    "the engine stopped following the query: {reason}"
+                )));
             }
             if let (Some(key), Some(cache)) = (key, shared.cache()) {
                 cache.touched(&key);

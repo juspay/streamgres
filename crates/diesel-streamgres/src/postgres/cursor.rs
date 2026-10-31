@@ -9,7 +9,7 @@ use diesel::QueryResult;
 use diesel::pg::{Pg, PgValue};
 use diesel::row::{Field, PartialRow, Row, RowIndex, RowSealed};
 
-use crate::row::{OwnedCursor, OwnedField, OwnedRow};
+use crate::postgres::{OwnedCursor, OwnedField, OwnedRow};
 
 /// Rows on their way to the application.
 pub enum SyncedCursor<I> {

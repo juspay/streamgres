@@ -17,7 +17,7 @@ use diesel::sql_types::Text;
 use diesel_streamgres::cache::Cache;
 use diesel_streamgres::engine::EngineClient;
 use diesel_streamgres::subscriptions::Subscriptions;
-use diesel_streamgres::{Consistency, Served, SyncedConnection};
+use diesel_streamgres::{Route, Served, SyncedConnection};
 
 diesel::table! {
     sg_configs (id) {
@@ -71,7 +71,7 @@ impl Live {
             .expect("schema");
         let prefix = format!("{name}-{}-", std::process::id());
         let inner = PgConnection::establish(&database).expect("connect");
-        let mut conn = SyncedConnection::with_cache(inner, cache.clone(), Consistency::Eventual);
+        let mut conn = SyncedConnection::with_cache(inner, cache.clone(), Route::Streamgres);
         let one: i32 = diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>("1"))
             .get_result(&mut conn)
             .expect("a first read, which reads what the connection reads as");
@@ -377,7 +377,7 @@ fn evicting_an_entry_unsubscribes_it_from_the_engine() {
     let mut conn = SyncedConnection::with_cache(
         PgConnection::establish(&database).unwrap(),
         small.clone(),
-        Consistency::Eventual,
+        Route::Streamgres,
     );
     for i in 0..6 {
         live.put(&format!("e{i}"), &"v".repeat(120));
@@ -992,7 +992,7 @@ fn a_pool_spreads_subscriptions_across_its_sockets() {
     let mut conn = SyncedConnection::with_cache(
         PgConnection::establish(&database).unwrap(),
         cache.clone(),
-        Consistency::Eventual,
+        Route::Streamgres,
     );
     for i in 0..6 {
         live.put(&format!("p{i}"), &format!("v{i}"));
@@ -1092,7 +1092,7 @@ fn the_subscription_cap_serves_the_rest_live() {
     let mut conn = SyncedConnection::with_cache(
         PgConnection::establish(&database).unwrap(),
         cache.clone(),
-        Consistency::Eventual,
+        Route::Streamgres,
     );
     for i in 0..3 {
         live.put(&format!("c{i}"), &format!("v{i}"));
@@ -1347,7 +1347,7 @@ fn a_role_that_may_not_read_a_table_is_not_served_its_rows() {
     let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
     let inner = PgConnection::establish(&format!("{scheme}://{role}:noread@{host}"))
         .expect("connect as the role");
-    let mut reader = SyncedConnection::with_cache(inner, live.cache.clone(), Consistency::Eventual);
+    let mut reader = SyncedConnection::with_cache(inner, live.cache.clone(), Route::Streamgres);
     for _ in 0..2 {
         let read: QueryResult<String> = sg_configs::table
             .filter(sg_configs::key.eq(live.key("n")))

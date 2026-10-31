@@ -29,10 +29,10 @@
 //!
 //! On a miss the query is subscribed first. When the engine can serve
 //! the rows itself (every projected column has a type the client encodes
-//! exactly, see [`encode`]), the result comes from the engine, is kept as
+//! exactly, see [`postgres`]), the result comes from the engine, is kept as
 //! Diesel rows ([`materialized`]), and every later change replaces it in
 //! place; Postgres is never read for that query. Otherwise the rows are
-//! read from Postgres once and kept byte for byte ([`row::OwnedRow`]),
+//! read from Postgres once and kept byte for byte ([`postgres::OwnedRow`]),
 //! and when the engine reports the query touched they are dropped and the
 //! next read refills them. Every other read goes to Postgres as before.
 //!
@@ -63,7 +63,7 @@ pub mod listen;
 pub mod materialized;
 pub mod metrics;
 pub mod postgres;
-pub mod route;
+mod route;
 pub mod rollout;
 pub mod shadow;
 #[cfg(feature = "sse")]
@@ -72,23 +72,18 @@ mod session;
 pub mod subscriptions;
 
 #[cfg(feature = "async")]
-pub use crate::connection::asynchronous;
-pub use crate::postgres::{cursor, encode, row, types};
-
-#[cfg(feature = "async")]
-pub use crate::connection::asynchronous::AsyncSyncedConnection;
+pub use crate::connection::asynchronous::{AsyncSyncedConnection, AsyncSyncedRow, PgRow};
 pub use crate::connection::{
     Attachment, DEFAULT_READ_YOUR_WRITES, Settings, SyncedConnection, SyncedManager, install,
     read_your_writes_from_env,
 };
-pub use crate::listen::{Change, SqlRow, Subscription, SubscribeError, Watch, WatchError};
+pub use crate::listen::{
+    Change, Ended, PENDING_LIMIT, SqlRow, SubscribeError, Subscription, WATCH_CAPACITY, Watch,
+    WatchError,
+};
 pub use crate::route::{Route, RouteDsl, Served, Via};
 /// The engine inside this process ([`engine::EngineClient::embedded`]):
 /// its handle, its configuration and the SQL that sets a database up
 /// for it, so an application depends on this crate alone.
 #[cfg(feature = "embedded")]
 pub use streamgres::embedded;
-
-/// [`Route`] under another name: `Consistency::Eventual` is
-/// [`Route::Streamgres`], `Consistency::Strong` is [`Route::Postgres`].
-pub type Consistency = Route;

@@ -16,7 +16,7 @@
 //!
 //! Every subscription asks for the rows. When the engine's `accepted`
 //! carries them and every projected column has a type the client encodes
-//! exactly, the rows are kept as a [`Materialized`](crate::materialized::Materialized) store that the cache
+//! exactly, the rows are kept as a `Materialized` store that the cache
 //! entry holds ([`crate::cache::Live`]): the engine's `delta` frames
 //! update the store in place, and the next read builds the result from
 //! it. Postgres is never read for that query, and the socket's thread
@@ -67,7 +67,7 @@ use crate::key::QueryKey;
 use crate::listen::Listening;
 use crate::materialized::Snapshot;
 use crate::subscriptions::{Outcome, Subscriptions, Verdict};
-use crate::types::TableTypes;
+use crate::postgres::TableTypes;
 
 mod transport;
 mod worker;
@@ -123,9 +123,8 @@ pub struct Config {
     /// Sent as `Authorization: Bearer <token>` when each socket opens,
     /// for an engine started with `STREAMGRES_S2S_TOKEN`.
     pub token: Option<String>,
-    /// How many steps one build of a joined result may take
-    /// ([`crate::materialized::Materialized::keyed`]). A cached read over
-    /// it goes to Postgres; a callback over it ends.
+    /// How many steps one build of a joined result may take. A cached
+    /// read over it goes to Postgres; a callback over it ends.
     pub max_join_work: u64,
 }
 

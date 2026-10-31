@@ -26,8 +26,8 @@ use std::sync::Arc;
 use crate::cache::Live;
 use crate::key::QueryKey;
 use crate::materialized::Snapshot;
-use crate::row::OwnedRow;
-use crate::types::{TableTypes, TypeLookup};
+use crate::postgres::OwnedRow;
+use crate::postgres::{TableTypes, TypeLookup};
 
 /// The engine's answer to a subscription.
 #[derive(Debug, Clone)]

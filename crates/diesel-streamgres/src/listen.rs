@@ -97,8 +97,8 @@ use tokio::sync::{Notify, broadcast};
 use crate::engine::EngineClient;
 use crate::key::QueryKey;
 use crate::materialized::{BuildError, Materialized};
-use crate::encode::oid;
-use crate::row::OwnedRow;
+use crate::postgres::encode::oid;
+use crate::postgres::OwnedRow;
 use crate::subscriptions::{Subscriptions, Verdict};
 
 /// How many changes may wait for a callback before they are kept as
@@ -127,12 +127,46 @@ pub enum Change<T> {
     Removed(T),
 }
 
+/// Why the engine stopped following a subscription's query. Each kind
+/// carries the reason as it was given; `Display` prints it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Ended {
+    /// The engine stopped following the query: it let it go, or refused
+    /// it again after a reconnect.
+    Stopped(String),
+    /// The engine side can no longer build the query's rows (a value it
+    /// cannot encode, column types it could not look up); a subscription
+    /// has no Postgres to read them from instead.
+    Unserved(String),
+    /// The result needs more work than the join budget allows
+    /// (`STREAMGRES_S2S_MAX_JOIN_WORK`). Unlike the others it can pass:
+    /// the rows may shrink, and a later subscribe succeed.
+    WorkBudget(String),
+}
+
+impl Ended {
+    /// The reason, as it was given.
+    pub fn reason(&self) -> &str {
+        match self {
+            Ended::Stopped(reason) | Ended::Unserved(reason) | Ended::WorkBudget(reason) => reason,
+        }
+    }
+}
+
+impl std::fmt::Display for Ended {
+    /// The reason.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
 /// What a subscription's delivery task hands on: a change, a notice that
 /// changes were lost (read the result afresh), or the end.
 pub(crate) enum Delivery<T> {
     Change(Change<T>),
     Missed(String),
-    Ended(String),
+    Ended(Ended),
 }
 
 /// One change as the engine side computes it: a result row's identity,
@@ -229,11 +263,7 @@ pub(crate) struct Listening {
     missed: Mutex<VecDeque<String>>,
     /// Why the engine no longer follows the query, once it does not: the
     /// subscription has ended.
-    ended: Mutex<Option<String>>,
-    /// Whether it ended because its result needs more work than the
-    /// budget allows ([`BuildError::OverBudget`]), which a subscribe
-    /// reports apart from a query the engine cannot serve.
-    over_budget: AtomicBool,
+    ended: Mutex<Option<Ended>>,
     /// The database the engine streams, to look column types up on when
     /// the engine connection comes back without them.
     database_url: String,
@@ -255,7 +285,6 @@ impl Listening {
             errors: Mutex::new(Vec::new()),
             missed: Mutex::new(VecDeque::new()),
             ended: Mutex::new(None),
-            over_budget: AtomicBool::new(false),
             database_url,
             database,
         })
@@ -309,37 +338,26 @@ impl Listening {
         self.notify.notify_one();
     }
 
-    /// The engine no longer follows the query (`reason`): recorded, and
-    /// the subscription ends once what is pending is delivered.
-    pub(crate) fn end(&self, reason: String) {
+    /// The engine no longer follows the query (`ended`): recorded, and
+    /// the subscription ends once what is pending is delivered. A result
+    /// past the work budget ends it too ([`Ended::WorkBudget`]): there is
+    /// no Postgres to read it from instead, as a cached read has.
+    pub(crate) fn end(&self, ended: Ended) {
+        let reason = ended.reason();
         crate::metrics::note(
             log::Level::Warn,
-            &crate::metrics::reason_key("ended", &reason),
+            &crate::metrics::reason_key("ended", reason),
             format!("a subscription ended, the engine no longer follows it: {reason}"),
         );
-        crate::metrics::report(|metrics| metrics.ended(&reason));
-        self.record(&reason);
-        self.ended.lock().expect("ended").get_or_insert(reason);
+        crate::metrics::report(|metrics| metrics.ended(reason));
+        self.record(reason);
+        self.ended.lock().expect("ended").get_or_insert(ended);
         self.notify.notify_one();
     }
 
     /// Why the subscription ended, once it has.
-    pub(crate) fn ended(&self) -> Option<String> {
+    pub(crate) fn ended(&self) -> Option<Ended> {
         self.ended.lock().expect("ended").clone()
-    }
-
-    /// The result needs more work than the budget allows: there is no
-    /// Postgres to read it from instead, as a cached read has, so the
-    /// subscription ends ([`Listening::end`]) and says why. Its rows may
-    /// shrink back under the budget, so a later subscribe may succeed.
-    pub(crate) fn end_over_budget(&self, reason: String) {
-        self.over_budget.store(true, Ordering::Release);
-        self.end(reason);
-    }
-
-    /// Whether the subscription ended over its work budget.
-    pub(crate) fn over_budget(&self) -> bool {
-        self.over_budget.load(Ordering::Acquire)
     }
 
     /// A store the engine side has just built for the subscription, from
@@ -376,8 +394,8 @@ impl Listening {
     pub(crate) fn lookup_types(
         &self,
         tables: &[String],
-    ) -> Result<HashMap<String, Arc<crate::types::TableTypes>>, String> {
-        use crate::types::TypeLookup;
+    ) -> Result<HashMap<String, Arc<crate::postgres::TableTypes>>, String> {
+        use crate::postgres::TypeLookup;
         let mut conn = PgConnection::establish(&self.database_url)
             .map_err(|error| format!("connecting to look the column types up: {error}"))?;
         tables
@@ -432,7 +450,7 @@ impl Listening {
                                 present: false,
                             })
                         })
-                        .collect::<Result<Vec<_>, crate::encode::Unsupported>>()
+                        .collect::<Result<Vec<_>, crate::postgres::encode::Unsupported>>()
                         .map_err(BuildError::from)
                 })
         } else {
@@ -442,7 +460,9 @@ impl Listening {
         };
         match changes {
             Ok(changes) => self.push(changes),
-            Err(error @ BuildError::OverBudget(_)) => self.end_over_budget(error.to_string()),
+            Err(error @ BuildError::OverBudget(_)) => {
+                self.end(Ended::WorkBudget(error.to_string()))
+            }
             Err(error @ BuildError::Unsupported(_)) => self.failed(error.to_string()),
         }
     }
@@ -453,7 +473,7 @@ impl Listening {
 fn plain_changes(
     store: &Materialized,
     body: &Json,
-) -> Result<Vec<(String, Option<OwnedRow>)>, crate::encode::Unsupported> {
+) -> Result<Vec<(String, Option<OwnedRow>)>, crate::postgres::encode::Unsupported> {
     let mut seen: Vec<(String, Option<OwnedRow>)> = Vec::new();
     let Some(Json::Array(changes)) = body.get("changes") else {
         return Ok(seen);
@@ -547,7 +567,7 @@ impl Subscription {
     /// stopped serving the query's rows, or let it go after a reconnect):
     /// no change arrives after the ones already pending. `None` while it
     /// is followed.
-    pub fn ended(&self) -> Option<String> {
+    pub fn ended(&self) -> Option<Ended> {
         self.listening.ended()
     }
 
@@ -785,9 +805,7 @@ impl EngineClient {
                     let engine = unclaimed.engine.clone();
                     drop(unclaimed);
                     Err(match listening.ended() {
-                        Some(reason) if listening.over_budget() => {
-                            SubscribeError::WorkBudget(reason)
-                        }
+                        Some(Ended::WorkBudget(reason)) => SubscribeError::WorkBudget(reason),
                         _ => SubscribeError::Unsupported(format!(
                             "the engine follows this query only by refills, not with its rows: {}",
                             engine.fallbacks().last().cloned().unwrap_or_default()
@@ -889,7 +907,7 @@ struct Watched {
 enum Fanned {
     Change(Change<SqlRow>),
     Missed(String),
-    Failed(String),
+    Failed(Ended),
 }
 
 impl EngineClient {
@@ -974,7 +992,7 @@ pub enum WatchError {
     Missed(String),
     /// The engine no longer follows the query; nothing follows, and the
     /// watcher's stream ends.
-    Failed(String),
+    Failed(Ended),
 }
 
 impl std::fmt::Display for WatchError {
@@ -1193,7 +1211,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::row::OwnedValue;
+    use crate::postgres::OwnedValue;
 
     /// A one-column row holding `value` as an int4.
     fn row(value: i32) -> OwnedRow {
@@ -1268,7 +1286,7 @@ mod tests {
         );
         listening.push(vec![change("a", None, Some(1))]);
         listening.failed("a delta could not be applied".to_string());
-        listening.end("the engine stopped following the query".to_string());
+        listening.end(Ended::Stopped("the engine stopped following the query".to_string()));
         listening.push(vec![change("b", None, Some(2))]);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let record = Arc::clone(&seen);
@@ -1294,7 +1312,10 @@ mod tests {
                 "ended: the engine stopped following the query".to_string(),
             ]
         );
-        assert_eq!(listening.ended().as_deref(), Some("the engine stopped following the query"));
+        assert_eq!(
+            listening.ended(),
+            Some(Ended::Stopped("the engine stopped following the query".to_string()))
+        );
         assert_eq!(listening.errors().len(), 2);
     }
 

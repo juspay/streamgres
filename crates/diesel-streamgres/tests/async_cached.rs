@@ -16,7 +16,7 @@ use diesel_streamgres::cache::Cache;
 use diesel_streamgres::key::QueryKey;
 use diesel_streamgres::materialized::Snapshot;
 use diesel_streamgres::subscriptions::{Outcome, Subscriptions, Verdict};
-use diesel_streamgres::types::TableTypes;
+use diesel_streamgres::postgres::TableTypes;
 use diesel_streamgres::{AsyncSyncedConnection, Route, RouteDsl, Served};
 use scoped_futures::ScopedFutureExt;
 

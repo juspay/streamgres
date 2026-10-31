@@ -44,7 +44,7 @@ use diesel::pg::PgMetadataCache;
 use moka::notification::RemovalCause;
 
 use crate::key::QueryKey;
-use crate::row::OwnedRow;
+use crate::postgres::OwnedRow;
 use crate::subscriptions::Subscriptions;
 
 /// Rows the engine keeps current for one query, as an entry holds them.
@@ -72,7 +72,7 @@ enum Content {
 
 /// One cached query.
 #[derive(Debug)]
-pub struct Entry {
+pub(crate) struct Entry {
     content: Content,
     bytes: usize,
 }
@@ -104,11 +104,6 @@ impl Entry {
             content: Content::Stale,
             bytes: key.byte_len(),
         }
-    }
-
-    /// What the entry weighs against the byte budget.
-    pub fn bytes(&self) -> usize {
-        self.bytes
     }
 }
 
@@ -340,8 +335,8 @@ pub struct Stats {
     /// change the engine will not report for the query.
     pub unreplayed: AtomicU64,
     /// Reads sent to Postgres because their connection's context cannot
-    /// be served ([`Cache::context_id`]: a shadowed name, another
-    /// database, one context too many) or its session has changed since
+    /// be served (a shadowed name, another database, one context too
+    /// many) or its session has changed since
     /// it was established.
     pub other_context: AtomicU64,
 }
@@ -366,17 +361,13 @@ type Generations = Arc<Mutex<HashMap<QueryKey, Slot>>>;
 /// A read's claim on a key between reserving it and filling it. Dropping
 /// it, with or without a fill, lets the key's generation go once no
 /// other read holds one.
+///
+/// Not part of the API: for this crate's own integration tests.
+#[doc(hidden)]
 pub struct Reservation {
     generations: Generations,
     key: QueryKey,
     generation: u64,
-}
-
-impl Reservation {
-    /// The key reserved.
-    pub fn key(&self) -> &QueryKey {
-        &self.key
-    }
 }
 
 impl Drop for Reservation {
@@ -425,6 +416,7 @@ pub struct Cache {
     standby_reads: AtomicBool,
     /// The OIDs of user-defined types, resolved once per database for
     /// the async wrapper (the blocking one asks its connection).
+    #[cfg_attr(not(feature = "async"), allow(dead_code))]
     type_metadata: Arc<Mutex<PgMetadataCache>>,
     /// The database this cache's reads go to, read once through the
     /// first connection that misses; `None` inside when it could not be
@@ -446,10 +438,6 @@ pub struct Database {
     pub name: String,
 }
 
-/// Reads a [`Database`] through a connection; the engine announces the
-/// same in its `hello`.
-pub const DATABASE_SQL: &str = "SELECT system_identifier::text AS system, current_database()::text AS name FROM pg_control_system()";
-
 /// What a connection reads as: its database, the role whose privileges
 /// apply (`current_user`), the role it logged in as, its search path,
 /// the settings that can change a supported query's rows, whether a
@@ -463,6 +451,9 @@ pub const DATABASE_SQL: &str = "SELECT system_identifier::text AS system, curren
 /// functions, so a setting has nothing to act on. The session's own
 /// statements are still watched for them (`crate::session`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, diesel::QueryableByName)]
+///
+/// Not part of the API: for this crate's own integration tests.
+#[doc(hidden)]
 pub struct Context {
     #[diesel(sql_type = diesel::sql_types::Text)]
     pub system: String,
@@ -503,7 +494,7 @@ pub struct Context {
 }
 
 /// Reads a [`Context`] through a connection.
-pub const CONTEXT_SQL: &str = r#"SELECT
+pub(crate) const CONTEXT_SQL: &str = r#"SELECT
   system_identifier::text AS system,
   current_database()::text AS name,
   current_user::text AS role,
@@ -542,7 +533,7 @@ FROM pg_control_system(), LATERAL (
 /// The most identities (a database, role, search path and settings) one
 /// cache keeps apart; a connection with one more reads Postgres. A change
 /// of an identity's privileges gives it a fresh context, not one more.
-pub const MAX_CONTEXTS: usize = 64;
+pub(crate) const MAX_CONTEXTS: usize = 64;
 
 /// The contexts a cache keeps apart: each identity's current context
 /// under its id. An identity is a context without its privileges. When a
@@ -602,14 +593,14 @@ impl Context {
 /// past the commit record of every transaction that has committed; `None`
 /// on a standby, which writes no WAL of its own.
 #[derive(Debug, Clone, PartialEq, Eq, diesel::QueryableByName)]
-pub struct WalPosition {
+pub(crate) struct WalPosition {
     #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
     pub lsn: Option<String>,
 }
 
 /// What a [`WalPosition`] query read, when it could be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Read {
+pub(crate) enum Read {
     /// A position.
     At(u64),
     /// `NULL`: no insert position on a standby ([`WAL_POSITION_SQL`]),
@@ -619,7 +610,7 @@ pub enum Read {
 
 impl WalPosition {
     /// What it read; `None` for a position that does not parse.
-    pub fn read(&self) -> Option<Read> {
+    pub(crate) fn read(&self) -> Option<Read> {
         match self.lsn {
             None => Some(Read::Null),
             Some(_) => self.position().map(Read::At),
@@ -629,7 +620,7 @@ impl WalPosition {
     /// The position as a number, `hi/lo` read as `hi << 32 | lo` as
     /// PostgreSQL and the engine count it; `None` on a standby or when it
     /// does not parse.
-    pub fn position(&self) -> Option<u64> {
+    pub(crate) fn position(&self) -> Option<u64> {
         let (hi, lo) = self.lsn.as_deref()?.split_once('/')?;
         let hi = u64::from_str_radix(hi, 16).ok()?;
         let lo = u64::from_str_radix(lo, 16).ok()?;
@@ -642,17 +633,17 @@ impl WalPosition {
 /// is written, and only the insert position is sure to be past it. A
 /// standby has none (the function raises there), so it reads `NULL`:
 /// reads through a replica fall back to the window.
-pub const WAL_POSITION_SQL: &str = "SELECT CASE WHEN pg_is_in_recovery() THEN NULL ELSE pg_current_wal_insert_lsn()::text END AS lsn";
+pub(crate) const WAL_POSITION_SQL: &str = "SELECT CASE WHEN pg_is_in_recovery() THEN NULL ELSE pg_current_wal_insert_lsn()::text END AS lsn";
 
 /// Reads a [`WalPosition`]: how far a standby has replayed, `NULL` on a
 /// primary, which is current (a promoted one included, whose last replay
 /// position stays behind).
-pub const REPLAY_POSITION_SQL: &str = "SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text END AS lsn";
+pub(crate) const REPLAY_POSITION_SQL: &str = "SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text END AS lsn";
 
 /// Whether a read through the cache may be served from it, given the
 /// writes through it ([`Cache::after_writes`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AfterWrites {
+pub(crate) enum AfterWrites {
     /// Every write through the cache has reached it, or the window
     /// since the last one has passed.
     Serve,
@@ -749,7 +740,7 @@ impl Cache {
     /// Counts a refusal of `key`, and when the engine side says the
     /// reason will hold, remembers it so reads of the same query with the
     /// same values skip the engine for [`Limits::refused_for`].
-    pub fn refused(&self, key: &QueryKey, reason: &str) {
+    pub(crate) fn refused(&self, key: &QueryKey, reason: &str) {
         Stats::bump(&self.stats.refused);
         if let Some(refused) = &self.refused
             && self.subscriptions.refusal_is_final(reason)
@@ -759,6 +750,9 @@ impl Cache {
     }
 
     /// Why `key` was refused recently, if it was; counts the skipped ask.
+    ///
+    /// Not part of the API: for this crate's own integration tests.
+    #[doc(hidden)]
     pub fn refused_recently(&self, key: &QueryKey) -> Option<Arc<str>> {
         let reason = self.refused.as_ref()?.get(key)?;
         Stats::bump(&self.stats.refused_recently);
@@ -802,11 +796,16 @@ impl Cache {
     }
 
     /// The same, owned, for a subscribe on another thread.
-    pub fn shared_subscriptions(&self) -> Arc<dyn Subscriptions> {
+    // Only the async connection asks for these.
+    #[cfg_attr(not(feature = "async"), allow(dead_code))]
+    pub(crate) fn shared_subscriptions(&self) -> Arc<dyn Subscriptions> {
         Arc::clone(&self.subscriptions)
     }
 
     /// The key's generation, taken before the read that will fill it.
+    ///
+    /// Not part of the API: for this crate's own integration tests.
+    #[doc(hidden)]
     pub fn reserve(&self, key: &QueryKey) -> Reservation {
         let generation = {
             let mut generations = self.generations.lock().expect("generations");
@@ -824,6 +823,9 @@ impl Cache {
     /// Stores the rows a Postgres read returned, unless the key was
     /// touched since the reservation was taken or the result is over the
     /// entry limit. Returns whether they were stored.
+    ///
+    /// Not part of the API: for this crate's own integration tests.
+    #[doc(hidden)]
     pub fn fill(&self, reservation: Reservation, rows: Arc<[OwnedRow]>) -> bool {
         let entry = Entry::rows(rows, &reservation.key);
         self.fill_entry(reservation, entry)
@@ -832,7 +834,7 @@ impl Cache {
     /// [`Cache::fill`] for a query the engine serves from its own rows:
     /// `rows` is the result just built from them, which a later read
     /// gets again until a change.
-    pub fn fill_live(
+    pub(crate) fn fill_live(
         &self,
         reservation: Reservation,
         live: Arc<dyn Live>,
@@ -872,7 +874,7 @@ impl Cache {
     /// store, so a subscription ended meanwhile (which bumps the
     /// generation once more) leaves the key stale again: the engine
     /// side's writes are held to the same rule as a Postgres read's.
-    pub fn live(&self, reservation: Reservation, live: Arc<dyn Live>) {
+    pub(crate) fn live(&self, reservation: Reservation, live: Arc<dyn Live>) {
         Stats::bump(&self.stats.replaced);
         let key = &reservation.key;
         bump(&self.generations, key);
@@ -889,15 +891,13 @@ impl Cache {
         self.database.get().and_then(Option::as_ref)
     }
 
-    /// Whether the database has been looked for, found or not.
-    pub fn knows_database(&self) -> bool {
-        self.database.get().is_some()
-    }
-
     /// Records the database a connection read; the first record stands.
     /// `None` says there is none to check the engine's against, and
     /// trusts it: the wrapper records only a database it read, and goes
     /// live on a read that failed.
+    ///
+    /// Not part of the API: for this crate's own integration tests.
+    #[doc(hidden)]
     pub fn learn_database(&self, database: Option<Database>) {
         let _ = self.database.set(database);
     }
@@ -911,7 +911,7 @@ impl Cache {
     /// table a known identity could read has become unreadable, it gets a
     /// fresh id and the old one is retired; a table created since, or a
     /// grant, keeps the id.
-    pub fn context_id(&self, context: &Context) -> Option<u32> {
+    pub(crate) fn context_id(&self, context: &Context) -> Option<u32> {
         if context.shadowed {
             return None;
         }
@@ -952,6 +952,9 @@ impl Cache {
 
     /// The context with id `id`, while it is current; `None` for one
     /// retired, or never given.
+    ///
+    /// Not part of the API: for this crate's own integration tests.
+    #[doc(hidden)]
     pub fn context(&self, id: u32) -> Option<Arc<Context>> {
         let contexts = self.contexts.lock().expect("contexts");
         contexts.by_id.get(&id).cloned()
@@ -967,7 +970,7 @@ impl Cache {
     /// the entry. For the engine side to call while it drops the key,
     /// under its own lock, so that no rows built before the drop can
     /// land after it.
-    pub fn bump_generation(&self, key: &QueryKey) {
+    pub(crate) fn bump_generation(&self, key: &QueryKey) {
         bump(&self.generations, key);
     }
 
@@ -1010,14 +1013,14 @@ impl Cache {
     /// before this point and inserts after it is dropped by its own
     /// re-check. Then the bump again for a Postgres fill in flight, and
     /// the entry.
-    pub fn abandon(&self, key: &QueryKey) {
+    pub(crate) fn abandon(&self, key: &QueryKey) {
         self.subscriptions.unsubscribe(key);
         bump(&self.generations, key);
         self.entries.invalidate(key);
     }
 
     /// A connection through this cache wrote.
-    pub fn mark_write(&self) {
+    pub(crate) fn mark_write(&self) {
         let nanos = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
         self.last_write.fetch_max(nanos + 1, Ordering::Release);
         self.writes.fetch_add(1, Ordering::AcqRel);
@@ -1030,7 +1033,7 @@ impl Cache {
     /// that takes, and no longer. Otherwise by the window: a read goes
     /// to Postgres for `window` after the last write. A zero window
     /// turns both off.
-    pub fn after_writes(&self, window: Duration) -> AfterWrites {
+    pub(crate) fn after_writes(&self, window: Duration) -> AfterWrites {
         if window.is_zero() {
             return AfterWrites::Serve;
         }
@@ -1050,7 +1053,7 @@ impl Cache {
 
     /// [`Cache::after_writes`] by the window alone, for when the position
     /// of the writes could not be read.
-    pub fn by_window(&self, window: Duration) -> AfterWrites {
+    pub(crate) fn by_window(&self, window: Duration) -> AfterWrites {
         if self.wrote_within(window) {
             AfterWrites::Postgres
         } else {
@@ -1061,19 +1064,19 @@ impl Cache {
     /// The first `writes` marks committed, if at all, below `position`,
     /// read after the count was taken. The target only rises: a later
     /// read of the position covers every earlier one.
-    pub fn resolve_writes(&self, writes: u64, position: u64) {
+    pub(crate) fn resolve_writes(&self, writes: u64, position: u64) {
         self.target.fetch_max(position, Ordering::AcqRel);
         self.resolved.fetch_max(writes, Ordering::AcqRel);
     }
 
     /// How many write marks there have been, for a write that reads the
     /// position itself once it has committed ([`Cache::resolve_writes`]).
-    pub fn write_count(&self) -> u64 {
+    pub(crate) fn write_count(&self) -> u64 {
         self.writes.load(Ordering::Acquire)
     }
 
     /// A read through the cache went to a standby.
-    pub fn saw_standby(&self) {
+    pub(crate) fn saw_standby(&self) {
         self.standby_reads.store(true, Ordering::Release);
     }
 
@@ -1085,7 +1088,7 @@ impl Cache {
     }
 
     /// Whether a connection through this cache wrote within `window`.
-    pub fn wrote_within(&self, window: Duration) -> bool {
+    pub(crate) fn wrote_within(&self, window: Duration) -> bool {
         if window.is_zero() {
             return false;
         }
@@ -1102,7 +1105,9 @@ impl Cache {
     }
 
     /// The OIDs of user-defined types resolved so far for this database.
-    pub fn type_metadata(&self) -> &Arc<Mutex<PgMetadataCache>> {
+    // Only the async connection asks for these.
+    #[cfg_attr(not(feature = "async"), allow(dead_code))]
+    pub(crate) fn type_metadata(&self) -> &Arc<Mutex<PgMetadataCache>> {
         &self.type_metadata
     }
 
@@ -1144,6 +1149,9 @@ impl Cache {
     }
 
     /// How many keys have a read in flight, for tests.
+    ///
+    /// Not part of the API: for this crate's own integration tests.
+    #[doc(hidden)]
     pub fn reservations(&self) -> usize {
         self.generations.lock().expect("generations").len()
     }
@@ -1201,7 +1209,7 @@ mod tests {
             ..Limits::default()
         }));
         let permit = gate.acquire().unwrap();
-        let mut cursor = crate::cursor::SyncedCursor::Limited(
+        let mut cursor = crate::postgres::SyncedCursor::Limited(
             std::iter::once(Ok::<(), diesel::result::Error>(())),
             permit,
         );
@@ -1212,7 +1220,7 @@ mod tests {
         );
         assert!(cursor.next().is_none());
         let permit = gate.acquire().unwrap();
-        let cursor = crate::cursor::SyncedCursor::Limited(
+        let cursor = crate::postgres::SyncedCursor::Limited(
             std::iter::once(Ok::<(), diesel::result::Error>(())),
             permit,
         );
@@ -1266,7 +1274,7 @@ mod tests {
     use super::*;
     use crate::materialized::Snapshot;
     use crate::subscriptions::{Outcome, Unsynced, Verdict};
-    use crate::types::TableTypes;
+    use crate::postgres::TableTypes;
 
     /// A context of `role` on database `app`, its role unable to read
     /// the tables of `unreadable` (OID and name), the newest table's OID
@@ -1422,7 +1430,7 @@ mod tests {
         let cache = Cache::new(1 << 20, Arc::new(Unsynced));
         let k = key("SELECT 1");
         let reservation = cache.reserve(&k);
-        let columns: crate::row::Columns = Arc::from(vec!["a".to_string()]);
+        let columns: crate::postgres::Columns = Arc::from(vec!["a".to_string()]);
         let newer: Arc<[OwnedRow]> = Arc::from(vec![OwnedRow::new(columns, vec![None])]);
         let engine_side = cache.reserve(&k);
         cache.live(engine_side, Arc::new(Fixed(Arc::clone(&newer))));

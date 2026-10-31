@@ -8,7 +8,7 @@
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sql_query;
-use diesel_streamgres::types::{ALL_TABLES_SQL, TableAttribute, TypeLookup, all_table_types};
+use diesel_streamgres::postgres::{ALL_TABLES_SQL, TableAttribute, TypeLookup, all_table_types};
 
 /// The test database's URL.
 fn url() -> String {
@@ -34,7 +34,7 @@ fn connection() -> PgConnection {
 }
 
 /// The names of a table's columns, in order.
-fn names(types: &diesel_streamgres::types::TableTypes) -> Vec<&str> {
+fn names(types: &diesel_streamgres::postgres::TableTypes) -> Vec<&str> {
     types.columns.iter().map(|column| column.name.as_str()).collect()
 }
 

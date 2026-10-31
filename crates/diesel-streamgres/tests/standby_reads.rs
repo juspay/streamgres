@@ -13,10 +13,25 @@ use std::time::{Duration, Instant};
 
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
-use diesel_streamgres::cache::{Cache, WAL_POSITION_SQL, WalPosition};
+use diesel_streamgres::cache::Cache;
 use diesel_streamgres::key::QueryKey;
 use diesel_streamgres::subscriptions::{Outcome, Subscriptions, Verdict};
 use diesel_streamgres::{Route, Served, SyncedConnection};
+
+/// A WAL position as PostgreSQL prints it.
+#[derive(QueryableByName)]
+struct Lsn {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    lsn: String,
+}
+
+impl Lsn {
+    /// The position as a number, `hi/lo` read as `hi << 32 | lo`.
+    fn position(&self) -> Option<u64> {
+        let (hi, lo) = self.lsn.split_once('/')?;
+        Some(u64::from_str_radix(hi, 16).ok()? << 32 | u64::from_str_radix(lo, 16).ok()?)
+    }
+}
 
 diesel::table! {
     sg_configs (id) {
@@ -52,7 +67,7 @@ impl Subscriptions for FakeEngine {
         &self,
         _: &QueryKey,
         _: diesel_streamgres::materialized::Snapshot,
-        _: std::collections::HashMap<String, Arc<diesel_streamgres::types::TableTypes>>,
+        _: std::collections::HashMap<String, Arc<diesel_streamgres::postgres::TableTypes>>,
     ) -> Verdict {
         unreachable!("touch mode")
     }
@@ -158,8 +173,8 @@ impl World {
 
     /// Where the primary will put its next WAL record.
     fn primary_position(&mut self) -> u64 {
-        diesel::sql_query(WAL_POSITION_SQL)
-            .get_result::<WalPosition>(&mut self.admin)
+        diesel::sql_query("SELECT pg_current_wal_insert_lsn()::text AS lsn")
+            .get_result::<Lsn>(&mut self.admin)
             .expect("position")
             .position()
             .expect("a primary's position")
@@ -172,7 +187,7 @@ impl World {
             let replayed = diesel::sql_query(
                 "SELECT pg_last_wal_replay_lsn()::text AS lsn",
             )
-            .get_result::<WalPosition>(&mut self.standby)
+            .get_result::<Lsn>(&mut self.standby)
             .expect("replay position")
             .position()
             .expect("a standby's position");

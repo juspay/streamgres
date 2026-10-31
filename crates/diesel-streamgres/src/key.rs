@@ -26,10 +26,9 @@ pub struct Bind {
 pub struct QueryKey {
     pub sql: String,
     pub binds: Vec<Bind>,
-    /// The context it is read in ([`crate::cache::Cache::context_id`]):
-    /// readers in different contexts (another role, search path or
-    /// setting) never share an answer, nor a subscription. 0 until the
-    /// connection's context is known.
+    /// The context it is read in: readers in different contexts (another
+    /// role, search path or setting) never share an answer, nor a
+    /// subscription. 0 until the connection's context is known.
     pub context: u32,
 }
 
@@ -81,7 +80,7 @@ impl QueryKey {
     /// Splits a leading route marker off the SQL, if the query was flagged
     /// with [`crate::RouteDsl::via`]. The key, and what the engine sees,
     /// is the SQL without it.
-    pub fn take_route(&mut self) -> Option<Route> {
+    pub(crate) fn take_route(&mut self) -> Option<Route> {
         let (route, rest) = Route::strip(&self.sql)?;
         self.sql = rest.to_string();
         Some(route)
@@ -127,7 +126,7 @@ impl QueryKey {
     }
 
     /// The bytes the binds hold, for a size-bounded cache.
-    pub fn byte_len(&self) -> usize {
+    pub(crate) fn byte_len(&self) -> usize {
         self.sql.len()
             + self
                 .binds

@@ -31,8 +31,8 @@ use std::time::Duration;
 
 use serde_json::Value as Json;
 
-use crate::encode::oid;
-use crate::row::OwnedRow;
+use crate::postgres::encode::oid;
+use crate::postgres::OwnedRow;
 
 /// How long a differing shadow read waits for the engine to pass
 /// Postgres's position before it counts as unverified.
@@ -162,7 +162,7 @@ fn canonical(rows: &[OwnedRow]) -> Vec<Vec<Cell>> {
 }
 
 /// A value as compared.
-fn cell(value: &crate::row::OwnedValue) -> Vec<u8> {
+fn cell(value: &crate::postgres::OwnedValue) -> Vec<u8> {
     let bytes = value.bytes();
     let json = match value.type_oid().get() {
         oid::JSON => serde_json::from_slice::<Json>(bytes).ok(),
@@ -188,7 +188,7 @@ fn truncated(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::row::OwnedValue;
+    use crate::postgres::OwnedValue;
     use std::num::NonZeroU32;
     use std::sync::Arc;
 

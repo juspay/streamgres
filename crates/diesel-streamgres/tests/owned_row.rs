@@ -8,7 +8,7 @@ use diesel::prelude::*;
 use diesel::sql_query;
 use diesel::sql_types::{Integer, Nullable, Text};
 use diesel_streamgres::SyncedConnection;
-use diesel_streamgres::row::{OwnedCursor, OwnedRow, capture_all};
+use diesel_streamgres::postgres::{OwnedCursor, OwnedRow, capture_all};
 
 diesel::table! {
     sg_items (id) {

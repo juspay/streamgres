@@ -76,15 +76,15 @@ use crate::cache::{
     AfterWrites, CONTEXT_SQL, Cache, Context, REPLAY_POSITION_SQL, Read, WAL_POSITION_SQL,
     WalPosition,
 };
-use crate::cursor::SyncedRow;
+use crate::postgres::SyncedRow;
 use crate::key::QueryKey;
 use crate::route::{Route, Served};
 use crate::session::{RawTransaction, Scope, SessionChanges};
-use crate::row::{OwnedCursor, OwnedRow, capture_all};
+use crate::postgres::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::STALE_TYPES;
 use crate::materialized::Snapshot;
 use crate::subscriptions::{Outcome, Subscriptions, Verdict};
-use crate::types::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
+use crate::postgres::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
 use super::policy::{self, Bypass, Replayed, commits, may_write, rendered};
 use super::{Attachment, SETTINGS, Settings, read_your_writes_from_env};
 

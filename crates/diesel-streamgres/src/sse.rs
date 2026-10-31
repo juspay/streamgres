@@ -370,7 +370,7 @@ mod tests {
                 .is_ok()
         );
         assert!(
-            notification::<i32>(&query, Err(WatchError::Failed("gone".into())))
+            notification::<i32>(&query, Err(WatchError::Failed(crate::listen::Ended::Stopped("gone".into()))))
                 .unwrap()
                 .is_err()
         );

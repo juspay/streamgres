@@ -51,6 +51,58 @@ and changes nothing else.
 | `postgres/cursor.rs` | one cursor type for rows from the cache and rows from Postgres |
 | `session.rs` | what a connection's statements changed in its session since it was established |
 
+## Public API
+
+What is public is public on purpose; everything else is `pub(crate)`.
+It falls in four groups.
+
+**What an application uses**, from the crate root unless named:
+
+- the connections: `SyncedConnection`, `AsyncSyncedConnection` and its
+  row type (feature `async`), and `SyncedManager` for r2d2;
+- `Settings`, `Attachment`, `install`, `read_your_writes_from_env`: which
+  cache and route a connection gets, and the connections and pools the
+  settings make (`establish`, `manager`, `async_manager`);
+- routing: `Route`, `RouteDsl`, `Via`, `Served`. `Route` is the only
+  name; the `Consistency` alias is gone;
+- callbacks: `Change`, `SqlRow`, `Subscription`, `SubscribeError`,
+  `Ended` (why the engine stopped following a query: `Stopped`,
+  `Unserved` or `WorkBudget`), `Watch`, `WatchError`;
+- `engine::{EngineClient, Config}`; `cache::{Cache, Limits, Stats}` with
+  the cache's inspection methods (`len`, `weighted_size`, `get`,
+  `database`, `reads_standbys`, `clear`...); `sse` (feature `sse`);
+  `embedded` (feature `embedded`);
+- the operational knobs: `metrics` (`Metrics`, `set_metrics`,
+  `history`), `rollout` (`set_cache_share`, `bypassed`), `shadow`
+  (`set_shadow_sample`, `counts`).
+
+**The seam between the cache and an engine side**, for an application
+that brings its own: the `subscriptions` module (`Subscriptions`,
+`Verdict`, `Outcome`, `Unsynced`), `Cache::touched` and
+`Cache::changed`, and every type those name: `key::{QueryKey, Bind}`,
+`materialized::{Snapshot, NodeSnapshot}`, `cache::Live`, and from
+`postgres` the rows (`OwnedRow`, `OwnedValue`, `Columns`) and column
+types (`TableTypes`, `ColumnType`, `TypeKind`, `TypeLookup`). Answering
+`Outcome::NeedsTypes` on a connection of one's own takes
+`postgres::{ALL_TABLES_SQL, TableAttribute, all_table_types}`, and
+capturing rows `postgres::{capture_all, OwnedCursor}`.
+
+**What Diesel's traits make public**: the cursor and row types of the
+connections' `LoadConnection` impls (`postgres::{SyncedCursor,
+SyncedRow, SyncedField}`) and the `FallbackPermit` a cursor read from
+Postgres holds, which has no methods.
+
+**Test hooks**, `#[doc(hidden)]` and not part of the API: the cache's
+`reserve`, `fill`, `refused_recently`, `context`, `learn_database` and
+`reservations`, and the `Reservation` and `Context` they take or give.
+The integration tests drive the cache through them where no public path
+reaches the same state.
+
+Crate-private: the wrappers' read protocol on the cache (fills,
+positions, contexts, permits), `connection::policy`, `session`, the
+engine client's worker and transport, `Materialized` and its build
+errors, and `postgres::encode`.
+
 ## The interception surface
 
 Diesel funnels every operation into three methods on the connection type:
@@ -438,8 +490,8 @@ it.
 
 **The engine's database.** The engine's `hello` names the database it
 streams. The first miss through a cache reads the same of the database
-its reads go to (`cache::DATABASE_SQL`, readable by any role), once per
-cache, before it subscribes. A probe that fails is not recorded: that
+its reads go to, with the connection's context (its `system_identifier`
+and name, readable by any role), once per cache, before it subscribes. A probe that fails is not recorded: that
 read goes live without asking the engine, and the next miss probes
 again. A socket whose engine
 streams another database is not asked for rows, which would otherwise
@@ -619,15 +671,13 @@ A read goes through the cache (`Route::Streamgres`) or live
    unflagged reads share an entry. `conn.with_route(route, |c| ...)`
    flags every read in the closure.
 2. **The pool.** Each connection's route and cache come from the URL it
-   was established with, through the process-wide `Settings`
-   (`install`, once per process). `Settings::single` shares one cache
+   was established with, through its `Settings`: the process-wide one
+   (`install`), or the one its pool or connection was made from
+   (`Settings::manager`, `Settings::establish`). `Settings::single` shares one cache
    and routes by URL; `Settings::by_url` gives each database its own
    cache, since one engine streams one database. A URL with no cache
    is a passthrough. `set_route` changes one connection.
 3. **The default:** Streamgres.
-
-`Consistency::Eventual` and `Consistency::Strong` are aliases of the two
-routes.
 
 **Read your writes.** Between a commit and the engine's delta, a
 Postgres read sees the new row and a cache read the old one. So after a

@@ -54,13 +54,6 @@ pub enum Route {
 }
 
 impl Route {
-    /// Another name for [`Route::Streamgres`], under [`crate::Consistency`].
-    #[allow(non_upper_case_globals)]
-    pub const Eventual: Route = Route::Streamgres;
-    /// Another name for [`Route::Postgres`], under [`crate::Consistency`].
-    #[allow(non_upper_case_globals)]
-    pub const Strong: Route = Route::Postgres;
-
     const MARKER_STREAMGRES: &'static str = "/*streamgres:streamgres*/ ";
     const MARKER_POSTGRES: &'static str = "/*streamgres:postgres*/ ";
 
@@ -185,11 +178,9 @@ mod tests {
         assert_eq!(Route::strip("/* a comment */ SELECT 1"), None);
     }
 
-    /// The old route names are aliases of the new ones.
+    /// A read goes through the cache unless something says otherwise.
     #[test]
-    fn old_names_still_mean_the_same() {
-        assert_eq!(Route::Eventual, Route::Streamgres);
-        assert_eq!(Route::Strong, Route::Postgres);
+    fn the_default_route_is_the_cache() {
         assert_eq!(Route::default(), Route::Streamgres);
     }
 }

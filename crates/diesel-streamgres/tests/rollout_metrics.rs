@@ -20,7 +20,7 @@ use diesel_streamgres::key::QueryKey;
 use diesel_streamgres::metrics::{Metrics, set_metrics};
 use diesel_streamgres::shadow::{Outcome, counts, set_shadow_sample};
 use diesel_streamgres::subscriptions::{Outcome as Subscribed, Subscriptions, Verdict};
-use diesel_streamgres::{Consistency, Route, RouteDsl, Served, SyncedConnection};
+use diesel_streamgres::{Route, RouteDsl, Served, SyncedConnection};
 
 diesel::table! {
     sg_rollout (id) {
@@ -60,7 +60,7 @@ impl Subscriptions for FakeEngine {
         &self,
         _: &QueryKey,
         _: diesel_streamgres::materialized::Snapshot,
-        _: std::collections::HashMap<String, Arc<diesel_streamgres::types::TableTypes>>,
+        _: std::collections::HashMap<String, Arc<diesel_streamgres::postgres::TableTypes>>,
     ) -> Verdict {
         Verdict::Accepted { since: None }
     }
@@ -119,7 +119,7 @@ impl World {
         let conn = SyncedConnection::with_cache(
             PgConnection::establish(&url()).expect("connect"),
             cache,
-            Consistency::Eventual,
+            Route::Streamgres,
         );
         let recording = Arc::new(Recording::default());
         set_metrics(recording.clone());

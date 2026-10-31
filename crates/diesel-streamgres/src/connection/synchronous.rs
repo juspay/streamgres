@@ -20,11 +20,10 @@ use crate::cache::{
     WalPosition,
 };
 use crate::session::{RawTransaction, Scope, SessionChanges};
-use crate::cursor::{SyncedCursor, SyncedRow};
+use crate::postgres::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
-use crate::Consistency;
 use crate::route::{Route, Served};
-use crate::row::{OwnedCursor, OwnedRow, capture_all};
+use crate::postgres::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::Verdict;
 
 use super::policy::{self, Bypass, Replayed, commits, may_write, rendered};
@@ -172,16 +171,6 @@ impl<C> SyncedConnection<C> {
     /// The route this connection's reads take by default.
     pub fn route(&self) -> Route {
         self.route
-    }
-
-    /// [`SyncedConnection::set_route`] under another name.
-    pub fn set_consistency(&mut self, consistency: Consistency) {
-        self.set_route(consistency);
-    }
-
-    /// [`SyncedConnection::route`] under another name.
-    pub fn consistency(&self) -> Consistency {
-        self.route()
     }
 
     /// How long after a write reads through this connection's cache go
@@ -474,8 +463,8 @@ where
     /// subscription ends with it rather than being held for nothing. A
     /// read is keyed in the context the connection reads in ([`Context`],
     /// read on its first read through the cache and whenever it may have
-    /// changed), and shares answers only with readers in the same one
-    /// ([`Cache::context_id`]); while its session differs from how it was
+    /// changed), and shares answers only with readers in the same one;
+    /// while its session differs from how it was
     /// established (the statements it has run), or its context cannot be served,
     /// it reads Postgres. While the engine side is too far behind the
     /// database, reads go to Postgres.

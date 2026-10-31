@@ -47,7 +47,7 @@ impl Subscriptions for AcceptAll {
         &self,
         _: &QueryKey,
         _: diesel_streamgres::materialized::Snapshot,
-        _: std::collections::HashMap<String, Arc<diesel_streamgres::types::TableTypes>>,
+        _: std::collections::HashMap<String, Arc<diesel_streamgres::postgres::TableTypes>>,
     ) -> Verdict {
         Verdict::Accepted { since: None }
     }

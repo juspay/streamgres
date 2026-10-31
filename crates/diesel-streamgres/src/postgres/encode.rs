@@ -16,8 +16,8 @@ use std::num::NonZeroU32;
 
 use serde_json::Value as Json;
 
-use crate::row::OwnedValue;
-use crate::types::{ColumnType, TypeKind};
+use crate::postgres::OwnedValue;
+use crate::postgres::{ColumnType, TypeKind};
 
 /// Why a column cannot be encoded from the engine's cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
