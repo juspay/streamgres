@@ -18,7 +18,7 @@ use crate::cache::{
     AfterWrites, CONTEXT_SQL, Cache, Context, REPLAY_POSITION_SQL, Read, WAL_POSITION_SQL,
     WalPosition,
 };
-use crate::session::{Effect, RECHECK_EVERY, RawTransaction, Scope, SessionChanges};
+use crate::session::{RawTransaction, Scope, SessionChanges};
 use crate::cursor::{SyncedCursor, SyncedRow};
 use crate::key::QueryKey;
 use crate::Consistency;
@@ -26,6 +26,7 @@ use crate::route::{Route, Served};
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::Verdict;
 
+use super::policy::{self, Bypass, Replayed, commits, may_write, rendered};
 use super::{Attachment, SETTINGS, read_your_writes_from_env};
 
 /// A Postgres connection whose reads can be served from a synced local copy.
@@ -152,9 +153,7 @@ impl<C> SyncedConnection<C> {
     /// block it opens counts as open from here ([`RawTransaction`]).
     fn observe(&mut self, sql: &str) {
         self.raw.before(sql);
-        if self.cache.is_some()
-            && matches!(self.session.apply(sql), Effect::Restored | Effect::Recheck)
-        {
+        if self.cache.is_some() && policy::rechecks(self.session.apply(sql)) {
             self.scope = Scope::Unchecked;
         }
     }
@@ -215,7 +214,7 @@ where
         if self.session.changed() {
             return None;
         }
-        if self.scope == Scope::Unchecked || self.checked.elapsed() >= RECHECK_EVERY {
+        if policy::scope_now(self.scope, self.checked.elapsed()) == Scope::Unchecked {
             let context = context_of(&mut self.inner)?;
             self.scope = cache.context_id(&context).map_or(Scope::Own, Scope::In);
             self.checked = Instant::now();
@@ -261,17 +260,13 @@ where
         if self.primary {
             return true;
         }
-        match read_position(&mut self.inner, REPLAY_POSITION_SQL) {
-            Some(Read::Null) => {
-                self.primary = true;
-                true
-            }
-            Some(Read::At(replayed)) => {
-                cache.saw_standby();
-                since.is_some_and(|since| replayed >= since)
-            }
-            None => false,
+        let replayed = Replayed::of(read_position(&mut self.inner, REPLAY_POSITION_SQL), since);
+        match replayed {
+            Replayed::Primary => self.primary = true,
+            Replayed::Standby(_) => cache.saw_standby(),
+            Replayed::Unknown => {}
         }
+        replayed.keep()
     }
 }
 
@@ -440,7 +435,7 @@ where
         let mut key = QueryKey::of(&source, &mut self.inner)?;
         self.observe(&key.sql);
         let named = key.take_route();
-        let route = named.or(self.scoped).unwrap_or(self.route);
+        let route = policy::route(named, self.scoped, self.route);
         if !key.is_select() {
             self.wrote();
             if cache.reads_standbys() && !self.transaction_open() {
@@ -464,30 +459,16 @@ where
             return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
         }
         if key.is_locking() {
-            cache.stats.locking.fetch_add(1, Ordering::Relaxed);
-            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            return LoadConnection::<B>::load(&mut self.inner, source).map(SyncedCursor::Live);
+            return bypassed::<C, B, T>(&mut self.inner, &cache, Bypass::Locking, source);
         }
         if after_writes(&cache, self.read_your_writes, &mut self.inner) != AfterWrites::Serve {
-            cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
-            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            let permit = cache.fallback_permit()?;
-            return LoadConnection::<B>::load(&mut self.inner, source)
-                .map(|cursor| SyncedCursor::Limited(cursor, permit));
+            return bypassed::<C, B, T>(&mut self.inner, &cache, Bypass::AfterWrites, source);
         }
         if cache.subscriptions().behind() {
-            cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
-            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            let permit = cache.fallback_permit()?;
-            return LoadConnection::<B>::load(&mut self.inner, source)
-                .map(|cursor| SyncedCursor::Limited(cursor, permit));
+            return bypassed::<C, B, T>(&mut self.inner, &cache, Bypass::Lagging, source);
         }
         let Some(context) = self.context_in(&cache) else {
-            cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
-            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            let permit = cache.fallback_permit()?;
-            return LoadConnection::<B>::load(&mut self.inner, source)
-                .map(|cursor| SyncedCursor::Limited(cursor, permit));
+            return bypassed::<C, B, T>(&mut self.inner, &cache, Bypass::OtherContext, source);
         };
         key.context = context;
         if let Some(rows) = cache.get(&key) {
@@ -499,28 +480,18 @@ where
             return Ok(SyncedCursor::Cached(OwnedCursor::new(rows)));
         }
         if cache.refused_recently(&key).is_some() {
-            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            let permit = cache.fallback_permit()?;
-            return LoadConnection::<B>::load(&mut self.inner, source)
-                .map(|cursor| SyncedCursor::Limited(cursor, permit));
+            return bypassed::<C, B, T>(&mut self.inner, &cache, Bypass::Refused, source);
         }
         let reservation = cache.reserve(&key);
         let since = match cache.subscriptions().subscribe_with(&key, &mut self.inner) {
             Verdict::Refused(reason) => {
                 cache.refused(&key, &reason);
-                crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                let permit = cache.fallback_permit()?;
-                return LoadConnection::<B>::load(&mut self.inner, source)
-                    .map(|cursor| SyncedCursor::Limited(cursor, permit));
+                return bypassed::<C, B, T>(&mut self.inner, &cache, Bypass::Refused, source);
             }
             Verdict::Rows { rows, live } => {
                 cache.fill_live(reservation, live, &rows);
                 if cache.subscriptions().behind() {
-                    cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
-                    crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                    let permit = cache.fallback_permit()?;
-                    return LoadConnection::<B>::load(&mut self.inner, source)
-                        .map(|cursor| SyncedCursor::Limited(cursor, permit));
+                    return bypassed::<C, B, T>(&mut self.inner, &cache, Bypass::Lagging, source);
                 }
                 self.served = Some(Served::Engine);
                 crate::metrics::report(|metrics| metrics.served(Served::Engine));
@@ -556,6 +527,28 @@ where
         }
         Ok(SyncedCursor::Cached(OwnedCursor::new(rows)))
     }
+}
+
+/// Reads `source` from Postgres for `bypass`: counted and reported
+/// ([`Bypass::record`]) and, unless it needs none, behind a fallback
+/// permit held for as long as the cursor lives.
+fn bypassed<'conn, 'query, C, B, T>(
+    inner: &'conn mut C,
+    cache: &Cache,
+    bypass: Bypass,
+    source: T,
+) -> QueryResult<SyncedCursor<<C as LoadConnection<B>>::Cursor<'conn, 'query>>>
+where
+    C: LoadConnection<B> + Connection<Backend = Pg> + 'conn,
+    T: Query + QueryFragment<Pg> + QueryId + 'query,
+    Pg: QueryMetadata<T::SqlType>,
+{
+    bypass.record(cache);
+    if !bypass.limited() {
+        return LoadConnection::<B>::load(inner, source).map(SyncedCursor::Live);
+    }
+    let permit = cache.fallback_permit()?;
+    LoadConnection::<B>::load(inner, source).map(|cursor| SyncedCursor::Limited(cursor, permit))
 }
 
 /// A shadow read ([`crate::shadow`]): `source` run on Postgres beside the
@@ -676,62 +669,6 @@ where
         .read()
 }
 
-/// Whether `sql` ends a transaction with its writes: a `COMMIT` or an
-/// `END`, as the ANSI manager and hand-written SQL send them.
-pub(crate) fn commits(sql: &str) -> bool {
-    let word = sql.split_whitespace().next().unwrap_or("");
-    let word = word.trim_end_matches(';');
-    word.eq_ignore_ascii_case("COMMIT") || word.eq_ignore_ascii_case("END")
-}
-
-/// The SQL a statement renders to, for [`may_write`]; a statement that
-/// cannot be rendered is taken for a write.
-pub(crate) fn rendered<T: QueryFragment<Pg>>(query: &T) -> String {
-    let mut builder = diesel::pg::PgQueryBuilder::default();
-    match query.to_sql(&mut builder, &Pg) {
-        Ok(()) => diesel::query_builder::QueryBuilder::finish(builder),
-        Err(_) => String::new(),
-    }
-}
-
-/// Whether raw SQL could change what a read sees: any statement of it
-/// but a plain `SELECT` (a pool's `SELECT 1` on every checkout would
-/// otherwise keep the read-your-writes window open for good) and the
-/// statements that only move a transaction along without committing it.
-/// A batch is split on every `;`, one inside a string literal included:
-/// a piece that then starts oddly counts as a write, which only sends a
-/// few more reads to Postgres.
-pub(crate) fn may_write(sql: &str) -> bool {
-    sql.split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-        .any(|statement| !reads_only(statement))
-}
-
-/// Whether one statement is a plain read or only moves a transaction
-/// along.
-fn reads_only(statement: &str) -> bool {
-    let head = statement.trim_start_matches('(');
-    let word = head
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .next()
-        .unwrap_or("");
-    [
-        "SELECT",
-        "BEGIN",
-        "START",
-        "SAVEPOINT",
-        "RELEASE",
-        "ROLLBACK",
-        "SET",
-        "RESET",
-        "DISCARD",
-        "SHOW",
-    ]
-    .iter()
-    .any(|statement| word.eq_ignore_ascii_case(statement))
-}
-
 /// Whether a transaction is open on the connection. Inside one, reads must
 /// see the connection's own uncommitted writes, which no cache has. A
 /// broken transaction state counts as open: the inner connection reports
@@ -774,44 +711,5 @@ where
     /// The inner connection's type metadata cache.
     fn get_metadata_cache(&mut self) -> &mut PgMetadataCache {
         self.inner.get_metadata_cache()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Reads and the statements that only move a transaction along or
-    /// change the session are not writes; anything else, or a batch with
-    /// anything else in it, is.
-    #[test]
-    fn what_counts_as_a_write() {
-        for sql in [
-            "SELECT 1",
-            "(SELECT 1) UNION (SELECT 2)",
-            "BEGIN",
-            "START TRANSACTION",
-            "SAVEPOINT a",
-            "RELEASE a",
-            "ROLLBACK",
-            "SET app.tenant = 'a'",
-            "RESET ALL",
-            "DISCARD ALL",
-            "SHOW search_path",
-            "SET ROLE r; SELECT 1;",
-        ] {
-            assert!(!may_write(sql), "{sql}");
-        }
-        for sql in [
-            "INSERT INTO t VALUES (1)",
-            "UPDATE t SET a = 1",
-            "DELETE FROM t",
-            "COMMIT",
-            "SELECT 1; DELETE FROM t",
-            "WITH gone AS (DELETE FROM t RETURNING *) SELECT * FROM gone",
-            "CALL p()",
-        ] {
-            assert!(may_write(sql), "{sql}");
-        }
     }
 }

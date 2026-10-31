@@ -77,13 +77,14 @@ use crate::cache::{
 use crate::cursor::SyncedRow;
 use crate::key::QueryKey;
 use crate::route::{Route, Served};
-use crate::session::{Effect, RECHECK_EVERY, RawTransaction, Scope, SessionChanges};
+use crate::session::{RawTransaction, Scope, SessionChanges};
 use crate::row::{OwnedCursor, OwnedRow, capture_all};
 use crate::subscriptions::STALE_TYPES;
 use crate::materialized::Snapshot;
 use crate::subscriptions::{Outcome, Subscriptions, Verdict};
 use crate::types::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
-use super::{Attachment, SETTINGS, commits, may_write, read_your_writes_from_env, rendered};
+use super::policy::{self, Bypass, Replayed, commits, may_write, rendered};
+use super::{Attachment, SETTINGS, read_your_writes_from_env};
 
 /// diesel-async's Postgres row, which it does not export by name.
 pub type PgRow = <AsyncPgConnection as AsyncConnectionCore>::Row<'static, 'static>;
@@ -159,9 +160,7 @@ impl AsyncSyncedConnection {
     /// block it opens counts as open from here ([`RawTransaction`]).
     fn observe(&mut self, sql: &str) {
         self.raw.lock().expect("raw").before(sql);
-        if self.cache.is_some()
-            && matches!(self.session.apply(sql), Effect::Restored | Effect::Recheck)
-        {
+        if self.cache.is_some() && policy::rechecks(self.session.apply(sql)) {
             self.scope.store(Scope::Unchecked.bits(), Ordering::Release);
         }
     }
@@ -172,10 +171,7 @@ impl AsyncSyncedConnection {
         let since = self.born.elapsed().saturating_sub(Duration::from_millis(
             self.checked.load(Ordering::Acquire),
         ));
-        match Scope::from_bits(self.scope.load(Ordering::Acquire)) {
-            _ if since >= RECHECK_EVERY => Scope::Unchecked,
-            scope => scope,
-        }
+        policy::scope_now(Scope::from_bits(self.scope.load(Ordering::Acquire)), since)
     }
 
     /// Where this connection's last read was served from: the cache,
@@ -407,6 +403,22 @@ impl AsyncSyncedConnection {
     /// through the row stream. Cancellation releases both the future and slot.
     fn fallback<'query>(cache: Arc<Cache>, live: LoadFuture<'query>) -> SyncedLoadFuture<'query> {
         Self::limit_fallback(cache, live.map_ok(Self::live_stream).boxed())
+    }
+
+    /// Reads from Postgres for `bypass`: counted and reported
+    /// ([`Bypass::record`]) and, unless it needs none, behind a fallback
+    /// permit held for as long as the stream lives.
+    fn bypassed<'query>(
+        cache: Arc<Cache>,
+        bypass: Bypass,
+        live: SyncedLoadFuture<'query>,
+    ) -> SyncedLoadFuture<'query> {
+        bypass.record(&cache);
+        if bypass.limited() {
+            Self::limit_fallback(cache, live)
+        } else {
+            live
+        }
     }
 
     fn limit_fallback<'query>(
@@ -647,7 +659,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
         };
         self.observe(&key.sql);
         let named = key.take_route();
-        let route = named.or(self.scoped).unwrap_or(self.route);
+        let route = policy::route(named, self.scoped, self.route);
         if !key.is_select() {
             let resolve = self.resolves_writes();
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
@@ -664,21 +676,16 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
             return self.tracked(live);
         }
         if key.is_locking() {
-            cache.stats.locking.fetch_add(1, Ordering::Relaxed);
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
-            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            return self.tracked(live);
+            return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::Locking, live));
         }
         match cache.after_writes(self.read_your_writes) {
             AfterWrites::Serve => {}
             AfterWrites::Postgres => {
-                cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
                 let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
-                crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                return self.tracked(Self::limit_fallback(Arc::clone(&cache), live));
+                return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::AfterWrites, live));
             }
             AfterWrites::Resolve(writes) => {
-                cache.stats.after_write.fetch_add(1, Ordering::Relaxed);
                 let probe = self.inner.load(sql_query(WAL_POSITION_SQL));
                 let live = self.inner.load(query);
                 let fallback_cache = Arc::clone(&cache);
@@ -692,15 +699,12 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                     live.map(Self::live_stream)
                 }
                 .boxed();
-                crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                return self.tracked(Self::limit_fallback(fallback_cache, live));
+                return self.tracked(Self::bypassed(fallback_cache, Bypass::AfterWrites, live));
             }
         }
         if cache.subscriptions().behind() {
-            cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
-            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            return self.tracked(Self::limit_fallback(Arc::clone(&cache), live));
+            return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::Lagging, live));
         }
         if !unknown.is_empty() {
             let live = self.inner.load(query);
@@ -708,22 +712,17 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                 .resolving(unknown, live)
                 .map_ok(Self::live_stream)
                 .boxed();
-            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            return self.tracked(Self::limit_fallback(Arc::clone(&cache), live));
+            return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::UnknownTypes, live));
         }
         match self.scope() {
             _ if self.session.changed() => {
-                cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
                 let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
-                crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                return self.tracked(Self::limit_fallback(Arc::clone(&cache), live));
+                return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::OtherContext, live));
             }
             Scope::In(context) => key.context = context,
             Scope::Own => {
-                cache.stats.other_context.fetch_add(1, Ordering::Relaxed);
                 let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
-                crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                return self.tracked(Self::limit_fallback(Arc::clone(&cache), live));
+                return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::OtherContext, live));
             }
             Scope::Unchecked => {
                 let probe = self.inner.load(sql_query(CONTEXT_SQL));
@@ -745,8 +744,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                     live.map(Self::live_stream)
                 }
                 .boxed();
-                crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-                return self.tracked(Self::limit_fallback(fallback_cache, live));
+                return self.tracked(Self::bypassed(fallback_cache, Bypass::ReadingContext, live));
             }
         }
         if let Some(rows) = cache.get(&key) {
@@ -756,8 +754,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
         }
         if cache.refused_recently(&key).is_some() {
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
-            crate::metrics::report(|metrics| metrics.served(Served::Postgres));
-            return self.tracked(Self::limit_fallback(Arc::clone(&cache), live));
+            return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::Refused, live));
         }
         let replay: Option<LoadFuture<'query>> = (!self.primary.load(Ordering::Acquire))
             .then(|| self.inner.load(sql_query(REPLAY_POSITION_SQL)));
@@ -807,15 +804,14 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                 Verdict::Refused(reason) => {
                     guard.disarm();
                     cache.refused(&key, &reason);
-                    crate::metrics::report(|metrics| metrics.served(Served::Postgres));
+                    Bypass::Refused.record(&cache);
                     Self::fallback(Arc::clone(&cache), live).await
                 }
                 Verdict::Rows { rows, live: store } => {
                     guard.disarm();
                     cache.fill_live(reservation, store, &rows);
                     if subscriptions.behind() {
-                        cache.stats.lagging.fetch_add(1, Ordering::Relaxed);
-                        crate::metrics::report(|metrics| metrics.served(Served::Postgres));
+                        Bypass::Lagging.record(&cache);
                         return Self::fallback(Arc::clone(&cache), live).await;
                     }
                     served.store(2, Ordering::Release);
@@ -826,17 +822,15 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                     crate::metrics::report(|metrics| metrics.served(Served::Postgres));
                     let keep = match replay {
                         None => true,
-                        Some(replay) => match read_position(replay).await {
-                            Some(Read::Null) => {
-                                primary.store(true, Ordering::Release);
-                                true
+                        Some(replay) => {
+                            let replayed = Replayed::of(read_position(replay).await, since);
+                            match replayed {
+                                Replayed::Primary => primary.store(true, Ordering::Release),
+                                Replayed::Standby(_) => cache.saw_standby(),
+                                Replayed::Unknown => {}
                             }
-                            Some(Read::At(replayed)) => {
-                                cache.saw_standby();
-                                since.is_some_and(|since| replayed >= since)
-                            }
-                            None => false,
-                        },
+                            replayed.keep()
+                        }
                     };
                     let _permit = cache.fallback_permit_async().await?;
                     let pg_rows: Vec<PgRow> = live.await?.try_collect().await?;

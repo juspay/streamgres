@@ -36,6 +36,7 @@ and changes nothing else.
 | `connection/mod.rs` | `Settings`, `Attachment`, `install`: which cache a connection reads through, by its URL |
 | `connection/synchronous.rs` | `SyncedConnection`, the interception of Diesel's three connection methods |
 | `connection/asynchronous.rs` | `AsyncSyncedConnection`, the same wrapper over diesel-async (feature `async`) |
+| `connection/policy.rs` | what both wrappers decide from what they know: a read's route, why it bypasses the cache and what that counts, whether a refill may be kept, what counts as a write |
 | `route.rs` | `Route`, `RouteDsl`, `Via`, `Served`: where a read goes and where it came from |
 | `key.rs` | `QueryKey`: what identifies a read, and a refusal |
 | `cache.rs` | `Cache`, `Limits`, `Stats`, the `Live` trait, reservations and generations |

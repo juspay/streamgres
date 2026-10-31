@@ -9,6 +9,7 @@
 
 #[cfg(feature = "async")]
 pub mod asynchronous;
+mod policy;
 mod synchronous;
 
 use std::sync::{Arc, OnceLock};
@@ -18,8 +19,6 @@ use crate::cache::Cache;
 use crate::route::Route;
 
 pub use self::synchronous::SyncedConnection;
-#[cfg(feature = "async")]
-pub(crate) use self::synchronous::{commits, may_write, rendered};
 
 /// What a connection established with some URL gets: the cache its
 /// reads go through and the route they take by default.
