@@ -83,7 +83,7 @@ use crate::subscriptions::STALE_TYPES;
 use crate::materialized::Snapshot;
 use crate::subscriptions::{Outcome, Subscriptions, Verdict};
 use crate::types::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
-use crate::{Attachment, SETTINGS, commits, may_write, read_your_writes_from_env, rendered};
+use super::{Attachment, SETTINGS, commits, may_write, read_your_writes_from_env, rendered};
 
 /// diesel-async's Postgres row, which it does not export by name.
 pub type PgRow = <AsyncPgConnection as AsyncConnectionCore>::Row<'static, 'static>;
