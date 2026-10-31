@@ -24,11 +24,13 @@
 //!
 //! diesel-async records a query as started when its future is built,
 //! and as finished when the future completes, so a future built and
-//! never run would leave a query started that never finishes. The
-//! wrapper keeps the instrumentation itself and holds a miss's starts
-//! back until the read runs their futures ([`super::held`]): a miss the
-//! engine serves from its own rows tells it of no query at all, a miss
-//! read from Postgres of the queries it ran. A hit builds nothing.
+//! never polled would leave a query started that never finishes. The
+//! wrapper keeps the instrumentation itself and holds every start back
+//! until its future is first polled ([`super::held`]): a miss the engine
+//! serves from its own rows tells it of no query at all, a read that gave
+//! up waiting for a fallback permit of none, a read from Postgres of the
+//! queries it ran. A future dropped in the middle of its query is told
+//! finished, with an error. A hit builds nothing.
 //!
 //! # Pipelining
 //!
@@ -88,7 +90,7 @@ use crate::subscriptions::STALE_TYPES;
 use crate::materialized::Snapshot;
 use crate::subscriptions::{Outcome, Subscriptions, Verdict};
 use crate::postgres::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
-use super::held::{Held, Instrumented};
+use super::held::Instrumented;
 use super::policy::{self, Bypass, Replayed, commits, may_write, rendered};
 use super::{Attachment, SETTINGS, Settings, read_your_writes_from_env};
 
@@ -355,7 +357,7 @@ impl AsyncSyncedConnection {
         if let Some(cache) = &cache {
             cache.mark_write();
         }
-        let probe = resolve.then(|| self.inner.load(sql_query(WAL_POSITION_SQL)));
+        let probe = resolve.then(|| self.load_held(sql_query(WAL_POSITION_SQL)));
         let token = Arc::clone(&self.inflight);
         async move {
             let _pending = token;
@@ -391,6 +393,18 @@ impl AsyncSyncedConnection {
             done
         }
         .boxed()
+    }
+
+    /// The inner connection's load of `query`, its start told when it is
+    /// first polled and its finish when it is dropped unfinished
+    /// ([`super::held`]).
+    fn load_held<'query, T>(&mut self, query: T) -> LoadFuture<'query>
+    where
+        T: AsQuery + 'query,
+        T::Query: QueryFragment<Pg> + QueryId + 'query,
+    {
+        let inner = &mut self.inner;
+        self.instrumented.hold(|| inner.load(query)).boxed()
     }
 
     /// A read future with the in-flight token attached.
@@ -503,7 +517,7 @@ impl AsyncSyncedConnection {
     ) -> LoadFuture<'query> {
         let resolvers: Vec<LoadFuture<'query>> = unknown
             .iter()
-            .map(|name| self.inner.load(type_oids_query(name)))
+            .map(|name| self.load_held(type_oids_query(name)))
             .collect();
         let metadata = Arc::clone(&self.metadata);
         async move {
@@ -636,6 +650,7 @@ impl SimpleAsyncConnection for AsyncSyncedConnection {
         let resolve = cache.as_ref().is_some_and(|cache| cache.reads_standbys())
             && (commits(query) || self.resolves_writes());
         let raw = Arc::clone(&self.raw);
+        let instrumented = self.instrumented.clone();
         let inner = &mut self.inner;
         async move {
             let result = inner.batch_execute(query).await;
@@ -646,7 +661,7 @@ impl SimpleAsyncConnection for AsyncSyncedConnection {
                 cache.mark_write();
                 if resolve && result.is_ok() {
                     let writes = cache.write_count();
-                    let probe = inner.load(sql_query(WAL_POSITION_SQL));
+                    let probe = instrumented.hold(|| inner.load(sql_query(WAL_POSITION_SQL))).boxed();
                     if let Some(Read::At(position)) = read_position(probe).await {
                         cache.resolve_writes(writes, position);
                     }
@@ -692,7 +707,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
         let query = source.as_query();
         self.served.store(3, Ordering::Release);
         let Some(cache) = self.cache.clone() else {
-            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            let live = self.load_held(query).map_ok(Self::live_stream).boxed();
             return self.tracked(live);
         };
         let (key, unknown) = match self.key_of(&query) {
@@ -701,7 +716,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
         };
         let Some(mut key) = key else {
             self.observe(&rendered(&query));
-            let live = self.inner.load(query);
+            let live = self.load_held(query);
             let live = self
                 .resolving(unknown, live)
                 .map_ok(Self::live_stream)
@@ -713,32 +728,32 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
         let route = policy::route(named, self.scoped, self.route);
         if !key.is_select() {
             let resolve = self.resolves_writes();
-            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            let live = self.load_held(query).map_ok(Self::live_stream).boxed();
             return self.written(live, resolve);
         }
         if route == Route::Postgres || self.pipelined() || self.in_transaction() {
-            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            let live = self.load_held(query).map_ok(Self::live_stream).boxed();
             return self.tracked(live);
         }
         // From here on the read is one the cache could serve: each way out
         // reports where it was served.
         if named.is_none() && !crate::rollout::through_cache() {
-            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            let live = self.load_held(query).map_ok(Self::live_stream).boxed();
             return self.tracked(live);
         }
         if key.is_locking() {
-            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            let live = self.load_held(query).map_ok(Self::live_stream).boxed();
             return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::Locking, live));
         }
         match cache.after_writes(self.read_your_writes) {
             AfterWrites::Serve => {}
             AfterWrites::Postgres => {
-                let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+                let live = self.load_held(query).map_ok(Self::live_stream).boxed();
                 return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::AfterWrites, live));
             }
             AfterWrites::Resolve(writes) => {
-                let probe = self.inner.load(sql_query(WAL_POSITION_SQL));
-                let live = self.inner.load(query);
+                let probe = self.load_held(sql_query(WAL_POSITION_SQL));
+                let live = self.load_held(query);
                 let fallback_cache = Arc::clone(&cache);
                 let live = async move {
                     let (position, live) = futures_util::join!(read_position(probe), live);
@@ -754,11 +769,11 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
             }
         }
         if cache.subscriptions().behind() {
-            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            let live = self.load_held(query).map_ok(Self::live_stream).boxed();
             return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::Lagging, live));
         }
         if !unknown.is_empty() {
-            let live = self.inner.load(query);
+            let live = self.load_held(query);
             let live = self
                 .resolving(unknown, live)
                 .map_ok(Self::live_stream)
@@ -767,17 +782,17 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
         }
         match self.scope() {
             _ if self.session.changed() => {
-                let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+                let live = self.load_held(query).map_ok(Self::live_stream).boxed();
                 return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::OtherContext, live));
             }
             Scope::In(context) => key.context = context,
             Scope::Own => {
-                let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+                let live = self.load_held(query).map_ok(Self::live_stream).boxed();
                 return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::OtherContext, live));
             }
             Scope::Unchecked => {
-                let probe = self.inner.load(sql_query(CONTEXT_SQL));
-                let live = self.inner.load(query);
+                let probe = self.load_held(sql_query(CONTEXT_SQL));
+                let live = self.load_held(query);
                 let (scope, checked, born) = (
                     Arc::clone(&self.scope),
                     Arc::clone(&self.checked),
@@ -804,20 +819,17 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
             return std::future::ready(Ok(Self::cached_stream(rows))).boxed();
         }
         if cache.refused_recently(&key).is_some() {
-            let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
+            let live = self.load_held(query).map_ok(Self::live_stream).boxed();
             return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::Refused, live));
         }
-        let inner = &mut self.inner;
-        let held = &self.instrumented;
-        let replay: Option<Held<LoadFuture<'query>>> = (!self.primary.load(Ordering::Acquire))
-            .then(|| held.hold(|| inner.load(sql_query(REPLAY_POSITION_SQL))));
-        let live = held.hold(|| inner.load(query));
-        let catalog: Option<Held<LoadFuture<'query>>> =
-            if self.catalog_loaded.load(Ordering::Acquire) {
-                None
-            } else {
-                Some(held.hold(|| inner.load(sql_query(ALL_TABLES_SQL))))
-            };
+        let replay: Option<LoadFuture<'query>> = (!self.primary.load(Ordering::Acquire))
+            .then(|| self.load_held(sql_query(REPLAY_POSITION_SQL)));
+        let live = self.load_held(query);
+        let catalog: Option<LoadFuture<'query>> = if self.catalog_loaded.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(self.load_held(sql_query(ALL_TABLES_SQL)))
+        };
         let catalog_loaded = Arc::clone(&self.catalog_loaded);
         let subscriptions = cache.shared_subscriptions();
         let token = Arc::clone(&self.inflight);
@@ -850,7 +862,6 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
             let verdict = match outcome {
                 Outcome::Verdict(verdict) => verdict,
                 Outcome::NeedsTypes { snapshot, missing } => {
-                    let catalog = catalog.map(Held::run);
                     with_types(&*subscriptions, &key, snapshot, &missing, catalog, &catalog_loaded)
                         .await?
                 }
@@ -860,14 +871,14 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                     guard.disarm();
                     cache.refused(&key, &reason);
                     Bypass::Refused.record(&cache);
-                    Self::fallback(Arc::clone(&cache), live.run()).await
+                    Self::fallback(Arc::clone(&cache), live).await
                 }
                 Verdict::Rows { rows, live: store } => {
                     guard.disarm();
                     cache.fill_live(reservation, store, &rows);
                     if subscriptions.behind() {
                         Bypass::Lagging.record(&cache);
-                        return Self::fallback(Arc::clone(&cache), live.run()).await;
+                        return Self::fallback(Arc::clone(&cache), live).await;
                     }
                     served.store(2, Ordering::Release);
                     crate::metrics::report(|metrics| metrics.served(Served::Engine));
@@ -878,7 +889,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                     let keep = match replay {
                         None => true,
                         Some(replay) => {
-                            let replayed = Replayed::of(read_position(replay.run()).await, since);
+                            let replayed = Replayed::of(read_position(replay).await, since);
                             match replayed {
                                 Replayed::Primary => primary.store(true, Ordering::Release),
                                 Replayed::Standby(_) => cache.saw_standby(),
@@ -888,7 +899,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                         }
                     };
                     let _permit = cache.fallback_permit_async().await?;
-                    let pg_rows: Vec<PgRow> = live.run().await?.try_collect().await?;
+                    let pg_rows: Vec<PgRow> = live.await?.try_collect().await?;
                     let rows: Arc<[OwnedRow]> =
                         Arc::from(capture_all(pg_rows.into_iter().map(Ok))?);
                     guard.disarm();
@@ -916,7 +927,8 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
         self.observe(&sql);
         let writes = may_write(&sql);
         let resolve = writes && self.resolves_writes();
-        let future = self.inner.execute_returning_count(source);
+        let inner = &mut self.inner;
+        let future = self.instrumented.hold(|| inner.execute_returning_count(source)).boxed();
         let future = self.ended(future, sql);
         if writes {
             self.written(future, resolve)

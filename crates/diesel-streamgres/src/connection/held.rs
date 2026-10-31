@@ -11,14 +11,21 @@
 //! a span that never closes.
 //!
 //! So the wrapper keeps the application's instrumentation itself, and the
-//! inner connection's is a forwarder to it ([`Instrumented`]). A future
-//! built through [`Instrumented::hold`] has its start held back and
-//! passed on only when the read runs it ([`Held::run`]); dropped, the
-//! query was never started as far as the instrumentation knows. Every
-//! other event passes straight through.
+//! inner connection's is a forwarder to it ([`Instrumented`]). Every
+//! future the wrapper builds on the inner connection is built through
+//! [`Instrumented::hold`], which holds its start back until the future is
+//! first polled ([`Held`]): a future dropped unpolled, as one is that a
+//! read never needed, or that waited for a fallback permit and gave up,
+//! never started as far as the instrumentation knows. One dropped after
+//! it started and before it finished, a read cancelled in the middle of
+//! its query, is told finished then, with an error saying so. Every other
+//! event passes straight through.
 
 use std::cell::RefCell;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
 
 use diesel::connection::{Instrumentation, InstrumentationEvent, StrQueryHelper};
 
@@ -46,7 +53,7 @@ impl Instrumented {
     }
 
     /// The future `build` makes, with the start of the query it sends
-    /// held back until the read runs it.
+    /// held back until the future is first polled.
     pub(super) fn hold<F>(&self, build: impl FnOnce() -> F) -> Held<F> {
         HOLDING.with(|holding| *holding.borrow_mut() = Some(None));
         let future = build();
@@ -54,6 +61,7 @@ impl Instrumented {
         Held {
             future,
             start,
+            running: None,
             instrumented: self.clone(),
         }
     }
@@ -91,23 +99,50 @@ impl Instrumentation for Instrumented {
     }
 }
 
-/// A future whose query's start is held back: told when the read runs
-/// it, never when it is dropped unrun.
+/// A future whose query's start is held back until its first poll, and
+/// whose finish is told when it is dropped started and unfinished.
+/// diesel-async tells the finish of one that completes.
 pub(super) struct Held<F> {
     future: F,
+    /// The start held back, told at the first poll.
     start: Option<String>,
+    /// The query's text from its start until the future completes.
+    running: Option<String>,
     instrumented: Instrumented,
 }
 
-impl<F> Held<F> {
-    /// The future, its query's start told now that the read runs it; its
-    /// finish follows as diesel-async tells it.
-    pub(super) fn run(self) -> F {
-        if let Some(sql) = &self.start {
-            self.instrumented
-                .tell(InstrumentationEvent::start_query(&StrQueryHelper::new(sql)));
+impl<F: Future + Unpin> Future for Held<F> {
+    type Output = F::Output;
+
+    /// Tells the start at the first poll, then polls the future.
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<F::Output> {
+        let this = &mut *self;
+        if let Some(sql) = this.start.take() {
+            this.instrumented
+                .tell(InstrumentationEvent::start_query(&StrQueryHelper::new(&sql)));
+            this.running = Some(sql);
         }
-        self.future
+        let polled = Pin::new(&mut this.future).poll(cx);
+        if polled.is_ready() {
+            this.running = None;
+        }
+        polled
+    }
+}
+
+impl<F> Drop for Held<F> {
+    /// Tells a started query finished, with an error, when it is dropped
+    /// before it completed.
+    fn drop(&mut self) {
+        if let Some(sql) = self.running.take() {
+            let dropped = diesel::result::Error::QueryBuilderError(
+                "the query's future was dropped before it finished".into(),
+            );
+            self.instrumented.tell(InstrumentationEvent::finish_query(
+                &StrQueryHelper::new(&sql),
+                Some(&dropped),
+            ));
+        }
     }
 }
 
@@ -130,42 +165,51 @@ mod tests {
         }
     }
 
-    /// A start sent while a future is built is held: dropped unrun, the
-    /// instrumentation hears nothing; run, it hears the start then. A
-    /// start sent outside `hold` passes straight through.
+    /// A start sent while a future is built is held: dropped unpolled,
+    /// the instrumentation hears nothing; polled, it hears the start; one
+    /// that completes is finished by diesel-async, not here; one dropped
+    /// pending after its start is told finished. A start sent outside
+    /// `hold` passes straight through, as does a finish.
     #[test]
-    fn a_start_is_told_only_when_the_future_runs() {
+    fn a_start_is_told_at_the_first_poll_and_a_dropped_one_finished() {
         let counts = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
         let instrumented = Instrumented::new(Some(Box::new(Count(Arc::clone(&counts)))));
-        let mut forwarder = instrumented.clone();
-        let starts = || counts.0.load(Ordering::SeqCst);
+        let forwarder = instrumented.clone();
+        let heard = || (counts.0.load(Ordering::SeqCst), counts.1.load(Ordering::SeqCst));
+        let build = |sql: &'static str| {
+            let mut forwarder = forwarder.clone();
+            move || {
+                forwarder.on_connection_event(InstrumentationEvent::start_query(
+                    &StrQueryHelper::new(sql),
+                ));
+            }
+        };
 
-        let unrun = instrumented.hold(|| {
-            forwarder.on_connection_event(InstrumentationEvent::start_query(&StrQueryHelper::new(
-                "SELECT 1",
-            )));
+        let unpolled = instrumented.hold(|| {
+            build("SELECT 1")();
+            std::future::ready(1)
         });
-        assert_eq!(starts(), 0, "held");
-        drop(unrun);
-        assert_eq!(starts(), 0, "dropped unrun: never started");
+        assert_eq!(heard(), (0, 0), "held");
+        drop(unpolled);
+        assert_eq!(heard(), (0, 0), "dropped unpolled: never started");
 
-        let run = instrumented.hold(|| {
-            forwarder.on_connection_event(InstrumentationEvent::start_query(&StrQueryHelper::new(
-                "SELECT 2",
-            )));
+        let completed = instrumented.hold(|| {
+            build("SELECT 2")();
+            std::future::ready(2)
         });
-        assert_eq!(run.start.as_deref(), Some("SELECT 2"));
-        run.run();
-        assert_eq!(starts(), 1, "run: started");
+        assert_eq!(futures_util::FutureExt::now_or_never(completed), Some(2));
+        assert_eq!(heard(), (1, 0), "started; its finish is diesel-async's to tell");
 
-        forwarder.on_connection_event(InstrumentationEvent::start_query(&StrQueryHelper::new(
-            "SELECT 3",
-        )));
-        assert_eq!(starts(), 2, "outside hold: passed on");
-        forwarder.on_connection_event(InstrumentationEvent::finish_query(
-            &StrQueryHelper::new("SELECT 3"),
-            None,
-        ));
-        assert_eq!(counts.1.load(Ordering::SeqCst), 1, "a finish passes on");
+        let cancelled = instrumented.hold(|| {
+            build("SELECT pg_sleep(1)")();
+            std::future::pending::<()>()
+        });
+        assert_eq!(futures_util::FutureExt::now_or_never(cancelled), None);
+        assert_eq!(heard(), (2, 1), "dropped after its start: told finished");
+
+        let mut outside = forwarder.clone();
+        outside.on_connection_event(InstrumentationEvent::start_query(&StrQueryHelper::new("SELECT 3")));
+        outside.on_connection_event(InstrumentationEvent::finish_query(&StrQueryHelper::new("SELECT 3"), None));
+        assert_eq!(heard(), (3, 2), "outside hold: passed on");
     }
 }

@@ -36,7 +36,7 @@ and changes nothing else.
 | `connection/mod.rs` | `Settings`, `Attachment`, `install`: which cache a connection reads through, by its URL; the settings make connections and pools (`SyncedManager`, `async_manager`) without `install` |
 | `connection/synchronous.rs` | `SyncedConnection`, the interception of Diesel's three connection methods |
 | `connection/asynchronous.rs` | `AsyncSyncedConnection`, the same wrapper over diesel-async (feature `async`) |
-| `connection/held.rs` | the async wrapper's instrumentation: a speculative future's query start is passed on only when the read runs it |
+| `connection/held.rs` | the async wrapper's instrumentation: each query's start is told at its future's first poll, and a future dropped mid-query is told finished |
 | `connection/policy.rs` | what both wrappers decide from what they know: a read's route, why it bypasses the cache and what that counts, whether a refill may be kept, what counts as a write |
 | `route.rs` | `Route`, `RouteDsl`, `Via`, `Served`: where a read goes and where it came from |
 | `key.rs` | `QueryKey`: what identifies a read, and a refusal |
@@ -750,13 +750,14 @@ diesel-async tells the instrumentation a query started when its future
 is built, and finished when the future completes; a future built for a
 read the engine then serves would never finish. So the wrapper keeps the
 instrumentation itself, installs a forwarder to it on the inner
-connection, and holds back the start of each future a miss builds until
-the read runs it (`connection/held.rs`). The instrumentation hears of the
-queries a read ran and no others, each started and finished. A future
-diesel-async itself drops mid-query, as any cancelled read does, still
-leaves its start unfinished. Instrumentation set on the inner connection
-before it is wrapped is replaced by diesel's default; set it on the
-wrapper.
+connection, and holds back the start of every future it builds there
+until the future is first polled (`connection/held.rs`). A future never
+polled (one a read the engine served did not need, one that waited for a
+fallback permit and was turned away or cancelled) never started as far
+as the instrumentation knows; one dropped in the middle of its query is
+told finished, with an error saying so. Every start has its finish.
+Instrumentation set on the inner connection before it is wrapped is
+replaced by diesel's default; set it on the wrapper.
 
 An enum bind needs its OID for the key. The async wrapper cannot look it
 up inside `load`, so the first read with such a bind goes live while the
