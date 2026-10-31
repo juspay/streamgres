@@ -133,11 +133,15 @@ actions (`insert, update, delete, truncate`, the default), and each table
 whole, with no row filter (`WHERE`) and no column list. The engine snapshots
 whole tables, so a change the publication leaves out would leave rows it
 serves that nothing updates. Startup refuses such a publication, naming what
-it leaves out. A row filter or column list added while serving stops the
-server, as a schema change it cannot follow; an action turned off changes no
-published schema, so the heartbeat checks for it, and a heartbeat it cannot
-write stops the server too. With heartbeats off (`STREAMGRES_HEARTBEAT_MS=0`),
-an action turned off while serving is caught only at the next start.
+it leaves out. While serving, the trigger stack's message for a change to
+the publication stops the server at that point in the WAL: a row filter, a
+column list, or an action turned off, even one turned on again a moment
+later. Restarted, the server takes a fresh snapshot, and serves once the
+publication is whole. The stack records the publication's actions from
+setup 2 on; under an older stack an action turned off is caught only by the
+heartbeat, which samples the publication once a beat and so can miss one
+turned off and on between beats, and not at all with heartbeats off
+(`STREAMGRES_HEARTBEAT_MS=0`). Re-run the setup SQL to update the stack.
 
 The stack is streamgres's own, not zero-cache's: its start trigger only takes
 a lock (zero-cache's also writes the whole published schema into the WAL, which

@@ -230,10 +230,10 @@ pub async fn load_catalog(
 /// it publishes, one line each: an action it leaves out, a table it
 /// filters by a `WHERE`, a table it publishes some columns of. Empty when
 /// it sends every change, and when it does not exist (the feed's own
-/// check names that). A schema-change message carries a row filter added
-/// while serving, and a column list as columns gone, either of which
-/// stops the engine; an action turned off changes no published schema,
-/// so the heartbeat checks for it ([`crate::sync::heartbeat::statement`]).
+/// check names that). While serving, the schema-change message for a
+/// change carries it in WAL order, and stops the engine: a row filter, a
+/// column list as columns gone, an action turned off as the actions the
+/// stack records ([`super::ddl::DdlMessage::missing_actions`]).
 pub async fn publication_gaps(client: &Client, name: &str) -> Result<Vec<String>, StorageError> {
     let Some(actions) = client
         .query_opt(

@@ -1295,12 +1295,65 @@ fn a_publication_that_misses_changes_is_refused() {
         assert_eq!(answer(&mut session, 1, &read).await[0], "accepted");
 
         alter(format!("ALTER PUBLICATION {publication} SET (publish = 'insert, delete, truncate')")).await;
-        down_for(&engine, &["no longer sends every change"]).await;
+        down_for(&engine, &["no longer publishes update", "no longer sends every change"]).await;
         alter(whole).await;
         reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
 
         alter(format!("ALTER PUBLICATION {publication} SET TABLE {table} (id, name)")).await;
         down_for(&engine, &["was removed", "no longer sends every change"]).await;
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+    });
+}
+
+/// An action turned off, a change it then leaves out, and the action
+/// turned on again, all before any heartbeat could see it (they are off
+/// here): the stack's message for the first change stops the engine at
+/// that point in the WAL, and it starts over on a fresh snapshot that
+/// holds the change.
+#[test]
+fn an_action_turned_off_and_on_again_starts_the_engine_over() {
+    let Some(dsn) = dsn("flicker") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("flicker");
+        let (table, publication) = (&names.table, &names.publication);
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        let mut quiet = config(&dsn, &names);
+        quiet.heartbeat = Duration::ZERO;
+        let engine = Engine::start(quiet);
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        let before = engine.slot().expect("a slot while it serves");
+        let mut states = engine.states();
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION {publication} SET (publish = 'insert, delete, truncate');
+                 UPDATE {table} SET n = 20 WHERE id = 1;
+                 ALTER PUBLICATION {publication} SET (publish = 'insert, update, delete, truncate');"
+            ))
+            .await
+            .expect("off, a change, on again");
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(30),
+            states.wait_for(|state| matches!(state, State::Down(reason) if reason.contains("no longer publishes update"))),
+        )
+        .await
+        .is_ok();
+        assert!(stopped, "not stopped at the message; {:?}", engine.state());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while engine.state() != State::Serving || engine.slot().is_none_or(|slot| slot == before) {
+            assert!(Instant::now() < deadline, "no fresh engine; {:?}", engine.state());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut session = engine.connect().expect("a session on the fresh engine");
+        assert_eq!(next(&mut session).await.expect("hello")[0], "hello");
+        let read = answer(&mut session, 1, &format!(r#"SELECT "id", "n" FROM "{table}" WHERE "{table}"."id" = 1"#)).await;
+        assert_eq!(read[0], "accepted", "{read}");
+        assert_eq!(read[1]["nodes"][0]["rows"][0]["n"], 20, "the fresh snapshot holds the change: {read}");
         let stopping = engine.clone();
         tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
     });

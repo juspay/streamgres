@@ -64,10 +64,23 @@ pub struct DdlEvent {
     pub tag: String,
 }
 
-/// The published schema at one moment: its tables (indexes are not read).
+/// The published schema at one moment: its tables (indexes are not read),
+/// and the actions each publication publishes, by name; absent from a
+/// trigger stack older than setup 2.
 #[derive(Debug, Deserialize)]
 pub struct PublishedSchema {
     pub tables: Vec<PublishedTable>,
+    #[serde(default)]
+    pub publications: Option<HashMap<String, PublishedActions>>,
+}
+
+/// The actions a publication publishes.
+#[derive(Debug, Deserialize)]
+pub struct PublishedActions {
+    pub insert: bool,
+    pub update: bool,
+    pub delete: bool,
+    pub truncate: bool,
 }
 
 /// One published table: its schema and name, its columns by name, and its
@@ -161,6 +174,30 @@ impl DdlMessage {
     /// The command tag, for the log.
     pub fn tag(&self) -> &str {
         self.event.as_ref().map_or("?", |event| event.tag.as_str())
+    }
+
+    /// The actions `publication` does not publish, as the message records
+    /// them; empty when it publishes all four, or when the message does
+    /// not say (a trigger stack older than setup 2, or a publication it
+    /// does not record).
+    pub fn missing_actions(&self, publication: &str) -> Vec<&'static str> {
+        let Some(actions) = self
+            .schema
+            .as_ref()
+            .and_then(|schema| schema.publications.as_ref()?.get(publication))
+        else {
+            return Vec::new();
+        };
+        [
+            ("insert", actions.insert),
+            ("update", actions.update),
+            ("delete", actions.delete),
+            ("truncate", actions.truncate),
+        ]
+        .into_iter()
+        .filter(|(_, published)| !published)
+        .map(|(action, _)| action)
+        .collect()
     }
 
     /// A table of `schemas` that `publication` publishes by a row filter,
@@ -969,6 +1006,28 @@ mod tests {
         );
         assert_eq!(whole.row_filter(&schemas, "zero_data"), None, "another's filter is not ours");
         assert!(classify(&catalog(), &schemas, &whole).is_ok());
+    }
+
+    /// The actions a message records for the engine's publication: the
+    /// ones left out are named; a message from an older stack, or one
+    /// recording only other publications, names none.
+    #[test]
+    fn a_message_names_the_actions_its_publication_leaves_out() {
+        let tickets = published("tickets", TICKETS, &["id"]);
+        let with = |publications: &str| {
+            DdlMessage::parse(&format!(
+                r#"{{"type": "ddlUpdate", "version": 1, "event": {{"tag": "ALTER PUBLICATION"}},
+                     "schema": {{"tables": [{tickets}], "indexes": []{publications}}}}}"#
+            ))
+            .expect("a message")
+        };
+        let off = with(
+            r#", "publications": {"zero_data": {"insert": true, "update": false, "delete": true, "truncate": false},
+                                 "other": {"insert": false, "update": false, "delete": false, "truncate": false}}"#,
+        );
+        assert_eq!(off.missing_actions("zero_data"), ["update", "truncate"]);
+        assert!(off.missing_actions("absent").is_empty(), "not recorded");
+        assert!(with("").missing_actions("zero_data").is_empty(), "an older stack");
     }
 
     /// Published types map as the startup catalog maps them.

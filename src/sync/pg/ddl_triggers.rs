@@ -28,13 +28,19 @@
 //!   own functions over it takes it back. An engine updates only a stack
 //!   that is this crate's; any other is adopted only on purpose (a
 //!   migration running this SQL, or an engine told to adopt it).
+//! - The published schema records which actions each publication
+//!   publishes (setup 2 on). Turning one off changes no table, so
+//!   zero-cache's stack writes no message for it, and an engine would
+//!   keep serving rows whose changes no longer reach it. Recorded, the
+//!   change writes a message in its transaction's place in the WAL, and
+//!   the engine stops there ([`super::ddl::DdlMessage::missing_actions`]).
 
 use super::sql::{quote_ident, quote_literal};
 
 /// The setup [`trigger_stack_sql`] installs, as `streamgres_stack()`
 /// returns it. Raise it whenever the stack's SQL changes, so engines that
 /// install their setup bring an older stack of theirs up to date.
-pub const STACK_VERSION: i32 = 1;
+pub const STACK_VERSION: i32 = 2;
 
 /// The stack's functions whose source the ownership marker fingerprints:
 /// the ones zero-cache's stack also defines, and defines differently.
@@ -320,7 +326,10 @@ tables AS (SELECT json_build_object(
 
     SELECT json_build_object(
       'tables', COALESCE((SELECT json_agg("table" ORDER BY "schema", "name") FROM tables), '[]'::json),
-      'indexes', COALESCE((SELECT json_agg("index" ORDER BY "schema", "tableName", "name") FROM indexes), '[]'::json)
+      'indexes', COALESCE((SELECT json_agg("index" ORDER BY "schema", "tableName", "name") FROM indexes), '[]'::json),
+      'publications', COALESCE((SELECT json_object_agg(pubname, json_build_object(
+          'insert', pubinsert, 'update', pubupdate, 'delete', pubdelete, 'truncate', pubtruncate)
+          ORDER BY pubname) FROM pg_publication WHERE pubname IN (@PUBLICATIONS@)), '{}'::json)
     ) as "publishedSchema"
 $$ LANGUAGE sql;
 

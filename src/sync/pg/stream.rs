@@ -298,6 +298,15 @@ impl Decoder {
         if !message.is_update() {
             return Ok(());
         }
+        let missing = message.missing_actions(&source.publication);
+        if !missing.is_empty() {
+            return Err(StorageError(format!(
+                "schema change at {at} ({}): publication `{}` no longer publishes {}, so changes after this point may not reach the engine; the server stops here and, restarted, takes a fresh snapshot once the publication publishes every action again",
+                message.tag(),
+                source.publication,
+                missing.join(", ")
+            )));
+        }
         if let Some((table, filter)) = message.row_filter(&source.schemas, &source.publication) {
             return Err(StorageError(format!(
                 "schema change at {at} ({}): publication `{}` now filters `{table}` by a row filter ({filter}), so it would not send every change of rows the engine serves; the server stops here and, restarted, refuses the publication until it publishes the table whole",

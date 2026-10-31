@@ -15,10 +15,13 @@
 //!
 //! A heartbeat vouches only for changes the feed was sent, so it is
 //! written only while the publication sends every change of what it
-//! publishes ([`statement`]). Altered to leave an action out, or to
-//! filter a table, it stops the heartbeats, and the engine with them
-//! ([`Stopped::Unpublished`]): rows the engine holds would no longer
-//! hear of every change, however current the feed.
+//! publishes ([`statement`]); otherwise it stops the engine
+//! ([`Stopped::Unpublished`]). This is a backstop, not the guarantee: it
+//! samples the publication once a beat, so an action turned off and on
+//! again between two beats escapes it. The guarantee is the trigger
+//! stack's message for the change, in its transaction's place in the WAL
+//! ([`crate::sync::pg::ddl::DdlMessage::missing_actions`]); the backstop
+//! covers a stack older than the one that records actions.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
