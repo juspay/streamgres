@@ -963,6 +963,14 @@ impl Parser<'_> {
         }
 
         let column = self.column_name(table)?;
+        self.comparison(column)
+    }
+
+    /// The operator and value after `column`: a comparison, `= ANY` /
+    /// `!= ALL` over a list, `[NOT] IN` or `IS [NOT] NULL`. Each caller
+    /// resolves the column in its own scope (one table, or the tables of a
+    /// join) and hands it here.
+    pub(super) fn comparison(&mut self, column: ColumnName) -> Result<Where, ParseError> {
         if self.eat_word("IS") {
             let comparison_operator = if self.eat_word("NOT") {
                 ComparisonOperator::IS_NOT
@@ -1339,7 +1347,7 @@ fn collect_pkey_equalities(filter: &Where, out: &mut Vec<(ColumnName, Value)>) -
 /// is empty, a `NULL` in the column included, which is no condition at
 /// all; the engine's `NOT IN` leaves `NULL` out, as its `NULL` rule
 /// does everywhere, so an empty list must not become one.
-pub(super) fn differs_from_all(column: ColumnName, list: Value) -> Where {
+fn differs_from_all(column: ColumnName, list: Value) -> Where {
     match &list {
         Value::List(items) if items.is_empty() => Where::AND(Vec::new()),
         _ => Where::Condition(Condition {

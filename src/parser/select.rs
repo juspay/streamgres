@@ -30,7 +30,7 @@
 //! always qualifies), compound join keys.
 
 use super::{
-    ParseError, Parser, Projected, Projection, Tok, collapse, default_order, differs_from_all,
+    ParseError, Parser, Projected, Projection, Tok, collapse, default_order,
     names_table,
 };
 use crate::model::{
@@ -526,75 +526,6 @@ impl Parser<'_> {
             self.ranged.push((nodes[column.node].table.name.clone(), column.column, at));
         }
         Ok(vec![(column.node, condition)])
-    }
-
-    /// The operator and value after a column, as the single-table parser
-    /// reads them.
-    fn comparison(&mut self, column: ColumnName) -> Result<Where, ParseError> {
-        if self.eat_word("IS") {
-            let comparison_operator = if self.eat_word("NOT") {
-                ComparisonOperator::IS_NOT
-            } else {
-                ComparisonOperator::IS
-            };
-            if !self.eat_word("NULL") {
-                return self.err(format!(
-                    "expected NULL after IS [NOT], found {}",
-                    self.describe()
-                ));
-            }
-            return Ok(Where::Condition(Condition {
-                column,
-                comparison_operator,
-                value: Value::Null,
-            }));
-        }
-        let comparison_operator = if self.eat_sym("=") {
-            if self.eat_word("ANY") {
-                return Ok(Where::Condition(Condition {
-                    column,
-                    comparison_operator: ComparisonOperator::IN,
-                    value: self.quantified_list("ANY")?,
-                }));
-            }
-            ComparisonOperator::EQ
-        } else if self.eat_sym("!=") {
-            if self.eat_word("ALL") {
-                return Ok(differs_from_all(column, self.quantified_list("ALL")?));
-            }
-            ComparisonOperator::NEQ
-        } else if self.eat_sym(">=") {
-            ComparisonOperator::GTE
-        } else if self.eat_sym(">") {
-            ComparisonOperator::GT
-        } else if self.eat_sym("<=") {
-            ComparisonOperator::LTE
-        } else if self.eat_sym("<") {
-            ComparisonOperator::LT
-        } else if self.eat_word("IN") {
-            return Ok(Where::Condition(Condition {
-                column,
-                comparison_operator: ComparisonOperator::IN,
-                value: self.value_list()?,
-            }));
-        } else if self.eat_word("NOT") {
-            self.expect_word("IN")?;
-            return Ok(Where::Condition(Condition {
-                column,
-                comparison_operator: ComparisonOperator::NOT_IN,
-                value: self.value_list()?,
-            }));
-        } else {
-            return self.err(format!(
-                "expected a comparison operator, [NOT] IN or IS [NOT] NULL after a column, found {}",
-                self.describe()
-            ));
-        };
-        Ok(Where::Condition(Condition {
-            column,
-            comparison_operator,
-            value: self.value()?,
-        }))
     }
 
     /// A column, qualified by its table when the scope has several.
