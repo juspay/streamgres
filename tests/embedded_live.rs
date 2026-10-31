@@ -1235,3 +1235,73 @@ fn a_table_created_while_serving_is_ordered_as_one_loaded_at_start() {
             .expect("stop");
     });
 }
+
+/// Waits up to thirty seconds for `engine` to be down for a reason
+/// naming one of `causes`.
+async fn down_for(engine: &Engine, causes: &[&str]) {
+    let mut states = engine.states();
+    let reached = tokio::time::timeout(
+        Duration::from_secs(30),
+        states.wait_for(|state| {
+            matches!(state, State::Down(reason) if causes.iter().any(|cause| reason.contains(cause)))
+        }),
+    )
+    .await;
+    assert!(reached.is_ok(), "not down for {causes:?}; {:?}", engine.state());
+}
+
+/// A publication that does not send every change of what it publishes
+/// is refused, since the engine snapshots whole tables: at start, one
+/// filtering a table by a row filter, one publishing some of its
+/// columns, one leaving an action out. While serving, an action turned
+/// off stops the engine, though it changes no published schema (the
+/// heartbeats see it), and so does a column list. Whole again, it serves.
+#[test]
+fn a_publication_that_misses_changes_is_refused() {
+    let Some(dsn) = dsn("partial") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("partial");
+        let (table, publication) = (&names.table, &names.publication);
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        let alter = async |sql: String| client.batch_execute(&sql).await.expect("alter the publication");
+        alter(format!(
+            "DROP PUBLICATION {publication};
+             CREATE PUBLICATION {publication} FOR TABLE {table} WHERE (id > 1);"
+        ))
+        .await;
+        let engine = Engine::start(config(&dsn, &names));
+        down_for(&engine, &["row filter"]).await;
+
+        alter(format!("ALTER PUBLICATION {publication} SET TABLE {table} (id, name)")).await;
+        down_for(&engine, &["some columns"]).await;
+        alter(format!(
+            "ALTER PUBLICATION {publication} SET TABLE {table};
+             ALTER PUBLICATION {publication} SET (publish = 'insert, update, delete');"
+        ))
+        .await;
+        down_for(&engine, &["does not publish truncate"]).await;
+
+        let whole = format!("ALTER PUBLICATION {publication} SET (publish = 'insert, update, delete, truncate')");
+        alter(whole.clone()).await;
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        let mut session = engine.connect().expect("a session");
+        assert_eq!(next(&mut session).await.expect("hello")[0], "hello");
+        let read = format!(r#"SELECT "id", "name" FROM "{table}""#);
+        assert_eq!(answer(&mut session, 1, &read).await[0], "accepted");
+
+        alter(format!("ALTER PUBLICATION {publication} SET (publish = 'insert, delete, truncate')")).await;
+        down_for(&engine, &["no longer sends every change"]).await;
+        alter(whole).await;
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+
+        alter(format!("ALTER PUBLICATION {publication} SET TABLE {table} (id, name)")).await;
+        down_for(&engine, &["was removed", "no longer sends every change"]).await;
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+    });
+}

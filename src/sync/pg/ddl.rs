@@ -32,6 +32,9 @@ use crate::sync::storage::StorageError;
 pub struct DdlSource {
     pub prefix: String,
     pub schemas: Vec<String>,
+    /// The publication the feed streams, whose row filters it checks
+    /// ([`DdlMessage::row_filter`]).
+    pub publication: String,
 }
 
 /// What one message meant: the changes to absorb, in the order they
@@ -80,6 +83,18 @@ pub struct PublishedTable {
     /// trigger stack older than it.
     #[serde(rename = "rowSecurity", default)]
     pub row_security: Option<bool>,
+    /// The publications it is in, by name, with the row filter each
+    /// applies to it.
+    #[serde(default)]
+    pub publications: HashMap<String, PublishedIn>,
+}
+
+/// How one publication publishes a table: its row filter's text, when it
+/// has one.
+#[derive(Debug, Deserialize)]
+pub struct PublishedIn {
+    #[serde(rename = "rowFilter", default)]
+    pub row_filter: Option<String>,
 }
 
 /// One published column: its type as `pg_type` names it (an array as
@@ -126,6 +141,20 @@ impl DdlMessage {
     /// The command tag, for the log.
     pub fn tag(&self) -> &str {
         self.event.as_ref().map_or("?", |event| event.tag.as_str())
+    }
+
+    /// A table of `schemas` that `publication` publishes by a row filter,
+    /// with the filter's text: the publication would not send every change
+    /// of rows the engine snapshots whole. The first found.
+    pub fn row_filter(&self, schemas: &[String], publication: &str) -> Option<(String, String)> {
+        self.schema
+            .iter()
+            .flat_map(|schema| schema.tables.iter())
+            .filter(|table| schemas.contains(&table.schema))
+            .find_map(|table| {
+                let filter = table.publications.get(publication)?.row_filter.clone()?;
+                Some((table.catalog_name(), filter))
+            })
     }
 }
 
@@ -799,6 +828,33 @@ mod tests {
         assert!(created(notes.clone()).is_row_secured(&notes_name), "not known: secured");
         assert!(created(secured(notes.clone(), "true")).is_row_secured(&notes_name));
         assert!(!created(secured(notes, "false")).is_row_secured(&notes_name));
+    }
+
+    /// A message names a served table the engine's publication filters,
+    /// and not one only another publication filters, nor one of a schema
+    /// not served.
+    #[test]
+    fn a_row_filter_of_the_engines_publication_is_found() {
+        let schemas = ["public".to_owned()];
+        let tickets = published("tickets", TICKETS, &["id"]);
+        let with = |publications: &str| {
+            tickets.replace(r#""publications": {}"#, &format!(r#""publications": {publications}"#))
+        };
+        let filtered = message(
+            &tickets,
+            &with(r#"{"zero_data": {"rowFilter": "(id > 0)"}, "other": {"rowFilter": "(id < 0)"}}"#),
+        );
+        assert_eq!(
+            filtered.row_filter(&schemas, "zero_data"),
+            Some(("tickets".to_owned(), "(id > 0)".to_owned()))
+        );
+        assert_eq!(filtered.row_filter(&["other".to_owned()], "zero_data"), None, "not served");
+        let whole = message(
+            &tickets,
+            &with(r#"{"zero_data": {"rowFilter": null}, "other": {"rowFilter": "(id < 0)"}}"#),
+        );
+        assert_eq!(whole.row_filter(&schemas, "zero_data"), None, "another's filter is not ours");
+        assert!(classify(&catalog(), &schemas, &whole).is_ok());
     }
 
     /// Published types map as the startup catalog maps them.

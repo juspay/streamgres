@@ -12,6 +12,13 @@
 //! thread, a slow feed), and measured on the engine's own clock. The
 //! S2S endpoint passes the lag on, so a backend can stop trusting its
 //! cache when the engine falls behind.
+//!
+//! A heartbeat vouches only for changes the feed was sent, so it is
+//! written only while the publication sends every change of what it
+//! publishes ([`statement`]). Altered to leave an action out, or to
+//! filter a table, it stops the heartbeats, and the engine with them
+//! ([`Stopped::Unpublished`]): rows the engine holds would no longer
+//! hear of every change, however current the feed.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -112,38 +119,79 @@ pub fn prefix(slot: &str) -> String {
 }
 
 /// The statement writing one heartbeat on a server of version `version`
-/// (`server_version_num`). A message outside a transaction writes no
-/// commit record, so nothing would flush it, and logical decoding reads
-/// only flushed WAL: on a quiet database the heartbeat would wait for
-/// someone else's commit. PostgreSQL 17 flushes it when asked; before
-/// that, taking a transaction id gives the statement a commit record,
-/// whose flush covers the message.
-pub fn statement(version: u32) -> &'static str {
-    if version >= 170_000 {
+/// (`server_version_num`), on prefix `$1` with content `$2`, while the
+/// publication `$3` sends every change: an action of the four, and every
+/// row and column of each table (row filters and column lists exist from
+/// PostgreSQL 15 on). It writes nothing, and returns no row, once the
+/// publication does not, or is gone. A message outside a transaction
+/// writes no commit record, so nothing would flush it, and logical
+/// decoding reads only flushed WAL: on a quiet database the heartbeat
+/// would wait for someone else's commit. PostgreSQL 17 flushes it when
+/// asked; before that, taking a transaction id gives the statement a
+/// commit record, whose flush covers the message.
+pub fn statement(version: u32) -> String {
+    let emit = if version >= 170_000 {
         "SELECT pg_logical_emit_message(false, $1::text, $2::text, true)"
     } else {
         "SELECT pg_logical_emit_message(false, $1::text, $2::text), pg_current_xact_id()"
+    };
+    let whole = if version >= 150_000 {
+        " AND NOT EXISTS (SELECT 1 FROM pg_publication_rel r WHERE r.prpubid = p.oid
+                            AND (r.prqual IS NOT NULL OR r.prattrs IS NOT NULL))"
+    } else {
+        ""
+    };
+    format!(
+        "{emit} FROM pg_publication p WHERE p.pubname = $3::text
+           AND p.pubinsert AND p.pubupdate AND p.pubdelete AND p.pubtruncate{whole}"
+    )
+}
+
+/// Why heartbeats stopped.
+#[derive(Debug)]
+pub enum Stopped {
+    /// The database failed a statement, or the connection.
+    Failed(tokio_postgres::Error),
+    /// The publication no longer sends every change, or is gone.
+    Unpublished,
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stopped::Failed(error) => write!(f, "{error}"),
+            Stopped::Unpublished => {
+                write!(f, "the publication no longer sends every change, or is gone")
+            }
+        }
+    }
+}
+
+impl From<tokio_postgres::Error> for Stopped {
+    fn from(error: tokio_postgres::Error) -> Self {
+        Stopped::Failed(error)
     }
 }
 
 /// Emits heartbeats on `client` every `every`, numbered by `freshness`,
-/// until the connection fails; each is recorded in `freshness` once it
-/// is in the WAL and flushed, as sent when it was asked for. A
-/// non-transactional message is decoded at once, in WAL order, whatever
-/// transactions are open.
+/// until the connection fails or `publication` stops sending every
+/// change; each is recorded in `freshness` once it is in the WAL and
+/// flushed, as sent when it was asked for. A non-transactional message
+/// is decoded at once, in WAL order, whatever transactions are open.
 pub async fn emit(
     client: &tokio_postgres::Client,
     prefix: &str,
+    publication: &str,
     every: Duration,
     freshness: &Freshness,
-) -> Result<(), tokio_postgres::Error> {
+) -> Result<(), Stopped> {
     let version: u32 = client
         .query_one("SELECT current_setting('server_version_num')::int4", &[])
         .await?
         .get::<_, i32>(0)
         .try_into()
         .unwrap_or(0);
-    let heartbeat = client.prepare(statement(version)).await?;
+    let heartbeat = client.prepare(&statement(version)).await?;
     let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -151,7 +199,13 @@ pub async fn emit(
         let n = freshness.number();
         let at = Instant::now();
         let content = n.to_string();
-        client.execute(&heartbeat, &[&prefix, &content]).await?;
+        if client
+            .execute(&heartbeat, &[&prefix, &content, &publication])
+            .await?
+            == 0
+        {
+            return Err(Stopped::Unpublished);
+        }
         freshness.sent(n, at);
     }
 }
@@ -242,10 +296,17 @@ mod tests {
     }
 
     /// PostgreSQL 17 is asked to flush the message; an older server is
-    /// given a commit record to flush it with.
+    /// given a commit record to flush it with. Every version checks the
+    /// publication's actions, and from 15 on its row filters and column
+    /// lists.
     #[test]
     fn the_heartbeat_is_flushed_on_every_version() {
-        assert!(statement(170_002).ends_with(", true)"));
-        assert!(statement(160_004).contains("pg_current_xact_id()"));
+        assert!(statement(170_002).contains(", true) FROM pg_publication"));
+        assert!(statement(160_004).contains("pg_current_xact_id() FROM pg_publication"));
+        for version in [140_010, 160_004, 170_002] {
+            assert!(statement(version).contains("p.pubtruncate"), "{version}");
+        }
+        assert!(statement(150_000).contains("prqual"));
+        assert!(!statement(140_010).contains("prqual"));
     }
 }

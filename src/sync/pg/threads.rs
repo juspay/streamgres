@@ -42,6 +42,7 @@ use crate::ivm::MultiTableIVM;
 use crate::log::{log_error, log_info, log_warn};
 use crate::model::{Catalog, Lsn, MultiTableReadQuery, TableName};
 use crate::shutdown::Shutdown;
+use crate::sync::heartbeat::Stopped;
 use crate::stats::Stats;
 use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Transaction};
 
@@ -270,6 +271,7 @@ pub fn spawn_feed(
                 let ddl = DdlSource {
                     prefix: settings.ddl_prefix.clone(),
                     schemas: settings.schemas.clone(),
+                    publication: settings.publication.clone(),
                 };
                 let mut feed = Feed::with_ddl(catalog, ddl)
                     .with_heartbeat(crate::sync::heartbeat::prefix(&settings.slot));
@@ -403,16 +405,40 @@ pub async fn stop_feed(mut feed: FeedHandle) -> Result<(), String> {
 /// until they are written again. Until the first is written the lag is
 /// unknown and backends trust the engine, as they would one that sends
 /// no lag: a standby cannot write them, and its engine keeps serving.
-/// A failure is logged once until heartbeats are written again.
-async fn beat(config: tokio_postgres::Config, slot: String, every: Duration, stats: Arc<Stats>) {
+/// A failure is logged once until heartbeats are written again. A
+/// publication that stops sending every change stops the engine through
+/// `shutdown` instead: the rows it holds would miss changes for good,
+/// and restarted, it refuses the publication until it is whole again.
+async fn beat(
+    config: tokio_postgres::Config,
+    slot: String,
+    publication: String,
+    every: Duration,
+    stats: Arc<Stats>,
+    shutdown: Shutdown,
+) {
     let prefix = crate::sync::heartbeat::prefix(&slot);
     let mut warned = false;
     let mut written = 0;
     loop {
         let outcome = match super::open(&config, &tokio::runtime::Handle::current()).await {
-            Ok(client) => crate::sync::heartbeat::emit(&client, &prefix, every, &stats.freshness)
-                .await
-                .map_err(|error| error.to_string()),
+            Ok(client) => {
+                let emitted = crate::sync::heartbeat::emit(
+                    &client,
+                    &prefix,
+                    &publication,
+                    every,
+                    &stats.freshness,
+                )
+                .await;
+                if let Err(Stopped::Unpublished) = emitted {
+                    shutdown.fail(format!(
+                        "publication `{publication}` no longer sends every change of what it publishes (an action left out, a row filter or a column list), or is gone; the engine stops, and restarted, checks it again"
+                    ));
+                    return;
+                }
+                emitted.map_err(|error| error.to_string())
+            }
             Err(error) => Err(error.to_string()),
         };
         if stats.freshness.written() != written {
@@ -506,6 +532,7 @@ pub async fn start(
         settings.slot_cleanup_age,
         shutdown.clone(),
     ));
+    let beat_shutdown = shutdown.clone();
     let (feed, feed_handle) = spawn_feed(
         settings.clone(),
         catalog.load(),
@@ -523,7 +550,14 @@ pub async fn start(
         log_info!("memory tables warmed with {rows} rows");
     }
     if !settings.heartbeat.is_zero() {
-        reads.spawn(beat(config.clone(), settings.slot.clone(), settings.heartbeat, Arc::clone(&stats)));
+        reads.spawn(beat(
+            config.clone(),
+            settings.slot.clone(),
+            settings.publication.clone(),
+            settings.heartbeat,
+            Arc::clone(&stats),
+            beat_shutdown,
+        ));
     }
     let (sinks, events): (Vec<_>, Vec<_>) = (0..consumers.max(1))
         .map(|_| mpsc::unbounded_channel())

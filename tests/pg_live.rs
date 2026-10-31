@@ -1482,6 +1482,7 @@ fn schema_changes_follow_the_trigger() {
         let source = DdlSource {
             prefix: "xslive/0/ddl".to_owned(),
             schemas: vec!["public".to_owned()],
+            publication: names.publication.clone(),
         };
         let stream = PgStream::open_with(
             &dsn,

@@ -128,6 +128,17 @@ The engine follows only the tables the publication streams: a table of a
 served schema the publication leaves out is unknown to it, so its queries
 read Postgres.
 
+The publication must send every change of what it publishes: all four
+actions (`insert, update, delete, truncate`, the default), and each table
+whole, with no row filter (`WHERE`) and no column list. The engine snapshots
+whole tables, so a change the publication leaves out would leave rows it
+serves that nothing updates. Startup refuses such a publication, naming what
+it leaves out. A row filter or column list added while serving stops the
+server, as a schema change it cannot follow; an action turned off changes no
+published schema, so the heartbeat checks for it, and a heartbeat it cannot
+write stops the server too. With heartbeats off (`STREAMGRES_HEARTBEAT_MS=0`),
+an action turned off while serving is caught only at the next start.
+
 The stack is streamgres's own, not zero-cache's: its start trigger only takes
 a lock (zero-cache's also writes the whole published schema into the WAL, which
 zero-cache reads), and its triggers also fire on `DROP SCHEMA`. It marks itself

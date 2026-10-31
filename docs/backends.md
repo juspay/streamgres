@@ -97,7 +97,10 @@ application that does not configure through the environment.
   every table (`FOR ALL TABLES`). With `STREAMGRES_PUBLICATION_TABLES`
   it publishes only the tables listed: a bare name stands for that table
   in every served schema that has it (a workspace's `config_versions`),
-  `schema.table` for one table. List what the backend's queries read,
+  `schema.table` for one table. Either way the publication must send
+  every change of each table it publishes: every action, no row filter,
+  no column list. The engine refuses one that does not, at start and
+  while it serves (`docs/deploy.md`, *Startup setup*). List what the backend's queries read,
   joined tables included. Everything else is then off the engine: its
   writes are not decoded, and its DDL takes the trigger's cheap path,
   since the published schema the trigger records holds only the listed

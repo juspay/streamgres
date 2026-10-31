@@ -13,7 +13,10 @@
 //! With a publication named, only the tables it streams are taken: a
 //! table of a served schema the publication leaves out would otherwise be
 //! read from a snapshot once and never hear of a change, and its rows
-//! served stale.
+//! served stale. For the same reason the publication must send every
+//! change of what it streams ([`publication_gaps`]): a snapshot reads
+//! whole tables, so a row filter, a column list or an action left out
+//! would leave rows the snapshot served that no change ever updates.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,6 +35,15 @@ pub async fn load_catalog(
     schemas: &[String],
     publication: Option<&str>,
 ) -> Result<(Catalog, Notes), StorageError> {
+    if let Some(name) = publication {
+        let gaps = publication_gaps(client, name).await?;
+        if !gaps.is_empty() {
+            return Err(StorageError(format!(
+                "publication `{name}` does not send every change of what it publishes ({}); the engine snapshots whole tables, so it would serve rows no change updates. Publish the tables whole, with every action (publish = 'insert, update, delete, truncate'), or let the engine create its own publication",
+                gaps.join("; ")
+            )));
+        }
+    }
     let published: Option<BTreeSet<(String, String)>> = match publication {
         Some(name) => Some(
             client
@@ -183,6 +195,56 @@ pub async fn load_catalog(
             })),
         notes,
     ))
+}
+
+/// What keeps publication `name` from sending every change of the tables
+/// it publishes, one line each: an action it leaves out, a table it
+/// filters by a `WHERE`, a table it publishes some columns of. Empty when
+/// it sends every change, and when it does not exist (the feed's own
+/// check names that). A schema-change message carries a row filter added
+/// while serving, and a column list as columns gone, either of which
+/// stops the engine; an action turned off changes no published schema,
+/// so the heartbeat checks for it ([`crate::sync::heartbeat::statement`]).
+pub async fn publication_gaps(client: &Client, name: &str) -> Result<Vec<String>, StorageError> {
+    let Some(actions) = client
+        .query_opt(
+            "SELECT pubinsert, pubupdate, pubdelete, pubtruncate FROM pg_publication WHERE pubname = $1",
+            &[&name],
+        )
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut gaps: Vec<String> = ["insert", "update", "delete", "truncate"]
+        .into_iter()
+        .enumerate()
+        .filter(|(at, _)| !actions.get::<_, bool>(*at))
+        .map(|(_, action)| format!("it does not publish {action}"))
+        .collect();
+    let partial = client
+        .query(
+            "SELECT n.nspname::text, c.relname::text,
+                    to_jsonb(r) ->> 'prqual' IS NOT NULL, to_jsonb(r) ->> 'prattrs' IS NOT NULL
+             FROM pg_publication_rel r
+             JOIN pg_publication p ON p.oid = r.prpubid
+             JOIN pg_class c ON c.oid = r.prrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE p.pubname = $1
+               AND (to_jsonb(r) ->> 'prqual' IS NOT NULL OR to_jsonb(r) ->> 'prattrs' IS NOT NULL)
+             ORDER BY 1, 2",
+            &[&name],
+        )
+        .await?;
+    for row in &partial {
+        let (schema, table): (String, String) = (row.get(0), row.get(1));
+        if row.get::<_, bool>(2) {
+            gaps.push(format!("it filters {schema}.{table} by a row filter"));
+        }
+        if row.get::<_, bool>(3) {
+            gaps.push(format!("it publishes some columns of {schema}.{table}"));
+        }
+    }
+    Ok(gaps)
 }
 
 /// The database's default collation: its locale name, and its provider

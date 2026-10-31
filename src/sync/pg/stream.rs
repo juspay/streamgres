@@ -298,6 +298,13 @@ impl Decoder {
         if !message.is_update() {
             return Ok(());
         }
+        if let Some((table, filter)) = message.row_filter(&source.schemas, &source.publication) {
+            return Err(StorageError(format!(
+                "schema change at {at} ({}): publication `{}` now filters `{table}` by a row filter ({filter}), so it would not send every change of rows the engine serves; the server stops here and, restarted, refuses the publication until it publishes the table whole",
+                message.tag(),
+                source.publication
+            )));
+        }
         let fresh: HashSet<String> = self
             .changes
             .iter()
@@ -1337,6 +1344,7 @@ mod tests {
         let source = DdlSource {
             prefix: "xyne/0/ddl".to_owned(),
             schemas: vec!["public".to_owned()],
+            publication: "xyne_pub".to_owned(),
         };
         (catalog, source)
     }
