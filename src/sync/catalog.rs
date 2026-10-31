@@ -72,6 +72,7 @@ pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
     )
     .with_enum_oids(catalog.enum_oids())
     .with_ordered_as_text(catalog.ordered_as_text().cloned())
+    .with_compared_otherwise(catalog.compared_otherwise().cloned())
     .with_bytewise_default(catalog.bytewise_default())
     .with_row_secured(catalog.row_secured().cloned())
 }
@@ -93,6 +94,19 @@ pub fn with_ordered(
     catalog
         .clone()
         .with_ordered_as_text(catalog.ordered_as_text().cloned().chain(added))
+}
+
+/// `catalog` knowing Postgres decides equality on `columns` of `table`
+/// by rules of their own too.
+pub fn with_compared(
+    catalog: &Catalog,
+    table: &TableName,
+    columns: impl IntoIterator<Item = ColumnName>,
+) -> Catalog {
+    let added = columns.into_iter().map(|column| (table.clone(), column));
+    catalog
+        .clone()
+        .with_compared_otherwise(catalog.compared_otherwise().cloned().chain(added))
 }
 
 /// `catalog` knowing `oids` are enum types too, as a type created after

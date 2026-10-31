@@ -225,6 +225,13 @@ has; a stack installed before it did (no `collationName` in its messages) does
 not, and an `ORDER BY` on such a column is served from Postgres until the next
 restart. Re-run the setup SQL to update an older stack.
 
+Equality is held to the same standard. A comparison or join on a column whose
+equality Postgres decides by rules of its own (a string under a
+nondeterministic collation, `citext`, `char(n)`, an interval, a network
+address) is refused and read from Postgres, on a column loaded at startup and
+on one a migration adds. A served column a migration gives such a collation
+or type stops the server, which restarts knowing it.
+
 **Row-level security is never served.** The engine reads as its own role and
 cannot apply a backend's policies, so the S2S endpoint refuses any query over a
 table with row-level security enabled, and the backend reads Postgres. Turning

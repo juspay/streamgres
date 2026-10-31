@@ -53,6 +53,18 @@ impl Database {
     /// `postgres`). A server of another major version than
     /// `STREAMGRES_TEST_PG_MAJOR` names fails the test.
     pub fn create(tag: &str) -> Option<Database> {
+        Self::create_with(tag, "")
+    }
+
+    /// [`Database::create`] encoded in UTF-8 whatever the server's
+    /// default, as an ICU collation needs.
+    #[allow(dead_code, reason = "each test binary uses what it needs of the support module")]
+    pub fn create_utf8(tag: &str) -> Option<Database> {
+        Self::create_with(tag, " ENCODING 'UTF8' TEMPLATE template0")
+    }
+
+    /// [`Database::create`] with `options` after its name.
+    fn create_with(tag: &str, options: &str) -> Option<Database> {
         let Ok(server) = std::env::var("STREAMGRES_PG_DSN") else {
             skip("postgres", "STREAMGRES_PG_DSN not set: live Postgres scenario");
             return None;
@@ -60,7 +72,7 @@ impl Database {
         let name = format!("sg_test_{tag}_{}", std::process::id());
         let statements = [
             format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"),
-            format!("CREATE DATABASE {name}"),
+            format!("CREATE DATABASE {name}{options}"),
         ];
         let on = server.clone();
         let (sender, version) = std::sync::mpsc::channel();

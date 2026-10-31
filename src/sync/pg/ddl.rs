@@ -18,11 +18,11 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 use tokio_postgres::Client;
 
-use super::catalog::{published_orders_as_text, scalar_type, table_name};
+use super::catalog::{compares_as_text, published_orders_as_text, scalar_type, table_name};
 use super::text;
 use crate::ivm::SchemaChange;
 use crate::model::{Catalog, ColumnName, DbColumn, DbTable, TableName, Value, ValueType};
-use crate::sync::catalog::{with_column, with_ordered, with_row_security, with_table};
+use crate::sync::catalog::{with_column, with_compared, with_ordered, with_row_security, with_table};
 use crate::sync::storage::StorageError;
 
 /// Where the feed hears of schema changes: the prefix of the trigger's
@@ -111,6 +111,12 @@ pub struct PublishedColumn {
     /// a trigger stack older than it, and for a type with none.
     #[serde(rename = "collationName", default)]
     pub collation_name: Option<String>,
+    /// Whether that collation is deterministic; absent as it is.
+    #[serde(rename = "collationIsDeterministic", default)]
+    pub collation_is_deterministic: Option<bool>,
+    /// An array's element type's class (`e` for an enum).
+    #[serde(rename = "elemPgTypeClass", default)]
+    pub elem_pg_type_class: Option<String>,
 }
 
 impl PublishedColumn {
@@ -122,6 +128,20 @@ impl PublishedColumn {
             self.collation_name.as_deref(),
             bytewise_default,
         )
+    }
+
+    /// Whether Postgres decides equality on the column as its text
+    /// compares, byte by byte ([`compares_as_text`]); `None` for a string
+    /// whose collation a trigger stack older than the flag does not say.
+    pub fn compares_as_text(&self) -> Option<bool> {
+        let (element, class) = match self.data_type.strip_suffix("[]") {
+            Some(element) => (
+                element.trim_end_matches("[]"),
+                self.elem_pg_type_class.as_deref(),
+            ),
+            None => (self.data_type.as_str(), self.pg_type_class.as_deref()),
+        };
+        compares_as_text(element, class == Some("e"), self.collation_is_deterministic)
     }
 }
 
@@ -402,6 +422,12 @@ pub fn classify_in(
                             .filter(|(_, column)| column.orders_as_text(catalog.bytewise_default()))
                             .map(|(column, _)| ColumnName::from(column.as_str()));
                         catalog_now = with_ordered(&catalog_now, &added.name, ordered);
+                        let compared = table
+                            .columns
+                            .iter()
+                            .filter(|(_, column)| column.compares_as_text() != Some(true))
+                            .map(|(column, _)| ColumnName::from(column.as_str()));
+                        catalog_now = with_compared(&catalog_now, &added.name, compared);
                         let secured = table.row_security != Some(false);
                         catalog_now = with_row_security(&catalog_now, &added.name, secured);
                         changes.push(SchemaChange::TableAdded { table: added });
@@ -422,6 +448,17 @@ pub fn classify_in(
                         secured,
                     });
                 }
+                if let Some(column) = held.columns.keys().find(|column| {
+                    catalog.equals_as_engine(&held.name, column)
+                        && table
+                            .columns
+                            .get(column.as_str())
+                            .is_some_and(|published| published.compares_as_text() == Some(false))
+                }) {
+                    return Err(format!(
+                        "column `{column}` of `{name}` now compares by rules of its own (a nondeterministic collation, citext, char(n))"
+                    ));
+                }
                 for change in column_changes(held, table)? {
                     if let SchemaChange::ColumnAdded { column, .. } = &change
                         && let Some(current) = catalog_now.table(&name)
@@ -436,6 +473,12 @@ pub fn classify_in(
                             })
                             .then(|| column.name.clone());
                         catalog_now = with_ordered(&catalog_now, &held.name, ordered);
+                        let compared = table
+                            .columns
+                            .get(column.name.as_str())
+                            .is_none_or(|published| published.compares_as_text() != Some(true))
+                            .then(|| column.name.clone());
+                        catalog_now = with_compared(&catalog_now, &held.name, compared);
                     }
                     changes.push(change);
                 }
@@ -830,6 +873,77 @@ mod tests {
         assert!(!created(secured(notes, "false")).is_row_secured(&notes_name));
     }
 
+    /// A published column compares as its text when its collation is
+    /// deterministic, it is an enum (or an array of one), or its type has
+    /// one spelling; not under a nondeterministic collation, nor as
+    /// `citext` or `char(n)`; and not known for a string whose message
+    /// does not say its collation.
+    #[test]
+    fn published_equality_follows_collations_and_types() {
+        let column = |data_type: &str, class: &str, elem: Option<&str>, deterministic: Option<bool>| {
+            PublishedColumn {
+                data_type: data_type.to_owned(),
+                pg_type_class: Some(class.to_owned()),
+                dflt: None,
+                collation_name: None,
+                collation_is_deterministic: deterministic,
+                elem_pg_type_class: elem.map(str::to_owned),
+            }
+            .compares_as_text()
+        };
+        assert_eq!(column("text", "b", None, Some(true)), Some(true));
+        assert_eq!(column("varchar", "b", None, Some(false)), Some(false), "nondeterministic");
+        assert_eq!(column("text", "b", None, None), None, "an older stack");
+        assert_eq!(column("text[]", "b", Some("b"), Some(true)), Some(true));
+        assert_eq!(column("citext", "b", None, Some(true)), Some(false));
+        assert_eq!(column("bpchar", "b", None, Some(true)), Some(false));
+        assert_eq!(column("interval", "b", None, None), Some(false));
+        assert_eq!(column("TicketStatus", "e", None, None), Some(true));
+        assert_eq!(column("TicketStatus[]", "b", Some("e"), None), Some(true));
+        assert_eq!(column("uuid", "b", None, None), Some(true));
+        assert_eq!(column("int8", "b", None, None), Some(true));
+        assert_eq!(column("hstore", "b", None, None), Some(false), "an unknown type");
+    }
+
+    /// A table created with a nondeterministic collation is followed
+    /// knowing that column compares by rules of its own; a served column
+    /// that comes to, by a new collation or type, stops the engine.
+    #[test]
+    fn equality_follows_the_messages() {
+        let column = |name: &str, data_type: &str, deterministic: &str| {
+            format!(
+                r#""{name}": {{"pos": 1, "dataType": "{data_type}", "pgTypeClass": "b", "typeOID": 1, "notNull": false, "dflt": null, "collationName": "default", "collationIsDeterministic": {deterministic}}}"#
+            )
+        };
+        let table = |name: &str, status: &str| {
+            format!(
+                r#"{{"oid": 2, "schema": "public", "name": "{name}", "columns": {{{}, {status}}}, "primaryKey": ["id"], "publications": {{}}}}"#,
+                column("id", "int8", "null"),
+            )
+        };
+        let schemas = ["public".to_owned()];
+        let tickets = published("tickets", TICKETS, &["id"]);
+        let notes = table("notes", &column("label", "text", "false"));
+        let created = classify(&catalog(), &schemas, &message(&tickets, &format!("{tickets}, {notes}")))
+            .expect("followed")
+            .catalog;
+        let equal = |catalog: &Catalog, table: &str, column: &str| {
+            catalog.equals_as_engine(&TableName::from(table), &ColumnName::from(column))
+        };
+        assert!(!equal(&created, "notes", "label"), "nondeterministic");
+        assert!(equal(&created, "notes", "id"));
+        assert!(equal(&created, "tickets", "status"), "held as it was");
+
+        let before = table("tickets", &column("status", "text", "true"));
+        let after = table("tickets", &column("status", "text", "false"));
+        let stopped = classify(&catalog(), &schemas, &message(&before, &after))
+            .map(drop)
+            .unwrap_err();
+        assert!(stopped.contains("compares by rules of its own"), "{stopped}");
+        let citext = table("tickets", &column("status", "citext", "true"));
+        assert!(classify(&catalog(), &schemas, &message(&before, &citext)).is_err());
+    }
+
     /// A message names a served table the engine's publication filters,
     /// and not one only another publication filters, nor one of a schema
     /// not served.
@@ -865,6 +979,8 @@ mod tests {
             pg_type_class: Some(class.to_owned()),
             dflt: None,
             collation_name: None,
+            collation_is_deterministic: None,
+            elem_pg_type_class: None,
         };
         assert_eq!(column_type(&column("int8", "b")), Some(ValueType::Int));
         assert_eq!(

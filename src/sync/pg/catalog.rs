@@ -17,6 +17,11 @@
 //! change of what it streams ([`publication_gaps`]): a snapshot reads
 //! whole tables, so a row filter, a column list or an action left out
 //! would leave rows the snapshot served that no change ever updates.
+//!
+//! It also notes which text-carried columns Postgres compares for
+//! equality as the engine does, byte by byte ([`compares_as_text`]): a
+//! nondeterministic collation, `citext` or `char(n)` makes distinct
+//! texts equal, and the engine would match other rows than Postgres.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -62,7 +67,17 @@ pub async fn load_catalog(
     let columns = client
         .query(
             "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.udt_name,
-                    c.collation_name
+                    c.collation_name,
+                    CASE WHEN c.collation_name IS NULL THEN true ELSE
+                      (SELECT bool_and(co.collisdeterministic) FROM pg_collation co
+                         JOIN pg_namespace cn ON cn.oid = co.collnamespace
+                        WHERE cn.nspname = c.collation_schema AND co.collname = c.collation_name)
+                    END,
+                    COALESCE((SELECT e.typtype = 'e' FROM pg_type t
+                                JOIN pg_namespace tn ON tn.oid = t.typnamespace
+                                JOIN pg_type e ON e.oid = CASE WHEN c.data_type = 'ARRAY'
+                                                               THEN t.typelem ELSE t.oid END
+                               WHERE tn.nspname = c.udt_schema AND t.typname = c.udt_name), false)
              FROM information_schema.columns c
              JOIN information_schema.tables t
                ON t.table_schema = c.table_schema AND t.table_name = c.table_name
@@ -124,6 +139,7 @@ pub async fn load_catalog(
     }
     let mut declared: BTreeMap<(String, String), Vec<DbColumn>> = BTreeMap::new();
     let mut ordered: Vec<(TableName, ColumnName)> = Vec::new();
+    let mut compared_otherwise: Vec<(TableName, ColumnName)> = Vec::new();
     let mut notes = Vec::new();
     for row in &columns {
         let schema: String = row.get(0);
@@ -132,8 +148,20 @@ pub async fn load_catalog(
         let data_type: String = row.get(3);
         let udt_name: String = row.get(4);
         let collation: Option<String> = row.get(5);
+        let deterministic: Option<bool> = row.get(6);
+        let is_enum: bool = row.get(7);
         if orders_as_text(&data_type, collation.as_deref(), &default_collation) {
             ordered.push((
+                TableName::from(table_name(&schema, &table)),
+                ColumnName::from(column.as_str()),
+            ));
+        }
+        let element = match data_type.as_str() {
+            "ARRAY" => udt_name.strip_prefix('_').unwrap_or(&udt_name),
+            _ => udt_name.as_str(),
+        };
+        if compares_as_text(element, is_enum, deterministic) != Some(true) {
+            compared_otherwise.push((
                 TableName::from(table_name(&schema, &table)),
                 ColumnName::from(column.as_str()),
             ));
@@ -187,6 +215,7 @@ pub async fn load_catalog(
         Catalog::new(tables)
             .with_enum_oids(enum_oids)
             .with_ordered_as_text(ordered)
+            .with_compared_otherwise(compared_otherwise)
             .with_bytewise_default(default_collation.is_bytewise())
             .with_row_secured(secured.iter().map(|row| {
                 let schema: String = row.get(0);
@@ -281,8 +310,8 @@ fn is_bytewise_collation(name: &str) -> bool {
 /// compares byte by byte. A `uuid`'s lower-case hex and a `bytea`'s hex
 /// do, as do `name` (always `C`) and `time`'s zero-padded text; strings
 /// do under a byte-order collation; everything else carried as text (an
-/// enum, `citext`, an `inet`, an interval, a time with its zone) orders
-/// by rules of its own.
+/// enum, `citext`, `char(n)`, whose trailing spaces do not count, an
+/// `inet`, an interval, a time with its zone) orders by rules of its own.
 pub fn orders_as_text(
     data_type: &str,
     collation: Option<&str>,
@@ -290,7 +319,7 @@ pub fn orders_as_text(
 ) -> bool {
     match data_type {
         "uuid" | "bytea" | "name" | "time without time zone" => true,
-        "text" | "character varying" | "character" => match collation {
+        "text" | "character varying" => match collation {
             Some(name) => is_bytewise_collation(name),
             None => default.is_bytewise(),
         },
@@ -310,12 +339,40 @@ pub fn published_orders_as_text(
 ) -> bool {
     match type_name {
         "uuid" | "bytea" | "name" | "time" => true,
-        "text" | "varchar" | "bpchar" => match collation {
+        "text" | "varchar" => match collation {
             Some("default") => bytewise_default,
             Some(name) => is_bytewise_collation(name),
             None => false,
         },
         _ => false,
+    }
+}
+
+/// Whether Postgres decides equality on a column as the engine does, by
+/// its text byte for byte: its type as `pg_type` names it (an array's
+/// element type for an array), whether that type is an enum, and whether
+/// its collation is deterministic (the database's default always is).
+/// `None` when that depends on a collation not known. A string under a
+/// deterministic collation does: such a collation calls texts equal only
+/// when their bytes are. So do an enum's label, a `uuid`, a `bytea` and a
+/// `time`, each carried in one spelling, and every type the engine
+/// carries as a value of its own (a number, a time, JSON). A string under
+/// a nondeterministic collation does not, nor `citext`, nor `char(n)`,
+/// whose trailing spaces do not count, nor any other text-carried type
+/// (an interval, a network address, an unknown type), where texts spelled
+/// differently can be equal.
+pub fn compares_as_text(type_name: &str, is_enum: bool, deterministic: Option<bool>) -> Option<bool> {
+    if is_enum {
+        return Some(true);
+    }
+    match scalar_type(type_name) {
+        Some(ValueType::String) => match type_name {
+            "text" | "varchar" | "name" => deterministic,
+            "uuid" | "bytea" | "time" => Some(true),
+            _ => Some(false),
+        },
+        Some(_) => Some(true),
+        None => Some(false),
     }
 }
 
@@ -417,5 +474,29 @@ mod tests {
         assert_eq!(value_type("int4range", "int4range"), None);
         assert_eq!(table_name("public", "tickets"), "tickets");
         assert_eq!(table_name("xyne_0", "clients"), "xyne_0.clients");
+    }
+
+    /// Strings compare as their text only under a deterministic
+    /// collation; `citext`, `char(n)` and the other text-carried types
+    /// with spellings of their own never do; enums, one-spelling types
+    /// and values always do. `char(n)` does not order as its text either.
+    #[test]
+    fn equality_follows_the_collation_and_type() {
+        assert_eq!(compares_as_text("varchar", false, Some(true)), Some(true));
+        assert_eq!(compares_as_text("text", false, Some(false)), Some(false));
+        assert_eq!(compares_as_text("text", false, None), None);
+        assert_eq!(compares_as_text("citext", false, Some(true)), Some(false));
+        assert_eq!(compares_as_text("bpchar", false, Some(true)), Some(false));
+        assert_eq!(compares_as_text("inet", false, None), Some(false));
+        assert_eq!(compares_as_text("TicketStatus", true, None), Some(true));
+        assert_eq!(compares_as_text("uuid", false, None), Some(true));
+        assert_eq!(compares_as_text("int8", false, None), Some(true));
+        let c = DefaultCollation {
+            name: "C".to_owned(),
+            provider: Some("c".to_owned()),
+        };
+        assert!(orders_as_text("text", None, &c));
+        assert!(!orders_as_text("character", None, &c), "trailing spaces do not count");
+        assert!(!published_orders_as_text("bpchar", Some("C"), true));
     }
 }

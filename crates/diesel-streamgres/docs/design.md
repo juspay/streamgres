@@ -282,6 +282,7 @@ identifiers, a column list, `*` or `COUNT(*)`, `$n` placeholders.
 | accepted | refused, with a reason |
 |---|---|
 | `=`, `<>`/`!=`, `<`, `<=`, `>`, `>=`, `[NOT] IN`, `IS [NOT] NULL`, `AND`, `OR`, parentheses | `DISTINCT`, `GROUP BY`, aggregates other than `COUNT(*)` |
+| comparisons and joins on columns Postgres compares as their text: strings under a deterministic collation (the database's default always is), enums, `uuid`, `bytea`, `time`, and every non-text type | a comparison or join on a string under a nondeterministic collation, `citext`, `char(n)`, an interval, a network address, or a type the engine does not know, where texts spelled differently can be equal |
 | `= ANY($n)` with an array bind (`eq_any`), read as `IN`; `!= ALL($n)` (`ne_all`), read as `NOT IN`, an empty array being no condition | `LIKE`, `ILIKE`, array operators such as `@>` |
 | `ORDER BY` on the root table by a column Postgres orders as the engine does: numbers, booleans, times, `uuid`, `bytea`, `name`, `time`, and strings under the `C` collation; `LIMIT`, `OFFSET` | an `ORDER BY` on an enum, on a string under any other collation, on JSON; table aliases, unknown tables or columns |
 | `INNER` and `LEFT [OUTER]` joins on a one-column equality each side; an `INNER JOIN` inside a `LEFT JOIN`'s parentheses | a table joined twice; `RIGHT`, `FULL`, `CROSS`; compound join keys; an `INNER JOIN` onto a table under a `LEFT JOIN`, written after it |

@@ -68,6 +68,17 @@ struct Node<'c> {
     left_joined: bool,
 }
 
+/// Whether `condition` is `IS [NOT] NULL`, which compares no value.
+fn is_null_test(condition: &Where) -> bool {
+    matches!(
+        condition,
+        Where::Condition(Condition {
+            comparison_operator: ComparisonOperator::IS | ComparisonOperator::IS_NOT,
+            ..
+        })
+    )
+}
+
 /// Whether a condition compares by order (`<`, `<=`, `>`, `>=`), which
 /// only gives Postgres's answer on a column the engine orders as
 /// Postgres does.
@@ -351,6 +362,10 @@ impl Parser<'_> {
                     position: at,
                 });
             }
+            self.compared.extend([
+                (nodes[parent].table.name.clone(), parent_column.clone(), on_at),
+                (nodes[right_root].table.name.clone(), child_column.clone(), on_at),
+            ]);
             nodes[parent]
                 .edges
                 .push((right_root, parent_column, child_column, inner));
@@ -522,8 +537,12 @@ impl Parser<'_> {
         let at = self.at();
         let column = self.column_ref(nodes, scope)?;
         let condition = self.comparison(column.column.clone())?;
+        let table = nodes[column.node].table.name.clone();
         if is_range(&condition) {
-            self.ranged.push((nodes[column.node].table.name.clone(), column.column, at));
+            self.ranged.push((table.clone(), column.column.clone(), at));
+        }
+        if !is_null_test(&condition) {
+            self.compared.push((table, column.column, at));
         }
         Ok(vec![(column.node, condition)])
     }

@@ -120,6 +120,7 @@ pub fn parse_with_binds(
         binds,
         times: TimeUnit::Millis,
         ranged: Vec::new(),
+        compared: Vec::new(),
     };
     let parsed = parser.query(catalog)?;
     if !matches!(parser.peek(), Tok::Eof) {
@@ -161,7 +162,11 @@ pub struct Projected {
 /// in another order ([`Catalog::orders_as_engine`]). So is a range
 /// comparison (`<`, `<=`, `>`, `>=`) on such a column in any filter:
 /// the engine would compare an enum's labels, or a string's bytes, and
-/// match other rows than Postgres does. An enum label
+/// match other rows than Postgres does. A comparison of any kind, or a
+/// join, on a column whose equality Postgres decides by rules of its own
+/// (a nondeterministic collation, `citext`, `char(n)`) is refused too:
+/// the engine would call distinct texts different that Postgres calls
+/// equal ([`Catalog::equals_as_engine`]). An enum label
 /// travels in the binary format as its text, under the enum's own OID,
 /// which the catalog names; an array of enums likewise, under the
 /// array's OID.
@@ -187,6 +192,7 @@ pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result
         binds: &binds,
         times: TimeUnit::Micros,
         ranged: Vec::new(),
+        compared: Vec::new(),
     };
     if !parser.is_word("SELECT") {
         return parser.err(format!("expected SELECT, found {}", parser.describe()));
@@ -215,6 +221,18 @@ pub fn parse_select(sql: &str, binds: &[BindValue], catalog: &Catalog) -> Result
         return Err(ParseError {
             message: format!(
                 "`<`, `<=`, `>` or `>=` on `{table}`.`{column}`: Postgres compares this column by rules the engine does not follow (an enum, a collation other than C, JSON)"
+            ),
+            position: *position,
+        });
+    }
+    if let Some((table, column, position)) = parser
+        .compared
+        .iter()
+        .find(|(table, column, _)| !catalog.equals_as_engine(table, column))
+    {
+        return Err(ParseError {
+            message: format!(
+                "a comparison or join on `{table}`.`{column}`: Postgres decides its equality by rules the engine does not follow (a nondeterministic collation, citext, char(n), an interval or network address)"
             ),
             position: *position,
         });
@@ -508,6 +526,10 @@ struct Parser<'b> {
     /// where it was named: [`parse_select`] refuses one the engine
     /// orders differently from Postgres, as it does for `ORDER BY`.
     ranged: Vec<(TableName, ColumnName, usize)>,
+    /// Every column a filter compares with a value, and both columns of
+    /// every join, with where each was named: [`parse_select`] refuses
+    /// one whose equality Postgres decides by rules of its own.
+    compared: Vec<(TableName, ColumnName, usize)>,
 }
 
 /// The unit of a number standing for a time, see [`Parser::times`].
@@ -1704,6 +1726,38 @@ mod tests {
         let joined = r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id" AND "books"."title" > 'm'))"#;
         let error = parse_select(joined, &[], &join_catalog()).expect_err("a range in an ON");
         assert!(error.message.contains("`books`.`title`"), "{}", error.message);
+    }
+
+    /// A column whose equality Postgres decides by rules of its own (a
+    /// nondeterministic collation, `citext`) is refused in a comparison
+    /// of any kind, in any filter, and as a join key; `IS NULL` on it
+    /// compares nothing and stands, as does every other column.
+    #[test]
+    fn a_comparison_needs_a_column_compared_as_text() {
+        let otherwise = catalog().with_compared_otherwise([(TableName::from("tickets"), ColumnName::from("status"))]);
+        for sql in [
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" = $1"#,
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" != $1"#,
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" IN ('a', 'z')"#,
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" NOT IN ('a', 'z')"#,
+            r#"SELECT * FROM "tickets" WHERE ("tickets"."points" = 1 OR ("tickets"."status" = 'b'))"#,
+        ] {
+            let binds = [text_bind("b")];
+            let error = parse_select(sql, &binds, &otherwise).expect_err(sql);
+            assert!(error.message.contains("decides its equality"), "{}", error.message);
+            parse_select(sql, &binds, &catalog()).expect("compared as text");
+        }
+        for sql in [
+            r#"SELECT * FROM "tickets" WHERE "tickets"."status" IS NULL"#,
+            r#"SELECT * FROM "tickets" WHERE "tickets"."points" = 3 AND "tickets"."priority" = 'p'"#,
+        ] {
+            parse_select(sql, &[], &otherwise).expect(sql);
+        }
+        let joined = r#"SELECT "authors"."id" FROM ("authors" INNER JOIN "books" ON ("books"."author_id" = "authors"."id"))"#;
+        let keyed = join_catalog().with_compared_otherwise([(TableName::from("books"), ColumnName::from("author_id"))]);
+        let error = parse_select(joined, &[], &keyed).expect_err("a join key");
+        assert!(error.message.contains("`books`.`author_id`"), "{}", error.message);
+        parse_select(joined, &[], &join_catalog()).expect("compared as values");
     }
 
     /// Diesel's joins become the engine's tree:

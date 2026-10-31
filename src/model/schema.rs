@@ -341,6 +341,11 @@ pub struct Catalog {
     /// the `C` collation. Any other text-carried column (an enum, a
     /// string under a linguistic collation, an `inet`) orders otherwise.
     ordered_as_text: std::collections::HashSet<(TableName, ColumnName)>,
+    /// Text-carried columns whose equality Postgres decides by rules other
+    /// than their text's bytes, as the engine compares them: a string under
+    /// a nondeterministic collation, `citext`, `char(n)`, an interval, a
+    /// network address. A column not named here compares as its text.
+    compared_otherwise: std::collections::HashSet<(TableName, ColumnName)>,
     /// Whether the database's default collation orders strings byte by
     /// byte, so a string column a migration adds under it orders as its
     /// text; false when not known.
@@ -361,6 +366,7 @@ impl Catalog {
                 .collect(),
             enum_oids: std::collections::HashSet::new(),
             ordered_as_text: std::collections::HashSet::new(),
+            compared_otherwise: std::collections::HashSet::new(),
             bytewise_default: false,
             row_secured: std::collections::HashSet::new(),
         }
@@ -447,6 +453,38 @@ impl Catalog {
     /// catalog built from this one to carry.
     pub fn ordered_as_text(&self) -> impl Iterator<Item = &(TableName, ColumnName)> + '_ {
         self.ordered_as_text.iter()
+    }
+
+    /// The same catalog knowing Postgres decides equality on these
+    /// text-carried columns by rules of their own, and on no others.
+    pub fn with_compared_otherwise(
+        mut self,
+        columns: impl IntoIterator<Item = (TableName, ColumnName)>,
+    ) -> Self {
+        self.compared_otherwise = columns.into_iter().collect();
+        self
+    }
+
+    /// Whether Postgres decides `table.column = value` as the engine
+    /// does. Numbers, booleans, times and JSON compare as values; a
+    /// text-carried column, or a list of them, unless the catalog was
+    /// told it compares by rules of its own.
+    pub fn equals_as_engine(&self, table: &TableName, column: &ColumnName) -> bool {
+        match self
+            .table(table.as_str())
+            .and_then(|held| held.column(column.as_str()))
+        {
+            Some(_) => !self
+                .compared_otherwise
+                .contains(&(table.clone(), column.clone())),
+            None => false,
+        }
+    }
+
+    /// The columns this catalog knows compare by rules of their own, for
+    /// a catalog built from this one to carry.
+    pub fn compared_otherwise(&self) -> impl Iterator<Item = &(TableName, ColumnName)> + '_ {
+        self.compared_otherwise.iter()
     }
 
     /// The schema of table `name`, if the catalog contains it.

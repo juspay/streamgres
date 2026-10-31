@@ -1305,3 +1305,71 @@ fn a_publication_that_misses_changes_is_refused() {
         tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
     });
 }
+
+/// A column whose equality Postgres decides by rules the engine does not
+/// follow is refused in a filter: here a nondeterministic ICU collation,
+/// under which `'a'` equals `'A'`, on a table loaded at start and on one
+/// created while serving; `IS NULL` on it, and the other columns, are
+/// followed. A served column given such a collation starts the engine
+/// over, so that what it followed under the old one ends.
+#[test]
+fn a_column_compared_by_rules_of_its_own_is_refused() {
+    let Some(dsn) = Database::create_utf8("embedded_collation") else { return };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime.block_on(async {
+        let names = names("collation");
+        let table = &names.table;
+        let client = admin(&dsn).await;
+        set_up(&client, &names).await;
+        client
+            .batch_execute(
+                "CREATE COLLATION folded (provider = icu, locale = 'und-u-ks-level2', deterministic = false);
+                 CREATE TABLE folded_items (id int8 PRIMARY KEY, value text COLLATE folded NOT NULL, code text NOT NULL);
+                 INSERT INTO folded_items VALUES (1, 'a', 'a');",
+            )
+            .await
+            .expect("a nondeterministic column");
+        let engine = Engine::start(config(&dsn, &names));
+        reach(&engine, |state| *state == State::Serving, Duration::from_secs(30)).await;
+        let mut session = engine.connect().expect("a session");
+        assert_eq!(next(&mut session).await.expect("hello")[0], "hello");
+        let refused = answer(&mut session, 1, r#"SELECT "id" FROM "folded_items" WHERE "folded_items"."value" = 'A'"#).await;
+        assert_eq!(refused[0], "refused", "{refused}");
+        assert!(refused.to_string().contains("decides its equality"), "{refused}");
+        for (id, sql) in [
+            (2, r#"SELECT "id" FROM "folded_items" WHERE "folded_items"."value" IS NULL"#),
+            (3, r#"SELECT "id" FROM "folded_items" WHERE "folded_items"."code" = 'a'"#),
+        ] {
+            let accepted = answer(&mut session, id, sql).await;
+            assert_eq!(accepted[0], "accepted", "{sql}: {accepted}");
+        }
+
+        client
+            .batch_execute("CREATE TABLE folded_later (id int8 PRIMARY KEY, value text COLLATE folded NOT NULL)")
+            .await
+            .expect("a table created while serving");
+        let later = r#"SELECT "id" FROM "folded_later" WHERE "folded_later"."value" = 'A'"#;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut id = 4;
+        let refused = loop {
+            let frame = answer(&mut session, id, later).await;
+            id += 1;
+            if frame.to_string().contains("decides its equality") || Instant::now() >= deadline {
+                break frame;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(refused.to_string().contains("decides its equality"), "{refused}");
+
+        client
+            .batch_execute(&format!("ALTER TABLE {table} ALTER COLUMN name TYPE text COLLATE folded"))
+            .await
+            .expect("a served column given the collation");
+        down_for(&engine, &["compares by rules of its own"]).await;
+        let stopping = engine.clone();
+        tokio::task::spawn_blocking(move || stopping.stop()).await.expect("stop");
+    });
+}
