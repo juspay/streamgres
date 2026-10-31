@@ -36,6 +36,7 @@ and changes nothing else.
 | `connection/mod.rs` | `Settings`, `Attachment`, `install`: which cache a connection reads through, by its URL; the settings make connections and pools (`SyncedManager`, `async_manager`) without `install` |
 | `connection/synchronous.rs` | `SyncedConnection`, the interception of Diesel's three connection methods |
 | `connection/asynchronous.rs` | `AsyncSyncedConnection`, the same wrapper over diesel-async (feature `async`) |
+| `connection/held.rs` | the async wrapper's instrumentation: a speculative future's query start is passed on only when the read runs it |
 | `connection/policy.rs` | what both wrappers decide from what they know: a read's route, why it bypasses the cache and what that counts, whether a refill may be kept, what counts as a write |
 | `route.rs` | `Route`, `RouteDsl`, `Via`, `Served`: where a read goes and where it came from |
 | `key.rs` | `QueryKey`: what identifies a read, and a refusal |
@@ -744,6 +745,18 @@ table whose types are unknown). The subscribe itself runs on a blocking
 thread. This is why `Subscriptions::subscribe` has two steps: it answers
 `NeedsTypes` for unknown tables, and `materialize` finishes once the
 caller has looked them up.
+
+diesel-async tells the instrumentation a query started when its future
+is built, and finished when the future completes; a future built for a
+read the engine then serves would never finish. So the wrapper keeps the
+instrumentation itself, installs a forwarder to it on the inner
+connection, and holds back the start of each future a miss builds until
+the read runs it (`connection/held.rs`). The instrumentation hears of the
+queries a read ran and no others, each started and finished. A future
+diesel-async itself drops mid-query, as any cancelled read does, still
+leaves its start unfinished. Instrumentation set on the inner connection
+before it is wrapped is replaced by diesel's default; set it on the
+wrapper.
 
 An enum bind needs its OID for the key. The async wrapper cannot look it
 up inside `load`, so the first read with such a bind goes live while the

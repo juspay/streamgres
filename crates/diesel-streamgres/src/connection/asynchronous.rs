@@ -22,10 +22,13 @@
 //! ships rows for a table not yet known), and the cache. A subscribe
 //! blocks on the engine, so it runs on a blocking thread.
 //!
-//! One consequence: diesel-async records a query as started when its
-//! future is built, and as finished when the future completes, so a
-//! miss the engine then serves from its own rows leaves one started
-//! query in the instrumentation with no finish. A hit builds nothing.
+//! diesel-async records a query as started when its future is built,
+//! and as finished when the future completes, so a future built and
+//! never run would leave a query started that never finishes. The
+//! wrapper keeps the instrumentation itself and holds a miss's starts
+//! back until the read runs their futures ([`super::held`]): a miss the
+//! engine serves from its own rows tells it of no query at all, a miss
+//! read from Postgres of the queries it ran. A hit builds nothing.
 //!
 //! # Pipelining
 //!
@@ -85,6 +88,7 @@ use crate::subscriptions::STALE_TYPES;
 use crate::materialized::Snapshot;
 use crate::subscriptions::{Outcome, Subscriptions, Verdict};
 use crate::postgres::{ALL_TABLES_SQL, TableAttribute, TableTypes, all_table_types};
+use super::held::{Held, Instrumented};
 use super::policy::{self, Bypass, Replayed, commits, may_write, rendered};
 use super::{Attachment, SETTINGS, Settings, read_your_writes_from_env};
 
@@ -167,12 +171,21 @@ pub struct AsyncSyncedConnection {
     scope: Arc<AtomicU64>,
     checked: Arc<AtomicU64>,
     born: Instant,
+    /// The application's instrumentation, which the inner connection's
+    /// forwards to.
+    instrumented: Instrumented,
 }
 
 impl AsyncSyncedConnection {
-    /// Wraps an established connection as a passthrough.
-    pub fn new(inner: AsyncPgConnection) -> Self {
+    /// Wraps an established connection as a passthrough. The wrapper
+    /// keeps the connection's instrumentation from here on, starting
+    /// from diesel's default as `establish` does: set any other on the
+    /// wrapper, since one set on `inner` before is replaced.
+    pub fn new(mut inner: AsyncPgConnection) -> Self {
+        let instrumented = Instrumented::new(diesel::connection::get_default_instrumentation());
+        inner.set_instrumentation(instrumented.clone());
         AsyncSyncedConnection {
+            instrumented,
             inner,
             cache: None,
             route: Route::Postgres,
@@ -794,14 +807,17 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
             let live = self.inner.load(query).map_ok(Self::live_stream).boxed();
             return self.tracked(Self::bypassed(Arc::clone(&cache), Bypass::Refused, live));
         }
-        let replay: Option<LoadFuture<'query>> = (!self.primary.load(Ordering::Acquire))
-            .then(|| self.inner.load(sql_query(REPLAY_POSITION_SQL)));
-        let live = self.inner.load(query);
-        let catalog: Option<LoadFuture<'query>> = if self.catalog_loaded.load(Ordering::Acquire) {
-            None
-        } else {
-            Some(self.inner.load(sql_query(ALL_TABLES_SQL)))
-        };
+        let inner = &mut self.inner;
+        let held = &self.instrumented;
+        let replay: Option<Held<LoadFuture<'query>>> = (!self.primary.load(Ordering::Acquire))
+            .then(|| held.hold(|| inner.load(sql_query(REPLAY_POSITION_SQL))));
+        let live = held.hold(|| inner.load(query));
+        let catalog: Option<Held<LoadFuture<'query>>> =
+            if self.catalog_loaded.load(Ordering::Acquire) {
+                None
+            } else {
+                Some(held.hold(|| inner.load(sql_query(ALL_TABLES_SQL))))
+            };
         let catalog_loaded = Arc::clone(&self.catalog_loaded);
         let subscriptions = cache.shared_subscriptions();
         let token = Arc::clone(&self.inflight);
@@ -834,6 +850,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
             let verdict = match outcome {
                 Outcome::Verdict(verdict) => verdict,
                 Outcome::NeedsTypes { snapshot, missing } => {
+                    let catalog = catalog.map(Held::run);
                     with_types(&*subscriptions, &key, snapshot, &missing, catalog, &catalog_loaded)
                         .await?
                 }
@@ -843,14 +860,14 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                     guard.disarm();
                     cache.refused(&key, &reason);
                     Bypass::Refused.record(&cache);
-                    Self::fallback(Arc::clone(&cache), live).await
+                    Self::fallback(Arc::clone(&cache), live.run()).await
                 }
                 Verdict::Rows { rows, live: store } => {
                     guard.disarm();
                     cache.fill_live(reservation, store, &rows);
                     if subscriptions.behind() {
                         Bypass::Lagging.record(&cache);
-                        return Self::fallback(Arc::clone(&cache), live).await;
+                        return Self::fallback(Arc::clone(&cache), live.run()).await;
                     }
                     served.store(2, Ordering::Release);
                     crate::metrics::report(|metrics| metrics.served(Served::Engine));
@@ -861,7 +878,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                     let keep = match replay {
                         None => true,
                         Some(replay) => {
-                            let replayed = Replayed::of(read_position(replay).await, since);
+                            let replayed = Replayed::of(read_position(replay.run()).await, since);
                             match replayed {
                                 Replayed::Primary => primary.store(true, Ordering::Release),
                                 Replayed::Standby(_) => cache.saw_standby(),
@@ -871,7 +888,7 @@ impl AsyncConnectionCore for AsyncSyncedConnection {
                         }
                     };
                     let _permit = cache.fallback_permit_async().await?;
-                    let pg_rows: Vec<PgRow> = live.await?.try_collect().await?;
+                    let pg_rows: Vec<PgRow> = live.run().await?.try_collect().await?;
                     let rows: Arc<[OwnedRow]> =
                         Arc::from(capture_all(pg_rows.into_iter().map(Ok))?);
                     guard.disarm();
@@ -927,14 +944,15 @@ impl AsyncConnection for AsyncSyncedConnection {
         self.inner.transaction_state()
     }
 
-    /// The inner connection's instrumentation.
+    /// The connection's instrumentation, which the inner connection's
+    /// forwards to.
     fn instrumentation(&mut self) -> &mut dyn Instrumentation {
-        self.inner.instrumentation()
+        &mut self.instrumented
     }
 
-    /// Sets the inner connection's instrumentation.
+    /// Sets the connection's instrumentation, for its pending futures too.
     fn set_instrumentation(&mut self, instrumentation: impl Instrumentation) {
-        self.inner.set_instrumentation(instrumentation)
+        self.instrumented.set(Box::new(instrumentation));
     }
 
     /// Sizes the inner connection's statement cache.

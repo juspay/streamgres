@@ -11,6 +11,8 @@
 
 #[cfg(feature = "async")]
 pub mod asynchronous;
+#[cfg(feature = "async")]
+mod held;
 mod policy;
 mod synchronous;
 
