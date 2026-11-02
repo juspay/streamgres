@@ -57,6 +57,9 @@
 //! Consumers that already wrap their connection enable it, so this crate
 //! does too rather than reaching into Diesel's hidden derive re-exports.
 
+#[cfg(feature = "async")]
+compile_error!("this POC branch builds on juspay_diesel; upstream diesel-async cannot use its traits, so `async` is not available");
+
 pub mod cache;
 mod connection;
 pub mod engine;

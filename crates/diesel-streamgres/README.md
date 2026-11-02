@@ -1,3 +1,9 @@
+> POC branch `poc/juspay-diesel-s2s`: `feat/s2s-endpoint` built on
+> Superposition's `juspay_diesel = 2.3.1`, so its queries, models,
+> connections and r2d2 pools share this crate's Diesel traits. The engine is
+> unchanged. Synchronous connections, `embedded` and `sse` work; `async`
+> (upstream diesel-async) does not build on the fork and is refused.
+
 # diesel_streamgres
 
 A Diesel connection wrapper for Postgres that an application swaps in for

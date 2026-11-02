@@ -14,9 +14,10 @@ default = ["diesel-2-3"]
 # diesel_derives 2.2, which cannot share a build with 2.3's: depend with
 # `default-features = false` and the build resolves Diesel 2.2.
 diesel-2-3 = []
-# `AsyncSyncedConnection`, the same wrapper over diesel-async's
-# `AsyncPgConnection` (Diesel 2.3).
-async = ["diesel-2-3", "dep:diesel-async", "diesel-async/postgres", "diesel-async/pool"]
+# POC branch: this build uses Superposition's juspay_diesel 2.3.1, whose
+# trait types upstream diesel-async cannot use, so `async` is refused
+# (lib.rs) rather than built.
+async = ["diesel-2-3"]
 # `sse::body`: changes as a Server-Sent Events body, a stream of text any
 # web framework serves. No dependencies of its own.
 sse = []
@@ -28,8 +29,9 @@ embedded = ["dep:streamgres"]
 [dependencies]
 streamgres = { path = "../..", default-features = false, optional = true }
 base64 = "0.23.1"
-diesel = { version = ">=2.2.12, <2.4", features = ["postgres", "r2d2", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
-diesel-async = { version = "0.7", features = ["postgres"], optional = true }
+# POC branch: Superposition's Diesel fork, so its queries, models,
+# connections and r2d2 pools share this crate's Diesel traits.
+diesel = { package = "juspay_diesel", version = "=2.3.1", features = ["postgres", "r2d2", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
 futures-util = "0.3.34"
 log = "0.4"
 moka = { version = "0.12", features = ["sync"] }
@@ -44,5 +46,5 @@ rustls-native-certs = "0.8"
 [dev-dependencies]
 chrono = "0.4.45"
 scoped-futures = "0.1"
-diesel = { version = "2.3.8", features = ["chrono", "postgres", "r2d2", "serde_json"] }
+diesel = { package = "juspay_diesel", version = "=2.3.1", features = ["chrono", "postgres", "r2d2", "serde_json"] }
 serde_json = "1.0.154"

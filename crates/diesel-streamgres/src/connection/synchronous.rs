@@ -425,7 +425,7 @@ where
     }
 
     /// Sizes the inner connection's statement cache.
-    #[cfg(feature = "diesel-2-3")]
+    // juspay_diesel 2.3.1 requires it whatever the features (POC branch).
     fn set_prepared_statement_cache_size(&mut self, size: diesel::connection::CacheSize) {
         self.inner.set_prepared_statement_cache_size(size)
     }
