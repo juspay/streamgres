@@ -32,8 +32,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
-use streamgres::client::ast::Translated;
-use streamgres::client::plan::{Count, PlanCache, Planner, Policy, Side, plan};
+use streamgres::plan::Translated;
+use streamgres::plan::{Count, PlanCache, Planner, Policy, Side, plan};
 use streamgres::model::ComparisonOperator::{GT, IN};
 use streamgres::model::Order::DESC;
 use streamgres::model::{Catalog, Lsn, MultiTableReadQuery};
@@ -353,7 +353,7 @@ fn counted_against_estimated() {
             .await
             .expect("connect");
         tokio::spawn(connection);
-        let (catalog, _) = load_catalog(&client, &["public".to_owned()])
+        let (catalog, _) = load_catalog(&client, &["public".to_owned()], None)
             .await
             .expect("catalog");
         let workspace = one(&client, r#"SELECT "workspaceId" FROM channels LIMIT 1"#).await;
@@ -538,7 +538,7 @@ fn planning_every_argument() {
             .await
             .expect("connect");
         tokio::spawn(connection);
-        let (catalog, _) = load_catalog(&client, &["public".to_owned()])
+        let (catalog, _) = load_catalog(&client, &["public".to_owned()], None)
             .await
             .expect("catalog");
         let workspace = one(&client, r#"SELECT "workspaceId" FROM channels LIMIT 1"#).await;

@@ -6,10 +6,15 @@ use serde_json::Value;
 use tokio_postgres::{NoTls, Transaction};
 
 use super::Config;
-use super::ddl_triggers::{self, FunctionSpec};
+use crate::sync::pg::ddl_triggers::{self, FunctionSpec};
 use crate::sync::pg::sql::quote_ident;
 
 const SETUP_LOCK: i64 = 0x5354_524d_4752_4553;
+
+/// What to do about a trigger stack that differs from the one this version
+/// installs: an older streamgres setup's, or zero-cache's, which startup
+/// never replaces.
+const UPDATE_STACK: &str = "if no zero-cache uses this app id, run the stack's SQL again as a migration (scripts/sql/ddl-triggers.sql, or trigger_stack_sql for another app, shard or publication)";
 
 pub async fn ensure(master_dsn: &str, config: &Config) -> Result<(), String> {
     let schema = config.upstream_schema();
@@ -297,30 +302,15 @@ async fn validate_triggers(
             || row.get::<_, String>(3) != result
         {
             return Err(format!(
-                "DDL function `{signature}` differs from the expected Streamgres definition"
+                "DDL function `{signature}` differs from the expected Streamgres definition; {UPDATE_STACK}"
             ));
         }
     }
 
-    let start_tags = [
-        "ALTER PUBLICATION",
-        "ALTER SCHEMA",
-        "ALTER TABLE",
-        "CREATE INDEX",
-        "CREATE TABLE",
-        "DROP INDEX",
-        "DROP TABLE",
-    ];
-    let end_tags = [
-        "ALTER PUBLICATION",
-        "ALTER SCHEMA",
-        "ALTER TABLE",
-        "COMMENT",
-        "CREATE INDEX",
-        "CREATE TABLE",
-        "DROP INDEX",
-        "DROP TABLE",
-    ];
+    let mut start_tags = ddl_triggers::DDL_TAGS.to_vec();
+    start_tags.sort_unstable();
+    let mut end_tags = [&ddl_triggers::DDL_TAGS[..], &["COMMENT"]].concat();
+    end_tags.sort_unstable();
     for (name, event, function, expected_tags) in [
         (
             start,
@@ -361,7 +351,7 @@ async fn validate_triggers(
             || !row.get::<_, bool>(5)
         {
             return Err(format!(
-                "DDL event trigger `{name}` differs from the expected Streamgres definition"
+                "DDL event trigger `{name}` differs from the expected Streamgres definition; {UPDATE_STACK}"
             ));
         }
     }

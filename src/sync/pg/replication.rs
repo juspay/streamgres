@@ -279,6 +279,7 @@ fn session_options(config: &Config) -> String {
         options.push_str(&format!("-c {setting}={value}"));
     };
     set("idle_in_transaction_session_timeout", "0");
+    set("TimeZone", "UTC");
     if config.get_keepalives() {
         set(
             "tcp_keepalives_idle",
@@ -371,7 +372,7 @@ mod tests {
             .keepalives_retries(3);
         assert_eq!(
             session_options(&config),
-            "-c idle_in_transaction_session_timeout=0 -c tcp_keepalives_idle=30 \
+            "-c idle_in_transaction_session_timeout=0 -c TimeZone=UTC -c tcp_keepalives_idle=30 \
              -c tcp_keepalives_interval=10 -c tcp_keepalives_count=3"
         );
 
@@ -382,14 +383,14 @@ mod tests {
         config.keepalives(false);
         assert_eq!(
             session_options(&config),
-            "-c idle_in_transaction_session_timeout=0"
+            "-c idle_in_transaction_session_timeout=0 -c TimeZone=UTC"
         );
 
         let mut config = Config::new();
         config.keepalives_idle(Duration::from_millis(500));
         assert_eq!(
             session_options(&config),
-            "-c idle_in_transaction_session_timeout=0 -c tcp_keepalives_idle=1"
+            "-c idle_in_transaction_session_timeout=0 -c TimeZone=UTC -c tcp_keepalives_idle=1"
         );
     }
 

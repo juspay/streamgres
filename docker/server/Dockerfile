@@ -24,6 +24,9 @@ FROM ${BUILD_IMAGE} AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock clippy.toml ./
 COPY src ./src
+# The workspace's other crates (the Diesel wrapper) are not part of the
+# server, but the locked workspace must resolve to build it.
+COPY crates ./crates
 RUN cargo build --release --locked --bin server \
     && mkdir -p /out/app /out/var/lib/streamgres \
     && cp target/release/server /out/app/server

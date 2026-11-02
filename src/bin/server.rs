@@ -20,6 +20,8 @@ struct MallocConf(*const std::ffi::c_char);
 unsafe impl Sync for MallocConf {}
 
 fn main() {
+    #[cfg(feature = "console")]
+    console_subscriber::init();
     load_dotenv(".env");
     raise_file_limit();
     let outcome = streamgres::client::Config::from_env().and_then(streamgres::client::serve);

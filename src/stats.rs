@@ -371,6 +371,9 @@ pub struct Stats {
     pub warm_shapes: AtomicU64,
     pub feed_lsn: AtomicU64,
     pub feed_last_message_ms: AtomicU64,
+    /// How current the engine is, from its heartbeats
+    /// ([`crate::sync::heartbeat`]).
+    pub freshness: crate::sync::heartbeat::Freshness,
     pub process_rss_bytes: AtomicU64,
     engine: Mutex<Engine>,
     pushes: Mutex<HashMap<String, Vec<PendingPush>>>,
@@ -532,6 +535,7 @@ impl Stats {
             warm_shapes: AtomicU64::new(0),
             feed_lsn: AtomicU64::new(0),
             feed_last_message_ms: AtomicU64::new(0),
+            freshness: crate::sync::heartbeat::Freshness::default(),
             process_rss_bytes: AtomicU64::new(0),
             engine: Mutex::new(Engine::default()),
             pushes: Mutex::new(HashMap::new()),
@@ -547,7 +551,7 @@ impl Stats {
     }
 
     /// Fresh measurements behind a shared handle, using `prefix` for metric names.
-    pub(crate) fn shared_with_metric_prefix(prefix: String) -> Arc<Self> {
+    pub fn shared_with_metric_prefix(prefix: String) -> Arc<Self> {
         Arc::new(Self::with_metric_prefix(prefix))
     }
 

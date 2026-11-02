@@ -268,7 +268,7 @@ pub struct DbTable {
 /// key followed by `:` (and preceded by `,` after the first) with the
 /// type the column declares. A row on that layout is then written as the
 /// head, each column's key bytes and value, and `}}`, with no lookup or
-/// escaping per cell (`client::wire::write_put`). Built by
+/// escaping per cell (`wire::write_put`). Built by
 /// [`DbTable::new`], so once per table when the catalog is read and once
 /// more when a migration adds the table or a column to it.
 #[derive(Debug, PartialEq, Eq)]
@@ -333,6 +333,28 @@ fn json_string(out: &mut Vec<u8>, text: &str) {
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     tables: HashMap<TableName, DbTable>,
+    /// Type OIDs of the database's enums and their array types: a bound
+    /// parameter of one of these carries its label as text.
+    enum_oids: std::collections::HashSet<u32>,
+    /// Text-carried columns Postgres orders as the engine compares their
+    /// text, byte by byte: a `uuid`, a `bytea`'s hex, or a string under
+    /// the `C` collation. Any other text-carried column (an enum, a
+    /// string under a linguistic collation, an `inet`) orders otherwise.
+    ordered_as_text: std::collections::HashSet<(TableName, ColumnName)>,
+    /// Columns Postgres compares by rules other than the engine's: a
+    /// string under a nondeterministic collation, `citext`, `char(n)`, an
+    /// interval, a network address, whose distinct texts can be equal; a
+    /// `numeric`, `money` or `real`, which the engine carries inexactly as
+    /// a `float8`. A column not named here compares as the engine does.
+    compared_otherwise: std::collections::HashSet<(TableName, ColumnName)>,
+    /// Whether the database's default collation orders strings byte by
+    /// byte, so a string column a migration adds under it orders as its
+    /// text; false when not known.
+    bytewise_default: bool,
+    /// Tables with row-level security enabled: who may see a row depends
+    /// on the reader's role and session, which the engine, reading as
+    /// its own, cannot apply for a backend.
+    row_secured: std::collections::HashSet<TableName>,
 }
 
 impl Catalog {
@@ -343,7 +365,134 @@ impl Catalog {
                 .into_iter()
                 .map(|table| (table.name.clone(), table))
                 .collect(),
+            enum_oids: std::collections::HashSet::new(),
+            ordered_as_text: std::collections::HashSet::new(),
+            compared_otherwise: std::collections::HashSet::new(),
+            bytewise_default: false,
+            row_secured: std::collections::HashSet::new(),
         }
+    }
+
+    /// The same catalog knowing these tables have row-level security
+    /// enabled, and no others.
+    pub fn with_row_secured(mut self, tables: impl IntoIterator<Item = TableName>) -> Self {
+        self.row_secured = tables.into_iter().collect();
+        self
+    }
+
+    /// Whether `table` has row-level security enabled.
+    pub fn is_row_secured(&self, table: &TableName) -> bool {
+        self.row_secured.contains(table)
+    }
+
+    /// The tables this catalog knows have row-level security enabled,
+    /// for a catalog built from this one to carry.
+    pub fn row_secured(&self) -> impl Iterator<Item = &TableName> + '_ {
+        self.row_secured.iter()
+    }
+
+    /// The same catalog knowing whether the database's default collation
+    /// orders strings byte by byte.
+    pub fn with_bytewise_default(mut self, bytewise: bool) -> Self {
+        self.bytewise_default = bytewise;
+        self
+    }
+
+    /// Whether the database's default collation orders strings byte by
+    /// byte, as far as this catalog knows.
+    pub fn bytewise_default(&self) -> bool {
+        self.bytewise_default
+    }
+
+    /// The same catalog knowing these type OIDs are enums (or arrays of
+    /// enums).
+    pub fn with_enum_oids(mut self, oids: impl IntoIterator<Item = u32>) -> Self {
+        self.enum_oids = oids.into_iter().collect();
+        self
+    }
+
+    /// Whether a bound parameter of type `oid` is an enum label or an
+    /// array of them, which the wire carries as text.
+    pub fn is_enum_oid(&self, oid: u32) -> bool {
+        self.enum_oids.contains(&oid)
+    }
+
+    /// The enum type OIDs this catalog knows, for a catalog built from
+    /// this one to carry.
+    pub fn enum_oids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.enum_oids.iter().copied()
+    }
+
+    /// The same catalog knowing these text-carried columns order in
+    /// Postgres as their text does, byte by byte.
+    pub fn with_ordered_as_text(
+        mut self,
+        columns: impl IntoIterator<Item = (TableName, ColumnName)>,
+    ) -> Self {
+        self.ordered_as_text = columns.into_iter().collect();
+        self
+    }
+
+    /// Whether Postgres orders `table.column` as the engine compares it.
+    /// Numbers, booleans and times do, unless the catalog was told they
+    /// compare by rules of their own (a `numeric`, carried inexactly); a
+    /// text-carried column only when the catalog was told so; JSON and
+    /// lists never do.
+    pub fn orders_as_engine(&self, table: &TableName, column: &ColumnName) -> bool {
+        if self
+            .compared_otherwise
+            .contains(&(table.clone(), column.clone()))
+        {
+            return false;
+        }
+        match self
+            .table(table.as_str())
+            .and_then(|held| held.column(column.as_str()))
+            .map(|declared| &declared.r#type)
+        {
+            Some(ValueType::String) => self
+                .ordered_as_text
+                .contains(&(table.clone(), column.clone())),
+            Some(ValueType::Json | ValueType::List(_)) | None => false,
+            Some(_) => true,
+        }
+    }
+
+    /// The text-carried columns this catalog knows order as text, for a
+    /// catalog built from this one to carry.
+    pub fn ordered_as_text(&self) -> impl Iterator<Item = &(TableName, ColumnName)> + '_ {
+        self.ordered_as_text.iter()
+    }
+
+    /// The same catalog knowing Postgres decides equality on these
+    /// text-carried columns by rules of their own, and on no others.
+    pub fn with_compared_otherwise(
+        mut self,
+        columns: impl IntoIterator<Item = (TableName, ColumnName)>,
+    ) -> Self {
+        self.compared_otherwise = columns.into_iter().collect();
+        self
+    }
+
+    /// Whether Postgres decides `table.column = value` as the engine
+    /// does: unless the catalog was told the column compares by rules of
+    /// its own.
+    pub fn equals_as_engine(&self, table: &TableName, column: &ColumnName) -> bool {
+        match self
+            .table(table.as_str())
+            .and_then(|held| held.column(column.as_str()))
+        {
+            Some(_) => !self
+                .compared_otherwise
+                .contains(&(table.clone(), column.clone())),
+            None => false,
+        }
+    }
+
+    /// The columns this catalog knows compare by rules of their own, for
+    /// a catalog built from this one to carry.
+    pub fn compared_otherwise(&self) -> impl Iterator<Item = &(TableName, ColumnName)> + '_ {
+        self.compared_otherwise.iter()
     }
 
     /// The schema of table `name`, if the catalog contains it.

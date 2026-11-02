@@ -83,19 +83,31 @@
 //! its filter holds from the first page on, no fewer than past the
 //! cursor — so a page turn asks nothing the first page did not.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 
-use super::ast::Translated;
+use crate::ivm::QueryPart;
 use crate::log::{Level, log_event};
 use crate::model::{
     ColumnName, ComparisonOperator, Condition, Driver, Join, MultiTableReadQuery,
     SingleTableReadQuery, Value,
 };
 use crate::sync::{Storage, StorageError};
+
+/// A translated query: the tree to register, the parts whose rows stay
+/// on the server (permission subqueries), and, when a page of it has a
+/// keyset cursor, the same tree with every cursor left out — what the
+/// planner estimates its sizes on, so a page turn asks nothing a first
+/// page did not.
+#[derive(Debug, Clone)]
+pub struct Translated {
+    pub query: MultiTableReadQuery,
+    pub hidden: HashSet<QueryPart>,
+    pub uncursored: Option<MultiTableReadQuery>,
+}
 
 /// Which side of an inner edge drives when reading a node whole and
 /// having its subs drive it hold the same.

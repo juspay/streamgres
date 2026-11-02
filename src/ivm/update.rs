@@ -2,7 +2,7 @@
 //! with everything it applies to. The engine knows subscriptions, never
 //! clients: which client or socket a subscription belongs to, what that
 //! client already holds and what it should therefore be sent are the
-//! transport's business ([`crate::client`]'s row ledger).
+//! transport's business (the client side's row ledger).
 //!
 //! Inside the engine every operation is produced per *audience*: one
 //! single-table subscription, or, in the join layer, one part of a tree

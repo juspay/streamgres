@@ -90,6 +90,10 @@ pub struct Transaction {
     pub received: Instant,
     pub committed_at_micros: i64,
     pub decode: Duration,
+    /// The engine's heartbeat this mark carries, passed to every consumer
+    /// once every transaction before it is applied
+    /// ([`crate::sync::heartbeat`]).
+    pub heartbeat: Option<u64>,
 }
 
 impl Transaction {
@@ -131,6 +135,7 @@ impl Transaction {
             received: Instant::now(),
             committed_at_micros: 0,
             decode: Duration::ZERO,
+            heartbeat: None,
         }
     }
 
@@ -149,11 +154,14 @@ impl Transaction {
 /// watched writes are one event.
 ///
 /// - `Registered`: the subscription a [`Command::Register`] became, with
-///   that command's `token`, the rows it was served at once (a twin's) and
+///   that command's `token`, the rows it was served at once (a twin's),
 ///   `reads`, how many storage reads the registration issued (zero when
-///   the frames already held answered it). It precedes every other event
-///   about the subscription.
-/// - `Landed`: a storage read landed, with the deltas it produced.
+///   the frames already held answered it), and the engine's `position`
+///   then: every change committed at or below it was applied before the
+///   subscription began, and none after it goes unreported. It precedes
+///   every other event about the subscription.
+/// - `Landed`: a storage read landed, with the deltas it produced and the
+///   engine's `position`, which the read was brought up to.
 /// - `Refused`: a storage read the subscription depended on was refused
 ///   (it returned more rows than a read may), so the subscription is gone;
 ///   `reason` is what the client can be told.
@@ -173,6 +181,12 @@ impl Transaction {
 ///   least half the row limit: a query to report by name before it grows
 ///   into the limit and is refused. Sent once per read, to the owner of
 ///   one subscription of the tree.
+/// - `Heartbeat`: the engine's heartbeat `heartbeat` was applied
+///   ([`crate::sync::heartbeat`]), with the engine's `position` then;
+///   sent to every consumer behind the events of every transaction
+///   before it, so a consumer that has passed on those events can take
+///   the heartbeat as applied and every change up to the position as
+///   passed on, even one that has heard of no change for a while.
 #[derive(Debug)]
 pub enum Event {
     Registered {
@@ -180,9 +194,11 @@ pub enum Event {
         sub: SubId,
         updates: Vec<Delta>,
         reads: usize,
+        position: Lsn,
     },
     Landed {
         updates: Vec<Delta>,
+        position: Lsn,
     },
     Refused {
         sub: SubId,
@@ -205,6 +221,10 @@ pub enum Event {
         table: TableName,
         rows: u64,
     },
+    Heartbeat {
+        heartbeat: u64,
+        position: Lsn,
+    },
 }
 
 /// How a step ended: what its deltas travel inside of.
@@ -214,6 +234,7 @@ enum Outcome {
         token: u64,
         sub: SubId,
         reads: usize,
+        position: Lsn,
     },
     Landed,
     Committed {
@@ -234,6 +255,9 @@ pub struct Service<E: Engine, S: Storage> {
     commands: mpsc::Receiver<Command<E::Query>>,
     feed: Option<mpsc::Receiver<Transaction>>,
     sinks: Vec<mpsc::UnboundedSender<Event>>,
+    /// The sinks told of every commit, one with nothing for them
+    /// included ([`Service::with_every_commit`]).
+    every_commit: Vec<usize>,
     stats: Option<Arc<Stats>>,
     /// The sink every live subscription belongs to: where its deltas and
     /// whatever else concerns it are sent.
@@ -290,6 +314,7 @@ where
             commands,
             feed: None,
             sinks: vec![events],
+            every_commit: Vec::new(),
             stats: None,
             owners: IdMap::default(),
             awaiting: IdMap::default(),
@@ -328,6 +353,17 @@ where
         if !sinks.is_empty() {
             self.sinks = sinks;
         }
+        self
+    }
+
+    /// Tell the sinks at `indices` of every commit, even one with nothing
+    /// for them. With several sinks, a serving engine wakes a sink only
+    /// for a commit that changes its subscriptions or carries a watched
+    /// write; a sink whose clients wait on the engine's position (the
+    /// live task, [`crate::live`], whose backends read their own writes
+    /// once it is past them) must hear it move on every commit.
+    pub fn with_every_commit(mut self, indices: &[usize]) -> Self {
+        self.every_commit = indices.to_vec();
         self
     }
 
@@ -436,6 +472,7 @@ where
                         token,
                         sub,
                         reads,
+                        position: self.runtime.position(),
                     },
                 );
                 self.settle(&[sub]);
@@ -478,6 +515,7 @@ where
             received,
             committed_at_micros,
             decode,
+            heartbeat,
         } = transaction;
         let started = Instant::now();
         let mut step = Step::default();
@@ -557,6 +595,14 @@ where
                 routed,
             },
         );
+        if let Some(n) = heartbeat {
+            for sink in &self.sinks {
+                let _ = sink.send(Event::Heartbeat {
+                    heartbeat: n,
+                    position,
+                });
+            }
+        }
         self.reap();
     }
 
@@ -580,7 +626,9 @@ where
         for change in changes {
             let table = match change {
                 SchemaChange::TableAdded { table } => &table.name,
-                SchemaChange::ColumnAdded { table, .. } => table,
+                SchemaChange::ColumnAdded { table, .. } | SchemaChange::RowSecurity { table, .. } => {
+                    table
+                }
             };
             if !touched.contains(table) {
                 touched.push(table.clone());
@@ -739,6 +787,7 @@ where
                 token,
                 sub,
                 reads,
+                position,
             } => {
                 self.send_to(
                     sink,
@@ -747,13 +796,18 @@ where
                         sub,
                         updates,
                         reads,
+                        position,
                     },
                 );
             }
             Outcome::Landed => {
+                let position = self.runtime.position();
                 for (sink, batch) in self.sinks.iter().zip(self.partition(updates)) {
                     if !batch.is_empty() {
-                        let _ = sink.send(Event::Landed { updates: batch });
+                        let _ = sink.send(Event::Landed {
+                            updates: batch,
+                            position,
+                        });
                     }
                 }
             }
@@ -765,8 +819,9 @@ where
                 routed,
             } => {
                 let skip_empty = self.serving && self.sinks.len() > 1 && watched.is_empty();
-                for (sink, batch) in self.sinks.iter().zip(self.partition(updates)) {
-                    if skip_empty && batch.is_empty() {
+                let batches = self.partition(updates);
+                for (index, (sink, batch)) in self.sinks.iter().zip(batches).enumerate() {
+                    if skip_empty && batch.is_empty() && !self.every_commit.contains(&index) {
                         continue;
                     }
                     let _ = sink.send(Event::Committed {

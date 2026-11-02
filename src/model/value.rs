@@ -48,9 +48,12 @@ pub enum ValueType {
     Datetime,
     List(Box<ValueType>),
     Map(Box<ValueType>, Box<ValueType>),
-    /// A point in time carried as milliseconds since the Unix epoch, the
-    /// form protocol clients see for `timestamp`, `timestamptz` and `date`
-    /// columns; the cell is a [`Value::Int`].
+    /// A point in time kept as microseconds since the Unix epoch, which
+    /// is Postgres's own precision for `timestamp`, `timestamptz` and
+    /// `date` columns; the cell is a [`Value::Int`]. The Zero protocol
+    /// sees milliseconds: its arguments are scaled up on the way in and
+    /// its rows scaled down on the way out; a server-to-server client
+    /// gets the microseconds as they are.
     Timestamp,
     /// A JSON document carried as its text, the form the engine keeps for
     /// `json` and `jsonb` columns; the cell is a [`Value::String`] and the

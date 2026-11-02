@@ -113,17 +113,7 @@ pub struct Correlation {
 /// them: the parent columns, the child columns and the child table.
 type Relationship<'a> = (&'a [String], &'a [String], &'a str);
 
-/// A translated query: the tree to register, the parts whose rows stay
-/// on the server (permission subqueries), and, when a page of it has a
-/// keyset cursor, the same tree with every cursor left out — what the
-/// planner estimates its sizes on, so a page turn asks nothing a first
-/// page did not.
-#[derive(Debug, Clone)]
-pub struct Translated {
-    pub query: MultiTableReadQuery,
-    pub hidden: HashSet<QueryPart>,
-    pub uncursored: Option<MultiTableReadQuery>,
-}
+pub use crate::plan::Translated;
 
 /// Translate `ast` against `catalog`; an error says what the engine
 /// cannot run.
@@ -553,25 +543,18 @@ fn simple(op: &str, left: &Operand, right: &Operand, table: &DbTable) -> Result<
         ">=" => GTE,
         "IN" => IN,
         "NOT IN" => NOT_IN,
-        "IS" => {
-            return Ok(if literal.is_null() {
-                Where::is_null(name.as_str())
-            } else {
-                Where::condition(name.as_str(), EQ, literal_value(literal, &column.r#type)?)
-            });
-        }
-        "IS NOT" => {
-            return Ok(if literal.is_null() {
-                Where::is_not_null(name.as_str())
-            } else {
-                Where::condition(name.as_str(), NEQ, literal_value(literal, &column.r#type)?)
-            });
-        }
+        "IS" if literal.is_null() => return Ok(Where::is_null(name.as_str())),
+        "IS NOT" if literal.is_null() => return Ok(Where::is_not_null(name.as_str())),
+        "IS" => EQ,
+        "IS NOT" => NEQ,
         "LIKE" | "ILIKE" | "NOT LIKE" | "NOT ILIKE" => {
             return Err(format!("{op} is not supported (a condition on `{name}`)"));
         }
         other => return Err(format!("unknown operator `{other}`")),
     };
+    if column.r#type == ValueType::Timestamp && !literal.is_null() {
+        return time_condition(name.as_str(), operator, literal);
+    }
     let value = if matches!(
         operator,
         ComparisonOperator::IN | ComparisonOperator::NOT_IN
@@ -591,10 +574,78 @@ fn simple(op: &str, left: &Operand, right: &Operand, table: &DbTable) -> Result<
     Ok(Where::condition(name.as_str(), operator, value))
 }
 
+/// `column op literal` on a time column, as Zero means it. The engine
+/// keeps a time in microseconds and Zero sees its whole milliseconds,
+/// so the comparison is on the millisecond: `= m` holds for every
+/// microsecond of `m`, `> m` from the next millisecond on, `<= m` up to
+/// the end of `m`, and a fractional literal compares as a whole number
+/// of milliseconds would against it.
+fn time_condition(column: &str, op: ComparisonOperator, literal: &Json) -> Result<Where, String> {
+    let millis_of = |literal: &Json| -> Result<Option<f64>, String> {
+        match literal {
+            Json::Null => Ok(None),
+            Json::Number(number) => Ok(number.as_f64()),
+            Json::String(text) => text
+                .parse::<f64>()
+                .map(Some)
+                .map_err(|_| format!("`{text}` is not a number")),
+            other => Err(format!("{other} is not a time")),
+        }
+    };
+    let micros = |millis: f64| Value::Int((millis as i64).saturating_mul(1000));
+    let at_least = |millis: f64| Where::condition(column, GTE, micros(millis));
+    let below = |millis: f64| Where::condition(column, LT, micros(millis));
+    let within = |millis: f64| -> Where {
+        if millis.fract() == 0.0 {
+            Where::AND(vec![at_least(millis), below(millis + 1.0)])
+        } else {
+            Where::OR(Vec::new())
+        }
+    };
+    let outside = |millis: f64| -> Where {
+        if millis.fract() == 0.0 {
+            Where::OR(vec![below(millis), at_least(millis + 1.0)])
+        } else {
+            Where::is_not_null(column)
+        }
+    };
+    if matches!(op, IN | NOT_IN) {
+        let Json::Array(items) = literal else {
+            return Err(format!("{op:?} on `{column}` needs a list"));
+        };
+        let mut members = Vec::with_capacity(items.len());
+        for item in items {
+            members.push(millis_of(item)?);
+        }
+        if op == NOT_IN && members.iter().any(Option::is_none) {
+            return Ok(Where::OR(Vec::new()));
+        }
+        let members = members.into_iter().flatten();
+        return Ok(if op == IN {
+            Where::OR(members.map(within).collect())
+        } else {
+            Where::AND(members.map(outside).chain([Where::is_not_null(column)]).collect())
+        });
+    }
+    let Some(millis) = millis_of(literal)? else {
+        return Ok(Where::OR(Vec::new()));
+    };
+    Ok(match op {
+        EQ => within(millis),
+        NEQ => outside(millis),
+        GT => at_least(millis.floor() + 1.0),
+        GTE => at_least(millis.ceil()),
+        LT => below(millis.ceil()),
+        LTE => below(millis.floor() + 1.0),
+        other => return Err(format!("{other:?} does not compare times")),
+    })
+}
+
 /// A JSON literal as the value a column of type `declared` compares
 /// against. A JSON column's cells are the text `jsonb` writes, so a literal
 /// against one, whatever its kind, is that text: the string `x` is `"x"`,
-/// a number its digits, an object its canonical form.
+/// a number its digits, an object its canonical form. A time literal is
+/// the protocol's milliseconds, kept as microseconds.
 fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> {
     Ok(match (literal, declared) {
         (Json::Null, _) => Value::Null,
@@ -607,6 +658,10 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
             Value::Float(number.as_f64().unwrap_or(f64::NAN))
         }
         (Json::Number(number), ValueType::String) => Value::String(number.to_string()),
+        (Json::Number(number), ValueType::Timestamp) => match number.as_i64() {
+            Some(millis) => Value::Int(millis.saturating_mul(1000)),
+            None => Value::Float(number.as_f64().unwrap_or(f64::NAN) * 1000.0),
+        },
         (Json::Number(number), _) => match number.as_i64() {
             Some(int) => Value::Int(int),
             None => Value::Float(number.as_f64().unwrap_or(f64::NAN)),
@@ -614,7 +669,11 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
         (Json::String(text), _) if text.contains('\0') => {
             return Err("a text value contains a NUL byte".to_owned());
         }
-        (Json::String(text), ValueType::Int | ValueType::Timestamp) => text
+        (Json::String(text), ValueType::Timestamp) => text
+            .parse::<i64>()
+            .map(|millis| Value::Int(millis.saturating_mul(1000)))
+            .map_err(|_| format!("`{text}` is not a number"))?,
+        (Json::String(text), ValueType::Int) => text
             .parse::<i64>()
             .map(Value::Int)
             .map_err(|_| format!("`{text}` is not a number"))?,
@@ -644,6 +703,8 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
 /// columns, the appended primary key in particular, and is then compared
 /// on the prefix it has), earlier columns tied and the column itself
 /// strictly past the cursor, plus the cursor row itself when inclusive.
+/// A time column is compared on its milliseconds, as Zero sees it
+/// ([`time_condition`]).
 fn keyset(bound: &Bound, order: &[OrderBy], table: &DbTable) -> Result<Where, String> {
     let mut keys = Vec::with_capacity(order.len());
     for clause in order {
@@ -655,31 +716,35 @@ fn keyset(bound: &Bound, order: &[OrderBy], table: &DbTable) -> Result<Where, St
             .column(name)
             .ok_or_else(|| format!("unknown column `{name}`"))?
             .r#type;
-        keys.push((name, clause.direction, literal_value(literal, declared)?));
+        keys.push(CursorKey {
+            column: name,
+            direction: clause.direction,
+            literal,
+            value: literal_value(literal, declared)?,
+            time: *declared == ValueType::Timestamp && !literal.is_null(),
+        });
     }
     if keys.is_empty() {
         return Err("the cursor names none of the sort columns".to_owned());
     }
     let mut branches = Vec::with_capacity(keys.len() + 1);
-    for (index, (column, direction, value)) in keys.iter().enumerate() {
-        let op = match direction {
+    for (index, key) in keys.iter().enumerate() {
+        let op = match key.direction {
             Order::ASC => GT,
             Order::DESC => LT,
         };
-        let mut conjuncts: Vec<Where> = keys[..index]
+        let mut conjuncts = keys[..index]
             .iter()
-            .map(|(earlier, _, earlier_value)| {
-                Where::condition(*earlier, EQ, earlier_value.clone())
-            })
-            .collect();
-        conjuncts.push(Where::condition(*column, op, value.clone()));
+            .map(|earlier| earlier.compared(EQ))
+            .collect::<Result<Vec<Where>, String>>()?;
+        conjuncts.push(key.compared(op)?);
         branches.push(collapse(conjuncts));
     }
     if !bound.exclusive {
         branches.push(collapse(
             keys.iter()
-                .map(|(column, _, value)| Where::condition(*column, EQ, value.clone()))
-                .collect(),
+                .map(|key| key.compared(EQ))
+                .collect::<Result<Vec<Where>, String>>()?,
         ));
     }
     Ok(if branches.len() == 1 {
@@ -687,6 +752,28 @@ fn keyset(bound: &Bound, order: &[OrderBy], table: &DbTable) -> Result<Where, St
     } else {
         Where::OR(branches)
     })
+}
+
+/// One sort column a cursor names: its literal, and the value the
+/// engine compares it as.
+struct CursorKey<'a> {
+    column: &'a str,
+    direction: Order,
+    literal: &'a Json,
+    value: Value,
+    time: bool,
+}
+
+impl CursorKey<'_> {
+    /// The column compared with the cursor's value by `op`; a time on
+    /// its milliseconds.
+    fn compared(&self, op: ComparisonOperator) -> Result<Where, String> {
+        if self.time {
+            time_condition(self.column, op, self.literal)
+        } else {
+            Ok(Where::condition(self.column, op, self.value.clone()))
+        }
+    }
 }
 
 /// One part is itself; several are an `AND`; none is `TRUE`.
@@ -967,13 +1054,51 @@ mod tests {
 
     /// A cursor that stops short of the appended primary key is compared
     /// on the columns it has; one that names no sort column is refused.
+    /// Zero sees a time as its whole milliseconds: a filter or a cursor
+    /// on a time holds for every microsecond of the millisecond it
+    /// names, so rows a few hundred microseconds apart compare equal, as
+    /// they do on the client, and a page's cursor loses none of them.
+    #[test]
+    fn a_time_compares_on_its_millisecond() {
+        use crate::ivm::evaluate;
+        use crate::model::RowData;
+        let message = |id: &str, micros: i64| {
+            RowData::from(std::collections::HashMap::from([
+                (crate::model::ColumnName::from("messageId"), Value::from(id)),
+                (crate::model::ColumnName::from("createdAt"), Value::Int(micros)),
+            ]))
+        };
+        let (early, late, before, after) = (
+            message("a", 7_000_300),
+            message("b", 7_000_700),
+            message("c", 6_999_999),
+            message("d", 7_001_000),
+        );
+        let filter_of = |json: &str| {
+            let ast: Ast = serde_json::from_str(json).unwrap();
+            translate(&ast, &catalog()).unwrap().query.main_table.filter
+        };
+        let holds = |filter: &Where, row: &RowData| evaluate(filter, row, &mut 0);
+        let equal = filter_of(r#"{"table": "messages", "where": {"type": "simple", "op": "=", "left": {"type": "column", "name": "createdAt"}, "right": {"type": "literal", "value": 7000}}}"#);
+        assert!(holds(&equal, &early) && holds(&equal, &late));
+        assert!(!holds(&equal, &before) && !holds(&equal, &after));
+        let at_most = filter_of(r#"{"table": "messages", "where": {"type": "simple", "op": "<=", "left": {"type": "column", "name": "createdAt"}, "right": {"type": "literal", "value": 7000}}}"#);
+        assert!(holds(&at_most, &late) && !holds(&at_most, &after));
+        let next_page = filter_of(r#"{"table": "messages", "orderBy": [["createdAt", "desc"], ["messageId", "desc"]], "start": {"row": {"createdAt": 7000, "messageId": "b"}, "exclusive": true}, "limit": 5}"#);
+        assert!(holds(&next_page, &early), "the same millisecond, a lower key");
+        assert!(holds(&next_page, &before));
+        assert!(!holds(&next_page, &late) && !holds(&next_page, &after));
+    }
+
+    /// A cursor compares on the prefix of the order it names, its
+    /// milliseconds kept as microseconds.
     #[test]
     fn cursors_compare_on_their_prefix() {
         let ast: Ast = serde_json::from_str(r#"{"table": "messages", "orderBy": [["createdAt", "desc"]], "start": {"row": {"createdAt": 1000}, "exclusive": true}, "limit": 5}"#).unwrap();
         let translated = translate(&ast, &catalog()).unwrap();
         assert_eq!(
             translated.query.main_table.filter,
-            Where::condition("createdAt", LT, Value::Int(1000))
+            Where::condition("createdAt", LT, Value::Int(1_000_000))
         );
         let empty: Ast = serde_json::from_str(r#"{"table": "messages", "orderBy": [["createdAt", "desc"]], "start": {"row": {"other": 1}, "exclusive": true}}"#).unwrap();
         assert!(

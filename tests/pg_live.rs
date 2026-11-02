@@ -4,34 +4,35 @@
 //! mirrored in memory; and schema changes followed through the
 //! schema-change trigger stack. They run only when `STREAMGRES_PG_DSN` names a
 //! database with `wal_level = logical` (and free replication slots), and
-//! report themselves skipped otherwise; each scenario uses its own tables
-//! and slot, so they can run in parallel.
+//! report themselves skipped otherwise; each scenario runs in a database
+//! of its own ([`support::Database`]), so they can run in parallel without
+//! one's schema-change triggers firing on another's statements.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
-use tokio::task::{LocalSet, spawn_local};
-use tokio_postgres::{Client, NoTls};
 use streamgres::ivm::{Delta, Engine, Fetch, MultiTableIVM, QueryPart};
 use streamgres::model::*;
-use streamgres::client::ddl_triggers::trigger_stack_sql;
 use streamgres::sync::pg::ddl::DdlSource;
+use streamgres::sync::pg::ddl_triggers::trigger_stack_sql;
 use streamgres::sync::pg::estimate_cache::EstimateCache;
 use streamgres::sync::pg::{PgStorage, PgStream};
 use streamgres::sync::{
     CatalogHandle, Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
 };
+use tokio::sync::mpsc;
+use tokio::task::{LocalSet, spawn_local};
+use tokio_postgres::{Client, NoTls};
 
-/// The database under test, if any.
-fn dsn() -> Option<String> {
-    let dsn = std::env::var("STREAMGRES_PG_DSN").ok();
-    if dsn.is_none() {
-        eprintln!("STREAMGRES_PG_DSN not set: live Postgres scenario skipped");
-    }
-    dsn
+mod support;
+
+use support::Database;
+
+/// A database of the test tagged `tag`'s own, if a server is named.
+fn dsn(tag: &str) -> Option<Database> {
+    Database::create(tag)
 }
 
 /// Run `body` on a current-thread runtime with a local task set (the
@@ -272,7 +273,7 @@ async fn drain(
 /// image.
 #[test]
 fn registration_behind_open_snapshot() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("registration_behind_open_snapshot") else { return };
     block_on(async {
         let names = Names::new("wal");
         let client = prepare(&dsn, &names).await;
@@ -391,7 +392,7 @@ fn registration_behind_open_snapshot() {
 /// holds, and the mirror follows the stream.
 #[test]
 fn service_streams_end_to_end() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("service_streams_end_to_end") else { return };
     block_on(async {
         let names = Names::new("service");
         let client = prepare(&dsn, &names).await;
@@ -432,6 +433,7 @@ fn service_streams_end_to_end() {
                     catalog: None,
                     received: Instant::now(),
                     committed_at_micros: 0,
+                    heartbeat: None,
                     decode: std::time::Duration::ZERO,
                 }))
                 .await
@@ -499,7 +501,7 @@ fn service_streams_end_to_end() {
         loop {
             match tokio::time::timeout(Duration::from_millis(200), events.recv()).await {
                 Ok(Some(
-                    Event::Landed { updates: batch }
+                    Event::Landed { updates: batch, .. }
                     | Event::Committed { updates: batch, .. }
                     | Event::Registered { updates: batch, .. },
                 )) => {
@@ -557,7 +559,7 @@ fn service_streams_end_to_end() {
 /// into `mutationsPatch` entries.
 #[test]
 fn mutation_results_travel_the_feed() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("mutation_results_travel_the_feed") else { return };
     block_on(async {
         let names = Names::new("results");
         let client = prepare(&dsn, &names).await;
@@ -651,7 +653,7 @@ fn mutation_results_travel_the_feed() {
 /// connections, and every one of them succeeds.
 #[test]
 fn reads_queue_at_the_connection_bound() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("reads_queue_at_the_connection_bound") else { return };
     block_on(async {
         let names = Names::new("pool");
         let client = prepare(&dsn, &names).await;
@@ -701,7 +703,7 @@ fn reads_queue_at_the_connection_bound() {
 /// 10, so a planner learns whether a side fits without scanning it whole.
 #[test]
 fn a_count_stops_at_the_cap_on_the_snapshot() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("a_count_stops_at_the_cap_on_the_snapshot") else { return };
     block_on(async {
         let names = Names::new("count");
         let client = prepare(&dsn, &names).await;
@@ -798,7 +800,7 @@ fn a_count_stops_at_the_cap_on_the_snapshot() {
 /// passes the cap.
 #[test]
 fn an_estimate_sizes_a_tree_without_counting_it() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("an_estimate_sizes_a_tree_without_countin") else { return };
     block_on(async {
         let names = Names::new("estimate");
         let client = prepare(&dsn, &names).await;
@@ -887,7 +889,7 @@ fn an_estimate_sizes_a_tree_without_counting_it() {
 /// table.
 #[test]
 fn an_estimate_is_remembered_until_its_table_moves() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("an_estimate_is_remembered_until_its_tabl") else { return };
     block_on(async {
         let names = Names::new("estcache");
         let client = prepare(&dsn, &names).await;
@@ -947,7 +949,7 @@ fn an_estimate_is_remembered_until_its_table_moves() {
 /// window bounds it before the budget does.
 #[test]
 fn a_read_past_the_row_budget_is_refused() {
-    let Some(dsn) = dsn() else {
+    let Some(dsn) = dsn("a_read_past_the_row_budget_is_refused") else {
         return;
     };
     block_on(async {
@@ -1004,7 +1006,7 @@ fn a_read_past_the_row_budget_is_refused() {
 /// Postgres used to refuse.
 #[test]
 fn a_json_column_is_filtered_by_value() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("a_json_column_is_filtered_by_value") else { return };
     block_on(async {
         let table = "live_json_values";
         let slot = "xyne_sync_live_json";
@@ -1155,7 +1157,7 @@ fn a_json_column_is_filtered_by_value() {
 /// leaf on the key, counts through the edge's semi-join.
 #[test]
 fn a_compound_key_is_served_by_postgres() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("a_compound_key_is_served_by_postgres") else { return };
     block_on(async {
         let parents = "live_compound_parents";
         let children = "live_compound_children";
@@ -1286,7 +1288,7 @@ fn a_compound_key_is_served_by_postgres() {
 /// is set, the same test sends its reads through that endpoint.
 #[test]
 fn a_read_past_its_time_is_refused() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("a_read_past_its_time_is_refused") else { return };
     let read_dsn = std::env::var("STREAMGRES_READ_PG_DSN").unwrap_or_else(|_| dsn.clone());
     block_on(async {
         let names = Names::new("timeout");
@@ -1362,7 +1364,7 @@ fn a_read_past_its_time_is_refused() {
 /// storage are, which is what a server waits for before it serves.
 #[test]
 fn an_idle_feed_brings_the_first_snapshot_into_use() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("an_idle_feed_brings_the_first_snapshot_i") else { return };
     block_on(async {
         let names = Names::new("idle");
         let client = prepare(&dsn, &names).await;
@@ -1443,7 +1445,7 @@ fn owners_added(events: &[Event], table: &str) -> BTreeMap<i64, Option<Value>> {
     for event in events {
         let updates: &[Delta] = match event {
             Event::Registered { updates, .. }
-            | Event::Landed { updates }
+            | Event::Landed { updates, .. }
             | Event::Committed { updates, .. } => updates,
             _ => &[],
         };
@@ -1471,7 +1473,7 @@ fn owners_added(events: &[Event], table: &str) -> BTreeMap<i64, Option<Value>> {
 /// reason.
 #[test]
 fn schema_changes_follow_the_trigger() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("schema_changes_follow_the_trigger") else { return };
     block_on(async {
         let names = Names::new("ddl");
         let client = prepare(&dsn, &names).await;
@@ -1480,6 +1482,7 @@ fn schema_changes_follow_the_trigger() {
         let source = DdlSource {
             prefix: "xslive/0/ddl".to_owned(),
             schemas: vec!["public".to_owned()],
+            publication: names.publication.clone(),
         };
         let stream = PgStream::open_with(
             &dsn,
@@ -1631,7 +1634,7 @@ fn schema_changes_follow_the_trigger() {
         let extra_ids: Vec<i64> = extra
             .iter()
             .flat_map(|event| match event {
-                Event::Registered { updates, .. } | Event::Landed { updates } => updates.as_slice(),
+                Event::Registered { updates, .. } | Event::Landed { updates, .. } => updates.as_slice(),
                 _ => &[],
             })
             .filter_map(|delta| match &delta.op {
@@ -1686,7 +1689,7 @@ fn schema_changes_follow_the_trigger() {
 /// the frame without `md`: the frame ends equal to what Postgres holds.
 #[test]
 fn unchanged_out_of_line_values_are_never_lost() {
-    let Some(dsn) = dsn() else { return };
+    let Some(dsn) = dsn("unchanged_out_of_line_values_are_never_l") else { return };
     block_on(async {
         let names = Names::new("toast");
         let table = names.extra.clone();
@@ -1847,3 +1850,196 @@ fn unchanged_out_of_line_values_are_never_lost() {
         cleanup(&dsn, &client, &names).await;
     });
 }
+
+/// A range on a `timestamptz` column is read right whatever zone the
+/// session would otherwise run in: the engine keeps times as UTC
+/// microseconds and spells a time in a filter as a zone-less timestamp,
+/// which PostgreSQL reads in the session's zone, so the storage pins the
+/// session to UTC after whatever the connection string asks for. A
+/// `timestamp` column, zone-less on both sides, reads the same either
+/// way. The desk's "created between" lookup missed every row on a
+/// server whose default zone was not UTC, until each row's next write.
+#[test]
+fn a_time_range_is_read_right_in_any_session_zone() {
+    let Some(dsn) = dsn("a_time_range_is_read_right_in_any_sessio") else { return };
+    block_on(async {
+        let table = "live_zone_events";
+        let slot = "xyne_sync_live_zone";
+        let publication = "xyne_sync_live_zone_pub";
+        let client = admin(&dsn).await;
+        PgStream::drop_slot(&dsn, slot, publication)
+            .await
+            .expect("drop slot");
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table};
+                 CREATE TABLE {table} (id int8 PRIMARY KEY, at timestamptz NOT NULL, naive timestamp NOT NULL);
+                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;
+                 INSERT INTO {table} VALUES
+                   (1, '2026-10-01 08:00:00+00', '2026-10-01 08:00:00'),
+                   (2, '2026-10-01 09:30:00+00', '2026-10-01 09:30:00'),
+                   (3, '2026-10-01 11:30:00+00', '2026-10-01 11:30:00'),
+                   (4, '2026-10-01 12:30:00+00', '2026-10-01 12:30:00');",
+            ))
+            .await
+            .expect("prepare");
+        let catalog = Arc::new(Catalog::new(vec![DbTable::new(
+            table,
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("at", ValueType::Timestamp),
+                DbColumn::new("naive", ValueType::Timestamp),
+            ],
+        )]));
+        let mut stream = PgStream::open(&dsn, slot, publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let mut config: tokio_postgres::Config = dsn.parse().expect("dsn");
+        config.options("-c TimeZone=Asia/Kolkata");
+        let storage = PgStorage::connect_configured(
+            config,
+            catalog.clone(),
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+
+        let micros = |hour: i64| -> Value {
+            let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+            let at = day.and_hms_opt(hour as u32, 0, 0).unwrap().and_utc();
+            Value::Int(at.timestamp_micros())
+        };
+        for column in ["at", "naive"] {
+            let query = SingleTableReadQuery::new(
+                table,
+                Where::AND(vec![
+                    Where::condition(column, ComparisonOperator::GTE, micros(9)),
+                    Where::condition(column, ComparisonOperator::LT, micros(12)),
+                ]),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            );
+            let snapshot = storage.select(&query).await.expect("select");
+            let read: BTreeSet<i64> = snapshot
+                .rows
+                .iter()
+                .filter_map(|(key, _)| match key.pkey_value.get("id") {
+                    Some(Value::Int(id)) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                read,
+                BTreeSet::from([2, 3]),
+                "the rows between 09:00 and 12:00 UTC by `{column}`, in a session asked for Asia/Kolkata"
+            );
+        }
+        let _ = client
+            .batch_execute(&format!("DROP TABLE IF EXISTS {table};"))
+            .await;
+        let _ = PgStream::drop_slot(&dsn, slot, publication).await;
+    });
+}
+
+/// Every time PostgreSQL can hold reaches the engine, through the
+/// snapshot and through the change feed: `infinity` and `-infinity` as
+/// the extreme microseconds (where they order, as PostgreSQL orders
+/// them), a BC date and a year past 9999 exactly. A single `infinity`
+/// in a published table used to stop the change feed, and the engine
+/// with it, on every restart until the row was changed by hand.
+#[test]
+fn every_time_postgres_holds_reaches_the_engine() {
+    let Some(dsn) = dsn("every_time_postgres_holds_reaches_the_en") else { return };
+    block_on(async {
+        let names = Names::new("infinite");
+        let table = names.extra.clone();
+        let client = prepare(&dsn, &names).await;
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE {table} (id int8 PRIMARY KEY, at timestamptz, naive timestamp, day date);
+                 INSERT INTO {table} VALUES
+                   (1, 'infinity', 'infinity', 'infinity'),
+                   (2, '-infinity', '-infinity', '-infinity'),
+                   (3, '4713-01-01 00:00:00+00 BC', '4713-01-01 00:00:00 BC', '4713-01-01 BC'),
+                   (4, '12345-06-07 08:09:10+00', '12345-06-07 08:09:10', '12345-06-07');"
+            ))
+            .await
+            .expect("times");
+        let catalog = Arc::new(Catalog::new(vec![DbTable::new(
+            table.as_str(),
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("at", ValueType::Timestamp),
+                DbColumn::new("naive", ValueType::Timestamp),
+                DbColumn::new("day", ValueType::Timestamp),
+            ],
+        )]));
+        let mut stream = PgStream::open(&dsn, &names.slot, &names.publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+        let expected = BTreeMap::from([
+            (1, i64::MAX),
+            (2, i64::MIN),
+            (3, -210_863_520_000_000_000),
+            (4, 327_416_976_550_000_000),
+        ]);
+        let read = |filter: Where| SingleTableReadQuery::new(table.as_str(), filter, OrderBy::new("id", Order::ASC), u32::MAX);
+        let snapshot = storage.select(&read(Where::AND(vec![]))).await.expect("select");
+        for (key, row) in &snapshot.rows {
+            let Some(Value::Int(id)) = key.pkey_value.get("id") else {
+                panic!("an id")
+            };
+            let day = if *id == 4 { 327_416_947_200_000_000 } else { expected[id] };
+            assert_eq!(row.data.get("at"), Some(&Value::Int(expected[id])), "at of {id}");
+            assert_eq!(row.data.get("naive"), Some(&Value::Int(expected[id])), "naive of {id}");
+            assert_eq!(row.data.get("day"), Some(&Value::Int(day)), "day of {id}");
+        }
+        assert_eq!(snapshot.rows.len(), 4);
+
+        let infinite = storage
+            .select(&read(Where::condition("at", ComparisonOperator::EQ, Value::Int(i64::MAX))))
+            .await
+            .expect("a condition on infinity renders");
+        assert_eq!(infinite.rows.len(), 1, "infinity finds its row");
+        let after = storage
+            .select(&read(Where::condition("at", ComparisonOperator::GT, Value::Int(0))))
+            .await
+            .expect("select");
+        assert_eq!(after.rows.len(), 2, "infinity and the year 12345 come after 1970");
+
+        client
+            .batch_execute(&format!(
+                "UPDATE {table} SET at = '-infinity', naive = '4713-01-01 00:00:00 BC' WHERE id = 1;
+                 INSERT INTO {table} VALUES (5, 'infinity', '12345-06-07 08:09:10', '-infinity');"
+            ))
+            .await
+            .expect("changes");
+        let mut images = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while images.len() < 2 {
+            assert!(Instant::now() < deadline, "the feed did not deliver both changes");
+            let batch = stream.poll().await.expect("the feed reads every time");
+            for (write, _) in batch.writes {
+                if let Some(image) = write.new_row_image() {
+                    images.push(image.data.clone());
+                }
+            }
+        }
+        assert_eq!(images[0].get("at"), Some(&Value::Int(i64::MIN)));
+        assert_eq!(images[0].get("naive"), Some(&Value::Int(-210_863_520_000_000_000)));
+        assert_eq!(images[1].get("at"), Some(&Value::Int(i64::MAX)));
+        assert_eq!(images[1].get("naive"), Some(&Value::Int(327_416_976_550_000_000)));
+        assert_eq!(images[1].get("day"), Some(&Value::Int(i64::MIN)));
+        cleanup(&dsn, &client, &names).await;
+    });
+}
+

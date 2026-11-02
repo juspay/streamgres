@@ -30,6 +30,7 @@ WITH published_columns AS (SELECT
   pc.relnamespace::int8 AS "schemaOID" ,
   pc.relname AS "name",
   pc.relreplident AS "replicaIdentity",
+  pc.relrowsecurity AS "rowSecurity",
   attnum AS "pos",
   attname AS "col",
   pt.typname AS "type",
@@ -37,6 +38,7 @@ WITH published_columns AS (SELECT
   pt.typtype,
   elem_pt.typtype AS "elemTyptype",
   coll.collisdeterministic AS "collationIsDeterministic",
+  coll.collname AS "collationName",
   NULLIF(atttypmod, -1) AS "maxLen",
   attndims "arrayDims",
   attnotnull AS "notNull",
@@ -66,6 +68,7 @@ tables AS (SELECT json_build_object(
   'schemaOID', "schemaOID",
   'name', "name",
   'replicaIdentity', "replicaIdentity",
+  'rowSecurity', "rowSecurity",
   'columns', json_object_agg(
     DISTINCT
     col,
@@ -78,6 +81,7 @@ tables AS (SELECT json_build_object(
       'elemPgTypeClass', "elemTyptype",
       'typeOID', "typeOID",
       'collationIsDeterministic', "collationIsDeterministic",
+      'collationName', "collationName",
       'characterMaximumLength', CASE WHEN "typeOID" = 1043 OR "typeOID" = 1042
                                      THEN "maxLen" - 4
                                      ELSE "maxLen" END,
@@ -98,7 +102,7 @@ tables AS (SELECT json_build_object(
     jsonb_build_object('rowFilter', "rowFilter") ORDER BY "publication"
   )
 ) AS "table", "schema", "name" FROM published_columns
-  GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity"),
+  GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity", "rowSecurity"),
 
   indexed_columns AS (SELECT
       pg_indexes.schemaname as "schema",
@@ -161,7 +165,10 @@ tables AS (SELECT json_build_object(
 
     SELECT json_build_object(
       'tables', COALESCE((SELECT json_agg("table" ORDER BY "schema", "name") FROM tables), '[]'::json),
-      'indexes', COALESCE((SELECT json_agg("index" ORDER BY "schema", "tableName", "name") FROM indexes), '[]'::json)
+      'indexes', COALESCE((SELECT json_agg("index" ORDER BY "schema", "tableName", "name") FROM indexes), '[]'::json),
+      'publications', COALESCE((SELECT json_object_agg(pubname, json_build_object(
+          'insert', pubinsert, 'update', pubupdate, 'delete', pubdelete, 'truncate', pubtruncate)
+          ORDER BY pubname) FROM pg_publication WHERE pubname IN ('xyne_sync_pub')), '{}'::json)
     ) as "publishedSchema"
 $$ LANGUAGE sql;
 
@@ -186,8 +193,6 @@ BEGIN
 
   IF prev_schema_specs::text != schema_specs::text THEN
     UPDATE "xyne_0"."publishedSchema" SET current = schema_specs;
-  ELSIF event_type = 'ddlStart' THEN
-    prev_schema_specs = NULL;
   ELSIF event_type = 'ddlUpdate' THEN
     PERFORM "xyne_0".notice_ignore('noop', tag, target);
     RETURN;
@@ -218,12 +223,8 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION "xyne_0".emit_ddl_start()
 RETURNS event_trigger AS $$
-DECLARE
-  schema_specs JSON;
-  message TEXT;
 BEGIN
   PERFORM pg_advisory_xact_lock(4353719051050729648);
-  PERFORM "xyne_0".update_schemas('ddlStart', TG_TAG, NULL);
 END
 $$ LANGUAGE plpgsql;
 
@@ -311,10 +312,25 @@ DROP EVENT TRIGGER IF EXISTS "xyne_ddl_end_0";
 
 CREATE EVENT TRIGGER "xyne_ddl_start_0"
   ON ddl_command_start
-  WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'DROP TABLE', 'DROP INDEX', 'ALTER PUBLICATION', 'ALTER SCHEMA')
+  WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'DROP TABLE', 'DROP INDEX', 'ALTER PUBLICATION', 'ALTER SCHEMA', 'DROP SCHEMA')
   EXECUTE PROCEDURE "xyne_0".emit_ddl_start();
 
 CREATE EVENT TRIGGER "xyne_ddl_end_0"
   ON ddl_command_end
-  WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'DROP TABLE', 'DROP INDEX', 'ALTER PUBLICATION', 'ALTER SCHEMA', 'COMMENT')
+  WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'DROP TABLE', 'DROP INDEX', 'ALTER PUBLICATION', 'ALTER SCHEMA', 'DROP SCHEMA', 'COMMENT')
   EXECUTE PROCEDURE "xyne_0".emit_ddl_end();
+
+DO $marker$
+DECLARE
+  fingerprint TEXT;
+BEGIN
+  SELECT encode(sha256(convert_to(string_agg(p.prosrc, E'\n' ORDER BY p.proname, p.prosrc), 'UTF8')), 'hex')
+    FROM pg_proc p
+    JOIN pg_namespace ns ON ns.oid = p.pronamespace
+    WHERE ns.nspname = 'xyne_0' AND p.proname IN ('emit_ddl_end', 'emit_ddl_start', 'schema_specs', 'update_schemas')
+    INTO fingerprint;
+  EXECUTE format(
+    'CREATE OR REPLACE FUNCTION "xyne_0".streamgres_stack() RETURNS jsonb IMMUTABLE AS %L LANGUAGE sql',
+    format('SELECT %L::jsonb', json_build_object('version', 2, 'fingerprint', fingerprint)::text));
+END
+$marker$;

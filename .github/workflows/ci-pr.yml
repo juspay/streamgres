@@ -46,14 +46,34 @@ jobs:
       - name: Install rust cache
         uses: Swatinem/rust-cache@v2.7.7
 
-      - name: Clippy, warnings denied
-        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Clippy, warnings denied, every crate of the workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Clippy, warnings denied, the engine without the server
+        run: cargo clippy -p streamgres --no-default-features --lib --tests --bins --locked -- -D warnings
+
+      - name: The crates build as another project's dependencies
+        run: scripts/check-downstream.sh
 
   test:
-    name: Tests (accuracy)
+    name: Tests (accuracy, PostgreSQL ${{ matrix.postgres }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["16", "17"]
     env:
       STREAMGRES_PG_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+      # The Diesel wrapper's tests read and write their own tables in the
+      # same database.
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+      # The server this run is for: a live test fails on another, and one
+      # that needs a later version says so and skips.
+      STREAMGRES_TEST_PG_MAJOR: ${{ matrix.postgres }}
+      # What each step gives the live tests; one that would skip for want
+      # of something listed fails instead (tests/support, and the Diesel
+      # wrapper's tests/require).
+      STREAMGRES_REQUIRE_LIVE: postgres
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -73,12 +93,61 @@ jobs:
 
       - name: Start PostgreSQL with logical replication
         run: |
-          docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17 \
+          docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:${{ matrix.postgres }} \
             -c wal_level=logical -c max_replication_slots=32 -c max_wal_senders=32
           until docker exec pg pg_isready -U postgres; do sleep 1; done
 
-      - name: Unit, scenario, randomized and live PostgreSQL tests
-        run: cargo test --release --locked
+      - name: Unit, scenario, randomized and live PostgreSQL tests, every crate
+        run: cargo test --release --locked --workspace
+
+      # The Diesel wrapper against a running engine: its live tests skip
+      # without one, so run them again with an engine in the test process.
+      # watch_failure_live drops a table, which restarts that test binary's
+      # engine; each test binary has an engine of its own.
+      - name: The Diesel wrapper's live tests, against an embedded engine
+        env:
+          STREAMGRES_TEST_EMBEDDED: "1"
+          STREAMGRES_SCHEMAS: public,streamgres_0,sg_live_ws
+          STREAMGRES_REQUIRE_LIVE: postgres,engine,embedded
+        run: |
+          docker exec pg psql -U postgres -c 'CREATE SCHEMA IF NOT EXISTS sg_live_ws'
+          cargo test --release --locked -p diesel-streamgres --features embedded,sse,async
+
+      # The S2S endpoint as backends reach it: a server, over its socket.
+      # Its own live test, and the Diesel wrapper's tests that need an
+      # engine, through the WebSocket rather than in process. Not the
+      # wrapper's others: session_context drops a table it reads, and a
+      # server stops on that by design, for its supervisor to restart it.
+      - name: The S2S endpoint and the Diesel wrapper's engine tests, against a server
+        env:
+          STREAMGRES_PG_DSN: postgresql://postgres:postgres@localhost:5432/s2s
+          STREAMGRES_MASTER_PG_DSN: postgresql://postgres:postgres@localhost:5432/s2s
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/s2s
+          STREAMGRES_BASE_PATH: /sync
+          STREAMGRES_APP_ID: xyne
+          STREAMGRES_SCHEMAS: public,xyne_0,sg_live_ws
+          STREAMGRES_QUERY_URL: http://127.0.0.1:9/query
+          STREAMGRES_MUTATE_URL: http://127.0.0.1:9/push
+          STREAMGRES_S2S_TOKEN: ci-s2s-token-0123456789abcdef
+          STREAMGRES_S2S_URL: ws://127.0.0.1:4848/sync/s2s/v1
+          STREAMGRES_REQUIRE_LIVE: postgres,engine,s2s,s2s-token
+        run: |
+          docker exec pg psql -U postgres -c 'CREATE DATABASE s2s'
+          docker exec pg psql -U postgres -d s2s -c 'CREATE SCHEMA sg_live_ws'
+          cargo build --release --locked --bin server
+          target/release/server > server.log 2>&1 &
+          for _ in $(seq 1 60); do
+            curl -sf -o /dev/null http://127.0.0.1:4848/health && break
+            sleep 1
+          done
+          curl -sf -o /dev/null http://127.0.0.1:4848/health || { tail -100 server.log; exit 1; }
+          cargo test --release --locked --test s2s_live
+          cargo test --release --locked -p diesel-streamgres --features sse,async \
+            --test engine_live --test listen_live --test async_live --test shape_coverage
+
+      - name: The server's log, when something failed
+        if: failure()
+        run: tail -200 server.log || true
 
   perf:
     name: Benchmark against the base branch (performance)

@@ -13,9 +13,9 @@
 //! hold. Each process streams from a slot of its own, named
 //! [`SLOT_PREFIX`] and a fresh UUID: a restart needs nothing of the
 //! slot before it (the slot is moved up to the first snapshot anyway).
-//! At startup it can drop this server's inactive slots once they have
-//! exceeded an explicitly configured age; the PostgreSQL 17
-//! `inactive_since` timestamp makes that cleanup safe across restarts.
+//! The process owns the slot through an advisory lock it holds while it
+//! runs, and drops the slots ended processes left behind, at its start
+//! and every minute ([`super::slots`]).
 //! Schema changes reach the feed as the messages of the schema-change
 //! event trigger ([`super::ddl`]); the server refuses to serve
 //! without that trigger ([`require_ddl_trigger`]).
@@ -35,11 +35,14 @@ use tokio::sync::watch;
 use tokio::task::spawn_local;
 
 use super::ddl::{self, DdlSource};
+use super::ddl_triggers;
+use super::slots;
 use super::{Feed, Keepalive, PgStorage, Transport, load_catalog};
 use crate::ivm::MultiTableIVM;
 use crate::log::{log_error, log_info, log_warn};
 use crate::model::{Catalog, Lsn, MultiTableReadQuery, TableName};
 use crate::shutdown::Shutdown;
+use crate::sync::heartbeat::Stopped;
 use crate::stats::Stats;
 use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Transaction};
 
@@ -48,8 +51,9 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 /// - `dsn`: the database, with the user and password in the URL.
 /// - `slot`: the replication slot of the change feed, this process's own
 ///   ([`slot_name`]).
-/// - `slot_cleanup_age`: how long an inactive slot of an ended process is
-///   retained before startup removes it (zero disables cleanup).
+/// - `slot_cleanup_age`: besides the slots no live process owns, which
+///   are always dropped, how long any inactive slot of the prefix is kept
+///   before it is (zero for no such age; PostgreSQL 17 or later).
 /// - `publication`: the publication the feed streams.
 /// - `schemas`: the schemas whose tables the catalog carries.
 /// - `snapshot_rotation`: how often a fresh exported snapshot is minted
@@ -68,6 +72,14 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 /// - `ddl_trigger`: the event trigger on `ddl_command_end` through which
 ///   schema changes are heard; the server will not serve without it.
 /// - `ddl_prefix`: the prefix of that trigger's logical messages.
+/// - `heartbeat`: how often the engine writes a heartbeat into the WAL
+///   to measure how far behind it is ([`crate::sync::heartbeat`]); zero
+///   for none.
+/// - `row_limit`: the most rows one read may return, and the planner's
+///   bound on a side it reads whole ([`super::DEFAULT_READ_ROW_LIMIT`]).
+/// - `memory_tables`: tables mirrored in memory and answered from there.
+/// - `estimate_ttl`, `estimate_capacity`: how long the planner's
+///   estimates are kept, and how many.
 #[derive(Debug, Clone)]
 pub struct Settings {
     pub dsn: String,
@@ -87,6 +99,11 @@ pub struct Settings {
     pub watched: Vec<TableName>,
     pub ddl_trigger: String,
     pub ddl_prefix: String,
+    pub heartbeat: Duration,
+    pub row_limit: usize,
+    pub memory_tables: Vec<TableName>,
+    pub estimate_ttl: Duration,
+    pub estimate_capacity: usize,
 }
 
 /// What every slot a server names for itself starts with.
@@ -125,6 +142,9 @@ pub struct Started {
 pub struct FeedHandle {
     stop: watch::Sender<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The process's hold on the feed's slot, kept for as long as the
+    /// handle is and let go once the feed has stopped streaming from it.
+    _owner: slots::SlotOwner,
 }
 
 /// The service's task, kept on the engine thread: it resolves only when
@@ -132,15 +152,20 @@ pub struct FeedHandle {
 /// keep listening.
 pub type ServiceTask = tokio::task::JoinHandle<Runtime<MultiTableIVM>>;
 
-/// Load the catalog of `schemas` over a connection of its own.
-pub async fn load_catalog_at(dsn: &str, schemas: &[String]) -> Result<Catalog, String> {
+/// Load the catalog of `schemas` over a connection of its own: the tables
+/// of theirs that `publication` streams ([`load_catalog`]).
+pub async fn load_catalog_at(
+    dsn: &str,
+    schemas: &[String],
+    publication: &str,
+) -> Result<Catalog, String> {
     let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
         .await
         .map_err(|error| format!("connecting to the database: {error}"))?;
     let handle = tokio::spawn(async move {
         let _ = connection.await;
     });
-    let (catalog, notes) = load_catalog(&client, schemas)
+    let (catalog, notes) = load_catalog(&client, schemas, Some(publication))
         .await
         .map_err(|error| format!("reading the catalog: {error}"))?;
     drop(client);
@@ -161,6 +186,29 @@ pub async fn load_catalog_at(dsn: &str, schemas: &[String]) -> Result<Catalog, S
     Ok(catalog)
 }
 
+/// What to warn of, at startup, about the trigger stack behind the event
+/// trigger `name`, whose [`ddl::stack_version`] is `version`: a stack of
+/// this crate's from an older setup, or one not marked as this crate's
+/// (and whether that one also predates `rowSecurity`). Nothing for the
+/// current setup.
+fn stack_warning(name: &str, version: Option<i32>, predates_row_security: bool) -> Option<String> {
+    let current = ddl_triggers::STACK_VERSION;
+    match version {
+        Some(version) if version < current => Some(format!(
+            "the schema-change trigger stack behind `{name}` is streamgres's setup {version}, older than {current}; run the setup SQL again (setup_sql, or scripts/sql/ddl-triggers.sql) to update it"
+        )),
+        Some(_) => None,
+        None => Some(format!(
+            "the schema-change trigger stack behind `{name}` is not marked as streamgres's, so it is left as it is{}. If zero-cache uses it, that is right. If streamgres installed it, before it marked its stacks, its start trigger builds the whole published schema on every DDL statement, an `IF NOT EXISTS` that does nothing included, which slows migrations and startup bootstraps on a database with many tables: adopt it by running the setup SQL as a migration (setup_sql, or scripts/sql/ddl-triggers.sql), or, for an embedded engine, with STREAMGRES_EMBEDDED_SETUP=adopt",
+            if predates_row_security {
+                ", and it predates `rowSecurity`: row-level security turned on while serving goes unnoticed until a restart, and tables created meanwhile are taken as secured"
+            } else {
+                ""
+            }
+        )),
+    }
+}
+
 /// Refuse to serve without the event trigger `name` on `ddl_command_end`
 /// at `dsn`: it is how the server hears of schema changes, and a server
 /// that would not hear of them could go on serving rows in a shape the
@@ -175,6 +223,13 @@ pub async fn require_ddl_trigger(dsn: &str, name: &str) -> Result<(), String> {
     let present = ddl::trigger_present(&client, name)
         .await
         .map_err(|error| format!("looking for the DDL event trigger `{name}`: {error}"))?;
+    if present && let Ok(version) = ddl::stack_version(&client, name).await {
+        let predates_row_security =
+            version.is_none() && ddl::stack_outdated(&client, name).await.unwrap_or(false);
+        if let Some(warning) = stack_warning(name, version, predates_row_security) {
+            log_warn!("{warning}");
+        }
+    }
     drop(client);
     let _ = handle.await;
     if present {
@@ -200,6 +255,7 @@ pub fn spawn_feed(
     catalog: Arc<Catalog>,
     start: Lsn,
     shutdown: Shutdown,
+    owner: slots::SlotOwner,
 ) -> Result<(mpsc::Receiver<Transaction>, FeedHandle), String> {
     let (out, transactions) = mpsc::channel(1024);
     let (stop, mut stop_rx) = watch::channel(false);
@@ -215,8 +271,10 @@ pub fn spawn_feed(
                 let ddl = DdlSource {
                     prefix: settings.ddl_prefix.clone(),
                     schemas: settings.schemas.clone(),
+                    publication: settings.publication.clone(),
                 };
-                let mut feed = Feed::with_ddl(catalog, ddl);
+                let mut feed = Feed::with_ddl(catalog, ddl)
+                    .with_heartbeat(crate::sync::heartbeat::prefix(&settings.slot));
                 let mut start = Some(start);
                 let mut failures = 0u32;
                 loop {
@@ -271,11 +329,11 @@ pub fn spawn_feed(
                                 Transport::slot_exists(&settings.dsn, &settings.slot).await
                             {
                                 log_error!(
-                                    "slot {} is gone, and a slot made again would skip the changes since; stopping so a restart begins on a fresh slot and snapshot",
+                                    "slot {} is gone or invalidated (past max_slot_wal_keep_size), and a slot made again would skip the changes since; stopping so a restart begins on a fresh slot and snapshot",
                                     settings.slot
                                 );
                                 running_shutdown.fail(format!(
-                                    "change-feed slot {} disappeared",
+                                    "change-feed slot {} disappeared or was invalidated",
                                     settings.slot
                                 ));
                                 return true;
@@ -308,6 +366,7 @@ pub fn spawn_feed(
         FeedHandle {
             stop,
             thread: Some(thread),
+            _owner: owner,
         },
     ))
 }
@@ -337,26 +396,105 @@ pub async fn stop_feed(mut feed: FeedHandle) -> Result<(), String> {
     }
 }
 
+/// Writes this engine's heartbeats into the WAL of the database `config`
+/// names, for as long as the process runs, reconnecting a second after a
+/// failure. It runs off the engine thread (on the reads runtime), so a
+/// stalled engine thread shows as a growing lag rather than as heartbeats
+/// that stop coming. Once heartbeats have been written, a stretch in
+/// which they cannot be makes the lag grow, so backends read Postgres
+/// until they are written again. Until the first is written the lag is
+/// unknown and backends trust the engine, as they would one that sends
+/// no lag: a standby cannot write them, and its engine keeps serving.
+/// A failure is logged once until heartbeats are written again. A
+/// publication that stops sending every change stops the engine through
+/// `shutdown` instead: the rows it holds would miss changes for good,
+/// and restarted, it refuses the publication until it is whole again.
+async fn beat(
+    config: tokio_postgres::Config,
+    slot: String,
+    publication: String,
+    every: Duration,
+    stats: Arc<Stats>,
+    shutdown: Shutdown,
+) {
+    let prefix = crate::sync::heartbeat::prefix(&slot);
+    let mut warned = false;
+    let mut written = 0;
+    loop {
+        let outcome = match super::open(&config, &tokio::runtime::Handle::current()).await {
+            Ok(client) => {
+                let emitted = crate::sync::heartbeat::emit(
+                    &client,
+                    &prefix,
+                    &publication,
+                    every,
+                    &stats.freshness,
+                )
+                .await;
+                if let Err(Stopped::Unpublished) = emitted {
+                    shutdown.fail(format!(
+                        "publication `{publication}` no longer sends every change of what it publishes (an action left out, a row filter or a column list), or is gone; the engine stops, and restarted, checks it again"
+                    ));
+                    return;
+                }
+                emitted.map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error.to_string()),
+        };
+        if stats.freshness.written() != written {
+            written = stats.freshness.written();
+            warned = false;
+        }
+        if let Err(error) = outcome
+            && !warned
+        {
+            log_warn!("heartbeats stopped: {error}; retrying every second");
+            warned = true;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// Bring the engine side up on the current thread's local set: the slot
 /// made to exist, the storage over `settings` (its reads running on
 /// `reads`) with its first snapshot minted, the feed thread started at
 /// that snapshot's point, and the service, keeping `catalog` current,
-/// delivering its events to `consumers` streams and its timings to
-/// `stats`. Must run inside a `LocalSet`.
+/// delivering its events to `consumers` streams (those at `every_commit`
+/// told of every commit, [`Service::with_every_commit`]) and its timings
+/// to `stats`. Must run inside a `LocalSet`. Making the slot and minting
+/// the first snapshot each wait for every transaction open at the time,
+/// so a long one holds them back; `shutdown` requested meanwhile gives
+/// up on either. A permanent slot given up on may still be made once the
+/// transaction ends: its maker drops it ([`Transport::drop_slot_only`]
+/// ends the backend making it).
 pub async fn start(
     settings: &Settings,
     catalog: Arc<CatalogHandle>,
     reads: tokio::runtime::Handle,
     consumers: usize,
+    every_commit: &[usize],
     stats: Arc<Stats>,
     shutdown: Shutdown,
 ) -> Result<(Started, ServiceTask), String> {
-    Transport::cleanup_inactive_slots(&settings.dsn, settings.slot_cleanup_age)
+    let dropped = slots::sweep(&settings.dsn, settings.slot_cleanup_age)
         .await
-        .map_err(|error| format!("cleaning up inactive replication slots: {error}"))?;
-    Transport::prepare(&settings.dsn, &settings.slot, &settings.publication)
+        .map_err(|error| format!("dropping the replication slots of ended processes: {error}"))?;
+    if dropped > 0 {
+        log_info!("dropped {dropped} replication slot(s) ended processes left behind");
+    }
+    slots::warn_if_unbounded(&settings.dsn).await;
+    let owner = slots::SlotOwner::take(&settings.dsn, &settings.slot, &reads, shutdown.clone())
         .await
-        .map_err(|error| format!("preparing the change feed: {error}"))?;
+        .map_err(|error| format!("taking the owner lock of the change feed's slot: {error}"))?;
+    let prepared = Transport::prepare(&settings.dsn, &settings.slot, &settings.publication);
+    tokio::select! {
+        prepared = prepared => {
+            prepared.map_err(|error| format!("preparing the change feed: {error}"))?;
+        }
+        () = shutdown.wait() => {
+            return Err("stopped before the change feed's slot was made".to_owned());
+        }
+    }
     let mut config: tokio_postgres::Config = settings
         .dsn
         .parse()
@@ -367,22 +505,42 @@ pub async fn start(
         .parse()
         .map_err(|error| format!("connecting the read pool: {error}"))?;
     settings.keepalive.apply(&mut read_config);
-    let pg =
-        PgStorage::connect_configured_with_read_config(config, read_config, catalog.load(), reads)
-            .await
-            .map_err(|error| format!("connecting the storage: {error}"))?
-            .with_rotation(settings.snapshot_rotation)
+    let connected = PgStorage::connect_configured_with_read_config(
+        config.clone(),
+        read_config,
+        catalog.load(),
+        reads.clone(),
+    );
+    let pg = tokio::select! {
+        connected = connected => {
+            connected.map_err(|error| format!("connecting the storage: {error}"))?
+        }
+        () = shutdown.wait() => {
+            return Err("stopped before the first snapshot was taken".to_owned());
+        }
+    };
+    let pg = Arc::new(
+        pg.with_rotation(settings.snapshot_rotation)
             .with_read_connections(settings.read_connections)
             .with_read_idle_connections(settings.read_idle_connections)
-            .with_read_timeout(settings.read_timeout);
-    let pg = Arc::new(pg);
+            .with_read_timeout(settings.read_timeout)
+            .with_read_row_limit(settings.row_limit)
+            .with_estimates(settings.estimate_ttl, settings.estimate_capacity),
+    );
+    reads.spawn(slots::sweep_every(
+        settings.dsn.clone(),
+        settings.slot_cleanup_age,
+        shutdown.clone(),
+    ));
+    let beat_shutdown = shutdown.clone();
     let (feed, feed_handle) = spawn_feed(
         settings.clone(),
         catalog.load(),
         pg.first_position(),
         shutdown,
+        owner,
     )?;
-    let cached = Sources::cached_from_env();
+    let cached = settings.memory_tables.clone();
     let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
     if !cached.is_empty() {
         let rows = storage
@@ -391,17 +549,28 @@ pub async fn start(
             .map_err(|error| format!("warming the memory tables: {error}"))?;
         log_info!("memory tables warmed with {rows} rows");
     }
+    if !settings.heartbeat.is_zero() {
+        reads.spawn(beat(
+            config.clone(),
+            settings.slot.clone(),
+            settings.publication.clone(),
+            settings.heartbeat,
+            Arc::clone(&stats),
+            beat_shutdown,
+        ));
+    }
     let (sinks, events): (Vec<_>, Vec<_>) = (0..consumers.max(1))
         .map(|_| mpsc::unbounded_channel())
         .unzip();
     let first = sinks[0].clone();
-    let engine = MultiTableIVM::new().with_row_limit(super::read_row_limit());
+    let engine = MultiTableIVM::new().with_row_limit(settings.row_limit);
     let (service, commands) = Service::new(engine, storage, first);
     let service = spawn_local(
         service
             .with_feed(feed)
             .with_catalog(catalog)
             .with_sinks(sinks)
+            .with_every_commit(every_commit)
             .with_stats(stats)
             .run(),
     );
@@ -414,4 +583,27 @@ pub async fn start(
         },
         service,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One warning at most: for an older stack of this crate's, or for a
+    /// stack not marked as this crate's, which also says when that stack
+    /// predates `rowSecurity`; none for the current setup.
+    #[test]
+    fn the_stack_warning_names_what_is_wrong_once() {
+        let current = ddl_triggers::STACK_VERSION;
+        assert_eq!(stack_warning("t", Some(current), false), None);
+        assert_eq!(stack_warning("t", Some(current + 1), false), None, "a newer setup is not ours to warn of");
+        let older = stack_warning("t", Some(current - 1), false).expect("an older setup");
+        assert!(older.contains(&format!("setup {}, older than {current}", current - 1)), "{older}");
+        let unmarked = stack_warning("t", None, false).expect("an unmarked stack");
+        assert!(unmarked.contains("not marked as streamgres's"), "{unmarked}");
+        assert!(unmarked.contains("STREAMGRES_EMBEDDED_SETUP=adopt"), "{unmarked}");
+        assert!(!unmarked.contains("rowSecurity"), "{unmarked}");
+        let old = stack_warning("t", None, true).expect("an unmarked, older stack");
+        assert!(old.contains("not marked as streamgres's") && old.contains("predates `rowSecurity`"), "{old}");
+    }
 }
