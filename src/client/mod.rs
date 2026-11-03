@@ -60,6 +60,7 @@ pub mod protocol;
 pub mod sampler;
 pub mod schema;
 mod setup;
+mod standby_snapshot;
 pub mod transform;
 pub mod warm;
 pub mod wire;
@@ -135,6 +136,15 @@ pub fn serve(mut config: Config) -> Result<(), String> {
         &settings.dsn,
         &settings.ddl_trigger,
     ))?;
+    if let Some(dsn) = &config.master_pg_dsn {
+        standby_snapshot::start(
+            dsn,
+            config.standby_snapshot_interval,
+            settings.keepalive,
+            shutdown.clone(),
+            &server,
+        )?;
+    }
     let reads = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(settings.read_threads)
         .enable_all()
