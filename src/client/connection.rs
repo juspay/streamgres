@@ -452,6 +452,7 @@ async fn handle(
             sink: out.clone(),
         },
         base_cookie: conn.params.base_cookie.clone(),
+        claim: conn.identity.claim(),
         lmids,
         results,
         reply: reply_tx,

@@ -37,6 +37,80 @@ pub struct Identity {
     pub token: Option<String>,
 }
 
+impl Identity {
+    /// The claim that binds a client group to its first claimant. Prefers
+    /// the JWT `sub` (stable across token rotation); then a token that is
+    /// not a JWT (it is the identity in its own right); then the cookie
+    /// pairs. Fixed-size, so a bind is a `Copy` compare and no raw
+    /// credential is kept.
+    pub fn claim(&self) -> Option<u64> {
+        if let Some(token) = self
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            if is_jwt(token) {
+                // A JWT's stable claim is its `sub`. One with no `sub` has
+                // no claim of its own: its raw form rotates, so fall
+                // through to the cookies rather than bind to it.
+                if let Some(sub) = jwt_sub(token) {
+                    return Some(digest("sub", &sub));
+                }
+            } else {
+                return Some(digest("token", token));
+            }
+        }
+        let cookie = self.cookie.as_deref().map(str::trim)?;
+        let mut pairs: Vec<&str> = cookie
+            .split(';')
+            .map(str::trim)
+            .filter(|pair| !pair.is_empty())
+            .collect();
+        if pairs.is_empty() {
+            return None;
+        }
+        // Cookie order is not part of a browser's identity: the same pairs
+        // in another order are the same claim.
+        pairs.sort_unstable();
+        pairs.dedup();
+        Some(digest("cookie", &pairs.join("\n")))
+    }
+}
+
+/// Whether `token` is a JWT: the three dot-separated segments of one.
+fn is_jwt(token: &str) -> bool {
+    token.split('.').count() == 3
+}
+
+/// Extract the `sub` claim from a JWT without verifying the signature.
+/// Returns `None` when the token is blank, malformed, or has no non-blank `sub`.
+fn jwt_sub(token: &str) -> Option<String> {
+    let token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let payload_b64 = token.split('.').nth(1)?;
+    use base64::Engine as _;
+    let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload_b64))
+        .ok()?;
+    let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).ok()?;
+    let sub = payload.get("sub").and_then(|v| v.as_str())?;
+    if sub.is_empty() { None } else { Some(sub.to_owned()) }
+}
+
+/// A fixed-size digest of `kind` and `material`.
+fn digest(kind: &str, material: &str) -> u64 {
+    use rustc_hash::FxHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = FxHasher::default();
+    kind.hash(&mut hasher);
+    material.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// The query endpoint's answer.
 #[derive(Debug)]
 pub enum TransformOutcome {
@@ -275,4 +349,54 @@ fn preview(text: &str) -> String {
         end -= 1;
     }
     format!("{}...", &text[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make(token: Option<&str>, cookie: Option<&str>) -> Identity {
+        Identity {
+            token: token.map(str::to_owned),
+            cookie: cookie.map(str::to_owned),
+            ..Identity::default()
+        }
+    }
+
+    // Two JWTs with the same `sub` ("user-123") but different `iat`.
+    const JWT_V1: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\
+        .eyJzdWIiOiAidXNlci0xMjMiLCAiaWF0IjogMTcwMDAwMDAwMH0.fakesig";
+    const JWT_V2: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\
+        .eyJzdWIiOiAidXNlci0xMjMiLCAiaWF0IjogMTcwMDAwMzYwMH0.fakesig";
+    const JWT_OTHER: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\
+        .eyJzdWIiOiAidXNlci00NTYiLCAiaWF0IjogMTcwMDAwMDAwMH0.fakesig";
+    // JWT with no `sub`.
+    const JWT_NOSUB: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9\
+        .eyJzdWIiOiBudWxsLCAiaWF0IjogMTcwMDAwMDAwMH0.fakesig";
+
+    /// A claim is the JWT `sub` when the token has one (so rotated tokens
+    /// for the same user match), an opaque token when it is not a JWT, and
+    /// the cookie pairs otherwise. Never blank.
+    #[test]
+    fn a_claim_is_the_jwt_sub_the_token_or_the_cookies() {
+        // JWT sub; two rotated tokens for the same user match.
+        assert_eq!(make(Some(JWT_V1), None).claim(), make(Some(JWT_V2), None).claim());
+        assert_ne!(make(Some(JWT_V1), None).claim(), make(Some(JWT_OTHER), None).claim());
+
+        // An opaque token is the claim in its own right.
+        let opaque = make(Some("opaque-token"), None).claim().unwrap();
+        assert_ne!(opaque, make(Some(JWT_V1), None).claim().unwrap());
+        assert_eq!(opaque, make(Some("  opaque-token  "), None).claim().unwrap());
+
+        // No token, or a JWT with no `sub`, falls through to the cookies;
+        // the same pairs in another order are the same claim.
+        let cookie = make(None, Some("sid=1; uid=2")).claim();
+        assert_eq!(cookie, make(Some(""), Some("sid=1; uid=2")).claim());
+        assert_eq!(cookie, make(Some(JWT_NOSUB), Some("sid=1; uid=2")).claim());
+        assert_eq!(cookie, make(None, Some("uid=2; sid=1")).claim());
+
+        // No token and no cookie is no claim.
+        assert_eq!(make(None, None).claim(), None);
+        assert_eq!(make(None, Some("  ;  ")).claim(), None);
+    }
 }
