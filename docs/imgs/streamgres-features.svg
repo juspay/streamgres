@@ -1,0 +1,156 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="760" viewBox="0 220 1800 760" role="img" aria-labelledby="title description">
+  <title id="title">Streamgres features</title>
+  <desc id="description">An overview of Streamgres features: live query subscriptions maintained as shared incremental views and delivered as row deltas; a read-only PostgreSQL change feed with safe snapshots and supported live schema changes; and production features including Zero protocol compatibility, observability, health probes, graceful shutdown, and Docker.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fbff"/>
+      <stop offset="1" stop-color="#eef4fb"/>
+    </linearGradient>
+    <linearGradient id="header" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#142d4e"/>
+      <stop offset="1" stop-color="#234f7c"/>
+    </linearGradient>
+    <style>
+      text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; fill: #182b43; }
+      .eyebrow { font-size: 15px; font-weight: 750; letter-spacing: 2px; fill: #b7d1ee; }
+      .title { font-size: 42px; font-weight: 750; letter-spacing: -1px; fill: #fff; }
+      .subtitle { font-size: 18px; fill: #d7e5f4; }
+      .section { font-size: 15px; font-weight: 800; letter-spacing: 1.8px; fill: #61758e; }
+      .card-title { font-size: 25px; font-weight: 750; letter-spacing: -.3px; }
+      .card-sub { font-size: 16px; fill: #586d85; }
+      .label { font-size: 12px; font-weight: 800; letter-spacing: 1px; }
+      .item-title { font-size: 16px; font-weight: 750; fill: #243b57; }
+      .item-copy { font-size: 14px; font-weight: 500; fill: #586d85; }
+      .chip { font-size: 13px; font-weight: 700; fill: #36506e; }
+      .foot { font-size: 17px; font-weight: 650; fill: #36506e; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1120" fill="#ffffff"/>
+
+  <!-- Live data -->
+  <rect x="70" y="254" width="530" height="700" rx="24" fill="#ffffff" stroke="#2E5AAC" stroke-width="2.25"/>
+  <rect x="104" y="290" width="122" height="28" rx="14" fill="#dcecff"/>
+  <text x="165" y="309" text-anchor="middle" class="label" fill="#3268a8">LIVE DATA</text>
+  <text x="104" y="362" class="card-title">Only what changed</text>
+  <text x="104" y="393" class="card-sub">Subscriptions stay live without rerunning queries.</text>
+
+  <rect x="104" y="424" width="462" height="128" rx="16" fill="#F3F7FF" stroke="#2E5AAC" stroke-width="1.5"/>
+  <rect x="126" y="446" width="130" height="82" rx="12" fill="#ffffff" stroke="#d5e4f4" stroke-width="1.5"/>
+  <text x="191" y="471" text-anchor="middle" class="label" fill="#61758e">QUERY</text>
+  <path d="M143 485h96M143 497h72M143 509h84" stroke="#9bb6d5" stroke-width="4" stroke-linecap="round"/>
+  <path d="M272 487h48" fill="none" stroke="#3977b9" stroke-width="2.5"/>
+  <path d="m312 480 10 7-10 7" fill="none" stroke="#3977b9" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="334" y="446" width="206" height="82" rx="12" fill="#ffffff" stroke="#8eb1df" stroke-width="1.5"/>
+  <text x="437" y="471" text-anchor="middle" class="label" fill="#285e9b">SHARED IVM</text>
+  <rect x="358" y="484" width="34" height="24" rx="5" fill="#dcecff"/>
+  <rect x="400" y="484" width="34" height="24" rx="5" fill="#dcecff"/>
+  <rect x="442" y="484" width="34" height="24" rx="5" fill="#dcecff"/>
+  <rect x="484" y="484" width="34" height="24" rx="5" fill="#dcecff"/>
+  <text x="375" y="501" text-anchor="middle" class="chip">A</text>
+  <text x="417" y="501" text-anchor="middle" class="chip">B</text>
+  <text x="459" y="501" text-anchor="middle" class="chip">C</text>
+  <text x="501" y="501" text-anchor="middle" class="chip">…</text>
+
+  <circle cx="119" cy="594" r="6" fill="#3977b9"/>
+  <text x="140" y="600" class="item-title">Shared views, indexed routing</text>
+  <text x="140" y="624" class="item-copy">Identical queries share rows and work; a write only</text>
+  <text x="140" y="644" class="item-copy">visits subscriptions whose filters match.</text>
+
+  <circle cx="119" cy="686" r="6" fill="#3977b9"/>
+  <text x="140" y="692" class="item-title">Row-level deltas</text>
+  <text x="140" y="716" class="item-copy">Clients get only rows entering, leaving, or changing.</text>
+  <text x="140" y="736" class="item-copy">New subscribers can be served from the shared view.</text>
+
+  <circle cx="119" cy="778" r="6" fill="#3977b9"/>
+  <text x="140" y="784" class="item-title">Joins and top-N feeds</text>
+  <text x="140" y="808" class="item-copy">Live joins and ranked lists stay current as either</text>
+  <text x="140" y="828" class="item-copy">side changes; oversized reads fail with a clear error.</text>
+
+  <rect x="104" y="866" width="462" height="54" rx="12" fill="#F3F7FF"/>
+  <path d="M129 893h30" fill="none" stroke="#3977b9" stroke-width="2"/>
+  <path d="m153 886 10 7-10 7" fill="none" stroke="#3977b9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="179" y="899" class="chip">One change → only affected views</text>
+
+  <!-- PostgreSQL -->
+  <rect x="635" y="254" width="530" height="700" rx="24" fill="#ffffff" stroke="#2E5AAC" stroke-width="2.25"/>
+  <rect x="669" y="290" width="198" height="28" rx="14" fill="#dcecff"/>
+  <text x="768" y="309" text-anchor="middle" class="label" fill="#285e9b">POSTGRESQL</text>
+  <text x="669" y="362" class="card-title">A careful neighbor</text>
+  <text x="669" y="393" class="card-sub">Follow committed changes; keep reads consistent.</text>
+
+  <rect x="669" y="424" width="462" height="128" rx="16" fill="#F3F7FF" stroke="#2E5AAC" stroke-width="1.5"/>
+  <ellipse cx="728" cy="462" rx="28" ry="10" fill="#e8eef6" stroke="#3d4f66" stroke-width="1.7"/>
+  <path d="M700 462v42c0 5.5 12.5 10 28 10s28-4.5 28-10v-42" fill="#e8eef6" stroke="#3d4f66" stroke-width="1.7"/>
+  <path d="M700 483c0 5.5 12.5 10 28 10s28-4.5 28-10" fill="none" stroke="#3d4f66" stroke-width="1.7"/>
+  <text x="783" y="467" class="item-title">PostgreSQL</text>
+  <text x="783" y="491" class="item-copy">WAL change feed</text>
+  <path d="M914 485h54" fill="none" stroke="#285e9b" stroke-width="2.5"/>
+  <path d="m960 478 10 7-10 7" fill="none" stroke="#285e9b" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="985" y="446" width="124" height="68" rx="12" fill="#ffffff" stroke="#b8ccdf" stroke-width="1.5"/>
+  <text x="1047" y="474" text-anchor="middle" class="label" fill="#285e9b">READ-ONLY</text>
+  <text x="1047" y="495" text-anchor="middle" class="chip">change feed</text>
+
+  <circle cx="684" cy="594" r="6" fill="#285e9b"/>
+  <text x="705" y="600" class="item-title">Read-only change feed</text>
+  <text x="705" y="624" class="item-copy">After one-time setup, follows a primary, logical</text>
+  <text x="705" y="644" class="item-copy">replica, or physical standby without table writes.</text>
+
+  <circle cx="684" cy="686" r="6" fill="#285e9b"/>
+  <text x="705" y="692" class="item-title">Schema changes, handled safely</text>
+  <text x="705" y="716" class="item-copy">New tables and columns with constant defaults are</text>
+  <text x="705" y="736" class="item-copy">picked up live; other changes require a restart.</text>
+
+  <circle cx="684" cy="778" r="6" fill="#285e9b"/>
+  <text x="705" y="784" class="item-title">Consistent snapshots</text>
+  <text x="705" y="808" class="item-copy">Reads never advance beyond the engine's WAL position;</text>
+  <text x="705" y="828" class="item-copy">writes during a read are replayed before results land.</text>
+
+  <rect x="669" y="866" width="462" height="54" rx="12" fill="#F3F7FF"/>
+  <circle cx="696" cy="893" r="8" fill="#285e9b"/>
+  <path d="m692 893 3 3 6-7" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="718" y="899" class="chip">May be slightly stale; never goes backwards</text>
+
+  <!-- Production -->
+  <rect x="1200" y="254" width="530" height="700" rx="24" fill="#ffffff" stroke="#2E5AAC" stroke-width="2.25"/>
+  <rect x="1234" y="290" width="192" height="28" rx="14" fill="#d8f2ed"/>
+  <text x="1330" y="309" text-anchor="middle" class="label" fill="#087c73">PRODUCTION</text>
+  <text x="1234" y="362" class="card-title">Ready for your stack</text>
+  <text x="1234" y="393" class="card-sub">Keep app logic yours; operate with confidence.</text>
+
+  <rect x="1234" y="424" width="462" height="128" rx="16" fill="#F3F7FF" stroke="#2E5AAC" stroke-width="1.5"/>
+  <rect x="1260" y="447" width="188" height="82" rx="12" fill="#ffffff" stroke="#cde7e2" stroke-width="1.5"/>
+  <circle cx="1282" cy="470" r="5" fill="#07877d"/>
+  <circle cx="1282" cy="488" r="5" fill="#41b9a7"/>
+  <circle cx="1282" cy="506" r="5" fill="#94d9cc"/>
+  <text x="1300" y="475" class="chip">query endpoint</text>
+  <text x="1300" y="493" class="chip">mutate endpoint</text>
+  <text x="1300" y="511" class="chip">your business logic</text>
+  <path d="M1460 488h54" fill="none" stroke="#07877d" stroke-width="2.5"/>
+  <path d="m1506 481 10 7-10 7" fill="none" stroke="#07877d" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="1530" y="447" width="142" height="82" rx="12" fill="#ffffff" stroke="#a9d8d1" stroke-width="1.5"/>
+  <text x="1601" y="475" text-anchor="middle" class="label" fill="#087c73">ZERO CLIENT</text>
+  <text x="1601" y="499" text-anchor="middle" class="chip">protocol v51</text>
+  <text x="1601" y="517" text-anchor="middle" class="chip">Zero 1.9</text>
+
+  <circle cx="1249" cy="594" r="6" fill="#07877d"/>
+  <text x="1270" y="600" class="item-title">Speaks Zero</text>
+  <text x="1270" y="624" class="item-copy">An unmodified Zero 1.9 client connects over</text>
+  <text x="1270" y="644" class="item-copy">sync protocol v51; app logic stays in your server.</text>
+
+  <circle cx="1249" cy="686" r="6" fill="#07877d"/>
+  <text x="1270" y="692" class="item-title">Observability included</text>
+  <text x="1270" y="716" class="item-copy">Prometheus metrics, JSON stats, structured logs,</text>
+  <text x="1270" y="736" class="item-copy">and opt-in OTLP push via admin endpoints.</text>
+
+  <circle cx="1249" cy="778" r="6" fill="#07877d"/>
+  <text x="1270" y="784" class="item-title">Operate from day one</text>
+  <text x="1270" y="808" class="item-copy">Health and readiness probes, graceful shutdown,</text>
+  <text x="1270" y="828" class="item-copy">and a slim Docker image.</text>
+
+  <rect x="1234" y="866" width="462" height="54" rx="12" fill="#F3F7FF"/>
+  <circle cx="1260" cy="893" r="8" fill="#07877d"/>
+  <path d="M1256 893h8M1260 889v8" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/>
+  <text x="1282" y="899" class="chip">Postgres changes in; live results out</text>
+
+</svg>

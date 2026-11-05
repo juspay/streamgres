@@ -142,6 +142,8 @@ Streamgres implements sync protocol **v51**, the wire protocol of `@rocicorp/zer
 
 ## Features
 
+![Streamgres features overview](docs/imgs/streamgres-features.svg)
+
 ### <ins>Live data, the easy way</ins>
 
 - **Deltas, not re-runs.** Clients subscribe to a query's results and receive only what changed, a row entered, left, or updated in place.
