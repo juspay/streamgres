@@ -164,13 +164,30 @@ Streamgres implements sync protocol **v51**, the wire protocol of `@rocicorp/zer
 - **Observability included.** Prometheus metrics, JSON stats, and OTLP push (via opt-in admin endpoints), plus structured logs.
 - **Operable from day one.** Health/readiness probes, graceful shutdown, and a slim Docker image.
 
-## Use cases, examples and demos
+### <ins>Performance</ins>
+
+Benchmarks on one Apple M4 Max:
+
+| Benchmark | Result |
+| --- | --- |
+| Routing a write | 0.9 / 1.7 / 3.7 µs at 100 / 1,000 / 10,000 subscriptions |
+| Registering a subscription | 1.5–7.4 µs, flat as subscriptions grow |
+| One channel watched by 200 clients | 1,000 updates/s (200,000 client rows/s); every row delivered; 28 ms median and 34 ms p99 commit-to-client latency; 1.2 cores |
+| Writes spread over 20 channels | 7,400 updates/s; every row delivered; 1.7 cores |
+
+These are relative numbers from single runs on a shared workstation. Run the benchmark harness on your own hardware:
+
+```bash
+cargo run --release --bin bench
+```
+
+## Demos
 
 <!-- Scenarios, examples, demos -->
 
 
 
-## Contributors, contact and support
+## Contribution
 
 Contributions are welcome.
 Let's make Streamgres better together!
