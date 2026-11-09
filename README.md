@@ -26,7 +26,65 @@ Every subscription is represented as an **incrementally maintained view (IVM)**.
 
 ![Streamgres subscription flow](docs/imgs/visual.png)
 
+## Choose how to use Streamgres
+
+| Integration | Best for | Status | Jump to |
+| --- | --- | --- | --- |
+| **Standalone server** | Live query subscriptions for Zero clients | Available | [Get started](#get-started) |
+| **Rust library + Diesel** | Opt-in cached reads inside a Rust backend | **Coming soon** | [Library quick start](#streamgres-as-a-rust-library) |
+
+Read more about [the live subscription engine](#how-it-works-) or see [performance benchmarks](#performance).
+
+## Streamgres as a Rust library
+
+> **Coming soon:** Embedded Streamgres and its `streamgres-diesel` integration are under development. The API below is a preview of the proposed integration, not a runnable example yet.
+
+Embed Streamgres in a Rust backend and opt into cached reads one query at a time. Diesel remains your query builder and write path: no fork, no SQL translation at the call site, and no separate sync service for cached reads.
+
+```toml
+# Proposed dependency layout; streamgres-diesel is not published yet.
+[dependencies]
+streamgres = { git = "https://github.com/juspay/streamgres" }
+streamgres-diesel = { git = "https://github.com/juspay/streamgres" }
+diesel = { version = "2.2", features = ["postgres"] }
+```
+
+```rust
+// Preview of the proposed API.
+let rows: Vec<Ticket> = tickets::table
+    .filter(tickets::org_id.eq(org))
+    .select(Ticket::as_select())
+    .cached(&streamgres)
+    .load_cached(&mut conn)?;
+```
+
+### <ins>How a cached read works</ins>
+
+1. Your application builds a normal Diesel query and explicitly opts in with `.cached(&streamgres)`.
+2. Streamgres serves the typed result from its incrementally maintained view when the query is supported and cached.
+3. A cache miss or unsupported query falls back to the same Diesel query on PostgreSQL.
+4. Writes continue through Diesel to PostgreSQL. Committed changes reach Streamgres through logical replication and update its views.
+
+This makes a potentially stale read visible where it happens. For a read that must observe a particular write, wait for the write's LSN to be replicated or read directly from PostgreSQL through Diesel.
+
+### <ins>Embedding trade-offs</ins>
+
+| Consideration | What it means |
+| --- | --- |
+| **Process resources** | The engine runs inside each backend process rather than in one shared Streamgres service. |
+| **Replication slots** | Each process needs one feed slot and up to three short-lived slots. Plan slot limits and WAL cleanup accordingly. |
+| **Schema changes** | If a served table changes in a way the engine cannot handle, disable the cache and fall back to PostgreSQL. |
+| **Cold starts** | Restart history is not retained. Stagger cache warm-up during deployments. |
+| **Rollout** | Cache individual reads and compare them with PostgreSQL before widening usage. |
+
+A sensible first test is one single-table query through both paths, asserting matching results and checking fallback and row mapping.
+
+
 ## Get Started
+
+### <ins>Run the standalone server</ins>
+
+The steps below run Streamgres as a separate service. To keep reads and writes in your Rust application, see [Streamgres as a Rust library](#streamgres-as-a-rust-library).
 
 ### <ins>What you need</ins>
 
@@ -181,7 +239,7 @@ These are relative numbers from single runs on a shared workstation. Run the ben
 cargo run --release --bin bench
 ```
 
-## Demos
+## Use Cases and Demos
 
 <!-- Scenarios, examples, demos -->
 
