@@ -574,8 +574,99 @@ tests (`read_latency`, `load_latency`):
 | Cache read, joined | 1.8 µs | 2.3 µs | 845 µs (prepared query) |
 | `load_cached` through Diesel | 7 µs | 13 µs | 814 µs (`load`) |
 
+## 24. An absorbed migration keeps every column's type and collation
+
+**Found by** the ticket-desk demo's schema scenario. After an `ADD
+COLUMN` the engine absorbs, the cache stopped answering any read of the
+table until a restart.
+
+**Cause.** The rebuilt catalog kept only each column's name and engine
+type, so every column lost its type OID, element OID and collation.
+- The cache refused every read of the table: "the type of `id` at the
+  source is not known".
+- Comparison rules were lost too. A `char(n)`, `citext` or
+  nondeterministic-collation column would have been compared for
+  equality, where Postgres compares it otherwise.
+
+**Decision.**
+- **Held columns are kept whole.** Widening a table copies its columns as
+  they are and adds the new one.
+- **The trigger sends what the startup catalog reads.** For each column,
+  the schema-change trigger now also sends:
+  - `baseTypeOID`: a domain resolved to its base type;
+  - `elementOID`: an array's element type;
+  - `collation`: by name, with `default` resolved to the database's own,
+    as the startup catalog resolves it (new function
+    `default_collation()`).
+  - An added column or table is then carried exactly as at startup.
+- **Older trigger stacks.** A stack installed before this change sends
+  only whether the collation is deterministic. A collatable column then
+  gets a nameless collation, under which text compares for equality at
+  most and never orders. That is safe; rerunning `setup_sql()` restores
+  ordering.
+
+**Tested by** the live test `an_absorbed_column_keeps_the_table_answerable`,
+which fails on the old code, and the demo's schema scenario.
+
+## 25. A read slices a projection kept per change
+
+**Found by** profiling the demo. For results of tens of rows, the cache
+gained only 15–40% over Postgres. A read cloned and looked up every cell
+by name, and the adapter allocated a buffer per cell.
+
+**Decision.**
+- **Projections are kept.** Each entry keeps, next to its ordered rows,
+  each statement shape's projection of them: the columns, and every
+  row's values. Shapes are told apart by projection and catalog version.
+  - Both are dropped when the rows change.
+  - A read takes its offset and limit as a window on the shared rows
+    (`CachedRows::rows()`), so nothing is copied.
+- **One buffer per read.** The adapter encodes a read's cells into one
+  buffer, through `binary::encode_into` and `encode_array_into`, and
+  Diesel reads each cell as a range of it.
+- **Refusals are remembered.** The parse memo keeps a refused statement
+  with its reason. A parse depends only on the text, the binds and the
+  catalog version, so this is exact and needs no expiry.
+
+**Measured** with `demo bench`, one connection, p50, timing the read and
+Diesel's decoding:
+
+| Lookup | Before | After | Postgres |
+|---|---|---|---|
+| One ticket | 3.1 µs | 2.2 µs | 35 µs |
+| 60 tickets | 49.5 µs | 12.8 µs | 90 µs |
+| 100 tickets by id | 84 µs | 24 µs | 166 µs |
+| Refused (`ILIKE`) | Postgres + 7–23 µs | Postgres + 6 µs | — |
+
+## 26. The ticket-desk demo as the adapter's test bed
+
+The S2S branch's demo (`crates/streamgres-demo`, git-ignored, kept on the
+machine) is ported to the library. It keeps:
+- the same schema, seed and writer, which makes all ten kinds of change;
+- the same 23 query shapes.
+
+Every read goes through `load_cached`. Its commands:
+- `explain`: who answers each shape, and the cache's reason when it
+  refuses.
+- `verify`: readers compare every shape between the cache and Postgres
+  under the writer. It fails on any wrong answer, or on a shape answered
+  by someone other than expected.
+- `bench`, `lag` (another service's write, and the reader's own write
+  through `wait_for_writes`) and `schema` (each kind of migration under a
+  running cache).
+
+On Postgres 17:
+- **Coverage:** 18 shapes are answered by the cache. `ILIKE`, `@>`,
+  `DISTINCT`, `MAX` and raw SQL fall back.
+- **Verify:** 193,085 comparisons in 60 s, none wrong; the slowest
+  catch-up was 7 ms.
+- **Lag:** a commit reaches the cache in 55 µs at p50.
+
 ## Operational notes
 
+- **Rerun `setup_sql()` after upgrading.** The trigger stack changed in
+  decision 24; until it is reinstalled, text columns added by a migration
+  compare for equality only.
 - **Run migrations one at a time.** Each schema-change trigger stack's
   start trigger takes a database-wide advisory lock (zero-cache's design,
   ported unchanged). Concurrent multi-statement DDL transactions can
