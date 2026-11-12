@@ -185,16 +185,17 @@ impl Value {
     /// comparisons of such magnitudes may tie spuriously; same-variant
     /// comparisons are always exact), `Int` / `Numeric` compare exactly,
     /// and `Float` / `Numeric` compare as `f64`, as Postgres compares
-    /// `float8` with `numeric`. Everything else — including anything involving
+    /// `float8` with `numeric`. Floats order as Postgres orders them
+    /// ([`float_cmp`]). Everything else — including anything involving
     /// `Null` — returns `None`, which predicate evaluation treats as
     /// "does not match" (SQL three-valued logic collapsed to `false`).
     pub fn compare(&self, other: &Value) -> Option<Ordering> {
         use Value::*;
         match (self, other) {
             (Int(a), Int(b)) => Some(a.cmp(b)),
-            (Float(a), Float(b)) => a.partial_cmp(b),
-            (Int(a), Float(b)) => (*a as f64).partial_cmp(b),
-            (Float(a), Int(b)) => a.partial_cmp(&(*b as f64)),
+            (Float(a), Float(b)) => Some(float_cmp(*a, *b)),
+            (Int(a), Float(b)) => Some(float_cmp(*a as f64, *b)),
+            (Float(a), Int(b)) => Some(float_cmp(*a, *b as f64)),
             (String(a), String(b)) => Some(a.cmp(b)),
             (Bool(a), Bool(b)) => Some(a.cmp(b)),
             (Date(a), Date(b)) => Some(a.cmp(b)),
@@ -203,8 +204,8 @@ impl Value {
             (Numeric(a), Numeric(b)) => Some(a.cmp(b)),
             (Int(a), Numeric(b)) => Some(self::Numeric::from_i64(*a).cmp(b)),
             (Numeric(a), Int(b)) => Some(a.cmp(&self::Numeric::from_i64(*b))),
-            (Float(a), Numeric(b)) => a.partial_cmp(&b.to_f64()),
-            (Numeric(a), Float(b)) => a.to_f64().partial_cmp(b),
+            (Float(a), Numeric(b)) => Some(float_cmp(*a, b.to_f64())),
+            (Numeric(a), Float(b)) => Some(float_cmp(a.to_f64(), *b)),
             (Timestamp(a), Timestamp(b)) => Some(a.cmp(b)),
             (Day(a), Day(b)) => Some(a.cmp(b)),
             (Time(a), Time(b)) => Some(a.cmp(b)),
@@ -228,6 +229,17 @@ impl Value {
             (Value::Null, _) | (_, Value::Null) => self == other,
             _ => self.equality_key_ref() == other.equality_key_ref(),
         }
+    }
+}
+
+/// Postgres's order of `float8`: every `NaN` equal to every other and
+/// above every number, infinity included; `-0` equal to `0`.
+pub fn float_cmp(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
     }
 }
 

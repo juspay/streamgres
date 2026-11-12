@@ -879,10 +879,31 @@ impl Parser {
         if self.eat_word("FALSE") {
             return Ok(Tagged::Or(Vec::new()));
         }
+        if self.eat_word("NOT") {
+            let at = self.at();
+            self.descend()?;
+            let negated = self.primary(scope)?.negated();
+            self.depth -= 1;
+            return negated.ok_or(ParseError {
+                message: "NOT of this condition is not supported".to_owned(),
+                position: at,
+            });
+        }
 
         let (node, declared) = scope.resolve(self)?;
         let column = declared.name.clone();
         let tag = |condition: Condition| Tagged::Condition(node, condition);
+        let ends_condition = matches!(self.peek(), Tok::Eof | Tok::Sym(")" | ";"))
+            || ["AND", "OR", "ORDER", "LIMIT", "OFFSET", "FOR"]
+                .iter()
+                .any(|word| self.is_word(word));
+        if declared.r#type == ValueType::Bool && ends_condition {
+            return Ok(tag(Condition::new(
+                column,
+                ComparisonOperator::EQ,
+                Value::Bool(true),
+            )));
+        }
         if self.eat_word("IS") {
             let comparison_operator = if self.eat_word("NOT") {
                 ComparisonOperator::IS_NOT
@@ -910,10 +931,10 @@ impl Parser {
                 tag(Condition::new(column.clone(), ComparisonOperator::GTE, low)),
                 tag(Condition::new(column, ComparisonOperator::LTE, high)),
             ]);
-            return if negated {
-                self.err("NOT BETWEEN is not supported")
-            } else {
-                Ok(within)
+            return match (negated, within.clone().negated()) {
+                (false, _) => Ok(within),
+                (true, Some(outside)) => Ok(outside),
+                (true, None) => self.err("NOT BETWEEN is not supported here"),
             };
         }
         if self.eat_word("IN") {
@@ -965,8 +986,10 @@ impl Parser {
             };
             self.bump();
             self.expect_sym(")")?;
+            // A `NULL` array makes the comparison `NULL`, true of no row,
+            // and so is its negation: a list holding one `NULL` is both.
             let value = match self.bind_value(number, declared, true, at)? {
-                Value::Null => Value::List(Vec::new()),
+                Value::Null => Value::List(vec![Value::Null]),
                 list => list,
             };
             return Ok(tag(Condition {
@@ -1059,6 +1082,26 @@ impl Parser {
         let Some(bytes) = &bind.bytes else {
             return Ok(Value::Null);
         };
+        let bound = if list {
+            binary::array_element(bind.type_oid)
+        } else {
+            Some(bind.type_oid)
+        };
+        let zoned = |oid: u32| match oid {
+            binary::oid::TIMESTAMP => Some(false),
+            binary::oid::TIMESTAMPTZ => Some(true),
+            _ => None,
+        };
+        if let (Some(value), Some(column)) = (bound.and_then(zoned), zoned(declared.type_oid))
+            && value != column
+        {
+            return Err(ParseError {
+                message: format!(
+                    "${number}: a `timestamp` and a `timestamptz` compare through the session's time zone, which the engine does not follow"
+                ),
+                position: at,
+            });
+        }
         let decoded = if list {
             binary::decode(
                 &ValueType::List(Box::new(declared.r#type.clone())),
@@ -1178,6 +1221,51 @@ impl Tagged {
         } else {
             group(parts)
         }
+    }
+
+    /// `NOT` of the filter, pushed down to its conditions: each takes the
+    /// opposite operator and `AND` and `OR` change places. SQL's three
+    /// values survive it, since a condition on a `NULL` holds under
+    /// neither operator of a pair. `None` for a condition with no
+    /// opposite.
+    fn negated(self) -> Option<Tagged> {
+        use ComparisonOperator::*;
+        Some(match self {
+            Tagged::Condition(node, condition) => {
+                let comparison_operator = match condition.comparison_operator {
+                    EQ => NEQ,
+                    NEQ => EQ,
+                    GT => LTE,
+                    GTE => LT,
+                    LT => GTE,
+                    LTE => GT,
+                    IN => NOT_IN,
+                    NOT_IN => IN,
+                    IS => IS_NOT,
+                    IS_NOT => IS,
+                    EXISTS => return None,
+                };
+                Tagged::Condition(
+                    node,
+                    Condition {
+                        comparison_operator,
+                        ..condition
+                    },
+                )
+            }
+            Tagged::And(parts) => Tagged::Or(
+                parts
+                    .into_iter()
+                    .map(Tagged::negated)
+                    .collect::<Option<_>>()?,
+            ),
+            Tagged::Or(parts) => Tagged::And(
+                parts
+                    .into_iter()
+                    .map(Tagged::negated)
+                    .collect::<Option<_>>()?,
+            ),
+        })
     }
 
     /// The filter without its tags.

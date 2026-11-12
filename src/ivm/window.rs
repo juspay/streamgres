@@ -1104,7 +1104,9 @@ fn order_values(a: &[Value], b: &[Value], order: &[OrderBy]) -> Ordering {
 /// The lexicographic comparison against `frontier` as a predicate: one
 /// branch per column, the earlier columns tied and the column itself
 /// compared with the operator `operator_for` picks from its direction and
-/// whether it is the last; a single column is the bare condition.
+/// whether it is the last; a single column is the bare condition. A row
+/// whose column is `NULL` counts as greater than the frontier's value, as
+/// the window orders it.
 fn lexicographic(
     order: &[OrderBy],
     frontier: &[Value],
@@ -1125,11 +1127,26 @@ fn lexicographic(
                     ))
                 })
                 .collect();
-            conjuncts.push(Where::Condition(Condition::new(
+            let operator = operator_for(clause.direction, index + 1 == order.len());
+            let compared = Where::Condition(Condition::new(
                 clause.column.clone(),
-                operator_for(clause.direction, index + 1 == order.len()),
+                operator,
                 frontier.get(index).cloned().unwrap_or(Value::Null),
-            )));
+            ));
+            // A `NULL` orders above every value ([`order_cmp`]), which no
+            // comparison says of it: "greater than the frontier" names it
+            // apart.
+            conjuncts.push(match operator {
+                ComparisonOperator::GT | ComparisonOperator::GTE => Where::OR(vec![
+                    compared,
+                    Where::Condition(Condition::new(
+                        clause.column.clone(),
+                        ComparisonOperator::IS,
+                        Value::Null,
+                    )),
+                ]),
+                _ => compared,
+            });
             if conjuncts.len() == 1 {
                 conjuncts.pop().expect("one conjunct")
             } else {
@@ -1165,26 +1182,13 @@ pub fn order_rows(order: &[OrderBy], a: &DataFrameRow, b: &DataFrameRow) -> Orde
 }
 
 /// Total order over [`Value`]s for window and storage sorting: delegates
-/// to [`Value::compare`] where defined; `NaN` sorts above every other
-/// numeric (all `NaN`s equal) and `Null` above everything — Postgres's
-/// convention — and remaining incomparable pairs fall back to a fixed
-/// variant rank. Deterministic and transitive, if semantically arbitrary
-/// across types.
+/// to [`Value::compare`] where defined, which orders floats as Postgres
+/// does (`NaN` above every number); `Null` sorts above everything —
+/// Postgres's convention — and remaining incomparable pairs fall back to a
+/// fixed variant rank. Deterministic and transitive, if semantically
+/// arbitrary across types.
 pub fn order_cmp(a: &Value, b: &Value) -> Ordering {
-    if let Some(ordering) = a.compare(b) {
-        return ordering;
-    }
-    let a_nan = matches!(a, Value::Float(f) if f.is_nan());
-    let b_nan = matches!(b, Value::Float(f) if f.is_nan());
-    let a_numeric = matches!(a, Value::Int(_) | Value::Float(_));
-    let b_numeric = matches!(b, Value::Int(_) | Value::Float(_));
-    if a_nan && b_numeric && !b_nan {
-        return Ordering::Greater;
-    }
-    if b_nan && a_numeric && !a_nan {
-        return Ordering::Less;
-    }
-    rank(a).cmp(&rank(b))
+    a.compare(b).unwrap_or_else(|| rank(a).cmp(&rank(b)))
 }
 
 /// The variant rank backing [`order_cmp`]'s cross-type fallback; `Null`

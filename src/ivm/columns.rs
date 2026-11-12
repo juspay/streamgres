@@ -110,6 +110,9 @@ pub(super) struct ColumnIndex {
     sets: HashSet<CondRef>,
     /// Set-valued `NOT IN` conditions past the limit, probed by non-membership.
     not_sets: HashSet<CondRef>,
+    /// `NOT IN` conditions over an empty list, which hold for every value,
+    /// `NULL` included.
+    always: HashSet<CondRef>,
 }
 
 /// The most members a set-valued condition is filed under one by one; a
@@ -167,7 +170,9 @@ impl ColumnIndex {
                 }
             }
             NOT_IN => {
-                if probed(value) {
+                if excludes_nothing(value) {
+                    self.always.insert(condition.clone());
+                } else if probed(value) {
                     self.not_sets.insert(condition.clone());
                 } else if negation_is_satisfiable(value) {
                     for key in member_keys(value) {
@@ -226,7 +231,7 @@ impl ColumnIndex {
                 self.unequal_all.remove(condition);
             }
             NOT_IN => {
-                if !self.not_sets.remove(condition) {
+                if !self.always.remove(condition) && !self.not_sets.remove(condition) {
                     for key in member_keys(value) {
                         remove_under(&mut self.unequal, Some(key), condition);
                     }
@@ -286,6 +291,7 @@ impl ColumnIndex {
             && self.below.is_empty()
             && self.sets.is_empty()
             && self.not_sets.is_empty()
+            && self.always.is_empty()
     }
 
     /// Append the conditions a written value satisfies to `out`: for a
@@ -294,6 +300,7 @@ impl ColumnIndex {
     /// has range conditions of the value's class.
     pub(super) fn candidates(&self, value: &Value, out: &mut Vec<CondRef>) {
         use ComparisonOperator::*;
+        out.extend(self.always.iter().cloned());
         if value.is_null() {
             if let Some(matching) = self.equal.get(&Value::Null) {
                 out.extend(matching.iter().cloned());
@@ -422,6 +429,12 @@ fn probed(value: &Value) -> bool {
     matches!(value, Value::Set(set) if set.len() > SET_FILING_LIMIT)
 }
 
+/// Whether a `NOT IN` operand is an empty list: the condition then holds
+/// for every value, as SQL's `<> ALL` of no values does.
+fn excludes_nothing(value: &Value) -> bool {
+    matches!(value, Value::List(items) if items.is_empty())
+}
+
 /// Whether a `NOT IN` operand can ever be true: a list holding `NULL`
 /// cannot; a shared set never holds `NULL`.
 fn negation_is_satisfiable(value: &Value) -> bool {
@@ -434,12 +447,11 @@ fn negation_is_satisfiable(value: &Value) -> bool {
 
 /// The comparison class a value takes part in range comparisons under:
 /// values of one class all compare with each other ([`Value::compare`]).
-/// `None` for values no range condition can match (`NULL`, a float `NaN`,
-/// lists, maps, raw values).
+/// `None` for values no range condition can match (`NULL`, lists, maps,
+/// raw values).
 fn class_of(value: &Value) -> Option<u8> {
     match value {
-        Value::Int(_) | Value::Numeric(_) => Some(1),
-        Value::Float(f) if !f.is_nan() => Some(1),
+        Value::Int(_) | Value::Numeric(_) | Value::Float(_) => Some(1),
         Value::String(_) => Some(2),
         Value::Bool(_) => Some(3),
         Value::Date(_) => Some(4),
@@ -450,7 +462,6 @@ fn class_of(value: &Value) -> Option<u8> {
         Value::Bytes(_) => Some(9),
         Value::Json(_) => Some(10),
         Value::Null
-        | Value::Float(_)
         | Value::List(_)
         | Value::Map(_)
         | Value::Set(_)

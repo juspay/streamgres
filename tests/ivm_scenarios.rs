@@ -1542,9 +1542,9 @@ fn disjuncts_are_canonical_regardless_of_condition_order() {
 
 /// The column index reaches every operator family with the predicate
 /// semantics of tree evaluation: equality with numeric coercion, `IN`,
-/// the negated forms (a `NOT IN` holding `NULL` never matches), each range
-/// operator at and around its threshold, and `NULL`, `NaN` and mixed-type
-/// writes.
+/// the negated forms (a `NOT IN` holding `NULL` never matches, one of no
+/// values always does), each range operator at and around its threshold,
+/// and `NULL`, `NaN` (above every number) and mixed-type writes.
 #[test]
 fn column_index_matches_every_operator_family() {
     use ComparisonOperator::*;
@@ -1567,6 +1567,10 @@ fn column_index_matches_every_operator_family() {
             "not-in-null",
             Where::condition("points", NOT_IN, Value::List(vec![1.into(), Value::Null])),
         ),
+        (
+            "not-in-none",
+            Where::condition("points", NOT_IN, Value::List(Vec::new())),
+        ),
         ("gt", Where::condition("points", GT, 5)),
         ("gte", Where::condition("points", GTE, 5)),
         ("lt", Where::condition("points", LT, 5)),
@@ -1577,17 +1581,26 @@ fn column_index_matches_every_operator_family() {
         names.register(&mut ivm, *uuid, query(&tickets, filter.clone()));
     }
     let cases: Vec<(Value, Vec<&str>)> = vec![
-        (5.into(), vec!["eq", "eq-float", "gte", "lte", "not-in"]),
+        (
+            5.into(),
+            vec!["eq", "eq-float", "gte", "lte", "not-in", "not-in-none"],
+        ),
         (
             Value::Float(5.0),
-            vec!["eq", "eq-float", "gte", "lte", "not-in"],
+            vec!["eq", "eq-float", "gte", "lte", "not-in", "not-in-none"],
         ),
-        (4.into(), vec!["lt", "lte", "neq", "not-in"]),
-        (6.into(), vec!["gt", "gte", "neq", "not-in"]),
-        (1.into(), vec!["in", "lt", "lte", "neq"]),
-        (Value::String("5".into()), vec!["neq", "not-in", "str"]),
-        (Value::Null, vec![]),
-        (Value::Float(f64::NAN), vec!["neq", "not-in"]),
+        (4.into(), vec!["lt", "lte", "neq", "not-in", "not-in-none"]),
+        (6.into(), vec!["gt", "gte", "neq", "not-in", "not-in-none"]),
+        (1.into(), vec!["in", "lt", "lte", "neq", "not-in-none"]),
+        (
+            Value::String("5".into()),
+            vec!["neq", "not-in", "not-in-none", "str"],
+        ),
+        (Value::Null, vec!["not-in-none"]),
+        (
+            Value::Float(f64::NAN),
+            vec!["gt", "gte", "neq", "not-in", "not-in-none"],
+        ),
     ];
     for (id, (value, expected)) in cases.into_iter().enumerate() {
         let write = insert(&tickets, id as i64 + 1, &[("points", value.clone())]);

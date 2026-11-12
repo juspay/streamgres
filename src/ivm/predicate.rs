@@ -52,7 +52,9 @@ pub fn evaluate_with(
 /// `IN` / `NOT_IN` expect the condition value to be a [`Value::List`];
 /// anything else matches nothing (the parser's job is to reject it earlier).
 /// A `Null` inside the list makes `NOT_IN` unsatisfiable, per the
-/// module-level NULL rule (SQL agrees: `x NOT IN (a, NULL)` is never true);
+/// module-level NULL rule (SQL agrees: `x NOT IN (a, NULL)` is never true),
+/// and an empty list makes it hold for every row, a `NULL` column included
+/// (`x <> ALL` of no values is true);
 /// `IN` needs no such guard — a `Null` element simply never matches.
 /// A composite key is compared whole or not at all (`EQ`, `NEQ`, `IN`,
 /// `NOT_IN`): it has no order and is never `NULL` as such, since a key
@@ -73,6 +75,7 @@ pub fn eval_condition(cond: &Condition, row: &RowData, evaluated: &mut u64) -> b
                     .is_some_and(|actual| !actual.is_null());
         }
         EXISTS => return false,
+        NOT_IN if matches!(&cond.value, Value::List(items) if items.is_empty()) => return true,
         _ => {}
     }
     let Some(actual) = cond.column.of(row) else {
