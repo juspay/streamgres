@@ -60,8 +60,8 @@ use std::fmt;
 
 use crate::model::{
     ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameRow, DbTable, DeleteQuery,
-    InsertQuery, Order, OrderBy, SingleTableReadQuery, UpdateQuery, Value, ValueType, Where,
-    WriteQuery,
+    InsertQuery, Numeric, Order, OrderBy, SingleTableReadQuery, Timestamp, UpdateQuery, Value,
+    ValueType, Where, WriteQuery,
 };
 
 /// Hard cap on `(` / `[` nesting depth. The parser descends recursively, so
@@ -1027,7 +1027,25 @@ fn coerce_to_type(
         (value @ Value::Float(_), ValueType::Float) => value,
         (value @ Value::String(_), ValueType::String) => value,
         (value @ Value::Bool(_), ValueType::Bool) => value,
-        (value @ Value::Int(_), ValueType::Timestamp) => value,
+        (Value::Int(millis), ValueType::Timestamp) => Timestamp::from_unix_millis(millis)
+            .map(Value::Timestamp)
+            .ok_or_else(|| ParseError {
+                message: format!("{millis} is outside the range of `{column}`"),
+                position: at,
+            })?,
+        (Value::Int(int), ValueType::Numeric) => Value::Numeric(Numeric::from_i64(int)),
+        (Value::Float(float), ValueType::Numeric) => Value::Numeric(
+            Numeric::parse(&float.to_string()).map_err(|error| ParseError {
+                message: format!("column `{column}`: {error}"),
+                position: at,
+            })?,
+        ),
+        (Value::String(text), ValueType::Numeric) => {
+            Value::Numeric(Numeric::parse(&text).map_err(|error| ParseError {
+                message: format!("column `{column}`: {error}"),
+                position: at,
+            })?)
+        }
         (value @ Value::String(_), ValueType::Json) => value,
         (Value::Int(int), ValueType::Float) => Value::Float(int as f64),
         (Value::Float(float), ValueType::Int)

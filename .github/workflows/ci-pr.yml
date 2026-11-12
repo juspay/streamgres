@@ -74,7 +74,7 @@ jobs:
       - name: Start PostgreSQL with logical replication
         run: |
           docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17 \
-            -c wal_level=logical -c max_replication_slots=32 -c max_wal_senders=32
+            -c wal_level=logical -c max_replication_slots=64 -c max_wal_senders=64
           until docker exec pg pg_isready -U postgres; do sleep 1; done
 
       - name: Unit, scenario, randomized and live PostgreSQL tests
@@ -172,7 +172,7 @@ jobs:
       - name: Start PostgreSQL and the collector
         run: |
           docker run -d --name pg --network host -e POSTGRES_PASSWORD=postgres postgres:17 \
-            -c wal_level=logical -c max_replication_slots=32 -c max_wal_senders=32
+            -c wal_level=logical -c max_replication_slots=64 -c max_wal_senders=64
           docker run -d --name collector --network host \
             -v "$PWD/scripts/ci/otel-collector.yaml:/etc/otelcol-contrib/config.yaml" \
             otel/opentelemetry-collector-contrib:0.146.1

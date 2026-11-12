@@ -238,6 +238,9 @@ pub struct DbColumn {
     pub table: TableName,
     pub name: ColumnName,
     pub r#type: ValueType,
+    /// The OID of the column's type at the source, its base type for a
+    /// domain; 0 when the column was declared by hand.
+    pub type_oid: u32,
 }
 
 /// A table: its name, its columns resolvable by name, and the names of the
@@ -364,7 +367,14 @@ impl DbColumn {
             table: TableName::from(""),
             name: name.into(),
             r#type,
+            type_oid: 0,
         }
+    }
+
+    /// This column with its source type's OID.
+    pub fn with_type_oid(mut self, type_oid: u32) -> Self {
+        self.type_oid = type_oid;
+        self
     }
 }
 

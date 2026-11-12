@@ -22,8 +22,8 @@ use serde_json::Value as Json;
 use crate::ivm::QueryPart;
 use crate::model::ComparisonOperator::{EQ, GT, GTE, IN, LT, LTE, NEQ, NOT_IN};
 use crate::model::{
-    Catalog, ColumnName, ComparisonOperator, DbTable, Join, MultiTableReadQuery, Order, OrderBy,
-    SingleTableReadQuery, Value, ValueType, Where,
+    Catalog, ColumnName, ComparisonOperator, Day, DbColumn, DbTable, Join, MultiTableReadQuery,
+    Numeric, Order, OrderBy, SingleTableReadQuery, Time, Timestamp, Value, ValueType, Where,
 };
 
 /// One query node.
@@ -554,41 +554,142 @@ fn simple(op: &str, left: &Operand, right: &Operand, table: &DbTable) -> Result<
         "IN" => IN,
         "NOT IN" => NOT_IN,
         "IS" => {
-            return Ok(if literal.is_null() {
-                Where::is_null(name.as_str())
+            return if literal.is_null() {
+                Ok(Where::is_null(name.as_str()))
             } else {
-                Where::condition(name.as_str(), EQ, literal_value(literal, &column.r#type)?)
-            });
+                compare(column, EQ, literal)
+            };
         }
         "IS NOT" => {
-            return Ok(if literal.is_null() {
-                Where::is_not_null(name.as_str())
+            return if literal.is_null() {
+                Ok(Where::is_not_null(name.as_str()))
             } else {
-                Where::condition(name.as_str(), NEQ, literal_value(literal, &column.r#type)?)
-            });
+                compare(column, NEQ, literal)
+            };
         }
         "LIKE" | "ILIKE" | "NOT LIKE" | "NOT ILIKE" => {
             return Err(format!("{op} is not supported (a condition on `{name}`)"));
         }
         other => return Err(format!("unknown operator `{other}`")),
     };
-    let value = if matches!(
-        operator,
-        ComparisonOperator::IN | ComparisonOperator::NOT_IN
-    ) {
-        let Json::Array(items) = literal else {
-            return Err(format!("{op} on `{name}` needs a list"));
-        };
-        Value::List(
+    if matches!(operator, IN | NOT_IN) && !literal.is_array() {
+        return Err(format!("{op} on `{name}` needs a list"));
+    }
+    compare(column, operator, literal)
+}
+
+/// `column <operator> literal`, the literal read as the client wrote it.
+/// A client sees a time as whole epoch milliseconds, so a comparison on a
+/// time column compares the milliseconds it shows ([`shown_time`]).
+fn compare(column: &DbColumn, operator: ComparisonOperator, literal: &Json) -> Result<Where, String> {
+    let name = column.name.as_str();
+    if column.r#type == ValueType::Raw {
+        return Err(format!(
+            "`{name}` has a type the server does not compare; it can be read, not filtered on"
+        ));
+    }
+    if matches!(column.r#type, ValueType::Timestamp | ValueType::Day) {
+        return shown_time(column, operator, literal);
+    }
+    let value = match (operator, literal) {
+        (IN | NOT_IN, Json::Array(items)) => Value::List(
             items
                 .iter()
                 .map(|item| literal_value(item, &column.r#type))
                 .collect::<Result<_, _>>()?,
-        )
-    } else {
-        literal_value(literal, &column.r#type)?
+        ),
+        _ => literal_value(literal, &column.r#type)?,
     };
-    Ok(Where::condition(name.as_str(), operator, value))
+    Ok(Where::condition(name, operator, value))
+}
+
+/// A comparison on a time column against the epoch milliseconds a client
+/// sees for it. A cell shows as its milliseconds rounded down (a day as
+/// its midnight), so the cells that show as `X` are those from `lo`, the
+/// first cell shown at or after `X`, up to `hi`, the first shown after
+/// it; every operator is a bound on those two.
+fn shown_time(column: &DbColumn, operator: ComparisonOperator, literal: &Json) -> Result<Where, String> {
+    let name = column.name.as_str();
+    let bounds = |literal: &Json| -> Result<Option<(Value, Value)>, String> {
+        let millis = match literal {
+            Json::Null => return Ok(None),
+            Json::Number(number) => number
+                .as_i64()
+                .or_else(|| number.as_f64().filter(|f| f.is_finite()).map(|f| f.floor() as i64)),
+            Json::String(text) => text.parse::<i64>().ok(),
+            _ => None,
+        }
+        .ok_or_else(|| format!("`{literal}` is not a time in epoch milliseconds"))?;
+        time_bounds(&column.r#type, millis)
+            .map(Some)
+            .ok_or_else(|| format!("{millis} is outside the range of `{name}`"))
+    };
+    let range = |lo: Value, hi: Value| {
+        Where::AND(vec![
+            Where::condition(name, GTE, lo),
+            Where::condition(name, LT, hi),
+        ])
+    };
+    let outside = |lo: Value, hi: Value| {
+        Where::OR(vec![
+            Where::condition(name, LT, lo),
+            Where::condition(name, GTE, hi),
+        ])
+    };
+    if let (IN | NOT_IN, Json::Array(items)) = (operator, literal) {
+        let mut parts = Vec::with_capacity(items.len());
+        let mut null_member = false;
+        for item in items {
+            match bounds(item)? {
+                Some((lo, hi)) if operator == IN => parts.push(range(lo, hi)),
+                Some((lo, hi)) => parts.push(outside(lo, hi)),
+                None => null_member = true,
+            }
+        }
+        return Ok(match operator {
+            IN => Where::OR(parts),
+            _ if null_member => Where::OR(Vec::new()),
+            _ => Where::AND(parts),
+        });
+    }
+    let Some((lo, hi)) = bounds(literal)? else {
+        return Ok(Where::OR(Vec::new()));
+    };
+    Ok(match operator {
+        EQ => range(lo, hi),
+        NEQ => outside(lo, hi),
+        GT => Where::condition(name, GTE, hi),
+        GTE => Where::condition(name, GTE, lo),
+        LT => Where::condition(name, LT, lo),
+        LTE => Where::condition(name, LT, hi),
+        other => return Err(format!("{other:?} on the time column `{name}`")),
+    })
+}
+
+/// The first value of a column of `declared` (a timestamp or a date)
+/// shown at or after `millis`, and the first shown after it.
+fn time_bounds(declared: &ValueType, millis: i64) -> Option<(Value, Value)> {
+    const DAY_MILLIS: i64 = 86_400_000;
+    match declared {
+        ValueType::Timestamp => {
+            let lo = Timestamp::from_unix_millis(millis)?;
+            let hi = Timestamp::from_unix_millis(millis.checked_add(1)?)?;
+            Some((Value::Timestamp(lo), Value::Timestamp(hi)))
+        }
+        ValueType::Day => {
+            let unix_epoch = Day(-10_957);
+            let day = |unix_days: i64| {
+                i32::try_from(unix_days)
+                    .ok()
+                    .and_then(|days| days.checked_add(unix_epoch.0))
+                    .map(|days| Value::Day(Day(days)))
+            };
+            let floor = millis.div_euclid(DAY_MILLIS);
+            let ceil = floor + i64::from(millis.rem_euclid(DAY_MILLIS) != 0);
+            Some((day(ceil)?, day(floor + 1)?))
+        }
+        _ => None,
+    }
 }
 
 /// A JSON literal as the value a column of type `declared` compares
@@ -607,6 +708,9 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
             Value::Float(number.as_f64().unwrap_or(f64::NAN))
         }
         (Json::Number(number), ValueType::String) => Value::String(number.to_string()),
+        (Json::Number(number), ValueType::Numeric) => Value::Numeric(
+            Numeric::parse(&number.to_string()).map_err(|error| error.to_string())?,
+        ),
         (Json::Number(number), _) => match number.as_i64() {
             Some(int) => Value::Int(int),
             None => Value::Float(number.as_f64().unwrap_or(f64::NAN)),
@@ -614,7 +718,16 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
         (Json::String(text), _) if text.contains('\0') => {
             return Err("a text value contains a NUL byte".to_owned());
         }
-        (Json::String(text), ValueType::Int | ValueType::Timestamp) => text
+        (Json::String(text), ValueType::Numeric) => {
+            Value::Numeric(Numeric::parse(text).map_err(|error| error.to_string())?)
+        }
+        (Json::String(text), ValueType::Time) => {
+            Value::Time(time_of_day(text).ok_or_else(|| format!("`{text}` is not a time of day"))?)
+        }
+        (Json::String(text), ValueType::Bytes) => Value::Bytes(
+            hex_bytes(text).ok_or_else(|| format!("`{text}` is not bytea's hex text"))?,
+        ),
+        (Json::String(text), ValueType::Int) => text
             .parse::<i64>()
             .map(Value::Int)
             .map_err(|_| format!("`{text}` is not a number"))?,
@@ -639,6 +752,39 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
     })
 }
 
+/// A time of day as Postgres writes it (`HH:MM[:SS[.ffffff]]`).
+fn time_of_day(text: &str) -> Option<Time> {
+    let mut parts = text.splitn(3, ':');
+    let hours: i64 = parts.next()?.parse().ok()?;
+    let minutes: i64 = parts.next()?.parse().ok()?;
+    let (seconds, fraction) = match parts.next() {
+        Some(rest) => match rest.split_once('.') {
+            Some((seconds, fraction)) => (seconds.parse::<i64>().ok()?, fraction),
+            None => (rest.parse::<i64>().ok()?, ""),
+        },
+        None => (0, ""),
+    };
+    if fraction.len() > 6 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let micros: i64 = format!("{fraction:0<6}").parse().ok()?;
+    let total = ((hours * 60 + minutes) * 60 + seconds) * 1_000_000 + micros;
+    ((0..=86_400_000_000).contains(&total) && minutes < 60 && seconds < 60).then_some(Time(total))
+}
+
+/// The bytes of bytea's hex text (`\x0aff`).
+fn hex_bytes(text: &str) -> Option<bytes::Bytes> {
+    let digits = text.strip_prefix("\\x")?;
+    if digits.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for index in (0..digits.len()).step_by(2) {
+        out.push(u8::from_str_radix(digits.get(index..index + 2)?, 16).ok()?);
+    }
+    Some(out.into())
+}
+
 /// The `WHERE` a keyset cursor means over `order`: one branch per sort
 /// column the cursor names (a cursor may stop short of the trailing
 /// columns, the appended primary key in particular, and is then compared
@@ -651,11 +797,10 @@ fn keyset(bound: &Bound, order: &[OrderBy], table: &DbTable) -> Result<Where, St
         let Some(literal) = bound.row.get(name) else {
             break;
         };
-        let declared = &table
+        let column = table
             .column(name)
-            .ok_or_else(|| format!("unknown column `{name}`"))?
-            .r#type;
-        keys.push((name, clause.direction, literal_value(literal, declared)?));
+            .ok_or_else(|| format!("unknown column `{name}`"))?;
+        keys.push((column, clause.direction, literal));
     }
     if keys.is_empty() {
         return Err("the cursor names none of the sort columns".to_owned());
@@ -668,18 +813,16 @@ fn keyset(bound: &Bound, order: &[OrderBy], table: &DbTable) -> Result<Where, St
         };
         let mut conjuncts: Vec<Where> = keys[..index]
             .iter()
-            .map(|(earlier, _, earlier_value)| {
-                Where::condition(*earlier, EQ, earlier_value.clone())
-            })
-            .collect();
-        conjuncts.push(Where::condition(*column, op, value.clone()));
+            .map(|(earlier, _, earlier_value)| compare(earlier, EQ, earlier_value))
+            .collect::<Result<_, _>>()?;
+        conjuncts.push(compare(column, op, value)?);
         branches.push(collapse(conjuncts));
     }
     if !bound.exclusive {
         branches.push(collapse(
             keys.iter()
-                .map(|(column, _, value)| Where::condition(*column, EQ, value.clone()))
-                .collect(),
+                .map(|(column, _, value)| compare(column, EQ, value))
+                .collect::<Result<_, _>>()?,
         ));
     }
     Ok(if branches.len() == 1 {
@@ -965,6 +1108,46 @@ mod tests {
         );
     }
 
+    /// A client compares a time by the milliseconds it is shown, the
+    /// stored microseconds rounded down: equal to `X` is every instant in
+    /// that millisecond, past `X` starts at the next one. A date is shown
+    /// as its midnight, so only a midnight equals one, and a bound between
+    /// midnights falls on the next day.
+    #[test]
+    fn times_compare_as_the_client_sees_them() {
+        let at = |millis: i64| Value::Timestamp(Timestamp::from_unix_millis(millis).unwrap());
+        let column = DbColumn::new("at", ValueType::Timestamp);
+        assert_eq!(
+            compare(&column, EQ, &serde_json::json!(1000)).unwrap(),
+            Where::AND(vec![
+                Where::condition("at", GTE, at(1000)),
+                Where::condition("at", LT, at(1001)),
+            ])
+        );
+        assert_eq!(
+            compare(&column, GT, &serde_json::json!(1000)).unwrap(),
+            Where::condition("at", GTE, at(1001))
+        );
+        assert_eq!(
+            compare(&column, LTE, &serde_json::json!(1000)).unwrap(),
+            Where::condition("at", LT, at(1001))
+        );
+        let day = |unix_days: i32| Value::Day(Day(unix_days - 10_957));
+        let date = DbColumn::new("on", ValueType::Day);
+        assert_eq!(
+            compare(&date, GTE, &serde_json::json!(86_400_001)).unwrap(),
+            Where::condition("on", GTE, day(2))
+        );
+        assert_eq!(
+            compare(&date, EQ, &serde_json::json!(86_400_000)).unwrap(),
+            Where::AND(vec![
+                Where::condition("on", GTE, day(1)),
+                Where::condition("on", LT, day(2)),
+            ])
+        );
+        assert!(compare(&DbColumn::new("span", ValueType::Raw), EQ, &serde_json::json!("1 day")).is_err());
+    }
+
     /// A cursor that stops short of the appended primary key is compared
     /// on the columns it has; one that names no sort column is refused.
     #[test]
@@ -973,7 +1156,11 @@ mod tests {
         let translated = translate(&ast, &catalog()).unwrap();
         assert_eq!(
             translated.query.main_table.filter,
-            Where::condition("createdAt", LT, Value::Int(1000))
+            Where::condition(
+                "createdAt",
+                LT,
+                Value::Timestamp(Timestamp::from_unix_millis(1000).unwrap())
+            )
         );
         let empty: Ast = serde_json::from_str(r#"{"table": "messages", "orderBy": [["createdAt", "desc"]], "start": {"row": {"other": 1}, "exclusive": true}}"#).unwrap();
         assert!(

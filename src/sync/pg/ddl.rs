@@ -79,12 +79,14 @@ pub struct PublishedTable {
 }
 
 /// One published column: its type as `pg_type` names it (an array as
-/// `text[]`), the type's class (`e` for an enum), and its default
-/// expression's text when it has one.
+/// `text[]`) and its OID, the type's class (`e` for an enum), and its
+/// default expression's text when it has one.
 #[derive(Debug, Deserialize)]
 pub struct PublishedColumn {
     #[serde(rename = "dataType")]
     pub data_type: String,
+    #[serde(rename = "typeOID", default)]
+    pub type_oid: Option<i64>,
     #[serde(rename = "pgTypeClass")]
     pub pg_type_class: Option<String>,
     pub dflt: Option<String>,
@@ -124,8 +126,24 @@ impl PublishedTable {
         }
         let mut columns = Vec::with_capacity(self.columns.len());
         for (name, column) in &self.columns {
+            let type_oid = column
+                .type_oid
+                .and_then(|oid| u32::try_from(oid).ok())
+                .unwrap_or(0);
             match column_type(column) {
-                Some(r#type) => columns.push(DbColumn::new(name.as_str(), r#type)),
+                Some(r#type)
+                    if self.primary_key.iter().any(|key| key == name)
+                        && !super::catalog::keyable(&r#type) =>
+                {
+                    return Err(format!(
+                        "{}: key column `{name}` has a type the engine cannot key by, {}",
+                        self.catalog_name(),
+                        column.data_type
+                    ));
+                }
+                Some(r#type) => {
+                    columns.push(DbColumn::new(name.as_str(), r#type).with_type_oid(type_oid))
+                }
                 None if self.primary_key.iter().any(|key| key == name) => {
                     return Err(format!(
                         "{}: key column `{name}` has an uncarried type {}",
@@ -146,18 +164,19 @@ impl PublishedTable {
 
 /// The engine's type for a published column, mapped as the startup
 /// catalog maps `information_schema`: an array is a list of its element's
-/// type, an enum is a string, `bytea` is not carried.
+/// type, an enum is a string, a type the engine does not interpret is
+/// raw.
 pub fn column_type(column: &PublishedColumn) -> Option<ValueType> {
     if let Some(element) = column.data_type.strip_suffix("[]") {
         let element = element.trim_end_matches("[]");
         return Some(ValueType::List(Box::new(
-            scalar_type(element).unwrap_or(ValueType::String),
+            scalar_type(element).unwrap_or(ValueType::Raw),
         )));
     }
     if column.pg_type_class.as_deref() == Some("e") {
         return Some(ValueType::String);
     }
-    scalar_type(&column.data_type)
+    Some(scalar_type(&column.data_type).unwrap_or(ValueType::Raw))
 }
 
 /// The value every existing row holds for a column added with default
@@ -284,7 +303,8 @@ fn typed(text: &str, declared: &ValueType) -> Option<Value> {
             "f" | "false" | "0" => false,
             _ => return None,
         }),
-        ValueType::Timestamp => Value::Int(text::epoch_millis(text)?),
+        ValueType::Timestamp => Value::Timestamp(text::timestamp(text)?),
+        ValueType::Day => Value::Day(text::day(text)?),
         ValueType::List(inner) => match text::array_literal(text, inner) {
             Value::List(items) => Value::List(items),
             _ => return None,
@@ -293,10 +313,9 @@ fn typed(text: &str, declared: &ValueType) -> Option<Value> {
         ValueType::Date
         | ValueType::Datetime
         | ValueType::Map(_, _)
-        | ValueType::Day
         | ValueType::Time
         | ValueType::Bytes
-        | ValueType::Raw(_) => return None,
+        | ValueType::Raw => return None,
     })
 }
 
@@ -570,8 +589,8 @@ mod tests {
                 Some("'2026-01-02 03:04:05+00'::timestamp with time zone"),
                 &ValueType::Timestamp
             ),
-            Some(Value::Int(
-                text::epoch_millis("2026-01-02 03:04:05+00").unwrap()
+            Some(Value::Timestamp(
+                text::timestamp("2026-01-02 03:04:05+00").unwrap()
             ))
         );
         for expression in [
@@ -600,6 +619,7 @@ mod tests {
     fn published_types_map_like_the_catalog() {
         let column = |data_type: &str, class: &str| PublishedColumn {
             data_type: data_type.to_owned(),
+            type_oid: None,
             pg_type_class: Some(class.to_owned()),
             dflt: None,
         };
@@ -617,7 +637,9 @@ mod tests {
             column_type(&column("text[]", "b")),
             Some(ValueType::List(Box::new(ValueType::String)))
         );
-        assert_eq!(column_type(&column("bytea", "b")), None);
+        assert_eq!(column_type(&column("bytea", "b")), Some(ValueType::Bytes));
+        assert_eq!(column_type(&column("numeric", "b")), Some(ValueType::Numeric));
+        assert_eq!(column_type(&column("interval", "b")), Some(ValueType::Raw));
     }
 
     /// A column added with a constant default, a table added, both

@@ -1,9 +1,9 @@
 //! The catalog read from the database itself: every table of the chosen
-//! schemas that has a primary key, its columns mapped onto the engine's
-//! value types the way the sync protocol maps them for its clients (times as epoch
-//! milliseconds, JSON and arrays as JSON, enums and uuids as strings,
-//! `bytea` left out), so a server needs no hand-written schema. Tables of
-//! the `public` schema keep their bare names; any other table is named
+//! schemas that has a primary key, each column mapped onto the engine's
+//! exact value type for its Postgres type and carrying the type's OID (a
+//! domain's base type), so a server needs no hand-written schema. A type
+//! the engine does not interpret is carried raw. Tables of the `public`
+//! schema keep their bare names; any other table is named
 //! `schema.table`, which is also how the change feed matches it.
 
 use std::collections::BTreeMap;
@@ -23,10 +23,17 @@ pub async fn load_catalog(
 ) -> Result<(Catalog, Notes), StorageError> {
     let columns = client
         .query(
-            "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.udt_name
+            "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.udt_name,
+                    COALESCE(NULLIF(ty.typbasetype, 0), ty.oid)::int8 AS type_oid,
+                    base.typtype::text AS type_class
              FROM information_schema.columns c
              JOIN information_schema.tables t
                ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+             JOIN pg_namespace ns ON ns.nspname = c.table_schema
+             JOIN pg_class rel ON rel.relnamespace = ns.oid AND rel.relname = c.table_name
+             JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attname = c.column_name
+             JOIN pg_type ty ON ty.oid = att.atttypid
+             JOIN pg_type base ON base.oid = COALESCE(NULLIF(ty.typbasetype, 0), ty.oid)
              WHERE t.table_type = 'BASE TABLE' AND c.table_schema = ANY($1)
              ORDER BY c.table_schema, c.table_name, c.ordinal_position",
             &[&schemas],
@@ -60,16 +67,17 @@ pub async fn load_catalog(
         let column: String = row.get(2);
         let data_type: String = row.get(3);
         let udt_name: String = row.get(4);
-        match value_type(&data_type, &udt_name) {
-            Some(r#type) => declared
-                .entry((schema, table))
-                .or_default()
-                .push(DbColumn::new(column, r#type)),
-            None => notes.push(format!(
-                "{}.{}.{}: {} is not carried",
-                schema, table, column, data_type
-            )),
-        }
+        let type_oid = u32::try_from(row.get::<_, i64>(5)).unwrap_or(0);
+        let class: String = row.get(6);
+        let r#type = if class == "e" {
+            ValueType::String
+        } else {
+            value_type(&data_type, &udt_name)
+        };
+        declared
+            .entry((schema, table))
+            .or_default()
+            .push(DbColumn::new(column, r#type).with_type_oid(type_oid));
     }
     let mut tables = Vec::new();
     for ((schema, table), columns) in declared {
@@ -77,12 +85,13 @@ pub async fn load_catalog(
             notes.push(format!("{schema}.{table}: no primary key, left out"));
             continue;
         };
-        if pkey
-            .iter()
-            .any(|key| !columns.iter().any(|column| column.name == key.as_str()))
-        {
+        if pkey.iter().any(|key| {
+            columns
+                .iter()
+                .any(|column| column.name == key.as_str() && !keyable(&column.r#type))
+        }) {
             notes.push(format!(
-                "{schema}.{table}: a key column has an uncarried type, left out"
+                "{schema}.{table}: a key column has a type the engine cannot key by, left out"
             ));
             continue;
         }
@@ -105,18 +114,29 @@ pub fn table_name(schema: &str, table: &str) -> String {
     }
 }
 
+/// Whether rows can be keyed by a column of `declared`: its values must
+/// compare by value and be writable as SQL literals.
+pub fn keyable(declared: &ValueType) -> bool {
+    !matches!(
+        declared,
+        ValueType::Raw | ValueType::List(_) | ValueType::Map(_, _) | ValueType::Json
+    )
+}
+
 /// The engine's type for a Postgres column, from `information_schema`'s
-/// `data_type` and `udt_name`; `None` for a type the wire cannot carry.
-pub fn value_type(data_type: &str, udt_name: &str) -> Option<ValueType> {
+/// `data_type` and `udt_name`; a type the engine does not interpret is
+/// [`ValueType::Raw`]. An enum is told apart by its type class, which the
+/// caller checks first.
+pub fn value_type(data_type: &str, udt_name: &str) -> ValueType {
     match data_type {
         "ARRAY" => {
             let element = udt_name.strip_prefix('_').unwrap_or(udt_name);
-            Some(ValueType::List(Box::new(
-                scalar_type(element).unwrap_or(ValueType::String),
-            )))
+            ValueType::List(Box::new(scalar_type(element).unwrap_or(ValueType::Raw)))
         }
-        "USER-DEFINED" => Some(scalar_type(udt_name).unwrap_or(ValueType::String)),
-        other => scalar_type(other).or_else(|| scalar_type(udt_name)),
+        "USER-DEFINED" => scalar_type(udt_name).unwrap_or(ValueType::Raw),
+        other => scalar_type(other)
+            .or_else(|| scalar_type(udt_name))
+            .unwrap_or(ValueType::Raw),
     }
 }
 
@@ -129,36 +149,19 @@ pub fn scalar_type(name: &str) -> Option<ValueType> {
     Some(match name {
         "smallint" | "integer" | "bigint" | "int2" | "int4" | "int8" | "serial" | "bigserial"
         | "smallserial" | "oid" => ValueType::Int,
-        "numeric" | "decimal" | "real" | "double precision" | "float4" | "float8" | "money" => {
-            ValueType::Float
-        }
+        "real" | "double precision" | "float4" | "float8" => ValueType::Float,
+        "numeric" | "decimal" => ValueType::Numeric,
         "boolean" | "bool" => ValueType::Bool,
         "json" | "jsonb" => ValueType::Json,
         "timestamp without time zone"
         | "timestamp with time zone"
         | "timestamp"
-        | "timestamptz"
-        | "date" => ValueType::Timestamp,
-        "text"
-        | "character varying"
-        | "character"
-        | "varchar"
-        | "bpchar"
-        | "char"
-        | "uuid"
-        | "citext"
-        | "name"
-        | "time without time zone"
-        | "time with time zone"
-        | "time"
-        | "timetz"
-        | "interval"
-        | "inet"
-        | "cidr"
-        | "macaddr"
-        | "xml"
-        | "tsvector" => ValueType::String,
-        "bytea" => return None,
+        | "timestamptz" => ValueType::Timestamp,
+        "date" => ValueType::Day,
+        "time without time zone" | "time" => ValueType::Time,
+        "bytea" => ValueType::Bytes,
+        "text" | "character varying" | "character" | "varchar" | "bpchar" | "char" | "uuid"
+        | "citext" | "name" | "xml" => ValueType::String,
         _ => return None,
     })
 }
@@ -167,27 +170,29 @@ pub fn scalar_type(name: &str) -> Option<ValueType> {
 mod tests {
     use super::*;
 
-    /// The mapping follows the protocol's: times are numbers, json and arrays are
-    /// json, enums are strings, bytea is left out.
+    /// Each Postgres type maps to the engine's exact type for it, and any
+    /// type the engine does not interpret is carried raw.
     #[test]
-    fn types_map_like_the_protocol() {
+    fn types_map_to_exact_values() {
         assert_eq!(
             value_type("timestamp without time zone", "timestamp"),
-            Some(ValueType::Timestamp)
+            ValueType::Timestamp
         );
-        assert_eq!(value_type("date", "date"), Some(ValueType::Timestamp));
-        assert_eq!(value_type("jsonb", "jsonb"), Some(ValueType::Json));
+        assert_eq!(value_type("date", "date"), ValueType::Day);
+        assert_eq!(value_type("jsonb", "jsonb"), ValueType::Json);
         assert_eq!(
             value_type("ARRAY", "_text"),
-            Some(ValueType::List(Box::new(ValueType::String)))
+            ValueType::List(Box::new(ValueType::String))
         );
-        assert_eq!(
-            value_type("USER-DEFINED", "TicketStatus"),
-            Some(ValueType::String)
-        );
-        assert_eq!(value_type("bigint", "int8"), Some(ValueType::Int));
-        assert_eq!(value_type("numeric", "numeric"), Some(ValueType::Float));
-        assert_eq!(value_type("bytea", "bytea"), None);
+        assert_eq!(value_type("USER-DEFINED", "citext"), ValueType::String);
+        assert_eq!(value_type("USER-DEFINED", "hstore"), ValueType::Raw);
+        assert_eq!(value_type("bigint", "int8"), ValueType::Int);
+        assert_eq!(value_type("numeric", "numeric"), ValueType::Numeric);
+        assert_eq!(value_type("money", "money"), ValueType::Raw);
+        assert_eq!(value_type("interval", "interval"), ValueType::Raw);
+        assert_eq!(value_type("bytea", "bytea"), ValueType::Bytes);
+        assert!(!keyable(&ValueType::Raw));
+        assert!(keyable(&ValueType::Numeric));
         assert_eq!(table_name("public", "tickets"), "tickets");
         assert_eq!(table_name("xyne_0", "clients"), "xyne_0.clients");
     }

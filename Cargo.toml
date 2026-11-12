@@ -36,11 +36,10 @@ libc = "0.2"
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 uuid = { version = "1", features = ["v4"] }
 # The change feed's transport (`src/sync/pg/stream.rs`): a replication
-# connection speaking START_REPLICATION with the `pgoutput` plugin, and the
-# row messages it carries, decoded. Apache-2.0 OR MIT and MIT respectively;
-# TLS is left off, as it is for tokio-postgres above.
+# connection speaking START_REPLICATION with the `pgoutput` plugin; its row
+# messages are read by `src/sync/pg/pgoutput.rs`. Apache-2.0 OR MIT; TLS is
+# left off, as it is for tokio-postgres above.
 pgwire-replication = { version = "0.4", default-features = false, features = ["scram"] }
-pgoutput = "0.0.7"
 # The replication-protocol connection that mints exported snapshots
 # (`src/sync/pg/replication.rs`): tokio-postgres cannot open one, so the
 # startup, authentication and simple-query messages are spoken directly.

@@ -1847,3 +1847,148 @@ fn unchanged_out_of_line_values_are_never_lost() {
         cleanup(&dsn, &client, &names).await;
     });
 }
+
+/// Every column type reads the same from a snapshot as from the change
+/// feed, exactly: a numeric keeps its digits and scale, a time its
+/// microseconds and infinities, bytea its bytes, and a type the engine
+/// does not interpret its binary form.
+#[test]
+fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let table = "live_exact_values";
+        let slot = "xyne_sync_live_exact";
+        let publication = "xyne_sync_live_exact_pub";
+        let client = admin(&dsn).await;
+        PgStream::drop_slot(&dsn, slot, publication)
+            .await
+            .expect("drop slot");
+        client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table};
+                 DROP TYPE IF EXISTS live_exact_mood;
+                 CREATE TYPE live_exact_mood AS ENUM ('calm', 'busy');
+                 CREATE TABLE {table} (
+                   id int8 PRIMARY KEY, i2 int2, i4 int4, f4 real, f8 float8,
+                   n numeric(30, 4), b bool, t text, vc varchar(10), ch char(3), u uuid,
+                   j json, jb jsonb, ts timestamp, tz timestamptz, d date, tm time,
+                   by bytea, iv interval, ints int4[], texts text[], mood live_exact_mood,
+                   addr inet);
+                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;"
+            ))
+            .await
+            .expect("prepare");
+        let loaded = streamgres::sync::pg::catalog::load_catalog(&client, &["public".to_owned()])
+            .await
+            .expect("catalog")
+            .0;
+        let declared = loaded.table(table).expect("the table is carried").clone();
+        let catalog = Arc::new(Catalog::new(vec![declared]));
+        let mut stream = PgStream::open(&dsn, slot, publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+
+        client
+            .batch_execute(&format!(
+                "SET TIME ZONE 'Asia/Kolkata';
+                 INSERT INTO {table} VALUES
+                   (1, -2, 7, 1.5, 0.1, 12345678901234567890.1230, true, 'it''s', 'v', 'ab',
+                    '00010203-0405-0607-0809-0a0b0c0d0e0f', '{{ \"b\":1.50, \"a\":2 }}',
+                    '{{\"a\": 1.50}}', '2026-09-11 10:00:00.123456', '2026-09-11 10:00:00.5+05:30',
+                    '2026-09-11', '23:59:59.999999', '\\x00ff10', '1 year 2 days 03:04:05',
+                    '{{1,NULL,3}}', '{{\"a b\",c}}', 'busy', '10.0.0.1/8'),
+                   (2, NULL, NULL, 'NaN', '-Infinity', 'NaN', NULL, NULL, NULL, NULL, NULL,
+                    NULL, NULL, 'infinity', '-infinity', 'infinity', NULL, '\\x', NULL,
+                    '{{}}', NULL, NULL, NULL);"
+            ))
+            .await
+            .expect("insert");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut fed: HashMap<DataFrameKey, DataFrameRow> = HashMap::new();
+        let mut last = Lsn(0);
+        while fed.len() < 2 {
+            let batch = stream.poll().await.expect("poll");
+            for (write, at) in batch.writes {
+                if let WriteQuery::INSERT(insert) = write {
+                    fed.insert(insert.pkey_value, insert.record);
+                    last = at;
+                }
+            }
+            assert!(Instant::now() < deadline, "the inserts never arrived");
+        }
+        storage.mint_now();
+        loop {
+            let batch = stream.poll().await.expect("poll");
+            storage.advance(batch.progress);
+            if storage.alias_position().is_some_and(|alias| alias >= last) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no snapshot past the inserts");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let read = storage
+            .select(&SingleTableReadQuery::new(
+                table,
+                Where::AND(vec![]),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            ))
+            .await
+            .expect("the read is served");
+        assert_eq!(read.rows.len(), 2);
+        for (key, row) in &read.rows {
+            assert_eq!(
+                Some(&row.data),
+                fed.get(key).map(|fed| &fed.data),
+                "the snapshot and the feed agree on {key:?}"
+            );
+        }
+
+        let first = &read.rows[0].1.data;
+        let cell = |name: &str| first.get(&ColumnName::from(name)).cloned().unwrap_or(Value::Null);
+        assert!(matches!(cell("n"), Value::Numeric(n) if n.to_string() == "12345678901234567890.1230"));
+        assert_eq!(cell("f4"), Value::Float(1.5));
+        assert_eq!(cell("u"), Value::from("00010203-0405-0607-0809-0a0b0c0d0e0f"));
+        assert_eq!(cell("j"), Value::from("{\"a\": 2, \"b\": 1.5}"));
+        assert_eq!(cell("jb"), Value::from("{\"a\": 1.5}"));
+        let micros = |text: &str| {
+            let at = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").unwrap();
+            Value::Timestamp(Timestamp::from_unix_micros(at.and_utc().timestamp_micros()).unwrap())
+        };
+        assert_eq!(cell("ts"), micros("2026-09-11 10:00:00.123456"));
+        assert_eq!(cell("tz"), micros("2026-09-11 04:30:00.5"));
+        assert_eq!(cell("tm"), Value::Time(Time(86_399_999_999)));
+        assert_eq!(cell("by"), Value::Bytes(bytes::Bytes::from_static(&[0, 255, 16])));
+        assert!(matches!(cell("iv"), Value::Raw(raw) if raw.type_oid == 1186 && raw.bytes.len() == 16));
+        assert!(matches!(cell("addr"), Value::Raw(raw) if raw.type_oid == 869));
+        assert_eq!(cell("mood"), Value::from("busy"));
+        assert_eq!(
+            cell("ints"),
+            Value::List(vec![Value::Int(1), Value::Null, Value::Int(3)])
+        );
+        assert_eq!(cell("ch"), Value::from("ab "));
+
+        let second = &read.rows[1].1.data;
+        let cell = |name: &str| second.get(&ColumnName::from(name)).cloned().unwrap_or(Value::Null);
+        assert!(matches!(cell("n"), Value::Numeric(Numeric::NaN)));
+        assert_eq!(cell("ts"), Value::Timestamp(Timestamp::INFINITY));
+        assert_eq!(cell("tz"), Value::Timestamp(Timestamp::NEG_INFINITY));
+        assert_eq!(cell("d"), Value::Day(Day::INFINITY));
+        assert_eq!(cell("by"), Value::Bytes(bytes::Bytes::new()));
+        assert_eq!(cell("ints"), Value::List(Vec::new()));
+
+        drop(stream);
+        let _ = PgStream::drop_slot(&dsn, slot, publication).await;
+        let _ = client
+            .batch_execute(&format!(
+                "DROP TABLE IF EXISTS {table}; DROP TYPE IF EXISTS live_exact_mood;"
+            ))
+            .await;
+    });
+}

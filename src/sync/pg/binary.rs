@@ -114,7 +114,19 @@ pub fn decode(declared: &ValueType, type_oid: u32, bytes: &[u8]) -> Result<Value
     let fail = |reason| CodecError { type_oid, reason };
     match declared {
         ValueType::List(inner) => decode_array(inner, type_oid, bytes),
-        ValueType::Raw(_) => Ok(raw(type_oid, bytes)),
+        ValueType::Date => match decode_scalar(type_oid, bytes)? {
+            Value::Day(day) => day
+                .midnight()
+                .and_then(naive)
+                .map(|at| Value::Date(at.date()))
+                .ok_or(fail("a date out of range")),
+            _ => Err(fail("not a date")),
+        },
+        ValueType::Datetime => match decode_scalar(type_oid, bytes)? {
+            Value::Timestamp(at) => naive(at).map(Value::Datetime).ok_or(fail("a time out of range")),
+            _ => Err(fail("not a timestamp")),
+        },
+        ValueType::Raw => Ok(raw(type_oid, bytes)),
         ValueType::String if value_type(type_oid).is_none() => utf8(bytes)
             .map(|text| Value::String(text.to_owned()))
             .map_err(|_| fail("not UTF-8")),
@@ -157,6 +169,11 @@ pub fn decode_scalar(type_oid: u32, bytes: &[u8]) -> Result<Value, CodecError> {
         oid::BYTEA => Value::Bytes(Bytes::copy_from_slice(bytes)),
         _ => raw(type_oid, bytes),
     })
+}
+
+/// A timestamp as a calendar date and time in UTC.
+fn naive(at: Timestamp) -> Option<chrono::NaiveDateTime> {
+    chrono::DateTime::from_timestamp_micros(at.unix_micros()?).map(|at| at.naive_utc())
 }
 
 /// A value kept as its bytes.
@@ -328,7 +345,7 @@ mod tests {
     use super::*;
 
     fn round_trip(type_oid: u32, bytes: &[u8]) -> Value {
-        let declared = value_type(type_oid).unwrap_or(ValueType::Raw(type_oid));
+        let declared = value_type(type_oid).unwrap_or(ValueType::Raw);
         let value = decode(&declared, type_oid, bytes).unwrap();
         assert_eq!(
             encode(&value, type_oid).as_deref(),

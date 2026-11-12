@@ -74,9 +74,8 @@ pub enum ValueType {
     Datetime,
     List(Box<ValueType>),
     Map(Box<ValueType>, Box<ValueType>),
-    /// A point in time carried as milliseconds since the Unix epoch, the
-    /// form protocol clients see for `timestamp`, `timestamptz` and `date`
-    /// columns; the cell is a [`Value::Int`].
+    /// A Postgres `timestamp` or `timestamptz`; the cell is a
+    /// [`Value::Timestamp`].
     Timestamp,
     /// A JSON document carried as its text, the form the engine keeps for
     /// `json` and `jsonb` columns; the cell is a [`Value::String`] and the
@@ -90,9 +89,8 @@ pub enum ValueType {
     Time,
     /// A Postgres `bytea`; the cell is a [`Value::Bytes`].
     Bytes,
-    /// A type the engine does not interpret, by its OID; the cell is a
-    /// [`Value::Raw`].
-    Raw(u32),
+    /// A type the engine does not interpret; the cell is a [`Value::Raw`].
+    Raw,
 }
 
 impl Value {

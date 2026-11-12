@@ -1,7 +1,6 @@
-//! The text forms Postgres uses for the values the engine carries in a
-//! form of its own: the epoch-millisecond reading of a time, a JSON array
-//! read from `to_json(column)`, and the `{a,b}` array literal the change
-//! feed delivers, each turned into the [`Value`] the column's declared
+//! The text forms Postgres uses for values the engine reads from text (a
+//! column's default in a schema change): times, dates and the `{a,b}`
+//! array literal, each turned into the [`Value`] the column's declared
 //! type calls for; and the **standard form** of a JSON value, the one text
 //! every JSON cell and every JSON literal is brought into, so that two
 //! equal values are two equal texts.
@@ -26,7 +25,7 @@
 
 use std::borrow::Cow;
 
-use crate::model::{Value, ValueType};
+use crate::model::{Day, Timestamp, Value, ValueType};
 
 /// A JSON value in the standard form (see the module docs): what a
 /// literal compared with a JSON column is written as, so equality of the
@@ -193,23 +192,41 @@ pub fn json_as_jsonb(text: &str) -> String {
     }
 }
 
-/// Milliseconds since the Unix epoch of a Postgres `timestamp`,
-/// `timestamptz` or `date` in its text form (`2026-09-15 10:00:00.123`,
-/// with an optional `+05:30` style offset, or `2026-09-15`); a timestamp
-/// without a zone is read as UTC, the protocol's convention. `None` when the text
-/// is not a time (`infinity` included).
-pub fn epoch_millis(text: &str) -> Option<i64> {
+/// A Postgres `timestamp` or `timestamptz` in its text form
+/// (`2026-09-15 10:00:00.123456`, with an optional `+05:30` style
+/// offset, `infinity` or `-infinity`); a time without a zone is read as
+/// UTC. `None` when the text is not a timestamp.
+pub fn timestamp(text: &str) -> Option<Timestamp> {
     let text = text.trim();
-    if text.len() == 10 {
-        let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
-        return Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis());
+    match text {
+        "infinity" => return Some(Timestamp::INFINITY),
+        "-infinity" => return Some(Timestamp::NEG_INFINITY),
+        _ => {}
     }
     let (naive, offset_seconds) = split_offset(text);
     let parsed = chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%d %H:%M:%S"))
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%dT%H:%M:%S%.f"))
         .ok()?;
-    Some(parsed.and_utc().timestamp_millis() - offset_seconds * 1000)
+    let micros = parsed
+        .and_utc()
+        .timestamp_micros()
+        .checked_sub(offset_seconds.checked_mul(1_000_000)?)?;
+    Timestamp::from_unix_micros(micros)
+}
+
+/// A Postgres `date` in its text form (`2026-09-15`, `infinity` or
+/// `-infinity`).
+pub fn day(text: &str) -> Option<Day> {
+    let text = text.trim();
+    match text {
+        "infinity" => return Some(Day::INFINITY),
+        "-infinity" => return Some(Day::NEG_INFINITY),
+        _ => {}
+    }
+    let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
+    let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)?;
+    i32::try_from((date - epoch).num_days()).ok().map(Day)
 }
 
 /// Split a trailing `+HH`, `+HH:MM` or `+HHMM` zone offset off a timestamp
@@ -233,33 +250,6 @@ fn split_offset(text: &str) -> (&str, i64) {
         _ => return (text, 0),
     };
     (rest, sign * (hours * 3600 + minutes * 60))
-}
-
-/// A JSON array text (what `to_json(column)::text` returns for an array
-/// column) as a [`Value::List`] of `inner`-typed items; text that is not
-/// a JSON array is kept whole as a string.
-pub fn json_list(text: &str, inner: &ValueType) -> Value {
-    match serde_json::from_str::<serde_json::Value>(text) {
-        Ok(serde_json::Value::Array(items)) => {
-            Value::List(items.iter().map(|item| json_scalar(item, inner)).collect())
-        }
-        _ => Value::String(text.to_owned()),
-    }
-}
-
-/// One JSON scalar as the [`Value`] the item type calls for.
-fn json_scalar(item: &serde_json::Value, inner: &ValueType) -> Value {
-    match item {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(flag) => Value::Bool(*flag),
-        serde_json::Value::Number(number) => match (number.as_i64(), inner) {
-            (Some(int), ValueType::Float) => Value::Float(int as f64),
-            (Some(int), _) => Value::Int(int),
-            (None, _) => Value::Float(number.as_f64().unwrap_or(f64::NAN)),
-        },
-        serde_json::Value::String(text) => scalar_text(text, inner),
-        other => Value::String(other.to_string()),
-    }
 }
 
 /// A Postgres array literal (`{a,"b c",NULL}`) as a [`Value::List`] of
@@ -352,15 +342,18 @@ fn scalar_text(text: &str, inner: &ValueType) -> Value {
 mod tests {
     use super::*;
 
-    /// Timestamps without a zone read as UTC, with a zone are shifted, and
-    /// dates land on UTC midnight.
+    /// Timestamps without a zone read as UTC, with a zone are shifted,
+    /// keep their microseconds, and the infinities read as such.
     #[test]
-    fn times_read_as_epoch_milliseconds() {
-        assert_eq!(epoch_millis("1970-01-01 00:00:01.5"), Some(1_500));
-        assert_eq!(epoch_millis("1970-01-01 01:00:00+01"), Some(0));
-        assert_eq!(epoch_millis("1970-01-01 05:30:00.25+05:30"), Some(250));
-        assert_eq!(epoch_millis("1970-01-02"), Some(86_400_000));
-        assert_eq!(epoch_millis("infinity"), None);
+    fn times_read_exactly() {
+        let unix = |micros| Timestamp::from_unix_micros(micros);
+        assert_eq!(timestamp("1970-01-01 00:00:01.000005"), unix(1_000_005));
+        assert_eq!(timestamp("1970-01-01 01:00:00+01"), unix(0));
+        assert_eq!(timestamp("1970-01-01 05:30:00.25+05:30"), unix(250_000));
+        assert_eq!(timestamp("infinity"), Some(Timestamp::INFINITY));
+        assert_eq!(timestamp("tomorrow"), None);
+        assert_eq!(day("2000-01-02"), Some(Day(1)));
+        assert_eq!(day("-infinity"), Some(Day::NEG_INFINITY));
     }
 
     /// Array literals split on unquoted commas, unquote, and read NULL.
@@ -380,19 +373,6 @@ mod tests {
             Value::List(vec![Value::Int(1), Value::Int(2)])
         );
         assert_eq!(array_literal("{}", &ValueType::String), Value::List(vec![]));
-    }
-
-    /// JSON arrays from `to_json` become the same lists.
-    #[test]
-    fn json_arrays_become_lists() {
-        assert_eq!(
-            json_list("[\"x\",null]", &ValueType::String),
-            Value::List(vec![Value::from("x"), Value::Null])
-        );
-        assert_eq!(
-            json_list("[1.5,2]", &ValueType::Float),
-            Value::List(vec![Value::Float(1.5), Value::Float(2.0)])
-        );
     }
 
     /// A JSON value is written as `jsonb` writes it: scalars as JSON, a

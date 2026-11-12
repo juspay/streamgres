@@ -1368,12 +1368,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "pgoutput"
-version = "0.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03462d520225c102d2a2ab96f12ac90abdbcbc1161e9aa0e1f007e315ecfed16"
-
-[[package]]
 name = "pgwire-replication"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2156,7 +2150,6 @@ dependencies = [
  "memchr",
  "once_cell",
  "percent-encoding",
- "pgoutput",
  "pgwire-replication",
  "postgres-protocol",
  "pyroscope",

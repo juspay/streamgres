@@ -38,7 +38,7 @@ pub fn client_type(declared: &ValueType) -> &'static str {
         | ValueType::Timestamp
         | ValueType::Numeric
         | ValueType::Day => "number",
-        ValueType::Time | ValueType::Bytes | ValueType::Raw(_) => "string",
+        ValueType::Time | ValueType::Bytes | ValueType::Raw => "string",
         ValueType::Bool => "boolean",
         ValueType::Json | ValueType::List(_) | ValueType::Map(_, _) => "json",
     }

@@ -53,6 +53,7 @@ pub mod catalog;
 pub mod ddl;
 pub mod estimate;
 pub mod estimate_cache;
+pub mod pgoutput;
 pub mod replication;
 pub mod sql;
 pub mod stream;
@@ -67,13 +68,14 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore};
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow};
+use tokio_postgres::types::{FromSql, Type};
+use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, SimpleQueryRow};
 
 use super::storage::{Storage, StorageError};
 use crate::log::{log_info, log_warn};
 use crate::model::{
     Catalog, DataFrameKey, DataFrameRow, DbTable, Lsn, MultiTableReadQuery, RowData,
-    SingleTableReadQuery, Snapshot, Value, ValueType,
+    SingleTableReadQuery, Snapshot, Value,
 };
 use replication::ReplicationConnection;
 
@@ -662,14 +664,12 @@ impl Storage for PgStorage {
             let sql = sql::count_sql(&query, &catalog, cap).map_err(StorageError)?;
             let what = format!("counting the rows of `{}`", query.main_table.table);
             let rows = pool.read(&alias, &what, &sql, None).await?;
-            let text = rows
+            let count: i64 = rows
                 .first()
-                .and_then(|row| row.get(0))
-                .ok_or_else(|| StorageError("the count returned no row".to_owned()))?;
-            let count: i64 = text
-                .parse()
-                .map_err(|_| StorageError(format!("`{text}` is not a count")))?;
-            Ok(count.max(0) as u64)
+                .ok_or_else(|| StorageError("the count returned no row".to_owned()))?
+                .try_get(0)
+                .map_err(|error| StorageError(format!("the count is unreadable: {error}")))?;
+            Ok(u64::try_from(count).unwrap_or(0))
         })
         .await
     }
@@ -968,35 +968,59 @@ impl Pool {
         }
     }
 
-    /// Run one positioned statement as a single simple-query batch: the
-    /// read-only transaction opened, the alias's exported snapshot
-    /// imported as its first statement, `sql` run against it, and the
-    /// transaction committed, all in one round trip ([`Pool::run`]); the
-    /// rows of `sql` come back as text.
+    /// Run one positioned statement: the read-only transaction opened with
+    /// the alias's exported snapshot imported, `sql` run against it with
+    /// its rows in binary format, and the transaction committed. The three
+    /// are pipelined, so the read is one round trip.
     async fn read(
         &self,
         alias: &Alias,
         what: &str,
         sql: &str,
         delay: Option<Duration>,
-    ) -> Result<Vec<SimpleQueryRow>, StorageError> {
-        let mut batch = format!(
+    ) -> Result<Vec<Row>, StorageError> {
+        let mut setup = format!(
             "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '{}';",
             alias.snapshot.replace('\'', "''")
         );
-        if let Some(limit) = self.timeout() {
-            batch.push_str(&format!(
+        let limit = self.timeout();
+        if let Some(limit) = limit {
+            setup.push_str(&format!(
                 " SET LOCAL statement_timeout = {};",
                 limit.as_millis()
             ));
         }
         if let Some(delay) = delay {
-            batch.push_str(&format!(" SELECT pg_sleep({});", delay.as_secs_f64()));
+            setup.push_str(&format!(" SELECT pg_sleep({});", delay.as_secs_f64()));
         }
-        batch.push(' ');
-        batch.push_str(sql);
-        batch.push_str("; COMMIT");
-        self.run(what, &batch).await
+        let _permit = self.permit().await?;
+        let work = async {
+            let client = self.acquire().await?;
+            let outcome = tokio::try_join!(
+                client.batch_execute(&setup),
+                client.query_typed(sql, &[]),
+                client.batch_execute("COMMIT"),
+            );
+            match outcome {
+                Ok((_, rows, _)) => {
+                    self.release(client);
+                    Ok(rows)
+                }
+                Err(error) => match limit {
+                    Some(limit) if error.code() == Some(&SqlState::QUERY_CANCELED) => {
+                        Err(timed_out(what, limit))
+                    }
+                    _ => Err(error.into()),
+                },
+            }
+        };
+        match limit {
+            None => work.await,
+            Some(limit) => match tokio::time::timeout(limit, work).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(timed_out(what, limit)),
+            },
+        }
     }
 }
 
@@ -1084,16 +1108,27 @@ pub fn parse_lsn(text: &str) -> Result<Lsn, StorageError> {
 /// One result row, in [`sql::select_columns`] order, as the engine's
 /// (identity, image) pair; the names come from the catalog, so no name is
 /// allocated per row.
-fn decode_row(
-    row: &SimpleQueryRow,
-    table: &DbTable,
-) -> Result<(DataFrameKey, DataFrameRow), StorageError> {
+fn decode_row(row: &Row, table: &DbTable) -> Result<(DataFrameKey, DataFrameRow), StorageError> {
     let schema = table.row_schema().clone();
     let mut values = Vec::with_capacity(schema.len());
-    for (index, column) in schema.names().iter().enumerate() {
-        let declared = &table.columns[column].r#type;
-        let value = match row.get(index) {
-            Some(text) => decode_text(text, declared)?,
+    for (index, name) in schema.names().iter().enumerate() {
+        let column = &table.columns[name];
+        let cell: Option<RawCell<'_>> = row.try_get(index).map_err(|error| {
+            StorageError(format!("`{}`.`{name}` is unreadable: {error}", table.name))
+        })?;
+        let value = match cell {
+            Some(RawCell(bytes)) => {
+                let type_oid = match column.type_oid {
+                    0 => row
+                        .columns()
+                        .get(index)
+                        .map_or(0, |described| described.type_().oid()),
+                    known => known,
+                };
+                binary::decode(&column.r#type, type_oid, bytes).map_err(|error| {
+                    StorageError(format!("`{}`.`{name}`: {error}", table.name))
+                })?
+            }
             None => Value::Null,
         };
         values.push(value);
@@ -1110,46 +1145,26 @@ fn decode_row(
     Ok((key, DataFrameRow::from(data)))
 }
 
-/// One column of a result row in its text form, decoded by the cast its
-/// declared type was read with ([`sql::select_expr`]): a time column
-/// arrives as its epoch milliseconds, a JSON column as the text of its
-/// `jsonb` (kept in the standard form, [`text::standard_json`]), a list
-/// or map column as JSON text, the rest in Postgres's text form for the
-/// cast type.
-fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> {
-    let unreadable = || StorageError(format!("`{text}` is not a {declared:?}"));
-    Ok(match declared {
-        ValueType::Int | ValueType::Timestamp => {
-            Value::Int(text.parse().map_err(|_| unreadable())?)
-        }
-        ValueType::Float => Value::Float(text.parse().map_err(|_| unreadable())?),
-        ValueType::Json => Value::String(text::standard_json(text).into_owned()),
-        ValueType::String | ValueType::Map(_, _) => Value::String(text.to_owned()),
-        ValueType::List(inner) => text::json_list(text, inner),
-        ValueType::Bool => Value::Bool(match text {
-            "t" | "true" => true,
-            "f" | "false" => false,
-            _ => return Err(unreadable()),
-        }),
-        ValueType::Date => Value::Date(
-            chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| unreadable())?,
-        ),
-        ValueType::Datetime => Value::Datetime(
-            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S"))
-                .map_err(|_| unreadable())?,
-        ),
-        ValueType::Numeric
-        | ValueType::Day
-        | ValueType::Time
-        | ValueType::Bytes
-        | ValueType::Raw(_) => return Err(unreadable()),
-    })
+/// One cell of a binary result row, as the bytes Postgres sent.
+struct RawCell<'a>(&'a [u8]);
+
+impl<'a> FromSql<'a> for RawCell<'a> {
+    fn from_sql(
+        _: &Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(RawCell(raw))
+    }
+
+    fn accepts(_: &Type) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ValueType;
 
     #[test]
     fn base36_keeps_any_snapshot_count_within_thirteen_digits() {
@@ -1305,44 +1320,5 @@ mod tests {
         assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(20)));
         assert!(Arc::ptr_eq(&aliases.catalog, &after));
         assert!(aliases.upcoming.is_empty());
-    }
-
-    /// The text forms the casts produce decode to the engine's values.
-    #[test]
-    fn text_columns_decode_by_declared_type() {
-        assert_eq!(decode_text("42", &ValueType::Int).unwrap(), Value::Int(42));
-        assert_eq!(
-            decode_text("1700000000123", &ValueType::Timestamp).unwrap(),
-            Value::Int(1_700_000_000_123)
-        );
-        assert_eq!(
-            decode_text("1.5", &ValueType::Float).unwrap(),
-            Value::Float(1.5)
-        );
-        assert!(
-            matches!(decode_text("NaN", &ValueType::Float).unwrap(), Value::Float(f) if f.is_nan())
-        );
-        assert_eq!(
-            decode_text("t", &ValueType::Bool).unwrap(),
-            Value::Bool(true)
-        );
-        assert_eq!(
-            decode_text("[1,2]", &ValueType::List(Box::new(ValueType::Int))).unwrap(),
-            Value::List(vec![Value::Int(1), Value::Int(2)])
-        );
-        assert_eq!(
-            decode_text("2026-09-11", &ValueType::Date).unwrap(),
-            Value::Date(chrono::NaiveDate::from_ymd_opt(2026, 9, 11).unwrap())
-        );
-        assert!(matches!(
-            decode_text("2026-09-11 10:00:00.5", &ValueType::Datetime).unwrap(),
-            Value::Datetime(_)
-        ));
-        assert_eq!(
-            decode_text("{\"a\": 1.50}", &ValueType::Json).unwrap(),
-            Value::String("{\"a\": 1.5}".into()),
-            "a JSON cell is kept in the standard form"
-        );
-        assert!(decode_text("x", &ValueType::Int).is_err());
     }
 }

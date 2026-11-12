@@ -242,7 +242,7 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
             .map_or(Json::Null, Json::from),
         Value::Time(time) => Json::String(time_text(*time)),
         Value::Bytes(bytes) => Json::String(bytea_text(bytes)),
-        Value::Raw(_) => Json::Null,
+        Value::Raw(raw) => super::pg_text::raw_text(raw).map_or(Json::Null, Json::String),
         Value::Set(set) => Json::Array(
             set.members()
                 .iter()
