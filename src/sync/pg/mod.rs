@@ -1138,6 +1138,11 @@ fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> 
                 .or_else(|_| chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S"))
                 .map_err(|_| unreadable())?,
         ),
+        ValueType::Numeric
+        | ValueType::Day
+        | ValueType::Time
+        | ValueType::Bytes
+        | ValueType::Raw(_) => return Err(unreadable()),
     })
 }
 

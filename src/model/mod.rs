@@ -23,10 +23,12 @@
 
 pub mod frame;
 pub mod ids;
+pub mod numeric;
 pub mod position;
 pub mod query;
 pub mod row;
 pub mod schema;
+pub mod time;
 pub mod value;
 
 pub use frame::{DataFrameKey, DataFrameOperation, DataFrameRow};
@@ -39,4 +41,4 @@ pub use query::{
 };
 pub use row::{RowData, RowSchema};
 pub use schema::{Catalog, ColumnName, DbColumn, DbTable, PutPlan, TableName};
-pub use value::{SharedSet, Value, ValueType};
+pub use value::{Day, Numeric, Raw, SharedSet, Time, Timestamp, Value, ValueType};

@@ -289,7 +289,14 @@ fn typed(text: &str, declared: &ValueType) -> Option<Value> {
             Value::List(items) => Value::List(items),
             _ => return None,
         },
-        ValueType::Date | ValueType::Datetime | ValueType::Map(_, _) => return None,
+        ValueType::Numeric => Value::Numeric(crate::model::Numeric::parse(text).ok()?),
+        ValueType::Date
+        | ValueType::Datetime
+        | ValueType::Map(_, _)
+        | ValueType::Day
+        | ValueType::Time
+        | ValueType::Bytes
+        | ValueType::Raw(_) => return None,
     })
 }
 

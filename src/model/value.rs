@@ -13,11 +13,16 @@
 //! - `Map`: equality is order-independent (as for any `HashMap`), so the
 //!   hash combines per-entry hashes with an order-independent fold.
 
-use chrono::{NaiveDate, NaiveDateTime};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
+
+use bytes::Bytes;
+use chrono::{NaiveDate, NaiveDateTime};
+
+pub use super::numeric::Numeric;
+pub use super::time::{Day, Time, Timestamp};
 
 /// A dynamically-typed database value.
 ///
@@ -35,6 +40,27 @@ pub enum Value {
     List(Vec<Value>),
     Map(std::collections::HashMap<Value, Value>),
     Set(SharedSet),
+    /// A Postgres `numeric`, exact.
+    Numeric(Numeric),
+    /// A Postgres `timestamp` or `timestamptz`.
+    Timestamp(Timestamp),
+    /// A Postgres `date`.
+    Day(Day),
+    /// A Postgres `time`.
+    Time(Time),
+    /// A Postgres `bytea`.
+    Bytes(Bytes),
+    /// A value of a type the engine does not interpret, as Postgres's
+    /// binary form. It can be stored and sent on, never compared.
+    Raw(Raw),
+}
+
+/// A value of a type the engine does not interpret: its type and its
+/// Postgres binary form.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Raw {
+    pub type_oid: u32,
+    pub bytes: Bytes,
 }
 
 /// The static type of a [`Value`], used to describe columns in a schema.
@@ -56,6 +82,17 @@ pub enum ValueType {
     /// `json` and `jsonb` columns; the cell is a [`Value::String`] and the
     /// transport writes it out as the JSON it holds.
     Json,
+    /// A Postgres `numeric`; the cell is a [`Value::Numeric`].
+    Numeric,
+    /// A Postgres `date`; the cell is a [`Value::Day`].
+    Day,
+    /// A Postgres `time`; the cell is a [`Value::Time`].
+    Time,
+    /// A Postgres `bytea`; the cell is a [`Value::Bytes`].
+    Bytes,
+    /// A type the engine does not interpret, by its OID; the cell is a
+    /// [`Value::Raw`].
+    Raw(u32),
 }
 
 impl Value {
@@ -83,19 +120,27 @@ impl Value {
             (Bool(a), Bool(b)) => Some(a.cmp(b)),
             (Date(a), Date(b)) => Some(a.cmp(b)),
             (Datetime(a), Datetime(b)) => Some(a.cmp(b)),
+            (Numeric(a), Numeric(b)) => Some(a.cmp(b)),
+            (Int(a), Numeric(b)) => Some(self::Numeric::from_i64(*a).cmp(b)),
+            (Numeric(a), Int(b)) => Some(a.cmp(&self::Numeric::from_i64(*b))),
+            (Timestamp(a), Timestamp(b)) => Some(a.cmp(b)),
+            (Day(a), Day(b)) => Some(a.cmp(b)),
+            (Time(a), Time(b)) => Some(a.cmp(b)),
+            (Bytes(a), Bytes(b)) => Some(a.cmp(b)),
             _ => None,
         }
     }
 
     /// Equality backing the `EQ` / `NEQ` / `IN` / `NOT_IN` operators:
-    /// strict equality plus `Int` / `Float` numeric coercion, so
-    /// `Int(5)` equals `Float(5.0)`.
+    /// strict equality plus numeric coercion between `Int`, `Float` and
+    /// `Numeric`, so `Int(5)` equals `Float(5.0)` and `Numeric(5.00)`.
     pub fn loose_eq(&self, other: &Value) -> bool {
         match (self, other) {
             (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
                 self.compare(other) == Some(Ordering::Equal)
             }
-            _ => self == other,
+            (Value::Null, _) | (_, Value::Null) => self == other,
+            _ => self.equality_key_ref() == other.equality_key_ref(),
         }
     }
 }
@@ -123,6 +168,12 @@ impl Value {
                 List(_) => 7,
                 Map(_) => 8,
                 Set(_) => 9,
+                Numeric(_) => 10,
+                Timestamp(_) => 11,
+                Day(_) => 12,
+                Time(_) => 13,
+                Bytes(_) => 14,
+                Raw(_) => 15,
             }
         }
         fn canonical_f64(f: f64) -> f64 {
@@ -149,6 +200,12 @@ impl Value {
                 .find(|ordering| *ordering != Ordering::Equal)
                 .unwrap_or_else(|| a.len().cmp(&b.len())),
             (Set(a), Set(b)) => a.address().cmp(&b.address()),
+            (Numeric(a), Numeric(b)) => a.cmp(b),
+            (Timestamp(a), Timestamp(b)) => a.cmp(b),
+            (Day(a), Day(b)) => a.cmp(b),
+            (Time(a), Time(b)) => a.cmp(b),
+            (Bytes(a), Bytes(b)) => a.cmp(b),
+            (Raw(a), Raw(b)) => a.cmp(b),
             (Map(a), Map(b)) => {
                 let mut left: Vec<_> = a.iter().collect();
                 let mut right: Vec<_> = b.iter().collect();
@@ -282,6 +339,10 @@ impl Value {
             Value::Float(f) if f.fract() == 0.0 && f.abs() <= EXACT_INTEGER_LIMIT => {
                 Some(std::borrow::Cow::Owned(Value::Int(*f as i64)))
             }
+            Value::Numeric(n) => match n.to_i64() {
+                Some(int) => Some(std::borrow::Cow::Owned(Value::Int(int))),
+                None => Some(std::borrow::Cow::Borrowed(self)),
+            },
             other => Some(std::borrow::Cow::Borrowed(other)),
         }
     }
@@ -305,6 +366,12 @@ impl PartialEq for Value {
             (List(a), List(b)) => a == b,
             (Map(a), Map(b)) => a == b,
             (Set(a), Set(b)) => a == b,
+            (Numeric(a), Numeric(b)) => a == b,
+            (Timestamp(a), Timestamp(b)) => a == b,
+            (Day(a), Day(b)) => a == b,
+            (Time(a), Time(b)) => a == b,
+            (Bytes(a), Bytes(b)) => a == b,
+            (Raw(a), Raw(b)) => a == b,
             _ => false,
         }
     }
@@ -330,6 +397,12 @@ impl Hash for Value {
             List(items) => items.hash(state),
             Map(entries) => unordered_map_hash(entries).hash(state),
             Set(set) => set.hash(state),
+            Numeric(n) => n.hash(state),
+            Timestamp(at) => at.hash(state),
+            Day(day) => day.hash(state),
+            Time(time) => time.hash(state),
+            Bytes(bytes) => bytes.hash(state),
+            Raw(raw) => raw.hash(state),
         }
     }
 }
@@ -458,6 +531,36 @@ mod tests {
         assert_send_sync::<crate::model::WriteQuery>();
         assert_send_sync::<crate::model::MultiTableReadQuery>();
         assert_send_sync::<crate::ivm::Delta>();
+    }
+
+    /// Numerics compare and equate by value with integers and with each
+    /// other, whatever their scale, and hash alike when equal.
+    #[test]
+    fn numerics_equate_by_value() {
+        let n = |text: &str| Value::Numeric(Numeric::parse(text).unwrap());
+        assert!(n("5.00").loose_eq(&Value::Int(5)));
+        assert!(Value::Int(5).loose_eq(&n("5")));
+        assert!(n("1.50").loose_eq(&n("1.5")));
+        assert!(!n("1.5").loose_eq(&Value::Int(1)));
+        assert_eq!(n("1.50"), n("1.5"));
+        assert_eq!(hash_of(&n("1.50")), hash_of(&n("1.5")));
+        assert_eq!(n("2").equality_key(), Some(Value::Int(2)));
+        assert_eq!(Value::Int(3).compare(&n("2.5")), Some(Ordering::Greater));
+    }
+
+    /// Raw values compare with nothing, and equal only the same type and
+    /// bytes.
+    #[test]
+    fn raw_values_never_compare() {
+        let raw = |oid: u32, bytes: &'static [u8]| {
+            Value::Raw(Raw {
+                type_oid: oid,
+                bytes: Bytes::from_static(bytes),
+            })
+        };
+        assert_eq!(raw(1186, b"\x01").compare(&raw(1186, b"\x01")), None);
+        assert_eq!(raw(1186, b"\x01"), raw(1186, b"\x01"));
+        assert_ne!(raw(1186, b"\x01"), raw(869, b"\x01"));
     }
 
     /// [`Value::compare`] returns `None` for anything involving `Null`,

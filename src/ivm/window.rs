@@ -1192,13 +1192,18 @@ pub fn order_cmp(a: &Value, b: &Value) -> Ordering {
 fn rank(value: &Value) -> u8 {
     match value {
         Value::Bool(_) => 0,
-        Value::Int(_) | Value::Float(_) => 1,
+        Value::Int(_) | Value::Float(_) | Value::Numeric(_) => 1,
         Value::String(_) => 2,
         Value::Date(_) => 3,
         Value::Datetime(_) => 4,
         Value::List(_) => 5,
         Value::Map(_) | Value::Set(_) => 6,
-        Value::Null => 7,
+        Value::Timestamp(_) => 7,
+        Value::Day(_) => 8,
+        Value::Time(_) => 9,
+        Value::Bytes(_) => 10,
+        Value::Raw(_) => 11,
+        Value::Null => 12,
     }
 }
 

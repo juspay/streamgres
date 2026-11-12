@@ -264,6 +264,11 @@ pub fn cast_of(declared: &ValueType) -> &'static str {
         ValueType::Date => "date",
         ValueType::Datetime => "timestamp",
         ValueType::List(_) | ValueType::Map(_, _) => "text",
+        ValueType::Numeric => "numeric",
+        ValueType::Day => "date",
+        ValueType::Time => "time",
+        ValueType::Bytes => "bytea",
+        ValueType::Raw(_) => "text",
     }
 }
 
@@ -486,7 +491,34 @@ fn literal(value: &Value) -> String {
         Value::Datetime(datetime) => {
             format!("TIMESTAMP '{}'", datetime.format("%Y-%m-%d %H:%M:%S%.6f"))
         }
-        Value::List(_) | Value::Map(_) | Value::Set(_) => "NULL".to_owned(),
+        Value::Numeric(number) => format!("'{number}'::numeric"),
+        Value::Timestamp(at) if *at == crate::model::Timestamp::INFINITY => {
+            "'infinity'::timestamp".to_owned()
+        }
+        Value::Timestamp(at) if *at == crate::model::Timestamp::NEG_INFINITY => {
+            "'-infinity'::timestamp".to_owned()
+        }
+        Value::Timestamp(at) => {
+            format!(
+                "(TIMESTAMP '2000-01-01' + {} * INTERVAL '1 microsecond')",
+                at.0
+            )
+        }
+        Value::Day(day) if *day == crate::model::Day::INFINITY => "'infinity'::date".to_owned(),
+        Value::Day(day) if *day == crate::model::Day::NEG_INFINITY => {
+            "'-infinity'::date".to_owned()
+        }
+        Value::Day(day) => format!("(DATE '2000-01-01' + {})", day.0),
+        Value::Time(time) => format!("(TIME '00:00' + {} * INTERVAL '1 microsecond')", time.0),
+        Value::Bytes(bytes) => {
+            use std::fmt::Write as _;
+            let mut hex = String::with_capacity(bytes.len() * 2);
+            for byte in bytes.iter() {
+                let _ = write!(hex, "{byte:02x}");
+            }
+            format!("'\\x{hex}'::bytea")
+        }
+        Value::List(_) | Value::Map(_) | Value::Set(_) | Value::Raw(_) => "NULL".to_owned(),
     }
 }
 

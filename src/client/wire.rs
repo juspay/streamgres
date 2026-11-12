@@ -122,12 +122,49 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
             }
             out.push(b']');
         }
-        Value::Map(_) | Value::Set(_) => {
+        Value::Map(_)
+        | Value::Set(_)
+        | Value::Numeric(_)
+        | Value::Timestamp(_)
+        | Value::Day(_)
+        | Value::Time(_)
+        | Value::Bytes(_)
+        | Value::Raw(_) => {
             if serde_json::to_writer(&mut *out, &value_json(value, declared)).is_err() {
                 out.extend_from_slice(b"null");
             }
         }
     }
+}
+
+/// A `time` as Postgres writes it: `HH:MM:SS`, then the fraction without
+/// trailing zeros when there is one.
+fn time_text(time: crate::model::Time) -> String {
+    let micros = time.0.rem_euclid(86_400_000_000);
+    let seconds = micros / 1_000_000;
+    let fraction = micros % 1_000_000;
+    let whole = format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    );
+    if fraction == 0 {
+        return whole;
+    }
+    let digits = format!("{fraction:06}");
+    format!("{whole}.{}", digits.trim_end_matches('0'))
+}
+
+/// A `bytea` as Postgres's hex text, `\x` and two digits a byte.
+fn bytea_text(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("\\x");
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Append `text` as a JSON string, escaped.
@@ -194,6 +231,18 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
             }
             Json::Object(object)
         }
+        Value::Numeric(number) => match number.to_i64() {
+            Some(int) => Json::from(int),
+            None => serde_json::Number::from_f64(number.to_f64()).map_or(Json::Null, Json::Number),
+        },
+        Value::Timestamp(at) => at.unix_millis().map_or(Json::Null, Json::from),
+        Value::Day(day) => day
+            .midnight()
+            .and_then(|at| at.unix_millis())
+            .map_or(Json::Null, Json::from),
+        Value::Time(time) => Json::String(time_text(*time)),
+        Value::Bytes(bytes) => Json::String(bytea_text(bytes)),
+        Value::Raw(_) => Json::Null,
         Value::Set(set) => Json::Array(
             set.members()
                 .iter()
