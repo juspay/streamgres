@@ -9,6 +9,9 @@
 //! debug); run with
 //! `cargo test --release --test engine_cost -- --ignored --nocapture`.
 
+// The planner these measure is the server's.
+#![cfg(feature = "server")]
+
 macro_rules! row {
     ($($column:expr => $value:expr),* $(,)?) => {
         &[$(($column, ::streamgres::model::Value::from($value))),*][..]

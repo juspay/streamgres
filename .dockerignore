@@ -4,3 +4,5 @@
 !Cargo.lock
 !clippy.toml
 !src
+!crates/streamgres-diesel/Cargo.toml
+!crates/streamgres-diesel/src

@@ -135,13 +135,5 @@ required-features = ["server"]
 name = "load"
 required-features = ["server"]
 
-[[test]]
-name = "plan_sizes"
-required-features = ["server"]
-
-[[test]]
-name = "engine_cost"
-required-features = ["server"]
-
 [profile.release]
 debug = "limited"

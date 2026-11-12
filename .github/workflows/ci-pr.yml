@@ -35,7 +35,7 @@ jobs:
       - name: Install lld
         run: |
           sudo apt-get update
-          sudo apt-get install -y lld
+          sudo apt-get install -y lld libpq-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -47,10 +47,13 @@ jobs:
         uses: Swatinem/rust-cache@v2.7.7
 
       - name: Clippy, warnings denied
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Clippy, the engine alone (no server feature)
         run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
+
+      - name: Clippy, the Diesel adapter on Juspay's fork
+        run: cargo clippy --all-targets --locked --manifest-path crates/streamgres-juspay-diesel/Cargo.toml -- -D warnings
 
   test:
     name: Tests (accuracy)
@@ -64,7 +67,7 @@ jobs:
       - name: Install lld
         run: |
           sudo apt-get update
-          sudo apt-get install -y lld
+          sudo apt-get install -y lld libpq-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
@@ -81,7 +84,7 @@ jobs:
           until docker exec pg pg_isready -U postgres; do sleep 1; done
 
       - name: Unit, scenario, randomized and live PostgreSQL tests
-        run: cargo test --release --locked
+        run: cargo test --workspace --release --locked
 
   perf:
     name: Benchmark against the base branch (performance)

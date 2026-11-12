@@ -21,6 +21,9 @@
 //! (`ANALYZE`), have `wal_level = logical` (the storage reads on exported
 //! snapshots) and a `public` schema of the application's tables.
 
+// The planner these measure is the server's.
+#![cfg(feature = "server")]
+
 #[path = "streamgres_queries/catalog.rs"]
 #[allow(dead_code)]
 mod catalog;
