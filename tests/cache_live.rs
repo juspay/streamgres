@@ -10,6 +10,16 @@ use streamgres::model::{Numeric, Value};
 use tokio_postgres::NoTls;
 
 const TABLE: &str = "live_cache_orders";
+
+/// Held for each scenario's whole run: their schema changes fire one
+/// another's schema-change triggers, whose shared advisory lock deadlocks
+/// concurrent DDL transactions, so the scenarios run one at a time.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Takes [`SERIAL`] whatever an earlier scenario's panic left it as.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 const PUBLICATION: &str = "live_cache_pub";
 
 fn text(value: &str) -> Bind {
@@ -48,6 +58,7 @@ fn amount(text: &str) -> Value {
 
 #[test]
 fn reads_are_answered_and_kept_current() {
+    let _serial = serial();
     let Ok(dsn) = std::env::var("STREAMGRES_PG_DSN") else {
         eprintln!("STREAMGRES_PG_DSN not set: live cache scenario skipped");
         return;
@@ -218,6 +229,7 @@ fn reads_are_answered_and_kept_current() {
 /// refused as not ready meanwhile, never answered from stale rows.
 #[test]
 fn a_lost_slot_brings_a_fresh_engine() {
+    let _serial = serial();
     let Ok(dsn) = std::env::var("STREAMGRES_PG_DSN") else {
         return;
     };
@@ -312,6 +324,7 @@ fn a_lost_slot_brings_a_fresh_engine() {
 #[test]
 #[ignore = "a measurement, not a check"]
 fn read_latency() {
+    let _serial = serial();
     let Ok(dsn) = std::env::var("STREAMGRES_PG_DSN") else {
         return;
     };
@@ -380,6 +393,73 @@ fn read_latency() {
     runtime
         .block_on(client.batch_execute(&format!(
             "{teardown} DROP PUBLICATION live_bench_pub; DROP TABLE live_bench_items; DROP TABLE live_bench_owners;"
+        )))
+        .unwrap();
+}
+
+/// An update that changes only how a value is spelled (a numeric's scale,
+/// a json document's text) reaches the cache: its answer is Postgres's
+/// spelling, not the one it held before.
+#[test]
+fn a_change_of_spelling_alone_reaches_the_cache() {
+    let _serial = serial();
+    let Ok(dsn) = std::env::var("STREAMGRES_PG_DSN") else {
+        return;
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let client = runtime.block_on(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(connection);
+        client
+    });
+    let mut config = CacheConfig::new(dsn.clone(), "live_spelling_pub");
+    config.app = "streamgres_spelling".to_owned();
+    runtime
+        .block_on(client.batch_execute(&format!(
+            "DROP PUBLICATION IF EXISTS live_spelling_pub; DROP TABLE IF EXISTS live_spelling;
+             CREATE TABLE live_spelling (id int8 PRIMARY KEY, n numeric, doc json);
+             INSERT INTO live_spelling VALUES (1, 1.5, '{{\"a\":1}}');
+             CREATE PUBLICATION live_spelling_pub FOR TABLE live_spelling;
+             {}",
+            config.setup_sql()
+        )))
+        .unwrap();
+    let teardown = config.teardown_sql();
+    let cache = Cache::start(config);
+    cache.wait_ready(Duration::from_secs(30)).unwrap();
+    let reader = reader_of(&runtime, &client, &cache);
+    let sql = r#"SELECT "live_spelling"."n", "live_spelling"."doc" FROM "live_spelling""#;
+    let spelled = |rows: &streamgres::cache::CachedRows| match (&rows.rows[0][0], &rows.rows[0][1])
+    {
+        (Value::Numeric(n), Value::Json(doc)) => (n.to_string(), doc.text().to_owned()),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        spelled(&cache.read(sql, &[], &reader).unwrap()),
+        ("1.5".to_owned(), "{\"a\":1}".to_owned())
+    );
+    runtime
+        .block_on(client.batch_execute("UPDATE live_spelling SET n = 1.50, doc = '{ \"a\" : 1 }'"))
+        .unwrap();
+    let at: String = runtime
+        .block_on(client.query_one("SELECT pg_current_wal_lsn()::text", &[]))
+        .unwrap()
+        .get(0);
+    assert!(cache.wait_for(
+        Position::from(streamgres::sync::pg::Lsn::parse(&at).unwrap()),
+        Duration::from_secs(10)
+    ));
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut seen = spelled(&cache.read(sql, &[], &reader).unwrap());
+    while seen.0 != "1.50" && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        seen = spelled(&cache.read(sql, &[], &reader).unwrap());
+    }
+    assert_eq!(seen, ("1.50".to_owned(), "{ \"a\" : 1 }".to_owned()));
+    cache.stop();
+    runtime
+        .block_on(client.batch_execute(&format!(
+            "{teardown} DROP PUBLICATION live_spelling_pub; DROP TABLE live_spelling;"
         )))
         .unwrap();
 }

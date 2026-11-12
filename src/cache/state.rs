@@ -72,6 +72,23 @@ pub(super) struct State {
 
 /// The state behind its lock, and the condition readers wait on for it
 /// to change.
+/// The hash a parsed statement is filed under.
+pub(super) fn parse_hash(
+    sql: &str,
+    binds: &[crate::parser::Bind],
+    version: &super::CatalogVersion,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sql.hash(&mut hasher);
+    binds.hash(&mut hasher);
+    version.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The parsed statements, filed by [`parse_hash`].
+pub(super) type ParseMemo = HashMap<u64, Vec<(ParseKey, Arc<crate::parser::Select>)>>;
+
 /// What identifies a parsed statement.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct ParseKey {
@@ -80,7 +97,7 @@ pub(super) struct ParseKey {
     pub version: super::CatalogVersion,
 }
 
-/// The most parsed statements kept; past it the memo starts over.
+/// The most parsed statements kept; past it an eighth of them give way.
 pub(super) const PARSED_LIMIT: usize = 8192;
 
 pub(super) struct Shared {
@@ -88,7 +105,7 @@ pub(super) struct Shared {
     changed: Condvar,
     /// Statements already parsed, by their text, binds and catalog: a
     /// repeated read is not parsed again.
-    pub parsed: std::sync::RwLock<HashMap<ParseKey, Arc<crate::parser::Select>>>,
+    pub parsed: std::sync::RwLock<ParseMemo>,
     pub config: CacheConfig,
     /// The database the engine streams.
     pub database: String,

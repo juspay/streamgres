@@ -1202,6 +1202,14 @@ impl Tagged {
         if several { None } else { found }
     }
 
+    /// Whether no condition of the filter names a table: a constant
+    /// (`TRUE`, `FALSE`, or the two combined).
+    fn names_no_table(&self) -> bool {
+        let mut any = false;
+        self.visit(&mut |_| any = true);
+        !any
+    }
+
     /// The filter's top-level conjuncts.
     fn conjuncts(self) -> Vec<Tagged> {
         match self {

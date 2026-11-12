@@ -116,7 +116,7 @@ where
             return Ok(None);
         }
         if let Some(reader) = session.current_reader()
-            && reader.is_current(version)
+            && reader.is_current(&version)
         {
             return Ok(Some(reader.clone()));
         }
@@ -137,9 +137,9 @@ where
 }
 
 /// Waits, for at most `timeout`, until the cache has applied every
-/// transaction committed on `conn`'s database so far, so a read after a
-/// write sees it; whether it has. One round trip reads where the
-/// database's WAL is.
+/// transaction `conn` can see so far (on a standby, as far as it has
+/// replayed), so a read after a write sees it; whether it has. One round
+/// trip reads where the connection's WAL is.
 pub fn wait_for_writes<C>(
     cache: &Cache,
     conn: &mut C,
@@ -149,7 +149,10 @@ where
     C: Connection<Backend = Pg> + LoadConnection + 'static,
 {
     let now: WalNow =
-        crate::diesel::sql_query("SELECT pg_current_wal_lsn()::text AS lsn").get_result(conn)?;
+        crate::diesel::sql_query(
+            "SELECT (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END)::text AS lsn",
+        )
+        .get_result(conn)?;
     let position = Lsn::parse(&now.lsn).map(Position::from).ok_or_else(|| {
         Error::DeserializationError(format!("`{}` is not a WAL location", now.lsn).into())
     })?;

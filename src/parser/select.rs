@@ -212,6 +212,10 @@ impl Parser {
         if self.eat_word("WHERE") {
             let filter = self.filter_in(&scope)?;
             for conjunct in filter.conjuncts() {
+                if conjunct.names_no_table() {
+                    building[0].conjuncts.push(conjunct.into_where());
+                    continue;
+                }
                 let Some(node) = conjunct.only_node() else {
                     return self.err("a WHERE condition naming several tables is not supported");
                 };
@@ -1122,6 +1126,16 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn a_constant_condition_is_the_roots() {
+        let select = parse(
+            r#"SELECT "orders"."id" FROM ("orders" INNER JOIN "users" ON ("orders"."id" = "users"."order_id")) WHERE (FALSE AND "users"."name" = 'x')"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(select.query.main_table.filter, Where::AND(vec![Where::OR(Vec::new())]));
     }
 
     #[test]

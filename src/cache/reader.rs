@@ -40,13 +40,28 @@ pub struct ReaderCheck {
 }
 
 /// Identifies one catalog the engine served by: a reader checked against
-/// an older one must be checked again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CatalogVersion(usize);
+/// an older one must be checked again. It holds the catalog, so no later
+/// catalog can take its place in memory and pass for it.
+#[derive(Debug, Clone)]
+pub struct CatalogVersion(Arc<Catalog>);
 
 impl CatalogVersion {
     pub(super) fn of(catalog: &Arc<Catalog>) -> Self {
-        CatalogVersion(Arc::as_ptr(catalog) as usize)
+        CatalogVersion(catalog.clone())
+    }
+}
+
+impl PartialEq for CatalogVersion {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for CatalogVersion {}
+
+impl std::hash::Hash for CatalogVersion {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
     }
 }
 
@@ -113,8 +128,8 @@ impl Reader {
     }
 
     /// Whether this reader was checked against `version`.
-    pub fn is_current(&self, version: CatalogVersion) -> bool {
-        self.version == version
+    pub fn is_current(&self, version: &CatalogVersion) -> bool {
+        self.version == *version
     }
 
     /// Why this reader cannot be answered for `table` in `database`, if
@@ -171,7 +186,7 @@ mod tests {
         let reader = Reader::new(
             "app",
             &format!("orders{SEPARATOR}billing.invoices"),
-            version,
+            version.clone(),
         );
         assert!(reader.refuses("app", &TableName::from("orders")).is_some());
         assert!(
@@ -182,10 +197,10 @@ mod tests {
         assert!(reader.refuses("app", &TableName::from("users")).is_none());
         assert!(reader.refuses("other", &TableName::from("users")).is_some());
         assert!(
-            Reader::new("app", "", version)
+            Reader::new("app", "", version.clone())
                 .refuses("app", &TableName::from("orders"))
                 .is_none()
         );
-        assert!(reader.is_current(version));
+        assert!(reader.is_current(&version));
     }
 }

@@ -111,18 +111,22 @@ impl Cache {
         binds: &[Bind],
         catalog: &Arc<crate::model::Catalog>,
     ) -> Result<Arc<crate::parser::Select>, Refusal> {
-        let key = state::ParseKey {
-            sql: sql.into(),
-            binds: binds.to_vec(),
-            version: CatalogVersion::of(catalog),
-        };
+        let version = CatalogVersion::of(catalog);
+        let hash = state::parse_hash(sql, binds, &version);
         let known = self
             .shared
             .parsed
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&key)
-            .cloned();
+            .get(&hash)
+            .and_then(|filed| {
+                filed
+                    .iter()
+                    .find(|(key, _)| {
+                        &*key.sql == sql && key.binds == binds && key.version == version
+                    })
+                    .map(|(_, select)| select.clone())
+            });
         if let Some(select) = known {
             return Ok(select);
         }
@@ -136,9 +140,21 @@ impl Cache {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if parsed.len() >= state::PARSED_LIMIT {
-            parsed.clear();
+            let gone: Vec<u64> = parsed
+                .keys()
+                .take(state::PARSED_LIMIT / 8)
+                .copied()
+                .collect();
+            for hash in gone {
+                parsed.remove(&hash);
+            }
         }
-        parsed.insert(key, select.clone());
+        let key = state::ParseKey {
+            sql: sql.into(),
+            binds: binds.to_vec(),
+            version,
+        };
+        parsed.entry(hash).or_default().push((key, select.clone()));
         Ok(select)
     }
 
@@ -169,7 +185,7 @@ impl Cache {
             state.readiness(config)?;
             state.catalog()?
         };
-        if !reader.is_current(CatalogVersion::of(&catalog)) {
+        if !reader.is_current(&CatalogVersion::of(&catalog)) {
             return Err(Refusal::NotReady(
                 "the reader was checked against an older catalog".to_owned(),
             ));
