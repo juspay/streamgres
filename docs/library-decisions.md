@@ -241,3 +241,143 @@ The feed then finds the slot gone and stops rather than skip changes.
 - The live suite runs one more scenario that uses replication slots, so
   CI's Postgres allows 64 slots instead of 32. Main's suite was already
   logging "all replication slots are in use".
+
+## 10. The catalog carries only tables the publication streams in full
+
+**Decision.** At load, the catalog keeps only the tables whose every
+change the feed carries:
+- the publication must publish inserts, updates and deletes;
+- a table with a row filter, a column list or a generated column is left
+  out, with a note. (Generated columns are not replicated before
+  PostgreSQL 18.)
+
+This applies to the server as well as the cache.
+
+**Why.** Every table in the configured schemas used to be carried. A table
+outside the publication was read from snapshots and never changed again,
+so its rows silently went stale.
+
+**Where.** `src/sync/pg/catalog.rs` (`restrict_to_publication`), called by
+`threads::load_catalog_at`.
+
+## 11. Tables outside `public` are named part by part in SQL
+
+**Decision.** A catalog name `schema.table` is written as
+`"schema"."table"` (`quote_table`).
+
+**Why.** It was quoted as one name, `"schema.table"`, so no table outside
+`public` could be read. That is a bug on main.
+
+**Known gap.** The planner's statistics lookup (`pg_stats` by table name)
+still assumes `public`. Estimates for other schemas fall back to having
+no statistics.
+
+## 12. The embedded cache
+
+**Decision.** `streamgres::cache::Cache`:
+
+- **Runs on its own threads.** A supervisor thread runs one engine at a
+  time, each on a single-threaded runtime of its own, plus a two-thread
+  runtime for storage reads. The host needs no tokio runtime, so blocking
+  Diesel works.
+- **Restarts on failure.** A failed engine (lost slot, service ended) is
+  torn down and its slot dropped. A fresh engine starts on a fresh slot
+  after 1 s, doubling up to 30 s while engines keep failing within a
+  minute of starting.
+- **Reads by SQL and binds.** `read(sql, binds)` parses against the
+  engine's catalog. The first read of a query subscribes it and waits up
+  to `fill_timeout` for its rows. Later reads are answered from the rows
+  the engine keeps current: in the statement's order with ties broken by
+  primary key, offset and limit applied, the projection taken, and each
+  column with its type's OID. The cache key is the engine query itself,
+  so two SQL texts that mean the same query share one subscription.
+- **Refuses in two ways.** `Unsupported` means the engine cannot answer
+  exactly; it is remembered for `refusal_ttl`. `NotReady` means the
+  engine is starting, restarting, unheard from for more than `max_lag`,
+  or still filling the query. Either way the caller reads Postgres.
+- **Read-your-writes is explicit.** `wait_for(lsn)` waits until the engine
+  has applied a position, such as `pg_current_wal_lsn()` read after a
+  write. Freshness is never assumed silently.
+- **Bounded.** Queries unread for `idle_ttl` are unsubscribed. When
+  `max_entries` are kept, the one read longest ago gives way.
+- **Its own trigger stack.** It hears schema changes through
+  `{app}_ddl_end_{shard}`, by default `streamgres`, shard 0, next to any
+  Zero stack. `CacheConfig::setup_sql` and `teardown_sql` give the SQL;
+  event triggers need a superuser, so an administrator runs it.
+
+**Rejected.**
+- *A per-read freshness check against Postgres.* It costs a round trip
+  per read, which is the cost the cache exists to remove.
+
+**Where.** `src/cache.rs`, `src/cache/{config,engine,rows,state}.rs`.
+Live tests: `tests/cache_live.rs`.
+
+## 13. Range conditions route on every exact type
+
+**Decision.** The routing index gives every exact type a comparison
+class:
+- `Numeric` shares the class of the numbers;
+- `Float` and `Numeric` compare through the float, as Postgres compares
+  `float8` with `numeric`.
+
+**Why.** Without a class, a range filter on a numeric, timestamp, date,
+time or bytea column was never re-evaluated when a row changed. That
+missed rows in the cache and in the Zero server's time ranges. The
+adapter's live test found it.
+
+**Where.** `src/ivm/columns.rs` (`class_of`), `src/model/value.rs`.
+
+## 14. The Diesel adapter
+
+**Decision.**
+- **The API.** `streamgres-diesel` gives every Diesel query
+  `.load_cached(&cache, &mut conn)`.
+  - It takes the connection so a refusal can fall back to `.load(conn)`
+    on its own. The connection is also Diesel's metadata lookup for
+    custom types' OIDs.
+  - `try_load_cached` returns `None` on a refusal instead.
+  - Writes and transactions stay on Diesel, unchanged.
+- **The read path.**
+  - The query is rendered and its binds collected exactly as Diesel
+    sends them.
+  - Cached values are written in Postgres's binary format for their
+    column's type (`sync::pg::binary::encode`) and read through Diesel's
+    own `FromSql`, via a `Row` of the adapter's own.
+  - A value that cannot be written exactly falls back to Postgres. A
+    deserialization error is returned, not hidden.
+- **Diesel versions.** It builds on Diesel 2.2 and 2.3.
+  `juspay_diesel` 2.3.1 needs `diesel_derives` 2.2, and Cargo allows only
+  one 2.x version of a crate per build. As an optional dependency it
+  would have pinned every application to Diesel 2.2. So the same source
+  builds as `streamgres-juspay-diesel`, with the fork renamed to `diesel`
+  in its manifest, outside the workspace with its own lockfile.
+
+**Rejected.**
+- *A connection wrapper* (the s2s branch's `SyncedConnection`). It caches
+  every read implicitly. The extension trait is explicit, opt-in per
+  query, and easier to roll out one query at a time.
+- *`.load_cached(&cache)` without a connection* (the PRD's sketch). A
+  refusal would then leave the caller to fall back by hand.
+
+**Where.** `crates/streamgres-diesel`, `crates/streamgres-juspay-diesel`.
+Live test: `crates/streamgres-diesel/tests/load_cached.rs`, covering
+every query shape and column type, before and after writes.
+
+## Known gaps
+
+- **Joins.** The parser refuses them. The s2s branch's join tree is the
+  model to follow, and the join planner still lives in the server.
+- **Positions.** The engine's position type is still `Lsn`. A
+  backend-defined position is a separate change (decision 3).
+- **Domains and schema changes.** A domain-typed column can stop the
+  server when a schema change touches its table. Main has the same gap.
+- **Arrays added by a schema change.** An array column added this way has
+  no element type known (`element_oid` 0), so the cache refuses to answer
+  for it until the next restart.
+- **Zero output.** `money` and `tsvector` are shown to Zero clients as
+  `null`.
+- **A flaky live test.** `an_idle_feed_brings_the_first_snapshot_into_use`
+  fails about one run in six. It does so on main too.
+- **Test leftovers.** `schema_changes_follow_the_trigger` leaves its
+  trigger stack installed when it fails, which breaks later runs on the
+  same database. Main has the same problem.
