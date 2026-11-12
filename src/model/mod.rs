@@ -40,5 +40,5 @@ pub use query::{
     WriteQuery,
 };
 pub use row::{RowData, RowSchema};
-pub use schema::{Catalog, ColumnName, DbColumn, DbTable, PutPlan, TableName};
+pub use schema::{Catalog, Collation, ColumnName, DbColumn, DbTable, PutPlan, TableName};
 pub use value::{Day, Numeric, Raw, SharedSet, Time, Timestamp, Value, ValueType};

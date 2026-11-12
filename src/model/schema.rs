@@ -241,6 +241,30 @@ pub struct DbColumn {
     /// The OID of the column's type at the source, its base type for a
     /// domain; 0 when the column was declared by hand.
     pub type_oid: u32,
+    /// How the source compares the column's text, for a collatable type;
+    /// `None` for any other type, or when it is not known.
+    pub collation: Option<Collation>,
+}
+
+/// A text column's collation as the source resolves it: its name (the
+/// database's own for `default`) and whether texts spelled differently can
+/// compare equal under it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Collation {
+    pub name: String,
+    pub deterministic: bool,
+}
+
+impl Collation {
+    /// Whether texts order by their bytes, as the engine orders them: the
+    /// `C` collations, and code-point order, which for UTF-8 is byte order.
+    pub fn orders_bytewise(&self) -> bool {
+        self.deterministic
+            && matches!(
+                self.name.as_str(),
+                "C" | "POSIX" | "ucs_basic" | "pg_c_utf8" | "C.UTF-8" | "C.utf8"
+            )
+    }
 }
 
 /// A table: its name, its columns resolvable by name, and the names of the
@@ -368,7 +392,14 @@ impl DbColumn {
             name: name.into(),
             r#type,
             type_oid: 0,
+            collation: None,
         }
+    }
+
+    /// This column with the collation its text compares under.
+    pub fn with_collation(mut self, collation: Collation) -> Self {
+        self.collation = Some(collation);
+        self
     }
 
     /// This column with its source type's OID.

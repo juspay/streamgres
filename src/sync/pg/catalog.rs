@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use tokio_postgres::Client;
 
 use super::StorageError;
-use crate::model::{Catalog, DbColumn, DbTable, ValueType};
+use crate::model::{Catalog, Collation, DbColumn, DbTable, ValueType};
 
 /// What the load left out and why, one line per table or column.
 pub type Notes = Vec<String>;
@@ -25,7 +25,9 @@ pub async fn load_catalog(
         .query(
             "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.udt_name,
                     COALESCE(NULLIF(ty.typbasetype, 0), ty.oid)::int8 AS type_oid,
-                    base.typtype::text AS type_class
+                    base.typtype::text AS type_class,
+                    coll.collname::text AS collation,
+                    COALESCE(coll.collisdeterministic, true) AS deterministic
              FROM information_schema.columns c
              JOIN information_schema.tables t
                ON t.table_schema = c.table_schema AND t.table_name = c.table_name
@@ -34,6 +36,7 @@ pub async fn load_catalog(
              JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attname = c.column_name
              JOIN pg_type ty ON ty.oid = att.atttypid
              JOIN pg_type base ON base.oid = COALESCE(NULLIF(ty.typbasetype, 0), ty.oid)
+             LEFT JOIN pg_collation coll ON coll.oid = att.attcollation
              WHERE t.table_type = 'BASE TABLE' AND c.table_schema = ANY($1)
              ORDER BY c.table_schema, c.table_name, c.ordinal_position",
             &[&schemas],
@@ -59,6 +62,7 @@ pub async fn load_catalog(
         let column: String = row.get(2);
         pkeys.entry((schema, table)).or_default().push(column);
     }
+    let default_collation = database_collation(client).await?;
     let mut declared: BTreeMap<(String, String), Vec<DbColumn>> = BTreeMap::new();
     let mut notes = Vec::new();
     for row in &columns {
@@ -74,10 +78,19 @@ pub async fn load_catalog(
         } else {
             value_type(&data_type, &udt_name)
         };
-        declared
-            .entry((schema, table))
-            .or_default()
-            .push(DbColumn::new(column, r#type).with_type_oid(type_oid));
+        let mut column = DbColumn::new(column, r#type).with_type_oid(type_oid);
+        if let Some(name) = row.get::<_, Option<String>>(7) {
+            let name = if name == "default" {
+                default_collation.clone()
+            } else {
+                name
+            };
+            column = column.with_collation(Collation {
+                name,
+                deterministic: row.get(8),
+            });
+        }
+        declared.entry((schema, table)).or_default().push(column);
     }
     let mut tables = Vec::new();
     for ((schema, table), columns) in declared {
@@ -102,6 +115,39 @@ pub async fn load_catalog(
         ));
     }
     Ok((Catalog::new(tables), notes))
+}
+
+/// The name of the collation `default` stands for in this database: its
+/// libc locale, or for an ICU or builtin default (PostgreSQL 15 and 17)
+/// that provider's locale, prefixed `icu:` for ICU.
+async fn database_collation(client: &Client) -> Result<String, StorageError> {
+    let version: i32 = client
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .await?
+        .get(0);
+    let sql = match version {
+        170_000.. => {
+            "SELECT datcollate::text, datlocprovider::text, COALESCE(datlocale, '')::text
+             FROM pg_database WHERE datname = current_database()"
+        }
+        150_000.. => {
+            "SELECT datcollate::text, datlocprovider::text, COALESCE(daticulocale, '')::text
+             FROM pg_database WHERE datname = current_database()"
+        }
+        _ => {
+            "SELECT datcollate::text, 'c'::text, ''::text
+             FROM pg_database WHERE datname = current_database()"
+        }
+    };
+    let row = client.query_one(sql, &[]).await?;
+    let libc: String = row.get(0);
+    let provider: String = row.get(1);
+    let locale: String = row.get(2);
+    Ok(match provider.as_str() {
+        "i" => format!("icu:{locale}"),
+        "b" => locale,
+        _ => libc,
+    })
 }
 
 /// The catalog name of a table: bare in `public`, schema-qualified

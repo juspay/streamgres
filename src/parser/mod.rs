@@ -58,8 +58,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use crate::sync::pg::binary;
 use crate::model::{
-    ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameRow, DbTable, DeleteQuery,
+    ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameRow, DbColumn, DbTable,
+    DeleteQuery,
     InsertQuery, Numeric, Order, OrderBy, SingleTableReadQuery, Timestamp, UpdateQuery, Value,
     ValueType, Where, WriteQuery,
 };
@@ -72,6 +74,9 @@ pub const MAX_NESTING_DEPTH: usize = 128;
 /// The authoritative table schemas live in the model; re-exported here
 /// because the parser is their primary consumer.
 pub use crate::model::Catalog;
+
+mod select;
+pub use select::{Projection, Select, parse_select};
 
 /// A successfully parsed statement — either side of the read/write split.
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +91,7 @@ pub fn parse(sql: &str, catalog: &Catalog) -> Result<ParsedQuery, ParseError> {
         tokens: lex(sql)?,
         pos: 0,
         depth: 0,
+        binds: Vec::new(),
     };
     let parsed = parser.query(catalog)?;
     if !matches!(parser.peek(), Tok::Eof) {
@@ -151,6 +157,8 @@ pub fn point_at(source: &str, error: &ParseError) -> String {
 /// One lexed token.
 ///
 /// - `Word`: identifiers and keywords alike; keywords match case-insensitively.
+/// - `Quoted`: a double-quoted identifier, never a keyword.
+/// - `Param`: a `$n` bind parameter, by its 1-based number.
 /// - `Str`: the unquoted content of a single-quoted string literal.
 /// - `Num`: raw numeric text; the parser decides int vs float.
 /// - `Sym`: operators and punctuation, normalised (`<>` lexes as `!=`).
@@ -158,6 +166,8 @@ pub fn point_at(source: &str, error: &ParseError) -> String {
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
     Word(String),
+    Quoted(String),
+    Param(usize),
     Str(String),
     Num(String),
     Sym(&'static str),
@@ -208,6 +218,45 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
                 tok: Tok::Num(number),
                 at,
             });
+        } else if c == '"' {
+            chars.next();
+            let mut name = String::new();
+            loop {
+                match chars.next() {
+                    Some((_, '"')) if peek_at_is(&chars, 0, '"') => {
+                        name.push('"');
+                        chars.next();
+                    }
+                    Some((_, '"')) => break,
+                    Some((_, c)) => name.push(c),
+                    None => {
+                        return Err(ParseError {
+                            message: "unterminated quoted name".into(),
+                            position: at,
+                        });
+                    }
+                }
+            }
+            tokens.push(Spanned {
+                tok: Tok::Quoted(name),
+                at,
+            });
+        } else if c == '$' {
+            chars.next();
+            let mut digits = String::new();
+            take_digits(&mut chars, &mut digits);
+            let number = digits
+                .parse::<usize>()
+                .ok()
+                .filter(|number| *number > 0)
+                .ok_or(ParseError {
+                    message: "expected a parameter number after `$`".into(),
+                    position: at,
+                })?;
+            tokens.push(Spanned {
+                tok: Tok::Param(number),
+                at,
+            });
         } else if c == '\'' {
             chars.next();
             let mut text = String::new();
@@ -245,6 +294,19 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
                 '*' => "*",
                 '-' => "-",
                 '=' => "=",
+                '.' => ".",
+                ';' => ";",
+                ':' => {
+                    if peek_at_is(&chars, 0, ':') {
+                        chars.next();
+                        "::"
+                    } else {
+                        return Err(ParseError {
+                            message: "unexpected character `:`".into(),
+                            position: at,
+                        });
+                    }
+                }
                 '>' => {
                     if peek_at_is(&chars, 0, '=') {
                         chars.next();
@@ -333,6 +395,15 @@ struct Parser {
     tokens: Vec<Spanned>,
     pos: usize,
     depth: usize,
+    binds: Vec<Bind>,
+}
+
+/// One bind parameter as a Postgres client sends it: its type's OID and
+/// its value in binary format, `None` for `NULL`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Bind {
+    pub type_oid: u32,
+    pub bytes: Option<Vec<u8>>,
 }
 
 impl Parser {
@@ -379,6 +450,8 @@ impl Parser {
     fn describe(&self) -> String {
         match self.peek() {
             Tok::Word(word) => format!("`{word}`"),
+            Tok::Quoted(name) => format!("`\"{name}\"`"),
+            Tok::Param(number) => format!("`${number}`"),
             Tok::Str(text) => format!("string `{text}`"),
             Tok::Num(number) => format!("number `{number}`"),
             Tok::Sym(symbol) => format!("`{symbol}`"),
@@ -432,10 +505,10 @@ impl Parser {
         }
     }
 
-    /// A bare-word identifier.
+    /// An identifier: a bare word as written, or a double-quoted name.
     fn ident(&mut self) -> Result<String, ParseError> {
         match self.peek().clone() {
-            Tok::Word(word) => {
+            Tok::Word(word) | Tok::Quoted(word) => {
                 self.bump();
                 Ok(word)
             }
@@ -443,20 +516,52 @@ impl Parser {
         }
     }
 
-    /// A table name, resolved against the catalog.
+    /// A dotted name of up to `parts` identifiers (`a`, `a.b`, `a.b.c`).
+    fn dotted(&mut self, parts: usize) -> Result<Vec<String>, ParseError> {
+        let mut names = vec![self.ident()?];
+        while names.len() < parts && self.eat_sym(".") {
+            names.push(self.ident()?);
+        }
+        Ok(names)
+    }
+
+    /// A table name, bare or schema-qualified, resolved against the
+    /// catalog, where a table outside `public` is named `schema.table`.
     fn table<'c>(&mut self, catalog: &'c Catalog) -> Result<&'c DbTable, ParseError> {
         let at = self.at();
-        let name = self.ident()?;
+        let names = self.dotted(2)?;
+        let name = match names.as_slice() {
+            [schema, table] if schema == "public" => table.clone(),
+            [schema, table] => format!("{schema}.{table}"),
+            _ => names.concat(),
+        };
         catalog.table(&name).ok_or(ParseError {
             message: format!("unknown table `{name}`"),
             position: at,
         })
     }
 
-    /// A column name, validated to exist on `table`.
+    /// A column of `table`, bare or qualified by the table (and its
+    /// schema), validated to exist.
     fn column_name(&mut self, table: &DbTable) -> Result<ColumnName, ParseError> {
         let at = self.at();
-        let name = self.ident()?;
+        let mut names = self.dotted(3)?;
+        let name = names.pop().unwrap_or_default();
+        let qualifier = match names.as_slice() {
+            [] => None,
+            [table] => Some(table.clone()),
+            [schema, table] if schema == "public" => Some(table.clone()),
+            [schema, table] => Some(format!("{schema}.{table}")),
+            _ => None,
+        };
+        if let Some(qualifier) = qualifier
+            && qualifier != table.name.as_str()
+        {
+            return Err(ParseError {
+                message: format!("`{qualifier}` is not the table read, `{}`", table.name),
+                position: at,
+            });
+        }
         if table.column(&name).is_some() {
             Ok(ColumnName::from(name))
         } else {
@@ -770,6 +875,10 @@ impl Parser {
         }
 
         let column = self.column_name(table)?;
+        let declared = table.column(column.as_str()).ok_or(ParseError {
+            message: format!("unknown column `{column}`"),
+            position: self.at(),
+        })?;
         if self.eat_word("IS") {
             let comparison_operator = if self.eat_word("NOT") {
                 ComparisonOperator::IS_NOT
@@ -788,6 +897,36 @@ impl Parser {
                 value: Value::Null,
             }));
         }
+        let negated = self.eat_word("NOT");
+        if self.eat_word("BETWEEN") {
+            let low = self.operand(declared)?;
+            self.expect_word("AND")?;
+            let high = self.operand(declared)?;
+            let within = Where::AND(vec![
+                Where::Condition(Condition::new(column.clone(), ComparisonOperator::GTE, low)),
+                Where::Condition(Condition::new(column, ComparisonOperator::LTE, high)),
+            ]);
+            return if negated {
+                self.err("NOT BETWEEN is not supported")
+            } else {
+                Ok(within)
+            };
+        }
+        if self.eat_word("IN") {
+            let comparison_operator = if negated {
+                ComparisonOperator::NOT_IN
+            } else {
+                ComparisonOperator::IN
+            };
+            return Ok(Where::Condition(Condition {
+                column,
+                comparison_operator,
+                value: self.value_list(declared)?,
+            }));
+        }
+        if negated {
+            return self.err(format!("expected IN or BETWEEN after NOT, found {}", self.describe()));
+        }
         let comparison_operator = if self.eat_sym("=") {
             ComparisonOperator::EQ
         } else if self.eat_sym("!=") {
@@ -800,44 +939,105 @@ impl Parser {
             ComparisonOperator::LTE
         } else if self.eat_sym("<") {
             ComparisonOperator::LT
-        } else if self.eat_word("IN") {
-            return Ok(Where::Condition(Condition {
-                column,
-                comparison_operator: ComparisonOperator::IN,
-                value: self.value_list()?,
-            }));
-        } else if self.eat_word("NOT") {
-            self.expect_word("IN")?;
-            return Ok(Where::Condition(Condition {
-                column,
-                comparison_operator: ComparisonOperator::NOT_IN,
-                value: self.value_list()?,
-            }));
         } else {
             return self.err(format!(
-                "expected a comparison operator, [NOT] IN or IS [NOT] NULL after a column, found {}",
+                "expected a comparison operator, [NOT] IN, BETWEEN or IS [NOT] NULL after a column, found {}",
                 self.describe()
             ));
         };
+        let quantified = match comparison_operator {
+            ComparisonOperator::EQ if self.eat_word("ANY") => Some(ComparisonOperator::IN),
+            ComparisonOperator::NEQ if self.eat_word("ALL") => Some(ComparisonOperator::NOT_IN),
+            _ if self.is_word("ANY") || self.is_word("ALL") => {
+                return self.err("only `= ANY` and `!= ALL` are supported");
+            }
+            _ => None,
+        };
+        if let Some(comparison_operator) = quantified {
+            self.expect_sym("(")?;
+            let at = self.at();
+            let Tok::Param(number) = *self.peek() else {
+                return self.err("ANY / ALL take one array parameter");
+            };
+            self.bump();
+            self.expect_sym(")")?;
+            let value = match self.bind_value(number, declared, true, at)? {
+                Value::Null => Value::List(Vec::new()),
+                list => list,
+            };
+            return Ok(Where::Condition(Condition {
+                column,
+                comparison_operator,
+                value,
+            }));
+        }
         Ok(Where::Condition(Condition {
             column,
             comparison_operator,
-            value: self.value()?,
+            value: self.operand(declared)?,
         }))
     }
 
     /// The parenthesised value list of `IN` / `NOT IN`.
-    fn value_list(&mut self) -> Result<Value, ParseError> {
+    fn value_list(&mut self, declared: &DbColumn) -> Result<Value, ParseError> {
         self.expect_sym("(")?;
         let mut items = Vec::new();
         if !self.is_sym(")") {
-            items.push(self.value()?);
+            items.push(self.operand(declared)?);
             while self.eat_sym(",") {
-                items.push(self.value()?);
+                items.push(self.operand(declared)?);
             }
         }
         self.expect_sym(")")?;
         Ok(Value::List(items))
+    }
+
+    /// The value compared with `declared`: a bind parameter, or a literal,
+    /// either brought to the column's type where the two differ only in
+    /// form ([`coerce_read`]).
+    fn operand(&mut self, declared: &DbColumn) -> Result<Value, ParseError> {
+        let at = self.at();
+        if let Tok::Param(number) = *self.peek() {
+            self.bump();
+            return self.bind_value(number, declared, false, at);
+        }
+        let value = self.value()?;
+        coerce_read(value, &declared.r#type, at)
+    }
+
+    /// Bind parameter `number` decoded by its type, as one value or (for
+    /// `ANY` / `ALL`) a list of values of the column's type.
+    fn bind_value(
+        &self,
+        number: usize,
+        declared: &DbColumn,
+        list: bool,
+        at: usize,
+    ) -> Result<Value, ParseError> {
+        let bind = number
+            .checked_sub(1)
+            .and_then(|index| self.binds.get(index))
+            .ok_or(ParseError {
+                message: format!("no value is bound for ${number}"),
+                position: at,
+            })?;
+        let Some(bytes) = &bind.bytes else {
+            return Ok(Value::Null);
+        };
+        let decoded = if list {
+            binary::decode(
+                &ValueType::List(Box::new(declared.r#type.clone())),
+                bind.type_oid,
+                bytes,
+            )
+        } else {
+            binary::decode_scalar(bind.type_oid, bytes)
+        }
+        .map_err(|error| ParseError {
+            message: format!("${number}: {error}"),
+            position: at,
+        })?;
+        coerce_read(decoded, &declared.r#type, at)
     }
 
     /// One literal: `NULL`, `TRUE` / `FALSE`, a (possibly `-`-negated)
@@ -1011,6 +1211,50 @@ fn coerce_to_column_type(
     coerce_to_type(value, declared, column.as_str(), at)
 }
 
+/// A value compared with a column of `declared`, brought to the column's
+/// type where the two are the same value in another form: a number for a
+/// numeric or a float, epoch milliseconds or text for a time, text for a
+/// date, an enum's label sent as its own type for a text column, a numeric
+/// for a float. Any other value is kept as it is and compares as itself.
+fn coerce_read(value: Value, declared: &ValueType, at: usize) -> Result<Value, ParseError> {
+    let fail = |message: String| ParseError {
+        message,
+        position: at,
+    };
+    Ok(match (value, declared) {
+        (Value::Null, _) => Value::Null,
+        (Value::Raw(raw), ValueType::String) => Value::String(
+            String::from_utf8(raw.bytes.to_vec())
+                .map_err(|_| fail("a text value is not UTF-8".to_owned()))?,
+        ),
+        (Value::Int(millis), ValueType::Timestamp) => Timestamp::from_unix_millis(millis)
+            .map(Value::Timestamp)
+            .ok_or_else(|| fail(format!("{millis} is outside the range of a timestamp")))?,
+        (Value::String(text), ValueType::Timestamp) => crate::sync::pg::text::timestamp(&text)
+            .map(Value::Timestamp)
+            .ok_or_else(|| fail(format!("`{text}` is not a timestamp")))?,
+        (Value::String(text), ValueType::Day) => crate::sync::pg::text::day(&text)
+            .map(Value::Day)
+            .ok_or_else(|| fail(format!("`{text}` is not a date")))?,
+        (Value::Int(int), ValueType::Numeric) => Value::Numeric(Numeric::from_i64(int)),
+        (Value::Float(float), ValueType::Numeric) => Value::Numeric(
+            Numeric::parse(&float.to_string()).map_err(|error| fail(error.to_string()))?,
+        ),
+        (Value::String(text), ValueType::Numeric) => {
+            Value::Numeric(Numeric::parse(&text).map_err(|error| fail(error.to_string()))?)
+        }
+        (Value::Int(int), ValueType::Float) => Value::Float(int as f64),
+        (Value::Numeric(number), ValueType::Float) => Value::Float(number.to_f64()),
+        (Value::List(items), ValueType::List(inner)) => Value::List(
+            items
+                .into_iter()
+                .map(|item| coerce_read(item, inner, at))
+                .collect::<Result<_, _>>()?,
+        ),
+        (value, _) => value,
+    })
+}
+
 /// Recursive worker for [`coerce_to_column_type`], matching a value (and
 /// list elements) against a declared [`ValueType`]. `NULL` fits any column
 /// here — primary-key columns reject it separately via
@@ -1047,6 +1291,11 @@ fn coerce_to_type(
             })?)
         }
         (value @ Value::String(_), ValueType::Json) => value,
+        (value @ Value::Timestamp(_), ValueType::Timestamp) => value,
+        (value @ Value::Numeric(_), ValueType::Numeric) => value,
+        (value @ Value::Day(_), ValueType::Day) => value,
+        (value @ Value::Time(_), ValueType::Time) => value,
+        (value @ Value::Bytes(_), ValueType::Bytes) => value,
         (Value::Int(int), ValueType::Float) => Value::Float(int as f64),
         (Value::Float(float), ValueType::Int)
             if float.fract() == 0.0 && ((i64::MIN as f64)..(i64::MAX as f64)).contains(&float) =>
