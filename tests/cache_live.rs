@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use streamgres::cache::{Bind, Cache, CacheConfig, Lsn, Refusal};
+use streamgres::cache::{Bind, Cache, CacheConfig, Lsn, Reader, Refusal};
 use streamgres::model::{Numeric, Value};
 use tokio_postgres::NoTls;
 
@@ -24,6 +24,22 @@ fn int8(value: i64) -> Bind {
         type_oid: 20,
         bytes: Some(value.to_be_bytes().to_vec()),
     }
+}
+
+/// `client`'s connection checked as a reader of `cache`.
+fn reader_of(
+    runtime: &tokio::runtime::Runtime,
+    client: &tokio_postgres::Client,
+    cache: &Cache,
+) -> Reader {
+    let check = cache.reader_check().expect("the engine is running");
+    let row = runtime
+        .block_on(client.query_one(
+            check.sql,
+            &[&check.names, &check.as_written, &check.qualified],
+        ))
+        .expect("the reader check");
+    Reader::new(row.get(0), row.get(1), check.version)
 }
 
 fn amount(text: &str) -> Value {
@@ -63,13 +79,14 @@ fn reads_are_answered_and_kept_current() {
     cache
         .wait_ready(Duration::from_secs(30))
         .expect("the engine comes up");
+    let reader = reader_of(&runtime, &client, &cache);
 
     let by_merchant = format!(
         r#"SELECT "{TABLE}"."id", "{TABLE}"."amount" FROM "{TABLE}" WHERE ("{TABLE}"."merchant" = $1) ORDER BY "{TABLE}"."amount" DESC LIMIT $2"#
     );
     let read = |merchant: &str| {
         cache
-            .read(&by_merchant, &[text(merchant), int8(10)])
+            .read(&by_merchant, &[text(merchant), int8(10)], &reader)
             .expect("served")
             .rows
     };
@@ -80,7 +97,9 @@ fn reads_are_answered_and_kept_current() {
             vec![Value::Int(2), amount("3.00")]
         ]
     );
-    let first = cache.read(&by_merchant, &[text("m1"), int8(10)]).unwrap();
+    let first = cache
+        .read(&by_merchant, &[text("m1"), int8(10)], &reader)
+        .unwrap();
     assert_eq!(
         first.columns[1].type_oid, 1700,
         "the column's type travels with it"
@@ -105,19 +124,20 @@ fn reads_are_answered_and_kept_current() {
     assert_eq!(read("m1").len(), 2);
 
     let count = cache
-        .read(&format!(r#"SELECT COUNT(*) FROM "{TABLE}""#), &[])
+        .read(&format!(r#"SELECT COUNT(*) FROM "{TABLE}""#), &[], &reader)
         .expect("counted");
     assert_eq!(count.rows, vec![vec![Value::Int(3)]]);
 
     let refused = cache.read(
         &format!(r#"SELECT * FROM "{TABLE}" WHERE "{TABLE}"."note" = $1"#),
         &[text("a")],
+        &reader,
     );
     assert!(
         matches!(refused, Err(Refusal::Unsupported(_))),
         "char(n) compares ignoring its padding, which the engine does not: {refused:?}"
     );
-    let secret = cache.read(&format!(r#"SELECT * FROM "{TABLE}_secret""#), &[]);
+    let secret = cache.read(&format!(r#"SELECT * FROM "{TABLE}_secret""#), &[], &reader);
     assert!(
         matches!(secret, Err(Refusal::Unsupported(_))),
         "row-level security is Postgres's to apply: {secret:?}"
@@ -126,6 +146,7 @@ fn reads_are_answered_and_kept_current() {
         .read(
             &format!(r#"SELECT * FROM "{TABLE}" WHERE "{TABLE}"."id" = $1"#),
             &[int8(2)],
+            &reader,
         )
         .expect("a whole row");
     let names: Vec<&str> = whole
@@ -139,6 +160,47 @@ fn reads_are_answered_and_kept_current() {
         "in the table's own order"
     );
     assert_eq!(whole.rows[0][3], Value::from("b   "));
+
+    let count_sql = format!(r#"SELECT COUNT(*) FROM "{TABLE}""#);
+    runtime
+        .block_on(client.batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS live_cache_shadow CASCADE;
+             CREATE SCHEMA live_cache_shadow;
+             CREATE TABLE live_cache_shadow.{TABLE} (id int8 PRIMARY KEY);
+             SET search_path = live_cache_shadow, public;"
+        )))
+        .unwrap();
+    let shadowed = reader_of(&runtime, &client, &cache);
+    assert!(
+        matches!(
+            cache.read(&count_sql, &[], &shadowed),
+            Err(Refusal::Unsupported(_))
+        ),
+        "the reader's search path names another table"
+    );
+    runtime
+        .block_on(client.batch_execute(
+            "RESET search_path; DROP SCHEMA live_cache_shadow CASCADE;
+             DROP ROLE IF EXISTS live_cache_limited; CREATE ROLE live_cache_limited;
+             SET ROLE live_cache_limited;",
+        ))
+        .unwrap();
+    let limited = reader_of(&runtime, &client, &cache);
+    assert!(
+        matches!(
+            cache.read(&count_sql, &[], &limited),
+            Err(Refusal::Unsupported(_))
+        ),
+        "a role that may not read the table is not answered from it"
+    );
+    runtime
+        .block_on(client.batch_execute("RESET ROLE; DROP ROLE live_cache_limited;"))
+        .unwrap();
+    assert!(
+        cache
+            .read(&count_sql, &[], &reader_of(&runtime, &client, &cache))
+            .is_ok()
+    );
 
     cache.stop();
     runtime
@@ -180,8 +242,9 @@ fn a_lost_slot_brings_a_fresh_engine() {
     let teardown = config.teardown_sql();
     let cache = Cache::start(config);
     cache.wait_ready(Duration::from_secs(30)).expect("up");
+    let reader = reader_of(&runtime, &client, &cache);
     let sql = format!(r#"SELECT "{table}"."id" FROM "{table}""#);
-    assert_eq!(cache.read(&sql, &[]).unwrap().rows.len(), 1);
+    assert_eq!(cache.read(&sql, &[], &reader).unwrap().rows.len(), 1);
 
     let slot = cache.slot().expect("running on a slot");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -217,7 +280,12 @@ fn a_lost_slot_brings_a_fresh_engine() {
         .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok(rows) = cache.read(&sql, &[])
+        let fresh = reader_of(&runtime, &client, &cache);
+        assert!(
+            matches!(cache.read(&sql, &[], &reader), Err(Refusal::NotReady(_))),
+            "a reader checked against the engine before is checked again"
+        );
+        if let Ok(rows) = cache.read(&sql, &[], &fresh)
             && rows.rows.len() == 2
         {
             break;

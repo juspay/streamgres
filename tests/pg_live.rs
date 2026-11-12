@@ -113,13 +113,60 @@ impl Names {
     }
 }
 
+/// The schema-change trigger stack the schema-change scenario installs.
+const SCENARIO_STACK: &str = "xslive";
+
+/// Removes, once per run, a trigger stack an earlier run's schema-change
+/// scenario left behind when it failed: once its publication is gone,
+/// its triggers fail every DDL statement in the database.
+static STALE_STACK: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
 /// An administrative connection.
 async fn admin(dsn: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(dsn, NoTls).await.expect("connect");
     spawn_local(async move {
         let _ = connection.await;
     });
+    STALE_STACK
+        .get_or_init(|| async {
+            client
+                .batch_execute(&streamgres::sync::pg::ddl_triggers::teardown_sql(
+                    SCENARIO_STACK,
+                    0,
+                ))
+                .await
+                .expect("remove a stale trigger stack");
+        })
+        .await;
     client
+}
+
+/// Removes the schema-change scenario's trigger stack when dropped, so it
+/// is gone however the scenario ends.
+struct StackGuard(String);
+
+impl Drop for StackGuard {
+    fn drop(&mut self) {
+        let dsn = self.0.clone();
+        let _ = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                if let Ok((client, connection)) = tokio_postgres::connect(&dsn, NoTls).await {
+                    tokio::spawn(connection);
+                    let _ = client
+                        .batch_execute(&streamgres::sync::pg::ddl_triggers::teardown_sql(
+                            SCENARIO_STACK,
+                            0,
+                        ))
+                        .await;
+                }
+            });
+        })
+        .join();
+    }
 }
 
 /// Fresh tables (three OPEN tickets on users 7, 7, 8; users 7 and 8) and
@@ -1471,6 +1518,7 @@ fn owners_added(events: &[Event], table: &str) -> BTreeMap<i64, Option<Value>> {
 #[test]
 fn schema_changes_follow_the_trigger() {
     let Some(dsn) = dsn() else { return };
+    let _stack = StackGuard(dsn.clone());
     block_on(async {
         let names = Names::new("ddl");
         let client = prepare(&dsn, &names).await;
@@ -1491,7 +1539,7 @@ fn schema_changes_follow_the_trigger() {
         .expect("open stream");
         client
             .batch_execute(&trigger_stack_sql(
-                "xslive",
+                SCENARIO_STACK,
                 0,
                 &[names.publication.as_str()],
             ))
@@ -1667,13 +1715,6 @@ fn schema_changes_follow_the_trigger() {
         assert!(error.0.contains("cannot follow"), "{error}");
         assert!(error.0.contains("`points`"), "{error}");
 
-        let _ = client
-            .batch_execute(
-                "DROP EVENT TRIGGER IF EXISTS xslive_ddl_start_0;
-                 DROP EVENT TRIGGER IF EXISTS xslive_ddl_end_0;
-                 DROP SCHEMA IF EXISTS xslive_0 CASCADE;",
-            )
-            .await;
         cleanup(&dsn, &client, &names).await;
     });
 }

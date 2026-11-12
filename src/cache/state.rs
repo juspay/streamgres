@@ -74,6 +74,8 @@ pub(super) struct Shared {
     state: Mutex<State>,
     changed: Condvar,
     pub config: CacheConfig,
+    /// The database the engine streams.
+    pub database: String,
 }
 
 impl Shared {
@@ -90,6 +92,7 @@ impl Shared {
                 refused: HashMap::new(),
             }),
             changed: Condvar::new(),
+            database: config.database(),
             config,
         }
     }

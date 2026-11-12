@@ -78,6 +78,20 @@ impl CacheConfig {
         crate::sync::pg::ddl_triggers::teardown_sql(&self.app, self.shard)
     }
 
+    /// The database `dsn` names: its `dbname`, else its user's name, as
+    /// Postgres defaults it.
+    pub fn database(&self) -> String {
+        let parsed: Option<tokio_postgres::Config> = self.dsn.parse().ok();
+        parsed
+            .and_then(|config| {
+                config
+                    .get_dbname()
+                    .or_else(|| config.get_user())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default()
+    }
+
     /// The event trigger schema changes are heard through.
     pub fn ddl_trigger(&self) -> String {
         format!("{}_ddl_end_{}", self.app, self.shard)

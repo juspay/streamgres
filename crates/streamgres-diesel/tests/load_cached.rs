@@ -13,7 +13,7 @@ use diesel::connection::SimpleConnection;
 use diesel::dsl::count_star;
 use diesel::prelude::*;
 use diesel::sql_types::Text;
-use streamgres_diesel::{Cache, CacheConfig, LoadCached, Lsn};
+use streamgres_diesel::{Cache, CacheConfig, LoadCached, Lsn, Tracker};
 
 diesel::table! {
     adapter_orders (id) {
@@ -238,6 +238,16 @@ fn load_cached_returns_what_load_returns() {
         all
     };
 
+    let mut untracked = PgConnection::establish(&dsn).expect("connect");
+    assert_eq!(
+        adapter_orders::table
+            .select(adapter_orders::id)
+            .try_load_cached(&cache, &mut untracked)
+            .expect("rendered"),
+        None::<Vec<i64>>,
+        "a connection without a tracker is never answered from the cache"
+    );
+    conn.set_instrumentation(Tracker::new());
     let before = check(&cache, &mut conn);
     assert_eq!(before.len(), 4);
 
@@ -286,6 +296,30 @@ fn load_cached_returns_what_load_returns() {
             .select(adapter_orders::meta)
             .order(adapter_orders::id),
         serde_json::Value
+    );
+
+    conn.batch_execute(
+        "CREATE SCHEMA adapter_shadow; CREATE TABLE adapter_shadow.adapter_orders (id int8 PRIMARY KEY);
+         SET search_path = adapter_shadow, public;",
+    )
+    .expect("shadow the table");
+    assert_eq!(
+        adapter_orders::table
+            .select(adapter_orders::id)
+            .try_load_cached(&cache, &mut conn)
+            .expect("rendered"),
+        None::<Vec<i64>>,
+        "the search path now names another table"
+    );
+    conn.batch_execute("RESET search_path; DROP SCHEMA adapter_shadow CASCADE;")
+        .expect("unshadow");
+    same!(
+        &cache,
+        &mut conn,
+        adapter_orders::table
+            .select(adapter_orders::id)
+            .order(adapter_orders::id),
+        i64
     );
 
     let filtered: Vec<i64> = adapter_orders::table

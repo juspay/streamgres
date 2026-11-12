@@ -11,12 +11,18 @@
 //! while the engine is not caught up, is refused ([`Refusal`]), and the
 //! caller reads Postgres instead.
 //!
+//! A read is made for a [`Reader`]: the reader's connection, checked by
+//! one query ([`Cache::reader_check`]) for the tables it would see
+//! otherwise than the engine (another table under its search path, one it
+//! may not read). A read of such a table is refused.
+//!
 //! A cached answer reflects every transaction the engine has applied,
 //! which trails a commit by the feed's lag. A caller that must see its
 //! own write waits for it first ([`Cache::wait_for`]).
 
 mod config;
 mod engine;
+mod reader;
 mod rows;
 mod state;
 
@@ -25,6 +31,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub use config::CacheConfig;
+pub use reader::{CatalogVersion, Reader, ReaderCheck};
 pub use rows::{CachedColumn, CachedRows};
 
 pub use crate::model::Lsn;
@@ -96,9 +103,26 @@ impl Cache {
         }
     }
 
-    /// The rows `sql` with `binds` returns, as Postgres would return them
-    /// at the position the engine has applied.
-    pub fn read(&self, sql: &str, binds: &[Bind]) -> Result<CachedRows, Refusal> {
+    /// The query that checks a reader's connection against the catalog
+    /// the engine serves by now.
+    pub fn reader_check(&self) -> Result<ReaderCheck, Refusal> {
+        let state = self.shared.lock();
+        Ok(ReaderCheck::of(&state.catalog()?))
+    }
+
+    /// The catalog the engine serves by now: a [`Reader`] checked against
+    /// another must be checked again.
+    pub fn catalog_version(&self) -> Option<CatalogVersion> {
+        let state = self.shared.lock();
+        state
+            .catalog()
+            .ok()
+            .map(|catalog| CatalogVersion::of(&catalog))
+    }
+
+    /// The rows `sql` with `binds` returns to `reader`, as Postgres would
+    /// return them at the position the engine has applied.
+    pub fn read(&self, sql: &str, binds: &[Bind], reader: &Reader) -> Result<CachedRows, Refusal> {
         let config = &self.shared.config;
         let deadline = Instant::now() + config.fill_timeout;
         let catalog = {
@@ -106,11 +130,19 @@ impl Cache {
             state.readiness(config)?;
             state.catalog()?
         };
+        if !reader.is_current(CatalogVersion::of(&catalog)) {
+            return Err(Refusal::NotReady(
+                "the reader was checked against an older catalog".to_owned(),
+            ));
+        }
         let select = parse_select(sql, binds, &catalog)
             .map_err(|error| Refusal::Unsupported(error.to_string()))?;
         let table = catalog.table(select.query.table.as_str()).ok_or_else(|| {
             Refusal::Unsupported(format!("unknown table `{}`", select.query.table))
         })?;
+        if let Some(reason) = reader.refuses(&self.shared.database, &select.query.table) {
+            return Err(Refusal::Unsupported(reason));
+        }
         let query = MultiTableReadQuery::single(select.query.clone());
 
         let mut state = self.shared.lock();
