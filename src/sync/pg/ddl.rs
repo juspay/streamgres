@@ -76,6 +76,10 @@ pub struct PublishedTable {
     pub columns: HashMap<String, PublishedColumn>,
     #[serde(rename = "primaryKey", default)]
     pub primary_key: Vec<String>,
+    /// Whether the table has row-level security, which the engine,
+    /// reading as its own role, cannot apply.
+    #[serde(rename = "rowSecurity", default)]
+    pub row_security: bool,
 }
 
 /// One published column: its type as `pg_type` names it (an array as
@@ -85,7 +89,7 @@ pub struct PublishedTable {
 /// an array's element OID and the collation by name (`default` resolved
 /// as the startup catalog resolves it); an older one sends only whether
 /// the collation is deterministic.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct PublishedColumn {
     #[serde(rename = "dataType")]
     pub data_type: String,
@@ -102,9 +106,33 @@ pub struct PublishedColumn {
     #[serde(rename = "pgTypeClass")]
     pub pg_type_class: Option<String>,
     pub dflt: Option<String>,
+    /// A generated column: the feed does not carry its values.
+    #[serde(default)]
+    pub generated: bool,
+    /// Whether the type has a binary send function; without one neither
+    /// a binary read nor the feed gives its values exactly.
+    #[serde(rename = "binarySend", default = "yes")]
+    pub binary_send: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl PublishedColumn {
+    /// Why a table with this column cannot be carried, if it cannot.
+    fn uncarried(&self, name: &str) -> Option<String> {
+        if self.generated {
+            Some(format!(
+                "`{name}` is a generated column the feed does not carry"
+            ))
+        } else if !self.binary_send {
+            Some(format!("the type of `{name}` has no binary send function"))
+        } else {
+            None
+        }
+    }
+
     /// The column as the startup catalog carries it: the base type's OID,
     /// the element's OID for an array, and the collation. Without the
     /// collation's name, a collatable column gets a nameless collation,
@@ -163,6 +191,19 @@ impl PublishedTable {
     pub fn to_db_table(&self) -> Result<DbTable, String> {
         if self.primary_key.is_empty() {
             return Err(format!("{}: no primary key", self.catalog_name()));
+        }
+        if self.row_security {
+            return Err(format!(
+                "{}: row-level security, which the engine cannot apply",
+                self.catalog_name()
+            ));
+        }
+        if let Some(reason) = self
+            .columns
+            .iter()
+            .find_map(|(name, column)| column.uncarried(name))
+        {
+            return Err(format!("{}: {reason}", self.catalog_name()));
         }
         let mut columns = Vec::with_capacity(self.columns.len());
         for (name, column) in &self.columns {
@@ -450,6 +491,11 @@ pub fn classify(
 /// expression.
 fn column_changes(held: &DbTable, published: &PublishedTable) -> Result<Vec<SchemaChange>, String> {
     let name = held.name.clone();
+    if published.row_security {
+        return Err(format!(
+            "row-level security was enabled on `{name}`, which the engine cannot apply"
+        ));
+    }
     let key: Vec<&str> = published.primary_key.iter().map(String::as_str).collect();
     let held_key: Vec<&str> = held.pkey.iter().map(|column| column.as_str()).collect();
     if key != held_key {
@@ -468,8 +514,8 @@ fn column_changes(held: &DbTable, published: &PublishedTable) -> Result<Vec<Sche
             }
             Some(after) => {
                 let now = column_type(after);
-                let a_domain_seen_by_its_name = after.pg_type_class.as_deref() == Some("d")
-                    && now == Some(ValueType::Raw);
+                let a_domain_seen_by_its_name =
+                    after.pg_type_class.as_deref() == Some("d") && now == Some(ValueType::Raw);
                 if now.as_ref() != Some(&column.r#type) && !a_domain_seen_by_its_name {
                     return Err(format!(
                         "column `{column_name}` of `{name}` changed type to {} ({:?} from {:?})",
@@ -487,6 +533,9 @@ fn column_changes(held: &DbTable, published: &PublishedTable) -> Result<Vec<Sche
     added.sort_by(|a, b| a.0.cmp(b.0));
     let mut changes = Vec::new();
     for (column_name, column) in added {
+        if let Some(reason) = column.uncarried(column_name) {
+            return Err(format!("`{name}`: {reason}"));
+        }
         let Some(r#type) = column_type(column) else {
             crate::log::log_warn!(
                 "new column `{column_name}` of `{name}` is not carried: {}",
@@ -508,6 +557,24 @@ fn column_changes(held: &DbTable, published: &PublishedTable) -> Result<Vec<Sche
         });
     }
     Ok(changes)
+}
+
+/// The version of the trigger stack installed in `schema`
+/// ([`super::ddl_triggers::STACK_VERSION`]); 1 for a stack from before
+/// versions were told.
+pub async fn stack_version(client: &Client, schema: &str) -> Result<i32, StorageError> {
+    let function = format!("{}.stack_version()", super::sql::quote_ident(schema));
+    let known: bool = client
+        .query_one("SELECT to_regprocedure($1) IS NOT NULL", &[&function])
+        .await?
+        .get(0);
+    if !known {
+        return Ok(1);
+    }
+    Ok(client
+        .query_one(&format!("SELECT {function}"), &[])
+        .await?
+        .get(0))
 }
 
 /// Whether the event trigger `name` exists on `ddl_command_end` and is
@@ -612,7 +679,9 @@ mod tests {
         );
         assert_eq!(
             parse_default(Some("'{\"b\": 1, \"a\": [1.50]}'::jsonb"), &ValueType::Json),
-            Some(Value::Json(crate::model::JsonText::standard_only("{\"a\": [1.5], \"b\": 1}".into()))),
+            Some(Value::Json(crate::model::JsonText::standard_only(
+                "{\"a\": [1.5], \"b\": 1}".into()
+            ))),
             "a JSON default in the standard form"
         );
         assert_eq!(
@@ -679,7 +748,10 @@ mod tests {
         )
         .unwrap();
         let column = array.to_db_column("statuses", ValueType::List(Box::new(ValueType::String)));
-        assert_eq!((column.type_oid, column.element_oid, column.collation), (90003, 90002, None));
+        assert_eq!(
+            (column.type_oid, column.element_oid, column.collation),
+            (90003, 90002, None)
+        );
 
         let older: PublishedColumn = serde_json::from_str(
             r#"{"dataType": "text", "typeOID": 25, "collationIsDeterministic": false, "pgTypeClass": "b"}"#,
@@ -691,13 +763,55 @@ mod tests {
         assert!(!collation.deterministic && !collation.orders_bytewise());
     }
 
+    /// What the startup catalog leaves out, a migration cannot bring in:
+    /// row-level security turned on stops the engine, and a new table
+    /// with it, with a generated column or with a type that has no binary
+    /// send function is not carried.
+    #[test]
+    fn what_the_engine_cannot_carry_is_not_absorbed() {
+        let secured = published("tickets", TICKETS, &["id"]).replace(
+            r#""publications""#,
+            r#""rowSecurity": true, "publications""#,
+        );
+        let reason = classify(
+            &catalog(),
+            &["public".into()],
+            &message(&published("tickets", TICKETS, &["id"]), &secured),
+        )
+        .unwrap_err();
+        assert!(reason.contains("row-level security"), "{reason}");
+
+        for (field, expected) in [
+            (
+                r#""rowSecurity": true, "publications""#,
+                "row-level security",
+            ),
+            (r#""publications""#, "generated"),
+            (r#""publications""#, "binary send"),
+        ] {
+            let mut fresh =
+                published("notes", TICKETS, &["id"]).replace(r#""publications""#, field);
+            if expected == "generated" {
+                fresh = fresh.replacen(r#""notNull""#, r#""generated": true, "notNull""#, 1);
+            }
+            if expected == "binary send" {
+                fresh = fresh.replacen(r#""notNull""#, r#""binarySend": false, "notNull""#, 1);
+            }
+            let table: PublishedTable = serde_json::from_str(&fresh).unwrap();
+            let reason = table.to_db_table().unwrap_err();
+            assert!(reason.contains(expected), "{reason}");
+        }
+    }
+
     /// Published types map as the startup catalog maps them.
     #[test]
     fn published_types_map_like_the_catalog() {
-        let column = |data_type: &str, class: &str| PublishedColumn {
-            data_type: data_type.to_owned(),
-            pg_type_class: Some(class.to_owned()),
-            ..PublishedColumn::default()
+        let column = |data_type: &str, class: &str| -> PublishedColumn {
+            serde_json::from_value(serde_json::json!({
+                "dataType": data_type,
+                "pgTypeClass": class,
+            }))
+            .unwrap()
         };
         assert_eq!(column_type(&column("int8", "b")), Some(ValueType::Int));
         assert_eq!(
@@ -714,7 +828,10 @@ mod tests {
             Some(ValueType::List(Box::new(ValueType::String)))
         );
         assert_eq!(column_type(&column("bytea", "b")), Some(ValueType::Bytes));
-        assert_eq!(column_type(&column("numeric", "b")), Some(ValueType::Numeric));
+        assert_eq!(
+            column_type(&column("numeric", "b")),
+            Some(ValueType::Numeric)
+        );
         assert_eq!(column_type(&column("interval", "b")), Some(ValueType::Raw));
     }
 

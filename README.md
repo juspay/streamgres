@@ -232,6 +232,10 @@ STREAMGRES_PG_DSN=postgresql://postgres@localhost:5432/streamgres cargo test --t
 
 ### Using the engine as a library
 
+For embedded cached SQL reads and the Diesel adapter, see the
+[library guide](docs/library-guide.md). The example below is the lower-level
+IVM API.
+
 ```rust
 use std::rc::Rc;
 use streamgres::ivm::SingleTableIVM;

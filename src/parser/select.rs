@@ -37,6 +37,7 @@
 //! table under a `LEFT` join written after it rather than inside it, and
 //! an `ON` condition on the parent of a `LEFT` join.
 
+use super::prepared::{Count, PreparedSelect};
 use super::{Bind, ParseError, Parser, Scope, Tagged, Tok, default_order, lex};
 use crate::ivm::QueryPart;
 use crate::model::{
@@ -115,18 +116,24 @@ pub struct Select {
 
 /// Parses `sql` with its bind parameters against `catalog`.
 pub fn parse_select(sql: &str, binds: &[Bind], catalog: &Catalog) -> Result<Select, ParseError> {
-    let mut parser = Parser {
-        tokens: lex(sql)?,
-        pos: 0,
-        depth: 0,
-        binds: binds.to_vec(),
-    };
-    let select = parser.select(catalog)?;
-    parser.eat_sym(";");
-    if !matches!(parser.peek(), Tok::Eof) {
-        return parser.err(format!("unexpected trailing input: {}", parser.describe()));
+    PreparedSelect::parse(sql, catalog)?.bind(binds, catalog)
+}
+
+impl PreparedSelect {
+    pub(crate) fn parse(sql: &str, catalog: &Catalog) -> Result<Self, ParseError> {
+        let mut parser = Parser {
+            tokens: lex(sql)?,
+            pos: 0,
+            depth: 0,
+            binds: Vec::new(),
+        };
+        let select = parser.select(catalog)?;
+        parser.eat_sym(";");
+        if !matches!(parser.peek(), Tok::Eof) {
+            return parser.err(format!("unexpected trailing input: {}", parser.describe()));
+        }
+        Ok(select)
     }
-    Ok(select)
 }
 
 /// A table of the `FROM` while the statement is read.
@@ -135,7 +142,7 @@ struct Building<'c> {
     edge: Option<Edge>,
     /// Under a `LEFT` join, itself or an ancestor.
     left_joined: bool,
-    conjuncts: Vec<Where>,
+    conjuncts: Vec<Tagged>,
 }
 
 /// The tables of the `FROM` as a scope: a qualified column names its
@@ -188,7 +195,7 @@ impl Scope for FromScope<'_> {
 }
 
 impl Parser {
-    fn select(&mut self, catalog: &Catalog) -> Result<Select, ParseError> {
+    fn select(&mut self, catalog: &Catalog) -> Result<PreparedSelect, ParseError> {
         self.expect_word("SELECT")?;
         if self.is_word("DISTINCT") {
             return self.err("DISTINCT is not supported");
@@ -213,7 +220,7 @@ impl Parser {
             let filter = self.filter_in(&scope)?;
             for conjunct in filter.conjuncts() {
                 if conjunct.names_no_table() {
-                    building[0].conjuncts.push(conjunct.into_where());
+                    building[0].conjuncts.push(conjunct);
                     continue;
                 }
                 let Some(node) = conjunct.only_node() else {
@@ -225,7 +232,7 @@ impl Parser {
                         building[node].table.name
                     ));
                 }
-                building[node].conjuncts.push(conjunct.into_where());
+                building[node].conjuncts.push(conjunct);
             }
         }
         let mut order = Vec::new();
@@ -241,25 +248,25 @@ impl Parser {
         let limit = if self.eat_word("LIMIT") {
             self.count(u32::MAX)?
         } else {
-            u32::MAX
+            Count::Literal(u32::MAX)
         };
         let offset = if self.eat_word("OFFSET") {
             self.count(0)?
         } else {
-            0
+            Count::Literal(0)
         };
         if self.is_word("FOR") {
             return self.err("a locking read (FOR UPDATE, FOR SHARE) is not supported");
         }
-        let windowed = limit != u32::MAX || offset != 0;
-        if windowed
+        let statically_windowed = matches!(limit, Count::Literal(value) if value != u32::MAX)
+            || matches!(offset, Count::Literal(value) if value != 0);
+        if statically_windowed
             && projection != Projection::CountStar
             && order.iter().any(|clause| clause.node != 0)
         {
             return self
                 .err("a LIMIT or OFFSET with an ORDER BY on a joined table is not supported");
         }
-
         let at = self.at();
         let root_order: Vec<OrderBy> = match order.iter().filter(|clause| clause.node == 0).count()
         {
@@ -271,7 +278,7 @@ impl Parser {
                 .collect(),
         };
         for (index, node) in building.iter().enumerate() {
-            let filter = Where::AND(node.conjuncts.clone());
+            let filter = Where::AND(node.conjuncts.iter().map(Tagged::validation).collect());
             let ordered: Vec<OrderBy> = order
                 .iter()
                 .filter(|clause| clause.node == index)
@@ -283,17 +290,22 @@ impl Parser {
             }
         }
 
-        let followed = match projection {
-            Projection::CountStar => u32::MAX,
-            _ => limit.saturating_add(offset),
-        };
         let nodes = parts(&building);
-        let query = tree(&building, 0, root_order, followed);
-        Ok(Select {
-            query,
-            nodes,
-            projection,
-            order,
+        let query = tree(&building, 0, root_order, u32::MAX);
+        let filters = building
+            .iter()
+            .map(|node| (node.table.name.clone(), Tagged::And(node.conjuncts.clone())))
+            .collect();
+        Ok(PreparedSelect {
+            base: Select {
+                query,
+                nodes,
+                projection,
+                order,
+                limit: u32::MAX,
+                offset: 0,
+            },
+            filters,
             limit,
             offset,
         })
@@ -423,11 +435,9 @@ impl Parser {
         }
         for condition in extra.into_iter().flat_map(Tagged::conjuncts) {
             match condition.only_node() {
-                Some(node) if node == child => {
-                    building[child].conjuncts.push(condition.into_where())
-                }
+                Some(node) if node == child => building[child].conjuncts.push(condition),
                 Some(node) if inner && !building[node].left_joined => {
-                    building[node].conjuncts.push(condition.into_where())
+                    building[node].conjuncts.push(condition)
                 }
                 _ => {
                     return Err(ParseError {
@@ -578,40 +588,25 @@ impl Parser {
 
     /// A row count: a non-negative integer, or a parameter bound to one;
     /// `null` for a parameter bound to `NULL` (no limit, no offset).
-    fn count(&mut self, null: u32) -> Result<u32, ParseError> {
+    fn count(&mut self, null: u32) -> Result<Count, ParseError> {
         let at = self.at();
-        let value = match self.peek().clone() {
+        match self.peek().clone() {
             Tok::Num(number) => {
                 self.bump();
-                number.parse::<i64>().ok()
+                number
+                    .parse::<u32>()
+                    .map(Count::Literal)
+                    .map_err(|_| ParseError {
+                        message: "a LIMIT or OFFSET must be a row count".to_owned(),
+                        position: at,
+                    })
             }
             Tok::Param(number) => {
                 self.bump();
-                let bind = number
-                    .checked_sub(1)
-                    .and_then(|index| self.binds.get(index))
-                    .ok_or(ParseError {
-                        message: format!("no value is bound for ${number}"),
-                        position: at,
-                    })?;
-                match &bind.bytes {
-                    None => return Ok(null),
-                    Some(bytes) => {
-                        match crate::sync::pg::binary::decode_scalar(bind.type_oid, bytes) {
-                            Ok(Value::Int(count)) => Some(count),
-                            _ => None,
-                        }
-                    }
-                }
+                Ok(Count::Parameter { number, null, at })
             }
-            _ => None,
-        };
-        value
-            .and_then(|count| u32::try_from(count).ok())
-            .ok_or(ParseError {
-                message: "a LIMIT or OFFSET must be a row count".to_owned(),
-                position: at,
-            })
+            _ => self.err("a LIMIT or OFFSET must be a row count"),
+        }
     }
 }
 
@@ -690,7 +685,13 @@ fn tree(
         .collect();
     let main = SingleTableReadQuery::new(
         table.name.clone(),
-        Where::AND(building[node].conjuncts.clone()),
+        Where::AND(
+            building[node]
+                .conjuncts
+                .iter()
+                .map(Tagged::validation)
+                .collect(),
+        ),
         order,
         limit,
     );
@@ -784,7 +785,7 @@ fn comparable(column: &DbColumn) -> Comparable {
 /// the engine does not interpret), a range or an `ORDER BY` on a column
 /// it orders otherwise (text under a collation that does not order by
 /// bytes, an enum, JSON), and a value of another type than the column's.
-fn check_exact(
+pub(super) fn check_exact(
     table: &DbTable,
     filter: &Where,
     order: &[OrderBy],
@@ -1135,7 +1136,10 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert_eq!(select.query.main_table.filter, Where::AND(vec![Where::OR(Vec::new())]));
+        assert_eq!(
+            select.query.main_table.filter,
+            Where::AND(vec![Where::OR(Vec::new())])
+        );
     }
 
     #[test]

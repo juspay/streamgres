@@ -47,7 +47,7 @@ jobs:
         uses: Swatinem/rust-cache@v2.7.7
 
       - name: Clippy, warnings denied
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --features streamgres-diesel/async --locked -- -D warnings
 
       - name: Clippy, the engine alone (no server feature)
         run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
@@ -84,7 +84,7 @@ jobs:
           until docker exec pg pg_isready -U postgres; do sleep 1; done
 
       - name: Unit, scenario, randomized and live PostgreSQL tests
-        run: cargo test --workspace --release --locked
+        run: cargo test --workspace --features streamgres-diesel/async --release --locked
 
   perf:
     name: Benchmark against the base branch (performance)

@@ -19,6 +19,11 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION "xyne_0".stack_version()
+RETURNS INT
+IMMUTABLE
+AS $$ SELECT 2 $$ LANGUAGE sql;
+
 CREATE OR REPLACE FUNCTION "xyne_0".default_collation()
 RETURNS TEXT
 STABLE
@@ -52,6 +57,7 @@ WITH published_columns AS (SELECT
   pc.relnamespace::int8 AS "schemaOID" ,
   pc.relname AS "name",
   pc.relreplident AS "replicaIdentity",
+  pc.relrowsecurity AS "rowSecurity",
   attnum AS "pos",
   attname AS "col",
   pt.typname AS "type",
@@ -60,6 +66,9 @@ WITH published_columns AS (SELECT
   base_pt.typelem::int8 AS "elementOID",
   CASE WHEN coll.collname = 'default' THEN "xyne_0".default_collation()
        ELSE coll.collname::text END AS "collation",
+  attgenerated <> '' AS "generated",
+  base_pt.typsend::oid <> 0
+    AND (base_pt.typcategory <> 'A' OR COALESCE(elem_pt.typsend::oid, 0) <> 0) AS "binarySend",
   pt.typtype,
   elem_pt.typtype AS "elemTyptype",
   coll.collisdeterministic AS "collationIsDeterministic",
@@ -93,6 +102,7 @@ tables AS (SELECT json_build_object(
   'schemaOID', "schemaOID",
   'name', "name",
   'replicaIdentity', "replicaIdentity",
+  'rowSecurity', "rowSecurity",
   'columns', json_object_agg(
     DISTINCT
     col,
@@ -107,6 +117,8 @@ tables AS (SELECT json_build_object(
       'baseTypeOID', "baseTypeOID",
       'elementOID', "elementOID",
       'collation', "collation",
+      'generated', "generated",
+      'binarySend', "binarySend",
       'collationIsDeterministic', "collationIsDeterministic",
       'characterMaximumLength', CASE WHEN "typeOID" = 1043 OR "typeOID" = 1042
                                      THEN "maxLen" - 4
@@ -128,7 +140,7 @@ tables AS (SELECT json_build_object(
     jsonb_build_object('rowFilter', "rowFilter") ORDER BY "publication"
   )
 ) AS "table", "schema", "name" FROM published_columns
-  GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity"),
+  GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity", "rowSecurity"),
 
   indexed_columns AS (SELECT
       pg_indexes.schemaname as "schema",

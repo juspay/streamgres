@@ -112,8 +112,8 @@ use super::wire;
 use crate::ivm::{Delta, QueryPart};
 use crate::log::{Level, log_debug, log_event, log_info, log_warn};
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, Position,
-    MultiTableReadQuery, RowData, SubId, TableName, Value, WriteQuery,
+    Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, MultiTableReadQuery,
+    Position, RowData, SubId, TableName, Value, WriteQuery,
 };
 use crate::stats::Stats;
 use crate::sync::{CatalogHandle, Command, Event};
@@ -736,6 +736,7 @@ impl Groups {
                 watched,
                 received,
                 routed,
+                ..
             } => {
                 self.absorb(updates);
                 self.stats.engine_to_groups.record(routed.elapsed());
@@ -1746,7 +1747,11 @@ fn build_poke(
             frames.push(part_frame(poke_id, head.take(), &[]));
             current_bytes = frame_overhead;
         }
-        current_bytes += if entries.is_empty() { entry.len() } else { entry.len() + 1 };
+        current_bytes += if entries.is_empty() {
+            entry.len()
+        } else {
+            entry.len() + 1
+        };
         entries.push(entry);
     }
     frames.push(part_frame(poke_id, head.take(), &entries));

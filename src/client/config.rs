@@ -496,6 +496,8 @@ impl Config {
             ddl_trigger: self.ddl_trigger.clone(),
             ddl_prefix: self.ddl_prefix.clone(),
             settle_reports: false,
+            row_limit: crate::sync::pg::read_row_limit(),
+            memory_tables: crate::sync::Sources::cached_from_env(),
         }
     }
 }

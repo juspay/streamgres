@@ -92,6 +92,9 @@ pub fn format() -> Format {
 
 /// Whether `level` is written.
 pub fn enabled(level: Level) -> bool {
+    if !cfg!(feature = "server") {
+        return ::log::log_enabled!(target: "streamgres", facade_level(level));
+    }
     rank(level) <= LEVEL.load(Ordering::Relaxed)
 }
 
@@ -133,8 +136,26 @@ pub fn event(level: Level, message: String, fields: Vec<(&'static str, String)>)
     submit(level, message, fields);
 }
 
-/// Hand a line to the log thread, or count it dropped.
+/// The host logging facade's matching level.
+fn facade_level(level: Level) -> ::log::Level {
+    match level {
+        Level::Error => ::log::Level::Error,
+        Level::Warn => ::log::Level::Warn,
+        Level::Info => ::log::Level::Info,
+        Level::Debug => ::log::Level::Debug,
+    }
+}
+
+/// Hand a line to the host logger or the server's log thread.
 fn submit(level: Level, message: String, fields: Vec<(&'static str, String)>) {
+    if !cfg!(feature = "server") {
+        let fields = fields
+            .iter()
+            .map(|(key, value)| format!(" {key}={value}"))
+            .collect::<String>();
+        ::log::log!(target: "streamgres", facade_level(level), "{message}{fields}");
+        return;
+    }
     let line = Line {
         at: chrono::Utc::now(),
         level,
@@ -159,6 +180,10 @@ fn submit(level: Level, message: String, fields: Vec<(&'static str, String)>) {
 /// Wait until everything queued so far is written, for at most a second:
 /// what a process does before it exits.
 pub fn flush() {
+    if !cfg!(feature = "server") {
+        ::log::logger().flush();
+        return;
+    }
     let (done_tx, done_rx) = sync_channel(1);
     let sent = sender()
         .lock()
@@ -350,6 +375,7 @@ mod tests {
     use super::*;
 
     /// A field value that must never be asked for.
+    #[cfg(feature = "server")]
     fn boom() -> String {
         panic!("formatted although the level is off")
     }
@@ -393,6 +419,7 @@ mod tests {
     /// nor queued; a line at the level is queued. The count is the
     /// process's, so lines other tests log meanwhile may be in it: the
     /// last check is that it grew, not by how much.
+    #[cfg(feature = "server")]
     #[test]
     fn a_level_that_is_off_formats_nothing() {
         set_level(Level::Warn);

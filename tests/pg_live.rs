@@ -12,18 +12,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
-use tokio::task::{LocalSet, spawn_local};
-use tokio_postgres::{Client, NoTls};
 use streamgres::ivm::{Delta, Engine, Fetch, MultiTableIVM, QueryPart};
 use streamgres::model::*;
-use streamgres::sync::pg::ddl_triggers::trigger_stack_sql;
 use streamgres::sync::pg::ddl::DdlSource;
+use streamgres::sync::pg::ddl_triggers::trigger_stack_sql;
 use streamgres::sync::pg::estimate_cache::EstimateCache;
 use streamgres::sync::pg::{PgStorage, PgStream};
 use streamgres::sync::{
     CatalogHandle, Command, Event, Position, Runtime, Service, Sources, Storage, SubId, Transaction,
 };
+use tokio::sync::mpsc;
+use tokio::task::{LocalSet, spawn_local};
+use tokio_postgres::{Client, NoTls};
 
 /// The database under test, if any.
 fn dsn() -> Option<String> {
@@ -501,6 +501,7 @@ fn service_streams_end_to_end() {
                     catalog: None,
                     received: Instant::now(),
                     committed_at_micros: 0,
+                    behind: std::time::Duration::ZERO,
                     decode: std::time::Duration::ZERO,
                 }))
                 .await
@@ -937,7 +938,11 @@ fn an_estimate_sizes_a_tree_without_counting_it() {
             );
         }
         assert!(
-            storage.estimate(&shapes[2].1, 100_000).await.expect("estimate") < 600,
+            storage
+                .estimate(&shapes[2].1, 100_000)
+                .await
+                .expect("estimate")
+                < 600,
             "not half the table"
         );
         assert_eq!(
@@ -1006,7 +1011,10 @@ fn an_estimate_is_remembered_until_its_table_moves() {
             .await
             .expect("analyze");
         let after = storage.estimate(&open, 100_000).await.expect("estimate");
-        assert!(after > 5 * first, "analyzed: {after} against {first} before");
+        assert!(
+            after > 5 * first,
+            "analyzed: {after} against {first} before"
+        );
         cleanup(&dsn, &client, &names).await;
     });
 }
@@ -1121,7 +1129,9 @@ fn a_json_column_is_filtered_by_value() {
                 Where::condition(
                     column,
                     ComparisonOperator::EQ,
-                    Value::Json(JsonText::standard_only(streamgres::sync::pg::text::jsonb_text(&literal))),
+                    Value::Json(JsonText::standard_only(
+                        streamgres::sync::pg::text::jsonb_text(&literal),
+                    )),
                 ),
                 OrderBy::new("id", Order::ASC),
                 u32::MAX,
@@ -1155,7 +1165,9 @@ fn a_json_column_is_filtered_by_value() {
                 assert_eq!(storage.count(&alone, 10).await.expect("count"), 1);
                 assert_eq!(
                     read.rows[0].1.data.get(&ColumnName::from(column)),
-                    Some(&Value::Json(JsonText::standard_only(streamgres::sync::pg::text::jsonb_text(&literal)))),
+                    Some(&Value::Json(JsonText::standard_only(
+                        streamgres::sync::pg::text::jsonb_text(&literal)
+                    ))),
                     "the {column} cell a read brings back is the text the literal was given"
                 );
             }
@@ -1176,7 +1188,9 @@ fn a_json_column_is_filtered_by_value() {
             .cloned();
         assert_eq!(
             cell,
-            Some(Value::Json(JsonText::standard_only("{\"a\": \"x\", \"b\": [1, 2]}".to_owned()))),
+            Some(Value::Json(JsonText::standard_only(
+                "{\"a\": \"x\", \"b\": [1, 2]}".to_owned()
+            ))),
             "the cell a read brings back is the text the literal was given"
         );
         let whole = SingleTableReadQuery::new(
@@ -1944,10 +1958,11 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
             ))
             .await
             .expect("prepare");
-        let loaded = streamgres::sync::pg::catalog::load_catalog(&client, &["live_exact".to_owned()])
-            .await
-            .expect("catalog")
-            .0;
+        let loaded =
+            streamgres::sync::pg::catalog::load_catalog(&client, &["live_exact".to_owned()])
+                .await
+                .expect("catalog")
+                .0;
         let declared = loaded.table(table).expect("the table is carried").clone();
         let catalog = Arc::new(Catalog::new(vec![declared]));
         let mut stream = PgStream::open(&dsn, slot, publication, catalog.clone())
@@ -2018,13 +2033,29 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
         }
 
         let first = &read.rows[0].1.data;
-        let cell = |name: &str| first.get(&ColumnName::from(name)).cloned().unwrap_or(Value::Null);
-        assert!(matches!(cell("n"), Value::Numeric(n) if n.to_string() == "12345678901234567890.1230"));
+        let cell = |name: &str| {
+            first
+                .get(&ColumnName::from(name))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        assert!(
+            matches!(cell("n"), Value::Numeric(n) if n.to_string() == "12345678901234567890.1230")
+        );
         assert_eq!(cell("f4"), Value::Float(1.5));
-        assert_eq!(cell("u"), Value::from("00010203-0405-0607-0809-0a0b0c0d0e0f"));
-        assert_eq!(cell("j"), Value::Json(JsonText::standard_only("{\"a\": 2, \"b\": 1.5}".to_owned())));
+        assert_eq!(
+            cell("u"),
+            Value::from("00010203-0405-0607-0809-0a0b0c0d0e0f")
+        );
+        assert_eq!(
+            cell("j"),
+            Value::Json(JsonText::standard_only("{\"a\": 2, \"b\": 1.5}".to_owned()))
+        );
         assert!(matches!(cell("j"), Value::Json(json) if json.text() == "{ \"b\":1.50, \"a\":2 }"));
-        assert_eq!(cell("jb"), Value::Json(JsonText::standard_only("{\"a\": 1.5}".to_owned())));
+        assert_eq!(
+            cell("jb"),
+            Value::Json(JsonText::standard_only("{\"a\": 1.5}".to_owned()))
+        );
         assert!(matches!(cell("jb"), Value::Json(json) if json.text() == "{\"a\": 1.50}"));
         let micros = |text: &str| {
             let at = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").unwrap();
@@ -2033,8 +2064,13 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
         assert_eq!(cell("ts"), micros("2026-09-11 10:00:00.123456"));
         assert_eq!(cell("tz"), micros("2026-09-11 04:30:00.5"));
         assert_eq!(cell("tm"), Value::Time(Time(86_399_999_999)));
-        assert_eq!(cell("by"), Value::Bytes(bytes::Bytes::from_static(&[0, 255, 16])));
-        assert!(matches!(cell("iv"), Value::Raw(raw) if raw.type_oid == 1186 && raw.bytes.len() == 16));
+        assert_eq!(
+            cell("by"),
+            Value::Bytes(bytes::Bytes::from_static(&[0, 255, 16]))
+        );
+        assert!(
+            matches!(cell("iv"), Value::Raw(raw) if raw.type_oid == 1186 && raw.bytes.len() == 16)
+        );
         assert!(matches!(cell("addr"), Value::Raw(raw) if raw.type_oid == 869));
         assert_eq!(cell("mood"), Value::from("busy"));
         assert_eq!(
@@ -2063,7 +2099,12 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
         }
 
         let second = &read.rows[1].1.data;
-        let cell = |name: &str| second.get(&ColumnName::from(name)).cloned().unwrap_or(Value::Null);
+        let cell = |name: &str| {
+            second
+                .get(&ColumnName::from(name))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
         assert!(matches!(cell("n"), Value::Numeric(Numeric::NaN)));
         assert_eq!(cell("ts"), Value::Timestamp(Timestamp::INFINITY));
         assert_eq!(cell("tz"), Value::Timestamp(Timestamp::NEG_INFINITY));
@@ -2134,7 +2175,10 @@ fn a_sweep_drops_only_slots_whose_owner_is_gone() {
             if dropped == vec![owned.clone()] {
                 break;
             }
-            assert!(Instant::now() < deadline, "the released slot was never swept");
+            assert!(
+                Instant::now() < deadline,
+                "the released slot was never swept"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(!exists(owned).await);

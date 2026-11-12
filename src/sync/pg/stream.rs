@@ -62,12 +62,12 @@ use tokio_postgres::Client;
 use tokio_postgres::config::Host;
 use tokio_postgres::types::PgLsn;
 
+use super::binary;
 use super::ddl::{self, DdlSource};
 use super::lsn::Lsn;
 use super::pgoutput::{self, Cell, Message};
 use crate::ivm::SchemaChange;
 use crate::log::{log_info, log_warn};
-use super::binary;
 use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbColumn, DbTable, DeleteQuery, InsertQuery,
     Position, RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
@@ -109,6 +109,9 @@ pub struct Transaction {
     pub schema: Vec<SchemaChange>,
     pub catalog: Option<Arc<Catalog>>,
     pub committed_at_micros: i64,
+    /// How far behind the commit the server was when it sent it, by the
+    /// server's own clock: the feed's lag at the source.
+    pub behind: Duration,
     pub decode: Duration,
 }
 
@@ -144,6 +147,8 @@ pub struct Decoder {
     /// that already has them, and the engine must still be told.
     changes: Vec<SchemaChange>,
     decode: Duration,
+    /// The server's clock on the last message that carried it.
+    server_time_micros: i64,
 }
 
 impl Decoder {
@@ -156,6 +161,7 @@ impl Decoder {
             ddl: None,
             changes: Vec::new(),
             decode: Duration::ZERO,
+            server_time_micros: 0,
         }
     }
 
@@ -207,11 +213,26 @@ impl Decoder {
                     catalog: (!schema.is_empty()).then(|| self.catalog.clone()),
                     schema,
                     committed_at_micros: commit_time_micros,
+                    behind: Duration::from_micros(
+                        u64::try_from(self.server_time_micros.saturating_sub(commit_time_micros))
+                            .unwrap_or(0),
+                    ),
                     decode: Duration::ZERO,
                 }))
             }
-            ReplicationEvent::XLogData { data, .. } => {
+            ReplicationEvent::XLogData {
+                data,
+                server_time_micros,
+                ..
+            } => {
+                self.server_time_micros = self.server_time_micros.max(server_time_micros);
                 self.decode(&data)?;
+                Ok(None)
+            }
+            ReplicationEvent::KeepAlive {
+                server_time_micros, ..
+            } => {
+                self.server_time_micros = self.server_time_micros.max(server_time_micros);
                 Ok(None)
             }
             ReplicationEvent::Message {
@@ -225,7 +246,7 @@ impl Decoder {
                 }
                 Ok(None)
             }
-            ReplicationEvent::KeepAlive { .. } | ReplicationEvent::StoppedAt { .. } => Ok(None),
+            ReplicationEvent::StoppedAt { .. } => Ok(None),
         }
     }
 
@@ -567,7 +588,8 @@ impl Transport {
 
     /// Tell the slot that everything up to `at` has been received.
     fn acknowledge(&mut self, at: Position) {
-        self.feed.update_applied_lsn(pgwire_replication::Lsn(super::lsn::wal(at)));
+        self.feed
+            .update_applied_lsn(pgwire_replication::Lsn(super::lsn::wal(at)));
     }
 
     /// Run until `out` has no receiver or the connection ends: decode
@@ -664,6 +686,7 @@ impl Transport {
                 catalog: transaction.catalog,
                 received: Instant::now(),
                 committed_at_micros: transaction.committed_at_micros,
+                behind: transaction.behind,
                 decode: transaction.decode,
             };
             if out.send(committed).await.is_err() {
@@ -1463,7 +1486,10 @@ mod tests {
         let mut feed = Feed::new(catalog());
         assert_eq!(feed.progress(), Position(0));
         assert!(feed.absorb(keepalive("0/100")).unwrap().is_none());
-        assert_eq!(feed.progress(), Position::from(Lsn::parse("0/100").unwrap()));
+        assert_eq!(
+            feed.progress(),
+            Position::from(Lsn::parse("0/100").unwrap())
+        );
         assert!(feed.absorb(begin()).unwrap().is_none());
         assert!(feed.absorb(keepalive("0/180")).unwrap().is_none());
         let committed = feed
@@ -1472,11 +1498,20 @@ mod tests {
             .expect("a transaction");
         assert_eq!(committed.at, Position::from(Lsn::parse("0/200").unwrap()));
         assert!(committed.writes.is_empty());
-        assert_eq!(feed.progress(), Position::from(Lsn::parse("0/200").unwrap()));
+        assert_eq!(
+            feed.progress(),
+            Position::from(Lsn::parse("0/200").unwrap())
+        );
         assert!(feed.absorb(keepalive("0/180")).unwrap().is_none());
-        assert_eq!(feed.progress(), Position::from(Lsn::parse("0/200").unwrap()));
+        assert_eq!(
+            feed.progress(),
+            Position::from(Lsn::parse("0/200").unwrap())
+        );
         assert!(feed.absorb(keepalive("0/2A8")).unwrap().is_none());
-        assert_eq!(feed.progress(), Position::from(Lsn::parse("0/2A8").unwrap()));
+        assert_eq!(
+            feed.progress(),
+            Position::from(Lsn::parse("0/2A8").unwrap())
+        );
     }
 
     /// A `jsonb` cell in binary format: its version byte, then its text.
@@ -1502,11 +1537,7 @@ mod tests {
         let mut decoder = Decoder::new(catalog);
         let events = vec![
             begin(),
-            relation(
-                7,
-                "docs",
-                &[("id", 20), ("binary", 3802), ("plain", 114)],
-            ),
+            relation(7, "docs", &[("id", 20), ("binary", 3802), ("plain", 114)]),
             insert(
                 7,
                 &[
@@ -1527,11 +1558,19 @@ mod tests {
             .iter()
             .map(|write| write.new_row_image().unwrap())
             .collect();
-        let standard = Value::Json(crate::model::JsonText::standard_only("{\"a\": 1.5, \"bb\": \"1.0\"}".into()));
+        let standard = Value::Json(crate::model::JsonText::standard_only(
+            "{\"a\": 1.5, \"bb\": \"1.0\"}".into(),
+        ));
         assert_eq!(rows[0].data["binary"], standard);
         assert_eq!(rows[0].data["plain"], standard);
-        assert_eq!(rows[1].data["binary"], Value::Json(crate::model::JsonText::standard_only("2".into())));
-        assert_eq!(rows[1].data["plain"], Value::Json(crate::model::JsonText::standard_only("2".into())));
+        assert_eq!(
+            rows[1].data["binary"],
+            Value::Json(crate::model::JsonText::standard_only("2".into()))
+        );
+        assert_eq!(
+            rows[1].data["plain"],
+            Value::Json(crate::model::JsonText::standard_only("2".into()))
+        );
         assert!(
             matches!(&rows[1].data["plain"], Value::Json(json) if json.text() == "2.0"),
             "the text Postgres has is kept beside the standard form"
@@ -1635,7 +1674,10 @@ mod tests {
             .collect();
         assert_eq!(transactions.len(), 4, "{transactions:?}");
 
-        assert_eq!(transactions[0].at, Position::from(Lsn::parse("0/3EFF460").unwrap()));
+        assert_eq!(
+            transactions[0].at,
+            Position::from(Lsn::parse("0/3EFF460").unwrap())
+        );
         assert_eq!(transactions[0].writes.len(), 2);
         let image = transactions[0].writes[0].new_row_image().unwrap();
         assert_eq!(image.data["name"], Value::String("it's x".into()));
@@ -1667,7 +1709,10 @@ mod tests {
         );
 
         assert!(matches!(transactions[1].writes[0], WriteQuery::UPDATE(_)));
-        assert_eq!(transactions[1].at, Position::from(Lsn::parse("0/3EFF508").unwrap()));
+        assert_eq!(
+            transactions[1].at,
+            Position::from(Lsn::parse("0/3EFF508").unwrap())
+        );
 
         let last = &transactions[2].writes;
         assert_eq!(
@@ -1684,9 +1729,15 @@ mod tests {
         assert!(
             matches!(&last[2], WriteQuery::DELETE(d) if d.pkey_value.pkey_value["id"] == Value::Int(1))
         );
-        assert_eq!(transactions[2].at, Position::from(Lsn::parse("0/3EFF6F8").unwrap()));
+        assert_eq!(
+            transactions[2].at,
+            Position::from(Lsn::parse("0/3EFF6F8").unwrap())
+        );
 
         assert!(transactions[3].writes.is_empty());
-        assert_eq!(transactions[3].at, Position::from(Lsn::parse("0/3EFF768").unwrap()));
+        assert_eq!(
+            transactions[3].at,
+            Position::from(Lsn::parse("0/3EFF768").unwrap())
+        );
     }
 }

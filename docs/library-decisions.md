@@ -675,10 +675,92 @@ On Postgres 17:
 
 ## Known gaps
 
-None of the gaps listed earlier remains open. What is left:
+The earlier implementation round closed its listed gaps. The later full-branch
+review and the reliability rewrite exposed additional work (see decision 27).
+Previously recorded costs:
 
 - **A cost of tracking.** Rendering each DSL statement's SQL on tracked
   connections (decision 19).
 - **What is still refused**, deliberately, until the engine can answer it
   exactly: the join shapes listed in decision 21, and the comparison
   rules of decision 8.
+
+
+## 27. Reliability and the embedded-library contract
+
+The review's four reproduced wrong answers are covered by the comparison
+fixes in `40ea7b1` and the permanent `exactness_live` differential test. RLS
+changes are now reported through a versioned trigger stack, retire the old
+engine, and remain excluded after restart. Reader identity includes the
+cluster identifier. An old trigger stack prevents startup.
+
+The supervisor cancels startup and feed connection attempts, has startup
+and cleanup deadlines, catches panics, clears the running phase, releases
+resources and retries with backoff. Unsubscribes wait for capacity while
+remaining cancellable. Fault tests inject a panic and saturate the command
+queue; TCP peers that never complete login exercise cancellation.
+
+A source watermark sampled independently over SQL must be applied before
+it can renew freshness. Position marks from a busy old feed no longer make
+backlogged answers look current. Sampling uses a local monotonic instant
+before its round trip, avoiding wall-clock skew. This costs one connection
+and five small queries per second per cache.
+
+Entry and per-query byte budgets include metadata and retained projections.
+Hydration enforces them incrementally; joins enumerate combinations under
+limits rather than build an unbounded product first. Refusal and parse
+memos have separate byte/count bounds. They are estimated retention limits,
+not an allocator/RSS cap. See `library-guide.md` for defaults and costs.
+
+Reads take shared locks. Their wake epoch is atomic, LRU touches write only
+when the millisecond changes, and metric updates are sharded. One bounded private answer per thread avoids
+shared read locks and shared Arc counter writes on repeated hot keys. Its
+revision is published as part of releasing the write lock, with a separate
+freshness/activity deadline: neither a completed WAL barrier nor a stopped
+engine can leave an old local answer usable. SQL shapes
+are compiled separately from typed value substitution; distinct bind values
+no longer rerun grammar parsing and schema resolution. A second bounded
+memo retains frequently repeated evaluated statements.
+
+## 28. Adapter sessions, diagnostics and version support
+
+The tracker is found by downcasting, replacing decision 19's fake query
+probe. It must wrap application instrumentation. `install()` refuses to
+replace an existing application default. Upstream Diesel 2.2 has no such
+downcast API; upstream is pinned to 2.3.14 and the separate Juspay package
+to 2.3.1. This deliberately replaces the earlier 2.2 compatibility claim.
+
+Every database statement invalidates its reader check, including a SELECT
+that changes session state inside a function. Cache-only events bypass
+that invalidation and are balanced, including on cancellation. Raw comments,
+long batches, chained transactions, rollback-to-savepoint variants and failed
+COMMITs have regressions. External privilege changes retain the documented
+ten-second recheck bound.
+
+Cached decode failures fall back and count as unusable answers. Adapter
+refusals before the core read are counted too. `inspect_cached` preserves
+reasons. First/get-result/optional methods supplement `load_cached`. The
+cache's Position is opaque and the adapter no longer re-exports Lsn.
+
+Library-only logging uses the host log facade. Embedded row limits are
+passed explicitly, never read from process env. The server-only money-text
+scale is absent from a library-only catalog load. `Stats::shared()` was
+verified to allocate fresh statistics; its name did not make it a singleton.
+
+## 29. Optional upstream async reads
+
+The `async` feature supports diesel-async 0.7.4 with the same reader checks,
+transaction refusals, decoding and fallback rules. Cache waits and decoding
+run on Tokio's blocking pool. Event guards finish on cancellation, and the
+connection borrow is released while an already-running cache task can finish
+its bounded work independently. The async write barrier waits off-executor.
+
+Built-in bind metadata is static. Custom bind metadata safely falls back to
+the normal async query instead of adding a synchronous metadata round trip.
+Juspay's fork has no compatible diesel-async crate; the async feature is
+explicitly upstream-only. Live async tests cover hits, fallback, writes,
+raw transactions and spawning extension futures on a multithreaded executor.
+
+CI now enables async for workspace tests/lints and still checks the separate
+Juspay lockfile and library-only build. The full user guide and adapter README
+record setup, costs, guarantees, fallback, limits and compatibility.

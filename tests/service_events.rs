@@ -10,13 +10,13 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-use tokio::task::{LocalSet, spawn_local};
 use streamgres::ivm::MultiTableIVM;
 use streamgres::model::*;
 use streamgres::sync::{
-    Command, Event, Position, MemoryStorage, Service, Storage, StorageError, SubId, Transaction,
+    Command, Event, MemoryStorage, Position, Service, Storage, StorageError, SubId, Transaction,
 };
+use tokio::sync::mpsc;
+use tokio::task::{LocalSet, spawn_local};
 
 /// Run `body` on a current-thread runtime with a local task set (the
 /// driver and its storage are single-threaded).
@@ -112,9 +112,7 @@ fn updates_of(event: &Event) -> &[streamgres::ivm::Delta] {
         | Event::Unsettled(_)
         | Event::Refused { .. }
         | Event::Capped { .. }
-        | Event::Heavy { .. } => {
-            &[]
-        }
+        | Event::Heavy { .. } => &[],
     }
 }
 
@@ -314,6 +312,7 @@ fn a_commit_reports_the_position_and_the_watched_writes() {
                 catalog: None,
                 received: std::time::Instant::now(),
                 committed_at_micros: 0,
+                behind: std::time::Duration::ZERO,
                 decode: std::time::Duration::ZERO,
             }))
             .await
@@ -670,7 +669,8 @@ fn a_transaction_the_feed_repeats_is_applied_once() {
         drain(&mut events).await;
 
         let committed = |id: i64, at: u64| {
-            let mut transaction = Transaction::new(vec![insert(id, "OPEN")], Position(u128::from(at)));
+            let mut transaction =
+                Transaction::new(vec![insert(id, "OPEN")], Position(u128::from(at)));
             transaction.committed_at_micros = 1;
             transaction
         };
@@ -682,7 +682,9 @@ fn a_transaction_the_feed_repeats_is_applied_once() {
 
         feed.send(committed(1, 10)).await.expect("feed");
         feed.send(committed(2, 20)).await.expect("feed");
-        feed.send(Transaction::mark(Position(25))).await.expect("feed");
+        feed.send(Transaction::mark(Position(25)))
+            .await
+            .expect("feed");
         feed.send(committed(2, 20)).await.expect("feed");
         feed.send(committed(1, 10)).await.expect("feed");
         feed.send(committed(3, 30)).await.expect("feed");
@@ -700,7 +702,10 @@ fn a_transaction_the_feed_repeats_is_applied_once() {
                 _ => None,
             })
             .collect();
-        assert_eq!(positions, vec![Position(10), Position(20), Position(25), Position(30)]);
+        assert_eq!(
+            positions,
+            vec![Position(10), Position(20), Position(25), Position(30)]
+        );
     });
 }
 
@@ -714,15 +719,18 @@ fn a_serving_consumer_is_not_woken_for_nothing() {
         let storage = Rc::new(MemoryStorage::new());
         let (owner_tx, mut owner) = mpsc::unbounded_channel();
         let (other_tx, mut other) = mpsc::unbounded_channel();
-        let (service, commands) =
-            Service::new(MultiTableIVM::new(), storage, owner_tx.clone());
+        let (service, commands) = Service::new(MultiTableIVM::new(), storage, owner_tx.clone());
         let service = service.with_sinks(vec![owner_tx, other_tx]);
         spawn_local(service.run());
 
         let transaction = |id: i64, at: u64, watched: bool| {
             let write = insert(id, "OPEN");
             Transaction {
-                watched: if watched { vec![write.clone()] } else { Vec::new() },
+                watched: if watched {
+                    vec![write.clone()]
+                } else {
+                    Vec::new()
+                },
                 writes: vec![write],
                 at: Position(u128::from(at)),
                 progress: Position(u128::from(at)),
@@ -730,6 +738,7 @@ fn a_serving_consumer_is_not_woken_for_nothing() {
                 catalog: None,
                 received: std::time::Instant::now(),
                 committed_at_micros: 0,
+                behind: std::time::Duration::ZERO,
                 decode: Duration::ZERO,
             }
         };
@@ -740,7 +749,11 @@ fn a_serving_consumer_is_not_woken_for_nothing() {
             .expect("send");
         let (first_owner, first_other) = (drain(&mut owner).await, drain(&mut other).await);
         assert_eq!(shapes(&first_owner), vec!["committed"]);
-        assert_eq!(shapes(&first_other), vec!["committed"], "every consumer starts serving");
+        assert_eq!(
+            shapes(&first_other),
+            vec!["committed"],
+            "every consumer starts serving"
+        );
 
         commands
             .send(Command::Register {
@@ -758,7 +771,11 @@ fn a_serving_consumer_is_not_woken_for_nothing() {
         let (owner_seen, other_seen) = (drain(&mut owner).await, drain(&mut other).await);
         assert_eq!(shapes(&owner_seen), vec!["committed"]);
         assert_eq!(ids(&owner_seen), vec![2]);
-        assert!(other_seen.is_empty(), "nothing for it: {:?}", shapes(&other_seen));
+        assert!(
+            other_seen.is_empty(),
+            "nothing for it: {:?}",
+            shapes(&other_seen)
+        );
 
         commands
             .send(Command::Transaction(transaction(3, 30, true)))

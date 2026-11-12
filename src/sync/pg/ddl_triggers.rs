@@ -47,7 +47,20 @@ pub fn trigger_stack_sql(app: &str, shard: u32, publications: &[&str]) -> String
         .replace("@TAGS_AND_COMMENT@", &format!("{tags}, 'COMMENT'"))
         .replace("@TAGS@", &tags)
         .replace("@LOCK@", &DDL_LOCK.to_string())
+        .replace("@VERSION@", &STACK_VERSION.to_string())
         .replace("@APP@", &app_literal)
+}
+
+/// The version of the stack [`trigger_stack_sql`] installs, which its
+/// `stack_version()` function answers: raised whenever the messages gain
+/// something an engine relies on. Version 2 sends each column's base
+/// type, element type, collation, whether it is generated and whether its
+/// type has a binary send function, and each table's row-level security.
+pub const STACK_VERSION: i32 = 2;
+
+/// The schema the stack for `app` and `shard` lives in.
+pub fn stack_schema(app: &str, shard: u32) -> String {
+    format!("{app}_{shard}")
 }
 
 /// The SQL that removes the trigger stack [`trigger_stack_sql`] installs
@@ -142,6 +155,11 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION @SCHEMA@.stack_version()
+RETURNS INT
+IMMUTABLE
+AS $$ SELECT @VERSION@ $$ LANGUAGE sql;
+
 CREATE OR REPLACE FUNCTION @SCHEMA@.default_collation()
 RETURNS TEXT
 STABLE
@@ -175,6 +193,7 @@ WITH published_columns AS (SELECT
   pc.relnamespace::int8 AS "schemaOID" ,
   pc.relname AS "name",
   pc.relreplident AS "replicaIdentity",
+  pc.relrowsecurity AS "rowSecurity",
   attnum AS "pos",
   attname AS "col",
   pt.typname AS "type",
@@ -183,6 +202,9 @@ WITH published_columns AS (SELECT
   base_pt.typelem::int8 AS "elementOID",
   CASE WHEN coll.collname = 'default' THEN @SCHEMA@.default_collation()
        ELSE coll.collname::text END AS "collation",
+  attgenerated <> '' AS "generated",
+  base_pt.typsend::oid <> 0
+    AND (base_pt.typcategory <> 'A' OR COALESCE(elem_pt.typsend::oid, 0) <> 0) AS "binarySend",
   pt.typtype,
   elem_pt.typtype AS "elemTyptype",
   coll.collisdeterministic AS "collationIsDeterministic",
@@ -216,6 +238,7 @@ tables AS (SELECT json_build_object(
   'schemaOID', "schemaOID",
   'name', "name",
   'replicaIdentity', "replicaIdentity",
+  'rowSecurity', "rowSecurity",
   'columns', json_object_agg(
     DISTINCT
     col,
@@ -230,6 +253,8 @@ tables AS (SELECT json_build_object(
       'baseTypeOID', "baseTypeOID",
       'elementOID', "elementOID",
       'collation', "collation",
+      'generated', "generated",
+      'binarySend', "binarySend",
       'collationIsDeterministic', "collationIsDeterministic",
       'characterMaximumLength', CASE WHEN "typeOID" = 1043 OR "typeOID" = 1042
                                      THEN "maxLen" - 4
@@ -251,7 +276,7 @@ tables AS (SELECT json_build_object(
     jsonb_build_object('rowFilter', "rowFilter") ORDER BY "publication"
   )
 ) AS "table", "schema", "name" FROM published_columns
-  GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity"),
+  GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity", "rowSecurity"),
 
   indexed_columns AS (SELECT
       pg_indexes.schemaname as "schema",
@@ -482,6 +507,18 @@ mod tests {
     /// and a lab run through `psql`) is the generator's output, so the two
     /// cannot drift: regenerate it from `trigger_stack_sql` with the same
     /// app, shard and publication, then check the output in.
+    /// Writes the checked-in copy from the generator; run it with
+    /// `--ignored` after changing the stack.
+    #[test]
+    #[ignore]
+    fn regenerate_checked_in_stack() {
+        std::fs::write(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sql/ddl-triggers.sql"),
+            trigger_stack_sql("xyne", 0, &["xyne_sync_pub"]),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn the_checked_in_stack_is_the_generators() {
         let checked_in = include_str!("../../../scripts/sql/ddl-triggers.sql");

@@ -89,6 +89,9 @@ pub struct Transaction {
     pub catalog: Option<Arc<Catalog>>,
     pub received: Instant,
     pub committed_at_micros: i64,
+    /// How far behind the commit the source was when it sent it, by the
+    /// source's own clock.
+    pub behind: Duration,
     pub decode: Duration,
 }
 
@@ -130,6 +133,7 @@ impl Transaction {
             catalog: None,
             received: Instant::now(),
             committed_at_micros: 0,
+            behind: Duration::ZERO,
             decode: Duration::ZERO,
         }
     }
@@ -159,9 +163,10 @@ impl Transaction {
 ///   `reason` is what the client can be told.
 /// - `Committed`: a transaction was applied: its deltas for this
 ///   consumer, the engine's position, the storage floor, the transaction's
-///   writes on the watched tables, and two instants for the consumer's
+///   writes on the watched tables, two instants for the consumer's
 ///   clock, when the feed decoded the transaction and when the engine
-///   finished with it. A consumer serves once the position covers the
+///   finished with it, and how far behind the commit the source was when
+///   it sent it. A consumer serves once the position covers the
 ///   floor. With several consumers, one already serving hears only the
 ///   commits with deltas for it or watched writes.
 /// - `Hydrated`: subscriptions whose first rows have all arrived (every
@@ -201,6 +206,7 @@ pub enum Event {
         watched: Vec<WriteQuery>,
         received: Instant,
         routed: Instant,
+        behind: Duration,
     },
     Hydrated(Vec<SubId>),
     Unsettled(Vec<SubId>),
@@ -229,6 +235,7 @@ enum Outcome {
         watched: Vec<WriteQuery>,
         received: Instant,
         routed: Instant,
+        behind: Duration,
     },
     Nothing,
 }
@@ -496,6 +503,7 @@ where
             catalog,
             received,
             committed_at_micros,
+            behind,
             decode,
         } = transaction;
         let started = Instant::now();
@@ -576,6 +584,7 @@ where
                 watched,
                 received,
                 routed,
+                behind,
             },
         );
         self.reap();
@@ -787,6 +796,7 @@ where
                 watched,
                 received,
                 routed,
+                behind,
             } => {
                 let skip_empty = self.serving && self.sinks.len() > 1 && watched.is_empty();
                 for (sink, batch) in self.sinks.iter().zip(self.partition(updates)) {
@@ -800,6 +810,7 @@ where
                         watched: watched.clone(),
                         received,
                         routed,
+                        behind,
                     });
                 }
                 self.serving |= floor.0 != 0 && position >= floor;

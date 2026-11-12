@@ -64,12 +64,15 @@ pub async fn load_catalog(
         pkeys.entry((schema, table)).or_default().push(column);
     }
     let default_collation = database_collation(client).await?;
-    let money_scale: i32 = client
-        .query_one("SELECT scale('0'::money::numeric)::int4", &[])
-        .await?
-        .get(0);
-    if let Ok(scale) = u8::try_from(money_scale) {
-        super::binary::set_money_scale(scale);
+    #[cfg(feature = "server")]
+    {
+        let money_scale: i32 = client
+            .query_one("SELECT scale('0'::money::numeric)::int4", &[])
+            .await?
+            .get(0);
+        if let Ok(scale) = u8::try_from(money_scale) {
+            super::binary::set_money_scale(scale);
+        }
     }
     let mut declared: BTreeMap<(String, String), Vec<DbColumn>> = BTreeMap::new();
     let mut notes = Vec::new();
@@ -223,8 +226,15 @@ pub async fn restrict_to_publication(
         .tables()
         .filter(|table| {
             let kept = published.contains(table.name.as_str());
-            if !kept && !notes.iter().any(|note| note.starts_with(&format!("{}:", table.name))) {
-                notes.push(format!("{}: not in the publication `{publication}`, left out", table.name));
+            if !kept
+                && !notes
+                    .iter()
+                    .any(|note| note.starts_with(&format!("{}:", table.name)))
+            {
+                notes.push(format!(
+                    "{}: not in the publication `{publication}`, left out",
+                    table.name
+                ));
             }
             kept
         })

@@ -1,0 +1,177 @@
+//! A schema-checked SQL shape, with parameter evaluation kept separate.
+//! No placeholder values enter the engine's query model.
+use super::Select;
+use super::{Bind, ParseError, Tagged, decode_bind, select};
+use crate::model::{
+    Catalog, ColumnName, ComparisonOperator, Condition, DbColumn, MultiTableReadQuery, TableName,
+    Value,
+};
+
+#[derive(Debug, Clone)]
+pub(super) enum Operand {
+    Literal(Value),
+    Parameter {
+        number: usize,
+        declared: DbColumn,
+        list: bool,
+        at: usize,
+    },
+    List(Vec<Operand>),
+}
+impl From<Value> for Operand {
+    fn from(value: Value) -> Self {
+        Self::Literal(value)
+    }
+}
+impl Operand {
+    fn bind(&self, binds: &[Bind]) -> Result<Value, ParseError> {
+        match self {
+            Self::Literal(value) => Ok(value.clone()),
+            Self::List(items) => items
+                .iter()
+                .map(|item| item.bind(binds))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::List),
+            Self::Parameter {
+                number,
+                declared,
+                list,
+                at,
+            } => {
+                let value = decode_bind(binds, *number, declared, *list, *at)?;
+                // A NULL array is unknown under ANY/ALL and their negations.
+                Ok(if *list && value.is_null() {
+                    Value::List(vec![Value::Null])
+                } else {
+                    value
+                })
+            }
+        }
+    }
+    pub(super) fn validation(&self) -> Value {
+        match self {
+            Self::Literal(value) => value.clone(),
+            Self::Parameter { .. } => Value::Null,
+            Self::List(items) => Value::List(items.iter().map(Self::validation).collect()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct Predicate {
+    pub column: ColumnName,
+    pub comparison_operator: ComparisonOperator,
+    pub value: Operand,
+}
+impl Predicate {
+    pub(super) fn new(
+        column: impl Into<ColumnName>,
+        comparison_operator: ComparisonOperator,
+        value: impl Into<Operand>,
+    ) -> Self {
+        Self {
+            column: column.into(),
+            comparison_operator,
+            value: value.into(),
+        }
+    }
+    pub(super) fn bind(&self, binds: &[Bind]) -> Result<Condition, ParseError> {
+        Ok(Condition {
+            column: self.column.clone(),
+            comparison_operator: self.comparison_operator,
+            value: self.value.bind(binds)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum Count {
+    Literal(u32),
+    Parameter { number: usize, null: u32, at: usize },
+}
+impl Count {
+    fn bind(&self, binds: &[Bind]) -> Result<u32, ParseError> {
+        match self {
+            Self::Literal(count) => Ok(*count),
+            Self::Parameter { number, null, at } => {
+                let error = || ParseError {
+                    message: format!("${number}: a LIMIT or OFFSET must be a bound row count"),
+                    position: *at,
+                };
+                let bind = number
+                    .checked_sub(1)
+                    .and_then(|index| binds.get(index))
+                    .ok_or_else(error)?;
+                match &bind.bytes {
+                    None => Ok(*null),
+                    Some(bytes) => {
+                        match crate::sync::pg::binary::decode_scalar(bind.type_oid, bytes) {
+                            Ok(Value::Int(count)) => u32::try_from(count).map_err(|_| error()),
+                            _ => Err(error()),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedSelect {
+    pub(super) base: Select,
+    pub(super) filters: Vec<(TableName, Tagged)>,
+    pub(super) limit: Count,
+    pub(super) offset: Count,
+}
+impl PreparedSelect {
+    /// Substitute and validate this call's values without lexing or resolving SQL.
+    pub(crate) fn bind(&self, binds: &[Bind], catalog: &Catalog) -> Result<Select, ParseError> {
+        let mut select = self.base.clone();
+        select.limit = self.limit.bind(binds)?;
+        select.offset = self.offset.bind(binds)?;
+        if (select.limit != u32::MAX || select.offset != 0)
+            && select.projection != super::Projection::CountStar
+            && select.order.iter().any(|order| order.node != 0)
+        {
+            return Err(ParseError {
+                message: "a LIMIT or OFFSET with an ORDER BY on a joined table is not supported"
+                    .into(),
+                position: 0,
+            });
+        }
+        self.bind_tree(&mut select.query, binds, catalog)?;
+        select.query.main_table.limit = if select.projection == super::Projection::CountStar {
+            u32::MAX
+        } else {
+            select.limit.saturating_add(select.offset)
+        };
+        Ok(select)
+    }
+    fn bind_tree(
+        &self,
+        query: &mut MultiTableReadQuery,
+        binds: &[Bind],
+        catalog: &Catalog,
+    ) -> Result<(), ParseError> {
+        let name = &query.main_table.table;
+        let (_, filter) = self
+            .filters
+            .iter()
+            .find(|(table, _)| table == name)
+            .ok_or_else(|| ParseError {
+                message: "prepared query has no filter for its table".into(),
+                position: 0,
+            })?;
+        query.main_table.filter = filter.bind(binds)?;
+        let table = catalog.table(name.as_str()).ok_or_else(|| ParseError {
+            message: format!("unknown table `{name}`"),
+            position: 0,
+        })?;
+        // Schema checks were done on compilation; values still need their type check.
+        select::check_exact(table, &query.main_table.filter, &[], 0)?;
+        for edge in &mut query.joins {
+            self.bind_tree(&mut edge.sub, binds, catalog)?;
+        }
+        Ok(())
+    }
+}

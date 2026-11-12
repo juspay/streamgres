@@ -52,9 +52,9 @@ pub mod binary;
 pub mod catalog;
 pub mod ddl;
 pub mod ddl_triggers;
-pub mod lsn;
 pub mod estimate;
 pub mod estimate_cache;
+pub mod lsn;
 pub mod pgoutput;
 pub mod replication;
 pub mod slots;
@@ -77,7 +77,7 @@ use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, SimpleQuery
 use super::storage::{Storage, StorageError};
 use crate::log::{log_info, log_warn};
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameRow, DbTable, Position, MultiTableReadQuery, RowData,
+    Catalog, DataFrameKey, DataFrameRow, DbTable, MultiTableReadQuery, Position, RowData,
     SingleTableReadQuery, Snapshot, Value,
 };
 use replication::ReplicationConnection;
@@ -120,11 +120,11 @@ pub fn read_row_limit() -> usize {
         "STREAMGRES_SYNC_JOIN_LIMIT",
         "XYNE_SYNC_JOIN_LIMIT",
     ]
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .and_then(|value| value.trim().parse().ok())
-        .filter(|limit| *limit > 0)
-        .unwrap_or(DEFAULT_READ_ROW_LIMIT)
+    .iter()
+    .find_map(|name| std::env::var(name).ok())
+    .and_then(|value| value.trim().parse().ok())
+    .filter(|limit| *limit > 0)
+    .unwrap_or(DEFAULT_READ_ROW_LIMIT)
 }
 
 /// How the kernel probes a connection to the database while it is silent,
@@ -456,6 +456,17 @@ impl PgStorage {
         catalog: Arc<Catalog>,
         runtime: Handle,
     ) -> Result<Self, StorageError> {
+        Self::connect_with_row_limit(config, read_config, catalog, runtime, read_row_limit()).await
+    }
+
+    /// An embedding supplies its limits explicitly, independent of process env.
+    pub(crate) async fn connect_with_row_limit(
+        config: Config,
+        read_config: Config,
+        catalog: Arc<Catalog>,
+        runtime: Handle,
+        row_limit: usize,
+    ) -> Result<Self, StorageError> {
         let client = open(&read_config, &runtime).await?;
         let pool = Arc::new(Pool {
             config,
@@ -463,7 +474,7 @@ impl PgStorage {
             idle: Mutex::new(vec![client]),
             permits: Arc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
             idle_limit: AtomicUsize::new(DEFAULT_READ_IDLE_CONNECTIONS),
-            row_limit: AtomicUsize::new(read_row_limit()),
+            row_limit: AtomicUsize::new(row_limit),
             aliases: Mutex::new(Aliases::new(catalog)),
             rotation: AtomicU64::new(250),
             wake: Notify::new(),
@@ -691,10 +702,12 @@ impl Storage for PgStorage {
         let query = query.clone();
         run_on(&self.pool.runtime, async move {
             let catalog = pool.lock_aliases().catalog.clone();
-            let estimation =
-                estimate::Estimation::new(&query, &catalog).map_err(StorageError)?;
+            let estimation = estimate::Estimation::new(&query, &catalog).map_err(StorageError)?;
             if cache.sizes_due() {
-                match pool.run("reading the tables' sizes", estimate_cache::SIZES_SQL).await {
+                match pool
+                    .run("reading the tables' sizes", estimate_cache::SIZES_SQL)
+                    .await
+                {
                     Ok(rows) => cache.sizes(rows.iter().map(|row| {
                         let field = |index: usize| row.get(index).unwrap_or_default().to_owned();
                         (field(0), field(1), field(2))
@@ -760,7 +773,9 @@ async fn estimated(
     let mut answers: Vec<Option<Answer>> = vec![None; keys.len()];
     let mut failure = None;
     for _ in 0..2 {
-        let missing: Vec<usize> = (0..keys.len()).filter(|&at| answers[at].is_none()).collect();
+        let missing: Vec<usize> = (0..keys.len())
+            .filter(|&at| answers[at].is_none())
+            .collect();
         if missing.is_empty() {
             break;
         }
@@ -841,7 +856,9 @@ async fn estimated(
             }
         }
     }
-    estimation.evaluate(&explained, &stats).map_err(StorageError)
+    estimation
+        .evaluate(&explained, &stats)
+        .map_err(StorageError)
 }
 
 impl Pool {
@@ -1106,7 +1123,9 @@ async fn open(config: &Config, runtime: &Handle) -> Result<Client, StorageError>
 
 /// Parse Postgres's `X/Y`.
 pub fn parse_lsn(text: &str) -> Result<Position, StorageError> {
-    Lsn::parse(text).map(Position::from).ok_or_else(|| StorageError(format!("unreadable WAL location `{text}`")))
+    Lsn::parse(text)
+        .map(Position::from)
+        .ok_or_else(|| StorageError(format!("unreadable WAL location `{text}`")))
 }
 
 /// One result row, in [`sql::select_columns`] order, as the engine's
@@ -1129,9 +1148,8 @@ fn decode_row(row: &Row, table: &DbTable) -> Result<(DataFrameKey, DataFrameRow)
                         .map_or(0, |described| described.type_().oid()),
                     known => known,
                 };
-                binary::decode(&column.r#type, type_oid, bytes).map_err(|error| {
-                    StorageError(format!("`{}`.`{name}`: {error}", table.name))
-                })?
+                binary::decode(&column.r#type, type_oid, bytes)
+                    .map_err(|error| StorageError(format!("`{}`.`{name}`: {error}", table.name)))?
             }
             None => Value::Null,
         };
@@ -1153,10 +1171,7 @@ fn decode_row(row: &Row, table: &DbTable) -> Result<(DataFrameKey, DataFrameRow)
 struct RawCell<'a>(&'a [u8]);
 
 impl<'a> FromSql<'a> for RawCell<'a> {
-    fn from_sql(
-        _: &Type,
-        raw: &'a [u8],
-    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         Ok(RawCell(raw))
     }
 

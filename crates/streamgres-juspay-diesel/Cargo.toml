@@ -12,4 +12,9 @@ path = "../streamgres-diesel/src/lib.rs"
 
 [dependencies]
 streamgres = { path = "../..", default-features = false }
-diesel = { package = "juspay_diesel", version = "2.3", default-features = false, features = ["postgres_backend", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+diesel = { package = "juspay_diesel", version = "=2.3.1", default-features = false, features = ["postgres_backend", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+
+# The shared source has an upstream-only async module. Juspay's fork has
+# no compatible diesel-async crate; it intentionally exposes no async feature.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("async"))'] }

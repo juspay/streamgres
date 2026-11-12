@@ -24,7 +24,7 @@ use crate::sync::pg::sql::{quote_ident, quote_table};
 /// The query that checks a reader's connection, with its parameters.
 ///
 /// Run it on the reader's connection with the three arrays as its `$1`,
-/// `$2` and `$3`, both columns read as text, and hand the row to
+/// `$2` and `$3`, its three columns read as text, and hand the row to
 /// [`Reader::new`] along with [`ReaderCheck::version`].
 #[derive(Debug, Clone)]
 pub struct ReaderCheck {
@@ -65,9 +65,12 @@ impl std::hash::Hash for CatalogVersion {
     }
 }
 
-/// The SQL of [`ReaderCheck`]: the reader's database, and the tables
-/// whose name resolves elsewhere for it or that it may not read whole.
-const CHECK_SQL: &str = "SELECT current_database()::text AS database,
+/// The SQL of [`ReaderCheck`]: the reader's cluster and database, and the
+/// tables whose name resolves elsewhere for it or that it may not read
+/// whole.
+const CHECK_SQL: &str =
+    "SELECT (SELECT system_identifier::text FROM pg_control_system()) AS cluster,
+       current_database()::text AS database,
        COALESCE(array_to_string(array_agg(t.name) FILTER (WHERE
            to_regclass(t.as_written) IS DISTINCT FROM to_regclass(t.qualified)
            OR NOT COALESCE(has_table_privilege(to_regclass(t.qualified), 'SELECT'), false)),
@@ -103,20 +106,23 @@ impl ReaderCheck {
     }
 }
 
-/// A reader's connection as checked: its database and the tables it
-/// would read otherwise than the engine.
+/// A reader's connection as checked: its cluster, its database and the
+/// tables it would read otherwise than the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reader {
+    cluster: String,
     database: String,
     excluded: HashSet<TableName>,
     version: CatalogVersion,
 }
 
 impl Reader {
-    /// The reader [`ReaderCheck`]'s row describes: its `database` and
-    /// `excluded` columns, checked against catalog `version`.
-    pub fn new(database: &str, excluded: &str, version: CatalogVersion) -> Self {
+    /// The reader [`ReaderCheck`]'s row describes: its `cluster`,
+    /// `database` and `excluded` columns, checked against catalog
+    /// `version`.
+    pub fn new(cluster: &str, database: &str, excluded: &str, version: CatalogVersion) -> Self {
         Reader {
+            cluster: cluster.to_owned(),
             database: database.to_owned(),
             excluded: excluded
                 .split(SEPARATOR)
@@ -132,15 +138,24 @@ impl Reader {
         self.version == *version
     }
 
-    /// Why this reader cannot be answered for `table` in `database`, if
-    /// it cannot.
-    pub(super) fn refuses(&self, database: &str, table: &TableName) -> Option<String> {
+    /// Why this reader cannot be answered at all by an engine on
+    /// `database` of `cluster`, if it cannot: it is connected elsewhere.
+    /// A physical standby shares its primary's cluster.
+    pub(super) fn elsewhere(&self, cluster: &str, database: &str) -> Option<String> {
+        if self.cluster != cluster {
+            return Some("the reader is on another database cluster than the engine".to_owned());
+        }
         if self.database != database {
             return Some(format!(
                 "the reader is on database `{}`, the engine on `{database}`",
                 self.database
             ));
         }
+        None
+    }
+
+    /// Why this reader cannot be answered for `table`, if it cannot.
+    pub(super) fn refuses(&self, table: &TableName) -> Option<String> {
         self.excluded.contains(table).then(|| {
             format!("`{table}` names another table for this reader, or one it may not read")
         })
@@ -184,21 +199,27 @@ mod tests {
         let catalog = Arc::new(Catalog::new(Vec::new()));
         let version = CatalogVersion::of(&catalog);
         let reader = Reader::new(
+            "7",
             "app",
             &format!("orders{SEPARATOR}billing.invoices"),
             version.clone(),
         );
-        assert!(reader.refuses("app", &TableName::from("orders")).is_some());
+        assert!(reader.refuses(&TableName::from("orders")).is_some());
         assert!(
             reader
-                .refuses("app", &TableName::from("billing.invoices"))
+                .refuses(&TableName::from("billing.invoices"))
                 .is_some()
         );
-        assert!(reader.refuses("app", &TableName::from("users")).is_none());
-        assert!(reader.refuses("other", &TableName::from("users")).is_some());
+        assert!(reader.refuses(&TableName::from("users")).is_none());
+        assert!(reader.elsewhere("7", "app").is_none());
+        assert!(reader.elsewhere("7", "other").is_some());
         assert!(
-            Reader::new("app", "", version.clone())
-                .refuses("app", &TableName::from("orders"))
+            reader.elsewhere("8", "app").is_some(),
+            "the same name on another cluster"
+        );
+        assert!(
+            Reader::new("7", "app", "", version.clone())
+                .refuses(&TableName::from("orders"))
                 .is_none()
         );
         assert!(reader.is_current(&version));

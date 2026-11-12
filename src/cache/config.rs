@@ -4,8 +4,10 @@ use std::time::Duration;
 
 use crate::sync::pg::{Keepalive, Settings};
 
-/// What [`super::Cache::start`] needs.
+/// What [`super::Cache::start`] needs. Start from [`CacheConfig::new`]
+/// and set what differs.
 ///
+/// Where the database is:
 /// - `dsn`: the database, reached directly (the feed's replication
 ///   connection and the slot's lock need a session of their own, never a
 ///   pooled one).
@@ -13,16 +15,42 @@ use crate::sync::pg::{Keepalive, Settings};
 /// - `publication`: the publication the feed streams; it must exist.
 /// - `schemas`: the schemas whose tables the engine carries.
 /// - `app`, `shard`: the schema-change trigger stack the engine hears
-///   changes through, as [`crate::sync::pg::ddl_triggers`] installs it.
-/// - `max_entries`: how many queries are kept current at once; the one
-///   read longest ago gives way to a new one.
+///   changes through, as [`CacheConfig::setup_sql`] installs it.
+///
+/// How much is kept:
+/// - `max_entries`: how many queries are kept current at once; the ones
+///   read longest ago give way to a new one.
+/// - `max_bytes`: what the kept rows may weigh together, by the cache's
+///   own estimate of their heap; past it the queries read longest ago
+///   give way.
+/// - `max_entry_bytes`: what one query's rows may weigh; a heavier query
+///   is refused.
+/// - `max_rows_per_query`: the most rows one table of a query may
+///   contribute; a query past it is refused.
 /// - `idle_ttl`: how long a query nobody reads is kept current.
+/// - `admit_after`: how many reads of a query it takes before it is kept
+///   current; the reads before that are refused. 1 keeps every query on
+///   its first read. Raise it where most queries are read once (a lookup
+///   by an id that rarely repeats), so that only the repeated ones cost a
+///   subscription.
+///
+/// When a read is refused:
 /// - `fill_timeout`: how long a read waits for a new query's rows.
-/// - `max_lag`: how long the engine may go without hearing the feed
-///   before reads are refused as behind.
-/// - `refusal_ttl`: how long a refused query is answered as refused
-///   without asking the engine again.
+/// - `max_lag`: how stale an answer may be: the engine must have heard
+///   the database within it and be no further behind the database's
+///   commits than it.
+/// - `refusal_ttl`: how long a query the engine refused is answered as
+///   refused without asking the engine again.
+///
+/// How the engine runs:
+/// - `start_timeout`: how long an engine may take to start before the
+///   attempt is given up and tried again.
+/// - `read_connections`: how many snapshot reads may run at once.
+/// - `read_timeout`: how long one snapshot read may take.
+/// - `snapshot_rotation`: how often the engine's reads move to a fresh
+///   snapshot.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CacheConfig {
     pub dsn: String,
     pub read_dsn: Option<String>,
@@ -31,10 +59,15 @@ pub struct CacheConfig {
     pub app: String,
     pub shard: u32,
     pub max_entries: usize,
+    pub max_bytes: usize,
+    pub max_entry_bytes: usize,
+    pub max_rows_per_query: usize,
     pub idle_ttl: Duration,
+    pub admit_after: u32,
     pub fill_timeout: Duration,
     pub max_lag: Duration,
     pub refusal_ttl: Duration,
+    pub start_timeout: Duration,
     pub read_connections: usize,
     pub read_timeout: Duration,
     pub snapshot_rotation: Duration,
@@ -52,10 +85,15 @@ impl CacheConfig {
             app: "streamgres".to_owned(),
             shard: 0,
             max_entries: 10_000,
+            max_bytes: 256 << 20,
+            max_entry_bytes: 32 << 20,
+            max_rows_per_query: 100_000,
             idle_ttl: Duration::from_secs(300),
+            admit_after: 1,
             fill_timeout: Duration::from_secs(5),
             max_lag: Duration::from_secs(2),
             refusal_ttl: Duration::from_secs(60),
+            start_timeout: Duration::from_secs(30),
             read_connections: 4,
             read_timeout: Duration::from_secs(10),
             snapshot_rotation: Duration::from_secs(1),
@@ -92,6 +130,11 @@ impl CacheConfig {
             .unwrap_or_default()
     }
 
+    /// The schema the trigger stack lives in.
+    pub(super) fn stack_schema(&self) -> String {
+        crate::sync::pg::ddl_triggers::stack_schema(&self.app, self.shard)
+    }
+
     /// The event trigger schema changes are heard through.
     pub fn ddl_trigger(&self) -> String {
         format!("{}_ddl_end_{}", self.app, self.shard)
@@ -119,6 +162,8 @@ impl CacheConfig {
             ddl_trigger: self.ddl_trigger(),
             ddl_prefix: format!("{}/{}/ddl", self.app, self.shard),
             settle_reports: true,
+            row_limit: self.max_rows_per_query,
+            memory_tables: Vec::new(),
         }
     }
 }

@@ -97,7 +97,7 @@ fn answers_equal_postgres() {
             &[&check.names, &check.as_written, &check.qualified],
         ))
         .unwrap();
-    let reader = Reader::new(row.get(0), row.get(1), check.version);
+    let reader = Reader::new(row.get(0), row.get(1), row.get(2), check.version);
 
     let t = r#"SELECT "probe_t"."id" FROM "probe_t""#;
     let jc = r#"SELECT "probe_t"."id" FROM ("probe_t" INNER JOIN "probe_c" ON ("probe_c"."t_id" = "probe_t"."id"))"#;

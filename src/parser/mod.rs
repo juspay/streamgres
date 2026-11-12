@@ -58,13 +58,12 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crate::sync::pg::binary;
 use crate::model::{
     ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameRow, DbColumn, DbTable,
-    DeleteQuery,
-    InsertQuery, Numeric, Order, OrderBy, SingleTableReadQuery, Timestamp, UpdateQuery, Value,
-    ValueType, Where, WriteQuery,
+    DeleteQuery, InsertQuery, Numeric, Order, OrderBy, SingleTableReadQuery, Timestamp,
+    UpdateQuery, Value, ValueType, Where, WriteQuery,
 };
+use crate::sync::pg::binary;
 
 /// Hard cap on `(` / `[` nesting depth. The parser descends recursively, so
 /// without a bound a client-supplied string with thousands of nested parens
@@ -75,7 +74,10 @@ pub const MAX_NESTING_DEPTH: usize = 128;
 /// because the parser is their primary consumer.
 pub use crate::model::Catalog;
 
+mod prepared;
 mod select;
+pub(crate) use prepared::PreparedSelect;
+use prepared::{Operand, Predicate};
 pub use select::{Projection, Select, parse_select};
 
 /// A successfully parsed statement — either side of the read/write split.
@@ -839,7 +841,7 @@ impl Parser {
 
     /// A filter over one table.
     fn filter(&mut self, table: &DbTable) -> Result<Where, ParseError> {
-        self.filter_in(&OneTable(table)).map(Tagged::into_where)
+        self.filter_in(&OneTable(table))?.bind(&self.binds)
     }
 
     /// A filter over the tables of `scope`, each condition tagged with the
@@ -892,13 +894,13 @@ impl Parser {
 
         let (node, declared) = scope.resolve(self)?;
         let column = declared.name.clone();
-        let tag = |condition: Condition| Tagged::Condition(node, condition);
+        let tag = |condition: Predicate| Tagged::Condition(node, condition);
         let ends_condition = matches!(self.peek(), Tok::Eof | Tok::Sym(")" | ";"))
             || ["AND", "OR", "ORDER", "LIMIT", "OFFSET", "FOR"]
                 .iter()
                 .any(|word| self.is_word(word));
         if declared.r#type == ValueType::Bool && ends_condition {
-            return Ok(tag(Condition::new(
+            return Ok(tag(Predicate::new(
                 column,
                 ComparisonOperator::EQ,
                 Value::Bool(true),
@@ -916,10 +918,10 @@ impl Parser {
                     self.describe()
                 ));
             }
-            return Ok(tag(Condition {
+            return Ok(tag(Predicate {
                 column,
                 comparison_operator,
-                value: Value::Null,
+                value: Value::Null.into(),
             }));
         }
         let negated = self.eat_word("NOT");
@@ -928,8 +930,8 @@ impl Parser {
             self.expect_word("AND")?;
             let high = self.operand(declared)?;
             let within = Tagged::And(vec![
-                tag(Condition::new(column.clone(), ComparisonOperator::GTE, low)),
-                tag(Condition::new(column, ComparisonOperator::LTE, high)),
+                tag(Predicate::new(column.clone(), ComparisonOperator::GTE, low)),
+                tag(Predicate::new(column, ComparisonOperator::LTE, high)),
             ]);
             return match (negated, within.clone().negated()) {
                 (false, _) => Ok(within),
@@ -943,14 +945,17 @@ impl Parser {
             } else {
                 ComparisonOperator::IN
             };
-            return Ok(tag(Condition {
+            return Ok(tag(Predicate {
                 column,
                 comparison_operator,
                 value: self.value_list(declared)?,
             }));
         }
         if negated {
-            return self.err(format!("expected IN or BETWEEN after NOT, found {}", self.describe()));
+            return self.err(format!(
+                "expected IN or BETWEEN after NOT, found {}",
+                self.describe()
+            ));
         }
         let comparison_operator = if self.eat_sym("=") {
             ComparisonOperator::EQ
@@ -988,17 +993,19 @@ impl Parser {
             self.expect_sym(")")?;
             // A `NULL` array makes the comparison `NULL`, true of no row,
             // and so is its negation: a list holding one `NULL` is both.
-            let value = match self.bind_value(number, declared, true, at)? {
-                Value::Null => Value::List(vec![Value::Null]),
-                list => list,
+            let value = Operand::Parameter {
+                number,
+                declared: declared.clone(),
+                list: true,
+                at,
             };
-            return Ok(tag(Condition {
+            return Ok(tag(Predicate {
                 column,
                 comparison_operator,
                 value,
             }));
         }
-        Ok(tag(Condition {
+        Ok(tag(Predicate {
             column,
             comparison_operator,
             value: self.operand(declared)?,
@@ -1006,7 +1013,7 @@ impl Parser {
     }
 
     /// The parenthesised value list of `IN` / `NOT IN`.
-    fn value_list(&mut self, declared: &DbColumn) -> Result<Value, ParseError> {
+    fn value_list(&mut self, declared: &DbColumn) -> Result<Operand, ParseError> {
         self.expect_sym("(")?;
         let mut items = Vec::new();
         if !self.is_sym(")") {
@@ -1016,25 +1023,30 @@ impl Parser {
             }
         }
         self.expect_sym(")")?;
-        Ok(Value::List(items))
+        Ok(Operand::List(items))
     }
 
     /// The value compared with `declared`: a bind parameter, or a literal,
     /// either brought to the column's type where the two differ only in
     /// form ([`coerce_read`]).
-    fn operand(&mut self, declared: &DbColumn) -> Result<Value, ParseError> {
+    fn operand(&mut self, declared: &DbColumn) -> Result<Operand, ParseError> {
         let at = self.at();
         if let Tok::Param(number) = *self.peek() {
             self.bump();
-            return self.bind_value(number, declared, false, at);
+            return Ok(Operand::Parameter {
+                number,
+                declared: declared.clone(),
+                list: false,
+                at,
+            });
         }
         if declared.r#type == ValueType::Numeric
             && let Some(number) = self.numeric_literal()?
         {
-            return Ok(Value::Numeric(number));
+            return Ok(Value::Numeric(number).into());
         }
         let value = self.value()?;
-        coerce_read(value, &declared.r#type, at)
+        coerce_read(value, &declared.r#type, at).map(Operand::Literal)
     }
 
     /// A number literal read as an exact numeric, digits and scale as
@@ -1061,61 +1073,6 @@ impl Parser {
         })?;
         self.pos += ahead + 1;
         Ok(Some(number))
-    }
-
-    /// Bind parameter `number` decoded by its type, as one value or (for
-    /// `ANY` / `ALL`) a list of values of the column's type.
-    fn bind_value(
-        &self,
-        number: usize,
-        declared: &DbColumn,
-        list: bool,
-        at: usize,
-    ) -> Result<Value, ParseError> {
-        let bind = number
-            .checked_sub(1)
-            .and_then(|index| self.binds.get(index))
-            .ok_or(ParseError {
-                message: format!("no value is bound for ${number}"),
-                position: at,
-            })?;
-        let Some(bytes) = &bind.bytes else {
-            return Ok(Value::Null);
-        };
-        let bound = if list {
-            binary::array_element(bind.type_oid)
-        } else {
-            Some(bind.type_oid)
-        };
-        let zoned = |oid: u32| match oid {
-            binary::oid::TIMESTAMP => Some(false),
-            binary::oid::TIMESTAMPTZ => Some(true),
-            _ => None,
-        };
-        if let (Some(value), Some(column)) = (bound.and_then(zoned), zoned(declared.type_oid))
-            && value != column
-        {
-            return Err(ParseError {
-                message: format!(
-                    "${number}: a `timestamp` and a `timestamptz` compare through the session's time zone, which the engine does not follow"
-                ),
-                position: at,
-            });
-        }
-        let decoded = if list {
-            binary::decode(
-                &ValueType::List(Box::new(declared.r#type.clone())),
-                bind.type_oid,
-                bytes,
-            )
-        } else {
-            binary::decode_scalar(bind.type_oid, bytes)
-        }
-        .map_err(|error| ParseError {
-            message: format!("${number}: {error}"),
-            position: at,
-        })?;
-        coerce_read(decoded, &declared.r#type, at)
     }
 
     /// One literal: `NULL`, `TRUE` / `FALSE`, a (possibly `-`-negated)
@@ -1203,12 +1160,65 @@ impl Scope for OneTable<'_> {
     }
 }
 
-/// A filter whose every condition is tagged with the table it names (its
-/// position in the scope), so a filter over several tables can be split
-/// among them.
-#[derive(Debug, Clone, PartialEq)]
+/// Bind parameter `number` decoded by its type, as one value or (for
+/// `ANY` / `ALL`) a list of values of the column's type.
+pub(super) fn decode_bind(
+    binds: &[Bind],
+    number: usize,
+    declared: &DbColumn,
+    list: bool,
+    at: usize,
+) -> Result<Value, ParseError> {
+    let bind = number
+        .checked_sub(1)
+        .and_then(|index| binds.get(index))
+        .ok_or(ParseError {
+            message: format!("no value is bound for ${number}"),
+            position: at,
+        })?;
+    let Some(bytes) = &bind.bytes else {
+        return Ok(Value::Null);
+    };
+    let bound = if list {
+        binary::array_element(bind.type_oid)
+    } else {
+        Some(bind.type_oid)
+    };
+    let zoned = |oid: u32| match oid {
+        binary::oid::TIMESTAMP => Some(false),
+        binary::oid::TIMESTAMPTZ => Some(true),
+        _ => None,
+    };
+    if let (Some(value), Some(column)) = (bound.and_then(zoned), zoned(declared.type_oid))
+        && value != column
+    {
+        return Err(ParseError {
+            message: format!(
+                "${number}: a `timestamp` and a `timestamptz` compare through the session's time zone, which the engine does not follow"
+            ),
+            position: at,
+        });
+    }
+    let decoded = if list {
+        binary::decode(
+            &ValueType::List(Box::new(declared.r#type.clone())),
+            bind.type_oid,
+            bytes,
+        )
+    } else {
+        binary::decode_scalar(bind.type_oid, bytes)
+    }
+    .map_err(|error| ParseError {
+        message: format!("${number}: {error}"),
+        position: at,
+    })?;
+    coerce_read(decoded, &declared.r#type, at)
+}
+
+/// A predicate tree retaining its table identity and unbound operands.
+#[derive(Debug, Clone)]
 enum Tagged {
-    Condition(usize, Condition),
+    Condition(usize, Predicate),
     And(Vec<Tagged>),
     Or(Vec<Tagged>),
 }
@@ -1247,7 +1257,7 @@ impl Tagged {
                 };
                 Tagged::Condition(
                     node,
-                    Condition {
+                    Predicate {
                         comparison_operator,
                         ..condition
                     },
@@ -1268,12 +1278,35 @@ impl Tagged {
         })
     }
 
-    /// The filter without its tags.
-    fn into_where(self) -> Where {
+    /// Evaluates literals and parameters without reparsing the SQL shape.
+    fn bind(&self, binds: &[Bind]) -> Result<Where, ParseError> {
+        Ok(match self {
+            Tagged::Condition(_, condition) => Where::Condition(condition.bind(binds)?),
+            Tagged::And(parts) => Where::AND(
+                parts
+                    .iter()
+                    .map(|part| part.bind(binds))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Tagged::Or(parts) => Where::OR(
+                parts
+                    .iter()
+                    .map(|part| part.bind(binds))
+                    .collect::<Result<_, _>>()?,
+            ),
+        })
+    }
+
+    /// A type-independent filter for compile-time schema checks.
+    fn validation(&self) -> Where {
         match self {
-            Tagged::Condition(_, condition) => Where::Condition(condition),
-            Tagged::And(parts) => Where::AND(parts.into_iter().map(Tagged::into_where).collect()),
-            Tagged::Or(parts) => Where::OR(parts.into_iter().map(Tagged::into_where).collect()),
+            Tagged::Condition(_, condition) => Where::Condition(Condition {
+                column: condition.column.clone(),
+                comparison_operator: condition.comparison_operator,
+                value: condition.value.validation(),
+            }),
+            Tagged::And(parts) => Where::AND(parts.iter().map(Tagged::validation).collect()),
+            Tagged::Or(parts) => Where::OR(parts.iter().map(Tagged::validation).collect()),
         }
     }
 
@@ -1317,7 +1350,6 @@ impl Tagged {
         }
     }
 }
-
 
 /// The implicit ORDER BY: the first declared pkey column, ascending. A
 /// (degenerate) pkey-less table falls back to the alphabetically first

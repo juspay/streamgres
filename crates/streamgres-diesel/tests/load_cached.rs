@@ -12,7 +12,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use diesel::connection::SimpleConnection;
 use diesel::dsl::count_star;
 use diesel::prelude::*;
-use streamgres_diesel::{Cache, CacheConfig, LoadCached, Tracker};
+use streamgres_diesel::{Cache, CacheAttempt, CacheConfig, FirstCached, LoadCached, Tracker};
 
 diesel::table! {
     adapter_orders (id) {
@@ -70,13 +70,56 @@ struct Order {
     note: Option<String>,
 }
 
+// A custom decoder that rejects the first row, so the adapter must retry
+// through the connection rather than making a successful SQL read fail.
+thread_local! {
+    static REJECT_NEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[derive(Debug, PartialEq, diesel::FromSqlRow)]
+struct RetryId(i64);
+
+impl diesel::deserialize::FromSql<diesel::sql_types::BigInt, diesel::pg::Pg> for RetryId {
+    fn from_sql(value: diesel::pg::PgValue<'_>) -> diesel::deserialize::Result<Self> {
+        if REJECT_NEXT.with(|reject| reject.replace(false)) {
+            return Err("retry through Postgres".into());
+        }
+        <i64 as diesel::deserialize::FromSql<diesel::sql_types::BigInt, diesel::pg::Pg>>::from_sql(
+            value,
+        )
+        .map(Self)
+    }
+}
+
+#[derive(Clone)]
+struct Events(std::sync::Arc<std::sync::Mutex<(usize, usize)>>);
+impl diesel::connection::Instrumentation for Events {
+    fn on_connection_event(&mut self, event: diesel::connection::InstrumentationEvent<'_>) {
+        let mut counts = self.0.lock().unwrap();
+        match event {
+            diesel::connection::InstrumentationEvent::StartQuery { .. } => counts.0 += 1,
+            diesel::connection::InstrumentationEvent::FinishQuery { .. } => counts.1 += 1,
+            _ => {}
+        }
+    }
+}
+
 const PUBLICATION: &str = "adapter_orders_pub";
 
 /// Asserts the cache answers `query` itself, with Postgres's rows.
 macro_rules! same {
     ($cache:expr, $conn:expr, $query:expr, $row:ty) => {{
         let live: Vec<$row> = $query.load($conn).expect("from Postgres");
-        let cached: Option<Vec<$row>> = $query.try_load_cached($cache, $conn).expect("rendered");
+        // A commit can leave a previously filled join temporarily unsettled.
+        // The library refuses immediately; this assertion waits for steady state.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let cached: Option<Vec<$row>> = loop {
+            let rows = $query.try_load_cached($cache, $conn).expect("rendered");
+            if rows.is_some() || std::time::Instant::now() >= deadline {
+                break rows;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         let sql = diesel::debug_query::<diesel::pg::Pg, _>(&$query).to_string();
         assert_eq!(cached.as_ref(), Some(&live), "{sql}");
         live
@@ -256,9 +299,49 @@ fn load_cached_returns_what_load_returns() {
         None::<Vec<i64>>,
         "a connection without a tracker is never answered from the cache"
     );
-    conn.set_instrumentation(Tracker::new());
+    let events = Events(Default::default());
+    conn.set_instrumentation(Tracker::wrapping(events.clone()));
     let before = check(&cache, &mut conn);
     assert_eq!(before.len(), 4);
+
+    let counts_before = *events.0.lock().unwrap();
+    let first: i64 = adapter_orders::table
+        .order(adapter_orders::id)
+        .select(adapter_orders::id)
+        .first_cached(&cache, &mut conn)
+        .unwrap();
+    assert_eq!(first, 1);
+    let counts_after = *events.0.lock().unwrap();
+    assert_eq!(
+        counts_after.0 - counts_before.0,
+        counts_after.1 - counts_before.1
+    );
+    assert!(
+        counts_after.0 > counts_before.0,
+        "cache answers emit balanced query events"
+    );
+    let absent: Option<i64> = adapter_orders::table
+        .find(-1i64)
+        .select(adapter_orders::id)
+        .optional_cached(&cache, &mut conn)
+        .unwrap();
+    assert_eq!(absent, None);
+    let refused: CacheAttempt<Vec<i64>> = adapter_orders::table
+        .select(adapter_orders::id)
+        .distinct()
+        .inspect_cached(&cache, &mut conn)
+        .unwrap();
+    assert!(matches!(refused, CacheAttempt::Refused(_)));
+
+    let unusable = cache.metrics().unusable;
+    REJECT_NEXT.with(|reject| reject.set(true));
+    let retried: Vec<RetryId> = adapter_orders::table
+        .select(adapter_orders::id)
+        .order(adapter_orders::id)
+        .load_cached(&cache, &mut conn)
+        .expect("a cached decode failure falls back to Postgres");
+    assert_eq!(retried.len(), 4);
+    assert_eq!(cache.metrics().unusable, unusable + 1);
 
     insert(&mut conn, &order(5, "m1", "7.7700", Some("fifth")));
     diesel::update(adapter_orders::table.find(2i64))
@@ -278,6 +361,18 @@ fn load_cached_returns_what_load_returns() {
     );
     let after = check(&cache, &mut conn);
     assert_eq!(after.len(), 4);
+
+    conn.batch_execute("BEGIN").unwrap();
+    assert!(conn.batch_execute("COMMIT AND BANANA").is_err());
+    let failed_commit: Option<Vec<i64>> = adapter_orders::table
+        .select(adapter_orders::id)
+        .try_load_cached(&cache, &mut conn)
+        .unwrap();
+    assert!(
+        failed_commit.is_none(),
+        "a failed raw COMMIT does not end the transaction"
+    );
+    conn.batch_execute("ROLLBACK").unwrap();
 
     let inside: Vec<i64> = conn
         .transaction(|conn| {
@@ -386,6 +481,26 @@ fn load_cached_returns_what_load_returns() {
             .order(adapter_orders::id),
         i64
     );
+
+    conn.batch_execute("CREATE SCHEMA adapter_hidden; CREATE TABLE adapter_hidden.adapter_orders (id int8 PRIMARY KEY);
+        CREATE FUNCTION pg_temp.hidden_path() RETURNS void LANGUAGE sql AS $$ SELECT set_config('search_path', 'adapter_hidden, public', false) $$;").unwrap();
+    // Warm the reader after creating the function, then invoke it through a
+    // SELECT whose text never mentions SET or set_config.
+    let _: Vec<i64> = adapter_orders::table
+        .select(adapter_orders::id)
+        .load_cached(&cache, &mut conn)
+        .unwrap();
+    conn.batch_execute("SELECT pg_temp.hidden_path()").unwrap();
+    let hidden: Option<Vec<i64>> = adapter_orders::table
+        .select(adapter_orders::id)
+        .try_load_cached(&cache, &mut conn)
+        .unwrap();
+    assert!(
+        hidden.is_none(),
+        "a SELECT function's hidden session change is rechecked immediately"
+    );
+    conn.batch_execute("RESET search_path; DROP SCHEMA adapter_hidden CASCADE")
+        .unwrap();
 
     let filtered: Vec<i64> = adapter_orders::table
         .filter(adapter_orders::note.like("%noted"))

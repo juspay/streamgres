@@ -33,8 +33,12 @@
 
 pub use ::diesel;
 
+#[cfg(feature = "async")]
+mod asynchronous;
 mod row;
 mod session;
+#[cfg(feature = "async")]
+pub use asynchronous::{AsyncLoadCached, wait_for_writes_async};
 
 pub use session::{Tracker, install};
 
@@ -56,10 +60,18 @@ use crate::diesel::sql_types::{Array, Text};
 use streamgres::cache::{Bind, CachedRows};
 pub use streamgres::cache::{Cache, CacheConfig, Position, Reader, Refusal};
 use streamgres::model::Value;
-pub use streamgres::sync::pg::Lsn;
+use streamgres::sync::pg::Lsn;
 use streamgres::sync::pg::binary;
 
 use crate::row::CachedRow;
+
+/// The outcome of asking only the cache, including a refusal's reason.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum CacheAttempt<T> {
+    Hit(T),
+    Refused(Refusal),
+}
 
 /// Loading a query's rows from the cache, falling back to Postgres.
 pub trait LoadCached<'query, C, U>: Sized {
@@ -69,6 +81,41 @@ pub trait LoadCached<'query, C, U>: Sized {
 
     /// The rows from `cache` alone: `Ok(None)` when it refused.
     fn try_load_cached(self, cache: &Cache, conn: &mut C) -> QueryResult<Option<Vec<U>>>;
+
+    /// The cache-only result, preserving the reason when it refuses.
+    fn inspect_cached(self, cache: &Cache, conn: &mut C) -> QueryResult<CacheAttempt<Vec<U>>>;
+
+    /// One row, or Diesel's `NotFound`; use `OptionalExtension::optional`
+    /// on the result when absence is expected.
+    fn get_result_cached(self, cache: &Cache, conn: &mut C) -> QueryResult<U> {
+        self.load_cached(cache, conn)?
+            .into_iter()
+            .next()
+            .ok_or(Error::NotFound)
+    }
+
+    /// One optional row, with the same fallback as `load_cached`.
+    fn optional_cached(self, cache: &Cache, conn: &mut C) -> QueryResult<Option<U>> {
+        match self.get_result_cached(cache, conn) {
+            Ok(row) => Ok(Some(row)),
+            Err(Error::NotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Efficient first-row reads: adds `LIMIT 1` before using the cache.
+pub trait FirstCached<'query, C, U>: Sized {
+    fn first_cached(self, cache: &Cache, conn: &mut C) -> QueryResult<U>;
+}
+impl<'query, T, C, U> FirstCached<'query, C, U> for T
+where
+    T: crate::diesel::query_dsl::methods::LimitDsl,
+    <T as crate::diesel::query_dsl::methods::LimitDsl>::Output: LoadCached<'query, C, U>,
+{
+    fn first_cached(self, cache: &Cache, conn: &mut C) -> QueryResult<U> {
+        crate::diesel::query_dsl::methods::LimitDsl::limit(self, 1).get_result_cached(cache, conn)
+    }
 }
 
 impl<'query, T, C, U> LoadCached<'query, C, U> for T
@@ -82,14 +129,22 @@ where
     fn load_cached(self, cache: &Cache, conn: &mut C) -> QueryResult<Vec<U>> {
         let query = self.as_query();
         match cached_rows::<_, U, C>(&query, cache, conn)? {
-            Some(rows) => Ok(rows),
-            None => RunQueryDsl::load(query, conn),
+            Ok(rows) => Ok(rows),
+            Err(_) => RunQueryDsl::load(query, conn),
         }
     }
 
     fn try_load_cached(self, cache: &Cache, conn: &mut C) -> QueryResult<Option<Vec<U>>> {
         let query = self.as_query();
-        cached_rows::<_, U, C>(&query, cache, conn)
+        cached_rows::<_, U, C>(&query, cache, conn).map(Result::ok)
+    }
+
+    fn inspect_cached(self, cache: &Cache, conn: &mut C) -> QueryResult<CacheAttempt<Vec<U>>> {
+        let query = self.as_query();
+        cached_rows::<_, U, C>(&query, cache, conn).map(|answer| match answer {
+            Ok(rows) => CacheAttempt::Hit(rows),
+            Err(reason) => CacheAttempt::Refused(reason),
+        })
     }
 }
 
@@ -97,43 +152,68 @@ where
 /// longer stands; `None` when the connection must read Postgres: it is
 /// not tracked ([`Tracker`]), it is inside a transaction, or the check
 /// cannot be made.
-fn reader_of<C>(conn: &mut C, cache: &Cache) -> QueryResult<Option<Reader>>
+fn reader_of<C>(conn: &mut C, cache: &Cache) -> Result<Reader, Refusal>
 where
     C: Connection<Backend = Pg> + LoadConnection + 'static,
 {
     if in_transaction(conn) {
-        return Ok(None);
+        return Err(Refusal::NotReady(
+            "a read inside a transaction must use Postgres".to_owned(),
+        ));
     }
-    let Some(session) = session::session_of(conn.instrumentation()) else {
-        return Ok(None);
+    let Some(tracker) = session::tracker_of(conn.instrumentation()) else {
+        return Err(Refusal::NotReady(
+            "the connection has no outer Tracker instrumentation".to_owned(),
+        ));
     };
     let Some(version) = cache.catalog_version() else {
-        return Ok(None);
+        return Err(Refusal::NotReady(
+            "the cache has no running catalog".to_owned(),
+        ));
     };
     {
-        let session = session::lock(&session);
+        let session = &tracker.session;
         if session.in_transaction {
-            return Ok(None);
+            return Err(Refusal::NotReady(
+                "a raw SQL transaction is open".to_owned(),
+            ));
         }
         if let Some(reader) = session.current_reader()
             && reader.is_current(&version)
         {
-            return Ok(Some(reader.clone()));
+            return Ok(reader.clone());
         }
     }
     let Ok(check) = cache.reader_check() else {
-        return Ok(None);
+        return Err(Refusal::NotReady(
+            "the cache cannot check this reader now".to_owned(),
+        ));
     };
-    let answer: ReaderAnswer = crate::diesel::sql_query(check.sql)
+    let answer: QueryResult<ReaderAnswer> = crate::diesel::sql_query(check.sql)
         .bind::<Array<Text>, _>(&check.names)
         .bind::<Array<Text>, _>(&check.as_written)
         .bind::<Array<Text>, _>(&check.qualified)
-        .get_result(conn)?;
-    let reader = Reader::new(&answer.database, &answer.excluded, check.version);
-    let mut session = session::lock(&session);
+        .get_result(conn);
+    let Ok(answer) = answer else {
+        return Err(Refusal::NotReady(
+            "the reader identity or privileges could not be verified".to_owned(),
+        ));
+    };
+    let reader = Reader::new(
+        &answer.cluster,
+        &answer.database,
+        &answer.excluded,
+        check.version,
+    );
+    let Some(tracker) = session::tracker_of(conn.instrumentation()) else {
+        return Err(Refusal::NotReady(
+            "the connection no longer has Tracker instrumentation".to_owned(),
+        ));
+    };
+    let session = &mut tracker.session;
     session.reader = Some((reader.clone(), std::time::Instant::now()));
     session.changed = false;
-    Ok(Some(reader))
+    Ok(reader)
 }
 
 /// Waits, for at most `timeout`, until the cache has applied every
@@ -153,10 +233,14 @@ where
             "SELECT (CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_lsn() END)::text AS lsn",
         )
         .get_result(conn)?;
-    let position = Lsn::parse(&now.lsn).map(Position::from).ok_or_else(|| {
-        Error::DeserializationError(format!("`{}` is not a WAL location", now.lsn).into())
-    })?;
+    let position = sync_position(&now.lsn)?;
     Ok(cache.wait_for(position, timeout))
+}
+
+fn sync_position(text: &str) -> QueryResult<Position> {
+    Lsn::parse(text).map(Position::from).ok_or_else(|| {
+        Error::DeserializationError("the database returned an invalid WAL location".into())
+    })
 }
 
 /// The row of the reader check.
@@ -177,6 +261,8 @@ mod answer {
     #[derive(crate::diesel::QueryableByName)]
     pub(crate) struct ReaderAnswer {
         #[diesel(sql_type = Text)]
+        pub cluster: String,
+        #[diesel(sql_type = Text)]
         pub database: String,
         #[diesel(sql_type = Text)]
         pub excluded: String,
@@ -195,24 +281,58 @@ fn in_transaction<C: Connection>(conn: &mut C) -> bool {
     )
 }
 
-/// `query`'s rows from `cache`, `None` when it refused or a value cannot
-/// be written for its column.
-fn cached_rows<Q, U, C>(query: &Q, cache: &Cache, conn: &mut C) -> QueryResult<Option<Vec<U>>>
+/// `query`'s rows from `cache`, retaining why it refused or why its values
+/// could not be delivered to the application's decoder.
+fn cached_rows<Q, U, C>(
+    query: &Q,
+    cache: &Cache,
+    conn: &mut C,
+) -> QueryResult<Result<Vec<U>, Refusal>>
 where
     Q: QueryFragment<Pg> + QueryId + Query,
     Q::SqlType: CompatibleType<U, Pg>,
     U: FromSqlRow<<Q::SqlType as CompatibleType<U, Pg>>::SqlType, Pg>,
     C: Connection<Backend = Pg> + LoadConnection + PgMetadataLookup + 'static,
 {
-    let Some(reader) = reader_of(conn, cache)? else {
-        return Ok(None);
+    let reader = match reader_of(conn, cache) {
+        Ok(reader) => reader,
+        Err(reason) => {
+            cache.report_refusal(&reason);
+            return Ok(Err(reason));
+        }
     };
     let (sql, binds) = rendered(query, conn)?;
-    let Ok(answer) = cache.read(&sql, &binds, &reader) else {
-        return Ok(None);
+    let answer = match cache.read(&sql, &binds, &reader) {
+        Ok(answer) => answer,
+        Err(reason) => return Ok(Err(reason)),
     };
-    let Some(Encoded { buffer, cells }) = encoded(&answer) else {
-        return Ok(None);
+    let events = session::CacheEvents::new(conn.instrumentation(), &sql);
+    let decoded = decode_cached::<Q, U>(&answer);
+    events.finish(decoded.as_ref().err());
+    match decoded {
+        Ok(rows) => Ok(Ok(rows)),
+        Err(_) => {
+            cache.report_unusable();
+            Ok(Err(Refusal::Unsupported(
+                "the cached answer could not be encoded or decoded".to_owned(),
+            )))
+        }
+    }
+}
+
+fn decode_cached<Q, U>(answer: &CachedRows) -> QueryResult<Vec<U>>
+where
+    Q: Query,
+    Q::SqlType: CompatibleType<U, Pg>,
+    U: FromSqlRow<<Q::SqlType as CompatibleType<U, Pg>>::SqlType, Pg>,
+{
+    let unusable = || {
+        Error::DeserializationError(
+            "the cached answer cannot be represented in PostgreSQL binary format".into(),
+        )
+    };
+    let Some(Encoded { buffer, cells }) = encoded(answer) else {
+        return Err(unusable());
     };
     let names: Vec<&str> = answer
         .columns
@@ -222,13 +342,13 @@ where
     let mut oids = Vec::with_capacity(answer.columns.len());
     for column in answer.columns.iter() {
         let Some(oid) = NonZeroU32::new(column.type_oid) else {
-            return Ok(None);
+            return Err(unusable());
         };
         oids.push(oid);
     }
     let width = names.len();
     if width == 0 {
-        return Ok(None);
+        return Err(unusable());
     }
     cells
         .chunks(width)
@@ -237,7 +357,6 @@ where
             U::build_from_row(&row).map_err(Error::DeserializationError)
         })
         .collect::<QueryResult<Vec<U>>>()
-        .map(Some)
 }
 
 /// The SQL of each query type Diesel would cache a prepared statement for:

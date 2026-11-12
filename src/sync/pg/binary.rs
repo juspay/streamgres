@@ -43,14 +43,17 @@ pub mod oid {
 
 /// The fraction digits of the database's currency (`lc_monetary`), which
 /// a `money` value's integer counts in; read with the catalog.
+#[cfg(feature = "server")]
 static MONEY_SCALE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
 
 /// The fraction digits a `money` value counts in.
+#[cfg(feature = "server")]
 pub fn money_scale() -> u8 {
     MONEY_SCALE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Records the fraction digits of the database's currency.
+#[cfg(feature = "server")]
 pub fn set_money_scale(scale: u8) {
     MONEY_SCALE.store(scale, std::sync::atomic::Ordering::Relaxed);
 }
@@ -167,7 +170,9 @@ pub fn decode(declared: &ValueType, type_oid: u32, bytes: &[u8]) -> Result<Value
             _ => Err(fail("not a date")),
         },
         ValueType::Datetime => match decode_scalar(type_oid, bytes)? {
-            Value::Timestamp(at) => naive(at).map(Value::Datetime).ok_or(fail("a time out of range")),
+            Value::Timestamp(at) => naive(at)
+                .map(Value::Datetime)
+                .ok_or(fail("a time out of range")),
             _ => Err(fail("not a timestamp")),
         },
         ValueType::Raw => Ok(raw(type_oid, bytes)),
@@ -388,10 +393,7 @@ pub fn encode_into(value: &Value, type_oid: u32, out: &mut Vec<u8>) -> bool {
             out.extend_from_slice(json.text().as_bytes());
             true
         }
-        (
-            Value::String(text),
-            oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::CHAR,
-        ) => {
+        (Value::String(text), oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::CHAR) => {
             out.extend_from_slice(text.as_bytes());
             true
         }
@@ -561,7 +563,9 @@ mod tests {
         );
         assert_eq!(
             decode_scalar(oid::JSON, b"{ \"b\":2, \"a\":1 }").unwrap(),
-            Value::Json(crate::model::JsonText::standard_only("{\"a\": 1, \"b\": 2}".into()))
+            Value::Json(crate::model::JsonText::standard_only(
+                "{\"a\": 1, \"b\": 2}".into()
+            ))
         );
         assert!(decode_scalar(oid::JSONB, &[2, b'1']).is_err());
     }

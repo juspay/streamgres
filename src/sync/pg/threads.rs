@@ -35,11 +35,12 @@ use tokio::sync::watch;
 use tokio::task::spawn_local;
 
 use super::ddl::{self, DdlSource};
+use super::ddl_triggers;
 use super::slots::{self, SlotOwner};
 use super::{Feed, Keepalive, PgStorage, Transport, load_catalog};
 use crate::ivm::MultiTableIVM;
 use crate::log::{log_error, log_info, log_warn};
-use crate::model::{Catalog, Position, MultiTableReadQuery, TableName};
+use crate::model::{Catalog, MultiTableReadQuery, Position, TableName};
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
 use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Transaction};
@@ -88,6 +89,11 @@ pub struct Settings {
     /// Tell the consumer when a subscription's rows become incomplete and
     /// complete again ([`Service::with_settle_reports`]).
     pub settle_reports: bool,
+    /// The most rows one storage read, and one subscription's part, may
+    /// hold; a query past it is refused.
+    pub row_limit: usize,
+    /// Tables held whole in memory and read from there.
+    pub memory_tables: Vec<TableName>,
 }
 
 /// What every slot a server names for itself starts with.
@@ -126,6 +132,14 @@ pub struct Started {
 pub struct FeedHandle {
     stop: watch::Sender<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+// A cancelled startup or a panic must not detach a live feed forever.
+// Explicit shutdown additionally joins it before dropping the slot.
+impl Drop for FeedHandle {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+    }
 }
 
 /// The service's task, kept on the engine thread: it resolves only when
@@ -198,6 +212,57 @@ pub async fn require_ddl_trigger(dsn: &str, name: &str) -> Result<(), String> {
     }
 }
 
+/// What an embedded engine learns of its database before it starts.
+#[derive(Debug, Clone)]
+pub struct Source {
+    /// The cluster's system identifier: the same on a primary and its
+    /// physical standbys, different on every other cluster.
+    pub cluster: String,
+}
+
+/// Looks the database at `dsn` over for an engine that relies on the
+/// current trigger stack: the event trigger `trigger` must be there, and
+/// the stack in `schema` at [`ddl_triggers::STACK_VERSION`], since an
+/// older one leaves out what the engine needs to hear (row-level security
+/// turned on, a column's collation).
+pub async fn inspect_source(dsn: &str, trigger: &str, schema: &str) -> Result<Source, String> {
+    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .map_err(|error| format!("connecting to the database: {error}"))?;
+    let handle = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let inspected = async {
+        if !ddl::trigger_present(&client, trigger)
+            .await
+            .map_err(|error| format!("looking for the DDL event trigger `{trigger}`: {error}"))?
+        {
+            return Err(format!(
+                "the event trigger `{trigger}` is missing or disabled; the engine hears of schema changes through it"
+            ));
+        }
+        let version = ddl::stack_version(&client, schema)
+            .await
+            .map_err(|error| format!("reading the trigger stack's version: {error}"))?;
+        if version < ddl_triggers::STACK_VERSION {
+            return Err(format!(
+                "the trigger stack in `{schema}` is version {version}, and version {} is needed; install it again (CacheConfig::setup_sql)",
+                ddl_triggers::STACK_VERSION
+            ));
+        }
+        let cluster: String = client
+            .query_one("SELECT system_identifier::text FROM pg_control_system()", &[])
+            .await
+            .map_err(|error| format!("reading the cluster's identifier: {error}"))?
+            .get(0);
+        Ok(Source { cluster })
+    }
+    .await;
+    drop(client);
+    let _ = handle.await;
+    inspected
+}
+
 /// Start the feed thread: it decodes every replication event, starting
 /// from `catalog` and following the schema changes the DDL trigger
 /// announces, sends one transaction per commit into the returned channel,
@@ -222,7 +287,8 @@ pub fn spawn_feed(
                 .build()
                 .expect("feed runtime");
             let running_shutdown = shutdown.clone();
-            let stopped = runtime.block_on(async move {
+            let mut cancelled = stop_rx.clone();
+            let running = async move {
                 let ddl = DdlSource {
                     prefix: settings.ddl_prefix.clone(),
                     schemas: settings.schemas.clone(),
@@ -302,6 +368,17 @@ pub fn spawn_feed(
                             }
                         }
                     }
+                }
+            };
+            let stopped = runtime.block_on(async move {
+                tokio::select! {
+                    outcome = running => outcome,
+                    () = async {
+                        loop {
+                            if *cancelled.borrow() { return; }
+                            if cancelled.changed().await.is_err() { return; }
+                        }
+                    } => true,
                 }
             });
             if stopped {
@@ -413,14 +490,19 @@ pub async fn start(
         .parse()
         .map_err(|error| format!("connecting the read pool: {error}"))?;
     settings.keepalive.apply(&mut read_config);
-    let pg =
-        PgStorage::connect_configured_with_read_config(config, read_config, catalog.load(), reads)
-            .await
-            .map_err(|error| format!("connecting the storage: {error}"))?
-            .with_rotation(settings.snapshot_rotation)
-            .with_read_connections(settings.read_connections)
-            .with_read_idle_connections(settings.read_idle_connections)
-            .with_read_timeout(settings.read_timeout);
+    let pg = PgStorage::connect_with_row_limit(
+        config,
+        read_config,
+        catalog.load(),
+        reads,
+        settings.row_limit,
+    )
+    .await
+    .map_err(|error| format!("connecting the storage: {error}"))?
+    .with_rotation(settings.snapshot_rotation)
+    .with_read_connections(settings.read_connections)
+    .with_read_idle_connections(settings.read_idle_connections)
+    .with_read_timeout(settings.read_timeout);
     let pg = Arc::new(pg);
     let (feed, feed_handle) = spawn_feed(
         settings.clone(),
@@ -429,7 +511,7 @@ pub async fn start(
         shutdown,
     )?;
     spawn_local(keep_and_sweep(owner, direct, feed_handle.stop.subscribe()));
-    let cached = Sources::cached_from_env();
+    let cached = settings.memory_tables.clone();
     let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
     if !cached.is_empty() {
         let rows = storage
@@ -442,7 +524,7 @@ pub async fn start(
         .map(|_| mpsc::unbounded_channel())
         .unzip();
     let first = sinks[0].clone();
-    let engine = MultiTableIVM::new().with_row_limit(super::read_row_limit());
+    let engine = MultiTableIVM::new().with_row_limit(settings.row_limit);
     let (service, commands) = Service::new(engine, storage, first);
     let service = if settings.settle_reports {
         service.with_settle_reports()
@@ -466,4 +548,65 @@ pub async fn start(
         },
         service,
     ))
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+    #[test]
+    fn abandoning_a_feed_handle_signals_its_thread() {
+        let (stop, mut stopped) = watch::channel(false);
+        drop(FeedHandle { stop, thread: None });
+        assert!(*stopped.borrow_and_update());
+    }
+    #[test]
+    fn stopping_a_feed_cancels_a_stalled_connection_attempt() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dsn = format!(
+            "postgresql://postgres@{}/test",
+            listener.local_addr().unwrap()
+        );
+        let settings = Settings {
+            dsn: dsn.clone(),
+            read_dsn: dsn,
+            slot: "test".into(),
+            publication: "p".into(),
+            schemas: vec![],
+            snapshot_rotation: Duration::from_secs(1),
+            read_connections: 1,
+            read_idle_connections: 1,
+            read_timeout: Duration::from_secs(1),
+            read_threads: 1,
+            keepalive: Keepalive {
+                idle: Duration::from_secs(1),
+                interval: Duration::from_secs(1),
+                retries: 1,
+            },
+            watched: vec![],
+            ddl_trigger: "test".into(),
+            ddl_prefix: "test".into(),
+            settle_reports: true,
+            row_limit: 10,
+            memory_tables: vec![],
+        };
+        let (_transactions, mut feed) = spawn_feed(
+            settings,
+            Arc::new(Catalog::new(vec![])),
+            Position(0),
+            Shutdown::new(),
+        )
+        .unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let thread = feed.thread.take().unwrap();
+        drop(feed);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !thread.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            thread.is_finished(),
+            "dropping a feed must cancel connection establishment too"
+        );
+        thread.join().unwrap();
+    }
 }
