@@ -22,7 +22,7 @@ use streamgres::sync::pg::ddl::DdlSource;
 use streamgres::sync::pg::estimate_cache::EstimateCache;
 use streamgres::sync::pg::{PgStorage, PgStream};
 use streamgres::sync::{
-    CatalogHandle, Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
+    CatalogHandle, Command, Event, Position, Runtime, Service, Sources, Storage, SubId, Transaction,
 };
 
 /// The database under test, if any.
@@ -483,7 +483,7 @@ fn service_streams_end_to_end() {
         let service = spawn_local(service.run());
 
         let deadline = Instant::now() + Duration::from_secs(10);
-        while sources.floor() == Lsn(0) {
+        while sources.floor() == Position(0) {
             let batch = stream.poll().await.expect("poll");
             for (write, at) in batch.writes {
                 commands
@@ -1454,7 +1454,7 @@ fn an_idle_feed_brings_the_first_snapshot_into_use() {
                 if let Event::Committed {
                     position, floor, ..
                 } = event
-                    && floor > Lsn(0)
+                    && floor > Position(0)
                     && position >= floor
                 {
                     return Some((position, floor));
@@ -1465,7 +1465,7 @@ fn an_idle_feed_brings_the_first_snapshot_into_use() {
         .await
         .expect("the service is ready within ten seconds of an idle feed");
         let (position, floor) = covered.expect("the service is still running");
-        assert!(position >= floor && floor > Lsn(0));
+        assert!(position >= floor && floor > Position(0));
         assert!(
             pg.alias_position().is_some_and(|alias| alias >= floor),
             "the snapshot in use is the floor or, rotated since, a later one: {:?} against {floor:?}",
@@ -1604,7 +1604,7 @@ fn schema_changes_follow_the_trigger() {
                 .await
         });
         wait_until("the first snapshot became current", || {
-            sources.floor() > Lsn(0)
+            sources.floor() > Position(0)
         })
         .await;
 
@@ -1977,7 +1977,7 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
 
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut fed: HashMap<DataFrameKey, DataFrameRow> = HashMap::new();
-        let mut last = Lsn(0);
+        let mut last = Position(0);
         while fed.len() < 2 {
             let batch = stream.poll().await.expect("poll");
             for (write, at) in batch.writes {

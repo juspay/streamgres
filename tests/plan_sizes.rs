@@ -39,7 +39,7 @@ use streamgres::client::ast::Translated;
 use streamgres::client::plan::{Count, PlanCache, Planner, Policy, Side, plan};
 use streamgres::model::ComparisonOperator::{GT, IN};
 use streamgres::model::Order::DESC;
-use streamgres::model::{Catalog, Lsn, MultiTableReadQuery};
+use streamgres::model::{Catalog, Position, MultiTableReadQuery};
 use streamgres::sync::pg::PgStorage;
 use streamgres::sync::pg::catalog::load_catalog;
 use streamgres::sync::{Storage, StorageError};
@@ -365,7 +365,7 @@ fn counted_against_estimated() {
             .await
             .expect("storage")
             .with_read_connections(64);
-        storage.advance(Lsn(u64::MAX));
+        storage.advance(Position(u128::MAX));
         let params = params(&client).await;
 
         let mut plans = 0;
@@ -400,7 +400,7 @@ fn counted_against_estimated() {
                     println!("{name:<44} skipped: no table `{missing}`");
                     continue;
                 }
-                storage.advance(Lsn(u64::MAX));
+                storage.advance(Position(u128::MAX));
                 let wanted = Planner::new(spec.clone(), policy()).counts();
                 if wanted.is_empty() {
                     println!("{name:<44} nothing to size");
@@ -550,7 +550,7 @@ fn planning_every_argument() {
             .await
             .expect("storage")
             .with_read_connections(64);
-        storage.advance(Lsn(u64::MAX));
+        storage.advance(Position(u128::MAX));
         let mut spread = Vec::new();
         for (label, at) in SPREAD {
             spread.push(Params {

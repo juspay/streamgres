@@ -76,7 +76,7 @@ use streamgres::ivm::{
 use streamgres::model::ComparisonOperator::{EQ, GTE};
 use streamgres::model::*;
 use streamgres::sync::pg::{PgStorage, PgStream};
-use streamgres::sync::{Local, Lsn, Runtime, Snapshot, Storage, StorageError};
+use streamgres::sync::{Local, Position, Runtime, Snapshot, Storage, StorageError};
 
 /// The production-app catalog shared with the query scenario tests.
 #[path = "../../tests/streamgres_queries/catalog.rs"]
@@ -477,7 +477,7 @@ impl BenchTable {
 #[derive(Default)]
 struct BenchStorage {
     tables: RefCell<HashMap<TableName, BenchTable>>,
-    position: Cell<Lsn>,
+    position: Cell<Position>,
 }
 
 impl BenchStorage {
@@ -607,14 +607,14 @@ impl Storage for BenchStorage {
     }
 
     /// The store is current at `feed`.
-    fn advance(&self, feed: Lsn) {
+    fn advance(&self, feed: Position) {
         if feed > self.position.get() {
             self.position.set(feed);
         }
     }
 
     /// Reads are never behind the position.
-    fn floor(&self) -> Lsn {
+    fn floor(&self) -> Position {
         self.position.get()
     }
 }

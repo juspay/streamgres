@@ -12,8 +12,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use diesel::connection::SimpleConnection;
 use diesel::dsl::count_star;
 use diesel::prelude::*;
-use diesel::sql_types::Text;
-use streamgres_diesel::{Cache, CacheConfig, LoadCached, Lsn, Tracker};
+use streamgres_diesel::{Cache, CacheConfig, LoadCached, Tracker};
 
 diesel::table! {
     adapter_orders (id) {
@@ -54,20 +53,6 @@ struct Order {
 }
 
 const PUBLICATION: &str = "adapter_orders_pub";
-
-#[derive(QueryableByName)]
-struct Position {
-    #[diesel(sql_type = Text)]
-    lsn: String,
-}
-
-/// Where the database's WAL is now.
-fn position(conn: &mut PgConnection) -> Lsn {
-    let row: Position = diesel::sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
-        .get_result(conn)
-        .expect("the WAL position");
-    Lsn::parse(&row.lsn).expect("an LSN")
-}
 
 /// Asserts the cache answers `query` itself, with Postgres's rows.
 macro_rules! same {
@@ -262,9 +247,8 @@ fn load_cached_returns_what_load_returns() {
     diesel::delete(adapter_orders::table.find(1i64))
         .execute(&mut conn)
         .expect("delete");
-    let written = position(&mut conn);
     assert!(
-        cache.wait_for(written, Duration::from_secs(10)),
+        streamgres_diesel::wait_for_writes(&cache, &mut conn, Duration::from_secs(10)).expect("read the WAL"),
         "the engine reaches the writes"
     );
     let after = check(&cache, &mut conn);

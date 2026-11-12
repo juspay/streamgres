@@ -44,7 +44,7 @@ use super::storage::{Storage, StorageError};
 use crate::ivm::{Audience, Delta, Engine, Fetch, FetchId, SchemaChange, Subs};
 use crate::model::frame::SharedRow;
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
+    Catalog, DataFrameKey, DataFrameRow, IdMap, Position, Snapshot, SubId, TableName, WriteQuery,
 };
 use crate::stats::Stats;
 
@@ -82,8 +82,8 @@ pub enum Command<Q> {
 #[derive(Debug)]
 pub struct Transaction {
     pub writes: Vec<WriteQuery>,
-    pub at: Lsn,
-    pub progress: Lsn,
+    pub at: Position,
+    pub progress: Position,
     pub watched: Vec<WriteQuery>,
     pub schema: Vec<SchemaChange>,
     pub catalog: Option<Arc<Catalog>>,
@@ -97,7 +97,7 @@ impl Transaction {
     /// committed at or below `position` has been delivered, and nothing
     /// was written. It is one step like any other, which is what moves
     /// the engine, and the snapshots waiting on it, while nobody writes.
-    pub fn mark(position: Lsn) -> Self {
+    pub fn mark(position: Position) -> Self {
         Self::new(Vec::new(), position)
     }
 
@@ -107,7 +107,7 @@ impl Transaction {
     /// from the last position the server saw confirmed, so the
     /// transactions received after that confirmation come again; commit
     /// records end at distinct locations, so the comparison is exact.
-    pub fn repeats(&self, position: Lsn) -> bool {
+    pub fn repeats(&self, position: Position) -> bool {
         !self.is_mark() && self.at <= position
     }
 
@@ -120,7 +120,7 @@ impl Transaction {
 
     /// A transaction of `writes` committed at `at`, the feed's progress
     /// mark being that same location, with nothing watched, received now.
-    pub fn new(writes: Vec<WriteQuery>, at: Lsn) -> Self {
+    pub fn new(writes: Vec<WriteQuery>, at: Position) -> Self {
         Transaction {
             writes,
             at,
@@ -190,8 +190,8 @@ pub enum Event {
     },
     Committed {
         updates: Vec<Delta>,
-        position: Lsn,
-        floor: Lsn,
+        position: Position,
+        floor: Position,
         watched: Vec<WriteQuery>,
         received: Instant,
         routed: Instant,
@@ -217,8 +217,8 @@ enum Outcome {
     },
     Landed,
     Committed {
-        position: Lsn,
-        floor: Lsn,
+        position: Position,
+        floor: Position,
         watched: Vec<WriteQuery>,
         received: Instant,
         routed: Instant,
@@ -266,7 +266,7 @@ pub struct Service<E: Engine, S: Storage> {
     /// position it took effect at, waiting for the storage floor to reach
     /// that position before the clients' side sees them, and the tables
     /// the change touched.
-    pending: VecDeque<(Lsn, Arc<Catalog>, Vec<TableName>)>,
+    pending: VecDeque<(Position, Arc<Catalog>, Vec<TableName>)>,
 }
 
 impl<E, S> Service<E, S>
@@ -499,7 +499,9 @@ where
         self.adopt(floor);
         let routed = Instant::now();
         if let Some(stats) = &self.stats {
-            stats.feed_lsn.store(at.0, Ordering::Relaxed);
+            stats
+                .feed_lsn
+                .store(u64::try_from(at.0).unwrap_or(u64::MAX), Ordering::Relaxed);
             stats.publish_engine(self.runtime.engine_stats(), self.runtime.stats());
             stats.publish_footprint(self.runtime.engine_footprint());
         }
@@ -568,7 +570,7 @@ where
     /// snapshot now rather than at its next tick, and the catalog waits
     /// for the storage floor to reach `at` before the clients' side sees
     /// it ([`Service::adopt`]).
-    fn migrate(&mut self, at: Lsn, changes: &[SchemaChange], catalog: Arc<Catalog>) {
+    fn migrate(&mut self, at: Position, changes: &[SchemaChange], catalog: Arc<Catalog>) {
         let started = Instant::now();
         for change in changes {
             self.storage.alter(change);
@@ -597,7 +599,7 @@ where
     /// Publish to the clients' side every waiting catalog whose position
     /// the storage `floor` has reached: from here on every read it plans
     /// and every query it translates meets a snapshot that has the change.
-    fn adopt(&mut self, floor: Lsn) {
+    fn adopt(&mut self, floor: Position) {
         while self.pending.front().is_some_and(|(at, _, _)| *at <= floor) {
             let Some((at, catalog, touched)) = self.pending.pop_front() else {
                 break;

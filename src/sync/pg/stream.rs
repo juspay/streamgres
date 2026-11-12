@@ -63,13 +63,14 @@ use tokio_postgres::config::Host;
 use tokio_postgres::types::PgLsn;
 
 use super::ddl::{self, DdlSource};
+use super::lsn::Lsn;
 use super::pgoutput::{self, Cell, Message};
 use crate::ivm::SchemaChange;
 use crate::log::{log_info, log_warn};
 use super::binary;
 use crate::model::{
     Catalog, ColumnName, DataFrameKey, DataFrameRow, DbColumn, DbTable, DeleteQuery, InsertQuery,
-    Lsn, RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
+    Position, RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
 };
 use crate::sync::service::{Command, Transaction as Committed};
 use crate::sync::storage::StorageError;
@@ -92,8 +93,8 @@ const ASK_WAIT: Duration = Duration::from_secs(5);
 /// have delivered everything up to.
 #[derive(Debug)]
 pub struct Batch {
-    pub writes: Vec<(WriteQuery, Lsn)>,
-    pub progress: Lsn,
+    pub writes: Vec<(WriteQuery, Position)>,
+    pub progress: Position,
 }
 
 /// One decoded transaction: the end of its commit record (the position of
@@ -103,7 +104,7 @@ pub struct Batch {
 /// how long decoding it took.
 #[derive(Debug)]
 pub struct Transaction {
-    pub at: Lsn,
+    pub at: Position,
     pub writes: Vec<WriteQuery>,
     pub schema: Vec<SchemaChange>,
     pub catalog: Option<Arc<Catalog>>,
@@ -235,21 +236,22 @@ impl Decoder {
     /// leaves everything as it was. A change the server cannot follow, or
     /// a message it cannot read, is the error that stops the feed, and
     /// with it the server; restarted, it loads the catalog as it is then.
-    fn migrate(&mut self, at: Lsn, content: &Bytes) -> Result<(), StorageError> {
+    fn migrate(&mut self, at: Position, content: &Bytes) -> Result<(), StorageError> {
+        let wal_at = super::lsn::text(at);
         let Some(source) = &self.ddl else {
             return Ok(());
         };
         let text = std::str::from_utf8(content)
-            .map_err(|_| StorageError(format!("the DDL message at {at} is not UTF-8")))?;
+            .map_err(|_| StorageError(format!("the DDL message at {wal_at} is not UTF-8")))?;
         let message = ddl::DdlMessage::parse(text)
-            .map_err(|reason| StorageError(format!("the DDL message at {at}: {reason}")))?;
+            .map_err(|reason| StorageError(format!("the DDL message at {wal_at}: {reason}")))?;
         if !message.is_update() {
             return Ok(());
         }
         let classified =
             ddl::classify(&self.catalog, &source.schemas, &message).map_err(|reason| {
                 StorageError(format!(
-                    "schema change at {at} ({}) the server cannot follow: {reason}; the server stops here and, restarted, serves the schema as it is now",
+                    "schema change at {wal_at} ({}) the server cannot follow: {reason}; the server stops here and, restarted, serves the schema as it is now",
                     message.tag()
                 ))
             })?;
@@ -257,7 +259,7 @@ impl Decoder {
             return Ok(());
         }
         for change in &classified.changes {
-            log_info!("schema change at {at} ({}): {change}", message.tag());
+            log_info!("schema change at {wal_at} ({}): {change}", message.tag());
         }
         self.catalog = Arc::new(classified.catalog);
         self.changes.extend(classified.changes);
@@ -427,7 +429,7 @@ impl Watch {
 /// the delivered position out.
 pub struct Feed {
     decoder: Decoder,
-    progress: Lsn,
+    progress: Position,
 }
 
 impl Transport {
@@ -452,7 +454,7 @@ impl Transport {
         dsn: &str,
         slot: &str,
         publication: &str,
-        start: Lsn,
+        start: Position,
     ) -> Result<Self, StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = require_slot(&config, slot).await?;
@@ -564,8 +566,8 @@ impl Transport {
     }
 
     /// Tell the slot that everything up to `at` has been received.
-    fn acknowledge(&mut self, at: Lsn) {
-        self.feed.update_applied_lsn(pgwire_replication::Lsn(at.0));
+    fn acknowledge(&mut self, at: Position) {
+        self.feed.update_applied_lsn(pgwire_replication::Lsn(super::lsn::wal(at)));
     }
 
     /// Run until `out` has no receiver or the connection ends: decode
@@ -616,12 +618,13 @@ impl Transport {
                 }
                 _ = ticker.tick() => {
                     let position = feed.progress();
-                    if position > Lsn(0) && out.send(Committed::mark(position)).await.is_err() {
+                    if position > Position(0) && out.send(Committed::mark(position)).await.is_err() {
                         return Ok(());
                     }
                     if watch.due(Instant::now()) && !self.slot_is_held().await {
+                        let wal_position = super::lsn::text(position);
                         log_warn!(
-                            "the change feed has been silent for {:.0} s at {position} and no walsender holds slot {}; giving the connection up",
+                            "the change feed has been silent for {:.0} s at {wal_position} and no walsender holds slot {}; giving the connection up",
                             watch.heard.elapsed().as_secs_f64(),
                             self.slot
                         );
@@ -730,7 +733,8 @@ async fn require_slot(config: &tokio_postgres::Config, slot: &str) -> Result<Cli
 /// first ending a walsender still holding it (one left by an earlier
 /// process; the server itself holds the slot on no other connection
 /// while it opens the feed). A slot at or past `to` is left alone.
-async fn advance_slot(client: &Client, slot: &str, to: Lsn) -> Result<(), StorageError> {
+async fn advance_slot(client: &Client, slot: &str, to: Position) -> Result<(), StorageError> {
+    let wal_to = super::lsn::text(to);
     let mut attempts = 0;
     loop {
         let row = client
@@ -742,7 +746,7 @@ async fn advance_slot(client: &Client, slot: &str, to: Lsn) -> Result<(), Storag
             .ok_or_else(|| StorageError(format!("slot `{slot}` does not exist")))?;
         let confirmed: Option<PgLsn> = row.get(0);
         let holder: Option<i32> = row.get(1);
-        let confirmed = confirmed.map(|lsn| Lsn(u64::from(lsn)));
+        let confirmed = confirmed.map(|lsn| Position::from(Lsn(u64::from(lsn))));
         if confirmed.is_some_and(|confirmed| confirmed >= to) {
             return Ok(());
         }
@@ -750,7 +754,7 @@ async fn advance_slot(client: &Client, slot: &str, to: Lsn) -> Result<(), Storag
             Some(pid) if attempts < 40 => {
                 attempts += 1;
                 log_warn!(
-                    "slot {slot} is held by backend {pid}; ending it to move the slot to {to}"
+                    "slot {slot} is held by backend {pid}; ending it to move the slot to {wal_to}"
                 );
                 client
                     .execute("SELECT pg_terminate_backend($1)", &[&pid])
@@ -759,19 +763,19 @@ async fn advance_slot(client: &Client, slot: &str, to: Lsn) -> Result<(), Storag
             }
             Some(pid) => {
                 return Err(StorageError(format!(
-                    "slot `{slot}` stays held by backend {pid}; it cannot be moved to {to}"
+                    "slot `{slot}` stays held by backend {pid}; it cannot be moved to {wal_to}"
                 )));
             }
             None => {
                 client
                     .execute(
                         "SELECT pg_replication_slot_advance($1, $2)",
-                        &[&slot, &PgLsn::from(to.0)],
+                        &[&slot, &PgLsn::from(super::lsn::wal(to))],
                     )
                     .await?;
                 log_info!(
-                    "slot {slot} moved from {} to {to}, the first read snapshot's point",
-                    confirmed.map_or_else(|| "nowhere".to_owned(), |lsn| lsn.to_string())
+                    "slot {slot} moved from {} to {wal_to}, the first read snapshot's point",
+                    confirmed.map_or_else(|| "nowhere".to_owned(), super::lsn::text)
                 );
                 return Ok(());
             }
@@ -795,7 +799,7 @@ impl Feed {
     pub fn new(catalog: Arc<Catalog>) -> Self {
         Feed {
             decoder: Decoder::new(catalog),
-            progress: Lsn(0),
+            progress: Position(0),
         }
     }
 
@@ -805,7 +809,7 @@ impl Feed {
     pub fn with_ddl(catalog: Arc<Catalog>, ddl: DdlSource) -> Self {
         Feed {
             decoder: Decoder::with_ddl(catalog, ddl),
-            progress: Lsn(0),
+            progress: Position(0),
         }
     }
 
@@ -831,7 +835,7 @@ impl Feed {
     }
 
     /// The position every commit has been delivered up to.
-    pub fn progress(&self) -> Lsn {
+    pub fn progress(&self) -> Position {
         self.progress
     }
 }
@@ -967,7 +971,7 @@ impl PgStream {
 /// positions are on: the flushed end on a primary (a transaction is
 /// acknowledged once its commit record is flushed, and the feed is sent
 /// flushed log only), the replayed end on a standby.
-async fn server_position(client: &Client) -> Result<Lsn, StorageError> {
+async fn server_position(client: &Client) -> Result<Position, StorageError> {
     let row = client
         .query_one(
             "SELECT CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn() ELSE pg_current_wal_flush_lsn() END",
@@ -975,12 +979,12 @@ async fn server_position(client: &Client) -> Result<Lsn, StorageError> {
         )
         .await?;
     let end: PgLsn = row.get(0);
-    Ok(Lsn(u64::from(end)))
+    Ok(Position::from(Lsn(u64::from(end))))
 }
 
 /// The feed's position for a location the transport reports.
-fn position(lsn: pgwire_replication::Lsn) -> Lsn {
-    Lsn(lsn.as_u64())
+fn position(lsn: pgwire_replication::Lsn) -> Position {
+    Position::from(Lsn(lsn.as_u64()))
 }
 
 /// The replication connection's settings, taken from the SQL connection's
@@ -1457,22 +1461,22 @@ mod tests {
     #[test]
     fn a_keepalive_moves_the_position_and_never_back() {
         let mut feed = Feed::new(catalog());
-        assert_eq!(feed.progress(), Lsn(0));
+        assert_eq!(feed.progress(), Position(0));
         assert!(feed.absorb(keepalive("0/100")).unwrap().is_none());
-        assert_eq!(feed.progress(), Lsn::parse("0/100").unwrap());
+        assert_eq!(feed.progress(), Position::from(Lsn::parse("0/100").unwrap()));
         assert!(feed.absorb(begin()).unwrap().is_none());
         assert!(feed.absorb(keepalive("0/180")).unwrap().is_none());
         let committed = feed
             .absorb(commit("0/200"))
             .unwrap()
             .expect("a transaction");
-        assert_eq!(committed.at, Lsn::parse("0/200").unwrap());
+        assert_eq!(committed.at, Position::from(Lsn::parse("0/200").unwrap()));
         assert!(committed.writes.is_empty());
-        assert_eq!(feed.progress(), Lsn::parse("0/200").unwrap());
+        assert_eq!(feed.progress(), Position::from(Lsn::parse("0/200").unwrap()));
         assert!(feed.absorb(keepalive("0/180")).unwrap().is_none());
-        assert_eq!(feed.progress(), Lsn::parse("0/200").unwrap());
+        assert_eq!(feed.progress(), Position::from(Lsn::parse("0/200").unwrap()));
         assert!(feed.absorb(keepalive("0/2A8")).unwrap().is_none());
-        assert_eq!(feed.progress(), Lsn::parse("0/2A8").unwrap());
+        assert_eq!(feed.progress(), Position::from(Lsn::parse("0/2A8").unwrap()));
     }
 
     /// A `jsonb` cell in binary format: its version byte, then its text.
@@ -1631,7 +1635,7 @@ mod tests {
             .collect();
         assert_eq!(transactions.len(), 4, "{transactions:?}");
 
-        assert_eq!(transactions[0].at, Lsn::parse("0/3EFF460").unwrap());
+        assert_eq!(transactions[0].at, Position::from(Lsn::parse("0/3EFF460").unwrap()));
         assert_eq!(transactions[0].writes.len(), 2);
         let image = transactions[0].writes[0].new_row_image().unwrap();
         assert_eq!(image.data["name"], Value::String("it's x".into()));
@@ -1663,7 +1667,7 @@ mod tests {
         );
 
         assert!(matches!(transactions[1].writes[0], WriteQuery::UPDATE(_)));
-        assert_eq!(transactions[1].at, Lsn::parse("0/3EFF508").unwrap());
+        assert_eq!(transactions[1].at, Position::from(Lsn::parse("0/3EFF508").unwrap()));
 
         let last = &transactions[2].writes;
         assert_eq!(
@@ -1680,9 +1684,9 @@ mod tests {
         assert!(
             matches!(&last[2], WriteQuery::DELETE(d) if d.pkey_value.pkey_value["id"] == Value::Int(1))
         );
-        assert_eq!(transactions[2].at, Lsn::parse("0/3EFF6F8").unwrap());
+        assert_eq!(transactions[2].at, Position::from(Lsn::parse("0/3EFF6F8").unwrap()));
 
         assert!(transactions[3].writes.is_empty());
-        assert_eq!(transactions[3].at, Lsn::parse("0/3EFF768").unwrap());
+        assert_eq!(transactions[3].at, Position::from(Lsn::parse("0/3EFF768").unwrap()));
     }
 }

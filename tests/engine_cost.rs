@@ -34,7 +34,7 @@ use streamgres::client::plan::{Planner, Policy, Side};
 use streamgres::ivm::MultiTableIVM;
 use streamgres::model::Order::DESC;
 use streamgres::model::{
-    ColumnName, DataFrameKey, DataFrameRow, InsertQuery, Lsn, MultiTableReadQuery,
+    ColumnName, DataFrameKey, DataFrameRow, InsertQuery, Position, MultiTableReadQuery,
     SingleTableReadQuery, Snapshot, Value, WriteQuery,
 };
 use streamgres::sync::{Local, MemoryStorage, Storage, StorageError};
@@ -85,13 +85,13 @@ impl Storage for Timed {
     async fn count(&self, query: &MultiTableReadQuery, cap: u64) -> Result<u64, StorageError> {
         self.inner.count(query, cap).await
     }
-    fn advance(&self, feed: Lsn) {
+    fn advance(&self, feed: Position) {
         self.inner.advance(feed)
     }
-    fn floor(&self) -> Lsn {
+    fn floor(&self) -> Position {
         self.inner.floor()
     }
-    fn absorb(&self, write: &WriteQuery, at: Lsn) {
+    fn absorb(&self, write: &WriteQuery, at: Position) {
         self.inner.absorb(write, at)
     }
 }

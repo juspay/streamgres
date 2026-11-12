@@ -14,7 +14,7 @@ use super::pg::PgStorage;
 use super::storage::{MemoryStorage, Storage, StorageError};
 use crate::ivm::SchemaChange;
 use crate::model::{
-    Catalog, Lsn, MultiTableReadQuery, Order, OrderBy, SingleTableReadQuery, Snapshot, TableName,
+    Catalog, Position, MultiTableReadQuery, Order, OrderBy, SingleTableReadQuery, Snapshot, TableName,
     Where, WriteQuery,
 };
 
@@ -174,19 +174,19 @@ impl Storage for Sources {
     }
 
     /// Both sources move.
-    fn advance(&self, feed: Lsn) {
+    fn advance(&self, feed: Position) {
         self.memory.advance(feed);
         self.pg.advance(feed);
     }
 
     /// The lower of the two floors: a Postgres read can be as far back as
     /// its snapshot, a memory read is always current.
-    fn floor(&self) -> Lsn {
+    fn floor(&self) -> Position {
         self.pg.floor().min(self.memory.floor())
     }
 
     /// A write on a cached table goes into the mirror.
-    fn absorb(&self, write: &WriteQuery, at: Lsn) {
+    fn absorb(&self, write: &WriteQuery, at: Position) {
         if self.is_cached(write.table()) {
             self.memory.absorb(write, at);
         }
@@ -202,7 +202,7 @@ impl Storage for Sources {
     }
 
     /// Postgres reads by the catalog.
-    fn follow(&self, at: Lsn, catalog: Arc<Catalog>) {
+    fn follow(&self, at: Position, catalog: Arc<Catalog>) {
         self.pg.follow(at, catalog);
     }
 

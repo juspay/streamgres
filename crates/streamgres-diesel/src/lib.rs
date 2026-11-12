@@ -51,7 +51,8 @@ use crate::diesel::query_dsl::methods::LoadQuery;
 use crate::diesel::result::{Error, QueryResult};
 use crate::diesel::sql_types::{Array, Text};
 use streamgres::cache::{Bind, CachedRows};
-pub use streamgres::cache::{Cache, CacheConfig, Lsn, Reader, Refusal};
+pub use streamgres::cache::{Cache, CacheConfig, Position, Reader, Refusal};
+pub use streamgres::sync::pg::Lsn;
 use streamgres::model::Value;
 use streamgres::sync::pg::binary;
 
@@ -132,6 +133,21 @@ where
     Ok(Some(reader))
 }
 
+/// Waits, for at most `timeout`, until the cache has applied every
+/// transaction committed on `conn`'s database so far, so a read after a
+/// write sees it; whether it has. One round trip reads where the
+/// database's WAL is.
+pub fn wait_for_writes<C>(cache: &Cache, conn: &mut C, timeout: std::time::Duration) -> QueryResult<bool>
+where
+    C: Connection<Backend = Pg> + LoadConnection + 'static,
+{
+    let now: WalNow = crate::diesel::sql_query("SELECT pg_current_wal_lsn()::text AS lsn").get_result(conn)?;
+    let position = Lsn::parse(&now.lsn)
+        .map(Position::from)
+        .ok_or_else(|| Error::DeserializationError(format!("`{}` is not a WAL location", now.lsn).into()))?;
+    Ok(cache.wait_for(position, timeout))
+}
+
 /// The row of the reader check.
 mod answer {
     #![allow(
@@ -142,6 +158,12 @@ mod answer {
     use crate::diesel::sql_types::Text;
 
     #[derive(crate::diesel::QueryableByName)]
+    pub(crate) struct WalNow {
+        #[diesel(sql_type = Text)]
+        pub lsn: String,
+    }
+
+    #[derive(crate::diesel::QueryableByName)]
     pub(crate) struct ReaderAnswer {
         #[diesel(sql_type = Text)]
         pub database: String,
@@ -149,7 +171,7 @@ mod answer {
         pub excluded: String,
     }
 }
-use answer::ReaderAnswer;
+use answer::{ReaderAnswer, WalNow};
 
 /// Whether `conn` is inside a transaction Diesel opened, or in a state
 /// Diesel cannot tell (a broken transaction), where only Postgres knows

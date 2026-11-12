@@ -4,7 +4,7 @@
 //!
 //! | Piece | Role |
 //! |-------|------|
-//! | [`Lsn`] | Where a write or a read's snapshot sits in the source's history: one WAL location. |
+//! | [`Position`] | Where a write or a read's snapshot sits in the source's history: one WAL location. |
 //! | [`Storage`] | The asynchronous read seam every source implements: [`MemoryStorage`] in-process, [`pg::PgStorage`] over Postgres, [`Sources`] routing by table between the two. |
 //! | [`Runtime`] | The single owner of an engine: hands out the engine's reads, keeps the delivered writes a read may still be behind, and lands each read after bringing it up to the engine's position (its module docs). Pure state, no I/O. |
 //! | [`Local`] | The synchronous driver: reads answered at once, landed inline (tests, demo, benchmark). |
@@ -24,7 +24,7 @@ mod sources;
 mod storage;
 
 pub use crate::model::SubId;
-pub use crate::model::{Lsn, Snapshot};
+pub use crate::model::{Position, Snapshot};
 pub use catalog::CatalogHandle;
 pub use codec::CellDecoder;
 pub use local::Local;

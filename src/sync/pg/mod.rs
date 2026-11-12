@@ -52,6 +52,7 @@ pub mod binary;
 pub mod catalog;
 pub mod ddl;
 pub mod ddl_triggers;
+pub mod lsn;
 pub mod estimate;
 pub mod estimate_cache;
 pub mod pgoutput;
@@ -76,12 +77,13 @@ use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, SimpleQuery
 use super::storage::{Storage, StorageError};
 use crate::log::{log_info, log_warn};
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameRow, DbTable, Lsn, MultiTableReadQuery, RowData,
+    Catalog, DataFrameKey, DataFrameRow, DbTable, Position, MultiTableReadQuery, RowData,
     SingleTableReadQuery, Snapshot, Value,
 };
 use replication::ReplicationConnection;
 
 pub use catalog::load_catalog;
+pub use lsn::Lsn;
 pub use stream::{Batch, Feed, PgStream, Transport};
 pub use threads::{Settings, Started};
 
@@ -168,7 +170,7 @@ impl Keepalive {
 /// its temporary slot.
 pub struct Alias {
     pub snapshot: String,
-    pub lsn: Lsn,
+    pub lsn: Position,
     _minter: ReplicationConnection,
 }
 
@@ -309,7 +311,7 @@ struct Aliases {
     catalog: Arc<Catalog>,
     /// Catalogs handed in for positions the current alias has not reached,
     /// each with the position it applies from, in order.
-    upcoming: VecDeque<(Lsn, Arc<Catalog>)>,
+    upcoming: VecDeque<(Position, Arc<Catalog>)>,
 }
 
 impl Aliases {
@@ -336,7 +338,7 @@ impl Aliases {
     /// Make the newest waiting alias at or below `feed` current, dropping
     /// the older ones it supersedes, and bring into force every catalog
     /// handed in for a position the current alias has reached.
-    fn advance(&mut self, feed: Lsn) {
+    fn advance(&mut self, feed: Position) {
         while self.waiting.front().is_some_and(|alias| alias.lsn <= feed) {
             self.current = self.waiting.pop_front();
         }
@@ -471,7 +473,7 @@ impl PgStorage {
             runtime,
         });
         let first = Arc::new(mint(&pool.config).await?);
-        pool.first.store(first.lsn.0, Ordering::Relaxed);
+        pool.first.store(lsn::wal(first.lsn), Ordering::Relaxed);
         pool.lock_aliases().waiting.push_back(first);
         rotate(pool.clone());
         Ok(PgStorage {
@@ -561,8 +563,8 @@ impl PgStorage {
     /// The consistent point of the first alias minted: everything the
     /// storage will ever read is at or past it, so it is where the feed
     /// starts.
-    pub fn first_position(&self) -> Lsn {
-        Lsn(self.pool.first.load(Ordering::Relaxed))
+    pub fn first_position(&self) -> Position {
+        Position::from(Lsn(self.pool.first.load(Ordering::Relaxed)))
     }
 
     /// Mint an alias now, without waiting for the rotation's next tick.
@@ -572,7 +574,7 @@ impl PgStorage {
 
     /// The current alias's consistent point, for inspection; `None` until
     /// the stream has passed the first alias.
-    pub fn alias_position(&self) -> Option<Lsn> {
+    pub fn alias_position(&self) -> Option<Position> {
         self.pool
             .lock_aliases()
             .current
@@ -708,14 +710,14 @@ impl Storage for PgStorage {
     }
 
     /// Flip to the newest minted alias the stream has passed.
-    fn advance(&self, feed: Lsn) {
+    fn advance(&self, feed: Position) {
         self.pool.lock_aliases().advance(feed);
     }
 
     /// Reads on the alias that first reaches `at`, and every later one,
     /// describe their tables by `catalog`; the estimates answered so far
     /// are forgotten, a table having perhaps changed shape.
-    fn follow(&self, at: Lsn, catalog: Arc<Catalog>) {
+    fn follow(&self, at: Position, catalog: Arc<Catalog>) {
         self.pool.lock_aliases().upcoming.push_back((at, catalog));
         self.estimates.clear();
     }
@@ -726,7 +728,7 @@ impl Storage for PgStorage {
     }
 
     /// The current alias's consistent point; zero while there is none.
-    fn floor(&self) -> Lsn {
+    fn floor(&self) -> Position {
         self.alias_position().unwrap_or_default()
     }
 }
@@ -1103,8 +1105,8 @@ async fn open(config: &Config, runtime: &Handle) -> Result<Client, StorageError>
 }
 
 /// Parse Postgres's `X/Y`.
-pub fn parse_lsn(text: &str) -> Result<Lsn, StorageError> {
-    Lsn::parse(text).ok_or_else(|| StorageError(format!("unreadable WAL location `{text}`")))
+pub fn parse_lsn(text: &str) -> Result<Position, StorageError> {
+    Lsn::parse(text).map(Position::from).ok_or_else(|| StorageError(format!("unreadable WAL location `{text}`")))
 }
 
 /// One result row, in [`sql::select_columns`] order, as the engine's
@@ -1272,7 +1274,7 @@ mod tests {
         let alias = |lsn: u64| {
             Arc::new(Alias {
                 snapshot: format!("snap-{lsn}"),
-                lsn: Lsn(lsn),
+                lsn: Position::from(Lsn(lsn)),
                 _minter: ReplicationConnection::detached(),
             })
         };
@@ -1280,15 +1282,15 @@ mod tests {
         aliases.waiting.push_back(alias(10));
         aliases.waiting.push_back(alias(20));
         aliases.waiting.push_back(alias(30));
-        aliases.advance(Lsn(5));
+        aliases.advance(Position(5));
         assert!(aliases.current.is_none());
-        aliases.advance(Lsn(25));
-        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(20)));
+        aliases.advance(Position(25));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Position(20)));
         assert_eq!(aliases.waiting.len(), 1);
-        aliases.advance(Lsn(25));
-        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(20)));
-        aliases.advance(Lsn(30));
-        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(30)));
+        aliases.advance(Position(25));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Position(20)));
+        aliases.advance(Position(30));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Position(30)));
         assert!(aliases.waiting.is_empty());
     }
 
@@ -1300,7 +1302,7 @@ mod tests {
         let alias = |lsn: u64| {
             Arc::new(Alias {
                 snapshot: format!("snap-{lsn}"),
-                lsn: Lsn(lsn),
+                lsn: Position::from(Lsn(lsn)),
                 _minter: ReplicationConnection::detached(),
             })
         };
@@ -1309,17 +1311,17 @@ mod tests {
         let before = Arc::new(Catalog::new(vec![table("a")]));
         let after = Arc::new(Catalog::new(vec![table("a"), table("b")]));
         let mut aliases = Aliases::new(before.clone());
-        aliases.upcoming.push_back((Lsn(15), after.clone()));
+        aliases.upcoming.push_back((Position(15), after.clone()));
         aliases.waiting.push_back(alias(10));
         aliases.waiting.push_back(alias(20));
-        aliases.advance(Lsn(12));
-        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(10)));
+        aliases.advance(Position(12));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Position(10)));
         assert!(
             Arc::ptr_eq(&aliases.catalog, &before),
             "10 is before the change at 15"
         );
-        aliases.advance(Lsn(20));
-        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(20)));
+        aliases.advance(Position(20));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Position(20)));
         assert!(Arc::ptr_eq(&aliases.catalog, &after));
         assert!(aliases.upcoming.is_empty());
     }

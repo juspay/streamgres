@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use streamgres::cache::{Bind, Cache, CacheConfig, Lsn, Reader, Refusal};
+use streamgres::cache::{Bind, Cache, CacheConfig, Position, Reader, Refusal};
 use streamgres::model::{Numeric, Value};
 use tokio_postgres::NoTls;
 
@@ -112,7 +112,7 @@ fn reads_are_answered_and_kept_current() {
             .unwrap()
             .get(0);
         assert!(
-            cache.wait_for(Lsn::parse(&at).unwrap(), Duration::from_secs(10)),
+            cache.wait_for(Position::from(streamgres::sync::pg::Lsn::parse(&at).unwrap()), Duration::from_secs(10)),
             "the engine reaches the write"
         );
     };

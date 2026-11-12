@@ -112,7 +112,7 @@ use super::wire;
 use crate::ivm::{Delta, QueryPart};
 use crate::log::{Level, log_debug, log_event, log_info, log_warn};
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, Lsn,
+    Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, Position,
     MultiTableReadQuery, RowData, SubId, TableName, Value, WriteQuery,
 };
 use crate::stats::Stats;
@@ -790,7 +790,7 @@ impl Groups {
 
     /// Start serving once the engine's position covers the storage's
     /// snapshots; the requests that arrived meanwhile run then.
-    fn serve_when_covered(&mut self, position: Lsn, floor: Lsn) {
+    fn serve_when_covered(&mut self, position: Position, floor: Position) {
         if self.ready || floor.0 == 0 || position < floor {
             return;
         }

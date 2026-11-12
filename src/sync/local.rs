@@ -14,7 +14,7 @@ use super::runtime::{Runtime, Step};
 use super::storage::Storage;
 use crate::ivm::{Delta, Engine};
 use crate::model::frame::SharedRow;
-use crate::model::{Lsn, SubId, WriteQuery};
+use crate::model::{Position, SubId, WriteQuery};
 
 /// A runtime over an engine and an immediately-answering storage.
 ///
@@ -55,7 +55,7 @@ impl<E: Engine, S: Storage> Local<E, S> {
     /// every delta it led to, reads included.
     pub fn incremental_update(&mut self, write: &WriteQuery) -> Vec<Delta> {
         self.clock += 1;
-        let step = self.runtime.write(write, Lsn(self.clock));
+        let step = self.runtime.write(write, Position(u128::from(self.clock)));
         self.moved();
         self.settle(step)
     }

@@ -34,7 +34,7 @@ pub use config::CacheConfig;
 pub use reader::{CatalogVersion, Reader, ReaderCheck};
 pub use rows::{CachedColumn, CachedRows};
 
-pub use crate::model::Lsn;
+pub use crate::model::Position;
 use crate::model::MultiTableReadQuery;
 pub use crate::parser::Bind;
 use crate::parser::parse_select;
@@ -216,7 +216,7 @@ impl Cache {
     /// Waits until the engine has applied every transaction committed at
     /// or before `position` (a `pg_current_wal_lsn()` read after a write),
     /// for at most `timeout`; whether it has.
-    pub fn wait_for(&self, position: Lsn, timeout: Duration) -> bool {
+    pub fn wait_for(&self, position: Position, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut state = self.shared.lock();
         loop {
@@ -232,7 +232,7 @@ impl Cache {
 
     /// The position the engine has applied every transaction up to;
     /// `None` while it is not running.
-    pub fn position(&self) -> Option<Lsn> {
+    pub fn position(&self) -> Option<Position> {
         let state = self.shared.lock();
         matches!(state.phase, Phase::Running(_)).then_some(state.position)
     }

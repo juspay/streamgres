@@ -39,7 +39,7 @@ use super::slots::{self, SlotOwner};
 use super::{Feed, Keepalive, PgStorage, Transport, load_catalog};
 use crate::ivm::MultiTableIVM;
 use crate::log::{log_error, log_info, log_warn};
-use crate::model::{Catalog, Lsn, MultiTableReadQuery, TableName};
+use crate::model::{Catalog, Position, MultiTableReadQuery, TableName};
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
 use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Transaction};
@@ -206,7 +206,7 @@ pub async fn require_ddl_trigger(dsn: &str, name: &str) -> Result<(), String> {
 pub fn spawn_feed(
     settings: Settings,
     catalog: Arc<Catalog>,
-    start: Lsn,
+    start: Position,
     shutdown: Shutdown,
 ) -> Result<(mpsc::Receiver<Transaction>, FeedHandle), String> {
     let (out, transactions) = mpsc::channel(1024);

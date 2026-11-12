@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use super::{CacheConfig, Refusal};
 use crate::ivm::{Delta, QueryPart};
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, Lsn, MultiTableReadQuery, SubId,
+    Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, Position, MultiTableReadQuery, SubId,
 };
 use crate::shutdown::Shutdown;
 use crate::sync::{CatalogHandle, Command, Event};
@@ -62,7 +62,7 @@ pub(super) struct State {
     by_sub: HashMap<SubId, u64>,
     next_id: u64,
     /// Every transaction committed at or below this has been applied.
-    pub position: Lsn,
+    pub position: Position,
     /// When the engine last told where the feed is.
     heard: Option<Instant>,
     refused: HashMap<MultiTableReadQuery, (String, Instant)>,
@@ -87,7 +87,7 @@ impl Shared {
                 by_query: HashMap::new(),
                 by_sub: HashMap::new(),
                 next_id: 1,
-                position: Lsn(0),
+                position: Position(0),
                 heard: None,
                 refused: HashMap::new(),
             }),
@@ -257,7 +257,7 @@ impl State {
         self.entries.clear();
         self.by_query.clear();
         self.by_sub.clear();
-        self.position = Lsn(0);
+        self.position = Position(0);
         self.heard = None;
         self.phase = Phase::Running(running);
     }
