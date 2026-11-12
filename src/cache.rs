@@ -125,28 +125,28 @@ impl Cache {
                     .find(|(key, _)| {
                         &*key.sql == sql && key.binds == binds && key.version == version
                     })
-                    .map(|(_, select)| select.clone())
+                    .map(|(_, parsed)| parsed.clone())
             });
-        if let Some(select) = known {
-            return Ok(select);
+        let unsupported = |reason: &Arc<str>| Refusal::Unsupported(reason.to_string());
+        if let Some(parsed) = known {
+            return parsed.map_err(|reason| unsupported(&reason));
         }
-        let select = Arc::new(
-            parse_select(sql, binds, catalog)
-                .map_err(|error| Refusal::Unsupported(error.to_string()))?,
-        );
-        let mut parsed = self
+        let parsed: state::Parsed = parse_select(sql, binds, catalog)
+            .map(Arc::new)
+            .map_err(|error| Arc::from(error.to_string()));
+        let mut parsed_memo = self
             .shared
             .parsed
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if parsed.len() >= state::PARSED_LIMIT {
-            let gone: Vec<u64> = parsed
+        if parsed_memo.len() >= state::PARSED_LIMIT {
+            let gone: Vec<u64> = parsed_memo
                 .keys()
                 .take(state::PARSED_LIMIT / 8)
                 .copied()
                 .collect();
             for hash in gone {
-                parsed.remove(&hash);
+                parsed_memo.remove(&hash);
             }
         }
         let key = state::ParseKey {
@@ -154,8 +154,8 @@ impl Cache {
             binds: binds.to_vec(),
             version,
         };
-        parsed.entry(hash).or_default().push((key, select.clone()));
-        Ok(select)
+        parsed_memo.entry(hash).or_default().push((key, parsed.clone()));
+        parsed.map_err(|reason| unsupported(&reason))
     }
 
     /// The query that checks a reader's connection against the catalog
@@ -237,10 +237,6 @@ impl Cache {
             match &entry.fill {
                 Fill::Ready => {
                     entry.last_read = Instant::now();
-                    if let Some(ordered) = entry.ordered.clone() {
-                        drop(state);
-                        return rows::answer(&ordered, ordered.len(), &select, &tables);
-                    }
                     if select.projection == crate::parser::Projection::CountStar
                         && select.nodes.len() == 1
                     {
@@ -248,30 +244,54 @@ impl Cache {
                             .parts
                             .get(&crate::ivm::QueryPart::main())
                             .map_or(0, HashMap::len);
-                        return rows::answer(&[], count, &select, &tables);
+                        return rows::count(count, &select);
+                    }
+                    let version = CatalogVersion::of(&catalog);
+                    if let Some((_, _, projected)) =
+                        entry.projected.iter().find(|(projection, at, _)| {
+                            *projection == select.projection && *at == version
+                        })
+                    {
+                        return Ok(rows::slice(projected, &select));
                     }
                     let generation = entry.generation;
-                    let kept: rows::Kept = select
-                        .nodes
-                        .iter()
-                        .map(|node| {
-                            entry
-                                .parts
-                                .get(&node.part)
-                                .map(|rows| rows.values().cloned().collect())
-                                .unwrap_or_default()
-                        })
-                        .collect();
+                    let ordered = entry.ordered.clone();
+                    let kept: Option<rows::Kept> = ordered.is_none().then(|| {
+                        select
+                            .nodes
+                            .iter()
+                            .map(|node| {
+                                entry
+                                    .parts
+                                    .get(&node.part)
+                                    .map(|rows| rows.values().cloned().collect())
+                                    .unwrap_or_default()
+                            })
+                            .collect()
+                    });
                     drop(state);
-                    let ordered = rows::compose(kept, &select, &tables);
+                    let ordered = match (ordered, kept) {
+                        (Some(ordered), _) => ordered,
+                        (None, kept) => rows::compose(kept.unwrap_or_default(), &select, &tables),
+                    };
+                    if select.projection == crate::parser::Projection::CountStar {
+                        return rows::count(ordered.len(), &select);
+                    }
+                    let projected = Arc::new(rows::project(&ordered, &select, &tables)?);
                     let mut state = self.shared.lock();
                     if let Some(entry) = state.entries.get_mut(&id)
                         && entry.generation == generation
                     {
-                        entry.ordered = Some(ordered.clone());
+                        entry.ordered = Some(ordered);
+                        entry.projected.retain(|(_, at, _)| *at == version);
+                        entry.projected.push((
+                            select.projection.clone(),
+                            version,
+                            projected.clone(),
+                        ));
                     }
                     drop(state);
-                    return rows::answer(&ordered, ordered.len(), &select, &tables);
+                    return Ok(rows::slice(&projected, &select));
                 }
                 Fill::Refused(reason) => return Err(Refusal::Unsupported(reason.clone())),
                 Fill::Pending => {}

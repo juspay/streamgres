@@ -51,6 +51,14 @@ pub(super) struct Entry {
     /// The joined rows in the statement's order, kept until the rows next
     /// change.
     pub ordered: Option<Arc<[super::rows::Joined]>>,
+    /// Each statement's projection of `ordered` read so far, by its
+    /// projection and the catalog it was resolved against; dropped with
+    /// `ordered`.
+    pub projected: Vec<(
+        crate::parser::Projection,
+        super::CatalogVersion,
+        Arc<super::rows::Projected>,
+    )>,
     /// Bumped by every change of the rows, so an ordering built from an
     /// older snapshot is not kept.
     pub generation: u64,
@@ -86,8 +94,13 @@ pub(super) fn parse_hash(
     hasher.finish()
 }
 
+/// What parsing a statement came to: the statement, or why the engine
+/// cannot answer it. Both follow from the text, the binds and the
+/// catalog alone, so both are kept.
+pub(super) type Parsed = Result<Arc<crate::parser::Select>, Arc<str>>;
+
 /// The parsed statements, filed by [`parse_hash`].
-pub(super) type ParseMemo = HashMap<u64, Vec<(ParseKey, Arc<crate::parser::Select>)>>;
+pub(super) type ParseMemo = HashMap<u64, Vec<(ParseKey, Parsed)>>;
 
 /// What identifies a parsed statement.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -103,8 +116,8 @@ pub(super) const PARSED_LIMIT: usize = 8192;
 pub(super) struct Shared {
     state: Mutex<State>,
     changed: Condvar,
-    /// Statements already parsed, by their text, binds and catalog: a
-    /// repeated read is not parsed again.
+    /// Statements already parsed, by their text, binds and catalog, and
+    /// those refused: a repeated read is not parsed again.
     pub parsed: std::sync::RwLock<ParseMemo>,
     pub config: CacheConfig,
     /// The database the engine streams.
@@ -253,6 +266,7 @@ impl State {
                 fill: Fill::Pending,
                 parts: HashMap::new(),
                 ordered: None,
+                projected: Vec::new(),
                 generation: 0,
                 last_read: Instant::now(),
             },
@@ -410,6 +424,7 @@ impl State {
                     (DataFrameOperation::Add(..), None) => continue,
                 }
                 entry.ordered = None;
+                entry.projected.clear();
                 entry.generation += 1;
             }
         }

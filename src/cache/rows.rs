@@ -2,12 +2,14 @@
 //! in the statement's order, its offset skipped, its limit applied, its
 //! projection taken.
 //!
-//! Joining and ordering are the costly part, so they are done once per
-//! change of a query's rows, not once per read: [`compose`] joins and
-//! sorts a snapshot of the rows, the entry keeps the result until its
-//! rows change again, and each read only slices it ([`answer`]).
+//! Joining, ordering and projecting are the costly part, so they are done
+//! once per change of a query's rows, not once per read: [`compose`] joins
+//! and sorts a snapshot of the rows, [`project`] takes a statement's
+//! columns of every joined row, the entry keeps both until its rows change
+//! again, and each read only slices the projection ([`slice`]).
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use super::Refusal;
@@ -26,11 +28,28 @@ pub struct CachedColumn {
 }
 
 /// An answer: its columns and its rows, each row's values in column
-/// order.
+/// order. The rows are a window on the projection the cache keeps, shared
+/// by every read of it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CachedRows {
-    pub columns: Vec<CachedColumn>,
-    pub rows: Vec<Vec<Value>>,
+    pub columns: Arc<[CachedColumn]>,
+    all: Arc<[Box<[Value]>]>,
+    window: Range<usize>,
+}
+
+impl CachedRows {
+    /// The rows, in the statement's order.
+    pub fn rows(&self) -> &[Box<[Value]>] {
+        self.all.get(self.window.clone()).unwrap_or_default()
+    }
+}
+
+/// A statement's columns of every joined row of its query, in order:
+/// what every read of the statement slices.
+#[derive(Debug)]
+pub(super) struct Projected {
+    columns: Arc<[CachedColumn]>,
+    rows: Arc<[Box<[Value]>]>,
 }
 
 /// One row of the join: a row of each table of the `FROM`, in its order,
@@ -153,33 +172,45 @@ fn expand(
     rows.into_iter().map(Vec::into_boxed_slice).collect()
 }
 
-/// The answer to `select` from its joined rows in order, `count` of them
-/// in all. `tables` are the `FROM`'s, in its order.
-pub(super) fn answer(
+/// The window of `len` rows `select`'s offset and limit leave.
+fn window(len: usize, select: &Select) -> Range<usize> {
+    let start = usize::try_from(select.offset).unwrap_or(usize::MAX).min(len);
+    let take = usize::try_from(select.limit).unwrap_or(usize::MAX);
+    start..start.saturating_add(take).min(len)
+}
+
+/// The answer to a `COUNT(*)` that matched `count` rows.
+pub(super) fn count(count: usize, select: &Select) -> Result<CachedRows, Refusal> {
+    let count = i64::try_from(count)
+        .map_err(|_| Refusal::Unsupported("the count is out of range".to_owned()))?;
+    let all: Arc<[Box<[Value]>]> = Arc::new([Box::new([Value::Int(count)]) as Box<[Value]>]);
+    Ok(CachedRows {
+        columns: Arc::new([CachedColumn {
+            name: ColumnName::from("count"),
+            type_oid: oid::INT8,
+            element_oid: 0,
+        }]),
+        window: window(all.len(), select),
+        all,
+    })
+}
+
+/// The read of `select` from its projection.
+pub(super) fn slice(projected: &Projected, select: &Select) -> CachedRows {
+    CachedRows {
+        columns: projected.columns.clone(),
+        all: projected.rows.clone(),
+        window: window(projected.rows.len(), select),
+    }
+}
+
+/// `select`'s columns of every row of `joined`, which is in its order.
+/// `tables` are the `FROM`'s, in its order. Not for a `COUNT(*)`.
+pub(super) fn project(
     joined: &[Joined],
-    count: usize,
     select: &Select,
     tables: &[&DbTable],
-) -> Result<CachedRows, Refusal> {
-    let start = usize::try_from(select.offset).unwrap_or(usize::MAX);
-    let take = usize::try_from(select.limit).unwrap_or(usize::MAX);
-    if select.projection == Projection::CountStar {
-        let count = i64::try_from(count)
-            .map_err(|_| Refusal::Unsupported("the count is out of range".to_owned()))?;
-        let rows = std::iter::once(vec![Value::Int(count)])
-            .skip(start)
-            .take(take)
-            .collect();
-        return Ok(CachedRows {
-            columns: vec![CachedColumn {
-                name: ColumnName::from("count"),
-                type_oid: oid::INT8,
-                element_oid: 0,
-            }],
-            rows,
-        });
-    }
-
+) -> Result<Projected, Refusal> {
     let projected: Vec<(usize, ColumnName)> = match &select.projection {
         Projection::Columns(columns) => columns
             .iter()
@@ -215,8 +246,6 @@ pub(super) fn answer(
     }
     let rows = joined
         .iter()
-        .skip(start)
-        .take(take)
         .map(|row| {
             projected
                 .iter()
@@ -233,8 +262,11 @@ pub(super) fn answer(
                         None => Ok(Value::Null),
                     }
                 })
-                .collect()
+                .collect::<Result<Box<[Value]>, _>>()
         })
         .collect::<Result<_, _>>()?;
-    Ok(CachedRows { columns, rows })
+    Ok(Projected {
+        columns: columns.into(),
+        rows,
+    })
 }

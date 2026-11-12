@@ -8,20 +8,28 @@ use std::ops::Range;
 use crate::diesel::pg::{Pg, PgValue};
 use crate::diesel::row::{Field, PartialRow, Row, RowIndex, RowSealed};
 
-/// One row: its columns' names and types, and each cell's bytes.
+/// One row: its columns' names and types, and each cell's bytes as their
+/// range in a buffer the answer's rows share.
 pub(crate) struct CachedRow<'a> {
     names: &'a [&'a str],
     oids: &'a [NonZeroU32],
-    cells: &'a [Option<Vec<u8>>],
+    buffer: &'a [u8],
+    cells: &'a [Option<Range<usize>>],
 }
 
 impl<'a> CachedRow<'a> {
     pub(crate) fn new(
         names: &'a [&'a str],
         oids: &'a [NonZeroU32],
-        cells: &'a [Option<Vec<u8>>],
+        buffer: &'a [u8],
+        cells: &'a [Option<Range<usize>>],
     ) -> Self {
-        CachedRow { names, oids, cells }
+        CachedRow {
+            names,
+            oids,
+            buffer,
+            cells,
+        }
     }
 }
 
@@ -55,7 +63,10 @@ impl<'a> Row<'a, Pg> for CachedRow<'a> {
         Some(CachedField {
             name: self.names.get(index)?,
             oid: self.oids.get(index)?,
-            bytes: self.cells.get(index)?.as_deref(),
+            bytes: match self.cells.get(index)? {
+                Some(range) => Some(self.buffer.get(range.clone())?),
+                None => None,
+            },
         })
     }
 

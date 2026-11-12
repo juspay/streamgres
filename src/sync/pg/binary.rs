@@ -324,54 +324,131 @@ fn decode_array(inner: &ValueType, type_oid: u32, bytes: &[u8]) -> Result<Value,
 /// Encodes `value` as Postgres's binary form for `type_oid`; `None` when
 /// the value is not one of that type. `Null` has no bytes and is `None`.
 pub fn encode(value: &Value, type_oid: u32) -> Option<Vec<u8>> {
-    Some(match (value, type_oid) {
-        (Value::Null, _) => return None,
-        (Value::Raw(raw), _) if raw.type_oid == type_oid => raw.bytes.to_vec(),
-        (Value::Bool(flag), oid::BOOL) => vec![u8::from(*flag)],
-        (Value::Int(int), oid::INT2) => i16::try_from(*int).ok()?.to_be_bytes().to_vec(),
-        (Value::Int(int), oid::INT4) => i32::try_from(*int).ok()?.to_be_bytes().to_vec(),
-        (Value::Int(int), oid::INT8) => int.to_be_bytes().to_vec(),
-        (Value::Int(int), oid::OID) => u32::try_from(*int).ok()?.to_be_bytes().to_vec(),
-        (Value::Float(float), oid::FLOAT8) => float.to_be_bytes().to_vec(),
+    let mut out = Vec::new();
+    encode_into(value, type_oid, &mut out).then_some(out)
+}
+
+/// Appends `value` in the binary format of `type_oid` to `out`; whether
+/// it could be, `out` as it was when not (or for `NULL`, which has no
+/// bytes).
+pub fn encode_into(value: &Value, type_oid: u32, out: &mut Vec<u8>) -> bool {
+    let at = out.len();
+    let written = match (value, type_oid) {
+        (Value::Null, _) => false,
+        (Value::Raw(raw), _) if raw.type_oid == type_oid => {
+            out.extend_from_slice(&raw.bytes);
+            true
+        }
+        (Value::Bool(flag), oid::BOOL) => {
+            out.push(u8::from(*flag));
+            true
+        }
+        (Value::Int(int), oid::INT2) => i16::try_from(*int)
+            .map(|int| out.extend_from_slice(&int.to_be_bytes()))
+            .is_ok(),
+        (Value::Int(int), oid::INT4) => i32::try_from(*int)
+            .map(|int| out.extend_from_slice(&int.to_be_bytes()))
+            .is_ok(),
+        (Value::Int(int), oid::INT8) => {
+            out.extend_from_slice(&int.to_be_bytes());
+            true
+        }
+        (Value::Int(int), oid::OID) => u32::try_from(*int)
+            .map(|int| out.extend_from_slice(&int.to_be_bytes()))
+            .is_ok(),
+        (Value::Float(float), oid::FLOAT8) => {
+            out.extend_from_slice(&float.to_be_bytes());
+            true
+        }
         (Value::Float(float), oid::FLOAT4) => {
             let narrow = *float as f32;
-            (f64::from(narrow) == *float || float.is_nan())
-                .then(|| narrow.to_be_bytes().to_vec())?
+            let exact = f64::from(narrow) == *float || float.is_nan();
+            if exact {
+                out.extend_from_slice(&narrow.to_be_bytes());
+            }
+            exact
         }
-        (Value::Numeric(number), oid::NUMERIC) => number.to_binary(),
-        (Value::String(text), oid::UUID) => uuid_bytes(text)?.to_vec(),
+        (Value::Numeric(number), oid::NUMERIC) => {
+            out.extend_from_slice(&number.to_binary());
+            true
+        }
+        (Value::String(text), oid::UUID) => match uuid_bytes(text) {
+            Some(bytes) => {
+                out.extend_from_slice(&bytes);
+                true
+            }
+            None => false,
+        },
         (Value::Json(json), oid::JSONB) => {
-            let text = json.text();
-            let mut out = Vec::with_capacity(text.len() + 1);
             out.push(JSONB_VERSION);
-            out.extend_from_slice(text.as_bytes());
-            out
+            out.extend_from_slice(json.text().as_bytes());
+            true
         }
-        (Value::Json(json), oid::JSON) => json.text().as_bytes().to_vec(),
+        (Value::Json(json), oid::JSON) => {
+            out.extend_from_slice(json.text().as_bytes());
+            true
+        }
         (
             Value::String(text),
             oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::CHAR,
-        ) => text.as_bytes().to_vec(),
-        (Value::String(text), other) if value_type(other).is_none() => text.as_bytes().to_vec(),
-        (Value::Timestamp(at), oid::TIMESTAMP | oid::TIMESTAMPTZ) => at.0.to_be_bytes().to_vec(),
-        (Value::Day(day), oid::DATE) => day.0.to_be_bytes().to_vec(),
-        (Value::Time(time), oid::TIME) => time.0.to_be_bytes().to_vec(),
-        (Value::Bytes(bytes), oid::BYTEA) => bytes.to_vec(),
-        _ => return None,
-    })
+        ) => {
+            out.extend_from_slice(text.as_bytes());
+            true
+        }
+        (Value::String(text), other) if value_type(other).is_none() => {
+            out.extend_from_slice(text.as_bytes());
+            true
+        }
+        (Value::Timestamp(at), oid::TIMESTAMP | oid::TIMESTAMPTZ) => {
+            out.extend_from_slice(&at.0.to_be_bytes());
+            true
+        }
+        (Value::Day(day), oid::DATE) => {
+            out.extend_from_slice(&day.0.to_be_bytes());
+            true
+        }
+        (Value::Time(time), oid::TIME) => {
+            out.extend_from_slice(&time.0.to_be_bytes());
+            true
+        }
+        (Value::Bytes(bytes), oid::BYTEA) => {
+            out.extend_from_slice(bytes);
+            true
+        }
+        _ => false,
+    };
+    if !written {
+        out.truncate(at);
+    }
+    written
 }
 
 /// Encodes a list as a one-dimensional array of `element_oid` for the
 /// array type `type_oid`; `None` when an element is not of that type.
 pub fn encode_array(items: &[Value], element_oid: u32) -> Option<Vec<u8>> {
     let mut out = Vec::new();
+    encode_array_into(items, element_oid, &mut out).then_some(out)
+}
+
+/// Appends a list as a one-dimensional array of `element_oid` to `out`;
+/// whether it could be, `out` as it was when not.
+pub fn encode_array_into(items: &[Value], element_oid: u32, out: &mut Vec<u8>) -> bool {
+    let at = out.len();
+    let written = write_array(items, element_oid, out).is_some();
+    if !written {
+        out.truncate(at);
+    }
+    written
+}
+
+fn write_array(items: &[Value], element_oid: u32, out: &mut Vec<u8>) -> Option<()> {
     let has_nulls = items.iter().any(Value::is_null);
     let dimensions: i32 = if items.is_empty() { 0 } else { 1 };
     out.extend_from_slice(&dimensions.to_be_bytes());
     out.extend_from_slice(&i32::from(has_nulls).to_be_bytes());
     out.extend_from_slice(&element_oid.to_be_bytes());
     if items.is_empty() {
-        return Some(out);
+        return Some(());
     }
     out.extend_from_slice(&i32::try_from(items.len()).ok()?.to_be_bytes());
     out.extend_from_slice(&1i32.to_be_bytes());
@@ -380,11 +457,16 @@ pub fn encode_array(items: &[Value], element_oid: u32) -> Option<Vec<u8>> {
             out.extend_from_slice(&(-1i32).to_be_bytes());
             continue;
         }
-        let element = encode(item, element_oid)?;
-        out.extend_from_slice(&i32::try_from(element.len()).ok()?.to_be_bytes());
-        out.extend_from_slice(&element);
+        let length_at = out.len();
+        out.extend_from_slice(&0i32.to_be_bytes());
+        if !encode_into(item, element_oid, out) {
+            return None;
+        }
+        let length = i32::try_from(out.len() - length_at - 4).ok()?;
+        out.get_mut(length_at..length_at + 4)?
+            .copy_from_slice(&length.to_be_bytes());
     }
-    Some(out)
+    Some(())
 }
 
 #[cfg(test)]

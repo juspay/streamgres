@@ -211,7 +211,7 @@ where
     let Ok(answer) = cache.read(&sql, &binds, &reader) else {
         return Ok(None);
     };
-    let Some(cells) = encoded(&answer) else {
+    let Some(Encoded { buffer, cells }) = encoded(&answer) else {
         return Ok(None);
     };
     let names: Vec<&str> = answer
@@ -220,16 +220,20 @@ where
         .map(|column| column.name.as_str())
         .collect();
     let mut oids = Vec::with_capacity(answer.columns.len());
-    for column in &answer.columns {
+    for column in answer.columns.iter() {
         let Some(oid) = NonZeroU32::new(column.type_oid) else {
             return Ok(None);
         };
         oids.push(oid);
     }
+    let width = names.len();
+    if width == 0 {
+        return Ok(None);
+    }
     cells
-        .iter()
+        .chunks(width)
         .map(|cells| {
-            let row = CachedRow::new(&names, &oids, cells);
+            let row = CachedRow::new(&names, &oids, &buffer, cells);
             U::build_from_row(&row).map_err(Error::DeserializationError)
         })
         .collect::<QueryResult<Vec<U>>>()
@@ -292,27 +296,41 @@ where
     Ok((sql, binds))
 }
 
-/// Every value of `answer` in Postgres's binary format for its column's
-/// type; `None` when one cannot be written exactly.
-fn encoded(answer: &CachedRows) -> Option<Vec<Vec<Option<Vec<u8>>>>> {
-    answer
-        .rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .zip(&answer.columns)
-                .map(|(value, column)| match value {
-                    Value::Null => Some(None),
-                    Value::List(items) => {
-                        let element = match column.element_oid {
-                            0 => binary::array_element(column.type_oid)?,
-                            known => known,
-                        };
-                        binary::encode_array(items, element).map(Some)
-                    }
-                    value => binary::encode(value, column.type_oid).map(Some),
-                })
-                .collect()
-        })
-        .collect()
+/// Every value of an answer in Postgres's binary format for its column's
+/// type, in one buffer: each cell, row after row, as its bytes' range in
+/// `buffer`, `None` for `NULL`.
+struct Encoded {
+    buffer: Vec<u8>,
+    cells: Vec<Option<std::ops::Range<usize>>>,
+}
+
+/// `answer` encoded; `None` when a value cannot be written exactly.
+fn encoded(answer: &CachedRows) -> Option<Encoded> {
+    let rows = answer.rows();
+    let mut buffer = Vec::with_capacity(rows.len() * answer.columns.len() * 16);
+    let mut cells = Vec::with_capacity(rows.len() * answer.columns.len());
+    for row in rows {
+        for (value, column) in row.iter().zip(answer.columns.iter()) {
+            let at = buffer.len();
+            let written = match value {
+                Value::Null => {
+                    cells.push(None);
+                    continue;
+                }
+                Value::List(items) => {
+                    let element = match column.element_oid {
+                        0 => binary::array_element(column.type_oid)?,
+                        known => known,
+                    };
+                    binary::encode_array_into(items, element, &mut buffer)
+                }
+                value => binary::encode_into(value, column.type_oid, &mut buffer),
+            };
+            if !written {
+                return None;
+            }
+            cells.push(Some(at..buffer.len()));
+        }
+    }
+    Some(Encoded { buffer, cells })
 }
