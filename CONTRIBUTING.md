@@ -133,4 +133,4 @@ you say otherwise, any contribution you submit is licensed under the same
 terms, as section 5 of the licence provides.
 
 Code ported from other Apache-2.0 projects must keep its original attribution
-comments, as `src/client/ddl_triggers.rs` does.
+comments, as `src/sync/pg/ddl_triggers.rs` does.

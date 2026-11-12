@@ -17,7 +17,7 @@ use tokio::task::{LocalSet, spawn_local};
 use tokio_postgres::{Client, NoTls};
 use streamgres::ivm::{Delta, Engine, Fetch, MultiTableIVM, QueryPart};
 use streamgres::model::*;
-use streamgres::client::ddl_triggers::trigger_stack_sql;
+use streamgres::sync::pg::ddl_triggers::trigger_stack_sql;
 use streamgres::sync::pg::ddl::DdlSource;
 use streamgres::sync::pg::estimate_cache::EstimateCache;
 use streamgres::sync::pg::{PgStorage, PgStream};

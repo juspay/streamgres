@@ -53,7 +53,6 @@ pub mod ast;
 pub mod backend;
 pub mod config;
 pub mod connection;
-pub mod ddl_triggers;
 pub mod groups;
 pub mod pg_text;
 pub mod plan;

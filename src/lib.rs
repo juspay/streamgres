@@ -60,13 +60,16 @@
 //! 10. Batching of one write's narrowed reads, parser `JOIN` syntax,
 //!     table sharding of the engine across threads
 
+#[cfg(feature = "server")]
 pub mod client;
 pub mod ivm;
 pub mod log;
 pub mod metric;
 pub mod model;
+#[cfg(feature = "server")]
 pub mod otel;
 pub mod parser;
+#[cfg(feature = "server")]
 pub mod profile;
 pub mod shutdown;
 pub mod stats;

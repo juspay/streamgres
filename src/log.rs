@@ -326,6 +326,7 @@ macro_rules! log_info {
         $crate::log::log($crate::log::Level::Info, format_args!($($arg)*))
     };
 }
+#[cfg(feature = "server")]
 macro_rules! log_debug {
     ($($arg:tt)*) => {
         $crate::log::log($crate::log::Level::Debug, format_args!($($arg)*))
@@ -340,7 +341,9 @@ macro_rules! log_event {
         }
     };
 }
-pub(crate) use {log_debug, log_error, log_event, log_info, log_warn};
+#[cfg(feature = "server")]
+pub(crate) use log_debug;
+pub(crate) use {log_error, log_event, log_info, log_warn};
 
 #[cfg(test)]
 mod tests {
