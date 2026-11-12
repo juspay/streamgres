@@ -37,11 +37,6 @@ pub struct Config {
     /// The replication slot of the change feed, not configurable: each
     /// process names its own using the existing compatible naming scheme.
     pub slot: String,
-    /// `STREAMGRES_SLOT_CLEANUP_AGE_MS`: how long a Streamgres feed slot
-    /// must have stayed inactive before startup drops it (zero disables
-    /// cleanup). PostgreSQL 17 or later is required when this is enabled,
-    /// because that is where `inactive_since` is available.
-    pub slot_cleanup_age: Duration,
     /// `STREAMGRES_PUBLICATION`: the publication the change feed streams;
     /// startup creates it when absent and validates it when present.
     pub publication: String,
@@ -319,7 +314,6 @@ impl Config {
             read_dsn,
             schemas,
             slot: threads::slot_name(),
-            slot_cleanup_age: millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
             publication: first(&["STREAMGRES_PUBLICATION"])
                 .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
             ddl_trigger,
@@ -483,7 +477,6 @@ impl Config {
             dsn: self.dsn.clone(),
             read_dsn: self.read_dsn.clone(),
             slot: self.slot.clone(),
-            slot_cleanup_age: self.slot_cleanup_age,
             publication: self.publication.clone(),
             schemas: self.schemas.clone(),
             snapshot_rotation: self.snapshot_rotation,
@@ -615,17 +608,6 @@ mod tests {
         );
         let error = config(&[("STREAMGRES_METRICS_PREFIX", "bad-prefix")]).unwrap_err();
         assert!(error.contains("STREAMGRES_METRICS_PREFIX"), "{error}");
-    }
-
-    #[test]
-    fn inactive_slot_cleanup_is_off_unless_an_age_is_set() {
-        assert_eq!(config(&[]).unwrap().slot_cleanup_age, Duration::ZERO);
-        let config = config_with(&[("STREAMGRES_SLOT_CLEANUP_AGE_MS", "3600000")]);
-        assert_eq!(config.slot_cleanup_age, Duration::from_secs(3600));
-        assert_eq!(
-            config.engine_settings().slot_cleanup_age,
-            Duration::from_secs(3600)
-        );
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub mod estimate;
 pub mod estimate_cache;
 pub mod pgoutput;
 pub mod replication;
+pub mod slots;
 pub mod sql;
 pub mod stream;
 pub mod text;

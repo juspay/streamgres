@@ -60,7 +60,6 @@ use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tokio_postgres::Client;
 use tokio_postgres::config::Host;
-use tokio_postgres::error::SqlState;
 use tokio_postgres::types::PgLsn;
 
 use super::ddl::{self, DdlSource};
@@ -469,56 +468,6 @@ impl Transport {
     pub async fn prepare(dsn: &str, slot: &str, publication: &str) -> Result<(), StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
         prepare_slot(&config, slot, publication).await.map(drop)
-    }
-
-    /// Drop only our own permanent slots that PostgreSQL has reported
-    /// inactive for at least `age`. A zero age disables cleanup. PostgreSQL
-    /// added `inactive_since` in version 17; refusing to guess on older
-    /// versions is safer than deleting a slot during a live reconnect.
-    pub async fn cleanup_inactive_slots(dsn: &str, age: Duration) -> Result<(), StorageError> {
-        if age.is_zero() {
-            return Ok(());
-        }
-        let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
-        let version: i32 = client
-            .query_one("SELECT current_setting('server_version_num')::int", &[])
-            .await?
-            .get(0);
-        if version < 170_000 {
-            return Err(StorageError(format!(
-                "STREAMGRES_SLOT_CLEANUP_AGE_MS requires PostgreSQL 17 or later (server is {version}); PostgreSQL 16 has no inactive_since timestamp, so safe age-bounded cleanup is impossible"
-            )));
-        }
-        let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
-        let prefix = "xyne_sync_slot_";
-        let slots = client
-            .query(
-                "SELECT slot_name FROM pg_replication_slots \
-                 WHERE left(slot_name, length($1)) = $1 \
-                   AND NOT temporary AND NOT active \
-                 AND inactive_since <= clock_timestamp() - $2::bigint * interval '1 millisecond'",
-                &[&prefix, &age_ms],
-            )
-            .await?;
-        for row in slots {
-            let slot: String = row.get(0);
-            match client
-                .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
-                .await
-            {
-                Ok(_) => log_info!("dropped inactive replication slot {slot} after {age:?}"),
-                // A feed may have claimed the slot after the candidate query.
-                // PostgreSQL refuses to drop an active slot; leave it alone.
-                Err(error) if error.code() == Some(&SqlState::OBJECT_IN_USE) => {
-                    log_info!(
-                        "inactive replication slot {slot} became active during cleanup; keeping it"
-                    )
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
     }
 
     /// Whether `slot` exists at `dsn`.

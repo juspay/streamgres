@@ -1992,3 +1992,67 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
             .await;
     });
 }
+
+/// A slot is dropped by a sweep only once its owner is gone: a slot whose
+/// owner holds its lock is kept though inactive, and dropped after the
+/// owner lets go; the sweeping process's own slot is never touched.
+#[test]
+fn a_sweep_drops_only_slots_whose_owner_is_gone() {
+    use streamgres::sync::pg::slots::{SlotOwner, sweep};
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let client = admin(&dsn).await;
+        let prefix = "xyne_sync_live_sweep_";
+        let owned = format!("{prefix}owned");
+        let orphan = format!("{prefix}orphan");
+        let mine = format!("{prefix}mine");
+        for slot in [&owned, &orphan, &mine] {
+            let _ = client
+                .execute("SELECT pg_drop_replication_slot($1)", &[slot])
+                .await;
+            client
+                .execute(
+                    "SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+                    &[slot],
+                )
+                .await
+                .expect("create slot");
+        }
+        let config: tokio_postgres::Config = dsn.parse().unwrap();
+        let owner = SlotOwner::claim(&config, &owned).await.expect("claim");
+        let exists = |slot: String| {
+            let client = &client;
+            async move {
+                client
+                    .query_opt(
+                        "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
+                        &[&slot],
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+            }
+        };
+
+        let dropped = sweep(&config, prefix, &mine).await.expect("sweep");
+        assert_eq!(dropped, vec![orphan.clone()]);
+        assert!(exists(owned.clone()).await, "its owner holds it");
+        assert!(exists(mine.clone()).await, "the sweeper's own slot");
+
+        drop(owner);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let dropped = sweep(&config, prefix, &mine).await.expect("sweep");
+            if dropped == vec![owned.clone()] {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the released slot was never swept");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!exists(owned).await);
+        client
+            .execute("SELECT pg_drop_replication_slot($1)", &[&mine])
+            .await
+            .expect("drop own slot");
+    });
+}

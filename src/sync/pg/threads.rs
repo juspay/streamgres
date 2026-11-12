@@ -13,9 +13,9 @@
 //! hold. Each process streams from a slot of its own, named
 //! [`SLOT_PREFIX`] and a fresh UUID: a restart needs nothing of the
 //! slot before it (the slot is moved up to the first snapshot anyway).
-//! At startup it can drop this server's inactive slots once they have
-//! exceeded an explicitly configured age; the PostgreSQL 17
-//! `inactive_since` timestamp makes that cleanup safe across restarts.
+//! The process owns its slot through an advisory lock, and at startup and
+//! every minute drops the inactive slots whose owner is gone
+//! ([`super::slots`]).
 //! Schema changes reach the feed as the messages of the schema-change
 //! event trigger ([`super::ddl`]); the server refuses to serve
 //! without that trigger ([`require_ddl_trigger`]).
@@ -35,6 +35,7 @@ use tokio::sync::watch;
 use tokio::task::spawn_local;
 
 use super::ddl::{self, DdlSource};
+use super::slots::{self, SlotOwner};
 use super::{Feed, Keepalive, PgStorage, Transport, load_catalog};
 use crate::ivm::MultiTableIVM;
 use crate::log::{log_error, log_info, log_warn};
@@ -48,8 +49,6 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 /// - `dsn`: the database, with the user and password in the URL.
 /// - `slot`: the replication slot of the change feed, this process's own
 ///   ([`slot_name`]).
-/// - `slot_cleanup_age`: how long an inactive slot of an ended process is
-///   retained before startup removes it (zero disables cleanup).
 /// - `publication`: the publication the feed streams.
 /// - `schemas`: the schemas whose tables the catalog carries.
 /// - `snapshot_rotation`: how often a fresh exported snapshot is minted
@@ -75,7 +74,6 @@ pub struct Settings {
     /// Snapshot minting and replication always use `dsn` above.
     pub read_dsn: String,
     pub slot: String,
-    pub slot_cleanup_age: Duration,
     pub publication: String,
     pub schemas: Vec<String>,
     pub snapshot_rotation: Duration,
@@ -312,6 +310,34 @@ pub fn spawn_feed(
     ))
 }
 
+/// Keep this process's slot owned and sweep the slots whose owner is gone,
+/// every [`slots::SWEEP_EVERY`], until the feed stops; the ownership ends
+/// with it.
+async fn keep_and_sweep(
+    mut owner: SlotOwner,
+    config: tokio_postgres::Config,
+    mut stopped: watch::Receiver<bool>,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(slots::SWEEP_EVERY) => {}
+            changed = stopped.changed() => {
+                if changed.is_err() || *stopped.borrow() {
+                    return;
+                }
+                continue;
+            }
+        }
+        if let Err(error) = owner.keep().await {
+            log_warn!("keeping slot {} owned: {error}", owner.slot());
+            continue;
+        }
+        if let Err(error) = slots::sweep(&config, SLOT_PREFIX, owner.slot()).await {
+            log_warn!("sweeping replication slots whose owner is gone: {error}");
+        }
+    }
+}
+
 /// Stop the feed thread and wait until its replication connection is closed.
 pub async fn stop_feed(mut feed: FeedHandle) -> Result<(), String> {
     feed.stop.send_replace(true);
@@ -351,9 +377,16 @@ pub async fn start(
     stats: Arc<Stats>,
     shutdown: Shutdown,
 ) -> Result<(Started, ServiceTask), String> {
-    Transport::cleanup_inactive_slots(&settings.dsn, settings.slot_cleanup_age)
+    let direct: tokio_postgres::Config = settings
+        .dsn
+        .parse()
+        .map_err(|error| format!("reading the database address: {error}"))?;
+    let owner = SlotOwner::claim(&direct, &settings.slot)
         .await
-        .map_err(|error| format!("cleaning up inactive replication slots: {error}"))?;
+        .map_err(|error| format!("taking ownership of slot {}: {error}", settings.slot))?;
+    if let Err(error) = slots::sweep(&direct, SLOT_PREFIX, &settings.slot).await {
+        log_warn!("sweeping replication slots whose owner is gone: {error}");
+    }
     Transport::prepare(&settings.dsn, &settings.slot, &settings.publication)
         .await
         .map_err(|error| format!("preparing the change feed: {error}"))?;
@@ -382,6 +415,7 @@ pub async fn start(
         pg.first_position(),
         shutdown,
     )?;
+    spawn_local(keep_and_sweep(owner, direct, feed_handle.stop.subscribe()));
     let cached = Sources::cached_from_env();
     let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
     if !cached.is_empty() {

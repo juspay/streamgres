@@ -122,12 +122,13 @@ DDL in that transaction's WAL.
 - **Each server process creates its own slot** at startup, on the database
   `STREAMGRES_PG_DSN` names. On `SIGTERM` it drops the slot. A restart needs
   nothing from the previous slot.
-- **A slot left behind by a crash holds WAL.** Either:
-  - set `STREAMGRES_SLOT_CLEANUP_AGE_MS` so the next startup drops inactive
-    `xyne_sync_slot_*` slots older than that age (needs PostgreSQL 17+, which
-    records `inactive_since`), or
-  - drop them by hand: `SELECT pg_drop_replication_slot('<slot name>');`
-  - Either way, set `max_slot_wal_keep_size` as a safety net.
+- **A slot left behind by a crash is dropped by the next engine.** Each
+  process owns its slot through an advisory lock held for as long as it
+  runs. Every engine on the database, at startup and every minute, drops
+  the inactive `xyne_sync_slot_*` slots whose lock it can take, so a slot
+  is dropped only once its owner is gone. With no engine left running on
+  the database nothing sweeps, so set `max_slot_wal_keep_size` as a safety
+  net.
 - **A process whose slot disappears while it runs stops.** It does not
   silently recreate the slot, which would skip the changes in between. The
   restarted process begins on a fresh slot and snapshot.
@@ -253,7 +254,6 @@ depend on what the defaults happen to be:
 | `STREAMGRES_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams |
 | `STREAMGRES_FORWARD_COOKIES` | `true` | forward the connection's cookies to the application server |
 | `STREAMGRES_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is created |
-| `STREAMGRES_SLOT_CLEANUP_AGE_MS` | `0` (off) | at startup, drop inactive slots of ended processes older than this (PostgreSQL 17+) |
 | `STREAMGRES_READ_TIMEOUT_MS` | `10000` | longest a database read may take before it is cancelled and its query refused. `0` means no limit |
 | `STREAMGRES_BACKEND_TIMEOUT_MS` | `30000` | longest a call to the application server may take. `0` means no limit |
 | `STREAMGRES_PG_KEEPALIVE_IDLE_MS`, `_INTERVAL_MS`, `_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on database connections. `0` idle time turns it off |
