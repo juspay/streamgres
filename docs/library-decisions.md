@@ -390,31 +390,204 @@ A review of every change on the branch led to these fixes:
   its entry idled out.
 - **`OFFSET NULL`** means no offset, as in Postgres.
 
+## 16. Float and numeric equate as Postgres does
+
+**Decision.**
+- A float equals a numeric when the numeric cast to `float8` equals it,
+  so `loose_eq` agrees with `compare`.
+- Equality keys are unchanged. The routing index relies on a condition's
+  value having its column's type, which both parsers ensure.
+
+**Rejected.**
+- *A float-shaped equality key for numerics.* It put string formatting
+  and parsing on the routing hot path for every non-integral numeric.
+
+## 17. A query's rows are ordered once per change, outside the lock
+
+**Decision.**
+- An entry keeps its rows behind shared pointers, and the joined, ordered
+  result until its rows next change.
+- A read takes that result under the lock (a pointer copy) and slices it
+  outside.
+- When there is none, the read composes and sorts a snapshot outside the
+  lock, and keeps the result unless the rows moved meanwhile, which a
+  generation counter tells.
+- A delta's row is allocated once and shared by every entry it reaches.
+
+## 18. JSON is kept exactly
+
+**Decision.** `Value::Json` holds two forms:
+- the standard form, which the engine compares, orders and hashes by;
+- the text Postgres gave, when it is spelled otherwise: a `json` column's
+  input as written, a `jsonb` number's trailing zeros.
+
+Writing the value back gives Postgres's bytes, so the cache answers JSON
+columns. A document known only in its standard form (a literal, or a
+default filled into rows the engine already holds) is never handed back
+as Postgres's text; a read that would return one is refused. Zero clients
+still get the standard form.
+
+A live scenario checks that an update changing only how a value is
+spelled (a numeric's scale, a json document's text) reaches the cache.
+
+**Supersedes** the JSON refusal of decision 15.
+
+## 19. Each reader is checked for the tables it would see otherwise
+
+**Decision.** Every cache read carries a `Reader`, so there is no
+unchecked read path.
+- **The check.** One query on the reader's connection
+  (`Cache::reader_check`) finds its database and the cached tables it
+  would read differently from the engine:
+  - a bare name that resolves to another table under its `search_path`;
+  - a table its role may not `SELECT`.
+
+  The cache refuses those tables.
+- **Catalog version.** A reader checked against an older catalog is
+  checked again, after a schema change or an engine restart. The catalog
+  version holds the catalog itself and compares by identity, so a new
+  catalog can never pass for an old one that shared its address.
+- **Settings.** Session settings don't affect an accepted answer: values
+  travel in binary, and every comparison is typed by its column.
+- **The adapter.** A connection is answered from the cache only when it
+  is tracked: a `Tracker` as its Diesel instrumentation (`install` makes
+  it every connection's).
+  - The tracker sees each statement and marks the session changed on
+    `SET`, `RESET`, `DISCARD`, `set_config`, DDL and grants.
+  - It follows transactions opened in raw SQL.
+  - The adapter checks a connection once, again after a change, and at
+    least every ten seconds.
+  - The adapter finds a connection's tracker by sending its
+    instrumentation a probe. That works on Diesel 2.2, Diesel 2.3 and
+    Juspay's fork, whose instrumentation can't be downcast.
+- **Cost.** The tracker reads only a statement's SQL, never its binds.
+  Rendering a DSL statement's SQL is a cost on tracked connections that
+  the trait object gives no way to avoid. It's small against the round
+  trip that statement makes anyway.
+
+**Rejected.**
+- *A connection wrapper type* (the s2s branch's approach). It sees every
+  statement, but replaces the application's connection type.
+- *A context query on every read.* It adds a round trip to every read.
+
+## 20. Positions are opaque in the core
+
+**Decision.**
+- The core orders history by `Position(u128)`, which each backend
+  defines: wide enough for a hybrid-logical timestamp as well as a WAL
+  location.
+- `Lsn` lives in the Postgres backend, which parses and prints `X/Y` and
+  converts at the boundary.
+- The adapter's `wait_for_writes(&cache, &mut conn, timeout)` reads where
+  the connection's WAL is (its replayed position on a standby) and waits
+  for the cache to reach it, so application code never handles positions.
+
+**Supersedes** the open item of decision 3.
+
+## 21. Joins
+
+**Decision.**
+- **Parsing.** `parse_select` reads the `FROM` as a tree, as Diesel
+  writes it, nested parentheses included:
+  - each `INNER` or `LEFT JOIN`'s `ON` equality is an edge of the
+    engine's tree;
+  - the `ON`'s other conditions belong to the joined table;
+  - each `WHERE` conjunct goes to the one table it names; one naming no
+    table belongs to the root.
+- **Engine query.** `INNER` edges are main-driven (`Join::inner_from_main`)
+  and `LEFT` edges are `Join::left`. The root follows `limit + offset`
+  rows, which is enough because every root row yields at least one joined
+  row.
+- **Refused:**
+  - `RIGHT`, `FULL` and `CROSS` joins, and a table joined twice;
+  - an `ON` or `WHERE` condition naming several tables;
+  - a `WHERE` condition on a table under a `LEFT` join;
+  - an `INNER` join onto a table under a `LEFT` join written after it;
+  - join columns of different types, or of a type the engine compares
+    otherwise;
+  - a `LIMIT` with an `ORDER BY` on a joined table.
+- **Composition.** The cache keeps a query's rows per part of its tree
+  and joins them as SQL does, once per change:
+  - an `INNER` edge that finds no row removes its parent's row;
+  - a `LEFT` edge with no match leaves nulls, so an `INNER` join under a
+    `LEFT` one nulls out rather than drops;
+  - the joined rows are sorted by the statement's order, ties broken by
+    each table's key.
+- **Settle reports.** A join needs reads after a write, for the rows a new
+  join value brings, and until they land the query's rows are incomplete.
+  - With settle reports, which the cache asks for and the Zero server
+    doesn't, the service names the subscriptions a step issued reads for
+    as `Unsettled` (through the engine's own `waiting_on`).
+  - That event comes before the step's own event, and `Hydrated` comes
+    again once the reads land.
+  - The cache doesn't answer a query in between, so it never serves a
+    partly joined result.
+- **Literals.** A numeric literal is read exactly, digits and scale as
+  written.
+
+Live tests: Diesel's own `inner_join`, `left_join`, a filter on the joined
+table, and `COUNT(*)` over a join, each compared with `.load` before and
+after writes to both tables.
+
+## 22. Small gaps closed
+
+- **Arrays added by a schema change** know their element type from the
+  array type, when it is a built-in one.
+- **A domain-typed column**, which a schema-change message names by the
+  domain, no longer reads as a type change that stops the server.
+- **Planner statistics** are looked up by schema and table.
+- **Zero clients** see:
+  - `interval`, `timetz`, `inet`, `cidr`, `macaddr` and `tsvector` as
+    Postgres writes them;
+  - `money` as `money::numeric` gives it, with the currency's fraction
+    digits read from the database.
+
+  The live suite compares these with Postgres's own text.
+- **The live suite is deterministic:**
+  - The schema-change scenario keeps its tables in a schema of its own,
+    so other scenarios' tables are never taken into its catalog.
+  - The idle-feed scenario asserts the snapshot is the floor it was told
+    of or a later one, instead of equality, which failed when a rotation
+    landed in between.
+  - A trigger stack a failed run left behind is removed at the next
+    run's start.
+  - The cache scenarios run one at a time (see below).
+
+## 23. Performance of the read path
+
+**Decision.**
+- **Rendered SQL.** The adapter renders the SQL of a query type Diesel
+  caches prepared statements for once, and collects only binds on each
+  call.
+- **Parsed statements.** The cache keeps each statement it parsed, by
+  text, binds and catalog. The lookup is a hash compared in place, so a
+  read copies nothing to find one. A full memo lets an eighth go.
+- **Eviction.** A full cache lets the oldest hundredth of its queries go
+  at once, rather than scanning every entry for each new one.
+
+**Measured.** On a laptop against local Postgres 17, in two ignored live
+tests (`read_latency`, `load_latency`):
+
+| Path | p50 | p99 | Postgres p50 |
+|---|---|---|---|
+| Cache read, single table | 2.75 µs | 4.7 µs | 840 µs (prepared query) |
+| Cache read, joined | 1.8 µs | 2.3 µs | 845 µs (prepared query) |
+| `load_cached` through Diesel | 7 µs | 13 µs | 814 µs (`load`) |
+
+## Operational notes
+
+- **Run migrations one at a time.** Each schema-change trigger stack's
+  start trigger takes a database-wide advisory lock (zero-cache's design,
+  ported unchanged). Concurrent multi-statement DDL transactions can
+  deadlock on it, and Postgres then aborts one of them.
+- **PostgreSQL 14 or later** is required (decision 15).
+
 ## Known gaps
 
-- **Who is reading.** The cache answers every reader from rows read as
-  the engine's role, with bare table names resolved to the engine's
-  schemas. A connection whose `search_path`, role privileges or session
-  settings would make Postgres answer differently must not use
-  `load_cached`. Checking this per connection, cheaply, is the next
-  correctness step (the s2s branch's context rules are the model).
-- **Read cost.** Every cached read sorts the query's whole row set while
-  holding the cache's lock. Keeping each entry's rows in order would make
-  a `LIMIT` read cost its limit, not the whole set.
+None of the gaps listed earlier remains open. What is left:
 
-- **Joins.** The parser refuses them. The s2s branch's join tree is the
-  model to follow, and the join planner still lives in the server.
-- **Positions.** The engine's position type is still `Lsn`. A
-  backend-defined position is a separate change (decision 3).
-- **Domains and schema changes.** A domain-typed column can stop the
-  server when a schema change touches its table. Main has the same gap.
-- **Arrays added by a schema change.** An array column added this way has
-  no element type known (`element_oid` 0), so the cache refuses to answer
-  for it until the next restart.
-- **Zero output.** `money` and `tsvector` are shown to Zero clients as
-  `null`.
-- **A flaky live test.** `an_idle_feed_brings_the_first_snapshot_into_use`
-  fails about one run in six. It does so on main too.
-- **Test leftovers.** `schema_changes_follow_the_trigger` leaves its
-  trigger stack installed when it fails, which breaks later runs on the
-  same database. Main has the same problem.
+- **A cost of tracking.** Rendering each DSL statement's SQL on tracked
+  connections (decision 19).
+- **What is still refused**, deliberately, until the engine can answer it
+  exactly: the join shapes listed in decision 21, and the comparison
+  rules of decision 8.
