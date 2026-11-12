@@ -432,18 +432,28 @@ fn negation_is_satisfiable(value: &Value) -> bool {
     }
 }
 
-/// The comparison class a value takes part in range comparisons under;
-/// `None` for values no range condition can match (`NULL`, `NaN`, lists,
-/// maps).
+/// The comparison class a value takes part in range comparisons under:
+/// values of one class all compare with each other ([`Value::compare`]).
+/// `None` for values no range condition can match (`NULL`, a float `NaN`,
+/// lists, maps, raw values).
 fn class_of(value: &Value) -> Option<u8> {
     match value {
-        Value::Int(_) => Some(1),
+        Value::Int(_) | Value::Numeric(_) => Some(1),
         Value::Float(f) if !f.is_nan() => Some(1),
         Value::String(_) => Some(2),
         Value::Bool(_) => Some(3),
         Value::Date(_) => Some(4),
         Value::Datetime(_) => Some(5),
-        _ => None,
+        Value::Timestamp(_) => Some(6),
+        Value::Day(_) => Some(7),
+        Value::Time(_) => Some(8),
+        Value::Bytes(_) => Some(9),
+        Value::Null
+        | Value::Float(_)
+        | Value::List(_)
+        | Value::Map(_)
+        | Value::Set(_)
+        | Value::Raw(_) => None,
     }
 }
 
@@ -466,6 +476,40 @@ mod tests {
         let mut out = Vec::new();
         index.candidates(&Value::from(value), &mut out);
         out
+    }
+
+    /// A range condition on each exact type reaches the values past its
+    /// threshold and no others.
+    #[test]
+    fn range_conditions_on_exact_types_are_found() {
+        use crate::model::{Day, Numeric, Timestamp};
+        let numeric = |text: &str| Value::Numeric(Numeric::parse(text).unwrap());
+        for (threshold, inside, outside) in [
+            (numeric("5"), numeric("99.99"), numeric("4.9999")),
+            (numeric("5"), Value::Int(6), Value::Int(5)),
+            (Value::Int(5), numeric("5.01"), numeric("5.00")),
+            (
+                Value::Timestamp(Timestamp(10)),
+                Value::Timestamp(Timestamp::INFINITY),
+                Value::Timestamp(Timestamp(10)),
+            ),
+            (Value::Day(Day(3)), Value::Day(Day(4)), Value::Day(Day(-1))),
+        ] {
+            let mut index = ColumnIndex::default();
+            let above = CondRef(Rc::new(Condition {
+                column: "c".into(),
+                comparison_operator: ComparisonOperator::GT,
+                value: threshold.clone(),
+            }));
+            index.file(&above);
+            let reached = |value: &Value| {
+                let mut out = Vec::new();
+                index.candidates(value, &mut out);
+                out.contains(&above)
+            };
+            assert!(reached(&inside), "{inside:?} > {threshold:?}");
+            assert!(!reached(&outside), "{outside:?} is not > {threshold:?}");
+        }
     }
 
     #[test]

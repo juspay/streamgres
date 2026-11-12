@@ -101,10 +101,12 @@ impl Value {
 
     /// Ordering comparison backing the `GT` / `GTE` / `LT` / `LTE` operators.
     ///
-    /// Values compare only within the same variant, except `Int` / `Float`
-    /// which coerce to `f64` (lossy above 2⁵³ — mixed-type comparisons of
-    /// such magnitudes may tie spuriously; same-variant comparisons are
-    /// always exact). Everything else — including anything involving
+    /// Values compare only within the same variant, except the numbers:
+    /// `Int` / `Float` coerce to `f64` (lossy above 2⁵³ — mixed-type
+    /// comparisons of such magnitudes may tie spuriously; same-variant
+    /// comparisons are always exact), `Int` / `Numeric` compare exactly,
+    /// and `Float` / `Numeric` compare as `f64`, as Postgres compares
+    /// `float8` with `numeric`. Everything else — including anything involving
     /// `Null` — returns `None`, which predicate evaluation treats as
     /// "does not match" (SQL three-valued logic collapsed to `false`).
     pub fn compare(&self, other: &Value) -> Option<Ordering> {
@@ -121,6 +123,8 @@ impl Value {
             (Numeric(a), Numeric(b)) => Some(a.cmp(b)),
             (Int(a), Numeric(b)) => Some(self::Numeric::from_i64(*a).cmp(b)),
             (Numeric(a), Int(b)) => Some(a.cmp(&self::Numeric::from_i64(*b))),
+            (Float(a), Numeric(b)) => a.partial_cmp(&b.to_f64()),
+            (Numeric(a), Float(b)) => a.to_f64().partial_cmp(b),
             (Timestamp(a), Timestamp(b)) => Some(a.cmp(b)),
             (Day(a), Day(b)) => Some(a.cmp(b)),
             (Time(a), Time(b)) => Some(a.cmp(b)),
