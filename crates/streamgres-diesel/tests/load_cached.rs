@@ -33,6 +33,24 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    adapter_customers (id) {
+        id -> Int8,
+        name -> Text,
+    }
+}
+
+diesel::table! {
+    adapter_purchases (id) {
+        id -> Int8,
+        customer_id -> Nullable<Int8>,
+        total -> Int8,
+    }
+}
+
+diesel::joinable!(adapter_purchases -> adapter_customers (customer_id));
+diesel::allow_tables_to_appear_in_same_query!(adapter_purchases, adapter_customers);
+
 #[derive(Debug, Clone, PartialEq, Queryable, Selectable)]
 #[diesel(table_name = adapter_orders)]
 struct Order {
@@ -83,7 +101,13 @@ fn load_cached_returns_what_load_returns() {
            amount numeric(14, 4) NOT NULL, created_at timestamptz NOT NULL,
            local_at timestamp NOT NULL, due date NOT NULL, payload bytea NOT NULL,
            meta jsonb NOT NULL, tags int4[] NOT NULL, note text);
-         CREATE PUBLICATION {PUBLICATION} FOR TABLE adapter_orders;"
+         DROP TABLE IF EXISTS adapter_purchases;
+         DROP TABLE IF EXISTS adapter_customers;
+         CREATE TABLE adapter_customers (id int8 PRIMARY KEY, name text COLLATE \"C\" NOT NULL);
+         CREATE TABLE adapter_purchases (id int8 PRIMARY KEY, customer_id int8, total int8 NOT NULL);
+         INSERT INTO adapter_customers VALUES (1, 'meera'), (2, 'arjun'), (3, 'nobody');
+         INSERT INTO adapter_purchases VALUES (10, 1, 100), (11, 1, 250), (12, 2, 75), (13, NULL, 5);
+         CREATE PUBLICATION {PUBLICATION} FOR TABLE adapter_orders, adapter_customers, adapter_purchases;"
     ))
     .expect("prepare");
     conn.batch_execute(&config.setup_sql())
@@ -248,7 +272,8 @@ fn load_cached_returns_what_load_returns() {
         .execute(&mut conn)
         .expect("delete");
     assert!(
-        streamgres_diesel::wait_for_writes(&cache, &mut conn, Duration::from_secs(10)).expect("read the WAL"),
+        streamgres_diesel::wait_for_writes(&cache, &mut conn, Duration::from_secs(10))
+            .expect("read the WAL"),
         "the engine reaches the writes"
     );
     let after = check(&cache, &mut conn);
@@ -281,6 +306,62 @@ fn load_cached_returns_what_load_returns() {
             .order(adapter_orders::id),
         serde_json::Value
     );
+
+    let joins = |cache: &Cache, conn: &mut PgConnection| {
+        use adapter_customers::dsl as c;
+        use adapter_purchases::dsl as p;
+        same!(
+            cache,
+            conn,
+            p::adapter_purchases
+                .inner_join(c::adapter_customers)
+                .select((p::id, c::name, p::total))
+                .order(p::id),
+            (i64, String, i64)
+        );
+        same!(
+            cache,
+            conn,
+            p::adapter_purchases
+                .left_join(c::adapter_customers)
+                .select((p::id, c::name.nullable()))
+                .order(p::id),
+            (i64, Option<String>)
+        );
+        same!(
+            cache,
+            conn,
+            p::adapter_purchases
+                .inner_join(c::adapter_customers)
+                .filter(c::name.eq("meera"))
+                .filter(p::total.gt(50))
+                .select(p::id)
+                .order(p::id.desc())
+                .limit(1),
+            i64
+        );
+        same!(
+            cache,
+            conn,
+            p::adapter_purchases
+                .inner_join(c::adapter_customers)
+                .select(count_star()),
+            i64
+        );
+    };
+    joins(&cache, &mut conn);
+    conn.batch_execute(
+        "INSERT INTO adapter_purchases VALUES (14, 3, 999);
+         UPDATE adapter_customers SET name = 'meera k' WHERE id = 1;
+         DELETE FROM adapter_purchases WHERE id = 12;",
+    )
+    .expect("write the joined tables");
+    assert!(
+        streamgres_diesel::wait_for_writes(&cache, &mut conn, Duration::from_secs(10))
+            .expect("read the WAL"),
+        "the engine reaches the writes"
+    );
+    joins(&cache, &mut conn);
 
     conn.batch_execute(
         "CREATE SCHEMA adapter_shadow; CREATE TABLE adapter_shadow.adapter_orders (id int8 PRIMARY KEY);
@@ -315,7 +396,7 @@ fn load_cached_returns_what_load_returns() {
 
     cache.stop();
     conn.batch_execute(&format!(
-        "{teardown} DROP PUBLICATION IF EXISTS {PUBLICATION}; DROP TABLE IF EXISTS adapter_orders;"
+        "{teardown} DROP PUBLICATION IF EXISTS {PUBLICATION}; DROP TABLE IF EXISTS adapter_orders; DROP TABLE IF EXISTS adapter_purchases; DROP TABLE IF EXISTS adapter_customers;"
     ))
     .expect("clean up");
 }

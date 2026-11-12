@@ -85,6 +85,9 @@ pub struct Settings {
     pub watched: Vec<TableName>,
     pub ddl_trigger: String,
     pub ddl_prefix: String,
+    /// Tell the consumer when a subscription's rows become incomplete and
+    /// complete again ([`Service::with_settle_reports`]).
+    pub settle_reports: bool,
 }
 
 /// What every slot a server names for itself starts with.
@@ -441,6 +444,11 @@ pub async fn start(
     let first = sinks[0].clone();
     let engine = MultiTableIVM::new().with_row_limit(super::read_row_limit());
     let (service, commands) = Service::new(engine, storage, first);
+    let service = if settings.settle_reports {
+        service.with_settle_reports()
+    } else {
+        service
+    };
     let service = spawn_local(
         service
             .with_feed(feed)

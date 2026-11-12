@@ -26,6 +26,7 @@ mod reader;
 mod rows;
 mod state;
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -35,7 +36,6 @@ pub use reader::{CatalogVersion, Reader, ReaderCheck};
 pub use rows::{CachedColumn, CachedRows};
 
 pub use crate::model::Position;
-use crate::model::MultiTableReadQuery;
 pub use crate::parser::Bind;
 use crate::parser::parse_select;
 use crate::sync::Command;
@@ -137,13 +137,17 @@ impl Cache {
         }
         let select = parse_select(sql, binds, &catalog)
             .map_err(|error| Refusal::Unsupported(error.to_string()))?;
-        let table = catalog.table(select.query.table.as_str()).ok_or_else(|| {
-            Refusal::Unsupported(format!("unknown table `{}`", select.query.table))
-        })?;
-        if let Some(reason) = reader.refuses(&self.shared.database, &select.query.table) {
-            return Err(Refusal::Unsupported(reason));
+        let mut tables = Vec::with_capacity(select.nodes.len());
+        for node in &select.nodes {
+            let table = catalog
+                .table(node.table.as_str())
+                .ok_or_else(|| Refusal::Unsupported(format!("unknown table `{}`", node.table)))?;
+            if let Some(reason) = reader.refuses(&self.shared.database, &node.table) {
+                return Err(Refusal::Unsupported(reason));
+            }
+            tables.push(table);
         }
-        let query = MultiTableReadQuery::single(select.query.clone());
+        let query = select.query.clone();
 
         let mut state = self.shared.lock();
         if let Some(reason) = state.refused(&query, config.refusal_ttl) {
@@ -179,18 +183,33 @@ impl Cache {
             match &entry.fill {
                 Fill::Ready => {
                     entry.last_read = Instant::now();
-                    let count = entry.rows.len();
                     if let Some(ordered) = entry.ordered.clone() {
                         drop(state);
-                        return rows::answer(&ordered, count, &select, table);
+                        return rows::answer(&ordered, ordered.len(), &select, &tables);
                     }
-                    if select.projection == crate::parser::Projection::CountStar {
-                        return rows::answer(&[], count, &select, table);
+                    if select.projection == crate::parser::Projection::CountStar
+                        && select.nodes.len() == 1
+                    {
+                        let count = entry
+                            .parts
+                            .get(&crate::ivm::QueryPart::main())
+                            .map_or(0, HashMap::len);
+                        return rows::answer(&[], count, &select, &tables);
                     }
                     let generation = entry.generation;
-                    let snapshot: Vec<_> = entry.rows.values().cloned().collect();
+                    let kept: rows::Kept = select
+                        .nodes
+                        .iter()
+                        .map(|node| {
+                            entry
+                                .parts
+                                .get(&node.part)
+                                .map(|rows| rows.values().cloned().collect())
+                                .unwrap_or_default()
+                        })
+                        .collect();
                     drop(state);
-                    let ordered = rows::ordered(snapshot, &select.query.order_by, table);
+                    let ordered = rows::compose(kept, &select, &tables);
                     let mut state = self.shared.lock();
                     if let Some(entry) = state.entries.get_mut(&id)
                         && entry.generation == generation
@@ -198,7 +217,7 @@ impl Cache {
                         entry.ordered = Some(ordered.clone());
                     }
                     drop(state);
-                    return rows::answer(&ordered, count, &select, table);
+                    return rows::answer(&ordered, ordered.len(), &select, &tables);
                 }
                 Fill::Refused(reason) => return Err(Refusal::Unsupported(reason.clone())),
                 Fill::Pending => {}

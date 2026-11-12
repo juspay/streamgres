@@ -92,6 +92,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
         .map(|event| match event {
             Event::Registered { .. } => "registered",
             Event::Hydrated(_) => "hydrated",
+            Event::Unsettled(_) => "unsettled",
             Event::Landed { .. } => "landed",
             Event::Refused { .. } => "refused",
             Event::Committed { .. } => "committed",
@@ -107,7 +108,11 @@ fn updates_of(event: &Event) -> &[streamgres::ivm::Delta] {
         Event::Registered { updates, .. }
         | Event::Landed { updates }
         | Event::Committed { updates, .. } => updates,
-        Event::Hydrated(_) | Event::Refused { .. } | Event::Capped { .. } | Event::Heavy { .. } => {
+        Event::Hydrated(_)
+        | Event::Unsettled(_)
+        | Event::Refused { .. }
+        | Event::Capped { .. }
+        | Event::Heavy { .. } => {
             &[]
         }
     }

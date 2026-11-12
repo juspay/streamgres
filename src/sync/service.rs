@@ -165,7 +165,13 @@ impl Transaction {
 ///   floor. With several consumers, one already serving hears only the
 ///   commits with deltas for it or watched writes.
 /// - `Hydrated`: subscriptions whose first rows have all arrived (every
-///   part of their tree is live), each named once.
+///   part of their tree is live), each named once; with settle reports
+///   ([`Service::with_settle_reports`]), named again each time they settle
+///   after being `Unsettled`.
+/// - `Unsettled`: with settle reports only, subscriptions a step issued
+///   storage reads for, so their rows are incomplete until they are
+///   `Hydrated` again. It comes before the step's own event, so a consumer
+///   never takes the step's rows as complete.
 /// - `Capped`: a page of the subscription stopped reaching past the rows
 ///   its join gate rejects, so it holds fewer rows than asked for: a
 ///   query to report by name. The subscription stays.
@@ -197,6 +203,7 @@ pub enum Event {
         routed: Instant,
     },
     Hydrated(Vec<SubId>),
+    Unsettled(Vec<SubId>),
     Capped {
         sub: SubId,
     },
@@ -257,6 +264,9 @@ pub struct Service<E: Engine, S: Storage> {
     /// the commit has deltas for it or watched writes: each send wakes its
     /// thread.
     serving: bool,
+    /// Whether consumers are told when a subscription's rows become
+    /// incomplete and complete again.
+    settle_reports: bool,
     results: mpsc::UnboundedReceiver<(FetchId, Result<Snapshot, StorageError>)>,
     report: mpsc::UnboundedSender<(FetchId, Result<Snapshot, StorageError>)>,
     /// The catalog the clients' side reads, when the service is to keep
@@ -298,6 +308,7 @@ where
             reaper: spawn_reaper(),
             lag_warned: None,
             serving: false,
+            settle_reports: false,
             results,
             report,
             catalog: None,
@@ -328,6 +339,14 @@ where
         if !sinks.is_empty() {
             self.sinks = sinks;
         }
+        self
+    }
+
+    /// Tell consumers each time a subscription's rows become incomplete
+    /// (`Unsettled`) and complete again (`Hydrated`), for a consumer that
+    /// must never answer from rows a read is still filling.
+    pub fn with_settle_reports(mut self) -> Self {
+        self.settle_reports = true;
         self
     }
 
@@ -735,6 +754,9 @@ where
     /// hydrated.
     fn dispatch(&mut self, step: Step, outcome: Outcome) {
         let Step { updates, selects } = step;
+        if self.settle_reports {
+            self.unsettle(&selects);
+        }
         match outcome {
             Outcome::Registered {
                 sink,
@@ -798,6 +820,29 @@ where
             self.swept = Instant::now();
             let all: Vec<SubId> = self.awaiting.keys().copied().collect();
             self.settle(&all);
+        }
+    }
+
+    /// Name, to the sink of each, the settled subscriptions `reads` were
+    /// issued for, and await them again.
+    fn unsettle(&mut self, reads: &[Fetch]) {
+        let mut per_sink: Vec<Vec<SubId>> = (0..self.sinks.len()).map(|_| Vec::new()).collect();
+        for read in reads {
+            for sub in self.runtime.engine().waiting_on(read) {
+                if self.awaiting.contains_key(&sub) {
+                    continue;
+                }
+                let Some(&sink) = self.owners.get(&sub) else {
+                    continue;
+                };
+                self.awaiting.insert(sub, ());
+                per_sink[sink].push(sub);
+            }
+        }
+        for (sink, subs) in self.sinks.iter().zip(per_sink) {
+            if !subs.is_empty() {
+                let _ = sink.send(Event::Unsettled(subs));
+            }
         }
     }
 

@@ -118,6 +118,7 @@ impl CacheConfig {
             watched: Vec::new(),
             ddl_trigger: self.ddl_trigger(),
             ddl_prefix: format!("{}/{}/ddl", self.app, self.shard),
+            settle_reports: true,
         }
     }
 }

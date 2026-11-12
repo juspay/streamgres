@@ -1,9 +1,13 @@
-//! A `SELECT` as an ORM renders it, over one table, with its bind
-//! parameters, into the engine's query and what the statement returns.
+//! A `SELECT` as an ORM renders it, over one table or a tree of joined
+//! tables, with its bind parameters, into the engine's query and what the
+//! statement returns.
 //!
 //! ```text
-//! select     := SELECT projection FROM table [WHERE filter]
+//! select     := SELECT projection FROM from [WHERE filter]
 //!               [ORDER BY order (, order)*] [LIMIT count] [OFFSET count]
+//! from       := item ((INNER | LEFT [OUTER]) JOIN item ON on)*
+//! item       := table | '(' from ')'
+//! on         := ['('] column '=' column [AND filter] [')']
 //! projection := '*' | table '.' '*' | COUNT '(' '*' ')' | column (, column)*
 //! order      := column [ASC | DESC] [NULLS FIRST | NULLS LAST]
 //! count      := integer | $n
@@ -14,36 +18,95 @@
 //! takes a literal, `= ANY($n)` and `!= ALL($n)` over an array parameter,
 //! and `BETWEEN`.
 //!
+//! The `FROM` is read as a tree, as Diesel writes it: each `JOIN` links
+//! the item on its right to one table on its left through an `ON`
+//! equality of one column each side, an edge from the left table (the
+//! parent) to the right item's first table (the child). Other conditions
+//! of an `ON` belong to the child. Each top-level conjunct of the `WHERE`
+//! goes to the one table it names. `ORDER BY` and `LIMIT` belong to the
+//! joined rows; the engine follows the root's rows in that order, so a
+//! `LIMIT` is taken only with an order on the root alone.
+//!
 //! The engine must answer exactly what Postgres would, so a statement is
 //! refused, with the reason, when it compares or orders a column the
-//! engine cannot compare the way Postgres does ([`check_exact`]).
+//! engine cannot compare the way Postgres does ([`check_exact`]), or
+//! joins in a way the engine's tree does not express: `RIGHT`, `FULL` or
+//! `CROSS` joins, a table joined twice, a condition naming two tables
+//! other than an edge's equality, a `WHERE` condition on a table under a
+//! `LEFT` join (it would turn the join inner), an `INNER JOIN` onto a
+//! table under a `LEFT` join written after it rather than inside it, and
+//! an `ON` condition on the parent of a `LEFT` join.
 
-use super::{Bind, ParseError, Parser, Tok, default_order, lex};
+use super::{Bind, ParseError, Parser, Scope, Tagged, Tok, default_order, lex};
+use crate::ivm::QueryPart;
 use crate::model::{
-    Catalog, ColumnName, ComparisonOperator, Condition, DbColumn, DbTable, Order, OrderBy,
-    SingleTableReadQuery, Value, ValueType, Where,
+    Catalog, ColumnName, ComparisonOperator, Condition, DbColumn, DbTable, Join,
+    MultiTableReadQuery, Order, OrderBy, PageRead, SingleTableReadQuery, TableName, Value,
+    ValueType, Where,
 };
 use crate::sync::pg::binary::oid;
+
+/// One column a statement returns: which table of the `FROM` it is on (by
+/// position, in the order the `FROM` names them) and its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Projected {
+    pub node: usize,
+    pub column: ColumnName,
+}
 
 /// What a statement returns of the rows it reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Projection {
-    /// Every column, in the table's order.
+    /// Every column of every table, in the order the `FROM` names them.
     All,
     /// These columns, in this order.
-    Columns(Vec<ColumnName>),
+    Columns(Vec<Projected>),
     /// One row holding the number of rows matched.
     CountStar,
+}
+
+/// One table of the `FROM`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Node {
+    pub table: TableName,
+    /// The part of the engine's tree that holds its rows.
+    pub part: QueryPart,
+    /// How it joins its parent; `None` for the root.
+    pub edge: Option<Edge>,
+}
+
+/// How a table joins its parent: `parent.parent_column = column`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edge {
+    pub parent: usize,
+    pub parent_column: ColumnName,
+    pub column: ColumnName,
+    /// An `INNER` join; a `LEFT` one otherwise.
+    pub inner: bool,
+}
+
+/// One clause of the statement's `ORDER BY`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ordered {
+    pub node: usize,
+    pub column: ColumnName,
+    pub direction: Order,
 }
 
 /// A parsed `SELECT`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Select {
-    /// The rows the engine follows: the filter and order, and as many
-    /// rows as the statement may return after skipping its offset
-    /// (`limit + offset`; no limit for a count).
-    pub query: SingleTableReadQuery,
+    /// The rows the engine follows: the tree of tables, their filters, and
+    /// the root's order, with as many root rows as the statement may
+    /// return after skipping its offset (`limit + offset`; no limit for a
+    /// count).
+    pub query: MultiTableReadQuery,
+    /// The tables of the `FROM`, in the order it names them; the root
+    /// first.
+    pub nodes: Vec<Node>,
     pub projection: Projection,
+    /// The statement's order of its joined rows.
+    pub order: Vec<Ordered>,
     /// The statement's own `LIMIT`, `u32::MAX` for none.
     pub limit: u32,
     /// Rows the statement skips.
@@ -66,6 +129,64 @@ pub fn parse_select(sql: &str, binds: &[Bind], catalog: &Catalog) -> Result<Sele
     Ok(select)
 }
 
+/// A table of the `FROM` while the statement is read.
+struct Building<'c> {
+    table: &'c DbTable,
+    edge: Option<Edge>,
+    /// Under a `LEFT` join, itself or an ancestor.
+    left_joined: bool,
+    conjuncts: Vec<Where>,
+}
+
+/// The tables of the `FROM` as a scope: a qualified column names its
+/// table; a bare one is taken only when one table has it.
+struct FromScope<'c> {
+    tables: Vec<&'c DbTable>,
+}
+
+impl Scope for FromScope<'_> {
+    fn resolve<'s>(&'s self, parser: &mut Parser) -> Result<(usize, &'s DbColumn), ParseError> {
+        let at = parser.at();
+        let mut names = parser.dotted(3)?;
+        let name = names.pop().unwrap_or_default();
+        let qualifier = match names.as_slice() {
+            [] => None,
+            [table] => Some(table.clone()),
+            [schema, table] if schema == "public" => Some(table.clone()),
+            [schema, table] => Some(format!("{schema}.{table}")),
+            _ => None,
+        };
+        let fail = |message: String| ParseError {
+            message,
+            position: at,
+        };
+        let candidates: Vec<usize> = (0..self.tables.len())
+            .filter(|index| match &qualifier {
+                Some(qualifier) => self.tables[*index].name.as_str() == qualifier.as_str(),
+                None => self.tables[*index].column(&name).is_some(),
+            })
+            .collect();
+        match candidates.as_slice() {
+            [node] => self.tables[*node]
+                .column(&name)
+                .map(|column| (*node, column))
+                .ok_or_else(|| {
+                    fail(format!(
+                        "unknown column `{name}` on table `{}`",
+                        self.tables[*node].name
+                    ))
+                }),
+            [] => Err(fail(match qualifier {
+                Some(qualifier) => format!("`{qualifier}` is not a table this statement reads"),
+                None => format!("unknown column `{name}`"),
+            })),
+            _ => Err(fail(format!(
+                "`{name}` is ambiguous: qualify it with its table"
+            ))),
+        }
+    }
+}
+
 impl Parser {
     fn select(&mut self, catalog: &Catalog) -> Result<Select, ParseError> {
         self.expect_word("SELECT")?;
@@ -75,40 +196,44 @@ impl Parser {
         let projection_at = self.pos;
         self.skip_projection()?;
         self.expect_word("FROM")?;
-        let table = self.table(catalog)?;
-        if self.is_word("JOIN")
-            || self.is_word("INNER")
-            || self.is_word("LEFT")
-            || self.is_word("RIGHT")
-            || self.is_word("FULL")
-            || self.is_word("CROSS")
-            || self.is_sym(",")
-        {
-            return self.err("joins are not supported yet: one table per statement");
+        let mut building: Vec<Building<'_>> = Vec::new();
+        self.from(catalog, &mut building)?;
+        if self.is_sym(",") || self.is_word("CROSS") {
+            return self.err("a CROSS join, or a FROM of several tables, is not supported");
         }
+        let scope = FromScope {
+            tables: building.iter().map(|node| node.table).collect(),
+        };
         let after_from = self.pos;
         self.pos = projection_at;
-        let projection = self.projection(table)?;
+        let projection = self.projection(&scope)?;
         self.pos = after_from;
 
-        let filter = if self.eat_word("WHERE") {
-            self.filter(table)?
-        } else {
-            Where::AND(Vec::new())
-        };
-        let order_by = if self.eat_word("ORDER") {
+        if self.eat_word("WHERE") {
+            let filter = self.filter_in(&scope)?;
+            for conjunct in filter.conjuncts() {
+                let Some(node) = conjunct.only_node() else {
+                    return self.err("a WHERE condition naming several tables is not supported");
+                };
+                if building[node].left_joined {
+                    return self.err(format!(
+                        "a WHERE condition on `{}` would turn its LEFT JOIN inner; put it in the ON",
+                        building[node].table.name
+                    ));
+                }
+                building[node].conjuncts.push(conjunct.into_where());
+            }
+        }
+        let mut order = Vec::new();
+        if self.eat_word("ORDER") {
             self.expect_word("BY")?;
-            let mut clauses = Vec::new();
             loop {
-                clauses.push(self.order(table)?);
+                order.push(self.order(&scope)?);
                 if !self.eat_sym(",") {
                     break;
                 }
             }
-            clauses
-        } else {
-            vec![default_order(table, self.at())?]
-        };
+        }
         let limit = if self.eat_word("LIMIT") {
             self.count(u32::MAX)?
         } else {
@@ -122,18 +247,193 @@ impl Parser {
         if self.is_word("FOR") {
             return self.err("a locking read (FOR UPDATE, FOR SHARE) is not supported");
         }
-        check_exact(table, &filter, &order_by, self.at())?;
+        let windowed = limit != u32::MAX || offset != 0;
+        if windowed
+            && projection != Projection::CountStar
+            && order.iter().any(|clause| clause.node != 0)
+        {
+            return self
+                .err("a LIMIT or OFFSET with an ORDER BY on a joined table is not supported");
+        }
+
+        let at = self.at();
+        let root_order: Vec<OrderBy> = match order.iter().filter(|clause| clause.node == 0).count()
+        {
+            0 => vec![default_order(building[0].table, at)?],
+            _ => order
+                .iter()
+                .filter(|clause| clause.node == 0)
+                .map(|clause| OrderBy::new(clause.column.clone(), clause.direction))
+                .collect(),
+        };
+        for (index, node) in building.iter().enumerate() {
+            let filter = Where::AND(node.conjuncts.clone());
+            let ordered: Vec<OrderBy> = order
+                .iter()
+                .filter(|clause| clause.node == index)
+                .map(|clause| OrderBy::new(clause.column.clone(), clause.direction))
+                .collect();
+            check_exact(node.table, &filter, &ordered, at)?;
+            if let Some(edge) = &node.edge {
+                check_edge(building[edge.parent].table, node.table, edge, at)?;
+            }
+        }
 
         let followed = match projection {
             Projection::CountStar => u32::MAX,
             _ => limit.saturating_add(offset),
         };
+        let nodes = parts(&building);
+        let query = tree(&building, 0, root_order, followed);
         Ok(Select {
-            query: SingleTableReadQuery::new(table.name.clone(), filter, order_by, followed),
+            query,
+            nodes,
             projection,
+            order,
             limit,
             offset,
         })
+    }
+
+    /// The `FROM`: an item, then each join onto it.
+    fn from<'c>(
+        &mut self,
+        catalog: &'c Catalog,
+        building: &mut Vec<Building<'c>>,
+    ) -> Result<usize, ParseError> {
+        let root = self.item(catalog, building)?;
+        loop {
+            let inner = if self.eat_word("INNER") {
+                self.expect_word("JOIN")?;
+                true
+            } else if self.eat_word("JOIN") {
+                true
+            } else if self.eat_word("LEFT") {
+                self.eat_word("OUTER");
+                self.expect_word("JOIN")?;
+                false
+            } else if self.is_word("RIGHT") || self.is_word("FULL") || self.is_word("CROSS") {
+                return self.err("only INNER and LEFT joins are supported");
+            } else {
+                return Ok(root);
+            };
+            let child = self.item(catalog, building)?;
+            self.expect_word("ON")?;
+            self.on(building, child, inner)?;
+        }
+    }
+
+    /// A table, or a parenthesised `FROM`; its first table.
+    fn item<'c>(
+        &mut self,
+        catalog: &'c Catalog,
+        building: &mut Vec<Building<'c>>,
+    ) -> Result<usize, ParseError> {
+        if self.eat_sym("(") {
+            self.descend()?;
+            let root = self.from(catalog, building)?;
+            self.expect_sym(")")?;
+            self.depth -= 1;
+            return Ok(root);
+        }
+        let at = self.at();
+        let table = self.table(catalog)?;
+        if building.iter().any(|node| node.table.name == table.name) {
+            return Err(ParseError {
+                message: format!("`{}` is joined twice, which is not supported", table.name),
+                position: at,
+            });
+        }
+        building.push(Building {
+            table,
+            edge: None,
+            left_joined: false,
+            conjuncts: Vec::new(),
+        });
+        Ok(building.len() - 1)
+    }
+
+    /// The `ON` of the join onto `child`: the edge's equality, then any
+    /// conditions on the child.
+    fn on(
+        &mut self,
+        building: &mut [Building<'_>],
+        child: usize,
+        inner: bool,
+    ) -> Result<(), ParseError> {
+        let scope = FromScope {
+            tables: building.iter().map(|node| node.table).collect(),
+        };
+        let mut open = 0usize;
+        while self.eat_sym("(") {
+            open += 1;
+        }
+        let at = self.at();
+        let (first, first_column) = scope.resolve(self)?;
+        self.expect_sym("=")?;
+        let (second, second_column) = scope.resolve(self)?;
+        let (parent, parent_column, child_column) = if second == child && first < child {
+            (first, first_column, second_column)
+        } else if first == child && second < child {
+            (second, second_column, first_column)
+        } else {
+            return Err(ParseError {
+                message:
+                    "an ON must equate a column of the joined table with one of a table before it"
+                        .to_owned(),
+                position: at,
+            });
+        };
+        let mut extra = Vec::new();
+        loop {
+            if open > 0 && self.eat_sym(")") {
+                open -= 1;
+            } else if self.eat_word("AND") {
+                extra.push(self.primary(&scope)?);
+            } else {
+                break;
+            }
+        }
+        if open > 0 {
+            return self.err(format!("expected `)`, found {}", self.describe()));
+        }
+        if inner && building[parent].left_joined {
+            return Err(ParseError {
+                message: format!(
+                    "an INNER JOIN onto `{}`, which is under a LEFT JOIN, drops the rows that join keeps; join it inside the LEFT JOIN's parentheses",
+                    building[parent].table.name
+                ),
+                position: at,
+            });
+        }
+        let edge = Edge {
+            parent,
+            parent_column: parent_column.name.clone(),
+            column: child_column.name.clone(),
+            inner,
+        };
+        let below_left = !inner || building[parent].left_joined;
+        building[child].edge = Some(edge);
+        if below_left {
+            mark_left(building, child);
+        }
+        for condition in extra.into_iter().flat_map(Tagged::conjuncts) {
+            match condition.only_node() {
+                Some(node) if node == child => {
+                    building[child].conjuncts.push(condition.into_where())
+                }
+                Some(node) if inner && !building[node].left_joined => {
+                    building[node].conjuncts.push(condition.into_where())
+                }
+                _ => {
+                    return Err(ParseError {
+                        message: "an ON condition must name only the joined table".to_owned(),
+                        position: at,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Steps over the projection to the `FROM`, which it must come before.
@@ -153,8 +453,8 @@ impl Parser {
         }
     }
 
-    /// The projection, its columns checked against `table`.
-    fn projection(&mut self, table: &DbTable) -> Result<Projection, ParseError> {
+    /// The projection, its columns resolved against the `FROM`.
+    fn projection(&mut self, scope: &FromScope<'_>) -> Result<Projection, ParseError> {
         if self.eat_sym("*") {
             return Ok(Projection::All);
         }
@@ -166,28 +466,37 @@ impl Parser {
             return Ok(Projection::CountStar);
         }
         let mut columns = Vec::new();
+        let mut stars = 0usize;
         loop {
             let at = self.pos;
-            if self.qualified_star(table)? {
-                if columns.is_empty() && self.is_word("FROM") {
-                    return Ok(Projection::All);
+            if let Some(node) = self.qualified_star(scope)? {
+                stars += 1;
+                for column in scope.tables[node].declared() {
+                    columns.push(Projected {
+                        node,
+                        column: column.clone(),
+                    });
                 }
-                return self.err("`table.*` must be the whole projection");
-            }
-            self.pos = at;
-            if self
-                .tokens
-                .get(self.pos + 1)
-                .is_some_and(|next| next.tok == Tok::Sym("("))
-            {
-                return self.err(format!(
-                    "a projection is columns of the table, not {}(...)",
-                    self.describe()
-                ));
-            }
-            columns.push(self.column_name(table)?);
-            if matches!(self.peek(), Tok::Quoted(_) | Tok::Word(_)) && !self.is_word("FROM") {
-                return self.err("a projected column cannot be renamed or computed");
+            } else {
+                self.pos = at;
+                if self
+                    .tokens
+                    .get(self.pos + 1)
+                    .is_some_and(|next| next.tok == Tok::Sym("("))
+                {
+                    return self.err(format!(
+                        "a projection is columns of the tables, not {}(...)",
+                        self.describe()
+                    ));
+                }
+                let (node, column) = scope.resolve(self)?;
+                columns.push(Projected {
+                    node,
+                    column: column.name.clone(),
+                });
+                if matches!(self.peek(), Tok::Quoted(_) | Tok::Word(_)) && !self.is_word("FROM") {
+                    return self.err("a projected column cannot be renamed or computed");
+                }
             }
             if !self.eat_sym(",") {
                 break;
@@ -195,20 +504,26 @@ impl Parser {
         }
         if !self.is_word("FROM") {
             return self.err(format!(
-                "a projection is columns of the table, found {}",
+                "a projection is columns of the tables, found {}",
                 self.describe()
             ));
+        }
+        if stars == 1
+            && scope.tables.len() == 1
+            && columns.len() == scope.tables[0].declared().len()
+        {
+            return Ok(Projection::All);
         }
         Ok(Projection::Columns(columns))
     }
 
-    /// Consumes `table.*` (or `schema.table.*`) when it is next.
-    fn qualified_star(&mut self, table: &DbTable) -> Result<bool, ParseError> {
+    /// Consumes `table.*` (or `schema.table.*`) when it is next; the table.
+    fn qualified_star(&mut self, scope: &FromScope<'_>) -> Result<Option<usize>, ParseError> {
         let mut names = Vec::new();
         while matches!(self.peek(), Tok::Word(_) | Tok::Quoted(_)) {
             names.push(self.ident()?);
             if !self.eat_sym(".") {
-                return Ok(false);
+                return Ok(None);
             }
             if self.eat_sym("*") {
                 let named = match names.as_slice() {
@@ -216,19 +531,23 @@ impl Parser {
                     [schema, name] => format!("{schema}.{name}"),
                     _ => names.concat(),
                 };
-                if named != table.name.as_str() {
-                    return self.err(format!("`{named}` is not the table read"));
-                }
-                return Ok(true);
+                return match scope
+                    .tables
+                    .iter()
+                    .position(|table| table.name.as_str() == named)
+                {
+                    Some(node) => Ok(Some(node)),
+                    None => self.err(format!("`{named}` is not a table this statement reads")),
+                };
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// One `ORDER BY` clause. Postgres puts `NULL`s last ascending and first
     /// descending, as the engine does; the other way round is refused.
-    fn order(&mut self, table: &DbTable) -> Result<OrderBy, ParseError> {
-        let column = self.column_name(table)?;
+    fn order(&mut self, scope: &FromScope<'_>) -> Result<Ordered, ParseError> {
+        let (node, column) = scope.resolve(self)?;
         let direction = if self.eat_word("DESC") {
             Order::DESC
         } else {
@@ -246,7 +565,11 @@ impl Parser {
                 return self.err("NULLS FIRST ascending or NULLS LAST descending is not supported");
             }
         }
-        Ok(OrderBy::new(column, direction))
+        Ok(Ordered {
+            node,
+            column: column.name.clone(),
+            direction,
+        })
     }
 
     /// A row count: a non-negative integer, or a parameter bound to one;
@@ -286,6 +609,128 @@ impl Parser {
                 position: at,
             })
     }
+}
+
+/// Marks `node` and every table below it as under a `LEFT` join.
+fn mark_left(building: &mut [Building<'_>], node: usize) {
+    let mut marked = vec![node];
+    while let Some(next) = marked.pop() {
+        building[next].left_joined = true;
+        for (index, other) in building.iter().enumerate() {
+            if other.edge.as_ref().is_some_and(|edge| edge.parent == next) && !other.left_joined {
+                marked.push(index);
+            }
+        }
+    }
+}
+
+/// Each table's part of the engine's tree: the root's joins are numbered
+/// in the order the `FROM` names them, and so on down.
+fn parts(building: &[Building<'_>]) -> Vec<Node> {
+    let mut nodes: Vec<Node> = building
+        .iter()
+        .map(|node| Node {
+            table: node.table.name.clone(),
+            part: QueryPart::main(),
+            edge: node.edge.clone(),
+        })
+        .collect();
+    fn assign(building: &[Building<'_>], nodes: &mut [Node], node: usize, path: &mut Vec<usize>) {
+        let children: Vec<usize> = (0..building.len())
+            .filter(|index| {
+                building[*index]
+                    .edge
+                    .as_ref()
+                    .is_some_and(|edge| edge.parent == node)
+            })
+            .collect();
+        for (position, child) in children.into_iter().enumerate() {
+            path.push(position);
+            if let Some(part) = QueryPart::try_new(path) {
+                nodes[child].part = part;
+            }
+            assign(building, nodes, child, path);
+            path.pop();
+        }
+    }
+    assign(building, &mut nodes, 0, &mut Vec::new());
+    nodes
+}
+
+/// The engine's query for the tree under `node`.
+fn tree(
+    building: &[Building<'_>],
+    node: usize,
+    order: Vec<OrderBy>,
+    limit: u32,
+) -> MultiTableReadQuery {
+    let table = building[node].table;
+    let joins: Vec<Join> = (0..building.len())
+        .filter_map(|index| {
+            let edge = building[index].edge.as_ref()?;
+            (edge.parent == node).then(|| {
+                let key: Vec<OrderBy> = building[index]
+                    .table
+                    .pkey
+                    .iter()
+                    .map(|column| OrderBy::new(column.clone(), Order::ASC))
+                    .collect();
+                let sub = tree(building, index, key, u32::MAX);
+                if edge.inner {
+                    Join::inner_from_main(sub, edge.parent_column.clone(), edge.column.clone())
+                } else {
+                    Join::left(sub, edge.parent_column.clone(), edge.column.clone())
+                }
+            })
+        })
+        .collect();
+    let main = SingleTableReadQuery::new(
+        table.name.clone(),
+        Where::AND(building[node].conjuncts.clone()),
+        order,
+        limit,
+    );
+    let mut query = MultiTableReadQuery::new(main, joins);
+    query.page = PageRead::Batched;
+    query
+}
+
+/// Refuses an edge the engine would join otherwise than Postgres: columns
+/// whose equality differs from Postgres's, or of different types.
+fn check_edge(parent: &DbTable, child: &DbTable, edge: &Edge, at: usize) -> Result<(), ParseError> {
+    let (Some(left), Some(right)) = (
+        parent.column(edge.parent_column.as_str()),
+        child.column(edge.column.as_str()),
+    ) else {
+        return Err(ParseError {
+            message: "a join column is unknown".to_owned(),
+            position: at,
+        });
+    };
+    if comparable(left) == Comparable::Not || comparable(right) == Comparable::Not {
+        return Err(ParseError {
+            message: format!(
+                "`{}` = `{}` is compared by rules of Postgres's own the engine does not follow",
+                left.name, right.name
+            ),
+            position: at,
+        });
+    }
+    let same = left.r#type == right.r#type
+        || matches!(
+            (&left.r#type, &right.r#type),
+            (ValueType::Int, ValueType::Numeric) | (ValueType::Numeric, ValueType::Int)
+        );
+    if !same {
+        return Err(ParseError {
+            message: format!(
+                "`{}` and `{}` are of different types",
+                left.name, right.name
+            ),
+            position: at,
+        });
+    }
+    Ok(())
 }
 
 /// How the engine compares a column's values against Postgres.
@@ -475,6 +920,15 @@ mod tests {
                 ],
             ),
             DbTable::new(
+                "users",
+                ["id"],
+                vec![
+                    DbColumn::new("id", ValueType::Int).with_type_oid(oid::INT8),
+                    DbColumn::new("order_id", ValueType::Int).with_type_oid(oid::INT8),
+                    DbColumn::new("name", ValueType::String).with_type_oid(oid::TEXT),
+                ],
+            ),
+            DbTable::new(
                 "billing.invoices",
                 ["id"],
                 vec![DbColumn::new("id", ValueType::Int).with_type_oid(oid::INT8)],
@@ -509,12 +963,24 @@ mod tests {
         .unwrap();
         assert_eq!(
             select.projection,
-            Projection::Columns(vec![ColumnName::from("id"), ColumnName::from("amount")])
+            Projection::Columns(vec![
+                Projected {
+                    node: 0,
+                    column: ColumnName::from("id")
+                },
+                Projected {
+                    node: 0,
+                    column: ColumnName::from("amount")
+                }
+            ])
         );
         assert_eq!(select.limit, 20);
         assert_eq!(select.offset, 5);
-        assert_eq!(select.query.limit, 25);
-        assert_eq!(select.query.order_by, vec![OrderBy::new("id", Order::DESC)]);
+        assert_eq!(select.query.main_table.limit, 25);
+        assert_eq!(
+            select.query.main_table.order_by,
+            vec![OrderBy::new("id", Order::DESC)]
+        );
         let unbounded = parse(
             r#"SELECT "orders"."id" FROM "orders" LIMIT $1 OFFSET $2"#,
             &[
@@ -535,7 +1001,7 @@ mod tests {
             "NULL is no limit, no offset"
         );
         assert_eq!(
-            select.query.filter,
+            select.query.main_table.filter,
             Where::AND(vec![
                 Where::condition("merchant_id", ComparisonOperator::EQ, "m1"),
                 Where::condition("id", ComparisonOperator::GT, 10),
@@ -565,26 +1031,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(select.projection, Projection::CountStar);
-        assert_eq!(select.query.limit, u32::MAX);
+        assert_eq!(select.query.main_table.limit, u32::MAX);
         let list = Value::List(vec![Value::Int(1), Value::Int(2)]);
         assert_eq!(
-            select.query.filter,
+            select.query.main_table.filter,
             Where::AND(vec![
                 Where::condition("id", ComparisonOperator::IN, list.clone()),
                 Where::condition("id", ComparisonOperator::NOT_IN, list),
-                Where::AND(vec![
-                    Where::condition(
-                        "amount",
-                        ComparisonOperator::GTE,
-                        Value::Numeric(Numeric::parse("1.5").unwrap())
-                    ),
-                    Where::condition(
-                        "amount",
-                        ComparisonOperator::LTE,
-                        Value::Numeric(Numeric::parse("100.50").unwrap())
-                    ),
-                ]),
+                Where::condition(
+                    "amount",
+                    ComparisonOperator::GTE,
+                    Value::Numeric(Numeric::parse("1.5").unwrap())
+                ),
+                Where::condition(
+                    "amount",
+                    ComparisonOperator::LTE,
+                    Value::Numeric(Numeric::parse("100.50").unwrap())
+                ),
             ])
+        );
+        let Where::AND(parts) = &select.query.main_table.filter else {
+            panic!("a conjunction");
+        };
+        assert!(
+            matches!(&parts[3], Where::Condition(condition)
+                if matches!(&condition.value, Value::Numeric(n) if n.to_string() == "100.50")),
+            "a numeric literal keeps its digits and scale"
         );
     }
 
@@ -596,7 +1068,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(select.projection, Projection::All);
-        assert_eq!(select.query.table.as_str(), "billing.invoices");
+        assert_eq!(select.query.main_table.table.as_str(), "billing.invoices");
         assert!(
             parse(
                 r#"SELECT * FROM "public"."orders" WHERE "orders"."id" = 1"#,
@@ -605,6 +1077,71 @@ mod tests {
             .is_ok()
         );
         assert!(parse(r#"SELECT "other"."id" FROM "orders""#, &[]).is_err());
+    }
+
+    #[test]
+    fn reads_a_join_tree_as_diesel_writes_it() {
+        let select = parse(
+            r#"SELECT "orders"."id", "users"."name" FROM ("orders" INNER JOIN "users" ON ("orders"."id" = "users"."order_id")) WHERE ("users"."name" = $1) ORDER BY "orders"."id" LIMIT $2"#,
+            &[text("meera"), int8(3)],
+        )
+        .unwrap();
+        assert_eq!(select.nodes.len(), 2);
+        let edge = select.nodes[1].edge.as_ref().unwrap();
+        assert_eq!(
+            (
+                edge.parent,
+                edge.parent_column.as_str(),
+                edge.column.as_str(),
+                edge.inner
+            ),
+            (0, "id", "order_id", true)
+        );
+        assert_eq!(select.nodes[1].part, QueryPart::join(0));
+        assert_eq!(select.query.main_table.limit, 3);
+        let join = &select.query.joins[0];
+        assert!(join.is_inner && join.main_drives());
+        assert_eq!(
+            join.sub.main_table.filter,
+            Where::AND(vec![Where::condition(
+                "name",
+                ComparisonOperator::EQ,
+                "meera"
+            )])
+        );
+        assert_eq!(
+            select.projection,
+            Projection::Columns(vec![
+                Projected {
+                    node: 0,
+                    column: ColumnName::from("id")
+                },
+                Projected {
+                    node: 1,
+                    column: ColumnName::from("name")
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn a_left_join_takes_its_on_conditions_on_the_joined_table() {
+        let select = parse(
+            r#"SELECT * FROM ("orders" LEFT OUTER JOIN "users" ON (("orders"."id" = "users"."order_id") AND ("users"."name" = 'meera')))"#,
+            &[],
+        )
+        .unwrap();
+        let join = &select.query.joins[0];
+        assert!(!join.is_inner);
+        assert_eq!(
+            join.sub.main_table.filter,
+            Where::AND(vec![Where::condition(
+                "name",
+                ComparisonOperator::EQ,
+                "meera"
+            )])
+        );
+        assert_eq!(select.projection, Projection::All);
     }
 
     #[test]
@@ -625,7 +1162,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            select.query.filter,
+            select.query.main_table.filter,
             Where::AND(vec![
                 Where::condition("created_at", ComparisonOperator::GTE, Value::Timestamp(at)),
                 Where::condition("status", ComparisonOperator::EQ, "paid"),
@@ -676,7 +1213,31 @@ mod tests {
             (r#"SELECT * FROM "orders" FOR UPDATE"#, "locking"),
             (
                 r#"SELECT * FROM "orders" INNER JOIN "billing"."invoices" ON TRUE"#,
-                "joins",
+                "column",
+            ),
+            (
+                r#"SELECT * FROM "orders" RIGHT JOIN "users" ON ("orders"."id" = "users"."id")"#,
+                "INNER and LEFT",
+            ),
+            (
+                r#"SELECT * FROM ("orders" INNER JOIN "orders" ON ("orders"."id" = "orders"."id"))"#,
+                "twice",
+            ),
+            (
+                r#"SELECT * FROM ("orders" LEFT JOIN "users" ON ("orders"."id" = "users"."order_id")) WHERE "users"."name" = 'x'"#,
+                "inner",
+            ),
+            (
+                r#"SELECT * FROM ("orders" INNER JOIN "users" ON ("orders"."id" = "users"."order_id")) WHERE ("orders"."id" = 1 OR "users"."name" = 'x')"#,
+                "several tables",
+            ),
+            (
+                r#"SELECT "orders"."id" FROM ("orders" INNER JOIN "users" ON ("orders"."id" = "users"."order_id")) ORDER BY "users"."name" LIMIT 5"#,
+                "joined table",
+            ),
+            (
+                r#"SELECT * FROM (("orders" LEFT JOIN "users" ON ("orders"."id" = "users"."order_id")) INNER JOIN "billing"."invoices" ON ("users"."id" = "billing"."invoices"."id"))"#,
+                "under a LEFT JOIN",
             ),
             (
                 r#"SELECT * FROM "orders" WHERE "orders"."id" = $1"#,

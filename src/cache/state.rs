@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use super::{CacheConfig, Refusal};
 use crate::ivm::{Delta, QueryPart};
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, Position, MultiTableReadQuery, SubId,
+    Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, MultiTableReadQuery, Position, SubId,
 };
 use crate::shutdown::Shutdown;
 use crate::sync::{CatalogHandle, Command, Event};
@@ -46,9 +46,11 @@ pub(super) struct Entry {
     pub query: MultiTableReadQuery,
     pub sub: Option<SubId>,
     pub fill: Fill,
-    pub rows: HashMap<DataFrameKey, Arc<DataFrameRow>>,
-    /// The rows in the query's order, kept until they next change.
-    pub ordered: Option<Arc<[Arc<DataFrameRow>]>>,
+    /// The rows of each part of the query's tree.
+    pub parts: HashMap<QueryPart, HashMap<DataFrameKey, Arc<DataFrameRow>>>,
+    /// The joined rows in the statement's order, kept until the rows next
+    /// change.
+    pub ordered: Option<Arc<[super::rows::Joined]>>,
     /// Bumped by every change of the rows, so an ordering built from an
     /// older snapshot is not kept.
     pub generation: u64,
@@ -214,7 +216,7 @@ impl State {
                 query,
                 sub: None,
                 fill: Fill::Pending,
-                rows: HashMap::new(),
+                parts: HashMap::new(),
                 ordered: None,
                 generation: 0,
                 last_read: Instant::now(),
@@ -299,6 +301,18 @@ impl State {
                     }
                 }
             }
+            Event::Unsettled(subs) => {
+                for sub in subs {
+                    if let Some(entry) = self
+                        .by_sub
+                        .get(&sub)
+                        .and_then(|id| self.entries.get_mut(id))
+                        && matches!(entry.fill, Fill::Ready)
+                    {
+                        entry.fill = Fill::Pending;
+                    }
+                }
+            }
             Event::Refused { sub, reason } => {
                 self.refuse(sub, reason);
                 orphans.push(sub);
@@ -338,9 +352,6 @@ impl State {
                 DataFrameOperation::Delete(..) => None,
             };
             for target in delta.targets() {
-                if target.part != QueryPart::main() {
-                    continue;
-                }
                 let Some(entry) = self
                     .by_sub
                     .get(&target.sub)
@@ -350,10 +361,16 @@ impl State {
                 };
                 match (&delta.op, &added) {
                     (DataFrameOperation::Add(key, _), Some(row)) => {
-                        entry.rows.insert(key.clone(), row.clone());
+                        entry
+                            .parts
+                            .entry(target.part)
+                            .or_default()
+                            .insert(key.clone(), row.clone());
                     }
                     (DataFrameOperation::Delete(key, _), _) => {
-                        entry.rows.remove(key);
+                        if let Some(rows) = entry.parts.get_mut(&target.part) {
+                            rows.remove(key);
+                        }
                     }
                     (DataFrameOperation::Add(..), None) => continue,
                 }

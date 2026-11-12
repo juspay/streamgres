@@ -837,48 +837,52 @@ impl Parser {
         Ok(pkey_value)
     }
 
-    /// `OR` is the loosest binder, so it sits at the top of the chain.
+    /// A filter over one table.
     fn filter(&mut self, table: &DbTable) -> Result<Where, ParseError> {
-        let mut parts = vec![self.conjunct(table)?];
+        self.filter_in(&OneTable(table)).map(Tagged::into_where)
+    }
+
+    /// A filter over the tables of `scope`, each condition tagged with the
+    /// table it names. `OR` is the loosest binder, so it sits at the top.
+    fn filter_in(&mut self, scope: &dyn Scope) -> Result<Tagged, ParseError> {
+        let mut parts = vec![self.conjunct(scope)?];
         while self.eat_word("OR") {
-            parts.push(self.conjunct(table)?);
+            parts.push(self.conjunct(scope)?);
         }
-        Ok(collapse(parts, Where::OR))
+        Ok(Tagged::group(parts, Tagged::Or))
     }
 
     /// `AND` chain of primaries; binds tighter than `OR`.
-    fn conjunct(&mut self, table: &DbTable) -> Result<Where, ParseError> {
-        let mut parts = vec![self.primary(table)?];
+    fn conjunct(&mut self, scope: &dyn Scope) -> Result<Tagged, ParseError> {
+        let mut parts = vec![self.primary(scope)?];
         while self.eat_word("AND") {
-            parts.push(self.primary(table)?);
+            parts.push(self.primary(scope)?);
         }
-        Ok(collapse(parts, Where::AND))
+        Ok(Tagged::group(parts, Tagged::And))
     }
 
     /// A parenthesised filter, a `TRUE` / `FALSE` literal, or one condition.
     ///
     /// `TRUE` / `FALSE` parse to the identities: an empty `AND` is true, an
     /// empty `OR` is false.
-    fn primary(&mut self, table: &DbTable) -> Result<Where, ParseError> {
+    fn primary(&mut self, scope: &dyn Scope) -> Result<Tagged, ParseError> {
         if self.eat_sym("(") {
             self.descend()?;
-            let filter = self.filter(table)?;
+            let filter = self.filter_in(scope)?;
             self.expect_sym(")")?;
             self.depth -= 1;
             return Ok(filter);
         }
         if self.eat_word("TRUE") {
-            return Ok(Where::AND(Vec::new()));
+            return Ok(Tagged::And(Vec::new()));
         }
         if self.eat_word("FALSE") {
-            return Ok(Where::OR(Vec::new()));
+            return Ok(Tagged::Or(Vec::new()));
         }
 
-        let column = self.column_name(table)?;
-        let declared = table.column(column.as_str()).ok_or(ParseError {
-            message: format!("unknown column `{column}`"),
-            position: self.at(),
-        })?;
+        let (node, declared) = scope.resolve(self)?;
+        let column = declared.name.clone();
+        let tag = |condition: Condition| Tagged::Condition(node, condition);
         if self.eat_word("IS") {
             let comparison_operator = if self.eat_word("NOT") {
                 ComparisonOperator::IS_NOT
@@ -891,7 +895,7 @@ impl Parser {
                     self.describe()
                 ));
             }
-            return Ok(Where::Condition(Condition {
+            return Ok(tag(Condition {
                 column,
                 comparison_operator,
                 value: Value::Null,
@@ -902,9 +906,9 @@ impl Parser {
             let low = self.operand(declared)?;
             self.expect_word("AND")?;
             let high = self.operand(declared)?;
-            let within = Where::AND(vec![
-                Where::Condition(Condition::new(column.clone(), ComparisonOperator::GTE, low)),
-                Where::Condition(Condition::new(column, ComparisonOperator::LTE, high)),
+            let within = Tagged::And(vec![
+                tag(Condition::new(column.clone(), ComparisonOperator::GTE, low)),
+                tag(Condition::new(column, ComparisonOperator::LTE, high)),
             ]);
             return if negated {
                 self.err("NOT BETWEEN is not supported")
@@ -918,7 +922,7 @@ impl Parser {
             } else {
                 ComparisonOperator::IN
             };
-            return Ok(Where::Condition(Condition {
+            return Ok(tag(Condition {
                 column,
                 comparison_operator,
                 value: self.value_list(declared)?,
@@ -965,13 +969,13 @@ impl Parser {
                 Value::Null => Value::List(Vec::new()),
                 list => list,
             };
-            return Ok(Where::Condition(Condition {
+            return Ok(tag(Condition {
                 column,
                 comparison_operator,
                 value,
             }));
         }
-        Ok(Where::Condition(Condition {
+        Ok(tag(Condition {
             column,
             comparison_operator,
             value: self.operand(declared)?,
@@ -1001,8 +1005,39 @@ impl Parser {
             self.bump();
             return self.bind_value(number, declared, false, at);
         }
+        if declared.r#type == ValueType::Numeric
+            && let Some(number) = self.numeric_literal()?
+        {
+            return Ok(Value::Numeric(number));
+        }
         let value = self.value()?;
         coerce_read(value, &declared.r#type, at)
+    }
+
+    /// A number literal read as an exact numeric, digits and scale as
+    /// written; `None`, consuming nothing, when the next token is not one.
+    fn numeric_literal(&mut self) -> Result<Option<Numeric>, ParseError> {
+        let at = self.at();
+        let negative = self.is_sym("-");
+        let ahead = if negative { 1 } else { 0 };
+        let Some(Spanned {
+            tok: Tok::Num(digits),
+            ..
+        }) = self.tokens.get(self.pos + ahead)
+        else {
+            return Ok(None);
+        };
+        let text = if negative {
+            format!("-{digits}")
+        } else {
+            digits.clone()
+        };
+        let number = Numeric::parse(&text).map_err(|error| ParseError {
+            message: error.to_string(),
+            position: at,
+        })?;
+        self.pos += ahead + 1;
+        Ok(Some(number))
     }
 
     /// Bind parameter `number` decoded by its type, as one value or (for
@@ -1103,14 +1138,90 @@ impl Parser {
     }
 }
 
-/// Unwrap a lone part; otherwise group `parts` under `group`.
-fn collapse(mut parts: Vec<Where>, group: fn(Vec<Where>) -> Where) -> Where {
-    if parts.len() == 1 {
-        parts.pop().expect("just checked the length")
-    } else {
-        group(parts)
+/// The tables a filter's references resolve against.
+trait Scope {
+    /// The column the reference at the parser's position names: which of
+    /// the scope's tables it is on, and its definition.
+    fn resolve<'s>(&'s self, parser: &mut Parser) -> Result<(usize, &'s DbColumn), ParseError>;
+}
+
+/// One table as a scope: every reference is to it.
+struct OneTable<'t>(&'t DbTable);
+
+impl Scope for OneTable<'_> {
+    fn resolve<'s>(&'s self, parser: &mut Parser) -> Result<(usize, &'s DbColumn), ParseError> {
+        let at = parser.at();
+        let name = parser.column_name(self.0)?;
+        let column = self.0.column(name.as_str()).ok_or(ParseError {
+            message: format!("unknown column `{name}`"),
+            position: at,
+        })?;
+        Ok((0, column))
     }
 }
+
+/// A filter whose every condition is tagged with the table it names (its
+/// position in the scope), so a filter over several tables can be split
+/// among them.
+#[derive(Debug, Clone, PartialEq)]
+enum Tagged {
+    Condition(usize, Condition),
+    And(Vec<Tagged>),
+    Or(Vec<Tagged>),
+}
+
+impl Tagged {
+    /// A lone part, or `parts` under `group`.
+    fn group(mut parts: Vec<Tagged>, group: fn(Vec<Tagged>) -> Tagged) -> Tagged {
+        if parts.len() == 1 {
+            parts.pop().unwrap_or_else(|| group(Vec::new()))
+        } else {
+            group(parts)
+        }
+    }
+
+    /// The filter without its tags.
+    fn into_where(self) -> Where {
+        match self {
+            Tagged::Condition(_, condition) => Where::Condition(condition),
+            Tagged::And(parts) => Where::AND(parts.into_iter().map(Tagged::into_where).collect()),
+            Tagged::Or(parts) => Where::OR(parts.into_iter().map(Tagged::into_where).collect()),
+        }
+    }
+
+    /// The one table every condition of this filter names; `None` when it
+    /// names none or several.
+    fn only_node(&self) -> Option<usize> {
+        let mut found = None;
+        let mut several = false;
+        self.visit(&mut |node| match found {
+            None => found = Some(node),
+            Some(seen) if seen != node => several = true,
+            Some(_) => {}
+        });
+        if several { None } else { found }
+    }
+
+    /// The filter's top-level conjuncts.
+    fn conjuncts(self) -> Vec<Tagged> {
+        match self {
+            Tagged::And(parts) => parts.into_iter().flat_map(Tagged::conjuncts).collect(),
+            other => vec![other],
+        }
+    }
+
+    fn visit(&self, each: &mut dyn FnMut(usize)) {
+        match self {
+            Tagged::Condition(node, _) => each(*node),
+            Tagged::And(parts) | Tagged::Or(parts) => {
+                for part in parts {
+                    part.visit(each);
+                }
+            }
+        }
+    }
+}
+
 
 /// The implicit ORDER BY: the first declared pkey column, ascending. A
 /// (degenerate) pkey-less table falls back to the alphabetically first
