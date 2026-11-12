@@ -363,7 +363,44 @@ adapter's live test found it.
 Live test: `crates/streamgres-diesel/tests/load_cached.rs`, covering
 every query shape and column type, before and after writes.
 
+## 15. What the full review changed
+
+A review of every change on the branch led to these fixes:
+
+- **Transactions.** A read inside a transaction Diesel opened goes to
+  Postgres, because the transaction's own writes and snapshot are only
+  there. So does a read in a state Diesel cannot tell, such as a broken
+  transaction. (A transaction opened with raw `BEGIN` SQL is invisible to
+  Diesel and therefore to the adapter.)
+- **Row-level security.** Tables with it are left out of the catalog: the
+  engine reads as its own role and cannot apply another role's policies.
+- **Types without a binary send function.** Tables with such a column are
+  left out. Neither a binary read nor the feed can give that column
+  exactly; before, the feed would have stopped the server on the first
+  write to the table.
+- **PostgreSQL 14 or later** is required, because the feed reads values in
+  binary format. This is checked at catalog load, with a clear error.
+- **JSON projections are refused by the cache.** The engine keeps JSON in
+  a standard form for comparisons (`1.50` and `1.5` are one value), which
+  is not the text Postgres returns. Filtering on JSON still works.
+  Serving it exactly needs a JSON value that keeps both forms; that is
+  future work.
+- **Refusals expire.** A refused query is answered as refused for
+  `refusal_ttl` and then asked again, instead of staying refused until
+  its entry idled out.
+- **`OFFSET NULL`** means no offset, as in Postgres.
+
 ## Known gaps
+
+- **Who is reading.** The cache answers every reader from rows read as
+  the engine's role, with bare table names resolved to the engine's
+  schemas. A connection whose `search_path`, role privileges or session
+  settings would make Postgres answer differently must not use
+  `load_cached`. Checking this per connection, cheaply, is the next
+  correctness step (the s2s branch's context rules are the model).
+- **Read cost.** Every cached read sorts the query's whole row set while
+  holding the cache's lock. Keeping each entry's rows in order would make
+  a `LIMIT` read cost its limit, not the whole set.
 
 - **Joins.** The parser refuses them. The s2s branch's join tree is the
   model to follow, and the join planner still lives in the server.
