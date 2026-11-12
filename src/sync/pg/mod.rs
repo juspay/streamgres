@@ -48,6 +48,7 @@
 //! end of its commit record, the same scale the aliases' consistent
 //! points are on.
 
+pub mod binary;
 pub mod catalog;
 pub mod ddl;
 pub mod estimate;
