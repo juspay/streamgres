@@ -60,6 +60,7 @@
 //! 10. Batching of one write's narrowed reads, parser `JOIN` syntax,
 //!     table sharding of the engine across threads
 
+pub mod cache;
 #[cfg(feature = "server")]
 pub mod client;
 pub mod ivm;

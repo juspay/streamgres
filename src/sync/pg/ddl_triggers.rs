@@ -50,6 +50,17 @@ pub fn trigger_stack_sql(app: &str, shard: u32, publications: &[&str]) -> String
         .replace("@APP@", &app_literal)
 }
 
+/// The SQL that removes the trigger stack [`trigger_stack_sql`] installs
+/// for `app` and `shard`: its two event triggers, then its schema.
+pub fn teardown_sql(app: &str, shard: u32) -> String {
+    format!(
+        "DROP EVENT TRIGGER IF EXISTS {start}; DROP EVENT TRIGGER IF EXISTS {end}; DROP SCHEMA IF EXISTS {schema} CASCADE;",
+        start = quote_ident(&format!("{app}_ddl_start_{shard}")),
+        end = quote_ident(&format!("{app}_ddl_end_{shard}")),
+        schema = quote_ident(&format!("{app}_{shard}")),
+    )
+}
+
 /// One function of the trigger stack: its name, argument types, body and
 /// language, so a setup can tell whether the installed one is current.
 pub struct FunctionSpec {
