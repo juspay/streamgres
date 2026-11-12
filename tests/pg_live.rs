@@ -66,6 +66,24 @@ impl Names {
         }
     }
 
+    /// Names suffixed with `tag`, the tables in `schema`: a scenario that
+    /// follows schema changes watches only its own schema, never the
+    /// tables other scenarios create and drop in `public` meanwhile.
+    fn in_schema(tag: &str, schema: &str) -> Self {
+        let names = Names::new(tag);
+        Names {
+            tickets: format!("{schema}.{}", names.tickets),
+            users: format!("{schema}.{}", names.users),
+            extra: format!("{schema}.{}", names.extra),
+            ..names
+        }
+    }
+
+    /// The schema of the scenario's tables, when it is not `public`.
+    fn schema(&self) -> Option<&str> {
+        self.tickets.split_once('.').map(|(schema, _)| schema)
+    }
+
     /// The catalog of the two tables.
     fn catalog(&self) -> Catalog {
         Catalog::new(vec![
@@ -176,9 +194,13 @@ async fn prepare(dsn: &str, names: &Names) -> Client {
     PgStream::drop_slot(dsn, &names.slot, &names.publication)
         .await
         .expect("drop slot");
+    let schema = names
+        .schema()
+        .map(|schema| format!("CREATE SCHEMA IF NOT EXISTS {schema};"))
+        .unwrap_or_default();
     client
         .batch_execute(&format!(
-            "DROP TABLE IF EXISTS {t}; DROP TABLE IF EXISTS {u}; DROP TABLE IF EXISTS {e};
+            "{schema} DROP TABLE IF EXISTS {t}; DROP TABLE IF EXISTS {u}; DROP TABLE IF EXISTS {e};
              CREATE TABLE {t} (id int8 PRIMARY KEY, status text, assigned_to int8, points int8);
              CREATE TABLE {u} (id int8 PRIMARY KEY, name text);
              CREATE PUBLICATION \"{p}\" FOR ALL TABLES;
@@ -1444,7 +1466,11 @@ fn an_idle_feed_brings_the_first_snapshot_into_use() {
         .expect("the service is ready within ten seconds of an idle feed");
         let (position, floor) = covered.expect("the service is still running");
         assert!(position >= floor && floor > Lsn(0));
-        assert_eq!(pg.alias_position(), Some(floor));
+        assert!(
+            pg.alias_position().is_some_and(|alias| alias >= floor),
+            "the snapshot in use is the floor or, rotated since, a later one: {:?} against {floor:?}",
+            pg.alias_position()
+        );
         feeding.abort();
         drop(commands);
         let _ = running.await;
@@ -1520,13 +1546,13 @@ fn schema_changes_follow_the_trigger() {
     let Some(dsn) = dsn() else { return };
     let _stack = StackGuard(dsn.clone());
     block_on(async {
-        let names = Names::new("ddl");
+        let names = Names::in_schema("ddl", "live_ddl");
         let client = prepare(&dsn, &names).await;
         let catalog = Arc::new(names.catalog());
         let handle = Arc::new(CatalogHandle::from_arc(catalog.clone()));
         let source = DdlSource {
             prefix: "xslive/0/ddl".to_owned(),
-            schemas: vec!["public".to_owned()],
+            schemas: vec!["live_ddl".to_owned()],
         };
         let stream = PgStream::open_with(
             &dsn,
