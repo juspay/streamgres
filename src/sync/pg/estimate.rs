@@ -183,9 +183,11 @@ pub fn batch(statements: &[&str], columns: &[(&str, &str)]) -> String {
             batch.push_str("; ");
         }
         batch.push_str(&format!(
-            "SELECT tablename, attname, null_frac, n_distinct FROM pg_stats \
-             WHERE schemaname = ANY (current_schemas(false)) \
-             AND (tablename, attname) IN ({}) ORDER BY inherited",
+            "SELECT name, attname, null_frac, n_distinct FROM ( \
+             SELECT CASE WHEN schemaname = 'public' THEN tablename::text \
+             ELSE schemaname::text || '.' || tablename::text END AS name, \
+             attname::text AS attname, null_frac, n_distinct, inherited FROM pg_stats) AS stats \
+             WHERE (name, attname) IN ({}) ORDER BY inherited",
             pairs.join(", ")
         ));
     }
@@ -667,6 +669,6 @@ mod tests {
             ]
         );
         let only_stats = super::batch(&[], &[("participants", "channelId")]);
-        assert!(only_stats.starts_with("SELECT tablename"), "{only_stats}");
+        assert!(only_stats.starts_with("SELECT name, attname"), "{only_stats}");
     }
 }

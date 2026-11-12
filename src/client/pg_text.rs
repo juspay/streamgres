@@ -1,7 +1,9 @@
 //! Postgres's text form of the raw values a Zero client is shown as text:
-//! the binary form of `interval`, `timetz`, `inet`, `cidr` and `macaddr`
-//! written as Postgres's output functions write it (`IntervalStyle`
-//! `postgres`). Other raw types have no text here.
+//! the binary form of `interval`, `timetz`, `inet`, `cidr`, `macaddr` and
+//! `tsvector` written as Postgres's output functions write it
+//! (`IntervalStyle` `postgres`), and `money` as its amount, as
+//! `money::numeric` gives it (the currency symbol and grouping of
+//! `lc_monetary` left out). Other raw types have no text here.
 
 use std::fmt::Write as _;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -13,6 +15,8 @@ const TIMETZ: u32 = 1266;
 const INET: u32 = 869;
 const CIDR: u32 = 650;
 const MACADDR: u32 = 829;
+const TSVECTOR: u32 = 3614;
+const MONEY: u32 = 790;
 
 /// The text Postgres writes for `raw`, when this module knows its type.
 pub fn raw_text(raw: &Raw) -> Option<String> {
@@ -22,6 +26,8 @@ pub fn raw_text(raw: &Raw) -> Option<String> {
         TIMETZ => timetz(bytes),
         INET | CIDR => inet(bytes, raw.type_oid == CIDR),
         MACADDR => macaddr(bytes),
+        TSVECTOR => tsvector(bytes),
+        MONEY => money(bytes),
         _ => None,
     }
 }
@@ -133,6 +139,58 @@ fn inet(bytes: &[u8], cidr: bool) -> Option<String> {
     }
 }
 
+/// A `tsvector`: its lexemes in order, each quoted, with its positions
+/// and their weights (`A`, `B`, `C`; `D` is written as none).
+fn tsvector(bytes: &[u8]) -> Option<String> {
+    let count = usize::try_from(i32_at(bytes, 0)?).ok()?;
+    let mut at = 4;
+    let mut lexemes = Vec::with_capacity(count);
+    for _ in 0..count {
+        let length = bytes.get(at..)?.iter().position(|byte| *byte == 0)?;
+        let lexeme = std::str::from_utf8(bytes.get(at..at + length)?).ok()?;
+        at += length + 1;
+        let positions = usize::from(u16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?));
+        at += 2;
+        let mut text = format!("'{}'", lexeme.replace('\\', "\\\\").replace('\'', "''"));
+        for index in 0..positions {
+            let entry = u16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?);
+            at += 2;
+            text.push(if index == 0 { ':' } else { ',' });
+            let _ = write!(text, "{}", entry & 0x3fff);
+            match entry >> 14 {
+                3 => text.push('A'),
+                2 => text.push('B'),
+                1 => text.push('C'),
+                _ => {}
+            }
+        }
+        lexemes.push(text);
+    }
+    (at == bytes.len()).then(|| lexemes.join(" "))
+}
+
+/// A `money` amount in the currency's units, with as many fraction
+/// digits as the database's `lc_monetary` gives it.
+fn money(bytes: &[u8]) -> Option<String> {
+    let cents = i64_at(bytes, 0)?;
+    if bytes.len() != 8 {
+        return None;
+    }
+    let scale = u32::from(crate::sync::pg::binary::money_scale());
+    if scale == 0 {
+        return Some(cents.to_string());
+    }
+    let unit = 10_u64.checked_pow(scale)?;
+    let magnitude = cents.unsigned_abs();
+    let sign = if cents < 0 { "-" } else { "" };
+    let width = usize::try_from(scale).ok()?;
+    Some(format!(
+        "{sign}{}.{:0width$}",
+        magnitude / unit,
+        magnitude % unit
+    ))
+}
+
 /// A `macaddr`: six bytes as lowercase hex pairs.
 fn macaddr(bytes: &[u8]) -> Option<String> {
     if bytes.len() != 6 {
@@ -219,9 +277,32 @@ mod tests {
     }
 
     #[test]
+    fn text_searches_and_amounts_read_as_postgres_gives_them() {
+        let mut vector = 2i32.to_be_bytes().to_vec();
+        vector.extend_from_slice(b"cat\0");
+        vector.extend_from_slice(&2u16.to_be_bytes());
+        vector.extend_from_slice(&(3u16 | (3 << 14)).to_be_bytes());
+        vector.extend_from_slice(&5u16.to_be_bytes());
+        vector.extend_from_slice(b"it's\0");
+        vector.extend_from_slice(&0u16.to_be_bytes());
+        assert_eq!(
+            raw_text(&raw(TSVECTOR, vector)).as_deref(),
+            Some("'cat':3A,5 'it''s'")
+        );
+        assert_eq!(
+            raw_text(&raw(MONEY, 123_456i64.to_be_bytes().to_vec())).as_deref(),
+            Some("1234.56")
+        );
+        assert_eq!(
+            raw_text(&raw(MONEY, (-5i64).to_be_bytes().to_vec())).as_deref(),
+            Some("-0.05")
+        );
+    }
+
+    #[test]
     fn malformed_or_unknown_values_have_no_text() {
         assert_eq!(raw_text(&raw(INTERVAL, vec![0; 3])), None);
         assert_eq!(raw_text(&raw(INET, vec![2, 32, 0, 4, 10])), None);
-        assert_eq!(raw_text(&raw(790, vec![0; 8])), None);
+        assert_eq!(raw_text(&raw(600, vec![0; 16])), None);
     }
 }

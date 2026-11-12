@@ -263,10 +263,13 @@ fn encoded(answer: &CachedRows) -> Option<Vec<Vec<Option<Vec<u8>>>>> {
                 .zip(&answer.columns)
                 .map(|(value, column)| match value {
                     Value::Null => Some(None),
-                    Value::List(items) if column.element_oid != 0 => {
-                        binary::encode_array(items, column.element_oid).map(Some)
+                    Value::List(items) => {
+                        let element = match column.element_oid {
+                            0 => binary::array_element(column.type_oid)?,
+                            known => known,
+                        };
+                        binary::encode_array(items, element).map(Some)
                     }
-                    Value::List(_) => None,
                     value => binary::encode(value, column.type_oid).map(Some),
                 })
                 .collect()

@@ -64,6 +64,13 @@ pub async fn load_catalog(
         pkeys.entry((schema, table)).or_default().push(column);
     }
     let default_collation = database_collation(client).await?;
+    let money_scale: i32 = client
+        .query_one("SELECT scale('0'::money::numeric)::int4", &[])
+        .await?
+        .get(0);
+    if let Ok(scale) = u8::try_from(money_scale) {
+        super::binary::set_money_scale(scale);
+    }
     let mut declared: BTreeMap<(String, String), Vec<DbColumn>> = BTreeMap::new();
     let mut notes = Vec::new();
     for row in &columns {

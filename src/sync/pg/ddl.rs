@@ -142,7 +142,12 @@ impl PublishedTable {
                     ));
                 }
                 Some(r#type) => {
-                    columns.push(DbColumn::new(name.as_str(), r#type).with_type_oid(type_oid))
+                    let element = super::binary::array_element(type_oid).unwrap_or(0);
+                    columns.push(
+                        DbColumn::new(name.as_str(), r#type)
+                            .with_type_oid(type_oid)
+                            .with_element_oid(element),
+                    )
                 }
                 None if self.primary_key.iter().any(|key| key == name) => {
                     return Err(format!(
@@ -434,7 +439,9 @@ fn column_changes(held: &DbTable, published: &PublishedTable) -> Result<Vec<Sche
             }
             Some(after) => {
                 let now = column_type(after);
-                if now.as_ref() != Some(&column.r#type) {
+                let a_domain_seen_by_its_name = after.pg_type_class.as_deref() == Some("d")
+                    && now == Some(ValueType::Raw);
+                if now.as_ref() != Some(&column.r#type) && !a_domain_seen_by_its_name {
                     return Err(format!(
                         "column `{column_name}` of `{name}` changed type to {} ({:?} from {:?})",
                         after.data_type, now, column.r#type

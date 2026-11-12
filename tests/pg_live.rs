@@ -1939,7 +1939,7 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
                    n numeric(30, 4), b bool, t text, vc varchar(10), ch char(3), u uuid,
                    j json, jb jsonb, ts timestamp, tz timestamptz, d date, tm time,
                    by bytea, iv interval, ints int4[], texts text[], mood live_exact.mood,
-                   addr inet);
+                   addr inet, tv tsvector, cash money);
                  CREATE PUBLICATION \"{publication}\" FOR TABLE {table};"
             ))
             .await
@@ -1967,10 +1967,11 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
                     '00010203-0405-0607-0809-0a0b0c0d0e0f', '{{ \"b\":1.50, \"a\":2 }}',
                     '{{\"a\": 1.50}}', '2026-09-11 10:00:00.123456', '2026-09-11 10:00:00.5+05:30',
                     '2026-09-11', '23:59:59.999999', '\\x00ff10', '1 year 2 days 03:04:05',
-                    '{{1,NULL,3}}', '{{\"a b\",c}}', 'busy', '10.0.0.1/8'),
+                    '{{1,NULL,3}}', '{{\"a b\",c}}', 'busy', '10.0.0.1/8',
+                    'a fat cat:3A sat:5,7B it''s', '-1234.56'),
                    (2, NULL, NULL, 'NaN', '-Infinity', 'NaN', NULL, NULL, NULL, NULL, NULL,
                     NULL, NULL, 'infinity', '-infinity', 'infinity', NULL, '\\x', NULL,
-                    '{{}}', NULL, NULL, NULL);"
+                    '{{}}', NULL, NULL, NULL, NULL, NULL);"
             ))
             .await
             .expect("insert");
@@ -2041,6 +2042,25 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
             Value::List(vec![Value::Int(1), Value::Null, Value::Int(3)])
         );
         assert_eq!(cell("ch"), Value::from("ab "));
+        #[cfg(feature = "server")]
+        let expected = client
+            .query_one(
+                &format!(
+                    "SELECT iv::text, addr::text, tv::text, cash::numeric::text FROM {table} WHERE id = 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("Postgres's text");
+        #[cfg(feature = "server")]
+        for (index, column) in ["iv", "addr", "tv", "cash"].into_iter().enumerate() {
+            let Value::Raw(raw) = cell(column) else {
+                panic!("{column} is raw");
+            };
+            let shown = streamgres::client::pg_text::raw_text(&raw);
+            let postgres: String = expected.get(index);
+            assert_eq!(shown.as_deref(), Some(postgres.as_str()), "{column}");
+        }
 
         let second = &read.rows[1].1.data;
         let cell = |name: &str| second.get(&ColumnName::from(name)).cloned().unwrap_or(Value::Null);

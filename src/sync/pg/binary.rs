@@ -41,6 +41,20 @@ pub mod oid {
     pub const JSONB: u32 = 3802;
 }
 
+/// The fraction digits of the database's currency (`lc_monetary`), which
+/// a `money` value's integer counts in; read with the catalog.
+static MONEY_SCALE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// The fraction digits a `money` value counts in.
+pub fn money_scale() -> u8 {
+    MONEY_SCALE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Records the fraction digits of the database's currency.
+pub fn set_money_scale(scale: u8) {
+    MONEY_SCALE.store(scale, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The version byte `jsonb_send` writes before the text.
 const JSONB_VERSION: u8 = 1;
 
@@ -82,6 +96,36 @@ impl CellDecoder for PgBinary {
     fn decode(&self, declared: &ValueType, cell: PgCell<'_>) -> Result<Value, CodecError> {
         decode(declared, cell.type_oid, cell.bytes)
     }
+}
+
+/// The element type of a built-in array type: what an array column's
+/// values are written as when the catalog has not said (a column a schema
+/// change added). `None` for any other type.
+pub fn array_element(type_oid: u32) -> Option<u32> {
+    Some(match type_oid {
+        1000 => oid::BOOL,
+        1001 => oid::BYTEA,
+        1002 => oid::CHAR,
+        1003 => oid::NAME,
+        1005 => oid::INT2,
+        1007 => oid::INT4,
+        1009 => oid::TEXT,
+        1014 => oid::BPCHAR,
+        1015 => oid::VARCHAR,
+        1016 => oid::INT8,
+        1021 => oid::FLOAT4,
+        1022 => oid::FLOAT8,
+        1115 => oid::TIMESTAMP,
+        1182 => oid::DATE,
+        1183 => oid::TIME,
+        1185 => oid::TIMESTAMPTZ,
+        1231 => oid::NUMERIC,
+        199 => oid::JSON,
+        2951 => oid::UUID,
+        3807 => oid::JSONB,
+        1028 => oid::OID,
+        _ => return None,
+    })
 }
 
 /// The engine's type for a column of `type_oid`, when the engine
@@ -479,6 +523,13 @@ mod tests {
             PgBinary.decode(&ValueType::Int, cell).unwrap(),
             Value::Int(5)
         );
+    }
+
+    #[test]
+    fn built_in_arrays_name_their_element() {
+        assert_eq!(array_element(1007), Some(oid::INT4));
+        assert_eq!(array_element(1009), Some(oid::TEXT));
+        assert_eq!(array_element(oid::INT4), None);
     }
 
     #[test]
