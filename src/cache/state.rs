@@ -46,7 +46,12 @@ pub(super) struct Entry {
     pub query: MultiTableReadQuery,
     pub sub: Option<SubId>,
     pub fill: Fill,
-    pub rows: HashMap<DataFrameKey, DataFrameRow>,
+    pub rows: HashMap<DataFrameKey, Arc<DataFrameRow>>,
+    /// The rows in the query's order, kept until they next change.
+    pub ordered: Option<Arc<[Arc<DataFrameRow>]>>,
+    /// Bumped by every change of the rows, so an ordering built from an
+    /// older snapshot is not kept.
+    pub generation: u64,
     pub last_read: Instant,
 }
 
@@ -207,6 +212,8 @@ impl State {
                 sub: None,
                 fill: Fill::Pending,
                 rows: HashMap::new(),
+                ordered: None,
+                generation: 0,
                 last_read: Instant::now(),
             },
         );
@@ -323,6 +330,10 @@ impl State {
     /// Applies the engine's row changes to the entries they concern.
     fn apply(&mut self, updates: &[Delta]) {
         for delta in updates {
+            let added = match &delta.op {
+                DataFrameOperation::Add(_, row) => Some(Arc::new(row.clone())),
+                DataFrameOperation::Delete(..) => None,
+            };
             for target in delta.targets() {
                 if target.part != QueryPart::main() {
                     continue;
@@ -334,14 +345,17 @@ impl State {
                 else {
                     continue;
                 };
-                match &delta.op {
-                    DataFrameOperation::Add(key, row) => {
+                match (&delta.op, &added) {
+                    (DataFrameOperation::Add(key, _), Some(row)) => {
                         entry.rows.insert(key.clone(), row.clone());
                     }
-                    DataFrameOperation::Delete(key, _) => {
+                    (DataFrameOperation::Delete(key, _), _) => {
                         entry.rows.remove(key);
                     }
+                    (DataFrameOperation::Add(..), None) => continue,
                 }
+                entry.ordered = None;
+                entry.generation += 1;
             }
         }
     }

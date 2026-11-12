@@ -1,11 +1,16 @@
 //! A read's answer, built from the rows a query keeps: in the statement's
 //! order, its offset skipped, its limit applied, its projection taken.
+//!
+//! The ordering is the costly part, so it is done once per change of a
+//! query's rows, not once per read: [`ordered`] sorts a snapshot of the
+//! rows, the entry keeps the result until its rows change again, and each
+//! read only slices it ([`answer`]).
 
-use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::Refusal;
 use crate::ivm::order_rows;
-use crate::model::{ColumnName, DataFrameKey, DataFrameRow, DbTable, Value, ValueType};
+use crate::model::{ColumnName, DataFrameRow, DbTable, Order, OrderBy, Value, ValueType};
 use crate::parser::{Projection, Select};
 use crate::sync::pg::binary::oid;
 
@@ -26,16 +31,34 @@ pub struct CachedRows {
     pub rows: Vec<Vec<Value>>,
 }
 
-/// The answer to `select` over `table` from the rows its query keeps.
-pub(super) fn build(
-    kept: &HashMap<DataFrameKey, DataFrameRow>,
+/// `rows` in `order`, ties settled by `table`'s primary key ascending so a
+/// repeated read returns them the same way.
+pub(super) fn ordered(
+    mut rows: Vec<Arc<DataFrameRow>>,
+    order: &[OrderBy],
+    table: &DbTable,
+) -> Arc<[Arc<DataFrameRow>]> {
+    let by_key: Vec<OrderBy> = table
+        .pkey
+        .iter()
+        .map(|column| OrderBy::new(column.clone(), Order::ASC))
+        .collect();
+    rows.sort_unstable_by(|a, b| order_rows(order, a, b).then_with(|| order_rows(&by_key, a, b)));
+    rows.into()
+}
+
+/// The answer to `select` over `table` from its query's rows in order,
+/// `count` of them in all.
+pub(super) fn answer(
+    ordered: &[Arc<DataFrameRow>],
+    count: usize,
     select: &Select,
     table: &DbTable,
 ) -> Result<CachedRows, Refusal> {
     let start = usize::try_from(select.offset).unwrap_or(usize::MAX);
     let take = usize::try_from(select.limit).unwrap_or(usize::MAX);
     if select.projection == Projection::CountStar {
-        let count = i64::try_from(kept.len())
+        let count = i64::try_from(count)
             .map_err(|_| Refusal::Unsupported("the count is out of range".to_owned()))?;
         let rows = std::iter::once(vec![Value::Int(count)])
             .skip(start)
@@ -51,12 +74,12 @@ pub(super) fn build(
         });
     }
 
-    let names: Vec<ColumnName> = match &select.projection {
-        Projection::Columns(names) => names.clone(),
-        Projection::All | Projection::CountStar => table.declared().to_vec(),
+    let names: &[ColumnName] = match &select.projection {
+        Projection::Columns(names) => names,
+        Projection::All | Projection::CountStar => table.declared(),
     };
     let mut columns = Vec::with_capacity(names.len());
-    for name in &names {
+    for name in names {
         let column = table
             .column(name.as_str())
             .ok_or_else(|| Refusal::Unsupported(format!("unknown column `{name}`")))?;
@@ -76,17 +99,11 @@ pub(super) fn build(
             element_oid: column.element_oid,
         });
     }
-
-    let mut ordered: Vec<(&DataFrameKey, &DataFrameRow)> = kept.iter().collect();
-    ordered.sort_by(|a, b| {
-        order_rows(&select.query.order_by, a.1, b.1)
-            .then_with(|| crate::ivm::order_rows(&key_order(table), a.1, b.1))
-    });
     let rows = ordered
-        .into_iter()
+        .iter()
         .skip(start)
         .take(take)
-        .map(|(_, row)| {
+        .map(|row| {
             names
                 .iter()
                 .map(|name| row.data.get(name).cloned().unwrap_or(Value::Null))
@@ -94,14 +111,4 @@ pub(super) fn build(
         })
         .collect();
     Ok(CachedRows { columns, rows })
-}
-
-/// The table's primary key ascending, which settles rows the statement's
-/// order ties, so a repeated read returns them the same way.
-fn key_order(table: &DbTable) -> Vec<crate::model::OrderBy> {
-    table
-        .pkey
-        .iter()
-        .map(|column| crate::model::OrderBy::new(column.clone(), crate::model::Order::ASC))
-        .collect()
 }

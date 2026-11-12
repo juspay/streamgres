@@ -147,7 +147,26 @@ impl Cache {
             match &entry.fill {
                 Fill::Ready => {
                     entry.last_read = Instant::now();
-                    return rows::build(&entry.rows, &select, table);
+                    let count = entry.rows.len();
+                    if let Some(ordered) = entry.ordered.clone() {
+                        drop(state);
+                        return rows::answer(&ordered, count, &select, table);
+                    }
+                    if select.projection == crate::parser::Projection::CountStar {
+                        return rows::answer(&[], count, &select, table);
+                    }
+                    let generation = entry.generation;
+                    let snapshot: Vec<_> = entry.rows.values().cloned().collect();
+                    drop(state);
+                    let ordered = rows::ordered(snapshot, &select.query.order_by, table);
+                    let mut state = self.shared.lock();
+                    if let Some(entry) = state.entries.get_mut(&id)
+                        && entry.generation == generation
+                    {
+                        entry.ordered = Some(ordered.clone());
+                    }
+                    drop(state);
+                    return rows::answer(&ordered, count, &select, table);
                 }
                 Fill::Refused(reason) => return Err(Refusal::Unsupported(reason.clone())),
                 Fill::Pending => {}
