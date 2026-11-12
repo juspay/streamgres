@@ -99,7 +99,10 @@ fn reads_are_answered_and_kept_current() {
         cache
             .read(&by_merchant, &[text(merchant), int8(10)], &reader)
             .expect("served")
-            .rows
+            .rows()
+            .iter()
+            .map(|row| row.to_vec())
+            .collect::<Vec<_>>()
     };
     assert_eq!(
         read("m1"),
@@ -140,7 +143,7 @@ fn reads_are_answered_and_kept_current() {
     let count = cache
         .read(&format!(r#"SELECT COUNT(*) FROM "{TABLE}""#), &[], &reader)
         .expect("counted");
-    assert_eq!(count.rows, vec![vec![Value::Int(3)]]);
+    assert_eq!(count.rows(), [Box::from([Value::Int(3)])]);
 
     let refused = cache.read(
         &format!(r#"SELECT * FROM "{TABLE}" WHERE "{TABLE}"."note" = $1"#),
@@ -173,7 +176,7 @@ fn reads_are_answered_and_kept_current() {
         ["id", "merchant", "amount", "note"],
         "in the table's own order"
     );
-    assert_eq!(whole.rows[0][3], Value::from("b   "));
+    assert_eq!(whole.rows()[0][3], Value::from("b   "));
 
     let count_sql = format!(r#"SELECT COUNT(*) FROM "{TABLE}""#);
     runtime
@@ -259,7 +262,7 @@ fn a_lost_slot_brings_a_fresh_engine() {
     cache.wait_ready(Duration::from_secs(30)).expect("up");
     let reader = reader_of(&runtime, &client, &cache);
     let sql = format!(r#"SELECT "{table}"."id" FROM "{table}""#);
-    assert_eq!(cache.read(&sql, &[], &reader).unwrap().rows.len(), 1);
+    assert_eq!(cache.read(&sql, &[], &reader).unwrap().rows().len(), 1);
 
     let slot = cache.slot().expect("running on a slot");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -301,7 +304,7 @@ fn a_lost_slot_brings_a_fresh_engine() {
             "a reader checked against the engine before is checked again"
         );
         if let Ok(rows) = cache.read(&sql, &[], &fresh)
-            && rows.rows.len() == 2
+            && rows.rows().len() == 2
         {
             break;
         }
@@ -365,7 +368,7 @@ fn read_latency() {
             let started = std::time::Instant::now();
             let rows = cache.read(sql, &binds, &reader).expect("served");
             cached.push(started.elapsed());
-            assert_eq!(rows.rows.len(), 20);
+            assert_eq!(rows.rows().len(), 20);
         }
         let statement = runtime.block_on(client.prepare(sql)).unwrap();
         let mut postgres = Vec::with_capacity(2_000);
@@ -429,7 +432,7 @@ fn a_change_of_spelling_alone_reaches_the_cache() {
     cache.wait_ready(Duration::from_secs(30)).unwrap();
     let reader = reader_of(&runtime, &client, &cache);
     let sql = r#"SELECT "live_spelling"."n", "live_spelling"."doc" FROM "live_spelling""#;
-    let spelled = |rows: &streamgres::cache::CachedRows| match (&rows.rows[0][0], &rows.rows[0][1])
+    let spelled = |rows: &streamgres::cache::CachedRows| match (&rows.rows()[0][0], &rows.rows()[0][1])
     {
         (Value::Numeric(n), Value::Json(doc)) => (n.to_string(), doc.text().to_owned()),
         other => panic!("{other:?}"),
@@ -460,6 +463,92 @@ fn a_change_of_spelling_alone_reaches_the_cache() {
     runtime
         .block_on(client.batch_execute(&format!(
             "{teardown} DROP PUBLICATION live_spelling_pub; DROP TABLE live_spelling;"
+        )))
+        .unwrap();
+}
+
+/// A column the engine absorbs leaves the table's other columns as the
+/// catalog carried them: their types and collations still decide what is
+/// answered (an order by a `C` text, the new column's values) and what is
+/// refused (a `char(n)` comparison), as before the migration.
+#[test]
+fn an_absorbed_column_keeps_the_table_answerable() {
+    let _serial = serial();
+    let Ok(dsn) = std::env::var("STREAMGRES_PG_DSN") else {
+        return;
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let client = runtime.block_on(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(connection);
+        client
+    });
+    let mut config = CacheConfig::new(dsn.clone(), "live_widen_pub");
+    config.app = "streamgres_widen".to_owned();
+    runtime
+        .block_on(client.batch_execute(&format!(
+            "DROP PUBLICATION IF EXISTS live_widen_pub; DROP TABLE IF EXISTS live_widen;
+             CREATE TABLE live_widen (id int8 PRIMARY KEY, name text COLLATE \"C\" NOT NULL, code char(4));
+             INSERT INTO live_widen VALUES (1, 'b', 'ab'), (2, 'a', 'cd');
+             CREATE PUBLICATION live_widen_pub FOR TABLE live_widen;
+             {}",
+            config.setup_sql()
+        )))
+        .unwrap();
+    let teardown = config.teardown_sql();
+    let cache = Cache::start(config);
+    cache.wait_ready(Duration::from_secs(30)).unwrap();
+    let ordered = r#"SELECT "live_widen"."id" FROM "live_widen" ORDER BY "live_widen"."name""#;
+    let by_code = r#"SELECT "live_widen"."id" FROM "live_widen" WHERE "live_widen"."code" = $1"#;
+    let note = r#"SELECT "live_widen"."id", "live_widen"."note" FROM "live_widen" ORDER BY "live_widen"."id""#;
+    let code = Bind {
+        type_oid: 1042,
+        bytes: Some(b"ab".to_vec()),
+    };
+    let reader = reader_of(&runtime, &client, &cache);
+    let ids = |rows: streamgres::cache::CachedRows| -> Vec<Value> {
+        rows.rows().iter().map(|row| row[0].clone()).collect()
+    };
+    assert_eq!(
+        ids(cache.read(ordered, &[], &reader).unwrap()),
+        vec![Value::Int(2), Value::Int(1)]
+    );
+    assert!(cache.read(by_code, std::slice::from_ref(&code), &reader).is_err());
+
+    runtime
+        .block_on(client.batch_execute(
+            "ALTER TABLE live_widen ADD COLUMN note text NOT NULL DEFAULT 'none'",
+        ))
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let widened = loop {
+        let reader = reader_of(&runtime, &client, &cache);
+        if let Ok(rows) = cache.read(note, &[], &reader) {
+            break (reader, rows);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the new column was never answered"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let (reader, rows) = widened;
+    assert_eq!(rows.columns[1].type_oid, 25, "the new column's type");
+    assert_eq!(rows.rows()[0][1], Value::from("none"));
+    assert_eq!(
+        ids(cache
+            .read(ordered, &[], &reader)
+            .expect("the held columns keep their types and collations")),
+        vec![Value::Int(2), Value::Int(1)]
+    );
+    assert!(
+        cache.read(by_code, &[code], &reader).is_err(),
+        "char(n) still compares otherwise than the engine"
+    );
+    cache.stop();
+    runtime
+        .block_on(client.batch_execute(&format!(
+            "{teardown} DROP PUBLICATION live_widen_pub; DROP TABLE live_widen;"
         )))
         .unwrap();
 }

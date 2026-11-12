@@ -62,14 +62,11 @@ pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
     )
 }
 
-/// `table` with `column` added: the same name and key, one column more.
+/// `table` with `column` added: the same name, key and columns, each as
+/// it was, and one column more.
 pub fn with_column(table: &DbTable, column: DbColumn) -> DbTable {
-    let mut columns: Vec<DbColumn> = table
-        .columns
-        .values()
-        .map(|held| DbColumn::new(held.name.clone(), held.r#type.clone()))
-        .collect();
-    columns.push(DbColumn::new(column.name, column.r#type));
+    let mut columns: Vec<DbColumn> = table.columns.values().cloned().collect();
+    columns.push(column);
     DbTable::new(table.name.clone(), table.pkey.iter().cloned(), columns)
 }
 
@@ -87,14 +84,31 @@ mod tests {
             ["id"],
             vec![
                 DbColumn::new("id", ValueType::Int),
-                DbColumn::new("status", ValueType::String),
+                DbColumn::new("status", ValueType::String)
+                    .with_type_oid(25)
+                    .with_collation(crate::model::Collation {
+                        name: "C".to_owned(),
+                        deterministic: true,
+                    }),
             ],
         );
         let handle = CatalogHandle::new(Catalog::new(vec![tickets.clone()]));
         let before = handle.load();
         assert!(handle.holds(&before));
-        let wider = with_column(&tickets, DbColumn::new("owner", ValueType::String));
+        let wider = with_column(
+            &with_table(&before, tickets.clone())
+                .table("tickets")
+                .cloned()
+                .unwrap(),
+            DbColumn::new("owner", ValueType::String).with_type_oid(25),
+        );
         assert_eq!(wider.pkey, tickets.pkey);
+        assert_eq!(
+            wider.column("status").map(|c| (c.type_oid, c.collation.clone())),
+            tickets.column("status").map(|c| (c.type_oid, c.collation.clone())),
+            "the held columns keep their types and collations"
+        );
+        assert_eq!(wider.column("owner").map(|c| c.type_oid), Some(25));
         assert!(wider.column("owner").is_some() && wider.column("status").is_some());
         assert_eq!(
             wider

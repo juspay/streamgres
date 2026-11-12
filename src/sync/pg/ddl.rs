@@ -21,7 +21,7 @@ use tokio_postgres::Client;
 use super::catalog::{scalar_type, table_name};
 use super::text;
 use crate::ivm::SchemaChange;
-use crate::model::{Catalog, DbColumn, DbTable, TableName, Value, ValueType};
+use crate::model::{Catalog, Collation, DbColumn, DbTable, TableName, Value, ValueType};
 use crate::sync::catalog::{with_column, with_table};
 use crate::sync::storage::StorageError;
 
@@ -80,16 +80,56 @@ pub struct PublishedTable {
 
 /// One published column: its type as `pg_type` names it (an array as
 /// `text[]`) and its OID, the type's class (`e` for an enum), and its
-/// default expression's text when it has one.
-#[derive(Debug, Deserialize)]
+/// default expression's text when it has one. A trigger stack installed
+/// by this version also sends the base type's OID (a domain's, resolved),
+/// an array's element OID and the collation by name (`default` resolved
+/// as the startup catalog resolves it); an older one sends only whether
+/// the collation is deterministic.
+#[derive(Debug, Default, Deserialize)]
 pub struct PublishedColumn {
     #[serde(rename = "dataType")]
     pub data_type: String,
     #[serde(rename = "typeOID", default)]
     pub type_oid: Option<i64>,
+    #[serde(rename = "baseTypeOID", default)]
+    pub base_type_oid: Option<i64>,
+    #[serde(rename = "elementOID", default)]
+    pub element_oid: Option<i64>,
+    #[serde(default)]
+    pub collation: Option<String>,
+    #[serde(rename = "collationIsDeterministic", default)]
+    pub collation_is_deterministic: Option<bool>,
     #[serde(rename = "pgTypeClass")]
     pub pg_type_class: Option<String>,
     pub dflt: Option<String>,
+}
+
+impl PublishedColumn {
+    /// The column as the startup catalog carries it: the base type's OID,
+    /// the element's OID for an array, and the collation. Without the
+    /// collation's name, a collatable column gets a nameless collation,
+    /// under which text compares for equality only.
+    pub fn to_db_column(&self, name: &str, r#type: ValueType) -> DbColumn {
+        let oid = |value: Option<i64>| value.and_then(|oid| u32::try_from(oid).ok());
+        let type_oid = oid(self.base_type_oid).or(oid(self.type_oid)).unwrap_or(0);
+        let element_oid = oid(self.element_oid)
+            .or_else(|| super::binary::array_element(type_oid))
+            .unwrap_or(0);
+        let column = DbColumn::new(name, r#type)
+            .with_type_oid(type_oid)
+            .with_element_oid(element_oid);
+        match (&self.collation, self.collation_is_deterministic) {
+            (Some(collation), deterministic) => column.with_collation(Collation {
+                name: collation.clone(),
+                deterministic: deterministic.unwrap_or(true),
+            }),
+            (None, Some(deterministic)) => column.with_collation(Collation {
+                name: String::new(),
+                deterministic,
+            }),
+            (None, None) => column,
+        }
+    }
 }
 
 impl DdlMessage {
@@ -126,10 +166,6 @@ impl PublishedTable {
         }
         let mut columns = Vec::with_capacity(self.columns.len());
         for (name, column) in &self.columns {
-            let type_oid = column
-                .type_oid
-                .and_then(|oid| u32::try_from(oid).ok())
-                .unwrap_or(0);
             match column_type(column) {
                 Some(r#type)
                     if self.primary_key.iter().any(|key| key == name)
@@ -141,14 +177,7 @@ impl PublishedTable {
                         column.data_type
                     ));
                 }
-                Some(r#type) => {
-                    let element = super::binary::array_element(type_oid).unwrap_or(0);
-                    columns.push(
-                        DbColumn::new(name.as_str(), r#type)
-                            .with_type_oid(type_oid)
-                            .with_element_oid(element),
-                    )
-                }
+                Some(r#type) => columns.push(column.to_db_column(name, r#type)),
                 None if self.primary_key.iter().any(|key| key == name) => {
                     return Err(format!(
                         "{}: key column `{name}` has an uncarried type {}",
@@ -473,7 +502,7 @@ fn column_changes(held: &DbTable, published: &PublishedTable) -> Result<Vec<Sche
         };
         changes.push(SchemaChange::ColumnAdded {
             table: TableName::from(name.as_str()),
-            column: DbColumn::new(column_name.as_str(), r#type),
+            column: column.to_db_column(column_name, r#type),
             value,
             schema: held.row_schema().clone(),
         });
@@ -623,14 +652,52 @@ mod tests {
         );
     }
 
+    /// A published column carries what the startup catalog carries: the
+    /// base type of a domain, an array's element, the collation; from an
+    /// older trigger stack, a collation known only as deterministic or
+    /// not, which compares for equality at most.
+    #[test]
+    fn published_columns_carry_their_types_and_collations() {
+        let message: PublishedColumn = serde_json::from_str(
+            r#"{"dataType": "email", "typeOID": 90001, "baseTypeOID": 25, "elementOID": 0,
+                "collation": "en_US.UTF-8", "collationIsDeterministic": true, "pgTypeClass": "d"}"#,
+        )
+        .unwrap();
+        let column = message.to_db_column("email", ValueType::String);
+        assert_eq!((column.type_oid, column.element_oid), (25, 0));
+        assert_eq!(
+            column.collation,
+            Some(Collation {
+                name: "en_US.UTF-8".to_owned(),
+                deterministic: true
+            })
+        );
+
+        let array: PublishedColumn = serde_json::from_str(
+            r#"{"dataType": "ticket_status[]", "typeOID": 90003, "baseTypeOID": 90003,
+                "elementOID": 90002, "pgTypeClass": "b"}"#,
+        )
+        .unwrap();
+        let column = array.to_db_column("statuses", ValueType::List(Box::new(ValueType::String)));
+        assert_eq!((column.type_oid, column.element_oid, column.collation), (90003, 90002, None));
+
+        let older: PublishedColumn = serde_json::from_str(
+            r#"{"dataType": "text", "typeOID": 25, "collationIsDeterministic": false, "pgTypeClass": "b"}"#,
+        )
+        .unwrap();
+        let column = older.to_db_column("name", ValueType::String);
+        assert_eq!(column.type_oid, 25);
+        let collation = column.collation.expect("a collation");
+        assert!(!collation.deterministic && !collation.orders_bytewise());
+    }
+
     /// Published types map as the startup catalog maps them.
     #[test]
     fn published_types_map_like_the_catalog() {
         let column = |data_type: &str, class: &str| PublishedColumn {
             data_type: data_type.to_owned(),
-            type_oid: None,
             pg_type_class: Some(class.to_owned()),
-            dflt: None,
+            ..PublishedColumn::default()
         };
         assert_eq!(column_type(&column("int8", "b")), Some(ValueType::Int));
         assert_eq!(

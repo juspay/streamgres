@@ -19,6 +19,28 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION "xyne_0".default_collation()
+RETURNS TEXT
+STABLE
+AS $$
+DECLARE
+  resolved TEXT;
+BEGIN
+  IF current_setting('server_version_num')::int >= 170000 THEN
+    EXECUTE $q$SELECT CASE datlocprovider WHEN 'i' THEN 'icu:' || COALESCE(datlocale, '')
+                      WHEN 'b' THEN COALESCE(datlocale, '') ELSE datcollate::text END
+               FROM pg_database WHERE datname = current_database()$q$ INTO resolved;
+  ELSIF current_setting('server_version_num')::int >= 150000 THEN
+    EXECUTE $q$SELECT CASE datlocprovider WHEN 'i' THEN 'icu:' || COALESCE(daticulocale, '')
+                      ELSE datcollate::text END
+               FROM pg_database WHERE datname = current_database()$q$ INTO resolved;
+  ELSE
+    SELECT datcollate::text INTO resolved FROM pg_database WHERE datname = current_database();
+  END IF;
+  RETURN resolved;
+END
+$$ LANGUAGE plpgsql;
+
 DROP FUNCTION IF EXISTS "xyne_0".schema_specs();
 CREATE FUNCTION "xyne_0".schema_specs()
 RETURNS JSON
@@ -34,6 +56,10 @@ WITH published_columns AS (SELECT
   attname AS "col",
   pt.typname AS "type",
   atttypid::int8 AS "typeOID",
+  base_pt.oid::int8 AS "baseTypeOID",
+  base_pt.typelem::int8 AS "elementOID",
+  CASE WHEN coll.collname = 'default' THEN "xyne_0".default_collation()
+       ELSE coll.collname::text END AS "collation",
   pt.typtype,
   elem_pt.typtype AS "elemTyptype",
   coll.collisdeterministic AS "collationIsDeterministic",
@@ -48,6 +74,7 @@ FROM pg_attribute
 JOIN pg_class pc ON pc.oid = attrelid
 JOIN pg_namespace pns ON pns.oid = relnamespace
 JOIN pg_type pt ON atttypid = pt.oid
+JOIN pg_type base_pt ON base_pt.oid = COALESCE(NULLIF(pt.typbasetype, 0), pt.oid)
 LEFT JOIN pg_type elem_pt ON elem_pt.oid = pt.typelem
 LEFT JOIN pg_collation coll ON coll.oid = pg_attribute.attcollation
 JOIN pg_publication_tables as pb ON
@@ -77,6 +104,9 @@ tables AS (SELECT json_build_object(
       'pgTypeClass', "typtype",
       'elemPgTypeClass', "elemTyptype",
       'typeOID', "typeOID",
+      'baseTypeOID', "baseTypeOID",
+      'elementOID', "elementOID",
+      'collation', "collation",
       'collationIsDeterministic', "collationIsDeterministic",
       'characterMaximumLength', CASE WHEN "typeOID" = 1043 OR "typeOID" = 1042
                                      THEN "maxLen" - 4
