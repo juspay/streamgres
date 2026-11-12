@@ -135,10 +135,14 @@ impl Value {
 
     /// Equality backing the `EQ` / `NEQ` / `IN` / `NOT_IN` operators:
     /// strict equality plus numeric coercion between `Int`, `Float` and
-    /// `Numeric`, so `Int(5)` equals `Float(5.0)` and `Numeric(5.00)`.
+    /// `Numeric`, so `Int(5)` equals `Float(5.0)` and `Numeric(5.00)`, and
+    /// a float equals a numeric as Postgres casts the numeric to `float8`.
     pub fn loose_eq(&self, other: &Value) -> bool {
         match (self, other) {
-            (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
+            (Value::Int(_), Value::Float(_))
+            | (Value::Float(_), Value::Int(_))
+            | (Value::Float(_), Value::Numeric(_))
+            | (Value::Numeric(_), Value::Float(_)) => {
                 self.compare(other) == Some(Ordering::Equal)
             }
             (Value::Null, _) | (_, Value::Null) => self == other,
@@ -327,8 +331,11 @@ impl Value {
     /// The key under which a value takes part in equality tests: `None` for
     /// `NULL` (which equals nothing), the integer for an integral float
     /// within exact range (the coercion of [`Value::loose_eq`]), the value
-    /// itself otherwise. Two values are `loose_eq` iff their keys are equal,
-    /// which is what lets hash maps and sets stand in for equality tests.
+    /// itself otherwise. Two values of one column's type are `loose_eq` iff
+    /// their keys are equal, which is what lets hash maps and sets stand in
+    /// for equality tests. A float and a non-integral numeric keep keys of
+    /// their own, so a condition's value must have its column's type: the
+    /// parsers bring every literal and parameter to it.
     pub fn equality_key(&self) -> Option<Value> {
         self.equality_key_ref().map(std::borrow::Cow::into_owned)
     }
@@ -548,6 +555,7 @@ mod tests {
         assert_eq!(hash_of(&n("1.50")), hash_of(&n("1.5")));
         assert_eq!(n("2").equality_key(), Some(Value::Int(2)));
         assert_eq!(Value::Int(3).compare(&n("2.5")), Some(Ordering::Greater));
+        assert!(Value::Float(0.1).loose_eq(&n("0.10")));
     }
 
     /// Raw values compare with nothing, and equal only the same type and
