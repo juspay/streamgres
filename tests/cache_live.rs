@@ -112,7 +112,10 @@ fn reads_are_answered_and_kept_current() {
             .unwrap()
             .get(0);
         assert!(
-            cache.wait_for(Position::from(streamgres::sync::pg::Lsn::parse(&at).unwrap()), Duration::from_secs(10)),
+            cache.wait_for(
+                Position::from(streamgres::sync::pg::Lsn::parse(&at).unwrap()),
+                Duration::from_secs(10)
+            ),
             "the engine reaches the write"
         );
     };
@@ -300,6 +303,83 @@ fn a_lost_slot_brings_a_fresh_engine() {
     runtime
         .block_on(client.batch_execute(&format!(
             "{teardown} DROP PUBLICATION IF EXISTS {publication}; DROP TABLE IF EXISTS {table};"
+        )))
+        .unwrap();
+}
+
+/// How long a hot read takes from the cache and from Postgres: run with
+/// `cargo test --release --test cache_live -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn read_latency() {
+    let Ok(dsn) = std::env::var("STREAMGRES_PG_DSN") else {
+        return;
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let client = runtime.block_on(async {
+        let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        tokio::spawn(connection);
+        client
+    });
+    let mut config = CacheConfig::new(dsn.clone(), "live_bench_pub");
+    config.app = "streamgres_bench".to_owned();
+    runtime
+        .block_on(client.batch_execute(&format!(
+            "DROP PUBLICATION IF EXISTS live_bench_pub;
+             DROP TABLE IF EXISTS live_bench_items; DROP TABLE IF EXISTS live_bench_owners;
+             CREATE TABLE live_bench_owners (id int8 PRIMARY KEY, name text COLLATE \"C\" NOT NULL);
+             CREATE TABLE live_bench_items (id int8 PRIMARY KEY, owner int8 NOT NULL, price numeric(12,2) NOT NULL, label text NOT NULL);
+             INSERT INTO live_bench_owners SELECT g, 'owner ' || g FROM generate_series(1, 1000) g;
+             INSERT INTO live_bench_items SELECT g, 1 + g % 1000, g * 1.25, 'item ' || g FROM generate_series(1, 100000) g;
+             CREATE INDEX ON live_bench_items (owner);
+             CREATE PUBLICATION live_bench_pub FOR TABLE live_bench_items, live_bench_owners;
+             {}",
+            config.setup_sql()
+        )))
+        .unwrap();
+    let teardown = config.teardown_sql();
+    let cache = Cache::start(config);
+    cache.wait_ready(Duration::from_secs(30)).unwrap();
+    let reader = reader_of(&runtime, &client, &cache);
+    let single = r#"SELECT "live_bench_items"."id", "live_bench_items"."price", "live_bench_items"."label" FROM "live_bench_items" WHERE ("live_bench_items"."owner" = $1) ORDER BY "live_bench_items"."id" LIMIT $2"#;
+    let joined = r#"SELECT "live_bench_items"."id", "live_bench_owners"."name" FROM ("live_bench_items" INNER JOIN "live_bench_owners" ON ("live_bench_items"."owner" = "live_bench_owners"."id")) WHERE ("live_bench_items"."owner" = $1) ORDER BY "live_bench_items"."id" LIMIT $2"#;
+    for (name, sql) in [("single table", single), ("joined", joined)] {
+        let binds = [int8(42), int8(20)];
+        cache.read(sql, &binds, &reader).expect("warm");
+        let rounds = 20_000;
+        let mut cached = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            let started = std::time::Instant::now();
+            let rows = cache.read(sql, &binds, &reader).expect("served");
+            cached.push(started.elapsed());
+            assert_eq!(rows.rows.len(), 20);
+        }
+        let statement = runtime.block_on(client.prepare(sql)).unwrap();
+        let mut postgres = Vec::with_capacity(2_000);
+        for _ in 0..2_000 {
+            let started = std::time::Instant::now();
+            let rows = runtime
+                .block_on(client.query(&statement, &[&42i64, &20i64]))
+                .unwrap();
+            postgres.push(started.elapsed());
+            assert_eq!(rows.len(), 20);
+        }
+        let percentile = |samples: &mut Vec<Duration>, p: f64| {
+            samples.sort();
+            samples[((samples.len() as f64 - 1.0) * p) as usize]
+        };
+        println!(
+            "{name}: cache p50 {:?} p99 {:?}; Postgres (prepared, local) p50 {:?} p99 {:?}",
+            percentile(&mut cached, 0.5),
+            percentile(&mut cached, 0.99),
+            percentile(&mut postgres, 0.5),
+            percentile(&mut postgres, 0.99)
+        );
+    }
+    cache.stop();
+    runtime
+        .block_on(client.batch_execute(&format!(
+            "{teardown} DROP PUBLICATION live_bench_pub; DROP TABLE live_bench_items; DROP TABLE live_bench_owners;"
         )))
         .unwrap();
 }

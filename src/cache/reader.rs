@@ -41,7 +41,7 @@ pub struct ReaderCheck {
 
 /// Identifies one catalog the engine served by: a reader checked against
 /// an older one must be checked again.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CatalogVersion(usize);
 
 impl CatalogVersion {

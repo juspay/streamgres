@@ -103,6 +103,45 @@ impl Cache {
         }
     }
 
+    /// `sql` with `binds` parsed against `catalog`, from the memo when
+    /// this very statement was parsed before.
+    fn parsed(
+        &self,
+        sql: &str,
+        binds: &[Bind],
+        catalog: &Arc<crate::model::Catalog>,
+    ) -> Result<Arc<crate::parser::Select>, Refusal> {
+        let key = state::ParseKey {
+            sql: sql.into(),
+            binds: binds.to_vec(),
+            version: CatalogVersion::of(catalog),
+        };
+        let known = self
+            .shared
+            .parsed
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key)
+            .cloned();
+        if let Some(select) = known {
+            return Ok(select);
+        }
+        let select = Arc::new(
+            parse_select(sql, binds, catalog)
+                .map_err(|error| Refusal::Unsupported(error.to_string()))?,
+        );
+        let mut parsed = self
+            .shared
+            .parsed
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if parsed.len() >= state::PARSED_LIMIT {
+            parsed.clear();
+        }
+        parsed.insert(key, select.clone());
+        Ok(select)
+    }
+
     /// The query that checks a reader's connection against the catalog
     /// the engine serves by now.
     pub fn reader_check(&self) -> Result<ReaderCheck, Refusal> {
@@ -135,8 +174,7 @@ impl Cache {
                 "the reader was checked against an older catalog".to_owned(),
             ));
         }
-        let select = parse_select(sql, binds, &catalog)
-            .map_err(|error| Refusal::Unsupported(error.to_string()))?;
+        let select = self.parsed(sql, binds, &catalog)?;
         let mut tables = Vec::with_capacity(select.nodes.len());
         for node in &select.nodes {
             let table = catalog

@@ -38,7 +38,10 @@ mod session;
 
 pub use session::{Tracker, install};
 
+use std::any::TypeId;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use crate::diesel::connection::{Connection, LoadConnection};
 use crate::diesel::deserialize::FromSqlRow;
@@ -52,8 +55,8 @@ use crate::diesel::result::{Error, QueryResult};
 use crate::diesel::sql_types::{Array, Text};
 use streamgres::cache::{Bind, CachedRows};
 pub use streamgres::cache::{Cache, CacheConfig, Position, Reader, Refusal};
-pub use streamgres::sync::pg::Lsn;
 use streamgres::model::Value;
+pub use streamgres::sync::pg::Lsn;
 use streamgres::sync::pg::binary;
 
 use crate::row::CachedRow;
@@ -137,14 +140,19 @@ where
 /// transaction committed on `conn`'s database so far, so a read after a
 /// write sees it; whether it has. One round trip reads where the
 /// database's WAL is.
-pub fn wait_for_writes<C>(cache: &Cache, conn: &mut C, timeout: std::time::Duration) -> QueryResult<bool>
+pub fn wait_for_writes<C>(
+    cache: &Cache,
+    conn: &mut C,
+    timeout: std::time::Duration,
+) -> QueryResult<bool>
 where
     C: Connection<Backend = Pg> + LoadConnection + 'static,
 {
-    let now: WalNow = crate::diesel::sql_query("SELECT pg_current_wal_lsn()::text AS lsn").get_result(conn)?;
-    let position = Lsn::parse(&now.lsn)
-        .map(Position::from)
-        .ok_or_else(|| Error::DeserializationError(format!("`{}` is not a WAL location", now.lsn).into()))?;
+    let now: WalNow =
+        crate::diesel::sql_query("SELECT pg_current_wal_lsn()::text AS lsn").get_result(conn)?;
+    let position = Lsn::parse(&now.lsn).map(Position::from).ok_or_else(|| {
+        Error::DeserializationError(format!("`{}` is not a WAL location", now.lsn).into())
+    })?;
     Ok(cache.wait_for(position, timeout))
 }
 
@@ -188,7 +196,7 @@ fn in_transaction<C: Connection>(conn: &mut C) -> bool {
 /// be written for its column.
 fn cached_rows<Q, U, C>(query: &Q, cache: &Cache, conn: &mut C) -> QueryResult<Option<Vec<U>>>
 where
-    Q: QueryFragment<Pg> + Query,
+    Q: QueryFragment<Pg> + QueryId + Query,
     Q::SqlType: CompatibleType<U, Pg>,
     U: FromSqlRow<<Q::SqlType as CompatibleType<U, Pg>>::SqlType, Pg>,
     C: Connection<Backend = Pg> + LoadConnection + PgMetadataLookup + 'static,
@@ -225,17 +233,46 @@ where
         .map(Some)
 }
 
-/// The SQL `query` renders to and its binds, as Diesel sends them.
+/// The SQL of each query type Diesel would cache a prepared statement for:
+/// one text for every query of the type, so it is rendered once.
+static RENDERED: OnceLock<RwLock<HashMap<TypeId, Arc<str>>>> = OnceLock::new();
+
+/// The SQL `query` renders to and its binds, as Diesel sends them. The SQL
+/// of a query type Diesel caches statements for is rendered once.
 pub fn rendered<Q>(
     query: &Q,
     lookup: &mut (dyn PgMetadataLookup + 'static),
-) -> QueryResult<(String, Vec<Bind>)>
+) -> QueryResult<(Arc<str>, Vec<Bind>)>
 where
-    Q: QueryFragment<Pg>,
+    Q: QueryFragment<Pg> + QueryId,
 {
-    let mut builder = PgQueryBuilder::default();
-    query.to_sql(&mut builder, &Pg)?;
-    let sql = builder.finish();
+    let render = || -> QueryResult<Arc<str>> {
+        let mut builder = PgQueryBuilder::default();
+        query.to_sql(&mut builder, &Pg)?;
+        Ok(builder.finish().into())
+    };
+    let sql = match Q::query_id() {
+        Some(id) if query.is_safe_to_cache_prepared(&Pg)? => {
+            let rendered = RENDERED.get_or_init(Default::default);
+            let known = rendered
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&id)
+                .cloned();
+            match known {
+                Some(sql) => sql,
+                None => {
+                    let sql = render()?;
+                    rendered
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(id, sql.clone());
+                    sql
+                }
+            }
+        }
+        _ => render()?,
+    };
     let mut collector = RawBytesBindCollector::<Pg>::new();
     query.collect_binds(&mut collector, lookup, &Pg)?;
     let binds = collector

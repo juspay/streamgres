@@ -400,3 +400,83 @@ fn load_cached_returns_what_load_returns() {
     ))
     .expect("clean up");
 }
+
+diesel::table! {
+    adapter_bench (id) {
+        id -> Int8,
+        owner -> Int8,
+        label -> Text,
+        price -> Numeric,
+    }
+}
+
+/// How long a hot `load_cached` takes against `load`: run with
+/// `cargo test -p streamgres-diesel --release --test load_cached -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn load_latency() {
+    let Ok(dsn) = std::env::var("STREAMGRES_PG_DSN") else {
+        return;
+    };
+    let mut conn = PgConnection::establish(&dsn).expect("connect");
+    let mut config = CacheConfig::new(dsn.clone(), "adapter_bench_pub");
+    config.app = "streamgres_adapter_bench".to_owned();
+    conn.batch_execute(&format!(
+        "DROP PUBLICATION IF EXISTS adapter_bench_pub; DROP TABLE IF EXISTS adapter_bench;
+         CREATE TABLE adapter_bench (id int8 PRIMARY KEY, owner int8 NOT NULL, label text NOT NULL, price numeric(12, 2) NOT NULL);
+         INSERT INTO adapter_bench SELECT g, 1 + g % 1000, 'item ' || g, g * 1.25 FROM generate_series(1, 100000) g;
+         CREATE INDEX ON adapter_bench (owner);
+         CREATE PUBLICATION adapter_bench_pub FOR TABLE adapter_bench;
+         {}",
+        config.setup_sql()
+    ))
+    .expect("prepare");
+    let teardown = config.teardown_sql();
+    let cache = Cache::start(config);
+    cache.wait_ready(Duration::from_secs(30)).expect("up");
+    conn.set_instrumentation(Tracker::new());
+    let query = || {
+        adapter_bench::table
+            .filter(adapter_bench::owner.eq(42i64))
+            .select((
+                adapter_bench::id,
+                adapter_bench::label,
+                adapter_bench::price,
+            ))
+            .order(adapter_bench::id)
+            .limit(20)
+    };
+    let rows: Option<Vec<(i64, String, BigDecimal)>> =
+        query().try_load_cached(&cache, &mut conn).expect("warm");
+    assert_eq!(rows.map(|rows| rows.len()), Some(20));
+    let time = |samples: &mut Vec<Duration>, p: f64| {
+        samples.sort();
+        samples[((samples.len() as f64 - 1.0) * p) as usize]
+    };
+    let mut cached = Vec::new();
+    for _ in 0..20_000 {
+        let started = std::time::Instant::now();
+        let rows: Vec<(i64, String, BigDecimal)> = query().load_cached(&cache, &mut conn).unwrap();
+        cached.push(started.elapsed());
+        assert_eq!(rows.len(), 20);
+    }
+    let mut live = Vec::new();
+    for _ in 0..2_000 {
+        let started = std::time::Instant::now();
+        let rows: Vec<(i64, String, BigDecimal)> = query().load(&mut conn).unwrap();
+        live.push(started.elapsed());
+        assert_eq!(rows.len(), 20);
+    }
+    println!(
+        "load_cached p50 {:?} p99 {:?}; load (local Postgres) p50 {:?} p99 {:?}",
+        time(&mut cached, 0.5),
+        time(&mut cached, 0.99),
+        time(&mut live, 0.5),
+        time(&mut live, 0.99)
+    );
+    cache.stop();
+    conn.batch_execute(&format!(
+        "{teardown} DROP PUBLICATION adapter_bench_pub; DROP TABLE adapter_bench;"
+    ))
+    .expect("clean up");
+}

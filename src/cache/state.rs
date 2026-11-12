@@ -72,9 +72,23 @@ pub(super) struct State {
 
 /// The state behind its lock, and the condition readers wait on for it
 /// to change.
+/// What identifies a parsed statement.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct ParseKey {
+    pub sql: Box<str>,
+    pub binds: Vec<crate::parser::Bind>,
+    pub version: super::CatalogVersion,
+}
+
+/// The most parsed statements kept; past it the memo starts over.
+pub(super) const PARSED_LIMIT: usize = 8192;
+
 pub(super) struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    /// Statements already parsed, by their text, binds and catalog: a
+    /// repeated read is not parsed again.
+    pub parsed: std::sync::RwLock<HashMap<ParseKey, Arc<crate::parser::Select>>>,
     pub config: CacheConfig,
     /// The database the engine streams.
     pub database: String,
@@ -94,6 +108,7 @@ impl Shared {
                 refused: HashMap::new(),
             }),
             changed: Condvar::new(),
+            parsed: std::sync::RwLock::new(HashMap::new()),
             database: config.database(),
             config,
         }
@@ -198,14 +213,17 @@ impl State {
         max_entries: usize,
     ) -> (u64, Vec<SubId>) {
         let mut evicted = Vec::new();
-        while self.entries.len() >= max_entries.max(1) {
-            let oldest = self
+        if self.entries.len() >= max_entries.max(1) {
+            let mut by_age: Vec<(Instant, u64)> = self
                 .entries
                 .iter()
-                .min_by_key(|(_, entry)| entry.last_read)
-                .map(|(id, _)| *id);
-            let Some(oldest) = oldest else { break };
-            evicted.extend(self.remove_entry(oldest));
+                .map(|(id, entry)| (entry.last_read, *id))
+                .collect();
+            let room = (max_entries / 100).clamp(1, by_age.len());
+            by_age.select_nth_unstable(room - 1);
+            for (_, id) in by_age.into_iter().take(room) {
+                evicted.extend(self.remove_entry(id));
+            }
         }
         let id = self.next_id;
         self.next_id += 1;
