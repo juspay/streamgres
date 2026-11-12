@@ -448,6 +448,7 @@ fn class_of(value: &Value) -> Option<u8> {
         Value::Day(_) => Some(7),
         Value::Time(_) => Some(8),
         Value::Bytes(_) => Some(9),
+        Value::Json(_) => Some(10),
         Value::Null
         | Value::Float(_)
         | Value::List(_)

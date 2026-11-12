@@ -295,7 +295,9 @@ fn quoted_literal(text: &str) -> Option<String> {
 fn typed(text: &str, declared: &ValueType) -> Option<Value> {
     Some(match declared {
         ValueType::String => Value::String(text.to_owned()),
-        ValueType::Json => Value::String(text::json_as_jsonb(text)),
+        ValueType::Json => Value::Json(crate::model::JsonText::standard_only(text::json_as_jsonb(
+            text,
+        ))),
         ValueType::Int => Value::Int(text.parse().ok()?),
         ValueType::Float => Value::Float(text.parse().ok()?),
         ValueType::Bool => Value::Bool(match text {
@@ -574,7 +576,7 @@ mod tests {
         );
         assert_eq!(
             parse_default(Some("'{\"b\": 1, \"a\": [1.50]}'::jsonb"), &ValueType::Json),
-            Some(Value::from("{\"a\": [1.5], \"b\": 1}")),
+            Some(Value::Json(crate::model::JsonText::standard_only("{\"a\": [1.5], \"b\": 1}".into()))),
             "a JSON default in the standard form"
         );
         assert_eq!(

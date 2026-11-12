@@ -278,9 +278,7 @@ fn column_expr(column: &str, scope: &Scope<'_>) -> String {
 /// the session's time zone.
 fn literal_as(value: &Value, column: Option<&DbColumn>) -> String {
     match (value, column) {
-        (Value::String(text), Some(column)) if column.r#type == ValueType::Json => {
-            format!("{}::jsonb", quote_literal(text))
-        }
+        (Value::Json(json), _) => format!("{}::jsonb", quote_literal(json.standard())),
         (Value::Timestamp(at), Some(column)) if column.type_oid == binary::oid::TIMESTAMPTZ => {
             if *at == Timestamp::INFINITY {
                 "'infinity'::timestamptz".to_owned()
@@ -469,6 +467,7 @@ fn literal(value: &Value) -> String {
         Value::Datetime(datetime) => {
             format!("TIMESTAMP '{}'", datetime.format("%Y-%m-%d %H:%M:%S%.6f"))
         }
+        Value::Json(json) => format!("{}::jsonb", quote_literal(json.standard())),
         Value::Numeric(number) => format!("'{number}'::numeric"),
         Value::Timestamp(at) if *at == Timestamp::INFINITY => {
             "'infinity'::timestamp".to_owned()
@@ -1057,11 +1056,11 @@ mod tests {
             Where::AND(vec![
                 Where::condition("fieldId", ComparisonOperator::EQ, "f1"),
                 Where::OR(vec![
-                    Where::condition("actualFieldValue", ComparisonOperator::EQ, "\"high\""),
+                    Where::condition("actualFieldValue", ComparisonOperator::EQ, Value::Json(crate::model::JsonText::standard_only("\"high\"".into()))),
                     Where::condition(
                         "actualFieldValue",
                         ComparisonOperator::IN,
-                        Value::List(vec![Value::from("5"), Value::from("true")]),
+                        Value::List(vec![Value::Json(crate::model::JsonText::standard_only("5".into())), Value::Json(crate::model::JsonText::standard_only("true".into()))]),
                     ),
                 ]),
             ]),

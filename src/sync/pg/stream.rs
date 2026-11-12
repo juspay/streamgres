@@ -1523,11 +1523,15 @@ mod tests {
             .iter()
             .map(|write| write.new_row_image().unwrap())
             .collect();
-        let standard = Value::String("{\"a\": 1.5, \"bb\": \"1.0\"}".into());
+        let standard = Value::Json(crate::model::JsonText::standard_only("{\"a\": 1.5, \"bb\": \"1.0\"}".into()));
         assert_eq!(rows[0].data["binary"], standard);
         assert_eq!(rows[0].data["plain"], standard);
-        assert_eq!(rows[1].data["binary"], Value::String("2".into()));
-        assert_eq!(rows[1].data["plain"], Value::String("2".into()));
+        assert_eq!(rows[1].data["binary"], Value::Json(crate::model::JsonText::standard_only("2".into())));
+        assert_eq!(rows[1].data["plain"], Value::Json(crate::model::JsonText::standard_only("2".into())));
+        assert!(
+            matches!(&rows[1].data["plain"], Value::Json(json) if json.text() == "2.0"),
+            "the text Postgres has is kept beside the standard form"
+        );
     }
 
     /// An `UPDATE` whose `name` PostgreSQL sent as unchanged (a large

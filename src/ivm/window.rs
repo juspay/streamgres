@@ -1203,7 +1203,8 @@ fn rank(value: &Value) -> u8 {
         Value::Time(_) => 9,
         Value::Bytes(_) => 10,
         Value::Raw(_) => 11,
-        Value::Null => 12,
+        Value::Json(_) => 12,
+        Value::Null => 13,
     }
 }
 

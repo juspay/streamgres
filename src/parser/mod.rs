@@ -1236,6 +1236,9 @@ fn coerce_read(value: Value, declared: &ValueType, at: usize) -> Result<Value, P
         (Value::String(text), ValueType::Day) => crate::sync::pg::text::day(&text)
             .map(Value::Day)
             .ok_or_else(|| fail(format!("`{text}` is not a date")))?,
+        (Value::String(text), ValueType::Json) => Value::Json(
+            crate::model::JsonText::standard_only(crate::sync::pg::text::json_as_jsonb(&text)),
+        ),
         (Value::Int(int), ValueType::Numeric) => Value::Numeric(Numeric::from_i64(int)),
         (Value::Float(float), ValueType::Numeric) => Value::Numeric(
             Numeric::parse(&float.to_string()).map_err(|error| fail(error.to_string()))?,
@@ -1290,7 +1293,10 @@ fn coerce_to_type(
                 position: at,
             })?)
         }
-        (value @ Value::String(_), ValueType::Json) => value,
+        (Value::String(text), ValueType::Json) => Value::Json(
+            crate::model::JsonText::standard_only(crate::sync::pg::text::json_as_jsonb(&text)),
+        ),
+        (value @ Value::Json(_), ValueType::Json) => value,
         (value @ Value::Timestamp(_), ValueType::Timestamp) => value,
         (value @ Value::Numeric(_), ValueType::Numeric) => value,
         (value @ Value::Day(_), ValueType::Day) => value,

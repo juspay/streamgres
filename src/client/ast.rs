@@ -702,7 +702,9 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
         (Json::String(text), ValueType::Json) if text.contains('\0') => {
             return Err("a text value contains a NUL byte".to_owned());
         }
-        (_, ValueType::Json) => Value::String(crate::sync::pg::text::jsonb_text(literal)),
+        (_, ValueType::Json) => Value::Json(crate::model::JsonText::standard_only(
+            crate::sync::pg::text::jsonb_text(literal),
+        )),
         (Json::Bool(flag), _) => Value::Bool(*flag),
         (Json::Number(number), ValueType::Float) => {
             Value::Float(number.as_f64().unwrap_or(f64::NAN))
@@ -1361,12 +1363,12 @@ mod tests {
     fn a_literal_against_a_json_column_is_jsonb_text() {
         let json = ValueType::Json;
         let value = |literal: Json| literal_value(&literal, &json).expect("a value");
-        assert_eq!(value(serde_json::json!("high")), Value::from("\"high\""));
-        assert_eq!(value(serde_json::json!(5)), Value::from("5"));
-        assert_eq!(value(serde_json::json!(true)), Value::from("true"));
+        assert_eq!(value(serde_json::json!("high")), Value::Json(crate::model::JsonText::standard_only("\"high\"".into())));
+        assert_eq!(value(serde_json::json!(5)), Value::Json(crate::model::JsonText::standard_only("5".into())));
+        assert_eq!(value(serde_json::json!(true)), Value::Json(crate::model::JsonText::standard_only("true".into())));
         assert_eq!(
             value(serde_json::json!({"b": [1, 2], "a": "x"})),
-            Value::from("{\"a\": \"x\", \"b\": [1, 2]}")
+            Value::Json(crate::model::JsonText::standard_only("{\"a\": \"x\", \"b\": [1, 2]}".into()))
         );
         assert_eq!(value(Json::Null), Value::Null);
         assert!(literal_value(&serde_json::json!("a\u{0}b"), &json).is_err());
@@ -1377,7 +1379,7 @@ mod tests {
         );
         assert_eq!(
             literal_value(&serde_json::json!(["a", 1]), &json).expect("a value"),
-            Value::from("[\"a\", 1]"),
+            Value::Json(crate::model::JsonText::standard_only("[\"a\", 1]".into())),
             "an array against a JSON column is one JSON value, not a list of them"
         );
     }

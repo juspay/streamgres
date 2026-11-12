@@ -48,6 +48,7 @@ struct Order {
     local_at: NaiveDateTime,
     due: NaiveDate,
     payload: Vec<u8>,
+    meta: serde_json::Value,
     tags: Vec<i32>,
     note: Option<String>,
 }
@@ -118,6 +119,7 @@ fn load_cached_returns_what_load_returns() {
             .naive_utc(),
         due: NaiveDate::from_ymd_opt(2026, 9, 1 + u32::try_from(id).unwrap()).unwrap(),
         payload: vec![0, 255, u8::try_from(id).unwrap()],
+        meta: serde_json::json!({"id": id, "price": 1.5, "tags": ["a", "b"]}),
         tags: vec![1, 2, i32::try_from(id).unwrap()],
         note: note.map(str::to_owned),
     };
@@ -135,7 +137,7 @@ fn load_cached_returns_what_load_returns() {
                 adapter_orders::local_at.eq(row.local_at),
                 adapter_orders::due.eq(row.due),
                 adapter_orders::payload.eq(&row.payload),
-                adapter_orders::meta.eq(serde_json::json!({"id": row.id, "price": 1.50})),
+                adapter_orders::meta.eq(&row.meta),
                 adapter_orders::tags.eq(&row.tags),
                 adapter_orders::note.eq(&row.note),
             ))
@@ -277,11 +279,14 @@ fn load_cached_returns_what_load_returns() {
         .expect("read inside a transaction");
     assert!(inside.contains(&6), "the transaction's own insert is seen");
 
-    let meta: Option<Vec<serde_json::Value>> = adapter_orders::table
-        .select(adapter_orders::meta)
-        .try_load_cached(&cache, &mut conn)
-        .expect("rendered");
-    assert_eq!(meta, None, "JSON is not kept as the text Postgres returns");
+    same!(
+        &cache,
+        &mut conn,
+        adapter_orders::table
+            .select(adapter_orders::meta)
+            .order(adapter_orders::id),
+        serde_json::Value
+    );
 
     let filtered: Vec<i64> = adapter_orders::table
         .filter(adapter_orders::note.like("%noted"))

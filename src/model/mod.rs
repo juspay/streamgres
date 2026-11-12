@@ -41,4 +41,4 @@ pub use query::{
 };
 pub use row::{RowData, RowSchema};
 pub use schema::{Catalog, Collation, ColumnName, DbColumn, DbTable, PutPlan, TableName};
-pub use value::{Day, Numeric, Raw, SharedSet, Time, Timestamp, Value, ValueType};
+pub use value::{Day, JsonText, Numeric, Raw, SharedSet, Time, Timestamp, Value, ValueType};

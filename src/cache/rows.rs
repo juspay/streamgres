@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use super::Refusal;
 use crate::ivm::order_rows;
-use crate::model::{ColumnName, DataFrameRow, DbTable, Order, OrderBy, Value, ValueType};
+use crate::model::{ColumnName, DataFrameRow, DbTable, Order, OrderBy, Value};
 use crate::parser::{Projection, Select};
 use crate::sync::pg::binary::oid;
 
@@ -88,11 +88,6 @@ pub(super) fn answer(
                 "the type of `{name}` at the source is not known"
             )));
         }
-        if column.r#type == ValueType::Json {
-            return Err(Refusal::Unsupported(format!(
-                "`{name}` is JSON, which the engine keeps in a standard form rather than the text Postgres returns"
-            )));
-        }
         columns.push(CachedColumn {
             name: name.clone(),
             type_oid: column.type_oid,
@@ -106,9 +101,15 @@ pub(super) fn answer(
         .map(|row| {
             names
                 .iter()
-                .map(|name| row.data.get(name).cloned().unwrap_or(Value::Null))
+                .map(|name| match row.data.get(name) {
+                    Some(Value::Json(json)) if !json.is_known() => Err(Refusal::Unsupported(
+                        format!("the text Postgres has for `{name}` is not known"),
+                    )),
+                    Some(value) => Ok(value.clone()),
+                    None => Ok(Value::Null),
+                })
                 .collect()
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
     Ok(CachedRows { columns, rows })
 }

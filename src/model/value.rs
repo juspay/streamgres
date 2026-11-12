@@ -40,6 +40,9 @@ pub enum Value {
     List(Vec<Value>),
     Map(std::collections::HashMap<Value, Value>),
     Set(SharedSet),
+    /// A JSON document: compared by its standard form, kept with the text
+    /// Postgres gave when that differs.
+    Json(JsonText),
     /// A Postgres `numeric`, exact.
     Numeric(Numeric),
     /// A Postgres `timestamp` or `timestamptz`.
@@ -53,6 +56,84 @@ pub enum Value {
     /// A value of a type the engine does not interpret, as Postgres's
     /// binary form. It can be stored and sent on, never compared.
     Raw(Raw),
+}
+
+/// A JSON document. Two documents are the same value when their standard
+/// forms are the same text ([`crate::sync::pg::text`]): that is what the
+/// engine compares, orders and hashes. The text Postgres stored or wrote
+/// is kept beside it when it is spelled otherwise (a `json` column keeps
+/// its input as written, a `jsonb` number its trailing zeros), so the
+/// document can be handed back exactly.
+#[derive(Debug, Clone)]
+pub struct JsonText {
+    standard: Box<str>,
+    text: Option<Box<str>>,
+    known: bool,
+}
+
+impl JsonText {
+    /// A document in `standard` form, given by its source as `text`.
+    pub fn new(standard: String, text: &str) -> Self {
+        let text = (text != standard).then(|| text.into());
+        JsonText {
+            standard: standard.into(),
+            text,
+            known: true,
+        }
+    }
+
+    /// A document known only in its standard form: a literal compared
+    /// with a column, or a value Postgres wrote without saying how it
+    /// spells it (a column's default filled into rows already held).
+    pub fn standard_only(standard: String) -> Self {
+        JsonText {
+            standard: standard.into(),
+            text: None,
+            known: false,
+        }
+    }
+
+    /// Whether [`JsonText::text`] is the text Postgres has, rather than
+    /// only the standard form.
+    pub fn is_known(&self) -> bool {
+        self.known
+    }
+
+    /// The standard form, what the engine compares.
+    pub fn standard(&self) -> &str {
+        &self.standard
+    }
+
+    /// The text the source gave.
+    pub fn text(&self) -> &str {
+        self.text.as_deref().unwrap_or(&self.standard)
+    }
+}
+
+impl PartialEq for JsonText {
+    fn eq(&self, other: &Self) -> bool {
+        self.standard == other.standard
+    }
+}
+
+impl Eq for JsonText {}
+
+impl Hash for JsonText {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.standard.hash(state);
+    }
+}
+
+impl PartialOrd for JsonText {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for JsonText {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.standard.cmp(&other.standard)
+    }
 }
 
 /// A value of a type the engine does not interpret: its type and its
@@ -77,9 +158,7 @@ pub enum ValueType {
     /// A Postgres `timestamp` or `timestamptz`; the cell is a
     /// [`Value::Timestamp`].
     Timestamp,
-    /// A JSON document carried as its text, the form the engine keeps for
-    /// `json` and `jsonb` columns; the cell is a [`Value::String`] and the
-    /// transport writes it out as the JSON it holds.
+    /// A Postgres `json` or `jsonb`; the cell is a [`Value::Json`].
     Json,
     /// A Postgres `numeric`; the cell is a [`Value::Numeric`].
     Numeric,
@@ -120,6 +199,7 @@ impl Value {
             (Bool(a), Bool(b)) => Some(a.cmp(b)),
             (Date(a), Date(b)) => Some(a.cmp(b)),
             (Datetime(a), Datetime(b)) => Some(a.cmp(b)),
+            (Json(a), Json(b)) => Some(a.cmp(b)),
             (Numeric(a), Numeric(b)) => Some(a.cmp(b)),
             (Int(a), Numeric(b)) => Some(self::Numeric::from_i64(*a).cmp(b)),
             (Numeric(a), Int(b)) => Some(a.cmp(&self::Numeric::from_i64(*b))),
@@ -180,6 +260,7 @@ impl Value {
                 Time(_) => 13,
                 Bytes(_) => 14,
                 Raw(_) => 15,
+                Json(_) => 16,
             }
         }
         fn canonical_f64(f: f64) -> f64 {
@@ -212,6 +293,7 @@ impl Value {
             (Time(a), Time(b)) => a.cmp(b),
             (Bytes(a), Bytes(b)) => a.cmp(b),
             (Raw(a), Raw(b)) => a.cmp(b),
+            (Json(a), Json(b)) => a.cmp(b),
             (Map(a), Map(b)) => {
                 let mut left: Vec<_> = a.iter().collect();
                 let mut right: Vec<_> = b.iter().collect();
@@ -381,6 +463,7 @@ impl PartialEq for Value {
             (Time(a), Time(b)) => a == b,
             (Bytes(a), Bytes(b)) => a == b,
             (Raw(a), Raw(b)) => a == b,
+            (Json(a), Json(b)) => a == b,
             _ => false,
         }
     }
@@ -412,6 +495,7 @@ impl Hash for Value {
             Time(time) => time.hash(state),
             Bytes(bytes) => bytes.hash(state),
             Raw(raw) => raw.hash(state),
+            Json(json) => json.hash(state),
         }
     }
 }

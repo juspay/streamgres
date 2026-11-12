@@ -13,7 +13,7 @@ use std::fmt;
 use bytes::Bytes;
 
 use super::text;
-use crate::model::{Day, Numeric, Raw, Time, Timestamp, Value, ValueType};
+use crate::model::{Day, JsonText, Numeric, Raw, Time, Timestamp, Value, ValueType};
 use crate::sync::CellDecoder;
 
 /// Type OIDs the engine interprets.
@@ -150,16 +150,17 @@ pub fn decode_scalar(type_oid: u32, bytes: &[u8]) -> Result<Value, CodecError> {
             Value::String(utf8(bytes).map_err(|_| fail("not UTF-8"))?.to_owned())
         }
         oid::UUID => Value::String(uuid_text(&fixed::<16>(bytes, type_oid)?)),
-        oid::JSON => Value::String(text::json_as_jsonb(
-            utf8(bytes).map_err(|_| fail("not UTF-8"))?,
-        )),
+        oid::JSON => {
+            let stored = utf8(bytes).map_err(|_| fail("not UTF-8"))?;
+            Value::Json(JsonText::new(text::json_as_jsonb(stored), stored))
+        }
         oid::JSONB => {
             let (version, body) = bytes.split_first().ok_or(fail("empty"))?;
             if *version != JSONB_VERSION {
                 return Err(fail("unknown jsonb version"));
             }
             let body = utf8(body).map_err(|_| fail("not UTF-8"))?;
-            Value::String(text::standard_json(body).into_owned())
+            Value::Json(JsonText::new(text::standard_json(body).into_owned(), body))
         }
         oid::TIMESTAMP | oid::TIMESTAMPTZ => {
             Value::Timestamp(Timestamp(i64::from_be_bytes(fixed::<8>(bytes, type_oid)?)))
@@ -295,15 +296,17 @@ pub fn encode(value: &Value, type_oid: u32) -> Option<Vec<u8>> {
         }
         (Value::Numeric(number), oid::NUMERIC) => number.to_binary(),
         (Value::String(text), oid::UUID) => uuid_bytes(text)?.to_vec(),
-        (Value::String(text), oid::JSONB) => {
+        (Value::Json(json), oid::JSONB) => {
+            let text = json.text();
             let mut out = Vec::with_capacity(text.len() + 1);
             out.push(JSONB_VERSION);
             out.extend_from_slice(text.as_bytes());
             out
         }
+        (Value::Json(json), oid::JSON) => json.text().as_bytes().to_vec(),
         (
             Value::String(text),
-            oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::CHAR | oid::JSON,
+            oid::TEXT | oid::VARCHAR | oid::BPCHAR | oid::NAME | oid::CHAR,
         ) => text.as_bytes().to_vec(),
         (Value::String(text), other) if value_type(other).is_none() => text.as_bytes().to_vec(),
         (Value::Timestamp(at), oid::TIMESTAMP | oid::TIMESTAMPTZ) => at.0.to_be_bytes().to_vec(),
@@ -428,11 +431,11 @@ mod tests {
         let jsonb = [&[JSONB_VERSION][..], b"{\"a\": 1.50}"].concat();
         assert_eq!(
             decode_scalar(oid::JSONB, &jsonb).unwrap(),
-            Value::from("{\"a\": 1.5}")
+            Value::Json(crate::model::JsonText::standard_only("{\"a\": 1.5}".into()))
         );
         assert_eq!(
             decode_scalar(oid::JSON, b"{ \"b\":2, \"a\":1 }").unwrap(),
-            Value::from("{\"a\": 1, \"b\": 2}")
+            Value::Json(crate::model::JsonText::standard_only("{\"a\": 1, \"b\": 2}".into()))
         );
         assert!(decode_scalar(oid::JSONB, &[2, b'1']).is_err());
     }

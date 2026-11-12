@@ -620,6 +620,7 @@ fn mutation_results_travel_the_feed() {
         }
         let text = |row: &RowData, column: &str| match row.get(column) {
             Some(Value::String(text)) => text.clone(),
+            Some(Value::Json(json)) => json.standard().to_owned(),
             other => panic!("{column}: {other:?}"),
         };
         let WriteQuery::INSERT(recorded) = &seen[0] else {
@@ -1051,7 +1052,7 @@ fn a_json_column_is_filtered_by_value() {
                 Where::condition(
                     column,
                     ComparisonOperator::EQ,
-                    streamgres::sync::pg::text::jsonb_text(&literal).as_str(),
+                    Value::Json(JsonText::standard_only(streamgres::sync::pg::text::jsonb_text(&literal))),
                 ),
                 OrderBy::new("id", Order::ASC),
                 u32::MAX,
@@ -1085,9 +1086,7 @@ fn a_json_column_is_filtered_by_value() {
                 assert_eq!(storage.count(&alone, 10).await.expect("count"), 1);
                 assert_eq!(
                     read.rows[0].1.data.get(&ColumnName::from(column)),
-                    Some(&Value::from(
-                        streamgres::sync::pg::text::jsonb_text(&literal).as_str()
-                    )),
+                    Some(&Value::Json(JsonText::standard_only(streamgres::sync::pg::text::jsonb_text(&literal)))),
                     "the {column} cell a read brings back is the text the literal was given"
                 );
             }
@@ -1108,7 +1107,7 @@ fn a_json_column_is_filtered_by_value() {
             .cloned();
         assert_eq!(
             cell,
-            Some(Value::from("{\"a\": \"x\", \"b\": [1, 2]}")),
+            Some(Value::Json(JsonText::standard_only("{\"a\": \"x\", \"b\": [1, 2]}".to_owned()))),
             "the cell a read brings back is the text the literal was given"
         );
         let whole = SingleTableReadQuery::new(
@@ -1955,8 +1954,10 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
         assert!(matches!(cell("n"), Value::Numeric(n) if n.to_string() == "12345678901234567890.1230"));
         assert_eq!(cell("f4"), Value::Float(1.5));
         assert_eq!(cell("u"), Value::from("00010203-0405-0607-0809-0a0b0c0d0e0f"));
-        assert_eq!(cell("j"), Value::from("{\"a\": 2, \"b\": 1.5}"));
-        assert_eq!(cell("jb"), Value::from("{\"a\": 1.5}"));
+        assert_eq!(cell("j"), Value::Json(JsonText::standard_only("{\"a\": 2, \"b\": 1.5}".to_owned())));
+        assert!(matches!(cell("j"), Value::Json(json) if json.text() == "{ \"b\":1.50, \"a\":2 }"));
+        assert_eq!(cell("jb"), Value::Json(JsonText::standard_only("{\"a\": 1.5}".to_owned())));
+        assert!(matches!(cell("jb"), Value::Json(json) if json.text() == "{\"a\": 1.50}"));
         let micros = |text: &str| {
             let at = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").unwrap();
             Value::Timestamp(Timestamp::from_unix_micros(at.and_utc().timestamp_micros()).unwrap())

@@ -78,14 +78,7 @@ pub fn write_del(out: &mut Vec<u8>, table: &str, key: &DataFrameKey) {
 pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType>) {
     match value {
         Value::Null => out.extend_from_slice(b"null"),
-        Value::String(text) => match declared {
-            Some(ValueType::Json)
-                if serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok() =>
-            {
-                out.extend_from_slice(text.as_bytes());
-            }
-            _ => write_text(out, text),
-        },
+        Value::String(text) => write_text(out, text),
         Value::Int(int) => {
             let _ = write!(out, "{int}");
         }
@@ -121,6 +114,14 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
                 write_value(out, item, inner);
             }
             out.push(b']');
+        }
+        Value::Json(json) => {
+            let text = json.standard();
+            if serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok() {
+                out.extend_from_slice(text.as_bytes());
+            } else {
+                write_text(out, text);
+            }
         }
         Value::Map(_)
         | Value::Set(_)
@@ -197,12 +198,7 @@ pub fn key_json(key: &DataFrameKey) -> Json {
 pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
     match value {
         Value::Null => Json::Null,
-        Value::String(text) => match declared {
-            Some(ValueType::Json) => {
-                serde_json::from_str(text).unwrap_or_else(|_| Json::String(text.clone()))
-            }
-            _ => Json::String(text.clone()),
-        },
+        Value::String(text) => Json::String(text.clone()),
         Value::Int(int) => Json::from(*int),
         Value::Float(float) if whole(*float) => Json::from(*float as i64),
         Value::Float(float) => {
@@ -231,6 +227,8 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
             }
             Json::Object(object)
         }
+        Value::Json(json) => serde_json::from_str(json.standard())
+            .unwrap_or_else(|_| Json::String(json.standard().to_owned())),
         Value::Numeric(number) => match number.to_i64() {
             Some(int) => Json::from(int),
             None => serde_json::Number::from_f64(number.to_f64()).map_or(Json::Null, Json::Number),
@@ -389,7 +387,7 @@ mod tests {
         );
         let row = DataFrameRow::from(HashMap::from([
             ("id".into(), Value::from("a")),
-            ("meta".into(), Value::from(r#"{"k":[1,2]}"#)),
+            ("meta".into(), Value::Json(crate::model::JsonText::standard_only(r#"{"k": [1, 2]}"#.into()))),
             ("at".into(), Value::Int(1_000)),
             ("extra".into(), Value::Int(7)),
         ]));
