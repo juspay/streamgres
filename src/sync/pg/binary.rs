@@ -14,6 +14,7 @@ use bytes::Bytes;
 
 use super::text;
 use crate::model::{Day, Numeric, Raw, Time, Timestamp, Value, ValueType};
+use crate::sync::CellDecoder;
 
 /// Type OIDs the engine interprets.
 pub mod oid {
@@ -61,6 +62,27 @@ impl fmt::Display for CodecError {
 }
 
 impl std::error::Error for CodecError {}
+
+/// Postgres's binary format as a [`CellDecoder`]: a cell is its type's
+/// OID and the bytes sent for it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PgBinary;
+
+/// One cell in Postgres's binary format.
+#[derive(Debug, Clone, Copy)]
+pub struct PgCell<'a> {
+    pub type_oid: u32,
+    pub bytes: &'a [u8],
+}
+
+impl CellDecoder for PgBinary {
+    type Cell<'a> = PgCell<'a>;
+    type Error = CodecError;
+
+    fn decode(&self, declared: &ValueType, cell: PgCell<'_>) -> Result<Value, CodecError> {
+        decode(declared, cell.type_oid, cell.bytes)
+    }
+}
 
 /// The engine's type for a column of `type_oid`, when the engine
 /// interprets it; `None` for a type kept as [`Value::Raw`] (arrays
@@ -424,6 +446,18 @@ mod tests {
         assert_eq!(
             decode(&ValueType::List(Box::new(ValueType::String)), 1009, &empty).unwrap(),
             Value::List(Vec::new())
+        );
+    }
+
+    #[test]
+    fn decodes_through_the_source_neutral_trait() {
+        let cell = PgCell {
+            type_oid: oid::INT4,
+            bytes: &5i32.to_be_bytes(),
+        };
+        assert_eq!(
+            PgBinary.decode(&ValueType::Int, cell).unwrap(),
+            Value::Int(5)
         );
     }
 
