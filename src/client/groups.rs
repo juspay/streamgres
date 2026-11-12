@@ -40,7 +40,7 @@
 //! # A client that comes back, or comes late
 //!
 //! What a client is owed is everything after its cookie, and a group
-//! answers that in one of four ways ([`Groups::connect`]):
+//! answers that in one of four ways (`Groups::connect`):
 //!
 //! - **The cookie is the group's version.** Nothing is owed. This is the
 //!   usual reconnect, because a group with no connection open stands

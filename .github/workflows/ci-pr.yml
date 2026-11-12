@@ -46,6 +46,17 @@ jobs:
       - name: Install rust cache
         uses: Swatinem/rust-cache@v2.7.7
 
+      - name: Verify adapter package sources
+        run: |
+          python3 scripts/sync-diesel-adapters.py --check
+          cargo package --list -p streamgres-diesel --allow-dirty
+          cargo package --list --manifest-path crates/streamgres-juspay-diesel/Cargo.toml --allow-dirty
+
+      - name: Public API documentation, warnings denied
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --workspace --no-deps --features streamgres-diesel/async --locked
+
       - name: Clippy, warnings denied
         run: cargo clippy --workspace --all-targets --features streamgres-diesel/async --locked -- -D warnings
 
@@ -85,6 +96,9 @@ jobs:
 
       - name: Unit, scenario, randomized and live PostgreSQL tests
         run: cargo test --workspace --features streamgres-diesel/async --release --locked
+
+      - name: Unit tests on Juspay's Diesel fork
+        run: cargo test --manifest-path crates/streamgres-juspay-diesel/Cargo.toml --locked
 
   perf:
     name: Benchmark against the base branch (performance)

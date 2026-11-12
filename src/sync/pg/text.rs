@@ -72,24 +72,14 @@ fn write_jsonb(value: &serde_json::Value, out: &mut String) {
     }
 }
 
-/// Append a number in the standard form: an integer as its digits, any
-/// other as the shortest decimal that reads back as the same double,
-/// which is what a JavaScript client wrote and so what `jsonb` stored;
-/// never an exponent, never a padded fraction, and zero without a sign.
+/// Append the exact decimal, without an exponent or a padded fraction.
+/// `arbitrary_precision` on serde_json preserves the input digits.
 fn write_number(number: &serde_json::Number, out: &mut String) {
-    use std::fmt::Write;
-    if let Some(int) = number.as_i64() {
-        let _ = write!(out, "{int}");
-    } else if let Some(int) = number.as_u64() {
-        let _ = write!(out, "{int}");
-    } else {
-        match number.as_f64() {
-            Some(0.0) => out.push('0'),
-            Some(float) => {
-                let _ = write!(out, "{float}");
-            }
-            None => out.push_str(&number.to_string()),
-        }
+    match crate::model::Numeric::parse(&number.to_string()) {
+        Ok(number) => out.push_str(&standard_json(&number.to_string())),
+        // Values outside Postgres's numeric range cannot match a stored
+        // jsonb number. Keep their digits rather than round through f64.
+        Err(_) => out.push_str(&number.to_string()),
     }
 }
 
@@ -179,12 +169,69 @@ fn after_string(bytes: &[u8], mut index: usize) -> usize {
     bytes.len()
 }
 
+/// Validate client JSON input before comparing it with jsonb. Values
+/// outside the exact decimal representation, or containing a NUL code
+/// point PostgreSQL rejects, must fall back rather than silently miss.
+pub(crate) fn jsonb_input(text: &str) -> Result<String, &'static str> {
+    fn charge(remaining: &mut usize, bytes: usize) -> bool {
+        match remaining.checked_sub(bytes) {
+            Some(left) => {
+                *remaining = left;
+                true
+            }
+            None => false,
+        }
+    }
+    fn exact(value: &serde_json::Value, remaining: &mut usize) -> bool {
+        match value {
+            serde_json::Value::Number(number) => {
+                let Ok(number) = crate::model::Numeric::parse(&number.to_string()) else {
+                    return false;
+                };
+                charge(remaining, standard_json(&number.to_string()).len())
+            }
+            serde_json::Value::String(text) => {
+                !text.contains('\0') && charge(remaining, value.to_string().len())
+            }
+            serde_json::Value::Array(items) => {
+                charge(
+                    remaining,
+                    2usize.saturating_add(items.len().saturating_sub(1).saturating_mul(2)),
+                ) && items.iter().all(|item| exact(item, remaining))
+            }
+            serde_json::Value::Object(items) => {
+                charge(
+                    remaining,
+                    2usize.saturating_add(items.len().saturating_sub(1).saturating_mul(2)),
+                ) && items.iter().all(|(key, value)| {
+                    !key.contains('\0')
+                        && charge(
+                            remaining,
+                            serde_json::Value::String(key.clone())
+                                .to_string()
+                                .len()
+                                .saturating_add(2),
+                        )
+                        && exact(value, remaining)
+                })
+            }
+            serde_json::Value::Null => charge(remaining, 4),
+            serde_json::Value::Bool(value) => charge(remaining, if *value { 4 } else { 5 }),
+        }
+    }
+    let value = serde_json::from_str(text).map_err(|_| "invalid JSON input")?;
+    // A short exponent can expand into a very long decimal. Count the
+    // canonical output before allocating it, including nested documents.
+    if !exact(&value, &mut (1 << 20)) {
+        return Err("JSON input exceeds the exact evaluation budget");
+    }
+    Ok(jsonb_text(&value))
+}
+
 /// A `json` cell's stored text in the standard form: parsed and written
 /// the way `jsonb` would hold it (the last of a repeated key wins, as it
-/// does there). Text that does not parse is kept as it is. A number with
-/// more digits than a double holds is written as the double, where the
-/// `::jsonb` cast of a read keeps every digit; no JavaScript client can
-/// write or read such a number.
+/// does there). Text that does not parse is kept as it is. Decimal digits are
+/// preserved exactly, including numbers beyond a double's precision.
 pub fn json_as_jsonb(text: &str) -> String {
     match serde_json::from_str::<serde_json::Value>(text) {
         Ok(value) => jsonb_text(&value),

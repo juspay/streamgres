@@ -102,6 +102,9 @@ impl Count {
                     .checked_sub(1)
                     .and_then(|index| binds.get(index))
                     .ok_or_else(error)?;
+                if !matches!(bind.type_oid, 20 | 21 | 23) {
+                    return Err(error());
+                }
                 match &bind.bytes {
                     None => Ok(*null),
                     Some(bytes) => {
@@ -122,10 +125,29 @@ pub(crate) struct PreparedSelect {
     pub(super) filters: Vec<(TableName, Tagged)>,
     pub(super) limit: Count,
     pub(super) offset: Count,
+    pub(super) parameters: usize,
 }
 impl PreparedSelect {
     /// Substitute and validate this call's values without lexing or resolving SQL.
     pub(crate) fn bind(&self, binds: &[Bind], catalog: &Catalog) -> Result<Select, ParseError> {
+        if binds.len() != self.parameters {
+            return Err(ParseError {
+                message: if binds.len() < self.parameters {
+                    format!(
+                        "no value is bound for all {} parameters (received {})",
+                        self.parameters,
+                        binds.len()
+                    )
+                } else {
+                    format!(
+                        "expected {} bind parameters, received {}",
+                        self.parameters,
+                        binds.len()
+                    )
+                },
+                position: 0,
+            });
+        }
         let mut select = self.base.clone();
         select.limit = self.limit.bind(binds)?;
         select.offset = self.offset.bind(binds)?;

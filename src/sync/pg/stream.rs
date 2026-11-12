@@ -41,7 +41,7 @@
 //! connection lives, PostgreSQL shows the slot as held by its walsender,
 //! and when the walsender has given up on a peer it no longer hears
 //! (`wal_sender_timeout`), the slot is free. So once nothing has been
-//! heard for [`SILENCE`] the server is asked, on a fresh ordinary
+//! heard for `SILENCE` the server is asked, on a fresh ordinary
 //! connection, whether the slot is still held (a read), and asked again
 //! every half of that while the silence lasts. A slot nobody holds means
 //! this connection is dead: it is given up and the caller reopens the
@@ -292,11 +292,15 @@ impl Decoder {
         let message = pgoutput::parse(data).map_err(|error| StorageError(error.to_string()))?;
         if let Message::Relation(relation) = message {
             let qualified = format!("{}.{}", relation.namespace, relation.name);
-            let declared = self.catalog.table(&qualified).or_else(|| {
-                (relation.namespace == "public")
-                    .then(|| self.catalog.table(&relation.name))
-                    .flatten()
-            });
+            let declared = super::catalog::supported_name(&relation.namespace, &relation.name)
+                .then(|| {
+                    self.catalog.table(&qualified).or_else(|| {
+                        (relation.namespace == "public")
+                            .then(|| self.catalog.table(&relation.name))
+                            .flatten()
+                    })
+                })
+                .flatten();
             self.relations.insert(
                 relation.oid,
                 Relation {
@@ -434,7 +438,7 @@ impl Watch {
     }
 
     /// Whether it is time to ask the server about the slot as of `now`:
-    /// nothing heard for [`SILENCE`], and not asked within half of it.
+    /// nothing heard for `SILENCE`, and not asked within half of it.
     /// Asking is noted, so the next is due half a silence later.
     fn due(&mut self, now: Instant) -> bool {
         let due = now.duration_since(self.heard) >= SILENCE
@@ -927,7 +931,7 @@ impl PgStream {
     /// end on a primary, the replayed end on a standby; a read, nothing is
     /// written) and the feed is consumed until a commit or a keepalive
     /// says it has been delivered that far; fails if that takes longer
-    /// than [`POLL_WAIT`]. A batch carries writes only: a poller is a
+    /// than `POLL_WAIT`. A batch carries writes only: a poller is a
     /// tool for tests and the bench over a feed that hears of no schema
     /// change ([`PgStream::open`]); the schema changes a feed opened with
     /// [`PgStream::open_with`] hears travel with its transactions
@@ -1086,7 +1090,7 @@ fn image(
                     0 => described.type_oid,
                     known => known,
                 };
-                binary::decode(&declared.r#type, type_oid, bytes).map_err(|error| {
+                binary::decode_source(&declared.r#type, type_oid, bytes).map_err(|error| {
                     StorageError(format!("`{}`.`{}`: {error}", table.name, declared.name))
                 })?
             }
@@ -1457,7 +1461,7 @@ mod tests {
     }
 
     /// The server is asked about the slot only once the feed has been
-    /// silent for [`SILENCE`], then every half of it while the silence
+    /// silent for `SILENCE`, then every half of it while the silence
     /// lasts, and hearing the feed starts the wait over.
     #[test]
     fn a_silent_feed_is_asked_about_at_intervals() {

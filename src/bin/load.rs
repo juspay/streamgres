@@ -59,18 +59,18 @@
 //!    PASS when every committed row reached every client that held its
 //!    query and no connection dropped; `--out FILE` writes it all as JSON.
 //!
-//! Options (defaults in brackets): `--dsn` [`$STREAMGRES_PG_DSN`],
-//! `--connections` [200], `--users` [100], `--channels` [20], `--boards`
-//! [10], `--threads` [3], `--tps` [50], `--rows-per-tx` [5], `--writers`
-//! [4], `--pushers` [8], `--push-rate` [10], `--churn` [1], `--warmup` [5],
-//! `--duration` [60], `--md-kb` [3], `--seed-users` [1000],
-//! `--seed-conversations` [100, per channel], `--seed-tickets` [10000],
-//! `--backend-ms` [0, think time of the application server],
-//! `--server-bin` [target/release/server], `--port` [4858],
-//! `--group-threads` [1], `--read-threads` [2], `--read-connections` [16],
-//! `--prewarm` [0: that many clients connected, hydrated and closed before
-//! the measured hydration, so the server's pool and caches are warm], `--server-log`
-//! [target/load-server.log], `--log-level` [warn], `--gateway URL` and
+//! Options (defaults in brackets): `--dsn` \[`$STREAMGRES_PG_DSN`\],
+//! `--connections` \[200\], `--users` \[100\], `--channels` \[20\], `--boards`
+//! \[10\], `--threads` \[3\], `--tps` \[50\], `--rows-per-tx` \[5\], `--writers`
+//! \[4\], `--pushers` \[8\], `--push-rate` \[10\], `--churn` \[1\], `--warmup` \[5\],
+//! `--duration` \[60\], `--md-kb` \[3\], `--seed-users` \[1000\],
+//! `--seed-conversations` \[100, per channel\], `--seed-tickets` \[10000\],
+//! `--backend-ms` \[0, think time of the application server\],
+//! `--server-bin` \[target/release/server\], `--port` \[4858\],
+//! `--group-threads` \[1\], `--read-threads` \[2\], `--read-connections` \[16\],
+//! `--prewarm` \[0: that many clients connected, hydrated and closed before
+//! the measured hydration, so the server's pool and caches are warm\], `--server-log`
+//! \[target/load-server.log\], `--log-level` \[warn\], `--gateway URL` and
 //! `--pid N` (attach instead of starting; the database must have been
 //! prepared before that server started, `--prepare-only` does that),
 //! `--out FILE`, `--label TEXT`, `--seed N`.

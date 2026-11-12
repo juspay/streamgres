@@ -8,9 +8,9 @@
 //! with `postgres-protocol`. Plain TCP or Unix sockets, no TLS. Once a
 //! slot has exported its snapshot, anything sent on the connection discards
 //! the snapshot, so the connection is kept without a byte: the kernel
-//! probes it while silent ([`keep_alive`]), and the session is opened with
+//! probes it while silent (`keep_alive`), and the session is opened with
 //! PostgreSQL's idle timeout off and its end probing too
-//! ([`session_options`]).
+//! (`session_options`).
 
 use std::io;
 use std::time::Duration;
@@ -77,8 +77,8 @@ impl ReplicationConnection {
 
     /// Connect with `config`'s first host, user, password and database in
     /// replication mode and authenticate; a TCP connection is probed while
-    /// silent as `config` asks ([`keep_alive`]), and the session is opened
-    /// with the settings that let it stay silent ([`session_options`]).
+    /// silent as `config` asks (`keep_alive`), and the session is opened
+    /// with the settings that let it stay silent (`session_options`).
     pub async fn open(config: &Config) -> Result<Self, StorageError> {
         let host = config
             .get_hosts()
@@ -268,7 +268,7 @@ impl ReplicationConnection {
 /// which would end the session and the snapshot with it, is turned off
 /// for this session, a setting every role may make for its own; and
 /// PostgreSQL's end of the connection is told to probe this one as this
-/// one probes it ([`keep_alive`]), so either side notices a dead peer in
+/// one probes it (`keep_alive`), so either side notices a dead peer in
 /// the same time instead of after the kernel's default hours.
 fn session_options(config: &Config) -> String {
     let mut options = config.get_options().unwrap_or_default().to_owned();

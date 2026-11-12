@@ -31,7 +31,12 @@
 //! single-quoted with `''` for an embedded quote; `TRUE` / `FALSE` as a
 //! filter parse to the vacuous `AND(vec![])` / `OR(vec![])`.
 //!
-//! # v1 restrictions (each rejected with a clear error, never narrowed silently)
+//! The grammar and restrictions below describe [`parse`], the legacy
+//! single-table read/write interface. Embedded SQL reads use
+//! [`parse_select`], whose projection, bind and join grammar is documented
+//! in `select`. The two interfaces share filter parsing and validation.
+//!
+//! # Legacy interface restrictions
 //!
 //! - Single table only — `LEFT JOIN` is recognised and refused.
 //! - Writes address **exactly one row by primary key**: the `WHERE` of an
@@ -532,6 +537,12 @@ impl Parser {
     fn table<'c>(&mut self, catalog: &'c Catalog) -> Result<&'c DbTable, ParseError> {
         let at = self.at();
         let names = self.dotted(2)?;
+        if names.iter().any(|name| name.contains('.')) {
+            return Err(ParseError {
+                message: "a dot inside a table or schema identifier is not supported".to_owned(),
+                position: at,
+            });
+        }
         let name = match names.as_slice() {
             [schema, table] if schema == "public" => table.clone(),
             [schema, table] => format!("{schema}.{table}"),
@@ -549,6 +560,12 @@ impl Parser {
         let at = self.at();
         let mut names = self.dotted(3)?;
         let name = names.pop().unwrap_or_default();
+        if names.iter().any(|name| name.contains('.')) {
+            return Err(ParseError {
+                message: "a dot inside a table or schema qualifier is not supported".to_owned(),
+                position: at,
+            });
+        }
         let qualifier = match names.as_slice() {
             [] => None,
             [table] => Some(table.clone()),
@@ -1040,12 +1057,19 @@ impl Parser {
                 at,
             });
         }
-        if declared.r#type == ValueType::Numeric
+        if matches!(declared.r#type, ValueType::Numeric | ValueType::Float)
             && let Some(number) = self.numeric_literal()?
         {
-            return Ok(Value::Numeric(number).into());
+            return coerce_read(Value::Numeric(number), &declared.r#type, at).map(Operand::Literal);
         }
         let value = self.value()?;
+        if declared.r#type == ValueType::Timestamp && declared.type_oid != 0 && !value.is_null() {
+            return Err(ParseError {
+                message: "timestamp literals require PostgreSQL session parsing; use a typed bind"
+                    .to_owned(),
+                position: at,
+            });
+        }
         coerce_read(value, &declared.r#type, at).map(Operand::Literal)
     }
 
@@ -1160,6 +1184,24 @@ impl Scope for OneTable<'_> {
     }
 }
 
+/// PostgreSQL binary parameters are already typed. Only known implicit
+/// comparison families may share an engine value representation. OID zero
+/// denotes a synthetic catalog without PostgreSQL metadata (engine tests).
+fn comparison_types(column: u32, value: u32) -> bool {
+    use binary::oid;
+    if column == 0 || value == 0 || column == value {
+        return true;
+    }
+    let integer = |oid| matches!(oid, oid::INT2 | oid::INT4 | oid::INT8);
+    let float = |oid| matches!(oid, oid::FLOAT4 | oid::FLOAT8);
+    let text = |oid| matches!(oid, oid::TEXT | oid::VARCHAR | oid::NAME);
+    (integer(column) && integer(value))
+        || (float(column) && (float(value) || integer(value) || value == oid::NUMERIC))
+        || (column == oid::NUMERIC && integer(value))
+        || (integer(column) && value == oid::NUMERIC)
+        || (text(column) && text(value))
+}
+
 /// Bind parameter `number` decoded by its type, as one value or (for
 /// `ANY` / `ALL`) a list of values of the column's type.
 pub(super) fn decode_bind(
@@ -1176,29 +1218,22 @@ pub(super) fn decode_bind(
             message: format!("no value is bound for ${number}"),
             position: at,
         })?;
-    let Some(bytes) = &bind.bytes else {
-        return Ok(Value::Null);
-    };
     let bound = if list {
-        binary::array_element(bind.type_oid)
+        binary::bound_element(bind.type_oid, bind.bytes.as_deref())
     } else {
         Some(bind.type_oid)
     };
-    let zoned = |oid: u32| match oid {
-        binary::oid::TIMESTAMP => Some(false),
-        binary::oid::TIMESTAMPTZ => Some(true),
-        _ => None,
-    };
-    if let (Some(value), Some(column)) = (bound.and_then(zoned), zoned(declared.type_oid))
-        && value != column
-    {
+    if !bound.is_some_and(|oid| comparison_types(declared.type_oid, oid)) {
         return Err(ParseError {
             message: format!(
-                "${number}: a `timestamp` and a `timestamptz` compare through the session's time zone, which the engine does not follow"
+                "${number}: parameter and column types do not have a supported Postgres comparison"
             ),
             position: at,
         });
     }
+    let Some(bytes) = &bind.bytes else {
+        return Ok(Value::Null);
+    };
     let decoded = if list {
         binary::decode(
             &ValueType::List(Box::new(declared.r#type.clone())),
@@ -1212,6 +1247,12 @@ pub(super) fn decode_bind(
         message: format!("${number}: {error}"),
         position: at,
     })?;
+    if binary::parameter_json_bytes(&decoded) > (1 << 20) / binds.len().max(1) {
+        return Err(ParseError {
+            message: "expanded JSON parameters exceed the evaluation budget".to_owned(),
+            position: at,
+        });
+    }
     coerce_read(decoded, &declared.r#type, at)
 }
 
@@ -1475,18 +1516,32 @@ fn coerce_read(value: Value, declared: &ValueType, at: usize) -> Result<Value, P
         (Value::String(text), ValueType::Day) => crate::sync::pg::text::day(&text)
             .map(Value::Day)
             .ok_or_else(|| fail(format!("`{text}` is not a date")))?,
-        (Value::String(text), ValueType::Json) => Value::Json(
-            crate::model::JsonText::standard_only(crate::sync::pg::text::json_as_jsonb(&text)),
-        ),
+        (Value::String(text), ValueType::Json) => {
+            Value::Json(crate::model::JsonText::standard_only(
+                crate::sync::pg::text::jsonb_input(&text)
+                    .map_err(|reason| fail(reason.to_owned()))?,
+            ))
+        }
         (Value::Int(int), ValueType::Numeric) => Value::Numeric(Numeric::from_i64(int)),
-        (Value::Float(float), ValueType::Numeric) => Value::Numeric(
-            Numeric::parse(&float.to_string()).map_err(|error| fail(error.to_string()))?,
-        ),
+        // Leave a float bound to numeric as a float. Exactness validation
+        // refuses it: Postgres promotes the column to float, which cannot
+        // be represented by the numeric equality indexes used here.
+        (value @ Value::Float(_), ValueType::Numeric) => value,
         (Value::String(text), ValueType::Numeric) => {
             Value::Numeric(Numeric::parse(&text).map_err(|error| fail(error.to_string()))?)
         }
         (Value::Int(int), ValueType::Float) => Value::Float(int as f64),
-        (Value::Numeric(number), ValueType::Float) => Value::Float(number.to_f64()),
+        (Value::Numeric(number), ValueType::Float) => {
+            let float = number.to_f64();
+            if let Numeric::Finite { digits, .. } = &number
+                && (!float.is_finite() || (float == 0.0 && !digits.is_empty()))
+            {
+                return Err(fail(
+                    "numeric value is outside the float comparison range".to_owned(),
+                ));
+            }
+            Value::Float(float)
+        }
         (Value::List(items), ValueType::List(inner)) => Value::List(
             items
                 .into_iter()

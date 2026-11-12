@@ -40,7 +40,7 @@ mod session;
 #[cfg(feature = "async")]
 pub use asynchronous::{AsyncLoadCached, wait_for_writes_async};
 
-pub use session::{Tracker, install};
+pub use session::{RECHECK_EVERY, Recheck, Tracker, install};
 
 use std::any::TypeId;
 use std::collections::HashMap;
@@ -294,6 +294,18 @@ where
     U: FromSqlRow<<Q::SqlType as CompatibleType<U, Pg>>::SqlType, Pg>,
     C: Connection<Backend = Pg> + LoadConnection + PgMetadataLookup + 'static,
 {
+    // What needs no round trip is asked first: a read the cache refuses
+    // whoever asks never pays for a check of its reader.
+    if in_transaction(conn) {
+        let reason = Refusal::NotReady("a read inside a transaction must use Postgres".to_owned());
+        cache.report_refusal(&reason);
+        return Ok(Err(reason));
+    }
+    let (sql, binds) = rendered(query, conn)?;
+    if let Some(reason) = cache.refuses(&sql, &binds) {
+        cache.report_refusal(&reason);
+        return Ok(Err(reason));
+    }
     let reader = match reader_of(conn, cache) {
         Ok(reader) => reader,
         Err(reason) => {
@@ -301,7 +313,6 @@ where
             return Ok(Err(reason));
         }
     };
-    let (sql, binds) = rendered(query, conn)?;
     let answer = match cache.read(&sql, &binds, &reader) {
         Ok(answer) => answer,
         Err(reason) => return Ok(Err(reason)),

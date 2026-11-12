@@ -108,6 +108,12 @@ pub async fn load_catalog(
     }
     let mut tables = Vec::new();
     for ((schema, table), columns) in declared {
+        if !supported_name(&schema, &table) {
+            notes.push(format!(
+                "{schema}.{table}: a dot inside an identifier is not supported, left out"
+            ));
+            continue;
+        }
         let Some(pkey) = pkeys.get(&(schema.clone(), table.clone())) else {
             notes.push(format!("{schema}.{table}: no primary key, left out"));
             continue;
@@ -203,7 +209,12 @@ pub async fn restrict_to_publication(
     let mut published = std::collections::HashSet::new();
     let mut notes = Vec::new();
     for row in rows {
-        let name = table_name(&row.get::<_, String>(0), &row.get::<_, String>(1));
+        let schema: String = row.get(0);
+        let table: String = row.get(1);
+        if !supported_name(&schema, &table) {
+            continue;
+        }
+        let name = table_name(&schema, &table);
         let left_out = if row.get::<_, bool>(3) {
             Some("has a generated column the feed does not carry")
         } else if !row.get::<_, bool>(2) {
@@ -274,6 +285,13 @@ async fn database_collation(client: &Client) -> Result<String, StorageError> {
         "b" => locale,
         _ => libc,
     })
+}
+
+/// The string table identity uses a dot as its schema separator. Until
+/// that identity has separate components, ambiguous names must be refused
+/// consistently by catalog loading, parsing and replication routing.
+pub(crate) fn supported_name(schema: &str, table: &str) -> bool {
+    !schema.contains('.') && !table.contains('.')
 }
 
 /// The catalog name of a table: bare in `public`, schema-qualified

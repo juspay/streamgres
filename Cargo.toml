@@ -7,10 +7,12 @@ exclude = ["crates/streamgres-juspay-diesel"]
 
 [package]
 name = "streamgres"
+description = "Incremental PostgreSQL query engine and embedded cache"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
+repository = "https://github.com/juspay/streamgres"
 
 [features]
 # The server: the Zero sync protocol over WebSockets, telemetry export,
@@ -25,7 +27,6 @@ server = [
     "dep:reqwest",
     "dep:base64",
     "dep:percent-encoding",
-    "dep:futures-util",
     "dep:tokio-tungstenite",
     "dep:pyroscope",
     "dep:tikv-jemallocator",
@@ -88,11 +89,11 @@ once_cell = "1"
 # The client side (`src/client`): message encoding, the
 # HTTP calls to the application server, and the WebSocket handshake.
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["raw_value", "arbitrary_precision"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 base64 = { version = "0.22", optional = true }
 percent-encoding = { version = "2", optional = true }
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"], optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 # The load bench's WebSocket clients (`src/bin/load.rs`): the crate axum's
 # `ws` feature already builds, at the same version, so nothing new is
 # compiled; `connect` alone, no TLS, since the bench talks to a server on

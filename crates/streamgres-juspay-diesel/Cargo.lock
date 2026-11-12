@@ -916,6 +916,7 @@ dependencies = [
  "bytes",
  "chrono",
  "fallible-iterator",
+ "futures-util",
  "log",
  "memchr",
  "once_cell",

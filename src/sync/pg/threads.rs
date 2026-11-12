@@ -92,6 +92,8 @@ pub struct Settings {
     /// The most rows one storage read, and one subscription's part, may
     /// hold; a query past it is refused.
     pub row_limit: usize,
+    /// Maximum wire payload buffered by one snapshot read.
+    pub read_byte_limit: usize,
     /// Tables held whole in memory and read from there.
     pub memory_tables: Vec<TableName>,
 }
@@ -499,6 +501,7 @@ pub async fn start(
     )
     .await
     .map_err(|error| format!("connecting the storage: {error}"))?
+    .with_read_byte_limit(settings.read_byte_limit)
     .with_rotation(settings.snapshot_rotation)
     .with_read_connections(settings.read_connections)
     .with_read_idle_connections(settings.read_idle_connections)
@@ -587,6 +590,7 @@ mod cancellation_tests {
             ddl_prefix: "test".into(),
             settle_reports: true,
             row_limit: 10,
+            read_byte_limit: 1 << 20,
             memory_tables: vec![],
         };
         let (_transactions, mut feed) = spawn_feed(

@@ -189,6 +189,9 @@ impl PublishedTable {
     /// its key; `None` when it has no key or a key column is not carriable,
     /// with the reason.
     pub fn to_db_table(&self) -> Result<DbTable, String> {
+        if !super::catalog::supported_name(&self.schema, &self.name) {
+            return Err("a dot inside a table or schema identifier is not supported".to_owned());
+        }
         if self.primary_key.is_empty() {
             return Err(format!("{}: no primary key", self.catalog_name()));
         }
@@ -411,7 +414,10 @@ pub fn classify(
             catalog: catalog.clone(),
         });
     };
-    let served = |table: &PublishedTable| schemas.contains(&table.schema);
+    let served = |table: &PublishedTable| {
+        schemas.contains(&table.schema)
+            && super::catalog::supported_name(&table.schema, &table.name)
+    };
     let before: HashMap<String, &PublishedTable> = message
         .previous
         .iter()

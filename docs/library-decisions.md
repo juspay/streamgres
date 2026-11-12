@@ -764,3 +764,81 @@ raw transactions and spawning extension futures on a multithreaded executor.
 CI now enables async for workspace tests/lints and still checks the separate
 Juspay lockfile and library-only build. The full user guide and adapter README
 record setup, costs, guarantees, fallback, limits and compatibility.
+
+## 30. Validate SQL types and names at the cache boundary
+
+The full-branch review reproduced wrong answers with noncanonical JSONB binds,
+float parameters compared with numeric columns, mixed timestamp joins, and
+quoted table names that collided with schema-qualified names. It also reproduced
+an exclusion-list bypass using a valid control character in a table name.
+
+Reader exclusions now use a JSON array and malformed data refuses every table.
+A shared comparison whitelist checks PostgreSQL OIDs before coercion, including
+NULL binds. JSONB input is canonicalized with arbitrary-precision decimal digits;
+trusted PostgreSQL source cells keep the existing fast normalization path.
+Canonical output size is counted before allocation, including exponent expansion;
+JSONB arrays and multiple parameters also have an aggregate evaluation bound.
+Unsupported numeric/float and timestamp comparisons fall back rather than rely
+on a session timezone or an equality index with different semantics.
+
+The engine's string table identity cannot distinguish dots inside identifiers
+from schema separators. Such names are refused throughout parsing, catalog
+loading, DDL and replication routing. A future structured table identity could
+support them without ambiguity. Unusual array bounds remain raw, preserving
+wire fidelity without expanding the flat list model.
+
+## 31. Bound snapshot buffers and cancelled async work
+
+Snapshot reads check row and wire-byte budgets while streaming, before retaining
+an oversized result. A failed read drops its connection; incomplete transactions
+are never returned to the pool. Driver statement timeouts retain their permanent
+refusal classification. The byte limit measures source rows, not projections;
+one incoming row and decoded/indexed representations still need extra memory.
+
+Async cache jobs use a process-wide 64-permit gate. Permits move into blocking
+workers so cancellation cannot admit an unlimited queue of abandoned fills.
+Saturation falls back for reads and returns false for an unconfirmed write wait.
+The fixed ceiling is intentionally conservative; sizing it per host can become
+a configuration API if workloads demonstrate that need.
+
+## 32. Keep both adapter packages self-contained
+
+Cargo excludes sibling source paths when packaging. Both adapter crates now
+contain the same source, with streamgres-diesel canonical and a small sync script
+checked by CI. This accepts mechanical source duplication to avoid independent
+implementations or build-time dependence on an absent sibling crate. Path
+dependencies carry versions, and CI executes the fork's unit tests in addition
+to compiling it. Publish the core crate before the adapters.
+
+## 33. What the demo found after the second review
+
+**Found by** running the ticket-desk demo (decision 26) on the code of
+decisions 27–32.
+
+**An enum array bind was refused.** The new check of a parameter's type
+against its column's (decision 30) found an array's element type only for
+built-in array types, so `status = ANY($1)` over an enum went to Postgres
+every time. Three of the demo's shapes stopped being served.
+- **Decision.** An array type the engine has no table of takes its
+  element type from the header of its binary form
+  (`binary::bound_element`). Postgres holds that header to the array's
+  own type, so it says the same.
+- **Tested by** the adapter's live test, which now binds an enum alone
+  and as an array; it fails without the fix.
+
+**A refused query cost a second round trip.** Every database statement
+invalidates the reader's check (decision 28), and the check ran before
+the cache was asked anything. A statement the cache refuses then paid
+for a check on every read: `ILIKE` through `load_cached` took 207 µs
+where Postgres alone took 89 µs.
+- **Decision.** `Cache::refuses(sql, binds)` says, without asking the
+  database, whether a statement is refused whoever reads it. Both
+  adapters ask it before checking the reader.
+- **Decision.** When the check is repeated is the application's choice,
+  `Recheck` on the tracker. The default stays the exact one, after every
+  statement. `AfterSessionStatements` repeats it only after statements
+  that name a session change, for applications that never change
+  `search_path` or role inside a function.
+- **Cost that remains under the default:** a cached read that follows
+  any database statement on its connection pays one round trip.
+

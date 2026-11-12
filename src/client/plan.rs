@@ -349,7 +349,7 @@ impl Planner {
     }
 
     /// Decide every inner edge's driver from the counts in, or refuse:
-    /// every node's plan from the leaves up ([`Planner::plans`]), then
+    /// every node's plan from the leaves up (`Planner::plans`), then
     /// the tree from the root down, a compared node by its plan and a
     /// node narrowed from above driving everything below it. A page's
     /// read stays as translated: in batches, driving or driven.
@@ -385,7 +385,7 @@ impl Planner {
     /// this planner's tree with every inner edge's driver decided, by this
     /// planner or by another on other numbers (a plan made on estimates,
     /// measured on counts). Each node compared under it holds what
-    /// [`Planner::plan_of`] gives that choice of drivers — its alone count
+    /// `Planner::plan_of` gives that choice of drivers — its alone count
     /// when it drives every inner sub, else its narrowed count (a page's no
     /// higher than its `LIMIT`) — plus the hold of every node compared
     /// below it (the subs driving it, a RIGHT child); a node driven from
@@ -432,7 +432,7 @@ impl Planner {
     }
 
     /// Every counted node's plan, subs before their parents (a sub's
-    /// index is always past its parent's), by [`Planner::plan_of`]; a
+    /// index is always past its parent's), by `Planner::plan_of`; a
     /// node not counted has the empty plan.
     fn plans(&self) -> Vec<Plan> {
         let mut plans = vec![Plan::default(); self.nodes.len()];

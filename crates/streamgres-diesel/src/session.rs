@@ -29,6 +29,32 @@ use crate::diesel::connection::{Instrumentation, InstrumentationEvent};
 /// changed it.
 pub const RECHECK_EVERY: Duration = Duration::from_secs(10);
 
+/// When a connection is checked again as a reader, besides every
+/// [`RECHECK_EVERY`].
+///
+/// A check is one round trip, paid by the next cached read. The choice is
+/// between never missing a change of the session and not paying that
+/// round trip after statements that change nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Recheck {
+    /// After every statement the connection sends to the database. No
+    /// change of the session is missed, a function that runs `SET`
+    /// inside included. A cached read that follows a database statement
+    /// costs one round trip; cached reads that follow one another cost
+    /// none.
+    #[default]
+    AfterEveryStatement,
+    /// After the statements that name a change: `SET`, `RESET`,
+    /// `DISCARD`, `set_config`, `CALL`, `DO`, schema changes, grants. A
+    /// change made inside a function a query calls (a `set_tenant()` that
+    /// sets `search_path`, a `SET ROLE` in a trigger) is not seen for up
+    /// to [`RECHECK_EVERY`], and reads in that time may be answered for
+    /// the session as it was. Only for an application that changes its
+    /// session's `search_path` and role in plain statements alone.
+    AfterSessionStatements,
+}
+
 /// One connection's session as the cache needs it.
 #[derive(Debug, Default)]
 pub(crate) struct Session {
@@ -219,6 +245,7 @@ pub struct Tracker {
     text: String,
     /// A failed COMMIT must not make an open transaction look closed.
     transaction_before: bool,
+    recheck: Recheck,
 }
 
 impl Tracker {
@@ -229,7 +256,14 @@ impl Tracker {
             inner: None,
             text: String::new(),
             transaction_before: false,
+            recheck: Recheck::default(),
         }
+    }
+
+    /// This tracker checking its reader again by `recheck`.
+    pub fn rechecking(mut self, recheck: Recheck) -> Self {
+        self.recheck = recheck;
+        self
     }
 
     /// A tracker passing every event on to `inner` as well.
@@ -264,10 +298,11 @@ impl Instrumentation for Tracker {
             self.text.clear();
             let _ = fmt::write(&mut UpToBinds(&mut self.text), format_args!("{query}"));
             self.session.saw(&self.text);
-            // Even a SELECT may call a function that changes session state.
-            // Actual database statements always require a new reader check;
-            // cache hits cannot have side effects and bypass this path.
-            self.session.changed = true;
+            // Even a SELECT may call a function that changes the session;
+            // cache hits never come this way.
+            if self.recheck == Recheck::AfterEveryStatement {
+                self.session.changed = true;
+            }
         }
         if let InstrumentationEvent::FinishQuery { error: Some(_), .. } = &event {
             self.session.in_transaction |= self.transaction_before;
@@ -457,6 +492,25 @@ mod tests {
         assert!(!session.in_transaction);
         session.saw("COMMIT PREPARED 'other'");
         assert!(!session.in_transaction);
+    }
+
+    /// Under the default every database statement asks for a new check;
+    /// under `AfterSessionStatements` only the ones that name a change.
+    #[test]
+    fn the_recheck_choice_decides_what_a_plain_statement_does() {
+        use crate::diesel::connection::{Instrumentation, InstrumentationEvent, StrQueryHelper};
+        let ran = |tracker: &mut Tracker, sql: &str| {
+            tracker.session.changed = false;
+            tracker.on_connection_event(InstrumentationEvent::start_query(&StrQueryHelper::new(
+                sql,
+            )));
+            tracker.session.changed
+        };
+        let mut strict = Tracker::new();
+        assert!(ran(&mut strict, "SELECT set_tenant($1)"));
+        let mut relaxed = Tracker::new().rechecking(Recheck::AfterSessionStatements);
+        assert!(!ran(&mut relaxed, "SELECT set_tenant($1)"));
+        assert!(ran(&mut relaxed, "SET search_path = tenant"));
     }
 
     #[test]

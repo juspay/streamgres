@@ -351,7 +351,7 @@ impl SingleTableIVM {
     /// row there is nothing to complete it from: no subscription is sent
     /// it and the frame does not take it; the row is read again by
     /// primary key for the subscriptions it enters
-    /// ([`SingleTableIVM::read_row`]) and reaches them when that read
+    /// (`SingleTableIVM::read_row`) and reaches them when that read
     /// lands.
     pub fn incremental_update(&mut self, write_query: &WriteQuery) -> Vec<SingleTableUpdate> {
         self.stats.writes_processed += 1;

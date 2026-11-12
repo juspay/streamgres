@@ -488,7 +488,7 @@ struct TreeId(u64);
 ///   admitted rows as of the last sync, each with the image it was sent
 ///   with and whether it is sent at all (under a shown parent row);
 ///   `synced` the window version each view was last synced at
-///   ([`SingleTableIVM::window_version`]), so a page whose window has not
+///   (`SingleTableIVM::window_version`), so a page whose window has not
 ///   changed since is not walked again.
 /// - `in_flight`: the rows the inner engine holds whose `Add` this layer
 ///   has not reached yet within the step being forwarded.
@@ -500,7 +500,7 @@ struct TreeId(u64);
 /// - `cause`: what the operations being forwarded come from — a write, or
 ///   a read a page asked for itself — and `landing`, the part whose read
 ///   is landing, if one is; together they say whether a gate opening
-///   needs a recall (see [`Cause`]). `write_reads` are the narrowed reads
+///   needs a recall (see `Cause`). `write_reads` are the narrowed reads
 ///   a write provoked, still out.
 ///
 /// The layer knows subscriptions, not clients: whose a subscription is,

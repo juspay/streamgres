@@ -100,7 +100,7 @@ pub fn resident_bytes() -> u64 {
 }
 
 /// One thread of the process as sampled: its id, its label
-/// ([`thread_label`]), its CPU time so far in seconds, the core it last
+/// (`thread_label`), its CPU time so far in seconds, the core it last
 /// ran on (`processor` in `/proc/<tid>/stat`; `None` off Linux) and how
 /// many times the scheduler has moved it between cores so far
 /// (`se.nr_migrations` in `/proc/<tid>/sched`; `None` where the kernel

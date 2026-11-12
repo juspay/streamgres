@@ -163,6 +163,30 @@ impl Cache {
             .map(|catalog| CatalogVersion::of(&catalog))
     }
 
+    /// Why `sql` with `binds` cannot be answered now whoever reads it, if
+    /// it cannot: the engine is not ready, or the statement or its query
+    /// is one the engine does not answer. It asks the database nothing,
+    /// so an adapter asks it before it spends a round trip checking its
+    /// reader; `None` promises nothing about [`Cache::read`].
+    pub fn refuses(&self, sql: &str, binds: &[Bind]) -> Option<Refusal> {
+        let shared = &self.shared;
+        let catalog = {
+            let state = shared.read();
+            if let Err(refusal) = state.readiness(&shared.config) {
+                return Some(refusal);
+            }
+            state.catalog().ok()?
+        };
+        let version = CatalogVersion::of(&catalog);
+        match shared.parsed.get_or_parse(sql, binds, &version, &catalog) {
+            Err(reason) => Some(Refusal::Unsupported(reason.to_string())),
+            Ok(select) => shared
+                .read()
+                .refused(&select.query, shared.config.refusal_ttl)
+                .map(|reason| Refusal::Unsupported(reason.to_string())),
+        }
+    }
+
     /// The rows `sql` with `binds` returns to `reader`, as Postgres would
     /// return them at the position the engine has applied.
     pub fn read(&self, sql: &str, binds: &[Bind], reader: &Reader) -> Result<CachedRows, Refusal> {

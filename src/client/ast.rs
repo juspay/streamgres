@@ -11,7 +11,7 @@
 //! marks as permission checks are registered but their parts are not
 //! shipped to the client, the way zero-cache withholds them. Two `EXISTS`
 //! tests beside each other under a node's `AND`, on the same to-one
-//! relationship, are one test of both conditions ([`merge_exists`]).
+//! relationship, are one test of both conditions (`merge_exists`).
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -109,7 +109,7 @@ pub struct Correlation {
     pub child_field: Vec<String>,
 }
 
-/// One to-one relationship an `EXISTS` tests, as [`merge_exists`] groups
+/// One to-one relationship an `EXISTS` tests, as `merge_exists` groups
 /// them: the parent columns, the child columns and the child table.
 type Relationship<'a> = (&'a [String], &'a [String], &'a str);
 

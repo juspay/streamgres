@@ -196,8 +196,10 @@ impl Numeric {
         {
             return Err(NumericError("not a decimal number"));
         }
-        let limit = i32::try_from(MAX_SCALE).unwrap_or(i32::MAX);
-        if !(-limit..=limit).contains(&exponent) {
+        // Whole numbers may have many more digits than the fractional
+        // scale limit. Check the actual resulting weight below.
+        const MAX_EXPONENT: i32 = 131_072;
+        if !(-MAX_EXPONENT..=MAX_EXPONENT).contains(&exponent) {
             return Err(NumericError("exponent out of range"));
         }
         let digits: Vec<u8> = whole
@@ -211,7 +213,25 @@ impl Numeric {
             .ok()
             .filter(|scale| usize::from(*scale) <= MAX_SCALE)
             .ok_or(NumericError("scale out of range"))?;
-        Ok(Self::from_decimal_digits(negative, &digits, point, scale))
+        // Strip leading zeros before deriving the base-10000 weight.
+        // Otherwise a long, valid zero prefix can saturate the i16 weight
+        // and silently change the value; oversized nonzero values must
+        // be rejected rather than saturated too.
+        let leading = digits
+            .iter()
+            .position(|digit| *digit != 0)
+            .unwrap_or(digits.len());
+        let significant = digits.get(leading..).unwrap_or_default();
+        let point = point - i64::try_from(leading).map_err(|_| NumericError("too many digits"))?;
+        if !significant.is_empty() && point > 131_072 {
+            return Err(NumericError("integer digits out of range"));
+        }
+        Ok(Self::from_decimal_digits(
+            negative,
+            significant,
+            point,
+            scale,
+        ))
     }
 
     /// The value of decimal `digits` with the decimal point after the
@@ -454,6 +474,19 @@ mod tests {
     }
 
     #[test]
+    fn decimal_weight_never_saturates_input_to_another_value() {
+        assert_eq!(
+            Numeric::parse(&format!("{}12345", "0".repeat(140_000))).unwrap(),
+            Numeric::from_i64(12345)
+        );
+        assert!(Numeric::parse(&format!("1{}", "0".repeat(131_072))).is_err());
+        let large = Numeric::parse("1e20000").unwrap();
+        assert_eq!(large.to_string(), format!("1{}", "0".repeat(20_000)));
+        assert_eq!(Numeric::from_binary(&large.to_binary()).unwrap(), large);
+        assert!(Numeric::parse("1e-16384").is_err());
+    }
+
+    #[test]
     fn text_round_trips_with_its_scale() {
         for text in [
             "0",
@@ -561,7 +594,7 @@ mod tests {
 
     #[test]
     fn rejects_what_is_not_a_number() {
-        for text in ["", "-", ".", "1.2.3", "1e", "abc", "1e99999"] {
+        for text in ["", "-", ".", "1.2.3", "1e", "abc", "1e999999"] {
             assert!(Numeric::parse(text).is_err(), "{text}");
         }
     }

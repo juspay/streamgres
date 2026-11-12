@@ -237,7 +237,7 @@ enum Step {
 
 /// The running profiler: one agent for the CPU, and one for the heap when
 /// it is profiled. Dropping it stops the sampling and sends the last
-/// profiles, waiting [`STOP_WAIT`] at most.
+/// profiles, waiting `STOP_WAIT` at most.
 pub struct Profiler {
     agents: Vec<(&'static str, PyroscopeAgent<PyroscopeAgentRunning>)>,
 }

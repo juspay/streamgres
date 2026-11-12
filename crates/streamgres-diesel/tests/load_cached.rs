@@ -104,6 +104,56 @@ impl diesel::connection::Instrumentation for Events {
     }
 }
 
+diesel::table! {
+    use diesel::sql_types::*;
+    use super::StatusType;
+
+    adapter_tickets (id) {
+        id -> Int8,
+        status -> StatusType,
+        previous -> Nullable<StatusType>,
+    }
+}
+
+/// The `adapter_status` enum type.
+#[derive(diesel::sql_types::SqlType, diesel::query_builder::QueryId)]
+#[diesel(postgres_type(name = "adapter_status"))]
+pub struct StatusType;
+
+#[derive(Debug, Clone, Copy, PartialEq, diesel::AsExpression, diesel::FromSqlRow)]
+#[diesel(sql_type = StatusType)]
+enum Status {
+    Open,
+    Pending,
+    Closed,
+}
+
+impl diesel::serialize::ToSql<StatusType, diesel::pg::Pg> for Status {
+    fn to_sql<'b>(
+        &'b self,
+        out: &mut diesel::serialize::Output<'b, '_, diesel::pg::Pg>,
+    ) -> diesel::serialize::Result {
+        use std::io::Write;
+        out.write_all(match self {
+            Status::Open => b"open",
+            Status::Pending => b"pending",
+            Status::Closed => b"closed",
+        })?;
+        Ok(diesel::serialize::IsNull::No)
+    }
+}
+
+impl diesel::deserialize::FromSql<StatusType, diesel::pg::Pg> for Status {
+    fn from_sql(value: diesel::pg::PgValue<'_>) -> diesel::deserialize::Result<Self> {
+        match value.as_bytes() {
+            b"open" => Ok(Status::Open),
+            b"pending" => Ok(Status::Pending),
+            b"closed" => Ok(Status::Closed),
+            other => Err(format!("not a status: {other:?}").into()),
+        }
+    }
+}
+
 const PUBLICATION: &str = "adapter_orders_pub";
 
 /// Asserts the cache answers `query` itself, with Postgres's rows.
@@ -144,13 +194,20 @@ fn load_cached_returns_what_load_returns() {
            amount numeric(14, 4) NOT NULL, created_at timestamptz NOT NULL,
            local_at timestamp NOT NULL, due date NOT NULL, payload bytea NOT NULL,
            meta jsonb NOT NULL, tags int4[] NOT NULL, note text);
+         DROP TABLE IF EXISTS adapter_tickets;
+         DROP TYPE IF EXISTS adapter_status;
+         CREATE TYPE adapter_status AS ENUM ('open', 'pending', 'closed');
+         CREATE TABLE adapter_tickets (
+           id int8 PRIMARY KEY, status adapter_status NOT NULL, previous adapter_status);
+         INSERT INTO adapter_tickets VALUES
+           (1, 'open', NULL), (2, 'pending', 'open'), (3, 'closed', 'pending'), (4, 'open', 'closed');
          DROP TABLE IF EXISTS adapter_purchases;
          DROP TABLE IF EXISTS adapter_customers;
          CREATE TABLE adapter_customers (id int8 PRIMARY KEY, name text COLLATE \"C\" NOT NULL);
          CREATE TABLE adapter_purchases (id int8 PRIMARY KEY, customer_id int8, total int8 NOT NULL);
          INSERT INTO adapter_customers VALUES (1, 'meera'), (2, 'arjun'), (3, 'nobody');
          INSERT INTO adapter_purchases VALUES (10, 1, 100), (11, 1, 250), (12, 2, 75), (13, NULL, 5);
-         CREATE PUBLICATION {PUBLICATION} FOR TABLE adapter_orders, adapter_customers, adapter_purchases;"
+         CREATE PUBLICATION {PUBLICATION} FOR TABLE adapter_orders, adapter_customers, adapter_purchases, adapter_tickets;"
     ))
     .expect("prepare");
     conn.batch_execute(&config.setup_sql())
@@ -502,6 +559,43 @@ fn load_cached_returns_what_load_returns() {
     conn.batch_execute("RESET search_path; DROP SCHEMA adapter_hidden CASCADE")
         .unwrap();
 
+    // A Postgres enum, bound alone and as an array of its own array type.
+    let open_or_pending = vec![Status::Open, Status::Pending];
+    same!(
+        &cache,
+        &mut conn,
+        adapter_tickets::table
+            .filter(adapter_tickets::status.eq(Status::Open))
+            .order(adapter_tickets::id.asc())
+            .select((adapter_tickets::id, adapter_tickets::status)),
+        (i64, Status)
+    );
+    same!(
+        &cache,
+        &mut conn,
+        adapter_tickets::table
+            .filter(adapter_tickets::status.eq_any(open_or_pending.clone()))
+            .order(adapter_tickets::id.asc())
+            .select((adapter_tickets::id, adapter_tickets::previous)),
+        (i64, Option<Status>)
+    );
+    same!(
+        &cache,
+        &mut conn,
+        adapter_tickets::table
+            .filter(adapter_tickets::status.ne_all(open_or_pending.clone()))
+            .select(adapter_tickets::id),
+        i64
+    );
+    same!(
+        &cache,
+        &mut conn,
+        adapter_tickets::table
+            .filter(adapter_tickets::status.eq_any(open_or_pending.clone()))
+            .count(),
+        i64
+    );
+
     let filtered: Vec<i64> = adapter_orders::table
         .filter(adapter_orders::note.like("%noted"))
         .select(adapter_orders::id)
@@ -511,7 +605,7 @@ fn load_cached_returns_what_load_returns() {
 
     cache.stop();
     conn.batch_execute(&format!(
-        "{teardown} DROP PUBLICATION IF EXISTS {PUBLICATION}; DROP TABLE IF EXISTS adapter_orders; DROP TABLE IF EXISTS adapter_purchases; DROP TABLE IF EXISTS adapter_customers;"
+        "{teardown} DROP PUBLICATION IF EXISTS {PUBLICATION}; DROP TABLE IF EXISTS adapter_orders; DROP TABLE IF EXISTS adapter_purchases; DROP TABLE IF EXISTS adapter_customers; DROP TABLE IF EXISTS adapter_tickets; DROP TYPE IF EXISTS adapter_status;"
     ))
     .expect("clean up");
 }

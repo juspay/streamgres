@@ -330,7 +330,7 @@ impl SingleTableIVM {
     /// Land the rows a lookup returned for `sub`, a window of a node with
     /// one per parent row, which the join layer sorted out of the node's
     /// one read ([`SingleTableIVM::lookup_query`]): as a lookup's rows land
-    /// ([`SingleTableIVM::land_rows`]), overflow evicted and the boundary
+    /// (`SingleTableIVM::land_rows`), overflow evicted and the boundary
     /// republished; no read of `sub`'s own is accounted for. Returns the
     /// subscription's operations.
     pub fn land_lookup(

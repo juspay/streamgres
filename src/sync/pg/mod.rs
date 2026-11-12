@@ -18,10 +18,9 @@
 //!
 //! # One round trip, on the reads pool
 //!
-//! A read is one simple-query batch, `BEGIN … READ ONLY; SET TRANSACTION
-//! SNAPSHOT '…'; SELECT …; COMMIT`, so the rows are back after a single
-//! round trip; the columns arrive as text, cast by the `SELECT` to the
-//! forms the feed already decodes, and are decoded the same way. The
+//! A read pipelines transaction setup, a binary SELECT and COMMIT in one
+//! round trip. The SELECT streams rows with row and wire-byte budgets;
+//! columns use the same binary decoder as the replication feed. The
 //! rendering of the SQL, the connection I/O and the decoding all run as
 //! tasks of the runtime the storage was opened on (a small pool of
 //! threads in the server, the caller's own runtime in tests), never on
@@ -107,7 +106,7 @@ const DEFAULT_READ_IDLE_CONNECTIONS: usize = 16;
 /// one a read returns.
 const DEFAULT_READ_ROW_LIMIT: usize = 100_000;
 
-/// [`DEFAULT_READ_ROW_LIMIT`], or the environment's override.
+/// `DEFAULT_READ_ROW_LIMIT`, or the environment's override.
 pub fn read_row_limit() -> usize {
     [
         "STREAMGRES_ROW_LIMIT",
@@ -388,6 +387,7 @@ struct Pool {
     idle_limit: AtomicUsize,
     /// The most rows one read may return before it is refused.
     row_limit: AtomicUsize,
+    byte_limit: AtomicUsize,
     aliases: Mutex<Aliases>,
     rotation: AtomicU64,
     wake: Notify,
@@ -475,6 +475,7 @@ impl PgStorage {
             permits: Arc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
             idle_limit: AtomicUsize::new(DEFAULT_READ_IDLE_CONNECTIONS),
             row_limit: AtomicUsize::new(row_limit),
+            byte_limit: AtomicUsize::new(usize::MAX),
             aliases: Mutex::new(Aliases::new(catalog)),
             rotation: AtomicU64::new(250),
             wake: Notify::new(),
@@ -507,6 +508,14 @@ impl PgStorage {
         self
     }
 
+    /// Bound the wire payload retained by one snapshot read. The budget
+    /// is checked as rows arrive, before retaining the next row. One row
+    /// must still be received in full by the Postgres driver to measure it.
+    pub fn with_read_byte_limit(self, limit: usize) -> Self {
+        self.pool.byte_limit.store(limit, Ordering::Relaxed);
+        self
+    }
+
     /// Let at most `limit` reads hold a connection at once (at least one).
     pub fn with_read_connections(self, limit: usize) -> Self {
         let pool = Arc::new(Pool {
@@ -516,6 +525,7 @@ impl PgStorage {
             permits: Arc::new(Semaphore::new(limit.max(1))),
             idle_limit: AtomicUsize::new(self.pool.idle_limit.load(Ordering::Relaxed)),
             row_limit: AtomicUsize::new(self.pool.row_limit.load(Ordering::Relaxed)),
+            byte_limit: AtomicUsize::new(self.pool.byte_limit.load(Ordering::Relaxed)),
             aliases: Mutex::new(self.pool.lock_aliases().take()),
             rotation: AtomicU64::new(self.pool.rotation.load(Ordering::Relaxed)),
             wake: Notify::new(),
@@ -635,7 +645,7 @@ impl Storage for PgStorage {
             let row_limit = pool.row_limit.load(Ordering::Relaxed);
             let mut sql = sql::select_sql(&query, table);
             if query.limit == u32::MAX {
-                sql.push_str(&format!(" LIMIT {}", row_limit + 1));
+                sql.push_str(&format!(" LIMIT {}", row_limit.saturating_add(1)));
             }
             let what = format!("a read on `{}`", query.table);
             let rows = pool.read(&alias, &what, &sql, delay).await?;
@@ -989,6 +999,59 @@ impl Pool {
         }
     }
 
+    /// Preserve permanent timeout refusals through the streaming path.
+    fn read_error(&self, what: &str, error: tokio_postgres::Error) -> StorageError {
+        match self.timeout() {
+            Some(limit) if error.code() == Some(&SqlState::QUERY_CANCELED) => {
+                timed_out(what, limit)
+            }
+            _ => error.into(),
+        }
+    }
+
+    /// Collect incrementally so an oversized result cannot be buffered
+    /// whole before the row and byte budgets are checked. Dropping a failed
+    /// read closes its connection; a partial transaction is never reused.
+    async fn read_rows(
+        &self,
+        client: &Client,
+        what: &str,
+        sql: &str,
+    ) -> Result<Vec<Row>, StorageError> {
+        use futures_util::TryStreamExt;
+        let stream = client
+            .query_typed_raw(
+                sql,
+                [] as [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 0],
+            )
+            .await
+            .map_err(|error| self.read_error(what, error))?;
+        let mut stream = std::pin::pin!(stream);
+        let row_limit = self.row_limit.load(Ordering::Relaxed);
+        let byte_limit = self.byte_limit.load(Ordering::Relaxed);
+        let mut bytes = 0usize;
+        let mut rows = Vec::new();
+        while let Some(row) = stream
+            .try_next()
+            .await
+            .map_err(|error| self.read_error(what, error))?
+        {
+            if rows.len() >= row_limit {
+                return Err(StorageError::refused("a snapshot exceeds its row budget"));
+            }
+            for at in 0..row.len() {
+                if let Some(RawCell(cell)) = row.try_get(at)? {
+                    bytes = bytes.saturating_add(cell.len());
+                }
+            }
+            if bytes > byte_limit {
+                return Err(StorageError::refused("a snapshot exceeds its byte budget"));
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
     /// Run one positioned statement: the read-only transaction opened with
     /// the alias's exported snapshot imported, `sql` run against it with
     /// its rows in binary format, and the transaction committed. The three
@@ -1018,21 +1081,26 @@ impl Pool {
         let work = async {
             let client = self.acquire().await?;
             let outcome = tokio::try_join!(
-                client.batch_execute(&setup),
-                client.query_typed(sql, &[]),
-                client.batch_execute("COMMIT"),
+                async {
+                    client
+                        .batch_execute(&setup)
+                        .await
+                        .map_err(|error| self.read_error(what, error))
+                },
+                self.read_rows(&client, what, sql),
+                async {
+                    client
+                        .batch_execute("COMMIT")
+                        .await
+                        .map_err(|error| self.read_error(what, error))
+                },
             );
             match outcome {
                 Ok((_, rows, _)) => {
                     self.release(client);
                     Ok(rows)
                 }
-                Err(error) => match limit {
-                    Some(limit) if error.code() == Some(&SqlState::QUERY_CANCELED) => {
-                        Err(timed_out(what, limit))
-                    }
-                    _ => Err(error.into()),
-                },
+                Err(error) => Err(error),
             }
         };
         match limit {
@@ -1148,7 +1216,7 @@ fn decode_row(row: &Row, table: &DbTable) -> Result<(DataFrameKey, DataFrameRow)
                         .map_or(0, |described| described.type_().oid()),
                     known => known,
                 };
-                binary::decode(&column.r#type, type_oid, bytes)
+                binary::decode_source(&column.r#type, type_oid, bytes)
                     .map_err(|error| StorageError(format!("`{}`.`{name}`: {error}", table.name)))?
             }
             None => Value::Null,

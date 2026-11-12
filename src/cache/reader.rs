@@ -71,15 +71,10 @@ impl std::hash::Hash for CatalogVersion {
 const CHECK_SQL: &str =
     "SELECT (SELECT system_identifier::text FROM pg_control_system()) AS cluster,
        current_database()::text AS database,
-       COALESCE(array_to_string(array_agg(t.name) FILTER (WHERE
+       COALESCE(json_agg(t.name) FILTER (WHERE
            to_regclass(t.as_written) IS DISTINCT FROM to_regclass(t.qualified)
-           OR NOT COALESCE(has_table_privilege(to_regclass(t.qualified), 'SELECT'), false)),
-         chr(31)), '') AS excluded
+           OR NOT COALESCE(has_table_privilege(to_regclass(t.qualified), 'SELECT'), false)), '[]'::json)::text AS excluded
 FROM unnest($1::text[], $2::text[], $3::text[]) AS t(name, as_written, qualified)";
-
-/// The separator of the excluded tables' names in the check's answer: a
-/// control character no table name holds.
-const SEPARATOR: char = '\u{1f}';
 
 impl ReaderCheck {
     pub(super) fn of(catalog: &Arc<Catalog>) -> Self {
@@ -112,23 +107,22 @@ impl ReaderCheck {
 pub struct Reader {
     cluster: String,
     database: String,
-    excluded: HashSet<TableName>,
+    excluded: Option<HashSet<TableName>>,
     version: CatalogVersion,
 }
 
 impl Reader {
     /// The reader [`ReaderCheck`]'s row describes: its `cluster`,
     /// `database` and `excluded` columns, checked against catalog
-    /// `version`.
+    /// `version`. `excluded` must be the JSON array of table names returned
+    /// by the check. Invalid input refuses every table, never grants access.
     pub fn new(cluster: &str, database: &str, excluded: &str, version: CatalogVersion) -> Self {
         Reader {
             cluster: cluster.to_owned(),
             database: database.to_owned(),
-            excluded: excluded
-                .split(SEPARATOR)
-                .filter(|name| !name.is_empty())
-                .map(TableName::from)
-                .collect(),
+            excluded: serde_json::from_str::<Vec<String>>(excluded)
+                .ok()
+                .map(|names| names.into_iter().map(TableName::from).collect()),
             version,
         }
     }
@@ -156,9 +150,12 @@ impl Reader {
 
     /// Why this reader cannot be answered for `table`, if it cannot.
     pub(super) fn refuses(&self, table: &TableName) -> Option<String> {
-        self.excluded.contains(table).then(|| {
-            format!("`{table}` names another table for this reader, or one it may not read")
-        })
+        match &self.excluded {
+            None => Some("the reader check returned an invalid table exclusion list".to_owned()),
+            Some(excluded) => excluded.contains(table).then(|| {
+                format!("`{table}` names another table for this reader, or one it may not read")
+            }),
+        }
     }
 }
 
@@ -166,6 +163,20 @@ impl Reader {
 mod tests {
     use super::*;
     use crate::model::{DbColumn, DbTable, ValueType};
+
+    #[test]
+    fn exclusions_preserve_every_character_and_fail_closed() {
+        let version = CatalogVersion::of(&Arc::new(Catalog::new(Vec::new())));
+        let name = "secret\u{1f}rows\"\\tail";
+        let encoded = serde_json::to_string(&vec![name]).unwrap();
+        let reader = Reader::new("1", "app", &encoded, version.clone());
+        assert!(reader.refuses(&TableName::from(name)).is_some());
+        assert!(reader.refuses(&TableName::from("other")).is_none());
+        for invalid in ["", "null", "{}", "[null]", "secret\u{1f}rows"] {
+            let reader = Reader::new("1", "app", invalid, version.clone());
+            assert!(reader.refuses(&TableName::from("any_table")).is_some());
+        }
+    }
 
     #[test]
     fn a_check_names_each_table_as_statements_do() {
@@ -201,7 +212,7 @@ mod tests {
         let reader = Reader::new(
             "7",
             "app",
-            &format!("orders{SEPARATOR}billing.invoices"),
+            r#"["orders", "billing.invoices"]"#,
             version.clone(),
         );
         assert!(reader.refuses(&TableName::from("orders")).is_some());
@@ -218,7 +229,7 @@ mod tests {
             "the same name on another cluster"
         );
         assert!(
-            Reader::new("7", "app", "", version.clone())
+            Reader::new("7", "app", "[]", version.clone())
                 .refuses(&TableName::from("orders"))
                 .is_none()
         );

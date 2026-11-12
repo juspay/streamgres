@@ -163,6 +163,7 @@ impl CacheConfig {
             ddl_prefix: format!("{}/{}/ddl", self.app, self.shard),
             settle_reports: true,
             row_limit: self.max_rows_per_query,
+            read_byte_limit: self.max_entry_bytes.min(self.max_bytes),
             memory_tables: Vec::new(),
         }
     }

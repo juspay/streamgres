@@ -83,8 +83,8 @@ mod tests {
             ["id"],
             vec![DbColumn::new("id", ValueType::Int)],
         )]));
-        let reader = Reader::new("1", "app", "", CatalogVersion::of(&catalog));
-        let excluded = Reader::new("1", "app", "t", CatalogVersion::of(&catalog));
+        let reader = Reader::new("1", "app", "[]", CatalogVersion::of(&catalog));
+        let excluded = Reader::new("1", "app", r#"["t"]"#, CatalogVersion::of(&catalog));
         let identity = Arc::new(());
         let other = Arc::new(());
         let select = crate::parser::parse_select("SELECT COUNT(*) FROM t", &[], &catalog).unwrap();

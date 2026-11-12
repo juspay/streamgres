@@ -156,6 +156,12 @@ impl Scope for FromScope<'_> {
         let at = parser.at();
         let mut names = parser.dotted(3)?;
         let name = names.pop().unwrap_or_default();
+        if names.iter().any(|name| name.contains('.')) {
+            return Err(ParseError {
+                message: "a dot inside a table or schema qualifier is not supported".to_owned(),
+                position: at,
+            });
+        }
         let qualifier = match names.as_slice() {
             [] => None,
             [table] => Some(table.clone()),
@@ -308,6 +314,15 @@ impl Parser {
             filters,
             limit,
             offset,
+            parameters: self
+                .tokens
+                .iter()
+                .filter_map(|token| match token.tok {
+                    Tok::Param(number) => Some(number),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0),
         })
     }
 
@@ -721,6 +736,20 @@ fn check_edge(parent: &DbTable, child: &DbTable, edge: &Edge, at: usize) -> Resu
             position: at,
         });
     }
+    if left.r#type == ValueType::Timestamp && left.type_oid != right.type_oid {
+        return Err(ParseError {
+            message: "timestamp and timestamptz joins depend on the session time zone".to_owned(),
+            position: at,
+        });
+    }
+    if !super::comparison_types(left.type_oid, right.type_oid)
+        || !super::comparison_types(right.type_oid, left.type_oid)
+    {
+        return Err(ParseError {
+            message: "the join types do not have a supported Postgres comparison".to_owned(),
+            position: at,
+        });
+    }
     let same = left.r#type == right.r#type
         || matches!(
             (&left.r#type, &right.r#type),
@@ -763,6 +792,7 @@ fn comparable(column: &DbColumn) -> Comparable {
         | ValueType::Bytes
         | ValueType::Date
         | ValueType::Datetime => Comparable::Fully,
+        ValueType::Json if column.type_oid == oid::JSON => Comparable::Not,
         ValueType::Json => Comparable::Equality,
         ValueType::String => match column.type_oid {
             oid::UUID => Comparable::Fully,
@@ -889,6 +919,77 @@ fn fits(value: &Value, declared: &ValueType) -> bool {
 mod tests {
     use super::*;
     use crate::model::{Collation, Numeric, Timestamp};
+
+    #[test]
+    fn typed_null_counts_and_extra_parameters_are_refused() {
+        let catalog = catalog();
+        let null_text = Bind {
+            type_oid: oid::TEXT,
+            bytes: None,
+        };
+        for sql in [
+            "SELECT id FROM orders ORDER BY id LIMIT $1",
+            "SELECT id FROM orders ORDER BY id OFFSET $1",
+            "SELECT id FROM orders WHERE created_at = $1",
+        ] {
+            assert!(
+                parse_select(sql, std::slice::from_ref(&null_text), &catalog).is_err(),
+                "{sql}"
+            );
+        }
+        assert!(parse_select("SELECT id FROM orders", &[null_text], &catalog).is_err());
+        for sql in [
+            "SELECT id FROM orders WHERE created_at = '2026-01-01 00:00:00'",
+            "SELECT id FROM orders WHERE created_at = 0",
+        ] {
+            assert!(parse_select(sql, &[], &catalog).is_err(), "{sql}");
+        }
+        let null_int = Bind {
+            type_oid: oid::INT8,
+            bytes: None,
+        };
+        assert!(
+            parse_select(
+                "SELECT id FROM orders ORDER BY id LIMIT $1",
+                &[null_int],
+                &catalog
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn numeric_float_comparisons_refuse_overflow_and_underflow() {
+        let catalog = Catalog::new(vec![DbTable::new(
+            "floats",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int).with_type_oid(oid::INT8),
+                DbColumn::new("f", ValueType::Float).with_type_oid(oid::FLOAT8),
+            ],
+        )]);
+        for number in ["1e1000", "1e-1000"] {
+            assert!(
+                parse_select(
+                    &format!("SELECT id FROM floats WHERE f = {number}"),
+                    &[],
+                    &catalog
+                )
+                .is_err()
+            );
+            let bind = Bind {
+                type_oid: oid::NUMERIC,
+                bytes: Some(Numeric::parse(number).unwrap().to_binary()),
+            };
+            assert!(parse_select("SELECT id FROM floats WHERE f = $1", &[bind], &catalog).is_err());
+        }
+        assert!(parse_select("SELECT id FROM floats WHERE f = 0.1", &[], &catalog).is_ok());
+        let infinity = Bind {
+            type_oid: oid::NUMERIC,
+            bytes: Some(Numeric::Infinity.to_binary()),
+        };
+        assert!(parse_select("SELECT id FROM floats WHERE f = $1", &[infinity], &catalog).is_ok());
+    }
 
     fn catalog() -> Catalog {
         let c = Collation {

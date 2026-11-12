@@ -87,12 +87,30 @@ sampled position has been applied within `max_lag`, reads refuse. Very small
 between the database and application's wall clocks.
 
 A reader is checked for cluster identity, database, table resolution and SELECT
-privileges. Every actual database statement invalidates the cached reader check,
-including a SELECT calling a function that changes session state. Cache hits
-cannot execute functions or change a session and do not invalidate it. Checks
-also expire after ten seconds, bounding detection of privilege changes made by
-another session. Applications requiring immediate external privilege revocation
-should read directly from Postgres.
+privileges. The check is one round trip, paid by the next cached read, so when
+it is repeated decides what the cache saves:
+
+- **`Recheck::AfterEveryStatement`** (the default). Every statement the
+  connection sends to the database invalidates the check, including a SELECT
+  calling a function that changes session state. No session change is missed.
+  A cached read that follows a database statement costs one round trip; cached
+  reads that follow one another cost none.
+- **`Recheck::AfterSessionStatements`**
+  (`Tracker::new().rechecking(Recheck::AfterSessionStatements)`). Only
+  statements that name a change invalidate the check: `SET`, `RESET`, `DISCARD`,
+  `set_config`, `CALL`, `DO`, schema changes and grants. A change made inside a
+  function a query calls (a `set_tenant()` that sets `search_path`, a
+  `SET ROLE` in a trigger) is not seen for up to ten seconds, and reads in that
+  time may be answered for the session as it was. Choose it only when the
+  application changes `search_path` and role in plain statements alone.
+
+Cache hits cannot execute functions or change a session and never invalidate the
+check. A read the cache refuses whoever asks (an unsupported statement, an
+engine not ready) is refused before the reader is checked, so it costs no round
+trip beyond the query's own. Under either choice checks expire after ten
+seconds, bounding detection of privilege changes made by another session.
+Applications requiring immediate external privilege revocation should read
+directly from Postgres.
 
 RLS tables are refused. Enabling RLS on a cached table retires that engine and
 its results; the restarted engine excludes the protected table. Like other WAL
@@ -103,6 +121,30 @@ shapes, unsafe type comparisons, incomplete joins, transactions, startup and lag
 cause fallback. A first admitted read may wait up to `fill_timeout` for rows;
 a previously filled join that becomes incomplete refuses immediately.
 
+PostgreSQL parameter types are checked before decoding, including typed NULLs.
+Mixed `numeric`/float binds and `timestamp`/`timestamptz` joins fall back: exact
+numeric indexes and session-independent timestamps cannot reproduce those
+comparisons. Non-NULL timestamp literals also fall back, since PostgreSQL's
+session input rules differ from a generic UTC parser; use typed binary binds.
+Plain `json` can be projected, but its SQL equality is refused
+(Postgres defines equality for `jsonb`, not `json`). JSONB binds normalize key
+order, whitespace, duplicate keys, exponents and decimal scale without rounding
+through a float. Malformed or unrepresentable JSON input falls back.
+Canonical JSON text is bounded to 1 MiB before allocation: compact exponents
+cannot expand into unbounded decimal output. JSONB arrays share that limit, and
+multiple parameters divide the evaluation allowance conservatively.
+
+A dot **inside** a quoted table or schema identifier is currently refused.
+Ordinary schema qualification (`billing.invoices`) is supported. These ambiguous
+identifiers are excluded consistently from startup catalogs, DDL handling and
+replication routing. Arrays with non-one lower bounds, like multidimensional
+arrays, retain their original wire bytes; they can be projected but are not
+interpreted as flat filter lists.
+
+Core integrations must pass the `excluded` column of `ReaderCheck` unchanged to
+`Reader::new`: it is a JSON array of names, not a delimiter-separated string.
+Malformed exclusion data refuses all tables.
+
 ## Bounds and lifecycle
 
 Defaults are 10,000 entries, a 256 MiB estimated entry budget, 32 MiB per entry,
@@ -110,6 +152,13 @@ and 100,000 rows per query part and composed join result. Entry accounting
 includes query metadata, row images, composed joins and projections. Hydration
 checks the budget between deltas; join enumeration stops at its row/byte limit
 before materializing a Cartesian product; projection checks before cloning cells.
+Snapshot reads also enforce the row limit while streaming and retain at most
+`min(max_entry_bytes, max_bytes)` bytes of wire payload per read. Exceeding a
+budget closes that read's connection and refuses the subscription. This
+includes full source row images even when the query projects only a small field.
+One row must be received in full before its size can be checked. Up to
+`read_connections` reads may have their own buffers concurrently; decoded rows,
+engine indexes and replication transactions have additional costs.
 
 Refused queries are bounded by both count and estimated bytes (at most 8 MiB,
 or one eighth of `max_bytes`). The two sharded parse memos retain at most
@@ -159,7 +208,10 @@ Use `Tracker` as the `AsyncPgConnection` instrumentation too. Cache waiting and
 decoding run on Tokio's blocking pool. `inspect_cached_async` preserves refusal
 reasons; `wait_for_writes_async` provides the write barrier. Cancellation releases
 the borrow on the database connection; an already-running blocking cache task
-may finish its bounded fill afterwards.
+may finish its bounded fill afterwards. A process-wide limit admits at most
+64 running or queued async cache jobs, including write-barrier waits. The worker
+owns its permit until it exits, even if its caller is cancelled. When full,
+reads fall back to async Postgres; a write-barrier attempt returns `false`.
 
 Built-in bind types use the cache. Custom bind metadata is delegated to the
 normal async Postgres query, preserving correctness without a synchronous
@@ -171,9 +223,25 @@ error for applications using custom SQL types.
 CI runs workspace tests and Clippy with async enabled, library-only Clippy,
 and the separately locked Juspay adapter. Live tests require
 `STREAMGRES_PG_DSN` pointing at a disposable logical-replication database.
-`exactness_live` compares edge-case queries with Postgres; `cache_live` covers
+`exactness_live` and `review_boundaries` compare edge-case queries with Postgres;
+the latter also covers restricted-reader exclusions, typed NULLs, exact JSONB
+binds, array bounds, colliding identifiers and streaming byte limits. `cache_live` covers
 RLS changes, restart and migrations. Additional regressions cover stalled
 startup/feed cancellation, panic recovery, saturated unsubscribe queues, memory
 limits, hidden session changes and decoder fallback. The ignored
 `concurrent_read_scaling` test measures 1/4/8/16-reader throughput; it is a
 measurement, not a timing threshold in CI.
+
+## Adapter source and release maintenance
+
+Both Diesel adapters contain their own `src` files so their Cargo packages are
+self-contained. `crates/streamgres-diesel/src` is the canonical implementation;
+run `python3 scripts/sync-diesel-adapters.py` after editing it. CI runs the script
+with `--check` and checks each package's contents. Do not edit the fork's copies
+independently. This avoids a second implementation while keeping published
+crates independent of sibling paths. The fork keeps its own lockfile because
+its derive dependency cannot share the upstream workspace's resolution.
+
+All path dependencies also have version requirements. Publish `streamgres`
+before either adapter, then verify each adapter against that published version.
+The Juspay package has sync support only; its shared async source is inactive.

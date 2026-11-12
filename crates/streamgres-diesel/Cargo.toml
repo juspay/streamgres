@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
+repository = "https://github.com/juspay/streamgres"
 description = "Diesel reads answered from an embedded Streamgres cache"
 
 [features]
@@ -11,8 +12,8 @@ async = ["dep:diesel-async", "dep:tokio"]
 
 [dependencies]
 diesel-async = { version = "=0.7.4", features = ["postgres"], optional = true }
-tokio = { version = "1", features = ["rt"], optional = true }
-streamgres = { path = "../..", default-features = false }
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
+streamgres = { version = "0.1.0", path = "../..", default-features = false }
 # Instrumentation downcasting needs Diesel 2.3. Juspay's fork builds the same source as the crate
 # `streamgres-juspay-diesel` (`crates/streamgres-juspay-diesel`).
 diesel = { version = "=2.3.14", default-features = false, features = ["postgres_backend", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }

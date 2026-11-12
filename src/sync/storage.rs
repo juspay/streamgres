@@ -24,7 +24,7 @@ use crate::model::{DataFrameKey, DataFrameRow, Position, SingleTableReadQuery, T
 
 /// A failed storage read; the runtime parks the read and hands it out
 /// again once the stream moves, unless the read was refused (the message
-/// begins with [`REFUSED`]): that read will never succeed, and the
+/// begins with `REFUSED`): that read will never succeed, and the
 /// subscriptions depending on it are told why instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageError(pub String);
@@ -92,7 +92,7 @@ pub trait Storage {
     /// with its subtree, to learn how small the node is by itself and how
     /// small its subs make it; a source that can stop counting early does,
     /// and the default reads the rows of every node and counts them
-    /// ([`count_by_select`]).
+    /// (`count_by_select`).
     async fn count(&self, query: &MultiTableReadQuery, cap: u64) -> Result<u64, StorageError> {
         count_by_select(self, query, cap).await
     }
@@ -161,7 +161,7 @@ pub async fn count_by_select<S: Storage + ?Sized>(
 type Matching<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<(DataFrameKey, DataFrameRow)>, StorageError>> + 'a>>;
 
-/// The rows of `node`'s main table [`count_by_select`] counts, boxed so
+/// The rows of `node`'s main table `count_by_select` counts, boxed so
 /// the tree is walked recursively: each inner sub's matching rows give
 /// the join values a row of the node may carry, and a row is kept when
 /// its filter holds with the `EXISTS` leaves answered from them and it
