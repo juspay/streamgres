@@ -241,6 +241,9 @@ pub struct DbColumn {
     /// The OID of the column's type at the source, its base type for a
     /// domain; 0 when the column was declared by hand.
     pub type_oid: u32,
+    /// For an array column, the OID of its element type; 0 otherwise or
+    /// when it is not known.
+    pub element_oid: u32,
     /// How the source compares the column's text, for a collatable type;
     /// `None` for any other type, or when it is not known.
     pub collation: Option<Collation>,
@@ -279,6 +282,9 @@ pub struct DbTable {
     pub name: TableName,
     pub pkey: Vec<ColumnName>,
     pub columns: HashMap<ColumnName, DbColumn>,
+    /// The column names in the order the table declares them, the order
+    /// of `SELECT *`.
+    declared: Vec<ColumnName>,
     /// The layout every row decoded from this table shares: the key
     /// columns first, the rest by name.
     row_schema: Arc<RowSchema>,
@@ -392,8 +398,15 @@ impl DbColumn {
             name: name.into(),
             r#type,
             type_oid: 0,
+            element_oid: 0,
             collation: None,
         }
+    }
+
+    /// This column with its array element type's OID.
+    pub fn with_element_oid(mut self, element_oid: u32) -> Self {
+        self.element_oid = element_oid;
+        self
     }
 
     /// This column with the collation its text compares under.
@@ -460,6 +473,7 @@ impl DbTable {
         let pkey: Vec<ColumnName> = pkey.into_iter().map(Into::into).collect();
 
         let mut by_name: HashMap<ColumnName, DbColumn> = HashMap::with_capacity(columns.len());
+        let declared: Vec<ColumnName> = columns.iter().map(|column| column.name.clone()).collect();
         for mut column in columns {
             column.table = name.clone();
             let column_name = column.name.clone();
@@ -492,10 +506,16 @@ impl DbTable {
             name,
             pkey,
             columns: by_name,
+            declared,
             row_schema,
             key_schema,
             put_plan,
         }
+    }
+
+    /// The column names in the order the table declares them.
+    pub fn declared(&self) -> &[ColumnName] {
+        &self.declared
     }
 
     /// The bytes and types the transport writes around the values of a

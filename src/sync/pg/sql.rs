@@ -38,7 +38,7 @@ pub fn select_sql(query: &SingleTableReadQuery, table: &DbTable) -> String {
     let _ = write!(
         sql,
         " FROM {} WHERE {}",
-        quote_ident(query.table.as_str()),
+        quote_table(query.table.as_str()),
         render_where(&query.filter, &Scope::plain(table))
     );
     if query.limit != u32::MAX {
@@ -90,7 +90,7 @@ pub fn count_sql(
         .ok_or_else(|| format!("table `{}` is not in the catalog", query.main_table.table))?;
     Ok(format!(
         "SELECT count(*) FROM (SELECT 1 FROM {} AS {} WHERE {} LIMIT {cap}) AS capped",
-        quote_ident(query.main_table.table.as_str()),
+        quote_table(query.main_table.table.as_str()),
         scope.alias,
         scope.render_node()
     ))
@@ -103,7 +103,7 @@ pub fn count_sql(
 pub fn explain_sql(name: &str, table: &DbTable, filter: &Where) -> String {
     format!(
         "EXPLAIN (FORMAT JSON) SELECT 1 FROM {} WHERE {}",
-        quote_ident(name),
+        quote_table(name),
         render_where(filter, &Scope::plain(table))
     )
 }
@@ -222,7 +222,7 @@ impl<'a> Scope<'a> {
             .collect();
         format!(
             "EXISTS (SELECT 1 FROM {} AS {} WHERE ({} AND {}))",
-            quote_ident(join.sub.main_table.table.as_str()),
+            quote_table(join.sub.main_table.table.as_str()),
             sub.alias,
             pairs.join(" AND "),
             sub.render_node()
@@ -294,6 +294,15 @@ fn literal_as(value: &Value, column: Option<&DbColumn>) -> String {
             }
         }
         _ => literal(value),
+    }
+}
+
+/// A table as SQL names it from its catalog name: a bare name in
+/// `public`, `schema.table` outside it ([`super::catalog::table_name`]).
+pub fn quote_table(name: &str) -> String {
+    match name.split_once('.') {
+        Some((schema, table)) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
+        None => quote_ident(name),
     }
 }
 
@@ -955,6 +964,14 @@ mod tests {
             "{sql}"
         );
         assert!(sql.starts_with("SELECT \"id\", \"createdAt\", \"localAt\" FROM"), "{sql}");
+    }
+
+    /// A table outside `public` is named by its schema and its name, each
+    /// quoted.
+    #[test]
+    fn a_qualified_table_is_quoted_part_by_part() {
+        assert_eq!(quote_table("billing.invoices"), "\"billing\".\"invoices\"");
+        assert_eq!(quote_table("orders"), "\"orders\"");
     }
 
     #[test]

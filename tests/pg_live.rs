@@ -1856,7 +1856,7 @@ fn unchanged_out_of_line_values_are_never_lost() {
 fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
     let Some(dsn) = dsn() else { return };
     block_on(async {
-        let table = "live_exact_values";
+        let table = "live_exact.values";
         let slot = "xyne_sync_live_exact";
         let publication = "xyne_sync_live_exact_pub";
         let client = admin(&dsn).await;
@@ -1865,20 +1865,20 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
             .expect("drop slot");
         client
             .batch_execute(&format!(
-                "DROP TABLE IF EXISTS {table};
-                 DROP TYPE IF EXISTS live_exact_mood;
-                 CREATE TYPE live_exact_mood AS ENUM ('calm', 'busy');
+                "DROP SCHEMA IF EXISTS live_exact CASCADE;
+                 CREATE SCHEMA live_exact;
+                 CREATE TYPE live_exact.mood AS ENUM ('calm', 'busy');
                  CREATE TABLE {table} (
                    id int8 PRIMARY KEY, i2 int2, i4 int4, f4 real, f8 float8,
                    n numeric(30, 4), b bool, t text, vc varchar(10), ch char(3), u uuid,
                    j json, jb jsonb, ts timestamp, tz timestamptz, d date, tm time,
-                   by bytea, iv interval, ints int4[], texts text[], mood live_exact_mood,
+                   by bytea, iv interval, ints int4[], texts text[], mood live_exact.mood,
                    addr inet);
-                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;"
+                 CREATE PUBLICATION \"{publication}\" FOR TABLE {table};"
             ))
             .await
             .expect("prepare");
-        let loaded = streamgres::sync::pg::catalog::load_catalog(&client, &["public".to_owned()])
+        let loaded = streamgres::sync::pg::catalog::load_catalog(&client, &["live_exact".to_owned()])
             .await
             .expect("catalog")
             .0;
@@ -1987,7 +1987,7 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
         let _ = PgStream::drop_slot(&dsn, slot, publication).await;
         let _ = client
             .batch_execute(&format!(
-                "DROP TABLE IF EXISTS {table}; DROP TYPE IF EXISTS live_exact_mood;"
+                "DROP PUBLICATION IF EXISTS \"{publication}\"; DROP SCHEMA IF EXISTS live_exact CASCADE;"
             ))
             .await;
     });

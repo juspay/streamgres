@@ -27,7 +27,8 @@ pub async fn load_catalog(
                     COALESCE(NULLIF(ty.typbasetype, 0), ty.oid)::int8 AS type_oid,
                     base.typtype::text AS type_class,
                     coll.collname::text AS collation,
-                    COALESCE(coll.collisdeterministic, true) AS deterministic
+                    COALESCE(coll.collisdeterministic, true) AS deterministic,
+                    base.typelem::int8 AS element_oid
              FROM information_schema.columns c
              JOIN information_schema.tables t
                ON t.table_schema = c.table_schema AND t.table_name = c.table_name
@@ -78,7 +79,10 @@ pub async fn load_catalog(
         } else {
             value_type(&data_type, &udt_name)
         };
-        let mut column = DbColumn::new(column, r#type).with_type_oid(type_oid);
+        let element_oid = u32::try_from(row.get::<_, i64>(9)).unwrap_or(0);
+        let mut column = DbColumn::new(column, r#type)
+            .with_type_oid(type_oid)
+            .with_element_oid(element_oid);
         if let Some(name) = row.get::<_, Option<String>>(7) {
             let name = if name == "default" {
                 default_collation.clone()
@@ -114,6 +118,82 @@ pub async fn load_catalog(
             columns,
         ));
     }
+    Ok((Catalog::new(tables), notes))
+}
+
+/// `catalog` cut down to the tables `publication` streams every change of
+/// in full: the publication must send inserts, updates and deletes, and a
+/// table with a row filter, a column list or a generated column (whose
+/// values the feed does not carry) is left out with a note. A table the
+/// engine carried without its changes streamed would never change.
+pub async fn restrict_to_publication(
+    client: &Client,
+    catalog: Catalog,
+    publication: &str,
+) -> Result<(Catalog, Notes), StorageError> {
+    let Some(row) = client
+        .query_opt(
+            "SELECT pubinsert AND pubupdate AND pubdelete FROM pg_publication WHERE pubname = $1",
+            &[&publication],
+        )
+        .await?
+    else {
+        return Err(StorageError(format!(
+            "the publication `{publication}` does not exist"
+        )));
+    };
+    if !row.get::<_, bool>(0) {
+        return Err(StorageError(format!(
+            "the publication `{publication}` does not publish every insert, update and delete"
+        )));
+    }
+    let version: i32 = client
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .await?
+        .get(0);
+    let whole = if version >= 150_000 {
+        "pt.rowfilter IS NULL AND cardinality(pt.attnames) = (
+             SELECT count(*) FROM pg_attribute a
+             WHERE a.attrelid = format('%I.%I', pt.schemaname, pt.tablename)::regclass
+               AND a.attnum > 0 AND NOT a.attisdropped)"
+    } else {
+        "true"
+    };
+    let rows = client
+        .query(
+            &format!(
+                "SELECT pt.schemaname::text, pt.tablename::text, {whole},
+                        EXISTS (SELECT 1 FROM pg_attribute a
+                                WHERE a.attrelid = format('%I.%I', pt.schemaname, pt.tablename)::regclass
+                                  AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated <> '')
+                 FROM pg_publication_tables pt WHERE pt.pubname = $1"
+            ),
+            &[&publication],
+        )
+        .await?;
+    let mut published = std::collections::HashSet::new();
+    let mut notes = Vec::new();
+    for row in rows {
+        let name = table_name(&row.get::<_, String>(0), &row.get::<_, String>(1));
+        if !row.get::<_, bool>(2) {
+            notes.push(format!("{name}: published with a row filter or a column list, left out"));
+        } else if row.get::<_, bool>(3) {
+            notes.push(format!("{name}: has a generated column the feed does not carry, left out"));
+        } else {
+            published.insert(name);
+        }
+    }
+    let tables: Vec<DbTable> = catalog
+        .tables()
+        .filter(|table| {
+            let kept = published.contains(table.name.as_str());
+            if !kept && !notes.iter().any(|note| note.starts_with(&format!("{}:", table.name))) {
+                notes.push(format!("{}: not in the publication `{publication}`, left out", table.name));
+            }
+            kept
+        })
+        .cloned()
+        .collect();
     Ok((Catalog::new(tables), notes))
 }
 
