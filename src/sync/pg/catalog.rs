@@ -121,16 +121,30 @@ pub async fn load_catalog(
     Ok((Catalog::new(tables), notes))
 }
 
-/// `catalog` cut down to the tables `publication` streams every change of
-/// in full: the publication must send inserts, updates and deletes, and a
-/// table with a row filter, a column list or a generated column (whose
-/// values the feed does not carry) is left out with a note. A table the
-/// engine carried without its changes streamed would never change.
+/// `catalog` cut down to the tables the engine can follow exactly, with a
+/// note for each one left out. The database must be PostgreSQL 14 or
+/// later (the feed reads values in binary format) and the publication
+/// must send inserts, updates and deletes. A table is left out when the
+/// publication filters its rows or columns, when it has a generated
+/// column (whose values the feed does not carry), a column of a type
+/// without a binary send function (which neither a binary read nor the
+/// feed can give exactly), or row-level security (which the engine,
+/// reading as its own role, cannot apply). A table the engine carried
+/// without its changes streamed would never change.
 pub async fn restrict_to_publication(
     client: &Client,
     catalog: Catalog,
     publication: &str,
 ) -> Result<(Catalog, Notes), StorageError> {
+    let version: i32 = client
+        .query_one("SELECT current_setting('server_version_num')::int4", &[])
+        .await?
+        .get(0);
+    if version < 140_000 {
+        return Err(StorageError(format!(
+            "PostgreSQL 14 or later is needed, for values in binary format from the feed; the server is {version}"
+        )));
+    }
     let Some(row) = client
         .query_opt(
             "SELECT pubinsert AND pubupdate AND pubdelete FROM pg_publication WHERE pubname = $1",
@@ -147,15 +161,11 @@ pub async fn restrict_to_publication(
             "the publication `{publication}` does not publish every insert, update and delete"
         )));
     }
-    let version: i32 = client
-        .query_one("SELECT current_setting('server_version_num')::int4", &[])
-        .await?
-        .get(0);
     let whole = if version >= 150_000 {
         "pt.rowfilter IS NULL AND cardinality(pt.attnames) = (
              SELECT count(*) FROM pg_attribute a
              WHERE a.attrelid = format('%I.%I', pt.schemaname, pt.tablename)::regclass
-               AND a.attnum > 0 AND NOT a.attisdropped)"
+               AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated = '')"
     } else {
         "true"
     };
@@ -165,8 +175,17 @@ pub async fn restrict_to_publication(
                 "SELECT pt.schemaname::text, pt.tablename::text, {whole},
                         EXISTS (SELECT 1 FROM pg_attribute a
                                 WHERE a.attrelid = format('%I.%I', pt.schemaname, pt.tablename)::regclass
-                                  AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated <> '')
-                 FROM pg_publication_tables pt WHERE pt.pubname = $1"
+                                  AND a.attnum > 0 AND NOT a.attisdropped AND a.attgenerated <> ''),
+                        EXISTS (SELECT 1 FROM pg_attribute a
+                                JOIN pg_type t ON t.oid = a.atttypid
+                                LEFT JOIN pg_type e ON e.oid = t.typelem AND t.typcategory = 'A'
+                                WHERE a.attrelid = format('%I.%I', pt.schemaname, pt.tablename)::regclass
+                                  AND a.attnum > 0 AND NOT a.attisdropped
+                                  AND (t.typsend::oid = 0 OR e.typsend::oid = 0)),
+                        c.relrowsecurity
+                 FROM pg_publication_tables pt
+                 JOIN pg_class c ON c.oid = format('%I.%I', pt.schemaname, pt.tablename)::regclass
+                 WHERE pt.pubname = $1"
             ),
             &[&publication],
         )
@@ -175,12 +194,22 @@ pub async fn restrict_to_publication(
     let mut notes = Vec::new();
     for row in rows {
         let name = table_name(&row.get::<_, String>(0), &row.get::<_, String>(1));
-        if !row.get::<_, bool>(2) {
-            notes.push(format!("{name}: published with a row filter or a column list, left out"));
-        } else if row.get::<_, bool>(3) {
-            notes.push(format!("{name}: has a generated column the feed does not carry, left out"));
+        let left_out = if row.get::<_, bool>(3) {
+            Some("has a generated column the feed does not carry")
+        } else if !row.get::<_, bool>(2) {
+            Some("is published with a row filter or a column list")
+        } else if row.get::<_, bool>(4) {
+            Some("has a column whose type has no binary send function")
+        } else if row.get::<_, bool>(5) {
+            Some("has row-level security, which the engine cannot apply")
         } else {
-            published.insert(name);
+            None
+        };
+        match left_out {
+            Some(reason) => notes.push(format!("{name}: {reason}, left out")),
+            None => {
+                published.insert(name);
+            }
         }
     }
     let tables: Vec<DbTable> = catalog

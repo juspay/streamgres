@@ -66,7 +66,11 @@ impl CacheConfig {
     /// hears changes through, for its publication; event triggers need a
     /// superuser, so an administrator runs it once per database.
     pub fn setup_sql(&self) -> String {
-        crate::sync::pg::ddl_triggers::trigger_stack_sql(&self.app, self.shard, &[&self.publication])
+        crate::sync::pg::ddl_triggers::trigger_stack_sql(
+            &self.app,
+            self.shard,
+            &[&self.publication],
+        )
     }
 
     /// The SQL that removes what [`CacheConfig::setup_sql`] installs.

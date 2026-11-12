@@ -48,7 +48,10 @@ fn reads_are_answered_and_kept_current() {
             "DROP PUBLICATION IF EXISTS {PUBLICATION};
              DROP TABLE IF EXISTS {TABLE};
              CREATE TABLE {TABLE} (id int8 PRIMARY KEY, merchant text COLLATE \"C\", amount numeric(12, 2), note char(4));
-             CREATE PUBLICATION {PUBLICATION} FOR TABLE {TABLE};
+             DROP TABLE IF EXISTS {TABLE}_secret;
+             CREATE TABLE {TABLE}_secret (id int8 PRIMARY KEY);
+             ALTER TABLE {TABLE}_secret ENABLE ROW LEVEL SECURITY;
+             CREATE PUBLICATION {PUBLICATION} FOR TABLE {TABLE}, {TABLE}_secret;
              INSERT INTO {TABLE} VALUES (1, 'm1', 10.50, 'a'), (2, 'm1', 3.00, 'b'), (3, 'm2', 7.25, 'c');
              {setup}",
             setup = config.setup_sql()
@@ -78,7 +81,10 @@ fn reads_are_answered_and_kept_current() {
         ]
     );
     let first = cache.read(&by_merchant, &[text("m1"), int8(10)]).unwrap();
-    assert_eq!(first.columns[1].type_oid, 1700, "the column's type travels with it");
+    assert_eq!(
+        first.columns[1].type_oid, 1700,
+        "the column's type travels with it"
+    );
 
     let wait_for_write = |sql: &str| {
         runtime.block_on(client.batch_execute(sql)).expect("write");
@@ -111,17 +117,33 @@ fn reads_are_answered_and_kept_current() {
         matches!(refused, Err(Refusal::Unsupported(_))),
         "char(n) compares ignoring its padding, which the engine does not: {refused:?}"
     );
+    let secret = cache.read(&format!(r#"SELECT * FROM "{TABLE}_secret""#), &[]);
+    assert!(
+        matches!(secret, Err(Refusal::Unsupported(_))),
+        "row-level security is Postgres's to apply: {secret:?}"
+    );
     let whole = cache
-        .read(&format!(r#"SELECT * FROM "{TABLE}" WHERE "{TABLE}"."id" = $1"#), &[int8(2)])
+        .read(
+            &format!(r#"SELECT * FROM "{TABLE}" WHERE "{TABLE}"."id" = $1"#),
+            &[int8(2)],
+        )
         .expect("a whole row");
-    let names: Vec<&str> = whole.columns.iter().map(|column| column.name.as_str()).collect();
-    assert_eq!(names, ["id", "merchant", "amount", "note"], "in the table's own order");
+    let names: Vec<&str> = whole
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["id", "merchant", "amount", "note"],
+        "in the table's own order"
+    );
     assert_eq!(whole.rows[0][3], Value::from("b   "));
 
     cache.stop();
     runtime
         .block_on(client.batch_execute(&format!(
-            "{teardown} DROP PUBLICATION IF EXISTS {PUBLICATION}; DROP TABLE IF EXISTS {TABLE};"
+            "{teardown} DROP PUBLICATION IF EXISTS {PUBLICATION}; DROP TABLE IF EXISTS {TABLE}; DROP TABLE IF EXISTS {TABLE}_secret;"
         )))
         .unwrap();
 }
@@ -172,13 +194,19 @@ fn a_lost_slot_brings_a_fresh_engine() {
         if dropped.is_ok() {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "the slot could not be taken away");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the slot could not be taken away"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while cache.slot().is_none_or(|now| now == slot) {
-        assert!(std::time::Instant::now() < deadline, "no fresh engine on a fresh slot");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no fresh engine on a fresh slot"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
     cache
@@ -194,7 +222,10 @@ fn a_lost_slot_brings_a_fresh_engine() {
         {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "the fresh engine never served the write");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the fresh engine never served the write"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     cache.stop();

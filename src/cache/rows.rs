@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use super::Refusal;
 use crate::ivm::order_rows;
-use crate::model::{ColumnName, DataFrameKey, DataFrameRow, DbTable, Value};
+use crate::model::{ColumnName, DataFrameKey, DataFrameRow, DbTable, Value, ValueType};
 use crate::parser::{Projection, Select};
 use crate::sync::pg::binary::oid;
 
@@ -63,6 +63,11 @@ pub(super) fn build(
         if column.type_oid == 0 {
             return Err(Refusal::Unsupported(format!(
                 "the type of `{name}` at the source is not known"
+            )));
+        }
+        if column.r#type == ValueType::Json {
+            return Err(Refusal::Unsupported(format!(
+                "`{name}` is JSON, which the engine keeps in a standard form rather than the text Postgres returns"
             )));
         }
         columns.push(CachedColumn {

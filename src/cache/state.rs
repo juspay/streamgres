@@ -216,19 +216,24 @@ impl State {
     /// Drops entry `id`; its subscription, if it has one, to unsubscribe.
     pub fn remove_entry(&mut self, id: u64) -> Option<SubId> {
         let entry = self.entries.remove(&id)?;
-        self.by_query.remove(&entry.query);
+        if self.by_query.get(&entry.query) == Some(&id) {
+            self.by_query.remove(&entry.query);
+        }
         let sub = entry.sub?;
         self.by_sub.remove(&sub);
         Some(sub)
     }
 
     /// The subscriptions of entries nobody has read within `ttl`, their
-    /// entries dropped.
+    /// entries dropped, refused entries with them (their readers have
+    /// seen the refusal; the refusal itself is remembered apart).
     pub fn evict_idle(&mut self, ttl: Duration) -> Vec<SubId> {
         let idle: Vec<u64> = self
             .entries
             .iter()
-            .filter(|(_, entry)| entry.last_read.elapsed() > ttl)
+            .filter(|(_, entry)| {
+                matches!(entry.fill, Fill::Refused(_)) || entry.last_read.elapsed() > ttl
+            })
             .map(|(id, _)| *id)
             .collect();
         idle.into_iter()
@@ -309,6 +314,7 @@ impl State {
         if let Some(entry) = self.entries.get_mut(&id) {
             entry.fill = Fill::Refused(reason.clone());
             entry.sub = None;
+            self.by_query.remove(&entry.query);
             self.refused
                 .insert(entry.query.clone(), (reason, Instant::now()));
         }

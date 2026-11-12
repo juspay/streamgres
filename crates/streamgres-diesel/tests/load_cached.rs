@@ -48,7 +48,6 @@ struct Order {
     local_at: NaiveDateTime,
     due: NaiveDate,
     payload: Vec<u8>,
-    meta: serde_json::Value,
     tags: Vec<i32>,
     note: Option<String>,
 }
@@ -119,7 +118,6 @@ fn load_cached_returns_what_load_returns() {
             .naive_utc(),
         due: NaiveDate::from_ymd_opt(2026, 9, 1 + u32::try_from(id).unwrap()).unwrap(),
         payload: vec![0, 255, u8::try_from(id).unwrap()],
-        meta: serde_json::json!({"id": id, "price": 1.5, "tags": ["a", "b"]}),
         tags: vec![1, 2, i32::try_from(id).unwrap()],
         note: note.map(str::to_owned),
     };
@@ -137,7 +135,7 @@ fn load_cached_returns_what_load_returns() {
                 adapter_orders::local_at.eq(row.local_at),
                 adapter_orders::due.eq(row.due),
                 adapter_orders::payload.eq(&row.payload),
-                adapter_orders::meta.eq(&row.meta),
+                adapter_orders::meta.eq(serde_json::json!({"id": row.id, "price": 1.50})),
                 adapter_orders::tags.eq(&row.tags),
                 adapter_orders::note.eq(&row.note),
             ))
@@ -159,11 +157,14 @@ fn load_cached_returns_what_load_returns() {
         .expect("the engine comes up");
 
     let check = |cache: &Cache, conn: &mut PgConnection| {
-        use adapter_orders::dsl::{
-            amount, created_at, id, merchant, note, paid, quantity,
-        };
+        use adapter_orders::dsl::{amount, created_at, id, merchant, note, paid, quantity};
         let orders = adapter_orders::table;
-        let all = same!(cache, conn, orders.select(Order::as_select()).order(id), Order);
+        let all = same!(
+            cache,
+            conn,
+            orders.select(Order::as_select()).order(id),
+            Order
+        );
         same!(
             cache,
             conn,
@@ -186,7 +187,11 @@ fn load_cached_returns_what_load_returns() {
             cache,
             conn,
             orders
-                .filter(merchant.eq("m1").and(paid.eq(false).or(amount.gt(BigDecimal::from(5)))))
+                .filter(
+                    merchant
+                        .eq("m1")
+                        .and(paid.eq(false).or(amount.gt(BigDecimal::from(5))))
+                )
                 .select(id)
                 .order((merchant.asc(), id.desc())),
             i64
@@ -195,7 +200,9 @@ fn load_cached_returns_what_load_returns() {
             cache,
             conn,
             orders
-                .filter(created_at.ge(DateTime::from_timestamp_micros(1_757_000_000_123_458).unwrap()))
+                .filter(
+                    created_at.ge(DateTime::from_timestamp_micros(1_757_000_000_123_458).unwrap())
+                )
                 .filter(note.is_null())
                 .select(id)
                 .order(created_at.desc()),
@@ -250,6 +257,31 @@ fn load_cached_returns_what_load_returns() {
     );
     let after = check(&cache, &mut conn);
     assert_eq!(after.len(), 4);
+
+    let inside: Vec<i64> = conn
+        .transaction(|conn| {
+            insert(conn, &order(6, "m1", "1.0000", None));
+            assert_eq!(
+                adapter_orders::table
+                    .select(adapter_orders::id)
+                    .try_load_cached(&cache, conn)?,
+                None::<Vec<i64>>,
+                "a transaction's reads are never the cache's"
+            );
+            let ids: Vec<i64> = adapter_orders::table
+                .select(adapter_orders::id)
+                .order(adapter_orders::id)
+                .load_cached(&cache, conn)?;
+            Ok::<_, diesel::result::Error>(ids)
+        })
+        .expect("read inside a transaction");
+    assert!(inside.contains(&6), "the transaction's own insert is seen");
+
+    let meta: Option<Vec<serde_json::Value>> = adapter_orders::table
+        .select(adapter_orders::meta)
+        .try_load_cached(&cache, &mut conn)
+        .expect("rendered");
+    assert_eq!(meta, None, "JSON is not kept as the text Postgres returns");
 
     let filtered: Vec<i64> = adapter_orders::table
         .filter(adapter_orders::note.like("%noted"))

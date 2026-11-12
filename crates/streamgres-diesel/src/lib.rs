@@ -17,8 +17,10 @@
 //! is written in Postgres's binary format for its column's type and read
 //! back through the same `FromSql` a row from Postgres goes through. When
 //! it refuses (a query it cannot answer exactly, an engine not caught up),
-//! the query runs on `conn` as `.load` would run it. Writes, transactions
-//! and every other read stay on Diesel as they are.
+//! the query runs on `conn` as `.load` would run it. A read inside a
+//! transaction Diesel opened always runs on `conn`: the transaction's own
+//! writes and snapshot are there, not in the cache. Writes and every other
+//! read stay on Diesel as they are.
 
 pub use ::diesel;
 
@@ -31,12 +33,12 @@ use crate::diesel::deserialize::FromSqlRow;
 use crate::diesel::pg::{Pg, PgMetadataLookup, PgQueryBuilder};
 use crate::diesel::query_builder::bind_collector::RawBytesBindCollector;
 use crate::diesel::query_builder::{AsQuery, Query, QueryBuilder, QueryFragment, QueryId};
+use crate::diesel::query_dsl::CompatibleType;
 use crate::diesel::query_dsl::RunQueryDsl;
 use crate::diesel::query_dsl::methods::LoadQuery;
 use crate::diesel::result::{Error, QueryResult};
-use crate::diesel::query_dsl::CompatibleType;
-pub use streamgres::cache::{Cache, CacheConfig, Lsn, Refusal};
 use streamgres::cache::{Bind, CachedRows};
+pub use streamgres::cache::{Cache, CacheConfig, Lsn, Refusal};
 use streamgres::model::Value;
 use streamgres::sync::pg::binary;
 
@@ -57,12 +59,14 @@ where
     T: AsQuery,
     T::Query: QueryFragment<Pg> + QueryId + RunQueryDsl<C> + LoadQuery<'query, C, U> + 'query,
     T::SqlType: CompatibleType<U, Pg>,
-    U: FromSqlRow<<T::SqlType as CompatibleType<U, Pg>>::SqlType, Pg>
-        + 'static,
+    U: FromSqlRow<<T::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + 'static,
     C: Connection<Backend = Pg> + LoadConnection + PgMetadataLookup + 'static,
 {
     fn load_cached(self, cache: &Cache, conn: &mut C) -> QueryResult<Vec<U>> {
         let query = self.as_query();
+        if in_transaction(conn) {
+            return RunQueryDsl::load(query, conn);
+        }
         match cached_rows::<_, U>(&query, cache, conn)? {
             Some(rows) => Ok(rows),
             None => RunQueryDsl::load(query, conn),
@@ -70,14 +74,32 @@ where
     }
 
     fn try_load_cached(self, cache: &Cache, conn: &mut C) -> QueryResult<Option<Vec<U>>> {
+        if in_transaction(conn) {
+            return Ok(None);
+        }
         let query = self.as_query();
         cached_rows::<_, U>(&query, cache, conn)
     }
 }
 
+/// Whether `conn` is inside a transaction Diesel opened, or in a state
+/// Diesel cannot tell (a broken transaction), where only Postgres knows
+/// what the connection would read.
+fn in_transaction<C: Connection>(conn: &mut C) -> bool {
+    use crate::diesel::connection::TransactionManager;
+    !matches!(
+        C::TransactionManager::transaction_manager_status_mut(conn).transaction_depth(),
+        Ok(None)
+    )
+}
+
 /// `query`'s rows from `cache`, `None` when it refused or a value cannot
 /// be written for its column.
-fn cached_rows<Q, U>(query: &Q, cache: &Cache, conn: &mut (dyn PgMetadataLookup + 'static)) -> QueryResult<Option<Vec<U>>>
+fn cached_rows<Q, U>(
+    query: &Q,
+    cache: &Cache,
+    conn: &mut (dyn PgMetadataLookup + 'static),
+) -> QueryResult<Option<Vec<U>>>
 where
     Q: QueryFragment<Pg> + Query,
     Q::SqlType: CompatibleType<U, Pg>,
@@ -90,7 +112,11 @@ where
     let Some(cells) = encoded(&answer) else {
         return Ok(None);
     };
-    let names: Vec<&str> = answer.columns.iter().map(|column| column.name.as_str()).collect();
+    let names: Vec<&str> = answer
+        .columns
+        .iter()
+        .map(|column| column.name.as_str())
+        .collect();
     let mut oids = Vec::with_capacity(answer.columns.len());
     for column in &answer.columns {
         let Some(oid) = NonZeroU32::new(column.type_oid) else {
@@ -109,7 +135,10 @@ where
 }
 
 /// The SQL `query` renders to and its binds, as Diesel sends them.
-pub fn rendered<Q>(query: &Q, lookup: &mut (dyn PgMetadataLookup + 'static)) -> QueryResult<(String, Vec<Bind>)>
+pub fn rendered<Q>(
+    query: &Q,
+    lookup: &mut (dyn PgMetadataLookup + 'static),
+) -> QueryResult<(String, Vec<Bind>)>
 where
     Q: QueryFragment<Pg>,
 {
@@ -153,4 +182,3 @@ fn encoded(answer: &CachedRows) -> Option<Vec<Vec<Option<Vec<u8>>>>> {
         })
         .collect()
 }
-

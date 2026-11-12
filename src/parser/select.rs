@@ -110,12 +110,12 @@ impl Parser {
             vec![default_order(table, self.at())?]
         };
         let limit = if self.eat_word("LIMIT") {
-            self.count()?
+            self.count(u32::MAX)?
         } else {
             u32::MAX
         };
         let offset = if self.eat_word("OFFSET") {
-            self.count()?
+            self.count(0)?
         } else {
             0
         };
@@ -249,8 +249,9 @@ impl Parser {
         Ok(OrderBy::new(column, direction))
     }
 
-    /// A row count: a non-negative integer, or a parameter bound to one.
-    fn count(&mut self) -> Result<u32, ParseError> {
+    /// A row count: a non-negative integer, or a parameter bound to one;
+    /// `null` for a parameter bound to `NULL` (no limit, no offset).
+    fn count(&mut self, null: u32) -> Result<u32, ParseError> {
         let at = self.at();
         let value = match self.peek().clone() {
             Tok::Num(number) => {
@@ -267,7 +268,7 @@ impl Parser {
                         position: at,
                     })?;
                 match &bind.bytes {
-                    None => return Ok(u32::MAX),
+                    None => return Ok(null),
                     Some(bytes) => {
                         match crate::sync::pg::binary::decode_scalar(bind.type_oid, bytes) {
                             Ok(Value::Int(count)) => Some(count),
@@ -513,6 +514,25 @@ mod tests {
         assert_eq!(select.offset, 5);
         assert_eq!(select.query.limit, 25);
         assert_eq!(select.query.order_by, vec![OrderBy::new("id", Order::DESC)]);
+        let unbounded = parse(
+            r#"SELECT "orders"."id" FROM "orders" LIMIT $1 OFFSET $2"#,
+            &[
+                Bind {
+                    type_oid: oid::INT8,
+                    bytes: None,
+                },
+                Bind {
+                    type_oid: oid::INT8,
+                    bytes: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            (unbounded.limit, unbounded.offset),
+            (u32::MAX, 0),
+            "NULL is no limit, no offset"
+        );
         assert_eq!(
             select.query.filter,
             Where::AND(vec![
