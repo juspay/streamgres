@@ -27,3 +27,6 @@ zigcc
 # Paper build logs
 paper/*.log
 results/
+
+# The Juspay adapter builds outside the workspace, in its own target.
+/crates/streamgres-juspay-diesel/target/

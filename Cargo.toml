@@ -1,3 +1,10 @@
+[workspace]
+members = ["crates/streamgres-diesel"]
+# Built on Juspay's Diesel fork, which needs diesel_derives 2.2 where
+# Diesel 2.3 needs 2.3; one build cannot hold both, so it has a lockfile
+# of its own.
+exclude = ["crates/streamgres-juspay-diesel"]
+
 [package]
 name = "streamgres"
 version = "0.1.0"

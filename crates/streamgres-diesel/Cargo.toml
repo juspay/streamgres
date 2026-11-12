@@ -1,0 +1,19 @@
+[package]
+name = "streamgres-diesel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Diesel reads answered from an embedded Streamgres cache"
+
+[dependencies]
+streamgres = { path = "../..", default-features = false }
+# Diesel 2.2 or 2.3. Juspay's fork builds the same source as the crate
+# `streamgres-juspay-diesel` (`crates/streamgres-juspay-diesel`).
+diesel = { version = ">=2.2.12, <2.4", default-features = false, features = ["postgres_backend", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+
+[dev-dependencies]
+diesel = { version = ">=2.2.12, <2.4", features = ["postgres", "chrono", "numeric", "serde_json"] }
+bigdecimal = "0.4"
+chrono = "0.4"
+serde_json = "1"
