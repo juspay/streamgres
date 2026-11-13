@@ -100,6 +100,53 @@ jobs:
       - name: Unit tests on Juspay's Diesel fork
         run: cargo test --manifest-path crates/streamgres-juspay-diesel/Cargo.toml --locked
 
+  ticket-desk:
+    name: Ticket desk example
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native dependencies
+        run: sudo apt-get update && sudo apt-get install -y lld libpq-dev
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+          components: clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: Swatinem/rust-cache@v2.7.7
+        with:
+          workspaces: examples/ticket-desk
+      - name: Lint service and browser source
+        run: |
+          cargo clippy --manifest-path examples/ticket-desk/Cargo.toml --all-targets --locked -- -D warnings
+          node --check examples/ticket-desk/src/service/assets/app.js
+      - name: Start disposable logical PostgreSQL
+        run: |
+          docker run -d --name ticketdesk-pg -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=ticketdesk_tests -p 5432:5432 postgres:17 \
+            -c wal_level=logical -c max_replication_slots=32 -c max_wal_senders=32
+          for attempt in $(seq 1 60); do
+            if docker exec ticketdesk-pg pg_isready -U postgres; then exit 0; fi
+            sleep 1
+          done
+          docker logs ticketdesk-pg
+          exit 1
+      - name: Live HTTP, write visibility and recovery scenarios
+        env:
+          TICKETDESK_TEST_DSN: postgresql://postgres:postgres@localhost:5432/ticketdesk_tests
+        run: cargo test --manifest-path examples/ticket-desk/Cargo.toml --locked
+      - name: Build image and test container lifecycle
+        env:
+          DEMO_HTTP_PORT: "18080"
+        run: |
+          stack_file=examples/ticket-desk/docker-compose.yml
+          trap 'docker compose -p ticketdesk-ci -f "$stack_file" logs --tail=30; docker compose -p ticketdesk-ci -f "$stack_file" down --volumes' EXIT
+          docker compose -p ticketdesk-ci -f "$stack_file" up --build -d
+          python3 examples/ticket-desk/scripts/container-smoke.py http://127.0.0.1:18080 \
+            --runtime docker \
+            --app "$(docker compose -p ticketdesk-ci -f "$stack_file" ps -q demo)" \
+            --postgres "$(docker compose -p ticketdesk-ci -f "$stack_file" ps -q postgres)"
+
   perf:
     name: Benchmark against the base branch (performance)
     runs-on: ubuntu-latest

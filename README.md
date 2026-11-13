@@ -232,6 +232,9 @@ STREAMGRES_PG_DSN=postgresql://postgres@localhost:5432/streamgres cargo test --t
 
 ### Using the engine as a library
 
+Try the [ticket desk example](examples/ticket-desk/README.md) for a local web app
+with live cache/Postgres comparisons, writes and reliability experiments.
+
 For embedded cached SQL reads and the Diesel adapter, see the
 [library guide](docs/library-guide.md). The example below is the lower-level
 IVM API.

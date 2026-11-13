@@ -1,0 +1,730 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Streamgres · Ticket desk</title>
+    <link rel="stylesheet" href="/app.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <header class="topbar">
+      <a class="brand" href="#overview" aria-label="Streamgres ticket desk home"
+        ><span class="brand-product"
+          >Streamgres<small>Ticket desk</small></span
+        ></a
+      >
+      <div class="headline-metrics">
+        <div>
+          <span class="metric-label"
+            >Memory hit rate
+            <button
+              class="hint"
+              title="Share of cached-path reads answered from memory since this service started."
+              aria-label="About memory hit rate"
+            >
+              ?
+            </button></span
+          ><strong id="hit-rate">—</strong>
+        </div>
+        <div id="comparison-metric">
+          <span class="metric-label">Last request sample</span
+          ><strong id="header-time">—<small>Waiting for reads</small></strong>
+        </div>
+        <div>
+          <span class="metric-label"
+            >Freshness delay
+            <button
+              class="hint"
+              title="The cache's current freshness estimate. Reads fall back when it exceeds the configured limit."
+              aria-label="About freshness delay"
+            >
+              ?
+            </button></span
+          ><strong id="lag">—</strong>
+        </div>
+      </div>
+      <div class="top-actions">
+        <span
+          class="status starting"
+          id="engine-status"
+          title="The engine's connection and freshness state"
+          ><i></i><span>Connecting</span></span
+        ><button
+          class="icon-button"
+          id="theme-toggle"
+          aria-label="Switch to dark theme"
+          title="Switch theme"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20 15.3A8.5 8.5 0 0 1 8.7 4 8.5 8.5 0 1 0 20 15.3Z" />
+          </svg></button
+        ><button class="subtle" id="help-button">How it works</button>
+      </div>
+    </header>
+    <div class="shell">
+      <nav class="tabs" role="tablist" aria-label="Ticket desk views">
+        <button
+          role="tab"
+          aria-controls="overview"
+          aria-selected="true"
+          id="tab-overview"
+          data-tab="overview"
+        >
+          Overview</button
+        ><button
+          role="tab"
+          aria-controls="desk"
+          aria-selected="false"
+          tabindex="-1"
+          id="tab-desk"
+          data-tab="desk"
+        >
+          Ticket desk</button
+        ><button
+          role="tab"
+          aria-controls="queries"
+          aria-selected="false"
+          tabindex="-1"
+          id="tab-queries"
+          data-tab="queries"
+        >
+          Queries <span id="shape-count">23</span></button
+        ><button
+          role="tab"
+          aria-controls="lab"
+          aria-selected="false"
+          tabindex="-1"
+          id="tab-lab"
+          data-tab="lab"
+        >
+          Lab</button
+        ><span class="tabs-note">A real service, with the cache inside.</span>
+      </nav>
+      <main id="main" tabindex="-1">
+        <section
+          id="overview"
+          class="view"
+          role="tabpanel"
+          aria-labelledby="tab-overview"
+        >
+          <div class="intro-grid">
+            <div class="intro">
+              <span class="kicker">The ticket desk, instrumented</span>
+              <h1>
+                Fast reads.<br /><span class="brand-highlight"
+                  >A real database.</span
+                >
+              </h1>
+              <p>
+                This is an ordinary support desk built with Diesel. Streamgres
+                answers supported reads from memory while Postgres remains the
+                source of truth.
+              </p>
+              <div class="intro-actions">
+                <button class="primary" data-go="desk">
+                  Try the ticket desk</button
+                ><button class="text-button" data-go="queries">
+                  Explore the queries
+                </button>
+              </div>
+            </div>
+            <div
+              class="flow"
+              id="query-flow"
+              aria-label="Application reads through Diesel. Streamgres can answer in memory. Unsupported reads fall back to Postgres. Postgres streams committed changes to the cache."
+            >
+              <svg class="flow-connectors" aria-hidden="true">
+                <defs>
+                  <marker
+                    id="changes-arrow"
+                    viewBox="0 0 8 8"
+                    refX="7"
+                    refY="4"
+                    markerWidth="8"
+                    markerHeight="8"
+                    markerUnits="userSpaceOnUse"
+                    orient="auto"
+                  >
+                    <path d="M1 1L7 4L1 7" />
+                  </marker>
+                  <marker
+                    id="fallback-arrow"
+                    viewBox="0 0 8 8"
+                    refX="7"
+                    refY="4"
+                    markerWidth="8"
+                    markerHeight="8"
+                    markerUnits="userSpaceOnUse"
+                    orient="auto"
+                  >
+                    <path d="M1 1L7 4L1 7" />
+                  </marker>
+                </defs>
+                <path class="fallback-path" marker-end="url(#fallback-arrow)" />
+                <path class="stream-path" marker-end="url(#changes-arrow)" />
+              </svg>
+              <span class="stream-caption">Committed<br />changes</span>
+              <div class="flow-caption">
+                <span class="status live"><i></i>Same application process</span
+                ><span>Live request path</span>
+              </div>
+              <div class="flow-stage">
+                <div class="flow-node app-node">
+                  <span class="node-icon">⌘</span><strong>Ticket desk</strong
+                  ><small>Reads through Diesel</small>
+                </div>
+                <div class="flow-link read-link">
+                  <span></span><small>read</small>
+                </div>
+                <div class="flow-node memory-node">
+                  <span class="node-icon">ϟ</span><strong>Streamgres</strong
+                  ><small>Answers from memory</small>
+                </div>
+              </div>
+              <div class="database-line">
+                <div class="flow-note">
+                  A safe fallback<br />for everything else
+                </div>
+                <div class="flow-node database-node">
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <ellipse cx="12" cy="5" rx="8" ry="3" />
+                    <path d="M4 5v14c0 4 16 4 16 0V5M4 12c0 4 16 4 16 0" /></svg
+                  ><strong>Postgres</strong><small>Owns the data</small>
+                </div>
+              </div>
+              <div class="flow-footer">
+                <span class="key memory-key"></span>Memory reads
+                <span class="key postgres-key"></span>Database reads
+                <span class="flow-count" id="flow-activity"
+                  >Waiting for activity</span
+                >
+              </div>
+            </div>
+          </div>
+          <div class="overview-grid">
+            <article class="panel race" id="race-panel">
+              <div class="panel-heading">
+                <div>
+                  <h2>One request. Two paths.</h2>
+                  <p>
+                    Live request samples, including any reader checks or cache
+                    filling.
+                  </p>
+                </div>
+                <span class="quiet-badge" id="race-round"
+                  >Live measurement</span
+                >
+              </div>
+              <div class="race-controls">
+                <label class="sr-only" for="race-select">Query to compare</label
+                ><select id="race-select">
+                  <option value="ticket">One ticket by ID</option></select
+                ><label class="sr-only" for="adapter-select"
+                  >Diesel adapter</label
+                ><select id="adapter-select">
+                  <option value="sync">Sync Diesel</option>
+                  <option value="async">Async Diesel</option></select
+                ><button class="primary" id="run-race">Run both</button>
+              </div>
+              <div class="race-lane">
+                <div>
+                  <span class="lane-name">Through Streamgres</span
+                  ><span class="answer-badge neutral" id="race-cache-badge"
+                    >Waiting for a read</span
+                  ><strong id="race-cache-time">—</strong>
+                </div>
+                <div class="bar-track">
+                  <div class="bar memory-bar" id="cache-bar"></div>
+                </div>
+              </div>
+              <div class="race-lane">
+                <div>
+                  <span class="lane-name">Direct to Postgres</span
+                  ><span class="answer-badge postgres">▤ Postgres</span
+                  ><strong id="race-pg-time">—</strong>
+                </div>
+                <div class="bar-track">
+                  <div class="bar postgres-bar" id="pg-bar"></div>
+                </div>
+              </div>
+              <div class="comparison-note" id="race-note">
+                The first read may fill a subscription. Following reads use the
+                maintained rows.
+              </div>
+              <details class="measurement-note">
+                <summary>What do these numbers measure?</summary>
+                <p>
+                  Time inside this service: the Diesel query, cache adapter,
+                  decoding and result serialization. Pool wait and the browser's
+                  HTTP round trip are separate. One sample is not a capacity
+                  benchmark.
+                </p>
+                <p id="race-pool">
+                  Pool waits will appear after the next comparison.
+                </p>
+              </details>
+              <button class="text-button" data-go="lab">
+                Measure repeated reads in Lab →
+              </button>
+            </article>
+            <article class="panel change-card">
+              <div class="panel-heading">
+                <div>
+                  <h2>Change the source of truth.</h2>
+                  <p>Update a ticket in Postgres, then read it again.</p>
+                </div>
+                <span class="ticket-reference">#1</span>
+              </div>
+              <div id="overview-ticket" class="mini-ticket">
+                <div class="skeleton-line"></div>
+                <p>Loading the ticket…</p>
+              </div>
+              <form id="quick-status">
+                <label for="overview-status">Move ticket to</label>
+                <div class="inline-form">
+                  <select id="overview-status">
+                    <option value="open">Open</option>
+                    <option value="pending">Pending</option>
+                    <option value="closed">Closed</option></select
+                  ><button class="primary" type="submit">Save status</button>
+                </div>
+                <label class="switch-label"
+                  ><input type="checkbox" class="wait-toggle" checked /><span
+                    >Wait for my write</span
+                  ><span
+                    class="hint"
+                    title="Wait for the engine to apply this connection's visible WAL before responding."
+                    >?</span
+                  ></label
+                >
+              </form>
+              <div class="write-result" id="quick-result">
+                With the wait enabled, the service checks a cache write barrier
+                after committing.
+              </div>
+            </article>
+          </div>
+          <div class="bottom-grid">
+            <article class="panel chart-panel">
+              <div class="panel-heading">
+                <div>
+                  <h2>Read time, as it happens</h2>
+                  <p>
+                    Sampled service reads over the last minute. Logarithmic
+                    scale.
+                  </p>
+                </div>
+                <div class="legend">
+                  <span><i class="memory-dot"></i>Memory</span
+                  ><span><i class="postgres-dot"></i>Postgres</span>
+                </div>
+              </div>
+              <div
+                id="latency-chart"
+                class="chart"
+                aria-label="Live read latency chart"
+              >
+                <p class="empty">Reads will appear here as you use the desk.</p>
+              </div>
+            </article>
+            <article class="panel activity-panel">
+              <div class="panel-heading">
+                <h2>Inside the service</h2>
+                <span class="live-caption">Live activity samples</span>
+              </div>
+              <ol id="overview-events" class="event-list">
+                <li class="empty">Waiting for the first event…</li>
+              </ol>
+            </article>
+          </div>
+        </section>
+        <section
+          id="desk"
+          class="view"
+          role="tabpanel"
+          aria-labelledby="tab-desk"
+          hidden
+        >
+          <div class="section-heading">
+            <div>
+              <h1>Ticket desk</h1>
+              <p>A working app. Every answer tells you where it came from.</p>
+            </div>
+            <button class="primary" id="new-ticket-button">
+              Create ticket
+            </button>
+          </div>
+          <div class="desk-toolbar">
+            <label
+              >Organization
+              <select id="org-select">
+                <option value="1">Loading…</option>
+              </select></label
+            ><label
+              >Status
+              <select id="status-filter">
+                <option value="open,pending">Open & pending</option>
+                <option value="open">Open</option>
+                <option value="pending">Pending</option>
+                <option value="closed">Closed</option>
+              </select></label
+            ><label class="switch-label"
+              ><input class="wait-toggle" type="checkbox" checked /><span
+                >Wait for my write</span
+              ></label
+            ><button class="subtle" id="refresh-desk">Refresh</button>
+          </div>
+          <div class="desk-grid">
+            <article class="panel queue-panel">
+              <div class="queue-heading">
+                <h2>Queue</h2>
+                <span id="queue-badge"></span>
+              </div>
+              <div id="ticket-list" class="ticket-list">
+                <p class="empty">Loading the queue…</p>
+              </div>
+              <div class="pagination">
+                <span id="page-label">Page 1</span>
+                <div>
+                  <button class="subtle" id="previous-page" disabled>
+                    Previous</button
+                  ><button class="subtle" id="next-page">Next</button>
+                </div>
+              </div>
+            </article>
+            <article class="panel detail-panel">
+              <div id="ticket-detail">
+                <div class="desk-empty">
+                  <span class="large-outline-icon">▱</span>
+                  <h2>Choose a ticket</h2>
+                  <p>
+                    Its details and comments will load through the cache
+                    adapter.
+                  </p>
+                </div>
+              </div>
+              <section id="comment-section" hidden>
+                <div class="comments-heading">
+                  <h3>Conversation</h3>
+                  <span id="comments-badge"></span>
+                </div>
+                <ol id="comments-list" class="comments-list"></ol>
+                <form id="comment-form">
+                  <label for="comment-body">Add a comment</label
+                  ><textarea
+                    id="comment-body"
+                    rows="3"
+                    maxlength="10000"
+                    placeholder="Write a reply…"
+                    required
+                  ></textarea
+                  ><button class="primary" type="submit">Add comment</button>
+                </form>
+              </section>
+            </article>
+          </div>
+        </section>
+        <section
+          id="queries"
+          class="view"
+          role="tabpanel"
+          aria-labelledby="tab-queries"
+          hidden
+        >
+          <div class="section-heading">
+            <div>
+              <h1>Every query has a reason.</h1>
+              <p>
+                Explore the service's query shapes, their actual answerer, and
+                the SQL Diesel sends.
+              </p>
+            </div>
+            <button class="subtle" id="refresh-queries">Recheck queries</button>
+          </div>
+          <div class="query-tools">
+            <label class="search"
+              ><span aria-hidden="true">⌕</span
+              ><input
+                id="query-search"
+                type="search"
+                placeholder="Search by name, SQL or feature…"
+                aria-label="Search query shapes" /></label
+            ><label class="sr-only" for="query-filter"
+              >Filter query shapes</label
+            ><select id="query-filter">
+              <option value="all">All query shapes</option>
+              <option value="cache">Expected from memory</option>
+              <option value="postgres">Expected from Postgres</option>
+              <option value="join">Joins</option>
+              <option value="enum">Enums</option>
+              <option value="pagination">Pagination</option>
+            </select>
+          </div>
+          <p class="inspection-note">
+            Initial inspection times can include cache filling and reader
+            validation. Run both for a new request sample.
+          </p>
+          <div id="query-shapes">
+            <p class="empty">Inspecting the running cache…</p>
+          </div>
+        </section>
+        <section
+          id="lab"
+          class="view"
+          role="tabpanel"
+          aria-labelledby="tab-lab"
+          hidden
+        >
+          <div class="section-heading">
+            <div>
+              <h1>Trust it. Then test it.</h1>
+              <p>
+                Compare actual answers, put the service under load, and watch
+                how it recovers.
+              </p>
+            </div>
+            <span class="quiet-badge" id="lab-mode">Checking lab mode…</span>
+          </div>
+          <div class="lab-main-grid">
+            <article class="panel">
+              <div class="panel-heading">
+                <div>
+                  <h2>Does it agree with Postgres?</h2>
+                  <p>
+                    Every shape, with a settle window for concurrent writes.
+                  </p>
+                </div>
+              </div>
+              <div class="verify-counters">
+                <div>
+                  <strong id="verify-compared">0</strong
+                  ><span>Comparisons</span>
+                </div>
+                <div>
+                  <strong id="verify-mismatches" class="success-text">0</strong
+                  ><span>Cache mismatches</span>
+                </div>
+                <div>
+                  <strong id="verify-errors">0</strong><span>Read errors</span>
+                </div>
+              </div>
+              <div class="button-row">
+                <button class="primary" id="verify-once">Verify now</button
+                ><button class="subtle" id="verify-continuous">
+                  Start continuous checks
+                </button>
+              </div>
+              <p class="fine-print" id="verify-note">
+                Fallback reads are counted separately; two Postgres snapshots
+                can differ while writes continue.
+              </p>
+              <details id="mismatch-detail" hidden>
+                <summary>Inspect the latest mismatch</summary>
+                <pre id="mismatch-json"></pre>
+              </details>
+            </article>
+            <article class="panel">
+              <div class="panel-heading">
+                <div>
+                  <h2>How does it behave under load?</h2>
+                  <p>Compare both routes using pooled service reads.</p>
+                </div>
+              </div>
+              <form id="load-form">
+                <label
+                  >Query
+                  <select id="load-query">
+                    <option value="ticket">One ticket by ID</option>
+                  </select></label
+                >
+                <div class="form-grid">
+                  <label
+                    >Workers
+                    <input
+                      id="load-workers"
+                      type="range"
+                      min="1"
+                      max="16"
+                      value="4"
+                    /><output id="worker-value">4</output></label
+                  ><label
+                    >Seconds per route
+                    <input
+                      id="load-seconds"
+                      type="range"
+                      min="1"
+                      max="10"
+                      value="2"
+                    /><output id="seconds-value">2</output></label
+                  >
+                </div>
+                <button class="primary" type="submit">Run load test</button>
+              </form>
+              <div id="load-result" class="load-result">
+                <p class="fine-print">
+                  Measures the service, including pooling and serialization. It
+                  excludes HTTP network time.
+                </p>
+              </div>
+            </article>
+          </div>
+          <article class="panel writer-panel">
+            <div>
+              <h2>Keep the database changing</h2>
+              <p>
+                The background writer exercises ten different kinds of change.
+              </p>
+            </div>
+            <div class="writer-actions">
+              <span class="status" id="writer-state"><i></i>Checking</span
+              ><label
+                >Writes per second
+                <input
+                  id="writer-rate"
+                  type="number"
+                  min="0"
+                  max="100"
+                  value="8" /></label
+              ><button class="subtle" id="writer-toggle">Pause writer</button
+              ><button class="primary" id="writer-apply">
+                Apply rate & mix
+              </button>
+            </div>
+            <fieldset id="writer-operations">
+              <legend>Operation mix</legend>
+            </fieldset>
+            <div id="writer-counts" class="writer-counts">
+              Waiting for writer counters…
+            </div>
+          </article>
+          <div class="section-heading compact">
+            <div>
+              <h2>What happens when things go wrong?</h2>
+              <p id="scenario-help">
+                Experiments target this demo database and its uniquely
+                identified cache.
+              </p>
+            </div>
+          </div>
+          <div class="scenario-grid" id="scenario-grid"></div>
+          <article class="panel scenario-result" id="scenario-result" hidden>
+            <div class="panel-heading">
+              <h2 id="scenario-result-title">Experiment timeline</h2>
+              <span id="scenario-result-status" class="quiet-badge"></span>
+            </div>
+            <ol id="scenario-timeline" class="timeline"></ol>
+          </article>
+          <article class="panel lab-activity">
+            <div class="panel-heading">
+              <h2>Activity</h2>
+              <span class="live-caption"
+                >Sampled reads, writes and engine events</span
+              >
+            </div>
+            <ol id="lab-events" class="event-list"></ol>
+          </article>
+        </section>
+      </main>
+      <footer class="footer">
+        <span
+          ><strong>Streamgres</strong> runs inside this application. Postgres
+          owns every write.</span
+        ><span id="footer-health">Connecting to the local service…</span>
+      </footer>
+    </div>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <dialog id="create-dialog">
+      <form id="create-form">
+        <div class="dialog-heading">
+          <h2>Create a ticket</h2>
+          <button
+            class="icon-button"
+            type="button"
+            data-close="create-dialog"
+            aria-label="Close create ticket"
+          >
+            ×
+          </button>
+        </div>
+        <p>A real write to Postgres, read back through the cache adapter.</p>
+        <label for="new-title">Title</label
+        ><input
+          id="new-title"
+          maxlength="160"
+          placeholder="What do you need help with?"
+          required
+        /><label for="new-priority">Priority</label
+        ><select id="new-priority">
+          <option value="normal">Normal</option>
+          <option value="high">High</option>
+          <option value="low">Low</option>
+        </select>
+        <p class="fine-print" id="create-org-label"></p>
+        <button class="primary" type="submit">Create ticket</button>
+      </form>
+    </dialog>
+    <dialog id="help-dialog">
+      <div class="dialog-heading">
+        <h2>A faster path to the same data.</h2>
+        <button
+          class="icon-button"
+          type="button"
+          data-close="help-dialog"
+          aria-label="Close explanation"
+        >
+          ×
+        </button>
+      </div>
+      <div class="help-steps">
+        <div>
+          <span>1</span>
+          <div>
+            <h3>Your app reads through Diesel</h3>
+            <p>The query and its typed parameters go to the cache adapter.</p>
+          </div>
+        </div>
+        <div>
+          <span>2</span>
+          <div>
+            <h3>Streamgres answers when it can</h3>
+            <p>
+              Supported queries use maintained rows in memory. Anything
+              unsupported, incomplete or too stale goes to Postgres.
+            </p>
+          </div>
+        </div>
+        <div>
+          <span>3</span>
+          <div>
+            <h3>Postgres streams committed changes</h3>
+            <p>
+              The cache applies the database's WAL. A write barrier lets you
+              wait for your own commit before reading.
+            </p>
+          </div>
+        </div>
+      </div>
+      <button class="primary" id="start-tour">Take the quick tour</button>
+    </dialog>
+    <div id="tour-shade" class="tour-shade" hidden></div>
+    <div
+      id="tour"
+      class="tour"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="tour-title"
+      hidden
+    >
+      <span id="tour-step"></span>
+      <h2 id="tour-title"></h2>
+      <p id="tour-copy"></p>
+      <div>
+        <button class="text-button" id="tour-skip">Skip tour</button
+        ><button class="primary" id="tour-next">Next</button>
+      </div>
+    </div>
+  </body>
+</html>
