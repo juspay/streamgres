@@ -1,4 +1,4 @@
-//! `demo seed | explain | verify | bench | lag | schema | migrate`.
+//! `demo serve | seed | explain | verify | bench | lag | schema | migrate`.
 //!
 //! `DATABASE_URL` names the Postgres the cache follows (`wal_level =
 //! logical`; `seed` installs the publication and the trigger stack, so it

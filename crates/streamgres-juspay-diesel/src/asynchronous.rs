@@ -12,9 +12,11 @@ use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
-/// A process-wide ceiling includes running and queued blocking cache work.
-/// Saturation refuses the cache attempt so ordinary database reads continue.
+/// How many cache reads may run or wait on Tokio's blocking pool at once,
+/// in the whole process. Past it a read is refused and goes to Postgres.
 const MAX_BLOCKING_JOBS: usize = 64;
+
+/// A place among the [`MAX_BLOCKING_JOBS`]; `None` when all are taken.
 fn worker_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
     static WORKERS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     WORKERS
@@ -24,14 +26,19 @@ fn worker_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
         .ok()
 }
 
-/// Async cached reads on `AsyncPgConnection`. Share the engine in an Arc;
-/// blocking cache fills never occupy the async executor's worker thread.
+/// Cached reads on `diesel-async`'s `AsyncPgConnection`. The cache is shared
+/// behind an `Arc`, and a read that waits for the cache waits on Tokio's
+/// blocking pool, never on a runtime worker.
 pub trait AsyncLoadCached<'query, U: Send>: Sized + Send {
+    /// The rows `.load(conn)` would return, from `cache` when it can answer
+    /// exactly, from `conn` otherwise.
     fn load_cached_async(
         self,
         cache: Arc<Cache>,
         conn: &mut AsyncPgConnection,
     ) -> impl Future<Output = QueryResult<Vec<U>>> + Send;
+
+    /// The rows from `cache` alone, or why it refused.
     fn inspect_cached_async(
         self,
         cache: Arc<Cache>,
@@ -66,8 +73,9 @@ where
     }
 }
 
-/// Built-in bind types carry their OIDs statically. A custom type needs
-/// async metadata resolution, so this version safely delegates it to Diesel.
+/// Type OIDs for rendering binds without a connection. A built-in type
+/// carries its OID; a custom one (an enum) would need a database lookup,
+/// so it is only noted, and the read goes to Postgres.
 #[derive(Default)]
 struct BuiltinMetadata {
     custom: bool,
@@ -78,6 +86,8 @@ impl PgMetadataLookup for BuiltinMetadata {
         PgTypeMetadata::new(0, 0)
     }
 }
+/// The reader `conn` reads as, checked again when its last check no
+/// longer stands; why not, when the connection must read Postgres.
 async fn reader(conn: &mut AsyncPgConnection, cache: &Cache) -> Result<Reader, Refusal> {
     let status =
         <AsyncPgConnection as AsyncConnection>::TransactionManager::transaction_manager_status_mut(
@@ -132,6 +142,8 @@ async fn reader(conn: &mut AsyncPgConnection, cache: &Cache) -> Result<Reader, R
     }
     Ok(reader)
 }
+/// `query`'s rows from `cache`, or why it refused. The read and the decoding
+/// run on Tokio's blocking pool.
 async fn attempt<Q, U>(
     query: &mut Q,
     cache: Arc<Cache>,

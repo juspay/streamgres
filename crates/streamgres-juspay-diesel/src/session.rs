@@ -13,10 +13,10 @@
 //! inside it ([`Tracker::wrapping`]). A connection without a tracker is
 //! never answered from the cache.
 //!
-//! What the tracker cannot see is a change made where no statement names
-//! it: a function that runs `SET` inside, a grant revoked by another
-//! session. The adapter checks every reader again after
-//! [`RECHECK_EVERY`], which bounds how long such a change goes unseen.
+//! By default every statement the connection sends to the database asks
+//! for a new check, so a change made inside a function is seen too
+//! ([`Recheck`]). What no statement on the connection can show, such as a
+//! grant revoked by another session, is seen within [`RECHECK_EVERY`].
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -64,8 +64,9 @@ pub(crate) struct Session {
     pub changed: bool,
     /// A transaction the connection opened in SQL of its own is open.
     pub in_transaction: bool,
-    /// A host may clear server-side prepared statements without clearing the
-    /// driver's cache. Keep full validation available via unnamed statements.
+    /// The reader check runs unprepared on this connection: its prepared
+    /// statement was removed behind Diesel's statement cache (`DISCARD
+    /// ALL`, `DEALLOCATE`).
     pub uncached_reader_check: bool,
 }
 

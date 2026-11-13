@@ -31,12 +31,13 @@
 //! single-quoted with `''` for an embedded quote; `TRUE` / `FALSE` as a
 //! filter parse to the vacuous `AND(vec![])` / `OR(vec![])`.
 //!
-//! The grammar and restrictions below describe [`parse`], the legacy
-//! single-table read/write interface. Embedded SQL reads use
-//! [`parse_select`], whose projection, bind and join grammar is documented
-//! in `select`. The two interfaces share filter parsing and validation.
+//! The grammar and restrictions below describe [`parse`]: the single-table
+//! reads and writes of the in-process engine API ([`parse_read`],
+//! [`parse_write`]). The embedded cache reads with [`parse_select`], whose
+//! projection, bind and join grammar is documented in `select`. The two
+//! share filter parsing and validation.
 //!
-//! # Legacy interface restrictions
+//! # Single-table restrictions
 //!
 //! - Single table only — `LEFT JOIN` is recognised and refused.
 //! - Writes address **exactly one row by primary key**: the `WHERE` of an

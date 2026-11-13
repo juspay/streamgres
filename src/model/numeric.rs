@@ -196,8 +196,9 @@ impl Numeric {
         {
             return Err(NumericError("not a decimal number"));
         }
-        // Whole numbers may have many more digits than the fractional
-        // scale limit. Check the actual resulting weight below.
+        // Postgres's largest exponent: a whole number may have far more
+        // digits than the scale limit allows after the point, so the weight
+        // is checked below as well.
         const MAX_EXPONENT: i32 = 131_072;
         if !(-MAX_EXPONENT..=MAX_EXPONENT).contains(&exponent) {
             return Err(NumericError("exponent out of range"));
@@ -213,10 +214,9 @@ impl Numeric {
             .ok()
             .filter(|scale| usize::from(*scale) <= MAX_SCALE)
             .ok_or(NumericError("scale out of range"))?;
-        // Strip leading zeros before deriving the base-10000 weight.
-        // Otherwise a long, valid zero prefix can saturate the i16 weight
-        // and silently change the value; oversized nonzero values must
-        // be rejected rather than saturated too.
+        // The weight is taken from the first nonzero digit: leading zeros,
+        // however many, do not count toward it, and a value too large for
+        // the weight is refused rather than clamped.
         let leading = digits
             .iter()
             .position(|digit| *digit != 0)

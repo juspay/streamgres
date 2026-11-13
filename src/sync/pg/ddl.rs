@@ -84,11 +84,11 @@ pub struct PublishedTable {
 
 /// One published column: its type as `pg_type` names it (an array as
 /// `text[]`) and its OID, the type's class (`e` for an enum), and its
-/// default expression's text when it has one. A trigger stack installed
-/// by this version also sends the base type's OID (a domain's, resolved),
-/// an array's element OID and the collation by name (`default` resolved
-/// as the startup catalog resolves it); an older one sends only whether
-/// the collation is deterministic.
+/// default expression's text when it has one, and from version 2 of the
+/// trigger stack, which the engine requires, the base type's OID (a
+/// domain's, resolved), an array's element OID, the collation by name
+/// (`default` resolved as the startup catalog resolves it), and whether it
+/// is generated and its type has a binary send function.
 #[derive(Debug, Deserialize)]
 pub struct PublishedColumn {
     #[serde(rename = "dataType")]
@@ -115,6 +115,7 @@ pub struct PublishedColumn {
     pub binary_send: bool,
 }
 
+/// The serde default of a `true` field.
 fn yes() -> bool {
     true
 }

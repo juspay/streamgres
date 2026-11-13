@@ -1,6 +1,12 @@
-//! Two bounded memos: SQL shapes are independent of values; evaluated
-//! answers are an optional fast path for repeated values. New values bind
-//! an existing shape and never rerun the grammar or schema resolution.
+//! What a statement parses to, kept so that reads do not parse again.
+//!
+//! Two bounded memos, each sharded by hash: one keeps each statement's
+//! shape (its SQL resolved against the catalog, binds still open), the
+//! other the shape with one set of binds substituted. A statement read
+//! with binds not seen before binds its kept shape, without lexing or
+//! resolving names again; one read again with the same binds is found
+//! whole.
+
 use super::{CatalogVersion, state::value_bytes};
 use crate::model::{Catalog, MultiTableReadQuery, Where};
 use crate::parser::{Bind, PreparedSelect, Select};
@@ -8,23 +14,35 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 
+/// How many shards each memo has.
 const SHARDS: usize = 16;
+/// What one shard may hold, by [`Memo::insert`]'s estimate.
 const BYTES_PER_SHARD: usize = 2 << 20;
+/// How many statements one shard may hold.
 const ENTRIES_PER_SHARD: usize = 512;
+/// The longest statement the cache parses; a longer one is refused.
 const MAX_SQL_BYTES: usize = 64 << 10;
 
+/// A statement's shape, or why it is refused whatever its binds.
 type Shape = Result<Arc<PreparedSelect>, Arc<str>>;
+/// A statement with its binds, or why it is refused. Both follow from the
+/// SQL, the binds and the catalog alone, so both are kept.
 pub(super) type Parsed = Result<Arc<Select>, Arc<str>>;
+
+/// What a shape is kept under.
 #[derive(Clone)]
 struct ShapeKey {
     sql: Box<str>,
     version: CatalogVersion,
 }
+/// What a statement with its binds is kept under.
 struct BoundKey {
     sql: Box<str>,
     binds: Vec<Bind>,
     version: CatalogVersion,
 }
+/// One shard: entries by hash, with what they weigh. When full, an
+/// eighth of its hashes give way, whichever they are.
 struct Memo<K, V> {
     buckets: HashMap<u64, Vec<(K, V, usize)>>,
     bytes: usize,
@@ -77,6 +95,7 @@ impl<K, V: Clone> Memo<K, V> {
     }
 }
 
+/// Both memos.
 pub(super) struct ParseMemo {
     shapes: [RwLock<Memo<ShapeKey, Shape>>; SHARDS],
     answers: [RwLock<Memo<BoundKey, Parsed>>; SHARDS],
@@ -88,6 +107,8 @@ impl ParseMemo {
             answers: std::array::from_fn(|_| RwLock::default()),
         }
     }
+    /// What `sql` with `binds` parses to against `catalog`, from the
+    /// memos when it can be.
     pub fn get_or_parse(
         &self,
         sql: &str,

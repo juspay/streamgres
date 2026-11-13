@@ -11,6 +11,8 @@ use crate::diesel::result::{Error, QueryResult};
 use crate::diesel::sql_types::{Array, Text, Untyped};
 use streamgres::cache::ReaderCheck;
 
+/// The check, and whether Diesel may prepare it: `false` on a connection
+/// whose prepared check was removed behind Diesel's statement cache.
 pub(crate) struct ReaderQuery<'a>(pub &'a ReaderCheck, pub bool);
 
 impl Query for ReaderQuery<'_> {

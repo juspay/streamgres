@@ -381,9 +381,9 @@ struct Slot {
     active_pid: Option<i32>,
 }
 fn owned_slot(app: &App, conn: &mut PgConnection) -> Result<Slot, ApiError> {
-    // Match the unique application label on THIS cache's slot-owner session.
-    // Hash collisions or any uncertainty refuse the experiment. Never select
-    // a slot just because it shares a prefix or database with this service.
+    // The slot is found by the unique application name of this cache's
+    // slot-owner session, never by a prefix or a database it shares with
+    // others; anything ambiguous refuses the experiment.
     let mut slots: Vec<Slot> = diesel::sql_query("SELECT s.slot_name::text AS slot_name, s.active_pid FROM pg_replication_slots s JOIN pg_locks l ON l.locktype='advisory' AND l.granted AND l.objsubid=2 AND l.classid::bigint=1397183308 AND l.objid::bigint=(hashtext(s.slot_name)::bigint & 4294967295) JOIN pg_stat_activity owner ON owner.pid=l.pid WHERE owner.application_name=$1 AND s.database=current_database() AND NOT s.temporary")
         .bind::<Text,_>(&app.engine_label).load(conn)?;
     if slots.len() != 1 {

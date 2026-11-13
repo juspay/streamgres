@@ -287,9 +287,10 @@ async fn database_collation(client: &Client) -> Result<String, StorageError> {
     })
 }
 
-/// The string table identity uses a dot as its schema separator. Until
-/// that identity has separate components, ambiguous names must be refused
-/// consistently by catalog loading, parsing and replication routing.
+/// Whether a table can be named in the catalog: a table outside `public`
+/// is named `schema.table`, so a name with a dot of its own would be
+/// ambiguous. Catalog loading, parsing and replication routing all refuse
+/// such names.
 pub(crate) fn supported_name(schema: &str, table: &str) -> bool {
     !schema.contains('.') && !table.contains('.')
 }

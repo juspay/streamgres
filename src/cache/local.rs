@@ -1,13 +1,22 @@
-//! One bounded answer per thread. A writer publishes a new revision before
-//! releasing the state lock, so a local answer cannot survive a visible
-//! commit, eviction, schema change or stop. Freshness expires independently
-//! of writes. Copies have thread-local Arc counters to avoid hot-key contention.
+//! The last answer each thread read, kept on the thread, so a thread
+//! repeating a read answers it without the state's lock or any shared
+//! reference count.
+//!
+//! An answer is reused only for the same cache, statement, binds and
+//! reader, and while nothing changed: every change of the state bumps its
+//! revision before its lock is let go ([`super::state::StateWrite`]), so a
+//! commit, an eviction, a schema change or a stop retires every kept
+//! answer at once. An answer also expires with the engine's freshness.
+
 use super::{CachedRows, Reader};
 use crate::parser::Bind;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::Instant;
+/// The most one thread's answer may weigh, its key included.
 const MAX_BYTES: usize = 64 << 10;
+
+/// A kept answer and what it answers.
 struct Answer {
     identity: Arc<()>,
     revision: u64,
@@ -18,6 +27,10 @@ struct Answer {
     rows: CachedRows,
 }
 thread_local! { static ANSWER: RefCell<Option<Answer>> = const { RefCell::new(None) }; }
+
+/// What an answer answers: the cache (by its [`super::state::Shared`]'s
+/// identity), the state's revision, the statement, its binds and the
+/// reader.
 pub(super) struct Key<'a> {
     pub identity: &'a Arc<()>,
     pub revision: u64,
@@ -25,6 +38,7 @@ pub(super) struct Key<'a> {
     pub binds: &'a [Bind],
     pub reader: &'a Reader,
 }
+/// This thread's answer to `key`, if it kept one and it still stands.
 pub(super) fn get(key: &Key<'_>) -> Option<CachedRows> {
     ANSWER.with(|answer| {
         let answer = answer.borrow();
@@ -38,6 +52,8 @@ pub(super) fn get(key: &Key<'_>) -> Option<CachedRows> {
             .then(|| answer.rows.clone())
     })
 }
+/// Keeps `rows` as this thread's answer to `key` until `expires`, when
+/// they and the key weigh at most `budget` (and [`MAX_BYTES`]).
 pub(super) fn keep(key: Key<'_>, expires: Instant, rows: &CachedRows, budget: usize) {
     let Key {
         identity,

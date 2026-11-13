@@ -14,12 +14,13 @@
 //!
 //! A connection is answered from the cache only when it is tracked: give
 //! every connection a [`Tracker`] as its instrumentation, most simply by
-//! calling [`install`] once at startup. The tracker sees what the session
-//! does, and the adapter checks once per connection, again after anything
-//! that may change it and at least every ten seconds, which cached tables
-//! the connection would see otherwise than the engine (another table
-//! under its search path, one its role may not read); those, and any read
-//! inside a transaction, go to Postgres.
+//! calling [`install`] once at startup. The adapter checks which cached
+//! tables the connection would see otherwise than the engine (another
+//! table under its search path, one its role may not read), and checks
+//! again after every statement the connection sends to the database (or
+//! only after those that change its session: [`Recheck`]) and at least
+//! every [`RECHECK_EVERY`]. Reads of those tables, and any read inside a
+//! transaction, go to Postgres.
 //!
 //! The query is rendered and its binds collected exactly as Diesel would
 //! send them, and handed to the cache. When the cache answers, each value
@@ -104,8 +105,11 @@ pub trait LoadCached<'query, C, U>: Sized {
     }
 }
 
-/// Efficient first-row reads: adds `LIMIT 1` before using the cache.
+/// Reading a query's first row.
 pub trait FirstCached<'query, C, U>: Sized {
+    /// The row `.first(conn)` would return: the query with `LIMIT 1`, read
+    /// as [`LoadCached::load_cached`] reads it; Diesel's `NotFound` when
+    /// there is none.
     fn first_cached(self, cache: &Cache, conn: &mut C) -> QueryResult<U>;
 }
 impl<'query, T, C, U> FirstCached<'query, C, U> for T
@@ -149,7 +153,7 @@ where
 }
 
 /// The reader `conn` reads as, checked again when its last check no
-/// longer stands; `None` when the connection must read Postgres: it is
+/// longer stands; why not, when the connection must read Postgres: it is
 /// not tracked ([`Tracker`]), it is inside a transaction, or the check
 /// cannot be made.
 fn reader_of<C>(conn: &mut C, cache: &Cache) -> Result<Reader, Refusal>

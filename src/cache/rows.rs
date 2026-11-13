@@ -6,7 +6,7 @@
 //! once per change of a query's rows, not once per read: [`compose`] joins
 //! and sorts a snapshot of the rows, [`project`] takes a statement's
 //! columns of every joined row, the entry keeps both until its rows change
-//! again, and each read only slices the projection ([`slice`]).
+//! again, and each read only slices the projection ([`slice()`]).
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -38,8 +38,9 @@ pub struct CachedRows {
 }
 
 impl CachedRows {
-    /// Private per-thread ownership removes shared Arc counter writes from
-    /// repeated reads of the same key. Copy only a bounded result window.
+    /// A copy owning its rows, for one thread to keep
+    /// ([`super::local`]): its reads then write no shared reference
+    /// count. `None` when the rows weigh more than `budget`.
     pub(super) fn local_copy(&self, budget: usize) -> Option<Self> {
         let bytes = self
             .rows()

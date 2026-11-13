@@ -1,11 +1,16 @@
-//! The ticket desk on the embedded Streamgres cache.
+//! A support desk whose reads go through the embedded Streamgres cache
+//! ([`streamgres_diesel::Cache`]) with `load_cached`: a web service to show
+//! it and a test bed to check it.
 //!
-//! The same desk the S2S wrapper was tested with: five tables, a fixed
-//! list of query shapes ([`queries::Lookup`]), a writer that makes every
-//! kind of change, and a verify loop that reads every shape through the
-//! cache and through Postgres while the writer runs. Here the cache runs
-//! in this process ([`streamgres_diesel::Cache`]) and every read goes
-//! through `load_cached`.
+//! - [`service`]: the HTTP service and its page: the desk, every query
+//!   shape compared with Postgres, and the lab's load tests and failure
+//!   experiments.
+//! - [`queries`]: the desk's reads, one per query shape ([`queries::Lookup`]),
+//!   on the sync adapter and, in [`asynchronous`], the async one.
+//! - [`writer`]: a background writer making every kind of change.
+//! - [`verify`], [`bench`](mod@bench), [`lag`], [`migrate`]: the command-line checks.
+//! - [`schema`], [`models`], [`seed`], [`stack`]: the tables, their rows,
+//!   the dataset and the cache's setup.
 
 pub mod bench;
 pub mod lag;

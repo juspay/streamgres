@@ -1,5 +1,9 @@
-//! Regression scenarios found by the full-branch review. PostgreSQL is
-//! the oracle; accepted answers must match, unsupported semantics refuse.
+//! The cache at the edges of what it accepts, against Postgres: JSONB
+//! binds, numeric against float, timestamp against timestamptz, quoted and
+//! dotted names, reader exclusions and typed `NULL` parameters. Every
+//! answer the cache gives must equal Postgres's; what it cannot give
+//! exactly it must refuse. Runs only when `STREAMGRES_PG_DSN` names a
+//! database with `wal_level = logical`.
 use std::time::Duration;
 use streamgres::cache::{Bind, Cache, CacheConfig, Reader};
 use streamgres::model::Value;
@@ -345,7 +349,7 @@ async fn check_boundaries(dsn: &str) {
 #[test]
 fn postgres_boundaries_remain_exact() {
     let Ok(dsn) = std::env::var("STREAMGRES_PG_DSN") else {
-        eprintln!("STREAMGRES_PG_DSN not set: review regressions skipped");
+        eprintln!("STREAMGRES_PG_DSN not set: boundary scenarios skipped");
         return;
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()

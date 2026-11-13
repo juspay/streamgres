@@ -229,7 +229,7 @@ error for applications using custom SQL types.
 CI runs workspace tests and Clippy with async enabled, library-only Clippy,
 and the separately locked Juspay adapter. Live tests require
 `STREAMGRES_PG_DSN` pointing at a disposable logical-replication database.
-`exactness_live` and `review_boundaries` compare edge-case queries with Postgres;
+`exactness_live` and `boundaries_live` compare edge-case queries with Postgres;
 the latter also covers restricted-reader exclusions, typed NULLs, exact JSONB
 binds, array bounds, colliding identifiers and streaming byte limits. `cache_live` covers
 RLS changes, restart and migrations. Additional regressions cover stalled

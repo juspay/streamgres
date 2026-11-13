@@ -67,8 +67,9 @@ impl std::hash::Hash for CatalogVersion {
 
 /// The SQL of [`ReaderCheck`]: the reader's cluster and database, and the
 /// tables whose name resolves elsewhere for it or that it may not read
-/// whole. Qualify the validation functions, types and equality operator:
-/// the caller's search path must affect table resolution, never the check.
+/// whole. Its functions, types and operator are named in `pg_catalog`: the
+/// reader's search path decides which table a name resolves to, and nothing
+/// else, so a function of the reader's own cannot stand in for one of them.
 const CHECK_SQL: &str =
     "SELECT (SELECT system_identifier::pg_catalog.text FROM pg_catalog.pg_control_system()) AS cluster,
        pg_catalog.current_database()::pg_catalog.text AS database,

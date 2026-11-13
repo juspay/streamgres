@@ -58,6 +58,8 @@ impl Stack {
         Self::start_config(database_url, config(database_url), ready)
     }
 
+    /// Starts the cache with `config` and waits up to `ready` for it to
+    /// catch up.
     pub fn start_config(
         database_url: &str,
         config: CacheConfig,

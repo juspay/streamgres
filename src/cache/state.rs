@@ -133,6 +133,7 @@ impl Sightings {
     }
 }
 
+/// Everything behind the state's lock.
 pub(super) struct State {
     pub phase: Phase,
     pub entries: HashMap<u64, Entry>,
@@ -172,7 +173,10 @@ pub(super) use super::parse::ParseMemo;
 /// change, and what does not need the lock.
 pub(super) struct Shared {
     state: RwLock<State>,
+    /// This cache's own allocation: what tells its answers kept on a
+    /// thread ([`super::local`]) from another cache's.
     pub identity: Arc<()>,
+    /// Bumped by every change of the state, before its lock is let go.
     pub revision: AtomicU64,
     /// Counts the state's changes; a reader waits for it to move.
     epoch: AtomicU64,
@@ -189,8 +193,9 @@ pub(super) struct Shared {
     started: Instant,
 }
 
-/// Publication is part of unlocking, not a later notification. A write
-/// barrier cannot observe a new position with the previous read revision.
+/// The state's lock, held to change it. Letting it go bumps
+/// [`Shared::revision`] first, so no reader can see the change and still
+/// find an answer kept under the revision before it.
 pub(super) struct StateWrite<'a> {
     shared: &'a Shared,
     guard: RwLockWriteGuard<'a, State>,
@@ -257,7 +262,7 @@ impl Shared {
     }
 
     /// The state, to change it; follow the change with [`Shared::notify`]
-    /// once the lock is let go.
+    /// once the lock is let go, to wake the readers waiting on it.
     pub fn write(&self) -> StateWrite<'_> {
         StateWrite {
             shared: self,
@@ -355,9 +360,10 @@ pub(super) fn value_bytes(value: &Value) -> usize {
 }
 
 impl State {
-    /// How stale an answer given now may be: how long the last event
-    /// waited in this process, and how far behind the source last said it
-    /// was.
+    /// How stale an answer given now may be: the longer of how long ago
+    /// the newest source position the engine has applied was sampled, and
+    /// how long the last event waited in this process plus how far behind
+    /// the source last said it was.
     pub fn lag(&self) -> Duration {
         let behind = match self.behind {
             Some((behind, at)) if at.elapsed() < BEHIND_STANDS => behind,
@@ -368,8 +374,9 @@ impl State {
             .max(self.confirmed.map_or(Duration::ZERO, |at| at.elapsed()))
     }
 
-    /// Whether reads can be answered now: the engine running, heard from
-    /// within `max_lag`, and no further behind the database than that.
+    /// Whether reads can be answered now: the engine running, a source
+    /// position sampled within `max_lag` applied, the engine heard from
+    /// within `max_lag`, and its [`State::lag`] within it.
     pub fn readiness(&self, config: &CacheConfig) -> Result<(), Refusal> {
         match &self.phase {
             Phase::Running(_)
@@ -401,8 +408,10 @@ impl State {
         }
     }
 
-    /// A local answer must revisit state before freshness or its activity
-    /// lease expires, even if the engine publishes no further updates.
+    /// Until when an answer kept on a thread may stand: until the engine's
+    /// freshness lapses, or half of `idle_ttl` (so its entry is touched
+    /// again before it would be swept), whichever is sooner. `None` when
+    /// reads cannot be answered now.
     pub fn answer_deadline(&self, config: &CacheConfig) -> Option<Instant> {
         self.readiness(config).ok()?;
         let confirmed = self.confirmed?.checked_add(config.max_lag)?;
@@ -517,8 +526,9 @@ impl State {
         Some(sub)
     }
 
-    /// Keeps `projected`, weighing `bytes`, for entry `id` if its rows
-    /// are still those of `generation` and the budget has room for it.
+    /// Keeps `kept`, and `ordered` when the entry has none, for entry `id`
+    /// if its rows are still those of `generation` and the byte budget has
+    /// room for them.
     pub fn keep_projection(
         &mut self,
         id: u64,
@@ -570,10 +580,9 @@ impl State {
     }
 
     /// The housekeeping of one tick: entries nobody has read within
-    /// `idle_ttl` or stuck filling or settling past `stuck` are dropped,
-    /// refused entries with them (their readers have seen the refusal,
-    /// which is remembered apart), and refusals older than `refusal_ttl`
-    /// are forgotten. The subscriptions to end.
+    /// `idle_ttl`, or filling or settling for over twice `fill_timeout`,
+    /// are dropped, and refusals older than `refusal_ttl` are forgotten.
+    /// The subscriptions to end.
     pub fn sweep(&mut self, now: u64, config: &CacheConfig) -> Vec<SubId> {
         let idle = u64::try_from(config.idle_ttl.as_millis()).unwrap_or(u64::MAX);
         let stuck = config.fill_timeout * 2;
@@ -629,6 +638,7 @@ impl State {
         }
     }
 
+    /// Confirms the samples whose position the engine has applied.
     fn confirm_samples(&mut self) {
         while self
             .samples

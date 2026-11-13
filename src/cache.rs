@@ -44,8 +44,9 @@ pub use metrics::Metrics;
 pub use reader::{CatalogVersion, Reader, ReaderCheck};
 pub use rows::{CachedColumn, CachedRows};
 
-/// An opaque point applied by this cache. Obtain one from `position()` or
-/// a PostgreSQL WAL location; callers compare and wait, never edit its parts.
+/// A point in the database's history, as the cache orders it: from
+/// [`Cache::position`], or from a WAL location. Compare and wait on it; its
+/// parts are the backend's own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Position(crate::model::Position);
 impl From<crate::sync::pg::Lsn> for Position {

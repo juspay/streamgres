@@ -1,5 +1,7 @@
-//! A schema-checked SQL shape, with parameter evaluation kept separate.
-//! No placeholder values enter the engine's query model.
+//! A statement's shape: its SQL parsed and resolved against the catalog
+//! once, with its parameters left open, and bound to each read's values
+//! without parsing again ([`PreparedSelect::bind`]). The engine's query is
+//! built only from bound values.
 use super::Select;
 use super::{Bind, ParseError, Tagged, decode_bind, select};
 use crate::model::{
@@ -7,15 +9,20 @@ use crate::model::{
     Value,
 };
 
+/// What a condition compares its column with.
 #[derive(Debug, Clone)]
 pub(super) enum Operand {
+    /// A value written in the SQL.
     Literal(Value),
+    /// Parameter `$number`, read as a value of `declared`'s type, or as a
+    /// list of them for `ANY` / `ALL`; `at` is where it is in the SQL.
     Parameter {
         number: usize,
         declared: DbColumn,
         list: bool,
         at: usize,
     },
+    /// An `IN` list.
     List(Vec<Operand>),
 }
 impl From<Value> for Operand {
@@ -48,6 +55,8 @@ impl Operand {
             }
         }
     }
+    /// The operand with every parameter `NULL`: what the shape's checks
+    /// that do not depend on values see.
     pub(super) fn validation(&self) -> Value {
         match self {
             Self::Literal(value) => value.clone(),
@@ -57,6 +66,7 @@ impl Operand {
     }
 }
 
+/// A condition whose operand may still be a parameter.
 #[derive(Debug, Clone)]
 pub(super) struct Predicate {
     pub column: ColumnName,
@@ -84,6 +94,8 @@ impl Predicate {
     }
 }
 
+/// A `LIMIT` or `OFFSET`: a number, or a parameter (`null` standing in
+/// for a `NULL` one).
 #[derive(Debug, Clone)]
 pub(super) enum Count {
     Literal(u32),
@@ -102,7 +114,8 @@ impl Count {
                     .checked_sub(1)
                     .and_then(|index| binds.get(index))
                     .ok_or_else(error)?;
-                if !matches!(bind.type_oid, 20 | 21 | 23) {
+                use crate::sync::pg::binary::oid;
+                if !matches!(bind.type_oid, oid::INT8 | oid::INT2 | oid::INT4) {
                     return Err(error());
                 }
                 match &bind.bytes {
@@ -119,6 +132,8 @@ impl Count {
     }
 }
 
+/// A statement's shape: the parsed statement, each table's filter and the
+/// counts with parameters open, and how many parameters it takes.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedSelect {
     pub(super) base: Select,
@@ -128,7 +143,8 @@ pub(crate) struct PreparedSelect {
     pub(super) parameters: usize,
 }
 impl PreparedSelect {
-    /// Substitute and validate this call's values without lexing or resolving SQL.
+    /// The statement with `binds` substituted, each checked against its
+    /// column's type, without lexing or resolving names again.
     pub(crate) fn bind(&self, binds: &[Bind], catalog: &Catalog) -> Result<Select, ParseError> {
         if binds.len() != self.parameters {
             return Err(ParseError {
