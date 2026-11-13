@@ -64,6 +64,9 @@ pub(crate) struct Session {
     pub changed: bool,
     /// A transaction the connection opened in SQL of its own is open.
     pub in_transaction: bool,
+    /// A host may clear server-side prepared statements without clearing the
+    /// driver's cache. Keep full validation available via unnamed statements.
+    pub uncached_reader_check: bool,
 }
 
 impl Session {
@@ -501,9 +504,8 @@ mod tests {
         use crate::diesel::connection::{Instrumentation, InstrumentationEvent, StrQueryHelper};
         let ran = |tracker: &mut Tracker, sql: &str| {
             tracker.session.changed = false;
-            tracker.on_connection_event(InstrumentationEvent::start_query(&StrQueryHelper::new(
-                sql,
-            )));
+            tracker
+                .on_connection_event(InstrumentationEvent::start_query(&StrQueryHelper::new(sql)));
             tracker.session.changed
         };
         let mut strict = Tracker::new();

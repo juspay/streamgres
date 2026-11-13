@@ -5,7 +5,6 @@ use crate::diesel::pg::{Pg, PgMetadataLookup, PgTypeMetadata};
 use crate::diesel::query_builder::{AsQuery, Query, QueryFragment, QueryId};
 use crate::diesel::query_dsl::CompatibleType;
 use crate::diesel::result::{Error, QueryResult};
-use crate::diesel::sql_types::{Array, Text};
 use crate::{Cache, CacheAttempt, Reader, Refusal, decode_cached, rendered, session};
 use diesel_async::TransactionManager;
 use diesel_async::methods::LoadQuery;
@@ -42,12 +41,7 @@ pub trait AsyncLoadCached<'query, U: Send>: Sized + Send {
 impl<'query, T, U> AsyncLoadCached<'query, U> for T
 where
     T: AsQuery + Send,
-    T::Query: QueryFragment<Pg>
-        + QueryId
-        + LoadQuery<'query, AsyncPgConnection, U>
-        + Send
-        + Sync
-        + 'query,
+    T::Query: QueryFragment<Pg> + QueryId + LoadQuery<'query, AsyncPgConnection, U> + Send + 'query,
     T::SqlType: CompatibleType<U, Pg>,
     U: FromSqlRow<<T::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send + 'static,
 {
@@ -56,8 +50,8 @@ where
         cache: Arc<Cache>,
         conn: &mut AsyncPgConnection,
     ) -> QueryResult<Vec<U>> {
-        let query = self.as_query();
-        match attempt::<_, U>(&query, cache, conn).await? {
+        let mut query = self.as_query();
+        match attempt::<_, U>(&mut query, cache, conn).await? {
             CacheAttempt::Hit(rows) => Ok(rows),
             CacheAttempt::Refused(_) => RunQueryDsl::load(query, conn).await,
         }
@@ -67,8 +61,8 @@ where
         cache: Arc<Cache>,
         conn: &mut AsyncPgConnection,
     ) -> QueryResult<CacheAttempt<Vec<U>>> {
-        let query = self.as_query();
-        attempt::<_, U>(&query, cache, conn).await
+        let mut query = self.as_query();
+        attempt::<_, U>(&mut query, cache, conn).await
     }
 }
 
@@ -110,12 +104,21 @@ async fn reader(conn: &mut AsyncPgConnection, cache: &Cache) -> Result<Reader, R
         return Ok(reader.clone());
     }
     let check = cache.reader_check()?;
-    let answer: crate::answer::ReaderAnswer = crate::diesel::sql_query(check.sql)
-        .bind::<Array<Text>, _>(&check.names)
-        .bind::<Array<Text>, _>(&check.as_written)
-        .bind::<Array<Text>, _>(&check.qualified)
-        .get_result(conn)
-        .await
+    let cacheable = !session::tracker_of(conn.instrumentation())
+        .is_some_and(|tracker| tracker.session.uncached_reader_check);
+    let mut answer: QueryResult<crate::answer::ReaderAnswer> =
+        crate::reader_query::ReaderQuery(&check, cacheable)
+            .get_result(conn)
+            .await;
+    if answer.is_err() && cacheable {
+        if let Some(tracker) = session::tracker_of(conn.instrumentation()) {
+            tracker.session.uncached_reader_check = true;
+        }
+        answer = crate::reader_query::ReaderQuery(&check, false)
+            .get_result(conn)
+            .await;
+    }
+    let answer = answer
         .map_err(|_| Refusal::NotReady("the async reader identity could not be verified".into()))?;
     let reader = Reader::new(
         &answer.cluster,
@@ -130,12 +133,12 @@ async fn reader(conn: &mut AsyncPgConnection, cache: &Cache) -> Result<Reader, R
     Ok(reader)
 }
 async fn attempt<Q, U>(
-    query: &Q,
+    query: &mut Q,
     cache: Arc<Cache>,
     conn: &mut AsyncPgConnection,
 ) -> QueryResult<CacheAttempt<Vec<U>>>
 where
-    Q: QueryFragment<Pg> + QueryId + Query + Sync,
+    Q: QueryFragment<Pg> + QueryId + Query + Send,
     Q::SqlType: CompatibleType<U, Pg>,
     U: FromSqlRow<<Q::SqlType as CompatibleType<U, Pg>>::SqlType, Pg> + Send + 'static,
 {

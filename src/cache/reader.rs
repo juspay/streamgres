@@ -67,14 +67,19 @@ impl std::hash::Hash for CatalogVersion {
 
 /// The SQL of [`ReaderCheck`]: the reader's cluster and database, and the
 /// tables whose name resolves elsewhere for it or that it may not read
-/// whole.
+/// whole. Qualify the validation functions, types and equality operator:
+/// the caller's search path must affect table resolution, never the check.
 const CHECK_SQL: &str =
-    "SELECT (SELECT system_identifier::text FROM pg_control_system()) AS cluster,
-       current_database()::text AS database,
-       COALESCE(json_agg(t.name) FILTER (WHERE
-           to_regclass(t.as_written) IS DISTINCT FROM to_regclass(t.qualified)
-           OR NOT COALESCE(has_table_privilege(to_regclass(t.qualified), 'SELECT'), false)), '[]'::json)::text AS excluded
-FROM unnest($1::text[], $2::text[], $3::text[]) AS t(name, as_written, qualified)";
+    "SELECT (SELECT system_identifier::pg_catalog.text FROM pg_catalog.pg_control_system()) AS cluster,
+       pg_catalog.current_database()::pg_catalog.text AS database,
+       COALESCE(pg_catalog.json_agg(t.name) FILTER (WHERE
+           (pg_catalog.to_regclass(t.as_written) OPERATOR(pg_catalog.=) pg_catalog.to_regclass(t.qualified)) IS NOT TRUE
+           OR NOT COALESCE(pg_catalog.has_table_privilege(pg_catalog.to_regclass(t.qualified), 'SELECT'), false)), '[]'::pg_catalog.json)::pg_catalog.text AS excluded
+FROM ROWS FROM (
+    pg_catalog.unnest($1::pg_catalog.text[]),
+    pg_catalog.unnest($2::pg_catalog.text[]),
+    pg_catalog.unnest($3::pg_catalog.text[])
+) AS t(name, as_written, qualified)";
 
 impl ReaderCheck {
     pub(super) fn of(catalog: &Arc<Catalog>) -> Self {

@@ -88,7 +88,13 @@ between the database and application's wall clocks.
 
 A reader is checked for cluster identity, database, table resolution and SELECT
 privileges. The check is one round trip, paid by the next cached read, so when
-it is repeated decides what the cache saves:
+it is repeated decides what the cache saves. Its SQL and bind types are reused
+through Diesel's prepared-statement cache; each recheck still executes the full
+identity, table-resolution and privilege checks. Validation uses explicitly
+qualified PostgreSQL builtins so a caller's schema cannot replace the check's
+functions or operators. If the host clears server prepared statements behind
+the driver's cache, the adapter retries the read-only check without preparing
+it and keeps using unnamed checks for that connection:
 
 - **`Recheck::AfterEveryStatement`** (the default). Every statement the
   connection sends to the database invalidates the check, including a SELECT

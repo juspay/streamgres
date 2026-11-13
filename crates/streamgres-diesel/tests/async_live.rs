@@ -62,6 +62,16 @@ fn async_reads_hit_fall_back_and_keep_transactions_on_postgres() {
         .await
         .unwrap();
         assert_eq!(rows, vec![1, 2]);
+        // Diesel's boxed queries are Send, but their erased fragments are
+        // not Sync. They must still work through the async adapter.
+        let boxed: CacheAttempt<Vec<i64>> = async_cache_rows::table
+            .select(async_cache_rows::id)
+            .order(async_cache_rows::id)
+            .into_boxed()
+            .inspect_cached_async(cache.clone(), &mut conn)
+            .await
+            .unwrap();
+        assert!(matches!(boxed, CacheAttempt::Hit(ref ids) if ids == &vec![1, 2]));
         conn.batch_execute("BEGIN; INSERT INTO async_cache_rows VALUES(3, 'three')")
             .await
             .unwrap();
@@ -102,6 +112,17 @@ fn async_reads_hit_fall_back_and_keep_transactions_on_postgres() {
             .await
             .unwrap();
         assert_eq!(direct, vec![1, 2, 4]);
+        conn.batch_execute("DISCARD ALL").await.unwrap();
+        let after_discard: CacheAttempt<Vec<i64>> = async_cache_rows::table
+            .select(async_cache_rows::id)
+            .order(async_cache_rows::id)
+            .inspect_cached_async(cache.clone(), &mut conn)
+            .await
+            .unwrap();
+        assert!(
+            matches!(after_discard, CacheAttempt::Hit(ref rows) if rows == &vec![1, 2, 4]),
+            "clearing prepared statements must not strand async reader validation"
+        );
         tokio::task::spawn_blocking(move || cache.stop())
             .await
             .unwrap();

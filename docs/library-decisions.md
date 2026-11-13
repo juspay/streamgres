@@ -842,3 +842,35 @@ where Postgres alone took 89 µs.
 - **Cost that remains under the default:** a cached read that follows
   any database statement on its connection pays one round trip.
 
+
+## 34. The reader check: prepared, and immune to the caller's search path
+
+**Found by** the ticket-desk demo and a review of the check's SQL.
+
+**A caller could spoof the check.** The check called `to_regclass` and
+compared with `=` by bare name. A connection whose `search_path` put a
+schema of its own before `pg_catalog` could supply its own `to_regclass`,
+make a table it was not reading look like the engine's, and be answered
+from the cache with the wrong table's rows.
+- **Decision.** The check names every function, type and operator it
+  uses by its `pg_catalog` name. The caller's search path decides which
+  tables its names resolve to, and nothing else.
+- **Tested by** the adapter's live test, which installs such a function;
+  it fails on the old check.
+
+**The check cost more than the read it guarded.** Under the strict
+recheck (decision 33) a cached read after any database statement runs
+the check again, and the check was parsed and planned on every run.
+- **Decision.** The check is a prepared statement, reused through
+  Diesel's statement cache. Every recheck still runs it in full: table
+  resolution and privileges are checked each time.
+- **Rejected:** rechecking only when the role or search path changed.
+  A function can create a temporary table that shadows a cached one while
+  both stay the same; a live test covers it.
+- **`DISCARD ALL` or `DEALLOCATE`** removes prepared statements behind
+  Diesel's cache. A check that fails is retried unprepared, and that
+  connection keeps using unprepared checks. A check that fails twice
+  refuses the read.
+- **Measured** in the demo, p50: a cached read right after a refused one
+  went from about 300 µs to 114–205 µs, still above a direct Postgres
+  read (48–78 µs). Consecutive cached reads stay at about 6 µs.

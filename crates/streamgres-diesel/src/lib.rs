@@ -35,6 +35,7 @@ pub use ::diesel;
 
 #[cfg(feature = "async")]
 mod asynchronous;
+mod reader_query;
 mod row;
 mod session;
 #[cfg(feature = "async")]
@@ -56,7 +57,6 @@ use crate::diesel::query_dsl::CompatibleType;
 use crate::diesel::query_dsl::RunQueryDsl;
 use crate::diesel::query_dsl::methods::LoadQuery;
 use crate::diesel::result::{Error, QueryResult};
-use crate::diesel::sql_types::{Array, Text};
 use streamgres::cache::{Bind, CachedRows};
 pub use streamgres::cache::{Cache, CacheConfig, Position, Reader, Refusal};
 use streamgres::model::Value;
@@ -189,11 +189,19 @@ where
             "the cache cannot check this reader now".to_owned(),
         ));
     };
-    let answer: QueryResult<ReaderAnswer> = crate::diesel::sql_query(check.sql)
-        .bind::<Array<Text>, _>(&check.names)
-        .bind::<Array<Text>, _>(&check.as_written)
-        .bind::<Array<Text>, _>(&check.qualified)
-        .get_result(conn);
+    let cacheable = !session::tracker_of(conn.instrumentation())
+        .is_some_and(|tracker| tracker.session.uncached_reader_check);
+    let mut answer: QueryResult<ReaderAnswer> =
+        reader_query::ReaderQuery(&check, cacheable).get_result(conn);
+    if answer.is_err() && cacheable {
+        // DISCARD/DEALLOCATE can remove a prepared statement behind Diesel's
+        // cache, including when called inside a function. Retry only this
+        // read-only validation, then use unnamed checks for this connection.
+        if let Some(tracker) = session::tracker_of(conn.instrumentation()) {
+            tracker.session.uncached_reader_check = true;
+        }
+        answer = reader_query::ReaderQuery(&check, false).get_result(conn);
+    }
     let Ok(answer) = answer else {
         return Err(Refusal::NotReady(
             "the reader identity or privileges could not be verified".to_owned(),

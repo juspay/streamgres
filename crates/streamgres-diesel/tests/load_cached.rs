@@ -559,6 +559,84 @@ fn load_cached_returns_what_load_returns() {
     conn.batch_execute("RESET search_path; DROP SCHEMA adapter_hidden CASCADE")
         .unwrap();
 
+    // A session guard on only search_path/current_user would miss a temporary
+    // table created inside a function: neither setting changes. Full reader
+    // checks must still resolve the actual table, even with prepared SQL.
+    #[derive(Debug, PartialEq, QueryableByName)]
+    struct Guard {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        path: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        role: String,
+    }
+    let guard = |conn: &mut PgConnection| {
+        diesel::sql_query(
+            "SELECT current_setting('search_path') AS path, current_user::text AS role",
+        )
+        .get_result::<Guard>(conn)
+        .unwrap()
+    };
+    conn.batch_execute("CREATE FUNCTION pg_temp.hidden_shadow() RETURNS void LANGUAGE plpgsql AS $$ BEGIN CREATE TEMP TABLE adapter_orders (id int8); INSERT INTO adapter_orders VALUES (987654321); END $$;").unwrap();
+    let before_guard = guard(&mut conn);
+    let public_ids: Vec<i64> = adapter_orders::table
+        .select(adapter_orders::id)
+        .order(adapter_orders::id)
+        .load_cached(&cache, &mut conn)
+        .unwrap();
+    conn.batch_execute("SELECT pg_temp.hidden_shadow()")
+        .unwrap();
+    assert_eq!(before_guard, guard(&mut conn));
+    let shadow_cached: Option<Vec<i64>> = adapter_orders::table
+        .select(adapter_orders::id)
+        .try_load_cached(&cache, &mut conn)
+        .unwrap();
+    assert!(
+        shadow_cached.is_none(),
+        "unchanged role and search_path do not imply unchanged table resolution"
+    );
+    let shadow_ids: Vec<i64> = adapter_orders::table
+        .select(adapter_orders::id)
+        .load_cached(&cache, &mut conn)
+        .unwrap();
+    assert_eq!(shadow_ids, vec![987654321]);
+    assert_ne!(shadow_ids, public_ids);
+    conn.batch_execute("DROP TABLE pg_temp.adapter_orders")
+        .unwrap();
+    let restored: Vec<i64> = adapter_orders::table
+        .select(adapter_orders::id)
+        .order(adapter_orders::id)
+        .load_cached(&cache, &mut conn)
+        .unwrap();
+    assert_eq!(restored, public_ids);
+
+    #[derive(QueryableByName)]
+    struct Prepared {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        count: i64,
+    }
+    let prepared = |conn: &mut PgConnection| {
+        diesel::sql_query("SELECT count(*)::bigint AS count FROM pg_prepared_statements WHERE statement LIKE '%pg_control_system()%' ").get_result::<Prepared>(conn).unwrap().count
+    };
+    let prepared_before = prepared(&mut conn);
+    assert!(
+        prepared_before > 0,
+        "the full reader check is prepared on this connection"
+    );
+    for _ in 0..3 {
+        conn.batch_execute("SELECT 1").unwrap();
+        let ids: Vec<i64> = adapter_orders::table
+            .select(adapter_orders::id)
+            .order(adapter_orders::id)
+            .load_cached(&cache, &mut conn)
+            .unwrap();
+        assert_eq!(ids, public_ids);
+    }
+    assert_eq!(
+        prepared(&mut conn),
+        prepared_before,
+        "rechecking reuses the prepared statement"
+    );
+
     // A Postgres enum, bound alone and as an array of its own array type.
     let open_or_pending = vec![Status::Open, Status::Pending];
     same!(
@@ -602,6 +680,51 @@ fn load_cached_returns_what_load_returns() {
         .load_cached(&cache, &mut conn)
         .expect("refused by the cache, read from Postgres");
     assert_eq!(filtered, vec![2]);
+
+    // Reader validation must use PostgreSQL's builtins even if the caller's
+    // path explicitly puts a user schema before pg_catalog.
+    conn.batch_execute(
+        "DROP SCHEMA IF EXISTS adapter_guard_attack CASCADE;
+         CREATE SCHEMA adapter_guard_attack;
+         CREATE TABLE adapter_guard_attack.adapter_orders (id int8);
+         INSERT INTO adapter_guard_attack.adapter_orders VALUES (876543210);
+         CREATE FUNCTION adapter_guard_attack.to_regclass(text)
+         RETURNS regclass LANGUAGE sql AS $$
+             SELECT 'public.adapter_orders'::pg_catalog.regclass
+         $$;
+         SET search_path=adapter_guard_attack,pg_catalog,public;",
+    )
+    .unwrap();
+    let guarded: Option<Vec<i64>> = adapter_orders::table
+        .select(adapter_orders::id)
+        .try_load_cached(&cache, &mut conn)
+        .unwrap();
+    assert!(
+        guarded.is_none(),
+        "a user-defined function must not spoof the reader check's table resolution"
+    );
+    let shadow_rows: Vec<i64> = adapter_orders::table
+        .select(adapter_orders::id)
+        .load_cached(&cache, &mut conn)
+        .unwrap();
+    assert_eq!(
+        shadow_rows,
+        vec![876543210],
+        "fallback uses the reader's table"
+    );
+    conn.batch_execute("RESET search_path; DROP SCHEMA adapter_guard_attack CASCADE")
+        .unwrap();
+
+    conn.batch_execute("DISCARD ALL").unwrap();
+    let after_discard: Option<Vec<i64>> = adapter_orders::table
+        .select(adapter_orders::id)
+        .order(adapter_orders::id)
+        .try_load_cached(&cache, &mut conn)
+        .unwrap();
+    assert!(
+        after_discard.is_some(),
+        "clearing server prepared statements must not prevent reader validation"
+    );
 
     cache.stop();
     conn.batch_execute(&format!(
