@@ -59,11 +59,9 @@ existing default; otherwise it returns an error explaining how to wrap that
 factory. Cached hits emit balanced query events around encoding/decoding. Async
 cache attempts also finish their event if the caller cancels its future.
 
-The upstream adapter pins Diesel 2.3.14 because it uses unstable backend APIs.
-The separate `streamgres-juspay-diesel` package pins Juspay 2.3.1 and shares the
-synchronous source. Upstream Diesel 2.2 lacks instrumentation downcasting and
-is not supported by this tracker design. Upgrade these pins deliberately and
-run the adapter checks.
+The adapter pins Diesel 2.3.14 because it uses unstable backend APIs.
+Diesel 2.2 lacks instrumentation downcasting and is not supported by this
+tracker design. Upgrade the pin deliberately and run the adapter checks.
 
 ## Refusals and consistency
 
@@ -200,9 +198,7 @@ API separately.
 
 ## Optional async adapter
 
-Enable the upstream adapter's `async` Cargo feature (diesel-async 0.7.4). Juspay's
-fork has no corresponding compatible async package, so this feature belongs to
-the upstream adapter only.
+Enable the adapter's `async` Cargo feature (diesel-async 0.7.4).
 
 ```rust,ignore
 use streamgres_diesel::AsyncLoadCached;
@@ -226,8 +222,7 @@ error for applications using custom SQL types.
 
 ## Validation
 
-CI runs workspace tests and Clippy with async enabled, library-only Clippy,
-and the separately locked Juspay adapter. Live tests require
+CI runs workspace tests and Clippy with async enabled, and library-only Clippy. Live tests require
 `STREAMGRES_PG_DSN` pointing at a disposable logical-replication database.
 `exactness_live` and `boundaries_live` compare edge-case queries with Postgres;
 the latter also covers restricted-reader exclusions, typed NULLs, exact JSONB
@@ -238,16 +233,8 @@ limits, hidden session changes and decoder fallback. The ignored
 `concurrent_read_scaling` test measures 1/4/8/16-reader throughput; it is a
 measurement, not a timing threshold in CI.
 
-## Adapter source and release maintenance
+## Release maintenance
 
-Both Diesel adapters contain their own `src` files so their Cargo packages are
-self-contained. `crates/streamgres-diesel/src` is the canonical implementation;
-run `python3 scripts/sync-diesel-adapters.py` after editing it. CI runs the script
-with `--check` and checks each package's contents. Do not edit the fork's copies
-independently. This avoids a second implementation while keeping published
-crates independent of sibling paths. The fork keeps its own lockfile because
-its derive dependency cannot share the upstream workspace's resolution.
-
-All path dependencies also have version requirements. Publish `streamgres`
-before either adapter, then verify each adapter against that published version.
-The Juspay package has sync support only; its shared async source is inactive.
+CI checks the adapter package's contents. All path dependencies also have
+version requirements. Publish `streamgres` before the adapter, then verify the
+adapter against that published version.

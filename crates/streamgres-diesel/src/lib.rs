@@ -257,11 +257,6 @@ fn sync_position(text: &str) -> QueryResult<Position> {
 
 /// The row of the reader check.
 mod answer {
-    #![allow(
-        clippy::redundant_field_names,
-        reason = "diesel_derives 2.2, which Juspay's fork builds with, writes `field: field`"
-    )]
-
     use crate::diesel::sql_types::Text;
 
     #[derive(crate::diesel::QueryableByName)]

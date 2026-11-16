@@ -345,12 +345,11 @@ adapter's live test found it.
     own `FromSql`, via a `Row` of the adapter's own.
   - A value that cannot be written exactly falls back to Postgres. A
     deserialization error is returned, not hidden.
-- **Diesel versions.** It builds on Diesel 2.2 and 2.3.
-  `juspay_diesel` 2.3.1 needs `diesel_derives` 2.2, and Cargo allows only
-  one 2.x version of a crate per build. As an optional dependency it
-  would have pinned every application to Diesel 2.2. So the same source
-  builds as `streamgres-juspay-diesel`, with the fork renamed to `diesel`
-  in its manifest, outside the workspace with its own lockfile.
+- **Diesel versions.** It builds on Diesel 2.3 (decision 28 pins
+  2.3.14). Juspay's fork, `juspay_diesel` 2.3.1, needs `diesel_derives`
+  2.2, and Cargo allows only one 2.x version of a crate per build, so it
+  needs a package of its own outside the workspace. That package is not
+  part of this branch.
 
 **Rejected.**
 - *A connection wrapper* (the s2s branch's `SyncedConnection`). It caches
@@ -359,7 +358,7 @@ adapter's live test found it.
 - *`.load_cached(&cache)` without a connection* (the PRD's sketch). A
   refusal would then leave the caller to fall back by hand.
 
-**Where.** `crates/streamgres-diesel`, `crates/streamgres-juspay-diesel`.
+**Where.** `crates/streamgres-diesel`.
 Live test: `crates/streamgres-diesel/tests/load_cached.rs`, covering
 every query shape and column type, before and after writes.
 
@@ -727,8 +726,8 @@ memo retains frequently repeated evaluated statements.
 The tracker is found by downcasting, replacing decision 19's fake query
 probe. It must wrap application instrumentation. `install()` refuses to
 replace an existing application default. Upstream Diesel 2.2 has no such
-downcast API; upstream is pinned to 2.3.14 and the separate Juspay package
-to 2.3.1. This deliberately replaces the earlier 2.2 compatibility claim.
+downcast API; Diesel is pinned to 2.3.14. This deliberately replaces the
+earlier 2.2 compatibility claim.
 
 Every database statement invalidates its reader check, including a SELECT
 that changes session state inside a function. Cache-only events bypass
@@ -757,12 +756,11 @@ its bounded work independently. The async write barrier waits off-executor.
 
 Built-in bind metadata is static. Custom bind metadata safely falls back to
 the normal async query instead of adding a synchronous metadata round trip.
-Juspay's fork has no compatible diesel-async crate; the async feature is
-explicitly upstream-only. Live async tests cover hits, fallback, writes,
+Live async tests cover hits, fallback, writes,
 raw transactions and spawning extension futures on a multithreaded executor.
 
-CI now enables async for workspace tests/lints and still checks the separate
-Juspay lockfile and library-only build. The full user guide and adapter README
+CI now enables async for workspace tests/lints and still checks the
+library-only build. The full user guide and adapter README
 record setup, costs, guarantees, fallback, limits and compatibility.
 
 ## 30. Validate SQL types and names at the cache boundary
