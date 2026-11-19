@@ -1,0 +1,25 @@
+[package]
+name = "streamlib-datasource-postgres"
+description = "Postgres DataSource for streamlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+streamlib-datasource = { path = "../datasource" }
+tokio = { workspace = true, features = ["net", "io-util"] }
+tokio-postgres = "0.7"
+# Low-level protocol for the snapshot connection, which tokio-postgres can't open.
+postgres-protocol = "0.6"
+bytes = "1"
+fallible-iterator = "0.2"
+# Logical replication stream and message decoding, same versions as streamgres.
+pgwire-replication = { version = "0.4", default-features = false, features = ["scram"] }
+pgoutput = "0.0.7"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+
+[dev-dependencies]
+streamlib-datasource = { path = "../datasource", features = ["testing"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

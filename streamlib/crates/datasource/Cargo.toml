@@ -1,0 +1,18 @@
+[package]
+name = "streamlib-datasource"
+description = "DataSource contract for streamlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Enables the test kit: the stand-in engine and the memory source.
+testing = []
+
+[dependencies]
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+streamlib-datasource = { path = ".", features = ["testing"] }
