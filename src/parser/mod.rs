@@ -1025,11 +1025,13 @@ fn coerce_to_type(
         (Value::Null, _) => Value::Null,
         (value @ Value::Int(_), ValueType::Int) => value,
         (value @ Value::Float(_), ValueType::Float) => value,
+        (value @ Value::Numeric(_), ValueType::Numeric) => value,
         (value @ Value::String(_), ValueType::String) => value,
         (value @ Value::Bool(_), ValueType::Bool) => value,
         (value @ Value::Int(_), ValueType::Timestamp) => value,
         (value @ Value::String(_), ValueType::Json) => value,
         (Value::Int(int), ValueType::Float) => Value::Float(int as f64),
+        (Value::Int(int), ValueType::Numeric) => Value::Numeric(int.to_string()),
         (Value::Float(float), ValueType::Int)
             if float.fract() == 0.0 && ((i64::MIN as f64)..(i64::MAX as f64)).contains(&float) =>
         {

@@ -27,7 +27,7 @@ use crate::model::{Catalog, ValueType};
 pub const KIND: &str = "SchemaVersionNotSupported";
 
 /// The type a Zero client sees for a column the catalog declares so:
-/// times travel as epoch milliseconds, lists and maps as JSON.
+/// times travel as epoch values, lists and maps as JSON.
 pub fn client_type(declared: &ValueType) -> &'static str {
     match declared {
         ValueType::String => "string",
@@ -35,7 +35,8 @@ pub fn client_type(declared: &ValueType) -> &'static str {
         | ValueType::Float
         | ValueType::Date
         | ValueType::Datetime
-        | ValueType::Timestamp => "number",
+        | ValueType::Timestamp
+        | ValueType::Numeric => "number",
         ValueType::Bool => "boolean",
         ValueType::Json | ValueType::List(_) | ValueType::Map(_, _) => "json",
     }

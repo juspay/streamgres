@@ -1,6 +1,6 @@
 //! Rows and keys as the wire carries them: JSON objects keyed by column,
 //! with a JSON column's text embedded as the JSON it holds, a time as its
-//! milliseconds, and every column the row carries, whoever receives it.
+//! epoch, and every column the row carries, whoever receives it.
 //! The row-patch entries of a poke are written straight into bytes
 //! ([`write_put`], [`write_del`]); a put once per row image, kept on the
 //! image and shared by every group's frame that carries it; the
@@ -74,7 +74,7 @@ pub fn write_del(out: &mut Vec<u8>, table: &str, key: &DataFrameKey) {
 
 /// Append one cell as JSON, in the light of its declared type: a JSON
 /// column's text is embedded as it is when it parses, a time as its
-/// milliseconds, a list item by item.
+/// epoch, a list item by item.
 pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType>) {
     match value {
         Value::Null => out.extend_from_slice(b"null"),
@@ -97,6 +97,7 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
                 out.extend_from_slice(b"null");
             }
         }
+        Value::Numeric(text) => out.extend_from_slice(text.as_bytes()),
         Value::Bool(true) => out.extend_from_slice(b"true"),
         Value::Bool(false) => out.extend_from_slice(b"false"),
         Value::Date(date) => match date.and_hms_opt(0, 0, 0) {
@@ -171,6 +172,8 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
         Value::Float(float) => {
             serde_json::Number::from_f64(*float).map_or(Json::Null, Json::Number)
         }
+        Value::Numeric(text) => serde_json::from_str(text)
+            .unwrap_or_else(|_| Json::String(text.clone())),
         Value::Bool(flag) => Json::Bool(*flag),
         Value::Date(date) => date
             .and_hms_opt(0, 0, 0)
@@ -322,6 +325,22 @@ mod tests {
         assert_eq!(value_json(&Value::Float(1.0), None), serde_json::json!(1));
         assert_eq!(value_json(&Value::Float(1.5), None), serde_json::json!(1.5));
         assert!(!whole(1e17), "beyond 2^53 a float is left as it is");
+    }
+
+    /// A numeric keeps the digits Postgres wrote: scale survives, and a
+    /// value past 2⁵³ keeps every digit.
+    #[test]
+    fn numerics_keep_their_digits_on_the_wire() {
+        let mut out = Vec::new();
+        write_value(&mut out, &Value::Numeric("1.50".into()), None);
+        assert_eq!(out, b"1.50");
+        out.clear();
+        write_value(&mut out, &Value::Numeric("9007199254740993.00".into()), None);
+        assert_eq!(out, b"9007199254740993.00");
+        assert_eq!(
+            value_json(&Value::Numeric("1.50".into()), None),
+            serde_json::json!(1.50)
+        );
     }
 
     /// JSON columns are embedded, times are numbers, and the client's

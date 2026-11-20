@@ -129,9 +129,8 @@ pub fn scalar_type(name: &str) -> Option<ValueType> {
     Some(match name {
         "smallint" | "integer" | "bigint" | "int2" | "int4" | "int8" | "serial" | "bigserial"
         | "smallserial" | "oid" => ValueType::Int,
-        "numeric" | "decimal" | "real" | "double precision" | "float4" | "float8" | "money" => {
-            ValueType::Float
-        }
+        "real" | "double precision" | "float4" | "float8" => ValueType::Float,
+        "numeric" | "decimal" | "money" => ValueType::Numeric,
         "boolean" | "bool" => ValueType::Bool,
         "json" | "jsonb" => ValueType::Json,
         "timestamp without time zone"
@@ -157,8 +156,8 @@ pub fn scalar_type(name: &str) -> Option<ValueType> {
         | "cidr"
         | "macaddr"
         | "xml"
-        | "tsvector" => ValueType::String,
-        "bytea" => return None,
+        | "tsvector"
+        | "bytea" => ValueType::String,
         _ => return None,
     })
 }
@@ -168,7 +167,7 @@ mod tests {
     use super::*;
 
     /// The mapping follows the protocol's: times are numbers, json and arrays are
-    /// json, enums are strings, bytea is left out.
+    /// json, enums are strings, `numeric` keeps its digits, `bytea` is text.
     #[test]
     fn types_map_like_the_protocol() {
         assert_eq!(
@@ -186,8 +185,10 @@ mod tests {
             Some(ValueType::String)
         );
         assert_eq!(value_type("bigint", "int8"), Some(ValueType::Int));
-        assert_eq!(value_type("numeric", "numeric"), Some(ValueType::Float));
-        assert_eq!(value_type("bytea", "bytea"), None);
+        assert_eq!(value_type("numeric", "numeric"), Some(ValueType::Numeric));
+        assert_eq!(value_type("decimal", "numeric"), Some(ValueType::Numeric));
+        assert_eq!(value_type("money", "money"), Some(ValueType::Numeric));
+        assert_eq!(value_type("bytea", "bytea"), Some(ValueType::String));
         assert_eq!(table_name("public", "tickets"), "tickets");
         assert_eq!(table_name("xyne_0", "clients"), "xyne_0.clients");
     }

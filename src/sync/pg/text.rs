@@ -1,5 +1,5 @@
 //! The text forms Postgres uses for the values the engine carries in a
-//! form of its own: the epoch-millisecond reading of a time, a JSON array
+//! form of its own: the epoch-microsecond reading of a time, a JSON array
 //! read from `to_json(column)`, and the `{a,b}` array literal the change
 //! feed delivers, each turned into the [`Value`] the column's declared
 //! type calls for; and the **standard form** of a JSON value, the one text
@@ -193,23 +193,80 @@ pub fn json_as_jsonb(text: &str) -> String {
     }
 }
 
-/// Milliseconds since the Unix epoch of a Postgres `timestamp`,
-/// `timestamptz` or `date` in its text form (`2026-09-15 10:00:00.123`,
+/// The one decoder for a cell Postgres sent as text, shared by the snapshot
+/// read and the change feed so the two can never disagree: the text is
+/// read as the form of its declared type and nothing else.
+pub fn decode(text: &str, declared: &ValueType) -> Result<Value, String> {
+    let unreadable = || format!("`{text}` is not a {declared:?}");
+    Ok(match declared {
+        ValueType::Int => Value::Int(text.parse().map_err(|_| unreadable())?),
+        ValueType::Timestamp => Value::Int(
+            epoch_micros(text)
+                .or_else(|| text.trim().parse::<i64>().ok())
+                .ok_or_else(unreadable)?,
+        ),
+        ValueType::Float => Value::Float(text.parse().map_err(|_| unreadable())?),
+        ValueType::Numeric => Value::Numeric(numeric_digits(text).ok_or_else(unreadable)?),
+        ValueType::Json => Value::String(standard_json(text).into_owned()),
+        ValueType::String | ValueType::Map(_, _) => Value::String(text.to_owned()),
+        ValueType::List(inner) => {
+            if text.trim_start().starts_with('{') {
+                array_literal(text, inner)
+            } else {
+                json_list(text, inner)
+            }
+        }
+        ValueType::Bool => Value::Bool(match text {
+            "true" | "t" => true,
+            "false" | "f" => false,
+            _ => return Err(unreadable()),
+        }),
+        ValueType::Date => Value::Date(
+            chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| unreadable())?,
+        ),
+        ValueType::Datetime => Value::Datetime(
+            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S"))
+                .map_err(|_| unreadable())?,
+        ),
+    })
+}
+
+/// A `numeric` or `money` cell as its exact digits: the text Postgres wrote
+/// for a `numeric` (`1.50` stays `1.50`, a long value keeps every digit),
+/// or a `money` adornment stripped from one (`$1,234.56` is `1234.56`).
+/// `None` when the text is neither.
+pub fn numeric_digits(text: &str) -> Option<String> {
+    let text = text.trim();
+    if crate::model::value::is_numeric_text(text) {
+        return Some(text.to_owned());
+    }
+    let digits: String = text
+        .chars()
+        .filter(|character| {
+            character.is_ascii_digit() || matches!(character, '.' | '-' | '+')
+        })
+        .collect();
+    crate::model::value::is_numeric_text(&digits).then_some(digits)
+}
+
+/// Microseconds since the Unix epoch of a Postgres `timestamp`,
+/// `timestamptz` or `date` in its text form (`2026-09-15 10:00:00.123456`,
 /// with an optional `+05:30` style offset, or `2026-09-15`); a timestamp
-/// without a zone is read as UTC, the protocol's convention. `None` when the text
-/// is not a time (`infinity` included).
-pub fn epoch_millis(text: &str) -> Option<i64> {
+/// without a zone is read as UTC, the protocol's convention. `None` when
+/// the text is not a time (`infinity` included).
+pub fn epoch_micros(text: &str) -> Option<i64> {
     let text = text.trim();
     if text.len() == 10 {
         let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
-        return Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis());
+        return Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros());
     }
     let (naive, offset_seconds) = split_offset(text);
     let parsed = chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%d %H:%M:%S"))
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%dT%H:%M:%S%.f"))
         .ok()?;
-    Some(parsed.and_utc().timestamp_millis() - offset_seconds * 1000)
+    Some(parsed.and_utc().timestamp_micros() - offset_seconds * 1_000_000)
 }
 
 /// Split a trailing `+HH`, `+HH:MM` or `+HHMM` zone offset off a timestamp
@@ -254,6 +311,7 @@ fn json_scalar(item: &serde_json::Value, inner: &ValueType) -> Value {
         serde_json::Value::Bool(flag) => Value::Bool(*flag),
         serde_json::Value::Number(number) => match (number.as_i64(), inner) {
             (Some(int), ValueType::Float) => Value::Float(int as f64),
+            (Some(int), ValueType::Numeric) => Value::Numeric(int.to_string()),
             (Some(int), _) => Value::Int(int),
             (None, _) => Value::Float(number.as_f64().unwrap_or(f64::NAN)),
         },
@@ -339,6 +397,9 @@ fn scalar_text(text: &str, inner: &ValueType) -> Value {
             .parse()
             .map(Value::Float)
             .unwrap_or_else(|_| Value::String(text.to_owned())),
+        ValueType::Numeric => numeric_digits(text)
+            .map(Value::Numeric)
+            .unwrap_or_else(|| Value::String(text.to_owned())),
         ValueType::Bool => match text {
             "t" | "true" => Value::Bool(true),
             "f" | "false" => Value::Bool(false),
@@ -355,12 +416,47 @@ mod tests {
     /// Timestamps without a zone read as UTC, with a zone are shifted, and
     /// dates land on UTC midnight.
     #[test]
-    fn times_read_as_epoch_milliseconds() {
-        assert_eq!(epoch_millis("1970-01-01 00:00:01.5"), Some(1_500));
-        assert_eq!(epoch_millis("1970-01-01 01:00:00+01"), Some(0));
-        assert_eq!(epoch_millis("1970-01-01 05:30:00.25+05:30"), Some(250));
-        assert_eq!(epoch_millis("1970-01-02"), Some(86_400_000));
-        assert_eq!(epoch_millis("infinity"), None);
+    fn times_read_as_epoch_microseconds() {
+        assert_eq!(epoch_micros("1970-01-01 00:00:01.5"), Some(1_500_000));
+        assert_eq!(epoch_micros("1970-01-01 00:00:00.000001"), Some(1));
+        assert_eq!(epoch_micros("1970-01-01 01:00:00+01"), Some(0));
+        assert_eq!(epoch_micros("1970-01-01 05:30:00.25+05:30"), Some(250_000));
+        assert_eq!(epoch_micros("1970-01-02"), Some(86_400_000_000));
+        assert_eq!(epoch_micros("infinity"), None);
+    }
+
+    /// The one decoder keeps a `numeric`'s digits, strips `money`
+    /// adornments, and carries `bytea` text through.
+    #[test]
+    fn numeric_money_and_bytea_decode_exactly() {
+        assert_eq!(
+            decode("1.50", &ValueType::Numeric).unwrap(),
+            Value::Numeric("1.50".into())
+        );
+        assert_eq!(
+            decode("9007199254740993.00", &ValueType::Numeric).unwrap(),
+            Value::Numeric("9007199254740993.00".into())
+        );
+        assert_eq!(
+            decode("$1,234.56", &ValueType::Numeric).unwrap(),
+            Value::Numeric("1234.56".into())
+        );
+        assert_eq!(
+            decode("\\x00ff", &ValueType::String).unwrap(),
+            Value::String("\\x00ff".into())
+        );
+    }
+
+    /// A microsecond is the same value from a timestamp's text, whatever
+    /// the ingest path that delivered it.
+    #[test]
+    fn timestamps_keep_microseconds_on_both_paths() {
+        let text = "2026-09-15 10:00:00.123456";
+        assert_eq!(
+            decode(text, &ValueType::Timestamp).unwrap(),
+            Value::Int(epoch_micros(text).unwrap())
+        );
+        assert_eq!(epoch_micros(text).unwrap() % 1_000, 456);
     }
 
     /// Array literals split on unquoted commas, unquote, and read NULL.

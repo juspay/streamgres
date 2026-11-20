@@ -1179,31 +1179,10 @@ fn image(
     Ok(DataFrameRow::from(RowData::partial(data)))
 }
 
-/// Convert one text value by its declared type; a `jsonb` cell is kept in
-/// the standard form, as a read keeps it.
+/// Convert one text value by its declared type — the one decoder shared
+/// with the snapshot read ([`super::text::decode`]).
 fn convert(raw: &str, declared: &ValueType) -> Result<Value, StorageError> {
-    let unreadable = || StorageError(format!("`{raw}` is not a {declared:?}"));
-    Ok(match declared {
-        ValueType::Int => Value::Int(raw.parse().map_err(|_| unreadable())?),
-        ValueType::Float => Value::Float(raw.parse().map_err(|_| unreadable())?),
-        ValueType::Json => Value::String(super::text::standard_json(raw).into_owned()),
-        ValueType::String | ValueType::Map(_, _) => Value::String(raw.to_owned()),
-        ValueType::List(inner) => super::text::array_literal(raw, inner),
-        ValueType::Timestamp => Value::Int(super::text::epoch_millis(raw).ok_or_else(unreadable)?),
-        ValueType::Bool => Value::Bool(match raw {
-            "true" | "t" => true,
-            "false" | "f" => false,
-            _ => return Err(unreadable()),
-        }),
-        ValueType::Date => Value::Date(
-            chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| unreadable())?,
-        ),
-        ValueType::Datetime => Value::Datetime(
-            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S"))
-                .map_err(|_| unreadable())?,
-        ),
-    })
+    super::text::decode(raw, declared).map_err(StorageError)
 }
 
 #[cfg(test)]

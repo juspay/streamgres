@@ -439,6 +439,7 @@ fn class_of(value: &Value) -> Option<u8> {
     match value {
         Value::Int(_) => Some(1),
         Value::Float(f) if !f.is_nan() => Some(1),
+        Value::Numeric(_) => Some(1),
         Value::String(_) => Some(2),
         Value::Bool(_) => Some(3),
         Value::Date(_) => Some(4),

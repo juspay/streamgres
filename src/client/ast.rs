@@ -606,6 +606,8 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
         (Json::Number(number), ValueType::Float) => {
             Value::Float(number.as_f64().unwrap_or(f64::NAN))
         }
+        (Json::Number(number), ValueType::Numeric) => Value::Numeric(number.to_string()),
+        (Json::String(text), ValueType::Numeric) => Value::Numeric(text.clone()),
         (Json::Number(number), ValueType::String) => Value::String(number.to_string()),
         (Json::Number(number), _) => match number.as_i64() {
             Some(int) => Value::Int(int),

@@ -1110,35 +1110,10 @@ fn decode_row(
 }
 
 /// One column of a result row in its text form, decoded by the cast its
-/// declared type was read with ([`sql::select_expr`]): a time column
-/// arrives as its epoch milliseconds, a JSON column as the text of its
-/// `jsonb` (kept in the standard form, [`text::standard_json`]), a list
-/// or map column as JSON text, the rest in Postgres's text form for the
-/// cast type.
+/// declared type was read with ([`sql::select_expr`]) — the one decoder
+/// shared with the change feed ([`text::decode`]).
 fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> {
-    let unreadable = || StorageError(format!("`{text}` is not a {declared:?}"));
-    Ok(match declared {
-        ValueType::Int | ValueType::Timestamp => {
-            Value::Int(text.parse().map_err(|_| unreadable())?)
-        }
-        ValueType::Float => Value::Float(text.parse().map_err(|_| unreadable())?),
-        ValueType::Json => Value::String(text::standard_json(text).into_owned()),
-        ValueType::String | ValueType::Map(_, _) => Value::String(text.to_owned()),
-        ValueType::List(inner) => text::json_list(text, inner),
-        ValueType::Bool => Value::Bool(match text {
-            "t" | "true" => true,
-            "f" | "false" => false,
-            _ => return Err(unreadable()),
-        }),
-        ValueType::Date => Value::Date(
-            chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| unreadable())?,
-        ),
-        ValueType::Datetime => Value::Datetime(
-            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S"))
-                .map_err(|_| unreadable())?,
-        ),
-    })
+    text::decode(text, declared).map_err(StorageError)
 }
 
 #[cfg(test)]

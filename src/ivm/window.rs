@@ -1176,8 +1176,8 @@ pub fn order_cmp(a: &Value, b: &Value) -> Ordering {
     }
     let a_nan = matches!(a, Value::Float(f) if f.is_nan());
     let b_nan = matches!(b, Value::Float(f) if f.is_nan());
-    let a_numeric = matches!(a, Value::Int(_) | Value::Float(_));
-    let b_numeric = matches!(b, Value::Int(_) | Value::Float(_));
+    let a_numeric = matches!(a, Value::Int(_) | Value::Float(_) | Value::Numeric(_));
+    let b_numeric = matches!(b, Value::Int(_) | Value::Float(_) | Value::Numeric(_));
     if a_nan && b_numeric && !b_nan {
         return Ordering::Greater;
     }
@@ -1192,7 +1192,7 @@ pub fn order_cmp(a: &Value, b: &Value) -> Ordering {
 fn rank(value: &Value) -> u8 {
     match value {
         Value::Bool(_) => 0,
-        Value::Int(_) | Value::Float(_) => 1,
+        Value::Int(_) | Value::Float(_) | Value::Numeric(_) => 1,
         Value::String(_) => 2,
         Value::Date(_) => 3,
         Value::Datetime(_) => 4,

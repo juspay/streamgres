@@ -10,6 +10,8 @@
 //!
 //! - `Float`: `NaN == NaN` and `0.0 == -0.0`, hashed via canonicalized bits,
 //!   so equality and hashing stay consistent.
+//! - `Numeric`: equal and hashed by the digits Postgres wrote (`1.50` is
+//!   not `1.5`), while comparisons order by numeric value.
 //! - `Map`: equality is order-independent (as for any `HashMap`), so the
 //!   hash combines per-entry hashes with an order-independent fold.
 
@@ -29,6 +31,11 @@ pub enum Value {
     String(String),
     Int(i64),
     Float(f64),
+    /// An exact Postgres `numeric`, kept as the digits Postgres wrote so no
+    /// digit or trailing zero is lost (`1.50` stays `1.50`, a value past 2⁵³
+    /// keeps every digit). Equality and hashing are by those digits;
+    /// comparisons order by numeric value.
+    Numeric(String),
     Bool(bool),
     Date(NaiveDate),
     Datetime(NaiveDateTime),
@@ -43,12 +50,15 @@ pub enum ValueType {
     String,
     Int,
     Float,
+    /// An exact Postgres `numeric` / `decimal`; the cell is a
+    /// [`Value::Numeric`].
+    Numeric,
     Bool,
     Date,
     Datetime,
     List(Box<ValueType>),
     Map(Box<ValueType>, Box<ValueType>),
-    /// A point in time carried as milliseconds since the Unix epoch, the
+    /// A point in time carried as microseconds since the Unix epoch, the
     /// form protocol clients see for `timestamp`, `timestamptz` and `date`
     /// columns; the cell is a [`Value::Int`].
     Timestamp,
@@ -67,11 +77,12 @@ impl Value {
     /// Ordering comparison backing the `GT` / `GTE` / `LT` / `LTE` operators.
     ///
     /// Values compare only within the same variant, except `Int` / `Float`
-    /// which coerce to `f64` (lossy above 2⁵³ — mixed-type comparisons of
-    /// such magnitudes may tie spuriously; same-variant comparisons are
-    /// always exact). Everything else — including anything involving
-    /// `Null` — returns `None`, which predicate evaluation treats as
-    /// "does not match" (SQL three-valued logic collapsed to `false`).
+    /// / `Numeric` which coerce (a `Numeric` is exact against an `Int`, and
+    /// lossy to `f64` against a `Float` above 2⁵³ — mixed-type comparisons
+    /// of such magnitudes may tie spuriously; same-variant `Numeric`
+    /// comparisons are always exact). Everything else — including anything
+    /// involving `Null` — returns `None`, which predicate evaluation treats
+    /// as "does not match" (SQL three-valued logic collapsed to `false`).
     pub fn compare(&self, other: &Value) -> Option<Ordering> {
         use Value::*;
         match (self, other) {
@@ -79,6 +90,11 @@ impl Value {
             (Float(a), Float(b)) => a.partial_cmp(b),
             (Int(a), Float(b)) => (*a as f64).partial_cmp(b),
             (Float(a), Int(b)) => a.partial_cmp(&(*b as f64)),
+            (Numeric(a), Numeric(b)) => Some(numeric_cmp(a, b)),
+            (Numeric(a), Int(b)) => Some(numeric_cmp(a, &b.to_string())),
+            (Int(a), Numeric(b)) => Some(numeric_cmp(&a.to_string(), b)),
+            (Numeric(a), Float(b)) => a.parse::<f64>().ok()?.partial_cmp(b),
+            (Float(a), Numeric(b)) => a.partial_cmp(&b.parse::<f64>().ok()?),
             (String(a), String(b)) => Some(a.cmp(b)),
             (Bool(a), Bool(b)) => Some(a.cmp(b)),
             (Date(a), Date(b)) => Some(a.cmp(b)),
@@ -88,13 +104,14 @@ impl Value {
     }
 
     /// Equality backing the `EQ` / `NEQ` / `IN` / `NOT_IN` operators:
-    /// strict equality plus `Int` / `Float` numeric coercion, so
-    /// `Int(5)` equals `Float(5.0)`.
+    /// strict equality plus `Int` / `Float` / `Numeric` numeric coercion,
+    /// so `Int(5)`, `Float(5.0)` and `Numeric("5.00")` are one value.
     pub fn loose_eq(&self, other: &Value) -> bool {
         match (self, other) {
-            (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
-                self.compare(other) == Some(Ordering::Equal)
-            }
+            (
+                Value::Int(_) | Value::Float(_) | Value::Numeric(_),
+                Value::Int(_) | Value::Float(_) | Value::Numeric(_),
+            ) => self.compare(other) == Some(Ordering::Equal),
             _ => self == other,
         }
     }
@@ -117,12 +134,13 @@ impl Value {
                 String(_) => 1,
                 Int(_) => 2,
                 Float(_) => 3,
-                Bool(_) => 4,
-                Date(_) => 5,
-                Datetime(_) => 6,
-                List(_) => 7,
-                Map(_) => 8,
-                Set(_) => 9,
+                Numeric(_) => 4,
+                Bool(_) => 5,
+                Date(_) => 6,
+                Datetime(_) => 7,
+                List(_) => 8,
+                Map(_) => 9,
+                Set(_) => 10,
             }
         }
         fn canonical_f64(f: f64) -> f64 {
@@ -139,6 +157,7 @@ impl Value {
             (String(a), String(b)) => a.cmp(b),
             (Int(a), Int(b)) => a.cmp(b),
             (Float(a), Float(b)) => canonical_f64(*a).total_cmp(&canonical_f64(*b)),
+            (Numeric(a), Numeric(b)) => a.cmp(b),
             (Bool(a), Bool(b)) => a.cmp(b),
             (Date(a), Date(b)) => a.cmp(b),
             (Datetime(a), Datetime(b)) => a.cmp(b),
@@ -170,6 +189,63 @@ impl Value {
 /// Floats up to this magnitude are exact integers, so an integral float
 /// within it equates to the integer under [`Value::equality_key`].
 const EXACT_INTEGER_LIMIT: f64 = 9_007_199_254_740_992.0;
+
+/// Compare two exact decimal digit strings by numeric value
+/// (`"1.50" == "1.5"`, `"2" > "1.9"`); the strings are plain digits with an
+/// optional leading `-` and optional `.` fraction, as Postgres writes a
+/// `numeric`.
+pub(crate) fn numeric_cmp(a: &str, b: &str) -> Ordering {
+    let (a_sign, a_int, a_frac) = split_numeric(a);
+    let (b_sign, b_int, b_frac) = split_numeric(b);
+    a_sign
+        .cmp(&b_sign)
+        .then_with(|| a_int.len().cmp(&b_int.len()))
+        .then_with(|| a_int.cmp(b_int))
+        .then_with(|| {
+            let len = a_frac.len().max(b_frac.len());
+            for index in 0..len {
+                let a_digit = a_frac.as_bytes().get(index).map_or(b'0', |byte| *byte);
+                let b_digit = b_frac.as_bytes().get(index).map_or(b'0', |byte| *byte);
+                match a_digit.cmp(&b_digit) {
+                    Ordering::Equal => {}
+                    unequal => return unequal,
+                }
+            }
+            Ordering::Equal
+        })
+}
+
+/// A numeric text as (sign, integer digits, fraction digits), with the sign
+/// `-1` for negative and `1` otherwise, leading zeros of the integer part
+/// dropped and every zero (`-0`, `0.0`) collapsed to the same `(1, "0", …)`
+/// form so equal values share a key.
+fn split_numeric(text: &str) -> (i8, &str, &str) {
+    let (sign, rest) = match text.strip_prefix('-') {
+        Some(rest) => (-1i8, rest),
+        None => (1i8, text.strip_prefix('+').unwrap_or(text)),
+    };
+    let (int, frac) = match rest.split_once('.') {
+        Some((int, frac)) => (int, frac),
+        None => (rest, ""),
+    };
+    let int = int.trim_start_matches('0');
+    let int = if int.is_empty() { "0" } else { int };
+    let zero = int == "0" && frac.bytes().all(|byte| byte == b'0');
+    (if zero { 1 } else { sign }, int, frac)
+}
+
+/// Whether `text` is a numeric Postgres can have written: an optional sign,
+/// digits with an optional fraction, and nothing else.
+pub(crate) fn is_numeric_text(text: &str) -> bool {
+    let rest = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let (int, frac) = match rest.split_once('.') {
+        Some((int, frac)) => (int, frac),
+        None => (rest, ""),
+    };
+    !int.is_empty()
+        && int.bytes().all(|byte| byte.is_ascii_digit())
+        && (frac.is_empty() || frac.bytes().all(|byte| byte.is_ascii_digit()))
+}
 
 /// A shared, mutable set of values: the operand of a set-valued `IN`, the
 /// membership list of a join edge, held by the edge and referenced by the
@@ -275,13 +351,21 @@ impl Value {
     }
 
     /// [`Value::equality_key`] without a copy: the value itself borrowed
-    /// when it is its own key, an owned integer for an integral float.
+    /// when it is its own key, an owned integer for an integral float or
+    /// numeric within exact range (the coercion of [`Value::loose_eq`]).
     pub fn equality_key_ref(&self) -> Option<std::borrow::Cow<'_, Value>> {
         match self {
             Value::Null => None,
             Value::Float(f) if f.fract() == 0.0 && f.abs() <= EXACT_INTEGER_LIMIT => {
                 Some(std::borrow::Cow::Owned(Value::Int(*f as i64)))
             }
+            Value::Numeric(text) => match text.parse::<f64>() {
+                Ok(f) if f.fract() == 0.0 && f.abs() <= EXACT_INTEGER_LIMIT => {
+                    Some(std::borrow::Cow::Owned(Value::Int(f as i64)))
+                }
+                Ok(f) if f.is_finite() => Some(std::borrow::Cow::Owned(Value::Float(f))),
+                _ => Some(std::borrow::Cow::Borrowed(self)),
+            },
             other => Some(std::borrow::Cow::Borrowed(other)),
         }
     }
@@ -299,6 +383,7 @@ impl PartialEq for Value {
             (String(a), String(b)) => a == b,
             (Int(a), Int(b)) => a == b,
             (Float(a), Float(b)) => a == b || (a.is_nan() && b.is_nan()),
+            (Numeric(a), Numeric(b)) => a == b,
             (Bool(a), Bool(b)) => a == b,
             (Date(a), Date(b)) => a == b,
             (Datetime(a), Datetime(b)) => a == b,
@@ -324,6 +409,7 @@ impl Hash for Value {
             String(s) => s.hash(state),
             Int(i) => i.hash(state),
             Float(f) => canonical_f64_bits(*f).hash(state),
+            Numeric(text) => text.hash(state),
             Bool(b) => b.hash(state),
             Date(d) => d.hash(state),
             Datetime(dt) => dt.hash(state),
@@ -444,6 +530,25 @@ mod tests {
     fn int_float_coercion_is_loose_only() {
         assert!(Value::Int(5).loose_eq(&Value::Float(5.0)));
         assert_ne!(Value::Int(5), Value::Float(5.0));
+    }
+
+    /// A `numeric` keeps its scale as an identity (`1.50` is not `1.5`)
+    /// while still comparing equal by value, and a past-2⁵³ digit string
+    /// survives intact.
+    #[test]
+    fn numerics_keep_scale_and_order_by_value() {
+        let padded = Value::Numeric("1.50".into());
+        let plain = Value::Numeric("1.5".into());
+        assert_ne!(padded, plain);
+        assert_ne!(hash_of(&padded), hash_of(&plain));
+        assert_eq!(padded.compare(&plain), Some(Ordering::Equal));
+        assert!(padded.loose_eq(&plain));
+        let huge = Value::Numeric("9007199254740993.00".into());
+        assert_eq!(
+            huge,
+            Value::Numeric("9007199254740993.00".into()),
+            "every digit past 2⁵³ is kept"
+        );
     }
 
     /// A value, and so a row, a key, a query and a write, can cross a
