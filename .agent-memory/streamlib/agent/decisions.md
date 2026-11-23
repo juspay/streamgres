@@ -2,7 +2,7 @@
 Human summary: ../human/decisions.md — update it in the same edit.
 
 ## Goal
-In-process runtime that keeps Postgres query results current (IVM over logical replication). Caching is the product: dev reads a query → served from a live cache. Advanced: own a cache with a handle, optionally with a handler receiving net changes. State convergence, not CDC.
+In-process runtime that keeps Postgres query results current (IVM over logical replication). Caching is the product: dev reads a query → served from a live cache. Advanced: pin a cache with `watch`, or get net changes with `on_change`. State convergence, not CDC.
 
 ## Runtime
 - One `Runtime` = everything for one database: 1 replication slot, feed thread, engine thread, reads runtime, watch-layer thread (caches), handler runtime. Starts and shuts down as a unit.
@@ -39,18 +39,17 @@ rt.read(q).idle(d).await?                        -> Arc<[T]>         // custom i
 rt.read(q).idle(ZERO).await?                     -> Arc<[T]>         // one-shot, never creates a cache
 rt.read(q).cached().await?                       -> Arc<[T]>         // cache, else Err(NotCached)
 rt.watch(q).await?                               -> Watch<T>         // pinned cache, RAII
-rt.watch(q).on_event(h).await?                   -> Subscription<T>  // handler, library-owned
+rt.on_change(q, h).await?                        -> Subscription<T>  // handler, library-owned
 rt.shutdown(grace).await
 w.view()?            -> Arc<[T]>
-w.on_event(h)        -> Subscription<T>   // consumes w
 w.unwatch().await    // or drop(w)
 sub.view()?          -> Arc<[T]>
 sub.stop().await
 handler returns () or Flow::{Continue, Stop}
 ```
 - `T` inferred from `q.select(T::as_select())`; `T: Selectable<Pg>` → struct/table mismatch is a compile error. `T: Send + Sync + 'static`.
-- `watch()` returns after hydration; with a handler, after its `Snapshot` call has run.
-- All async methods are cancel-safe: dropping a `watch`/`read` future mid-hydration cleans up its registration.
+- `watch()` returns after hydration; `on_change()` returns after the handler's `Snapshot` call has run.
+- All async methods are cancel-safe: dropping a `watch`/`on_change`/`read` future mid-hydration cleans up its registration.
 
 ## Shared cache per query
 - One cache per query, shared by reads, `Watch`es and `Subscription`s. Any of them reuses an existing cache (no rehydration).
@@ -88,20 +87,28 @@ handler returns () or Flow::{Continue, Stop}
 - Nothing evictable → `read` still returns the Postgres result, just doesn't cache; `watch` → `Err(CacheFull)`.
 
 ## Watch<T> vs Subscription<T> (ownership)
-- `watch` is the advanced path. Use it to: pre-warm at startup, pin (never evict), hot path (`view()` skips the query parse), events.
+- `watch` is the advanced path. Use it to: pre-warm at startup, pin (never evict), hot path (`view()` skips the query parse).
 - A `Watch` pins: no idle timer while it is held. After drop, the cache falls back to its idle timer (if any read set one).
 
 | | `Watch<T>` | `Subscription<T>` |
 |---|---|---|
-| Created by | `rt.watch(q)` | `rt.watch(q).on_event(h)` / `w.on_event(h)` |
+| Created by | `rt.watch(q)` | `rt.on_change(q, h)` |
 | Owned by | dev code | library |
 | Drop | unwatches (RAII) | nothing; handler keeps running |
 | Ends via | drop / `unwatch().await` | `Flow::Stop`, `sub.stop().await`, shutdown, library stop |
 - Rationale: drop behaviour is in the type. Watch-without-handler can't leak (RAII). A handler is almost always meant to run until a deliberate stop, so no `.detach()` ceremony.
 - Both: `#[must_use]` on `Watch`, not `Clone`, `Send + Sync`. Unwatch/stop consume `self` → use-after-unwatch and double unwatch are compile errors.
 - One handler per subscription. To change it: stop, subscribe again. (No replace-in-place, no `off()`.)
-- Caveat: `rt.watch(q).on_event(h)` per request without `Flow::Stop` adds a handler each time (shared cache, but each fires side effects). Subscribe once (startup / business event).
+- Caveat: `rt.on_change(q, h)` per request without `Flow::Stop` adds a handler each time (shared cache, but each fires side effects). Subscribe once (startup / business event).
 - `rt.watch(q).await?.view()?` drops the temporary `Watch` at once. Not harmful now: use `rt.read(q)` for that. Bind the watch only if you need to pin.
+
+## on_change (decided 2026-11-20)
+- One call for handlers: `rt.on_change(q, h)`. Reuses the query's cache if one exists, else creates it. No separate watch step.
+- Same semantics as before: cache is shared per query, so this is ergonomics only.
+- Removed: `rt.watch(q).on_event(h)` and `w.on_event(h)`. One concept per call: read = rows, watch = pin, on_change = handler.
+- Holding a `Watch` and wanting events → call `rt.on_change(q, h)`; it hits the same cache.
+- First call gets `Snapshot` (current rows), then `Changes`. Name kept as `on_change` because it says what devs care about.
+- Returns a builder you `.await`, so options can be added without breaking callers (e.g. `.max_lag(d)`).
 
 ## Stop / unwatch semantics
 - `unwatch().await` / `stop().await` return only when no handler call is running and none will run → safe to tear down handler resources. Drop of `Watch` = fire-and-forget.

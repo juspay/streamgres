@@ -14,8 +14,7 @@ let r = rt.read(q).cached().await?;               // cache only, else Err
 // Advanced: own the cache
 let w = rt.watch(q).await?;                       // pinned cache (Watch)
 let v = w.view()?;                                // current view, no query parse
-let sub = rt.watch(q).on_event(h).await?;         // with handler (Subscription)
-let sub = w.on_event(h);                          // attach later; consumes w
+let sub = rt.on_change(q, h).await?;              // handler (Subscription); reuses or creates the cache
 w.unwatch().await;                                // or drop(w)
 sub.stop().await;                                 // or return Flow::Stop
 
@@ -36,12 +35,18 @@ rt.shutdown(grace).await;
 - Many idle values on one cache → longest wins
 
 ## Watch
-- Use it to: pre-warm, never evict, read hot paths, get events
+- Use it to: pre-warm, never evict, read hot paths
 - Watch (no handler): yours; drop = unwatch
-- Subscription (handler): library-owned; runs until Flow::Stop, stop(), or shutdown
+- Subscription (handler): from `rt.on_change(q, h)`; library-owned; runs until Flow::Stop, stop(), or shutdown
 - Unwatch/stop consume the handle → use-after-unwatch won't compile
 - unwatch()/stop() return only after the handler has finished
 - Subscribe once (startup/event), not per request
+
+## on_change
+- One call: `rt.on_change(q, h)`; no watch step needed
+- Reuses the query's cache if there is one, else creates it
+- First call gets the current rows (Snapshot), then changes
+- Returns a builder, so options like `.max_lag(d)` can come later
 
 ## Memory cap
 - Runtime-wide cap in config
@@ -81,13 +86,14 @@ rt.shutdown(grace).await;
 ## Why this way?
 1. **What is a runtime?** Everything streamlib runs for one database: 1 replication slot, feed thread, engine, reads pool, watch layer (caches), handler runtime. Starts and shuts down together. One per database per process.
 2. **Why `rt.read(q)` caches by default?** Caching is our moat. Devs just read; the library decides what stays cached.
-3. **Why keep watch?** Some devs need to own the lifetime: pre-warm, pin, hot path, events.
+3. **Why keep watch?** Some devs need to own the lifetime: pre-warm, pin, hot path.
 4. **Why idle time, not a fixed TTL?** A busy query should never expire. Only unused caches go.
 5. **Why `rt.watch(q)` and not a Diesel trait?** Methods on `rt` stay ORM-agnostic. A Diesel trait would be 2 lines of sugar.
 6. **Why two handle types?** Drop behaviour is visible in the type. A Watch cleans up on drop. A handler runs until you stop it.
 7. **Why no idle time on watch?** The handle already sets the lifetime. A timer could evict the cache while you hold it, and view() would fail. Want expiry? Use read.
 8. **Why doesn't read return a handle?** read means nothing to manage. A handle would bring back drop questions, and on a miss the cache isn't ready yet. Need a handle? Call watch(q); it reuses the same cache.
-9. **Compile-time safety:** no use after unwatch, no double unwatch, no struct/table mismatch, no non-Send handler.
+9. **Why `on_change` and not `watch(q).on_event(h)`?** The cache is shared per query anyway, so the watch step added nothing. One concept per call: read = rows, watch = pin, on_change = handler.
+10. **Compile-time safety:** no use after unwatch, no double unwatch, no struct/table mismatch, no non-Send handler.
 
 ---
 Above: API. Below: making streamlib extensible.
@@ -163,13 +169,6 @@ Above: API. Below: making streamlib extensible.
 ## Timing
 - Traits behind an `unstable` feature flag at first
 - Stabilise only after a second real source works
-
-
-## half baked thoughts
-1. Publication creation, slot cleanups, snapshot minting, database read request, change feed (replication slot), now how do we define all of these?
- Ans : All of these steps will go in the lifecycle of the dataSource, and the minting will be the internal code of postgres datasource for giving the snapshots.
-
-2. 
 
 ## Partial rows (Postgres TOAST)
 - Postgres skips big unchanged values in updates

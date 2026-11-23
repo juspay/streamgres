@@ -4,6 +4,7 @@ mod codec;
 mod feed;
 mod repl;
 mod snapshots;
+mod spawn;
 mod sql;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -22,6 +23,7 @@ use tokio_postgres::{Client, Config, NoTls};
 pub use codec::{Lsn, PgCodec, PgType, TextCodec};
 use repl::ReplConn;
 use snapshots::{Aliases, Pool};
+pub use spawn::Spawner;
 
 /// Oldest Postgres this source supports (publication column lists need 15+).
 const MIN_SERVER_VERSION: i32 = 160_000;
@@ -63,6 +65,7 @@ pub struct PgSource {
     cfg: PgConfig,
     pg: Config,
     codec: Arc<dyn PgCodec>,
+    spawner: Spawner,
     catalog: RwLock<Arc<Catalog>>,
     aliases: Arc<Mutex<Aliases>>,
     pool: Pool,
@@ -102,10 +105,16 @@ impl PgSource {
             return Err(SourceError::Refused("TLS is not supported yet".into()));
         }
         Ok(PgSource {
-            pool: Pool::new(pg.clone(), cfg.read_connections, cfg.read_timeout),
+            pool: Pool::new(
+                pg.clone(),
+                cfg.read_connections,
+                cfg.read_timeout,
+                Spawner::default(),
+            ),
             cfg,
             pg,
             codec,
+            spawner: Spawner::default(),
             catalog: RwLock::default(),
             aliases: Arc::default(),
             acked: Arc::default(),
@@ -116,13 +125,20 @@ impl PgSource {
         })
     }
 
+    /// Run background tasks (feed, snapshot minting, connections) on this runtime.
+    pub fn with_runtime(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.spawner = Spawner::on(handle);
+        self.pool.spawner = self.spawner.clone();
+        self
+    }
+
     /// The feed slot's name, while open.
     pub fn slot(&self) -> Option<String> {
         self.open.lock().unwrap().as_ref().map(|o| o.slot.clone())
     }
 
     pub async fn client(&self) -> Result<Client> {
-        connect(&self.pg).await
+        connect(&self.pg, &self.spawner).await
     }
 
     /// Drop this source's feed slots left inactive for `older_than` (crashed processes). Needs Postgres 17+.
@@ -204,18 +220,18 @@ impl Drop for PgSource {
             f.abort();
         }
         // Best effort: the feed slot would otherwise keep WAL forever.
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            let cfg = self.pg.clone();
-            rt.spawn(async move { drop_slot(&cfg, &o.slot).await });
+        if let Some(rt) = self.spawner.handle() {
+            let (cfg, spawner) = (self.pg.clone(), self.spawner.clone());
+            rt.spawn(async move { drop_slot(&cfg, &spawner, &o.slot).await });
         } else {
             tracing::warn!(slot = %o.slot, "source dropped without close; slot left behind");
         }
     }
 }
 
-pub(crate) async fn connect(cfg: &Config) -> Result<Client> {
+pub(crate) async fn connect(cfg: &Config, spawner: &Spawner) -> Result<Client> {
     let (client, conn) = cfg.connect(NoTls).await.map_err(pg_error)?;
-    tokio::spawn(async move {
+    spawner.spawn(async move {
         if let Err(e) = conn.await {
             tracing::debug!(error = %e, "postgres connection ended");
         }
@@ -245,8 +261,8 @@ async fn server_version(client: &Client) -> Result<i32> {
 }
 
 /// Drop a slot, retrying while Postgres still holds it for a closing connection.
-async fn drop_slot(cfg: &Config, slot: &str) {
-    let Ok(client) = connect(cfg).await else {
+async fn drop_slot(cfg: &Config, spawner: &Spawner, slot: &str) {
+    let Ok(client) = connect(cfg, spawner).await else {
         tracing::warn!(slot, "can't connect to drop slot");
         return;
     };
@@ -521,7 +537,7 @@ impl Changes for PgSource {
             self.acked.clone(),
         );
         streaming.store(true, Ordering::Relaxed);
-        let task = tokio::spawn(async move {
+        let task = self.spawner.spawn(async move {
             feed::run(stream, acked, tx).await;
             if feed_id.load(Ordering::Relaxed) == id {
                 streaming.store(false, Ordering::Relaxed);
@@ -628,6 +644,7 @@ impl Lifecycle for PgSource {
             .map_err(pg_error)?;
         let start = Lsn::parse(row.get(0))?;
         let rotation = snapshots::rotate(
+            self.spawner.clone(),
             self.pg.clone(),
             self.aliases.clone(),
             self.streaming.clone(),
@@ -653,7 +670,7 @@ impl Lifecycle for PgSource {
             f.abort();
         }
         *self.aliases.lock().unwrap() = Aliases::default();
-        drop_slot(&self.pg, &o.slot).await;
+        drop_slot(&self.pg, &self.spawner, &o.slot).await;
     }
 }
 

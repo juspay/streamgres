@@ -1,0 +1,18 @@
+[package]
+name = "streamlib-runtime"
+description = "In-process runtime that keeps query results cached and current"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+streamlib-datasource = { path = "../datasource" }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing = "0.1"
+
+[dev-dependencies]
+streamlib-datasource = { path = "../datasource", features = ["testing"] }
+streamlib-datasource-postgres = { path = "../datasource-postgres" }
+tokio-postgres = "0.7"
+uuid = { version = "1", features = ["v4"] }

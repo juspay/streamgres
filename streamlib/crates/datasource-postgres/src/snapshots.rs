@@ -11,6 +11,7 @@ use tokio_postgres::{Client, Config, SimpleQueryMessage};
 
 use crate::codec::{Lsn, PgCodec};
 use crate::repl::ReplConn;
+use crate::spawn::Spawner;
 use crate::{connect, pg_error};
 
 /// An exported snapshot and its WAL position; it lives as long as its connection.
@@ -88,13 +89,15 @@ async fn mint(cfg: &Config, prefix: &str) -> Result<Alias> {
 
 /// Keeps creating snapshots while a feed runs, and nudges the stream so an idle database advances.
 pub fn rotate(
+    spawner: Spawner,
     cfg: Config,
     aliases: Arc<Mutex<Aliases>>,
     streaming: Arc<AtomicBool>,
     every: Duration,
     prefix: String,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    let tasks = spawner.clone();
+    spawner.spawn(async move {
         let mut ticker: Option<Client> = None;
         loop {
             tokio::time::sleep(every).await;
@@ -112,7 +115,7 @@ pub fn rotate(
                 continue;
             }
             if ticker.as_ref().is_none_or(Client::is_closed) {
-                ticker = connect(&cfg).await.ok();
+                ticker = connect(&cfg, &tasks).await.ok();
             }
             if let Some(c) = &ticker {
                 let tick = "SELECT pg_logical_emit_message(true, 'streamlib.tick', '')";
@@ -127,6 +130,7 @@ pub fn rotate(
 /// Read connections: capped, reused, and set up with the stream's session settings.
 pub struct Pool {
     cfg: Config,
+    pub spawner: Spawner,
     idle: Mutex<Vec<Client>>,
     permits: Semaphore,
     timeout: Duration,
@@ -135,9 +139,10 @@ pub struct Pool {
 }
 
 impl Pool {
-    pub fn new(cfg: Config, max: usize, timeout: Duration) -> Self {
+    pub fn new(cfg: Config, max: usize, timeout: Duration, spawner: Spawner) -> Self {
         Pool {
             cfg,
+            spawner,
             idle: Mutex::default(),
             permits: Semaphore::new(max.max(1)),
             timeout,
@@ -155,7 +160,7 @@ impl Pool {
         if let Some(c) = reuse.filter(|c| !c.is_closed()) {
             return Ok(c);
         }
-        let client = connect(&self.cfg).await?;
+        let client = connect(&self.cfg, &self.spawner).await?;
         let session = self.session.read().unwrap().clone();
         if !session.is_empty() {
             client.batch_execute(&session).await.map_err(pg_error)?;

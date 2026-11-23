@@ -682,6 +682,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "streamlib-runtime"
+version = "0.1.0"
+dependencies = [
+ "streamlib-datasource",
+ "streamlib-datasource-postgres",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "stringprep"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -759,3 +759,74 @@ async fn cleanup_inactive_slots() {
     assert_eq!(dropped, vec![stale]);
     db.drop().await;
 }
+
+/// Background tasks run on the runtime the owner picks, and all end once the source is dropped.
+#[test]
+fn background_tasks_run_on_the_given_runtime() {
+    let Ok(dsn) = std::env::var("STREAMLIB_PG_DSN") else {
+        eprintln!("skipped: STREAMLIB_PG_DSN not set");
+        return;
+    };
+    let io = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let caller = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let tag = uuid::Uuid::new_v4().simple().to_string()[..8].to_owned();
+    let (table, publication) = (format!("public.sl_items_{tag}"), format!("sl_pub_{tag}"));
+    caller.block_on(async {
+        let (sql, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(conn);
+        sql.batch_execute(&format!("CREATE TABLE {table} (id int PRIMARY KEY)"))
+            .await
+            .unwrap();
+        let mut cfg = PgConfig::new(&dsn, &publication);
+        cfg.tables = vec![table.clone()];
+        cfg.slot_prefix = format!("sl_{tag}");
+        let src = PgSource::new(cfg)
+            .unwrap()
+            .with_runtime(io.handle().clone());
+        src.setup().await.unwrap();
+
+        let caller_tasks = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        src.open().await.unwrap();
+        let _feed = src.stream(None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks(),
+            caller_tasks,
+            "nothing spawned on the caller"
+        );
+        assert!(
+            io.metrics().num_alive_tasks() >= 2,
+            "feed and minting on io"
+        );
+
+        src.close().await;
+        drop(src);
+        let mut left = usize::MAX;
+        for _ in 0..50 {
+            left = io.metrics().num_alive_tasks();
+            if left == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(left, 0, "every background task ended");
+        sql.batch_execute(&format!(
+            "DROP PUBLICATION {publication}; DROP TABLE {table}"
+        ))
+        .await
+        .unwrap();
+    });
+}
