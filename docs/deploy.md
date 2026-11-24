@@ -110,7 +110,9 @@ idle. PgBouncer's own pool settings control the PostgreSQL backend connections.
 `STREAMGRES_MASTER_PG_DSN` connects to the writable primary. On first startup,
 Streamgres creates the `<app>_<shard>` mutation schema, publication, DDL
 functions, and event triggers. Existing objects are validated without
-replacement; mismatches stop startup. The master role must be a PostgreSQL
+replacement; mismatches stop startup. The publication is created with
+`publish_via_partition_root = true`; one created before that setting was
+required stops startup with the `ALTER PUBLICATION` command that fixes it. The master role must be a PostgreSQL
 superuser to create the publication and event triggers. Choose
 `STREAMGRES_PUBLICATION` and `STREAMGRES_SCHEMAS` for the publication scope.
 Trigger names and the WAL message prefix come from `STREAMGRES_APP_ID` and
@@ -157,6 +159,17 @@ DDL in that transaction's WAL.
 
 ### What is served
 
+- A table is served when it is in a `STREAMGRES_SCHEMAS` schema **and** the
+  publication streams it. A table it does not stream would be read once and
+  never updated, so it is left out with a startup warning. That covers
+  unlogged tables, which PostgreSQL never publishes.
+- Partitioned tables are served through their root: the publication sets
+  `publish_via_partition_root = true`, and the partitions themselves are not
+  served.
+- Generated columns are left out with a warning: PostgreSQL does not send
+  them in the change feed.
+- A served table that the publication streams with a row filter or a column
+  list stops startup: its rows or columns could not be kept up to date.
 - Tables without a primary key are skipped. So are columns of types the wire
   format cannot carry (`bytea`). The startup log lists both.
 - Tables with large TOASTed columns need `REPLICA IDENTITY FULL`.
@@ -249,7 +262,7 @@ depend on what the defaults happen to be:
 | variable | default | meaning |
 |---|---|---|
 | `STREAMGRES_ADDR` | `0.0.0.0:4848` | listen address |
-| `STREAMGRES_SCHEMAS` | `public,<app>_<shard>` | schemas whose tables are served |
+| `STREAMGRES_SCHEMAS` | `public,<app>_<shard>` | schemas whose published tables are served |
 | `STREAMGRES_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams |
 | `STREAMGRES_FORWARD_COOKIES` | `true` | forward the connection's cookies to the application server |
 | `STREAMGRES_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is created |

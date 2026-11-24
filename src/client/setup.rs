@@ -159,9 +159,15 @@ async fn ensure_locked(tx: &Transaction<'_>, config: &Config, schema: &str) -> R
             .await
             .map_err(|error| format!("checking publication `{publication}` tables: {error}"))?
             .get(0);
-        if flags != [false, true, true, true, true, false] || actual != wanted || explicit != 0 {
+        if flags == [false, true, true, true, true, false] && actual == wanted && explicit == 0 {
             return Err(format!(
-                "publication `{publication}` differs: expected schema scopes {wanted:?}, all change types, no explicit tables; found scopes {actual:?}, flags {flags:?}, {explicit} explicit tables"
+                "publication `{publication}` publishes partitions under their own names; the catalog serves partitioned tables through their root, so run on the primary: ALTER PUBLICATION {} SET (publish_via_partition_root = true)",
+                quote_ident(publication)
+            ));
+        }
+        if flags != [false, true, true, true, true, true] || actual != wanted || explicit != 0 {
+            return Err(format!(
+                "publication `{publication}` differs: expected schema scopes {wanted:?}, all change types, publish_via_partition_root = true, no explicit tables; found scopes {actual:?}, flags {flags:?}, {explicit} explicit tables"
             ));
         }
     } else {
@@ -172,7 +178,8 @@ async fn ensure_locked(tx: &Transaction<'_>, config: &Config, schema: &str) -> R
             .collect::<Vec<_>>()
             .join(", ");
         tx.batch_execute(&format!(
-            "CREATE PUBLICATION {} FOR TABLES IN SCHEMA {schemas}",
+            "CREATE PUBLICATION {} FOR TABLES IN SCHEMA {schemas}
+             WITH (publish_via_partition_root = true)",
             quote_ident(publication)
         ))
         .await
@@ -738,6 +745,27 @@ mod tests {
             ))
             .await
             .unwrap();
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION {} SET (publish_via_partition_root = false)",
+                quote_ident(&publication)
+            ))
+            .await
+            .unwrap();
+        assert!(
+            ensure(&dsn, &config)
+                .await
+                .unwrap_err()
+                .contains("publish_via_partition_root = true")
+        );
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION {} SET (publish_via_partition_root = true)",
+                quote_ident(&publication)
+            ))
+            .await
+            .unwrap();
+        ensure(&dsn, &config).await.unwrap();
         let mut conflicting = config.clone();
         conflicting.app_id.push('x');
         let other_schema = conflicting.upstream_schema();
