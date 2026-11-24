@@ -85,9 +85,28 @@ pub struct PublishedTable {
 pub struct PublishedColumn {
     #[serde(rename = "dataType")]
     pub data_type: String,
+    #[serde(rename = "typeOID", default)]
+    pub type_oid: Option<i64>,
     #[serde(rename = "pgTypeClass")]
     pub pg_type_class: Option<String>,
     pub dflt: Option<String>,
+}
+
+impl PublishedColumn {
+    /// The engine's column, carrying the type OIDs a binary decode needs:
+    /// the base type, and the array's element type (looked up when the
+    /// payload did not name one).
+    pub fn to_db_column(&self, name: &str, r#type: ValueType) -> DbColumn {
+        let type_oid = self
+            .type_oid
+            .and_then(|oid| u32::try_from(oid).ok())
+            .unwrap_or(0);
+        let element_oid = super::binary::array_element(type_oid).unwrap_or(0);
+        DbColumn::new(name, r#type)
+            .with_type_oid(type_oid)
+            .with_element_oid(element_oid)
+            .with_is_domain(self.pg_type_class.as_deref() == Some("d"))
+    }
 }
 
 impl DdlMessage {
@@ -135,7 +154,7 @@ impl PublishedTable {
                         column.data_type
                     ));
                 }
-                Some(r#type) => columns.push(DbColumn::new(name.as_str(), r#type)),
+                Some(r#type) => columns.push(column.to_db_column(name.as_str(), r#type)),
                 None if self.primary_key.iter().any(|key| key == name) => {
                     return Err(format!(
                         "{}: key column `{name}` has an uncarried type {}",
@@ -456,7 +475,7 @@ fn column_changes(held: &DbTable, published: &PublishedTable) -> Result<Vec<Sche
         };
         changes.push(SchemaChange::ColumnAdded {
             table: TableName::from(name.as_str()),
-            column: DbColumn::new(column_name.as_str(), r#type),
+            column: column.to_db_column(column_name.as_str(), r#type),
             value,
             schema: held.row_schema().clone(),
         });
@@ -523,6 +542,46 @@ mod tests {
                 DbColumn::new("status", ValueType::String),
             ],
         )])
+    }
+
+    /// A migration on a source whose `lc_monetary` is not the usual two
+    /// digits: absorbing a column must keep that scale, and must keep the
+    /// held columns' source metadata (the OIDs used for binary decoding
+    /// and the domain flag used for source type information).
+    #[test]
+    fn a_migration_keeps_the_sources_money_scale_and_the_columns_metadata() {
+        let before = Catalog::new(vec![DbTable::new(
+            "tickets",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int)
+                    .with_type_oid(20)
+                    .with_is_domain(true),
+                DbColumn::new("amount", ValueType::Raw).with_type_oid(790),
+            ],
+        )])
+        .with_money_scale(0);
+        let wider = published(
+            "tickets",
+            &[
+                ("id", "int8", None),
+                ("amount", "money", None),
+                ("owner", "text", Some("'nobody'::text")),
+            ],
+            &["id"],
+        );
+        let classified = classify(
+            &before,
+            &["public".into()],
+            &message(&published("tickets", TICKETS, &["id"]), &wider),
+        )
+        .unwrap();
+        assert_eq!(classified.catalog.money_scale(), 0, "a migration does not reset the scale");
+        let held = classified.catalog.table("tickets").unwrap();
+        assert_eq!(held.column("id").unwrap().type_oid, 20);
+        assert!(held.column("id").unwrap().is_domain, "keep source type information");
+        assert_eq!(held.column("amount").unwrap().type_oid, 790);
+        assert_eq!(held.column("owner").unwrap().type_oid, 1);
     }
 
     const TICKETS: &[(&str, &str, Option<&str>)] =
@@ -611,6 +670,7 @@ mod tests {
     fn published_types_map_like_the_catalog() {
         let column = |data_type: &str, class: &str| PublishedColumn {
             data_type: data_type.to_owned(),
+            type_oid: None,
             pg_type_class: Some(class.to_owned()),
             dflt: None,
         };

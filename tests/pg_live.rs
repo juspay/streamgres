@@ -620,6 +620,7 @@ fn mutation_results_travel_the_feed() {
         }
         let text = |row: &RowData, column: &str| match row.get(column) {
             Some(Value::String(text)) => text.clone(),
+            Some(Value::Json(json)) => json.text().to_owned(),
             other => panic!("{column}: {other:?}"),
         };
         let WriteQuery::INSERT(recorded) = &seen[0] else {
@@ -2015,7 +2016,7 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
             let Value::Raw(raw) = cell(column) else {
                 panic!("{column} is raw");
             };
-            let shown = streamgres::client::pg_text::raw_text(&raw);
+            let shown = raw.client_text.as_ref().map(|t| t.to_string());
             let postgres: String = expected.get(index);
             assert_eq!(shown.as_deref(), Some(postgres.as_str()), "{column}");
         }
@@ -2040,6 +2041,147 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
             .batch_execute(&format!(
                 "DROP PUBLICATION IF EXISTS \"{publication}\"; DROP SCHEMA IF EXISTS live_exact CASCADE;"
             ))
+            .await;
+    });
+}
+
+/// A scalar domain is described by its built-in base OID, so its read can
+/// stream without a separate prepare. A result large enough to pend data
+/// proves that the driver needs no type lookup while the rows are arriving.
+#[test]
+fn a_fresh_connection_reads_a_large_known_domain_without_prepare() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let table = "live_known_domain.probe";
+        let client = admin(&dsn).await;
+        client
+            .batch_execute(
+                "DROP SCHEMA IF EXISTS live_known_domain CASCADE;
+                 CREATE SCHEMA live_known_domain;
+                 CREATE DOMAIN live_known_domain.cents AS bigint;
+                 CREATE TABLE live_known_domain.probe (
+                   id bigint PRIMARY KEY,
+                   amount live_known_domain.cents,
+                   note text
+                 );",
+            )
+            .await
+            .expect("create domain and table");
+        let filler = "x".repeat(16 * 1024);
+        for batch in 0..10 {
+            let values: Vec<String> = (0..10)
+                .map(|i| {
+                    let id = batch * 10 + i;
+                    format!("({id}, {}, '{filler}')", id * 100)
+                })
+                .collect();
+            client
+                .batch_execute(&format!("INSERT INTO {table} VALUES {};", values.join(",")))
+                .await
+                .expect("insert domain values");
+        }
+        let loaded =
+            streamgres::sync::pg::catalog::load_catalog(&client, &["live_known_domain".to_owned()])
+                .await
+                .expect("catalog")
+                .0;
+        let table_info = loaded.table(table).expect("the table is carried");
+        let amount = table_info.column("amount").expect("the amount is carried");
+        assert_eq!(amount.type_oid, 20, "the catalog stores bigint's OID");
+        assert!(amount.is_domain);
+        let catalog = Arc::new(Catalog::new(vec![table_info.clone()]));
+        let storage = PgStorage::connect(&dsn, catalog)
+            .await
+            .expect("connect");
+        storage.advance(storage.first_position());
+        let read = tokio::time::timeout(
+            Duration::from_secs(15),
+            storage.select(&SingleTableReadQuery::new(
+                table,
+                Where::AND(vec![]),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            )),
+        )
+        .await
+        .expect("a known scalar domain must not wait on a mid-stream type lookup")
+        .expect("the domain read is served");
+        assert_eq!(read.rows.len(), 100);
+        for (index, (_, row)) in read.rows.iter().enumerate() {
+            assert_eq!(
+                row.data.get("amount"),
+                Some(&Value::Int(index as i64 * 100)),
+                "the domain keeps its exact bigint value"
+            );
+        }
+
+        drop(storage);
+        let _ = client
+            .batch_execute("DROP SCHEMA IF EXISTS live_known_domain CASCADE;")
+            .await;
+    });
+}
+
+/// A large result containing a custom type must not stall on a fresh
+/// connection: `query_typed_raw` resolves unknown OIDs mid-stream, and
+/// the typeinfo lookup can queue behind the undrained result, deadlocking
+/// the read. Preparing before streaming avoids the stall.
+#[test]
+fn a_fresh_connection_reads_a_large_enum_result_without_stalling() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let table = "live_stall.probe";
+        let client = admin(&dsn).await;
+        client
+            .batch_execute(
+                "DROP SCHEMA IF EXISTS live_stall CASCADE;
+                 CREATE SCHEMA live_stall;
+                 CREATE TYPE live_stall.status AS ENUM ('open', 'closed');
+                 CREATE TABLE live_stall.probe (
+                   id int8 PRIMARY KEY,
+                   s live_stall.status,
+                   t text
+                 );",
+            )
+            .await
+            .expect("prepare");
+        let filler = "x".repeat(16 * 1024);
+        for batch in 0..10 {
+            let values: Vec<String> = (0..10)
+                .map(|i| format!("({}, 'open', '{}')", batch * 10 + i, filler))
+                .collect();
+            client
+                .batch_execute(&format!("INSERT INTO {table} VALUES {};", values.join(",")))
+                .await
+                .expect("insert");
+        }
+        let loaded =
+            streamgres::sync::pg::catalog::load_catalog(&client, &["live_stall".to_owned()])
+                .await
+                .expect("catalog")
+                .0;
+        let declared = loaded.table(table).expect("the table is carried").clone();
+        let catalog = Arc::new(Catalog::new(vec![declared]));
+        let storage = PgStorage::connect(&dsn, catalog)
+            .await
+            .expect("connect");
+        storage.advance(storage.first_position());
+        let read = tokio::time::timeout(
+            Duration::from_secs(15),
+            storage.select(&SingleTableReadQuery::new(
+                table,
+                Where::AND(vec![]),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            )),
+        )
+        .await
+        .expect("the read must not stall")
+        .expect("the read is served");
+        assert_eq!(read.rows.len(), 100);
+
+        let _ = client
+            .batch_execute("DROP SCHEMA IF EXISTS live_stall CASCADE;")
             .await;
     });
 }

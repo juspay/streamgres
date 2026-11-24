@@ -42,20 +42,6 @@ pub mod oid {
     pub const JSONB: u32 = 3802;
 }
 
-/// The fraction digits of the database's currency (`lc_monetary`), which
-/// a `money` value's integer counts in; read with the catalog.
-static MONEY_SCALE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
-
-/// The fraction digits a `money` value counts in.
-pub fn money_scale() -> u8 {
-    MONEY_SCALE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Records the fraction digits of the database's currency.
-pub fn set_money_scale(scale: u8) {
-    MONEY_SCALE.store(scale, std::sync::atomic::Ordering::Relaxed);
-}
-
 /// The version byte `jsonb_send` writes before the text.
 const JSONB_VERSION: u8 = 1;
 
@@ -95,7 +81,7 @@ impl CellDecoder for PgBinary {
     type Error = CodecError;
 
     fn decode(&self, declared: &ValueType, cell: PgCell<'_>) -> Result<Value, CodecError> {
-        decode(declared, cell.type_oid, cell.bytes)
+        decode(declared, cell.type_oid, cell.bytes, 2)
     }
 }
 
@@ -166,11 +152,11 @@ pub fn value_type(type_oid: u32) -> Option<ValueType> {
 /// type is not a known text type (an enum, a domain over text) reads its
 /// bytes as UTF-8, which is what those types send. A list reads
 /// Postgres's array format.
-pub fn decode(declared: &ValueType, type_oid: u32, bytes: &[u8]) -> Result<Value, CodecError> {
+pub fn decode(declared: &ValueType, type_oid: u32, bytes: &[u8], money_scale: u8) -> Result<Value, CodecError> {
     let fail = |reason| CodecError { type_oid, reason };
     match declared {
-        ValueType::List(inner) => decode_array(inner, type_oid, bytes, false),
-        ValueType::Date => match decode_scalar(type_oid, bytes)? {
+        ValueType::List(inner) => decode_array(inner, type_oid, bytes, false, money_scale),
+        ValueType::Date => match decode_scalar(type_oid, bytes, money_scale)? {
             Value::Day(day) => day
                 .midnight()
                 .and_then(naive)
@@ -178,17 +164,17 @@ pub fn decode(declared: &ValueType, type_oid: u32, bytes: &[u8]) -> Result<Value
                 .ok_or(fail("a date out of range")),
             _ => Err(fail("not a date")),
         },
-        ValueType::Datetime => match decode_scalar(type_oid, bytes)? {
+        ValueType::Datetime => match decode_scalar(type_oid, bytes, money_scale)? {
             Value::Timestamp(at) => naive(at)
                 .map(Value::Datetime)
                 .ok_or(fail("a time out of range")),
             _ => Err(fail("not a timestamp")),
         },
-        ValueType::Raw => Ok(raw(type_oid, bytes)),
+        ValueType::Raw => Ok(raw(type_oid, bytes, money_scale)),
         ValueType::String if value_type(type_oid).is_none() => utf8(bytes)
             .map(|text| Value::String(text.to_owned()))
             .map_err(|_| fail("not UTF-8")),
-        _ => decode_scalar(type_oid, bytes),
+        _ => decode_scalar(type_oid, bytes, money_scale),
     }
 }
 
@@ -199,9 +185,10 @@ pub(crate) fn decode_source(
     declared: &ValueType,
     type_oid: u32,
     bytes: &[u8],
+    money_scale: u8,
 ) -> Result<Value, CodecError> {
     if let ValueType::List(inner) = declared {
-        return decode_array(inner, type_oid, bytes, true);
+        return decode_array(inner, type_oid, bytes, true, money_scale);
     }
     if type_oid == oid::JSONB && *declared == ValueType::Json {
         let fail = |reason| CodecError { type_oid, reason };
@@ -215,12 +202,12 @@ pub(crate) fn decode_source(
             body,
         )));
     }
-    decode(declared, type_oid, bytes)
+    decode(declared, type_oid, bytes, money_scale)
 }
 
 /// Decodes one non-null cell by its type alone. JSONB input is validated
 /// and canonicalized, since client bind bytes need not be jsonb_send output.
-pub fn decode_scalar(type_oid: u32, bytes: &[u8]) -> Result<Value, CodecError> {
+pub fn decode_scalar(type_oid: u32, bytes: &[u8], money_scale: u8) -> Result<Value, CodecError> {
     let fail = |reason| CodecError { type_oid, reason };
     Ok(match type_oid {
         oid::BOOL => Value::Bool(fixed::<1>(bytes, type_oid)? != [0]),
@@ -256,7 +243,7 @@ pub fn decode_scalar(type_oid: u32, bytes: &[u8]) -> Result<Value, CodecError> {
         oid::DATE => Value::Day(Day(i32::from_be_bytes(fixed::<4>(bytes, type_oid)?))),
         oid::TIME => Value::Time(Time(i64::from_be_bytes(fixed::<8>(bytes, type_oid)?))),
         oid::BYTEA => Value::Bytes(Bytes::copy_from_slice(bytes)),
-        _ => raw(type_oid, bytes),
+        _ => raw(type_oid, bytes, money_scale),
     })
 }
 
@@ -265,12 +252,22 @@ fn naive(at: Timestamp) -> Option<chrono::NaiveDateTime> {
     chrono::DateTime::from_timestamp_micros(at.unix_micros()?).map(|at| at.naive_utc())
 }
 
-/// A value kept as its bytes.
-fn raw(type_oid: u32, bytes: &[u8]) -> Value {
-    Value::Raw(Raw {
-        type_oid,
-        bytes: Bytes::copy_from_slice(bytes),
-    })
+/// A value kept as its bytes, with the client text pre-rendered when
+/// `client_scale` is supplied (the source instance's money scale).
+fn raw(type_oid: u32, bytes: &[u8], money_scale: u8) -> Value {
+    let bytes = Bytes::copy_from_slice(bytes);
+    let text = client_text(type_oid, bytes.as_ref(), money_scale);
+    match text {
+        Some(text) => Value::Raw(Raw::with_text(type_oid, bytes, text)),
+        None => Value::Raw(Raw::new(type_oid, bytes)),
+    }
+}
+
+/// The client-side text for a raw value, rendered at ingress so the wire
+/// never dispatches on type OIDs. `money_scale` is the source instance's
+/// `lc_monetary` scale.
+fn client_text(type_oid: u32, bytes: &[u8], money_scale: u8) -> Option<String> {
+    crate::client::pg_text::raw_text(type_oid, bytes, money_scale)
 }
 
 /// Bytes as UTF-8 text.
@@ -326,12 +323,15 @@ fn read_i32(bytes: &[u8], at: &mut usize, type_oid: u32) -> Result<i32, CodecErr
 
 /// Decodes Postgres's array format. A one-dimensional array becomes a
 /// list of its elements decoded as `inner`; an empty array an empty list;
-/// an array of more dimensions is kept raw.
+/// a multidimensional array becomes nested lists (last dimension
+/// innermost). Lower bounds are not kept — the client projection shows
+/// contents, not index bounds, matching `to_json`.
 fn decode_array(
     inner: &ValueType,
     type_oid: u32,
     bytes: &[u8],
     source: bool,
+    money_scale: u8,
 ) -> Result<Value, CodecError> {
     let fail = |reason| CodecError { type_oid, reason };
     let mut at = 0;
@@ -342,20 +342,21 @@ fn decode_array(
         type_oid,
     )?);
     at += 4;
-    match dimensions {
-        0 => return Ok(Value::List(Vec::new())),
-        1 => {}
-        _ => return Ok(raw(type_oid, bytes)),
+    if dimensions <= 0 {
+        return Ok(Value::List(Vec::new()));
     }
-    let length = usize::try_from(read_i32(bytes, &mut at, type_oid)?)
-        .map_err(|_| fail("negative array length"))?;
-    let lower_bound = read_i32(bytes, &mut at, type_oid)?;
-    if lower_bound != 1 {
-        return Ok(raw(type_oid, bytes));
+    let mut dims = Vec::with_capacity(dimensions as usize);
+    let mut total = 1usize;
+    for _ in 0..dimensions {
+        let length = usize::try_from(read_i32(bytes, &mut at, type_oid)?)
+            .map_err(|_| fail("negative array dimension"))?;
+        let _lower_bound = read_i32(bytes, &mut at, type_oid)?;
+        total = total.saturating_mul(length);
+        dims.push(length);
     }
-    let mut items = Vec::with_capacity(length.min(bytes.len() / 4));
+    let mut items = Vec::with_capacity(total.min(bytes.len() / 4));
     let mut json_bytes = 0usize;
-    for _ in 0..length {
+    for _ in 0..total {
         let size = read_i32(bytes, &mut at, type_oid)?;
         if size < 0 {
             items.push(Value::Null);
@@ -367,9 +368,9 @@ fn decode_array(
             .ok_or(fail("truncated array element"))?;
         at += size;
         let value = if source {
-            decode_source(inner, element_oid, element)?
+            decode_source(inner, element_oid, element, money_scale)?
         } else {
-            decode(inner, element_oid, element)?
+            decode(inner, element_oid, element, money_scale)?
         };
         if !source {
             json_bytes = json_bytes.saturating_add(parameter_json_bytes(&value));
@@ -382,7 +383,22 @@ fn decode_array(
     if at != bytes.len() {
         return Err(fail("trailing bytes after array"));
     }
-    Ok(Value::List(items))
+    Ok(Value::List(nest(&mut items.into_iter(), &dims)))
+}
+
+/// Groups flat `items` into nested lists by `dims` (outermost first). A
+/// single dimension stays flat. Postgres writes the last dimension
+/// fastest.
+fn nest(items: &mut std::vec::IntoIter<Value>, dims: &[usize]) -> Vec<Value> {
+    let Some(&count) = dims.first() else {
+        return Vec::new();
+    };
+    if dims.len() == 1 {
+        return items.by_ref().take(count).collect();
+    }
+    (0..count)
+        .map(|_| Value::List(nest(items, &dims[1..])))
+        .collect()
 }
 
 /// Expanded JSON in a client parameter, beyond its compact wire input.
@@ -545,6 +561,14 @@ fn write_array(items: &[Value], element_oid: u32, out: &mut Vec<u8>) -> Option<(
 mod tests {
     use super::*;
 
+    fn decode(declared: &ValueType, type_oid: u32, bytes: &[u8]) -> Result<Value, CodecError> {
+        super::decode(declared, type_oid, bytes, 2)
+    }
+
+    fn decode_scalar(type_oid: u32, bytes: &[u8]) -> Result<Value, CodecError> {
+        super::decode_scalar(type_oid, bytes, 2)
+    }
+
     fn round_trip(type_oid: u32, bytes: &[u8]) -> Value {
         let declared = value_type(type_oid).unwrap_or(ValueType::Raw);
         let value = decode(&declared, type_oid, bytes).unwrap();
@@ -677,14 +701,39 @@ mod tests {
     }
 
     #[test]
-    fn unusual_array_bounds_keep_the_original_wire_value() {
+    fn unusual_array_bounds_expose_their_contents() {
         let mut bytes = encode_array(&[Value::Int(7), Value::Int(8)], oid::INT4).unwrap();
         for bound in [0i32, -3, 42] {
             bytes[16..20].copy_from_slice(&bound.to_be_bytes());
             let value = decode(&ValueType::List(Box::new(ValueType::Int)), 1007, &bytes).unwrap();
-            assert!(matches!(value, Value::Raw(_)));
-            assert_eq!(encode(&value, 1007).unwrap(), bytes);
+            assert_eq!(value, Value::List(vec![Value::Int(7), Value::Int(8)]));
         }
+    }
+
+    #[test]
+    fn a_multidimensional_array_becomes_nested_lists() {
+        // A 2×2 int4 array: dims (2,2), lower bounds (1,1), elements
+        // 1 2 / 3 4 — Postgres writes the last dimension fastest.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2i32.to_be_bytes()); // dimensions
+        bytes.extend_from_slice(&0i32.to_be_bytes()); // no nulls
+        bytes.extend_from_slice(&oid::INT4.to_be_bytes());
+        bytes.extend_from_slice(&2i32.to_be_bytes()); // dim 1
+        bytes.extend_from_slice(&1i32.to_be_bytes());
+        bytes.extend_from_slice(&2i32.to_be_bytes()); // dim 2
+        bytes.extend_from_slice(&1i32.to_be_bytes());
+        for n in [1i32, 2, 3, 4] {
+            bytes.extend_from_slice(&4i32.to_be_bytes());
+            bytes.extend_from_slice(&n.to_be_bytes());
+        }
+        let value = decode(&ValueType::List(Box::new(ValueType::Int)), 1007, &bytes).unwrap();
+        assert_eq!(
+            value,
+            Value::List(vec![
+                Value::List(vec![Value::Int(1), Value::Int(2)]),
+                Value::List(vec![Value::Int(3), Value::Int(4)]),
+            ])
+        );
     }
 
     #[test]
@@ -692,10 +741,7 @@ mod tests {
         let interval = [0u8; 16];
         assert_eq!(
             round_trip(1186, &interval),
-            Value::Raw(Raw {
-                type_oid: 1186,
-                bytes: Bytes::copy_from_slice(&interval)
-            })
+            Value::Raw(Raw::new(1186, Bytes::copy_from_slice(&interval)))
         );
         assert_eq!(
             decode(&ValueType::String, 99_999, b"open").unwrap(),

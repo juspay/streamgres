@@ -623,7 +623,9 @@ impl Storage for PgStorage {
                 sql.push_str(&format!(" LIMIT {}", row_limit + 1));
             }
             let what = format!("a read on `{}`", query.table);
-            let rows = pool.read(&alias, &what, &sql, delay).await?;
+            let rows = pool
+                .read(&alias, &what, &sql, delay, driver_knows(table))
+                .await?;
             if rows.len() > row_limit {
                 log_warn!(
                     "read on `{}` returned more than {} rows; refused",
@@ -643,7 +645,7 @@ impl Storage for PgStorage {
             }
             let rows = rows
                 .iter()
-                .map(|row| decode_row(row, table))
+                .map(|row| decode_row(row, table, catalog.money_scale()))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Snapshot {
                 rows,
@@ -663,7 +665,7 @@ impl Storage for PgStorage {
             let (alias, catalog) = pool.current_alias()?;
             let sql = sql::count_sql(&query, &catalog, cap).map_err(StorageError)?;
             let what = format!("counting the rows of `{}`", query.main_table.table);
-            let rows = pool.read(&alias, &what, &sql, None).await?;
+            let rows = pool.read(&alias, &what, &sql, None, true).await?;
             let count: i64 = rows
                 .first()
                 .ok_or_else(|| StorageError("the count returned no row".to_owned()))?
@@ -981,20 +983,34 @@ impl Pool {
     /// Collect incrementally so an oversized result cannot be buffered
     /// whole before the row budget is checked. Dropping a failed read
     /// closes its connection; a partial transaction is never reused.
+    ///
+    /// `statement` is `Some` when the caller resolved the result types
+    /// with a `prepare` first; `None` streams through the driver's
+    /// known-type table, which never looks a type up mid-stream.
     async fn read_rows(
         &self,
         client: &Client,
         what: &str,
         sql: &str,
+        statement: Option<&tokio_postgres::Statement>,
     ) -> Result<Vec<Row>, StorageError> {
         use futures_util::TryStreamExt;
-        let stream = client
-            .query_typed_raw(
-                sql,
-                [] as [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 0],
-            )
-            .await
-            .map_err(|error| self.read_error(what, error))?;
+        let started = match statement {
+            Some(statement) => {
+                client
+                    .query_raw(statement, [] as [&(dyn tokio_postgres::types::ToSql + Sync); 0])
+                    .await
+            }
+            None => {
+                client
+                    .query_typed_raw(
+                        sql,
+                        [] as [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 0],
+                    )
+                    .await
+            }
+        };
+        let stream = started.map_err(|error| self.read_error(what, error))?;
         let mut stream = std::pin::pin!(stream);
         let row_limit = self.row_limit.load(Ordering::Relaxed);
         let mut rows = Vec::new();
@@ -1015,12 +1031,21 @@ impl Pool {
     /// the alias's exported snapshot imported, `sql` run against it with
     /// its rows in binary format, and the transaction committed. The three
     /// are pipelined, so the read is one round trip.
+    ///
+    /// `driver_knows` says every result column is a type the Postgres
+    /// driver already recognises. When it is false the result types are
+    /// resolved first with `prepare`, because a lookup mid-stream can
+    /// queue behind the undrained result on a fresh connection and stall
+    /// the read. `prepare` has no DataRows pending, so the lookup runs
+    /// cleanly; `query_raw` then streams. When it is true the read skips
+    /// that extra round trip and streams through `query_typed_raw`.
     async fn read(
         &self,
         alias: &Alias,
         what: &str,
         sql: &str,
         delay: Option<Duration>,
+        driver_knows: bool,
     ) -> Result<Vec<Row>, StorageError> {
         let mut setup = format!(
             "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '{}';",
@@ -1039,6 +1064,17 @@ impl Pool {
         let limit = self.timeout();
         let work = async {
             let client = self.acquire().await?;
+            let statement = if driver_knows {
+                None
+            } else {
+                match client.prepare(sql).await {
+                    Ok(statement) => Some(statement),
+                    Err(error) => {
+                        self.release(client);
+                        return Err(self.read_error(what, error));
+                    }
+                }
+            };
             let outcome = tokio::try_join!(
                 async {
                     client
@@ -1046,7 +1082,7 @@ impl Pool {
                         .await
                         .map_err(|error| self.read_error(what, error))
                 },
-                self.read_rows(&client, what, sql),
+                self.read_rows(&client, what, sql, statement.as_ref()),
                 async {
                     client
                         .batch_execute("COMMIT")
@@ -1108,6 +1144,20 @@ fn table_of<'a>(
         .ok_or_else(|| StorageError(format!("table `{}` is not in the catalog", query.table)))
 }
 
+/// Whether the driver already knows every result type of a read on `table`.
+/// Postgres describes a domain by its base type, including the base array
+/// type for a domain over an array. The startup catalog keeps that base OID,
+/// so a known base's scalar and array element types all resolve locally.
+/// Custom bases (enums, extension types) and hand-declared columns without
+/// an OID still need `prepare` to resolve their result types before rows
+/// arrive, rather than looking them up while the result stream is pending.
+fn driver_knows(table: &DbTable) -> bool {
+    table
+        .columns
+        .values()
+        .all(|column| Type::from_oid(column.type_oid).is_some())
+}
+
 /// Keep minting aliases every rotation interval until the storage drops,
 /// pausing while enough are already waiting for the stream, and at once
 /// when rung ([`PgStorage::mint_now`], whatever is waiting); a failed mint
@@ -1156,7 +1206,7 @@ pub fn parse_lsn(text: &str) -> Result<Lsn, StorageError> {
 /// One result row, in [`sql::select_columns`] order, as the engine's
 /// (identity, image) pair; the names come from the catalog, so no name is
 /// allocated per row.
-fn decode_row(row: &Row, table: &DbTable) -> Result<(DataFrameKey, DataFrameRow), StorageError> {
+fn decode_row(row: &Row, table: &DbTable, money_scale: u8) -> Result<(DataFrameKey, DataFrameRow), StorageError> {
     let schema = table.row_schema().clone();
     let mut values = Vec::with_capacity(schema.len());
     for (index, name) in schema.names().iter().enumerate() {
@@ -1173,7 +1223,7 @@ fn decode_row(row: &Row, table: &DbTable) -> Result<(DataFrameKey, DataFrameRow)
                         .map_or(0, |described| described.type_().oid()),
                     known => known,
                 };
-                binary::decode_source(&column.r#type, type_oid, bytes)
+                binary::decode_source(&column.r#type, type_oid, bytes, money_scale)
                     .map_err(|error| StorageError(format!("`{}`.`{name}`: {error}", table.name)))?
             }
             None => Value::Null,
@@ -1216,6 +1266,52 @@ mod tests {
         assert_eq!(base36(35), "z");
         assert_eq!(base36(36), "10");
         assert_eq!(base36(u64::MAX).len(), 13);
+    }
+
+    /// A read streams without `prepare` when every result OID is in the
+    /// driver's table. A domain reports its base type, so known scalar and
+    /// array bases are eligible too; a custom base or absent OID is not.
+    #[test]
+    fn a_read_prepares_unless_every_result_type_is_the_drivers_own() {
+        use crate::model::{DbColumn, DbTable, ValueType};
+        let table = |columns: Vec<DbColumn>| DbTable::new("t", ["id"], columns);
+        let column = |name: &str, type_oid: u32| DbColumn::new(name, ValueType::Int).with_type_oid(type_oid);
+        let domain = |r#type, type_oid, element_oid| {
+            DbColumn::new("id", r#type)
+                .with_type_oid(type_oid)
+                .with_element_oid(element_oid)
+                .with_is_domain(true)
+        };
+
+        assert!(driver_knows(&table(vec![column("id", 23)])), "int4 is known");
+        assert!(
+            driver_knows(&table(vec![domain(ValueType::Int, 20, 0)])),
+            "Postgres describes a domain over bigint as bigint"
+        );
+        assert!(
+            driver_knows(&table(vec![domain(
+                ValueType::List(Box::new(ValueType::Int)),
+                1016,
+                20,
+            )])),
+            "a domain over a known array reports its base array"
+        );
+        assert!(
+            !driver_knows(&table(vec![domain(ValueType::String, 16_483, 0)])),
+            "a domain over an enum has a custom base OID"
+        );
+        assert!(
+            !driver_knows(&table(vec![column("id", 16_483)])),
+            "an enum's OID is not the driver's"
+        );
+        assert!(
+            !driver_knows(&table(vec![DbColumn::new("id", ValueType::Int)])),
+            "no OID needs prepare"
+        );
+        assert!(
+            !driver_knows(&table(vec![column("id", 23), column("extra", 16_483)])),
+            "one unknown column is enough"
+        );
     }
 
     #[test]

@@ -24,7 +24,7 @@
 //!   key and nothing else, since every comparison is false for it.
 //! - **Ranges** (`>`, `>=`, `<`, `<=`): ordered maps from threshold to
 //!   conditions, one per comparison class (numeric, string, bool, date,
-//!   datetime, timestamp, day, time, bytes, json) so incomparable types
+//!   datetime, timestamp, day, time, bytes) so incomparable types
 //!   never fall inside a range; the
 //!   matches for a value are one ordered-map range scan, with the strict
 //!   operators dropped at a tying threshold.
@@ -449,7 +449,11 @@ fn class_of(value: &Value) -> Option<u8> {
         Value::Day(_) => Some(7),
         Value::Time(_) => Some(8),
         Value::Bytes(_) => Some(9),
-        Value::Json(_) => Some(10),
+        // `Json` is deliberately absent: its `compare` is lexicographic on
+        // canonical text, which does not match Postgres's `jsonb` ordering
+        // (`10 > 2` is true there and false here). Range conditions on JSON
+        // are refused at the query seam; this keeps a programmatically
+        // built query from filing one anyway.
         _ => None,
     }
 }

@@ -26,7 +26,8 @@ pub async fn load_catalog(
             "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.udt_name,
                     COALESCE(NULLIF(ty.typbasetype, 0), ty.oid)::int8 AS type_oid,
                     base.typtype::text AS type_class,
-                    base.typelem::int8 AS element_oid
+                    base.typelem::int8 AS element_oid,
+                    ty.typtype = 'd' AS is_domain
              FROM information_schema.columns c
              JOIN information_schema.tables t
                ON t.table_schema = c.table_schema AND t.table_name = c.table_name
@@ -57,9 +58,7 @@ pub async fn load_catalog(
         .query_one("SELECT scale('0'::money::numeric)::int4", &[])
         .await?
         .get(0);
-    if let Ok(scale) = u8::try_from(money_scale) {
-        super::binary::set_money_scale(scale);
-    }
+    let money_scale = u8::try_from(money_scale).unwrap_or(2);
     let mut pkeys: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for row in &keys {
         let schema: String = row.get(0);
@@ -83,10 +82,12 @@ pub async fn load_catalog(
             value_type(&data_type, &udt_name)
         };
         let element_oid = u32::try_from(row.get::<_, i64>(7)).unwrap_or(0);
+        let is_domain: bool = row.get(8);
         declared.entry((schema, table)).or_default().push(
             DbColumn::new(column, r#type)
                 .with_type_oid(type_oid)
-                .with_element_oid(element_oid),
+                .with_element_oid(element_oid)
+                .with_is_domain(is_domain),
         );
     }
     let mut tables = Vec::new();
@@ -111,7 +112,7 @@ pub async fn load_catalog(
             columns,
         ));
     }
-    Ok((Catalog::new(tables), notes))
+    Ok((Catalog::new(tables).with_money_scale(money_scale), notes))
 }
 
 /// The catalog name of a table: bare in `public`, schema-qualified
@@ -127,10 +128,7 @@ pub fn table_name(schema: &str, table: &str) -> String {
 /// Whether rows can be keyed by a column of `declared`: its values must
 /// compare by value and be writable as SQL literals.
 pub fn keyable(declared: &ValueType) -> bool {
-    !matches!(
-        declared,
-        ValueType::Raw | ValueType::List(_) | ValueType::Map(_, _) | ValueType::Json
-    )
+    crate::model::supports(crate::model::Capability::Key, declared)
 }
 
 /// The engine's type for a Postgres column, from `information_schema`'s

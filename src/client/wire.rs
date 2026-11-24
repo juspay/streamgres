@@ -249,7 +249,7 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
         Value::Numeric(number) => {
             let text = number.to_string();
             if matches!(number, crate::model::Numeric::Finite { .. }) {
-                serde_json::from_str(&text).unwrap_or_else(|_| Json::String(text))
+                serde_json::from_str(&text).unwrap_or(Json::String(text))
             } else {
                 Json::String(text)
             }
@@ -292,7 +292,10 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
             .map_or(Json::Null, Json::from),
         Value::Time(time) => Json::String(time_text(*time)),
         Value::Bytes(bytes) => Json::String(bytea_text(bytes)),
-        Value::Raw(raw) => super::pg_text::raw_text(raw).map_or(Json::Null, Json::String),
+        Value::Raw(raw) => raw
+            .client_text
+            .as_ref()
+            .map_or(Json::Null, |text| Json::String(text.to_string())),
     }
 }
 
@@ -446,9 +449,9 @@ mod tests {
         use crate::model::Raw;
         use bytes::Bytes;
 
-        let interval = Value::Raw(Raw {
-            type_oid: 1186,
-            bytes: Bytes::from(
+        let interval = Value::Raw(Raw::with_text(
+            1186,
+            Bytes::from(
                 [
                     &11_045_000_000i64.to_be_bytes()[..],
                     &2i32.to_be_bytes(),
@@ -456,7 +459,8 @@ mod tests {
                 ]
                 .concat(),
             ),
-        });
+            "1 year 2 days 03:04:05",
+        ));
         let mut out = Vec::new();
         write_value(&mut out, &interval, None);
         assert_eq!(out, b"\"1 year 2 days 03:04:05\"");
@@ -465,10 +469,7 @@ mod tests {
             serde_json::json!("1 year 2 days 03:04:05")
         );
 
-        let unknown = Value::Raw(Raw {
-            type_oid: 999_999,
-            bytes: Bytes::from_static(&[1, 2, 3]),
-        });
+        let unknown = Value::Raw(Raw::new(999_999, Bytes::from_static(&[1, 2, 3])));
         out.clear();
         write_value(&mut out, &unknown, None);
         assert_eq!(out, b"null", "a type with no text is not made up");

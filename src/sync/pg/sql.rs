@@ -340,9 +340,14 @@ fn literal_as(value: &Value, declared: Option<&DbColumn>) -> String {
     }
 }
 
-/// A double-quoted identifier.
+/// A double-quoted identifier, each dot-separated part quoted so a
+/// schema-qualified name (`live_exact.values`) is two identifiers, not
+/// one name that happens to contain a dot.
 pub fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    name.split('.')
+        .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// The filter tree as a boolean expression in `scope`.

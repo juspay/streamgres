@@ -137,11 +137,101 @@ impl Ord for JsonText {
 }
 
 /// A value of a type the engine does not interpret: its type and its
-/// Postgres binary form.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Postgres binary form, with the client-side text rendered at decode
+/// time so the wire never dispatches on type OIDs. Equality, hashing and
+/// ordering use only `type_oid` and `bytes` — the text is a projection.
+#[derive(Debug, Clone)]
 pub struct Raw {
     pub type_oid: u32,
     pub bytes: Bytes,
+    /// Postgres's output text for this value, when the renderer knows the
+    /// type. Rendered once at ingress.
+    pub client_text: Option<Box<str>>,
+}
+
+impl Raw {
+    /// A raw value with no pre-rendered text.
+    pub fn new(type_oid: u32, bytes: Bytes) -> Self {
+        Raw {
+            type_oid,
+            bytes,
+            client_text: None,
+        }
+    }
+
+    /// A raw value carrying its client-side text.
+    pub fn with_text(type_oid: u32, bytes: Bytes, text: impl Into<Box<str>>) -> Self {
+        Raw {
+            type_oid,
+            bytes,
+            client_text: Some(text.into()),
+        }
+    }
+}
+
+impl PartialEq for Raw {
+    fn eq(&self, other: &Self) -> bool {
+        self.type_oid == other.type_oid && self.bytes == other.bytes
+    }
+}
+
+impl Eq for Raw {}
+
+impl Hash for Raw {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.type_oid.hash(state);
+        self.bytes.hash(state);
+    }
+}
+
+impl PartialOrd for Raw {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Raw {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.type_oid
+            .cmp(&other.type_oid)
+            .then_with(|| self.bytes.cmp(&other.bytes))
+    }
+}
+
+/// What the engine can do with values of a [`ValueType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Capability {
+    /// Can be a primary key: compared by value and writable as SQL literals.
+    Key,
+    /// Can appear in a WHERE equality filter.
+    Filter,
+    /// Can appear in a WHERE range filter or ORDER BY, ordered as Postgres does.
+    Order,
+}
+
+/// Whether columns declared as `declared` support `capability`.
+pub fn supports(capability: Capability, declared: &ValueType) -> bool {
+    match capability {
+        Capability::Key => !matches!(
+            declared,
+            ValueType::Raw | ValueType::List(_) | ValueType::Map(_, _) | ValueType::Json
+        ),
+        Capability::Filter => !matches!(declared, ValueType::Raw),
+        Capability::Order => matches!(
+            declared,
+            ValueType::String
+                | ValueType::Int
+                | ValueType::Float
+                | ValueType::Bool
+                | ValueType::Date
+                | ValueType::Datetime
+                | ValueType::Timestamp
+                | ValueType::Numeric
+                | ValueType::Day
+                | ValueType::Time
+                | ValueType::Bytes
+        ),
+    }
 }
 
 /// The static type of a [`Value`], used to describe columns in a schema.
@@ -170,6 +260,29 @@ pub enum ValueType {
     Bytes,
     /// A type the engine does not interpret; the cell is a [`Value::Raw`].
     Raw,
+}
+
+impl ValueType {
+    /// A short name for error messages.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            ValueType::String => "string",
+            ValueType::Int => "int",
+            ValueType::Float => "float",
+            ValueType::Bool => "bool",
+            ValueType::Date => "date",
+            ValueType::Datetime => "datetime",
+            ValueType::List(_) => "list",
+            ValueType::Map(_, _) => "map",
+            ValueType::Timestamp => "timestamp",
+            ValueType::Json => "JSON",
+            ValueType::Numeric => "numeric",
+            ValueType::Day => "day",
+            ValueType::Time => "time",
+            ValueType::Bytes => "bytes",
+            ValueType::Raw => "raw",
+        }
+    }
 }
 
 impl Value {
@@ -659,10 +772,7 @@ mod tests {
     #[test]
     fn raw_values_never_compare() {
         let raw = |oid: u32, bytes: &'static [u8]| {
-            Value::Raw(Raw {
-                type_oid: oid,
-                bytes: Bytes::from_static(bytes),
-            })
+            Value::Raw(Raw::new(oid, Bytes::from_static(bytes)))
         };
         assert_eq!(raw(1186, b"\x01").compare(&raw(1186, b"\x01")), None);
         assert_eq!(raw(1186, b"\x01"), raw(1186, b"\x01"));

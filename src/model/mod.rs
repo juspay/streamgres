@@ -43,4 +43,4 @@ pub use numeric::Numeric;
 pub use row::{RowData, RowSchema};
 pub use schema::{Catalog, ColumnName, DbColumn, DbTable, PutPlan, TableName};
 pub use time::{Day, Time, Timestamp};
-pub use value::{JsonText, Raw, SharedSet, Value, ValueType};
+pub use value::{Capability, JsonText, Raw, SharedSet, Value, ValueType, supports};

@@ -8,8 +8,6 @@
 use std::fmt::Write as _;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::model::Raw;
-
 const INTERVAL: u32 = 1186;
 const TIMETZ: u32 = 1266;
 const INET: u32 = 869;
@@ -18,16 +16,17 @@ const MACADDR: u32 = 829;
 const TSVECTOR: u32 = 3614;
 const MONEY: u32 = 790;
 
-/// The text Postgres writes for `raw`, when this module knows its type.
-pub fn raw_text(raw: &Raw) -> Option<String> {
-    let bytes = raw.bytes.as_ref();
-    match raw.type_oid {
+/// The text Postgres writes for a raw value of type `type_oid`, when this
+/// module knows the type. `money_scale` is the source instance's
+/// `lc_monetary` scale.
+pub fn raw_text(type_oid: u32, bytes: &[u8], money_scale: u8) -> Option<String> {
+    match type_oid {
         INTERVAL => interval(bytes),
         TIMETZ => timetz(bytes),
-        INET | CIDR => inet(bytes, raw.type_oid == CIDR),
+        INET | CIDR => inet(bytes, type_oid == CIDR),
         MACADDR => macaddr(bytes),
         TSVECTOR => tsvector(bytes),
-        MONEY => money(bytes),
+        MONEY => money(bytes, money_scale),
         _ => None,
     }
 }
@@ -171,12 +170,12 @@ fn tsvector(bytes: &[u8]) -> Option<String> {
 
 /// A `money` amount in the currency's units, with as many fraction
 /// digits as the database's `lc_monetary` gives it.
-fn money(bytes: &[u8]) -> Option<String> {
+fn money(bytes: &[u8], money_scale: u8) -> Option<String> {
     let cents = i64_at(bytes, 0)?;
     if bytes.len() != 8 {
         return None;
     }
-    let scale = u32::from(crate::sync::pg::binary::money_scale());
+    let scale = u32::from(money_scale);
     if scale == 0 {
         return Some(cents.to_string());
     }
@@ -203,13 +202,9 @@ fn macaddr(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
 
-    fn raw(type_oid: u32, bytes: Vec<u8>) -> Raw {
-        Raw {
-            type_oid,
-            bytes: Bytes::from(bytes),
-        }
+    fn raw(type_oid: u32, bytes: Vec<u8>) -> (u32, Vec<u8>) {
+        (type_oid, bytes)
     }
 
     fn interval_bytes(micros: i64, days: i32, months: i32) -> Vec<u8> {
@@ -223,8 +218,10 @@ mod tests {
 
     #[test]
     fn intervals_read_as_postgres_writes_them() {
-        let text =
-            |micros, days, months| raw_text(&raw(INTERVAL, interval_bytes(micros, days, months)));
+        let text = |micros, days, months| {
+            let (oid, bytes) = raw(INTERVAL, interval_bytes(micros, days, months));
+            raw_text(oid, &bytes, 2)
+        };
         assert_eq!(
             text(11_045_000_000, 2, 12).as_deref(),
             Some("1 year 2 days 03:04:05")
@@ -244,11 +241,11 @@ mod tests {
         let bytes =
             |micros: i64, west: i32| [&micros.to_be_bytes()[..], &west.to_be_bytes()].concat();
         assert_eq!(
-            raw_text(&raw(TIMETZ, bytes(36_000_000_000, -19_800))).as_deref(),
+            raw_text(TIMETZ, &bytes(36_000_000_000, -19_800), 2).as_deref(),
             Some("10:00:00+05:30")
         );
         assert_eq!(
-            raw_text(&raw(TIMETZ, bytes(500_000, 18_000))).as_deref(),
+            raw_text(TIMETZ, &bytes(500_000, 18_000), 2).as_deref(),
             Some("00:00:00.5-05")
         );
     }
@@ -256,22 +253,22 @@ mod tests {
     #[test]
     fn addresses_read_as_postgres_writes_them() {
         assert_eq!(
-            raw_text(&raw(INET, vec![2, 32, 0, 4, 10, 0, 0, 1])).as_deref(),
+            raw_text(INET, &[2, 32, 0, 4, 10, 0, 0, 1], 2).as_deref(),
             Some("10.0.0.1")
         );
         assert_eq!(
-            raw_text(&raw(INET, vec![2, 8, 0, 4, 10, 0, 0, 1])).as_deref(),
+            raw_text(INET, &[2, 8, 0, 4, 10, 0, 0, 1], 2).as_deref(),
             Some("10.0.0.1/8")
         );
         assert_eq!(
-            raw_text(&raw(CIDR, vec![2, 32, 1, 4, 10, 0, 0, 1])).as_deref(),
+            raw_text(CIDR, &[2, 32, 1, 4, 10, 0, 0, 1], 2).as_deref(),
             Some("10.0.0.1/32")
         );
         let mut v6 = vec![3, 128, 0, 16];
         v6.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
-        assert_eq!(raw_text(&raw(INET, v6)).as_deref(), Some("::1"));
+        assert_eq!(raw_text(INET, &v6, 2).as_deref(), Some("::1"));
         assert_eq!(
-            raw_text(&raw(MACADDR, vec![8, 0, 0x2b, 1, 2, 3])).as_deref(),
+            raw_text(MACADDR, &[8, 0, 0x2b, 1, 2, 3], 2).as_deref(),
             Some("08:00:2b:01:02:03")
         );
     }
@@ -286,23 +283,23 @@ mod tests {
         vector.extend_from_slice(b"it's\0");
         vector.extend_from_slice(&0u16.to_be_bytes());
         assert_eq!(
-            raw_text(&raw(TSVECTOR, vector)).as_deref(),
+            raw_text(TSVECTOR, &vector, 2).as_deref(),
             Some("'cat':3A,5 'it''s'")
         );
         assert_eq!(
-            raw_text(&raw(MONEY, 123_456i64.to_be_bytes().to_vec())).as_deref(),
+            raw_text(MONEY, &123_456i64.to_be_bytes(), 2).as_deref(),
             Some("1234.56")
         );
         assert_eq!(
-            raw_text(&raw(MONEY, (-5i64).to_be_bytes().to_vec())).as_deref(),
+            raw_text(MONEY, &(-5i64).to_be_bytes(), 2).as_deref(),
             Some("-0.05")
         );
     }
 
     #[test]
     fn malformed_or_unknown_values_have_no_text() {
-        assert_eq!(raw_text(&raw(INTERVAL, vec![0; 3])), None);
-        assert_eq!(raw_text(&raw(INET, vec![2, 32, 0, 4, 10])), None);
-        assert_eq!(raw_text(&raw(600, vec![0; 16])), None);
+        assert_eq!(raw_text(INTERVAL, &[0; 3], 2), None);
+        assert_eq!(raw_text(INET, &[2, 32, 0, 4, 10], 2), None);
+        assert_eq!(raw_text(600, &[0; 16], 2), None);
     }
 }

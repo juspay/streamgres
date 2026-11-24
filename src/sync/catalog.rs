@@ -50,7 +50,9 @@ impl CatalogHandle {
     }
 }
 
-/// `catalog` with `table` in it, replacing a table of the same name.
+/// `catalog` with `table` in it, replacing a table of the same name. The
+/// source's money scale carries over: a migration changes the schema, not
+/// the instance's `lc_monetary`.
 pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
     let name = table.name.clone();
     Catalog::new(
@@ -60,16 +62,17 @@ pub fn with_table(catalog: &Catalog, table: DbTable) -> Catalog {
             .cloned()
             .chain(std::iter::once(table)),
     )
+    .with_money_scale(catalog.money_scale())
 }
 
 /// `table` with `column` added: the same name and key, one column more.
+/// The held columns and the added one keep their source metadata (type
+/// OIDs, domain flag) — rebuilding a column from its name and type alone
+/// would leave the decoder without an OID and the read path without a
+/// domain to prepare for.
 pub fn with_column(table: &DbTable, column: DbColumn) -> DbTable {
-    let mut columns: Vec<DbColumn> = table
-        .columns
-        .values()
-        .map(|held| DbColumn::new(held.name.clone(), held.r#type.clone()))
-        .collect();
-    columns.push(DbColumn::new(column.name, column.r#type));
+    let mut columns: Vec<DbColumn> = table.columns.values().cloned().collect();
+    columns.push(column);
     DbTable::new(table.name.clone(), table.pkey.iter().cloned(), columns)
 }
 
@@ -115,5 +118,37 @@ mod tests {
         assert!(after.table("tickets").unwrap().column("owner").is_some());
         assert!(before.table("tickets").unwrap().column("owner").is_none());
         assert_eq!(after.tables().count(), 2);
+    }
+
+    /// A migration must not undo the source's `lc_monetary` scale, and
+    /// widening a table must keep every column's source metadata — the
+    /// OIDs a binary decode dispatches on, and the domain flag the read
+    /// path prepares for.
+    #[test]
+    fn a_migration_keeps_the_sources_money_scale_and_the_columns_metadata() {
+        let tickets = DbTable::new(
+            "tickets",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int)
+                    .with_type_oid(20)
+                    .with_is_domain(true),
+                DbColumn::new("amount", ValueType::Raw).with_type_oid(790),
+            ],
+        );
+        let before = Catalog::new(vec![tickets.clone()]).with_money_scale(0);
+
+        let wider = with_column(
+            &tickets,
+            DbColumn::new("owner", ValueType::String).with_type_oid(25),
+        );
+        let next = with_table(&before, wider);
+
+        assert_eq!(next.money_scale(), 0, "a migration does not reset the scale");
+        let held = next.table("tickets").unwrap();
+        assert_eq!(held.column("id").unwrap().type_oid, 20);
+        assert!(held.column("id").unwrap().is_domain);
+        assert_eq!(held.column("amount").unwrap().type_oid, 790);
+        assert_eq!(held.column("owner").unwrap().type_oid, 25);
     }
 }

@@ -298,12 +298,13 @@ impl Decoder {
     /// The catalog writes one row message stands for: none for a table
     /// the catalog does not declare, two for a primary-key change.
     fn writes_of(&self, message: &Message<'_>) -> Result<Vec<WriteQuery>, StorageError> {
+        let scale = self.catalog.money_scale();
         match message {
             Message::Insert { relation, new } => {
                 let Some((table, columns)) = self.declared(*relation) else {
                     return Ok(Vec::new());
                 };
-                let row = image(table, columns, new)?;
+                let row = image(table, columns, new, scale)?;
                 Ok(vec![WriteQuery::INSERT(InsertQuery {
                     table: table.name.clone(),
                     pkey_value: key_of(&row, table),
@@ -314,10 +315,10 @@ impl Decoder {
                 let Some((table, columns)) = self.declared(*relation) else {
                     return Ok(Vec::new());
                 };
-                let new = image(table, columns, new)?;
+                let new = image(table, columns, new, scale)?;
                 let new_key = key_of(&new, table);
                 let old_key = match old {
-                    Some(old) => Some(key_of(&image(table, columns, old)?, table)),
+                    Some(old) => Some(key_of(&image(table, columns, old, scale)?, table)),
                     None => None,
                 };
                 match old_key.filter(|old_key| *old_key != new_key) {
@@ -345,7 +346,7 @@ impl Decoder {
                 };
                 Ok(vec![WriteQuery::DELETE(DeleteQuery {
                     table: table.name.clone(),
-                    pkey_value: key_of(&image(table, columns, old)?, table),
+                    pkey_value: key_of(&image(table, columns, old, scale)?, table),
                 })])
             }
             Message::Truncate => Err(StorageError(
@@ -1095,6 +1096,7 @@ fn image(
     table: &DbTable,
     columns: &[Described],
     tuple: &[Cell<'_>],
+    money_scale: u8,
 ) -> Result<DataFrameRow, StorageError> {
     let mut data = HashMap::new();
     let mut unchanged: Vec<ColumnName> = Vec::new();
@@ -1109,7 +1111,7 @@ fn image(
                     0 => described.type_oid,
                     known => known,
                 };
-                binary::decode_source(&declared.r#type, type_oid, bytes).map_err(|error| {
+                binary::decode_source(&declared.r#type, type_oid, bytes, money_scale).map_err(|error| {
                     StorageError(format!("`{}`.`{}`: {error}", table.name, declared.name))
                 })?
             }

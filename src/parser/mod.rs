@@ -508,6 +508,14 @@ impl Parser {
             let mut clauses = Vec::new();
             loop {
                 let column = self.column_name(table)?;
+                if table
+                    .column(column.as_str())
+                    .is_some_and(|c| !crate::model::supports(crate::model::Capability::Order, &c.r#type))
+                {
+                    return self.err(format!(
+                        "`{column}` has a type the server does not order the way Postgres does, so ORDER BY is not supported on it"
+                    ));
+                }
                 let direction = if self.eat_word("DESC") {
                     Order::DESC
                 } else {
@@ -823,6 +831,17 @@ impl Parser {
                 self.describe()
             ));
         };
+        if matches!(
+            comparison_operator,
+            ComparisonOperator::GT | ComparisonOperator::GTE | ComparisonOperator::LT | ComparisonOperator::LTE
+        ) && table
+            .column(column.as_str())
+            .is_some_and(|c| !crate::model::supports(crate::model::Capability::Order, &c.r#type))
+        {
+            return self.err(format!(
+                "`{column}` has a type the server does not order the way Postgres does, so range filters are not supported on it"
+            ));
+        }
         let value = self.condition_value(table, &column)?;
         Ok(Where::Condition(Condition {
             column,

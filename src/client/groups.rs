@@ -1642,7 +1642,12 @@ fn result_entry(write: &WriteQuery) -> Option<(String, Json)> {
     let entry = match write {
         WriteQuery::DELETE(_) => protocol::result_del(&client, id),
         _ => {
-            let result: Json = serde_json::from_str(&text("result")?).ok()?;
+            let result_text = match row.get("result") {
+                Some(Value::String(text)) => Some(text.clone()),
+                Some(Value::Json(json)) => Some(json.text().to_owned()),
+                _ => None,
+            };
+            let result: Json = serde_json::from_str(&result_text?).ok()?;
             protocol::result_put(&client, id, result)
         }
     };
@@ -1841,7 +1846,7 @@ fn coalesce(rows: Vec<RowOp>) -> Vec<RowOp> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ColumnName;
+    use crate::model::{ColumnName, JsonText};
 
     /// A holder of a row: subscription `sub`, main part.
     fn holder(sub: u64) -> IdSet<(SubId, QueryPart)> {
@@ -2224,7 +2229,10 @@ mod tests {
         ];
         let key = DataFrameKey::from(columns.iter().cloned().collect::<HashMap<_, _>>());
         if let Some(result) = result {
-            columns.push((ColumnName::from("result"), Value::from(result)));
+            columns.push((
+                ColumnName::from("result"),
+                Value::Json(JsonText::standard_only(result.to_owned())),
+            ));
         }
         (
             key,

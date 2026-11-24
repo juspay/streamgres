@@ -192,10 +192,16 @@ fn node(
     };
     let mut order = Vec::with_capacity(ast.order_by.len() + table.pkey.len());
     for (column, direction) in &ast.order_by {
-        if table.column(column).is_none() {
-            return Err(format!(
+        let declared = table.column(column).ok_or_else(|| {
+            format!(
                 "unknown column `{}.{column}` in ORDER BY",
                 ast.table
+            )
+        })?;
+        if !crate::model::supports(crate::model::Capability::Order, &declared.r#type) {
+            return Err(format!(
+                "`{column}` is `{}`; the server does not order it the way Postgres does, so ORDER BY is not supported on it",
+                declared.r#type.type_name()
             ));
         }
         let direction = match direction.as_str() {
@@ -533,7 +539,7 @@ fn simple(op: &str, left: &Operand, right: &Operand, table: &DbTable) -> Result<
     let column = table
         .column(name)
         .ok_or_else(|| format!("unknown column `{}.{name}`", table.name))?;
-    if column.r#type == ValueType::Raw {
+    if !crate::model::supports(crate::model::Capability::Filter, &column.r#type) {
         return Err(format!(
             "`{name}` has a type the server does not compare; it can be read, not filtered on"
         ));
@@ -577,6 +583,14 @@ fn simple(op: &str, left: &Operand, right: &Operand, table: &DbTable) -> Result<
         }
         other => return Err(format!("unknown operator `{other}`")),
     };
+    if matches!(operator, LT | LTE | GT | GTE)
+        && !crate::model::supports(crate::model::Capability::Order, &column.r#type)
+    {
+        return Err(format!(
+            "`{name}` is `{}`; the server does not order it the way Postgres does, so range filters are not supported on it",
+            column.r#type.type_name()
+        ));
+    }
     let value = if matches!(
         operator,
         ComparisonOperator::IN | ComparisonOperator::NOT_IN
