@@ -234,7 +234,7 @@ pub async fn load(
     Ok(Json(json!({
         "cached": cached,
         "postgres": postgres,
-        "measurement": "in-service reads with Diesel decoding; no serialization, pool wait or HTTP; percentiles use the last 512 samples per worker",
+        "measurement": "in-service reads: the query, decoding and the JSON value; the app pool's connection wait and HTTP excluded, a Streamgres fallback's checkout included; percentiles use the last 512 samples per worker",
     })))
 }
 

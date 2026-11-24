@@ -252,10 +252,12 @@
               <details class="measurement-note">
                 <summary>What do these numbers measure?</summary>
                 <p>
-                  Time inside this service: the Diesel query, cache adapter,
-                  decoding and result serialization. Pool wait and the browser's
-                  HTTP round trip are separate. One sample is not a capacity
-                  benchmark.
+                  Time inside this service for one read: the query through
+                  Streamgres or Diesel, decoding its rows and building the JSON
+                  value. Waiting for a connection of the app's pool is shown
+                  separately; a Streamgres fallback's own checkout is included.
+                  Sending the response and the browser's round trip are not.
+                  One sample is not a capacity benchmark.
                 </p>
                 <p id="race-pool">
                   Pool waits will appear after the next comparison.
@@ -570,8 +572,9 @@
               </form>
               <div id="load-result" class="load-result">
                 <p class="fine-print">
-                  Measures the service, including pooling and serialization. It
-                  excludes HTTP network time.
+                  Times reads inside the service: the query, decoding and the
+                  JSON value. The app pool's connection wait is left out, a
+                  Streamgres fallback's checkout is in, and no HTTP is timed.
                 </p>
               </div>
             </article>

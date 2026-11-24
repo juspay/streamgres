@@ -449,7 +449,11 @@ pub struct Answer {
     pub answered_by: Option<String>,
     /// Why the engine did not answer, when it did not.
     pub refusal: Option<String>,
+    /// The read, its decoding and its JSON value, without the wait for a
+    /// connection of the app's pool; a Streamgres fallback's own checkout
+    /// is included.
     pub elapsed_us: f64,
+    /// The wait for a connection of the app's pool.
     pub pool_wait_us: f64,
     pub rows: usize,
     pub data: Value,
