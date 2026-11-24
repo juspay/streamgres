@@ -120,6 +120,8 @@ pub struct Config {
     /// `STREAMGRES_GROUP_TTL_MS`: how long a client group's subscriptions
     /// stay registered after its last connection closes (60000).
     pub group_ttl: Duration,
+    /// `STREAMGRES_ACK_HOLD_LIMIT_MS`: how long a held mutation ack waits for its rows before the group is dropped (30000).
+    pub ack_hold_limit: Duration,
     /// `STREAMGRES_GROUP_LOG_BYTES`: how many bytes of its most recent
     /// pokes a client group keeps, the oldest dropped as new ones are
     /// sent, so a client that reconnects behind the group (its socket
@@ -376,6 +378,7 @@ impl Config {
             client_timeout: millis("STREAMGRES_CLIENT_TIMEOUT_MS", 45_000)?,
             pong_interval: millis("STREAMGRES_PONG_INTERVAL_MS", 3_000)?,
             group_ttl: millis("STREAMGRES_GROUP_TTL_MS", 60_000)?,
+            ack_hold_limit: millis("STREAMGRES_ACK_HOLD_LIMIT_MS", 30_000)?,
             group_log_bytes: match first(&["STREAMGRES_GROUP_LOG_BYTES"]) {
                 Some(text) => text.parse().map_err(|_| {
                     format!("STREAMGRES_GROUP_LOG_BYTES must be a number of bytes, got `{text}`")

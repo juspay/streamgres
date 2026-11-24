@@ -217,6 +217,7 @@ static GLOBAL: OnceLock<Arc<Stats>> = OnceLock::new();
 /// - `engine_to_groups`: from the engine sending its commit event to a
 ///   group thread taking it up.
 /// - `groups_flush`: one flush of a group thread (every poke it built).
+/// - `ack_hold`: a group's poke held because a mutation ack waits on reads its rows need.
 /// - `groups_to_socket`: from a poke being handed to a connection's
 ///   writer to its last frame written (per poke and connection).
 /// - `end_to_end`: from the feed decoding the oldest transaction a poke
@@ -273,6 +274,7 @@ pub struct Stats {
     pub engine_step: Histogram,
     pub engine_to_groups: Histogram,
     pub groups_flush: Histogram,
+    pub ack_hold: Histogram,
     pub groups_to_socket: Histogram,
     pub end_to_end: Histogram,
     pub transform: Histogram,
@@ -344,6 +346,8 @@ pub struct Stats {
     pub connects_from_state: AtomicU64,
     pub connects_from_log: AtomicU64,
     pub connects_reset: AtomicU64,
+    /// Client groups dropped because a mutation ack waited too long for its rows.
+    pub ack_hold_drops: AtomicU64,
     /// Storage reads that came back with at least half, and at least four
     /// fifths, of the row limit: the queries to look at before they are
     /// refused.
@@ -458,6 +462,7 @@ impl Stats {
             engine_step: Histogram::new(),
             engine_to_groups: Histogram::new(),
             groups_flush: Histogram::new(),
+            ack_hold: Histogram::new(),
             groups_to_socket: Histogram::new(),
             end_to_end: Histogram::new(),
             transform: Histogram::new(),
@@ -512,6 +517,7 @@ impl Stats {
             connects_from_state: AtomicU64::new(0),
             connects_from_log: AtomicU64::new(0),
             connects_reset: AtomicU64::new(0),
+            ack_hold_drops: AtomicU64::new(0),
             reads_over_half: AtomicU64::new(0),
             reads_over_80: AtomicU64::new(0),
             read_row_limit: AtomicU64::new(0),
@@ -758,6 +764,7 @@ impl Stats {
             ("engine_step", &self.engine_step),
             ("engine_to_groups", &self.engine_to_groups),
             ("groups_flush", &self.groups_flush),
+            ("ack_hold", &self.ack_hold),
             ("groups_to_socket", &self.groups_to_socket),
             ("end_to_end", &self.end_to_end),
             ("transform", &self.transform),
@@ -832,6 +839,7 @@ impl Stats {
             ("connects_from_state", load(&self.connects_from_state)),
             ("connects_from_log", load(&self.connects_from_log)),
             ("connects_reset", load(&self.connects_reset)),
+            ("ack_hold_drops", load(&self.ack_hold_drops)),
             ("reads_over_half", load(&self.reads_over_half)),
             ("reads_over_80", load(&self.reads_over_80)),
             ("log_dropped", crate::log::dropped()),
@@ -1609,6 +1617,7 @@ fn metric_of(stage: &str) -> &'static str {
         "engine_step" | "register_step" | "unregister_step" | "land_step" => "engine_step_seconds",
         "engine_to_groups" => "engine_to_groups_seconds",
         "groups_flush" => "groups_flush_seconds",
+        "ack_hold" => "ack_hold_seconds",
         "groups_to_socket" => "groups_to_socket_seconds",
         "end_to_end" => "end_to_end_seconds",
         "transform" => "transform_seconds",
@@ -1658,6 +1667,7 @@ fn stage_help(stage: &str) -> &'static str {
         }
         "engine_to_groups" => "the engine's commit event's wait for a group thread",
         "groups_flush" => "one flush of a group thread",
+        "ack_hold" => "a mutation ack held until the reads its rows wait on land",
         "groups_to_socket" => "a poke's wait from the writer to its last frame written",
         "end_to_end" => "the oldest transaction of a poke to its last frame written",
         "transform" => "one round trip to the application server for ASTs",
@@ -1776,6 +1786,9 @@ fn measure_help(name: &str) -> &'static str {
         | "connections_refused_schema" => "client connections by event and reason",
         "connects_current" | "connects_from_state" | "connects_from_log" | "connects_reset" => {
             "connections by what they were owed since their cookie: nothing, the group's state, its logged pokes, or told to start over"
+        }
+        "ack_hold_drops" => {
+            "client groups dropped because a mutation ack waited too long for the rows it confirms"
         }
         "reads_over_half" | "reads_over_80" => {
             "storage reads that returned at least this percentage of the row limit"

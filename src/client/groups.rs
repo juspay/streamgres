@@ -76,7 +76,9 @@
 //! The application's mutation ids arrive as writes to its clients table,
 //! which the engine side carries inside the transaction's own
 //! [`Event::Committed`], so a mutation's rows and its id go out in the
-//! same poke and no later transaction's id rides out early. At every
+//! same poke and no later transaction's id rides out early. When those rows
+//! wait on storage reads the commit opened, the group's poke is held until
+//! the reads close, so the id never reaches the client before its rows. At every
 //! connect they are also read from the table itself, merged into what the
 //! group knows, and sent with the connection's first poke: the state
 //! poke, the replayed pokes, or a poke of their own at the next flush.
@@ -109,14 +111,14 @@ use super::ast::Translated;
 use super::config::Config;
 use super::protocol;
 use super::wire;
-use crate::ivm::{Delta, QueryPart};
+use crate::ivm::{Delta, FetchId, QueryPart};
 use crate::log::{Level, log_debug, log_event, log_info, log_warn};
 use crate::model::{
     Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, Lsn,
     MultiTableReadQuery, RowData, SubId, TableName, Value, WriteQuery,
 };
 use crate::stats::Stats;
-use crate::sync::{CatalogHandle, Command, Event};
+use crate::sync::{CatalogHandle, Command, Event, Opened};
 
 /// What goes out on one connection: a text frame, one poke (its frames
 /// written together, one flush; `since` is when the feed decoded the
@@ -402,6 +404,8 @@ struct Group {
     /// they have doubled, so holding them costs each delta once.
     queued_floor: usize,
     log: PokeLog,
+    /// Storage reads still out that this group's rows wait on.
+    reads: IdSet<FetchId>,
 }
 
 /// A group's most recent pokes as the frames that were sent, oldest
@@ -495,6 +499,7 @@ impl Group {
             queued_rows: Vec::new(),
             queued_floor: 0,
             log: PokeLog::default(),
+            reads: IdSet::default(),
         }
     }
 
@@ -509,6 +514,12 @@ impl Group {
             });
         }
     }
+}
+
+/// A held poke: when the hold began, and the clock of the flush it was held from.
+struct Hold {
+    at: Instant,
+    since: Option<Instant>,
 }
 
 /// One group thread's state.
@@ -546,6 +557,10 @@ pub struct Groups {
     result_changes: HashMap<String, Vec<Json>>,
     /// Groups with something to hear at the next flush.
     dirty: HashSet<String>,
+    /// The groups each open read was announced to.
+    read_groups: IdMap<FetchId, Vec<String>>,
+    /// Groups whose poke waits for reads because it carries a mutation ack.
+    held: HashMap<String, Hold>,
     clients_table: TableName,
     mutations_table: TableName,
     next_poke: u64,
@@ -590,6 +605,8 @@ pub async fn run(
         lmid_changes: HashMap::new(),
         result_changes: HashMap::new(),
         dirty: HashSet::new(),
+        read_groups: IdMap::default(),
+        held: HashMap::new(),
         next_poke: 1,
         next_generation: 0,
     };
@@ -601,7 +618,11 @@ pub async fn run(
     let mut taken_requests = Vec::with_capacity(256);
     let mut taken_events = Vec::with_capacity(1024);
     loop {
+        let deadline = core.hold_deadline();
         tokio::select! {
+            _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
+                core.drop_stuck();
+            }
             taken = requests_rx.recv_many(&mut taken_requests, 256) => {
                 core.stats.set_groups_inbox(shard, requests_rx.len() as u64);
                 if taken == 0 {
@@ -690,7 +711,17 @@ impl Groups {
                 self.registered(token, sub, reads);
                 self.absorb(updates);
             }
-            Event::Landed { updates } => self.absorb(updates),
+            Event::Landed {
+                updates,
+                closed,
+                opened,
+            } => {
+                self.absorb(updates);
+                self.open_reads(opened);
+                if let Some(id) = closed {
+                    self.close_read(id);
+                }
+            }
             Event::Refused { sub, reason } => self.refused(sub, &reason),
             Event::Capped { sub } => self.capped(sub),
             Event::Heavy { sub, table, rows } => self.heavy(sub, table.as_str(), rows),
@@ -735,8 +766,10 @@ impl Groups {
                 watched,
                 received,
                 routed,
+                opened,
             } => {
                 self.absorb(updates);
+                self.open_reads(opened);
                 self.stats.engine_to_groups.record(routed.elapsed());
                 self.oldest = Some(match self.oldest {
                     Some(oldest) => oldest.min(received),
@@ -1036,7 +1069,100 @@ impl Groups {
             }
             self.pending.remove(group_id);
             self.lmid_changes.remove(group_id);
+            self.result_changes.remove(group_id);
+            self.held.remove(group_id);
             self.dirty.remove(group_id);
+        }
+    }
+
+    /// Note which of this thread's groups wait on each opened read.
+    fn open_reads(&mut self, opened: Vec<Opened>) {
+        for (id, subs) in opened {
+            for sub in subs {
+                let Some((group_id, _)) = self.by_sub.get(&sub) else {
+                    continue;
+                };
+                let Some(group) = self.groups.get_mut(group_id) else {
+                    continue;
+                };
+                if group.reads.insert(id) {
+                    self.read_groups
+                        .entry(id)
+                        .or_default()
+                        .push(group_id.clone());
+                }
+            }
+        }
+    }
+
+    /// A read closed: a held group waiting on nothing else is poked at the next flush.
+    fn close_read(&mut self, id: FetchId) {
+        for group_id in self.read_groups.remove(&id).unwrap_or_default() {
+            let Some(group) = self.groups.get_mut(&group_id) else {
+                continue;
+            };
+            group.reads.remove(&id);
+            if group.reads.is_empty() && self.held.contains_key(&group_id) {
+                self.dirty.insert(group_id);
+            }
+        }
+    }
+
+    /// Whether the group's poke waits: it carries a mutation ack and its rows wait on reads. A release takes the held flush's clock into `since`.
+    fn held_back(&mut self, group_id: &str, since: &mut Option<Instant>) -> bool {
+        let waiting = self
+            .groups
+            .get(group_id)
+            .is_some_and(|group| !group.reads.is_empty());
+        let acking =
+            self.lmid_changes.contains_key(group_id) || self.result_changes.contains_key(group_id);
+        if waiting && acking {
+            self.held.entry(group_id.to_owned()).or_insert(Hold {
+                at: Instant::now(),
+                since: *since,
+            });
+            return true;
+        }
+        if let Some(hold) = self.held.remove(group_id) {
+            self.stats.ack_hold.record(hold.at.elapsed());
+            *since = match (hold.since, *since) {
+                (Some(held), Some(now)) => Some(held.min(now)),
+                (held, now) => held.or(now),
+            };
+        }
+        false
+    }
+
+    /// When the oldest held poke runs out of time.
+    fn hold_deadline(&self) -> Option<tokio::time::Instant> {
+        let oldest = self.held.values().map(|hold| hold.at).min()?;
+        Some(tokio::time::Instant::from_std(
+            oldest + self.config.ack_hold_limit,
+        ))
+    }
+
+    /// Drop every group held past the limit, closing its connections, so its clients start over rather than see an ack before its rows.
+    fn drop_stuck(&mut self) {
+        let limit = self.config.ack_hold_limit;
+        let stuck: Vec<String> = self
+            .held
+            .iter()
+            .filter(|(_, hold)| hold.at.elapsed() >= limit)
+            .map(|(group_id, _)| group_id.clone())
+            .collect();
+        for group_id in stuck {
+            if let Some(group) = self.groups.get(&group_id) {
+                for socket in group.sockets.values() {
+                    let _ = socket.sink.send(Outbound::Close);
+                }
+            }
+            log_warn!(
+                "client group {group_id} dropped: a mutation ack waited {} ms for its rows",
+                limit.as_millis()
+            );
+            self.stats.ack_hold_drops.fetch_add(1, Ordering::Relaxed);
+            self.held.remove(&group_id);
+            self.drop_group(&group_id);
         }
     }
 
@@ -1472,7 +1598,10 @@ impl Groups {
     /// waiting, coalesced, and stands still: no frames, no new version,
     /// so the client that returns with the group's cookie is owed exactly
     /// what waits here.
-    fn poke(&mut self, group_id: &str, since: Option<Instant>) {
+    fn poke(&mut self, group_id: &str, mut since: Option<Instant>) {
+        if self.held_back(group_id, &mut since) {
+            return;
+        }
         let lmid_changes = self.lmid_changes.remove(group_id).unwrap_or_default();
         let result_changes = self.result_changes.remove(group_id).unwrap_or_default();
         let Some(group) = self.groups.get_mut(group_id) else {
@@ -1986,6 +2115,8 @@ mod tests {
                 lmid_changes: HashMap::new(),
                 result_changes: HashMap::new(),
                 dirty: HashSet::new(),
+                read_groups: IdMap::default(),
+                held: HashMap::new(),
                 next_poke: 1,
                 next_generation: 0,
             };
@@ -2043,7 +2174,12 @@ mod tests {
         /// group `g`: the write to the clients table, as the feed carries
         /// it.
         fn mutation_recorded(&mut self, client: &str, lmid: i64) {
-            let table = self.core.clients_table.clone();
+            let write = self.lmid_write(client, lmid);
+            self.core.note_lmid(&write);
+        }
+
+        /// The clients-table write recording mutation `lmid` of `client` in group `g`.
+        fn lmid_write(&self, client: &str, lmid: i64) -> WriteQuery {
             let key = DataFrameKey::from(HashMap::from([
                 (ColumnName::from("clientGroupID"), Value::from("g")),
                 (ColumnName::from("clientID"), Value::from(client)),
@@ -2053,12 +2189,38 @@ mod tests {
                 (ColumnName::from("clientID"), Value::from(client)),
                 (ColumnName::from("lastMutationID"), Value::Int(lmid)),
             ]));
-            self.core
-                .note_lmid(&WriteQuery::INSERT(crate::model::InsertQuery {
-                    table,
-                    pkey_value: key,
-                    record,
-                }));
+            WriteQuery::INSERT(crate::model::InsertQuery {
+                table: self.core.clients_table.clone(),
+                pkey_value: key,
+                record,
+            })
+        }
+
+        /// A transaction commits with `updates`, the reads it `opened` and, when given, a mutation ack; the thread flushes.
+        fn commit(&mut self, updates: Vec<Delta>, opened: Vec<Opened>, ack: Option<(&str, i64)>) {
+            let watched = ack
+                .map(|(client, lmid)| vec![self.lmid_write(client, lmid)])
+                .unwrap_or_default();
+            self.core.event(Event::Committed {
+                updates,
+                position: Lsn(1),
+                floor: Lsn(1),
+                watched,
+                received: Instant::now(),
+                routed: Instant::now(),
+                opened,
+            });
+            self.core.flush();
+        }
+
+        /// A read lands with `updates`, closing `closed` and opening `opened`; the thread flushes.
+        fn land(&mut self, updates: Vec<Delta>, closed: u64, opened: Vec<Opened>) {
+            self.core.event(Event::Landed {
+                updates,
+                closed: Some(FetchId(closed)),
+                opened,
+            });
+            self.core.flush();
         }
 
         /// The application recorded `result` (JSON text, as the feed carries
@@ -2127,7 +2289,11 @@ mod tests {
 
         /// Deltas arrive from the engine side and the thread flushes.
         fn deliver(&mut self, updates: Vec<Delta>) {
-            self.core.event(Event::Landed { updates });
+            self.core.event(Event::Landed {
+                updates,
+                closed: None,
+                opened: Vec::new(),
+            });
             self.core.flush();
         }
 
@@ -2481,6 +2647,143 @@ mod tests {
                 state[0].puts,
                 vec![(2, "two".to_owned()), (3, "three".to_owned())]
             );
+        });
+    }
+
+    /// A read opened for subscription 1.
+    fn read(id: u64) -> Vec<Opened> {
+        vec![(FetchId(id), vec![SubId(1)])]
+    }
+
+    #[test]
+    fn an_ack_waits_for_the_reads_its_rows_need() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut tab = bench.connect("t", None).expect("accepted");
+            bench.hydrate(&tab, "q", 1, &[(1, "one")]);
+            tab.pokes();
+
+            bench.commit(vec![put(1, 2, "two")], read(7), Some(("c", 5)));
+            assert!(tab.pokes().is_empty(), "the ack waits for read 7");
+
+            bench.land(vec![put(1, 3, "three")], 7, Vec::new());
+            let heard = tab.pokes();
+            assert_eq!(heard.len(), 1, "{heard:?}");
+            assert_eq!(
+                heard[0].puts,
+                vec![(2, "two".to_owned()), (3, "three".to_owned())]
+            );
+            assert_eq!(heard[0].lmids, vec![("c".to_owned(), 5)]);
+            assert!(bench.core.held.is_empty());
+        });
+    }
+
+    #[test]
+    fn an_ack_waits_for_the_reads_a_landing_starts() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut tab = bench.connect("t", None).expect("accepted");
+            bench.hydrate(&tab, "q", 1, &[(1, "one")]);
+            tab.pokes();
+
+            bench.commit(vec![put(1, 2, "two")], read(7), Some(("c", 5)));
+            bench.land(vec![put(1, 3, "three")], 7, read(8));
+            assert!(tab.pokes().is_empty(), "read 8 is still out");
+
+            bench.land(vec![put(1, 4, "four")], 8, Vec::new());
+            let heard = tab.pokes();
+            assert_eq!(heard.len(), 1, "{heard:?}");
+            assert_eq!(heard[0].puts.len(), 3);
+            assert_eq!(heard[0].lmids, vec![("c".to_owned(), 5)]);
+        });
+    }
+
+    #[test]
+    fn a_read_closing_with_no_rows_releases_the_ack() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut tab = bench.connect("t", None).expect("accepted");
+            bench.hydrate(&tab, "q", 1, &[(1, "one")]);
+            tab.pokes();
+
+            bench.commit(vec![put(1, 2, "two")], read(7), Some(("c", 5)));
+            bench.land(Vec::new(), 7, Vec::new());
+            let heard = tab.pokes();
+            assert_eq!(heard.len(), 1, "{heard:?}");
+            assert_eq!(heard[0].puts, vec![(2, "two".to_owned())]);
+            assert_eq!(heard[0].lmids, vec![("c".to_owned(), 5)]);
+        });
+    }
+
+    #[test]
+    fn nothing_is_held_without_both_an_ack_and_an_open_read() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut tab = bench.connect("t", None).expect("accepted");
+            bench.hydrate(&tab, "q", 1, &[(1, "one")]);
+            tab.pokes();
+
+            bench.commit(vec![put(1, 2, "two")], Vec::new(), Some(("c", 5)));
+            let heard = tab.pokes();
+            assert_eq!(heard.len(), 1, "an ack with no read out goes at once");
+            assert_eq!(heard[0].lmids, vec![("c".to_owned(), 5)]);
+
+            bench.commit(vec![put(1, 3, "three")], read(7), None);
+            let heard = tab.pokes();
+            assert_eq!(heard.len(), 1, "rows with no ack go at once");
+            assert_eq!(heard[0].puts, vec![(3, "three".to_owned())]);
+            assert!(bench.core.held.is_empty());
+        });
+    }
+
+    #[test]
+    fn later_acks_wait_behind_a_held_one() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut tab = bench.connect("t", None).expect("accepted");
+            bench.hydrate(&tab, "q", 1, &[(1, "one")]);
+            tab.pokes();
+
+            bench.commit(vec![put(1, 2, "two")], read(7), Some(("c", 5)));
+            bench.commit(vec![put(1, 3, "three")], Vec::new(), Some(("c", 6)));
+            assert!(tab.pokes().is_empty(), "ack 6 does not pass ack 5");
+
+            bench.land(vec![put(1, 4, "four")], 7, Vec::new());
+            let heard = tab.pokes();
+            assert_eq!(heard.len(), 1, "{heard:?}");
+            assert_eq!(heard[0].puts.len(), 3);
+            assert_eq!(heard[0].lmids, vec![("c".to_owned(), 6)]);
+        });
+    }
+
+    #[test]
+    fn a_group_held_past_the_limit_is_dropped() {
+        on_local(|| {
+            let mut bench = Bench::new("262144");
+            let mut tab = bench.connect("t", None).expect("accepted");
+            bench.hydrate(&tab, "q", 1, &[(1, "one")]);
+            tab.pokes();
+
+            bench.commit(vec![put(1, 2, "two")], read(7), Some(("c", 5)));
+            assert!(bench.core.hold_deadline().is_some());
+            bench.core.held.get_mut("g").expect("held").at -= bench.core.config.ack_hold_limit;
+            bench.core.drop_stuck();
+
+            assert!(!bench.core.groups.contains_key("g"));
+            assert!(bench.core.held.is_empty());
+            assert_eq!(bench.core.stats.ack_hold_drops.load(Ordering::Relaxed), 1);
+            let mut closed = false;
+            while let Ok(outbound) = tab.frames.try_recv() {
+                assert!(
+                    !matches!(outbound, Outbound::Poke { .. }),
+                    "no ack before its rows"
+                );
+                closed |= matches!(outbound, Outbound::Close);
+            }
+            assert!(closed, "the connection is closed so the client starts over");
+
+            bench.land(vec![put(1, 3, "three")], 7, Vec::new());
+            assert!(bench.core.read_groups.is_empty());
         });
     }
 
@@ -3376,6 +3679,8 @@ mod tests {
                 lmid_changes: HashMap::new(),
                 result_changes: HashMap::new(),
                 dirty: HashSet::new(),
+                read_groups: IdMap::default(),
+                held: HashMap::new(),
                 next_poke: 1,
                 next_generation: 0,
             };
@@ -4035,6 +4340,8 @@ mod tests {
                     lmid_changes: HashMap::new(),
                     result_changes: HashMap::new(),
                     dirty: HashSet::new(),
+                    read_groups: IdMap::default(),
+                    held: HashMap::new(),
                     next_poke: 1,
                     next_generation: 0,
                 };
@@ -4146,6 +4453,8 @@ mod tests {
                             Step::Land(groups, updates) => {
                                 core.event(Event::Landed {
                                     updates: updates.clone(),
+                                    closed: None,
+                                    opened: Vec::new(),
                                 });
                                 let started = Instant::now();
                                 core.flush();
