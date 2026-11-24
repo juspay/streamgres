@@ -475,6 +475,134 @@ pub struct Feed {
     progress: Lsn,
 }
 
+const CLEANUP_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+const CLEANUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct CleanupConnection {
+    client: Client,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for CleanupConnection {
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
+}
+
+async fn open_cleanup(dsn: &str) -> Result<CleanupConnection, StorageError> {
+    let mut config: tokio_postgres::Config = dsn.parse()?;
+    config.connect_timeout(CLEANUP_CONNECT_TIMEOUT);
+    let options = format!(
+        "{} -cstatement_timeout=5000 -clock_timeout=1000",
+        config.get_options().unwrap_or("")
+    );
+    config.options(&options);
+    let (client, connection) = tokio::time::timeout(
+        CLEANUP_CONNECT_TIMEOUT,
+        config.connect(tokio_postgres::NoTls),
+    )
+    .await
+    .map_err(|_| StorageError("slot cleanup connection timed out after 5 seconds".to_owned()))??;
+    let driver = tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            log_warn!("slot cleanup connection ended: {error}");
+        }
+    });
+    Ok(CleanupConnection { client, driver })
+}
+
+async fn cleanup_deadline<T>(
+    future: impl std::future::Future<Output = Result<T, StorageError>>,
+    limit: Duration,
+) -> Result<T, StorageError> {
+    tokio::time::timeout(limit, future).await.map_err(|_| {
+        StorageError(format!(
+            "slot cleanup operation exceeded its {} ms deadline",
+            limit.as_millis()
+        ))
+    })?
+}
+
+fn validate_sweep_lock_key(lock_key: &str) -> Result<(), StorageError> {
+    if lock_key.trim().is_empty() || lock_key.contains('\0') {
+        return Err(StorageError(
+            "sweep lock key must be nonblank and contain no NUL".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn sweep_slots(
+    dsn: &str,
+    keep: &str,
+    age: Duration,
+    lock_key: &str,
+) -> Result<(), StorageError> {
+    if age.as_secs_f64() > (i64::MAX / 1_000_000 - 1) as f64 {
+        return Err(StorageError(
+            "slot cleanup age exceeds the PostgreSQL interval range".to_owned(),
+        ));
+    }
+    let Some(connection) = acquire_sweep_connection(dsn, lock_key).await? else {
+        return Ok(());
+    };
+    sweep_with_permit(dsn, connection, keep, age, lock_key).await
+}
+
+async fn acquire_sweep_connection(
+    dsn: &str,
+    lock_key: &str,
+) -> Result<Option<CleanupConnection>, StorageError> {
+    validate_sweep_lock_key(lock_key)?;
+    let connection = open_cleanup(dsn).await?;
+    let acquired = try_sweep_lock(&connection.client, lock_key).await?;
+    Ok(acquired.then_some(connection))
+}
+
+async fn try_sweep_lock(client: &Client, lock_key: &str) -> Result<bool, StorageError> {
+    cleanup_deadline(
+        async {
+            client
+                .query_one(
+                    "SELECT pg_try_advisory_lock(hashtextextended($1, 0))",
+                    &[&lock_key],
+                )
+                .await
+                .map(|row| row.get(0))
+                .map_err(StorageError::from)
+        },
+        CLEANUP_OPERATION_TIMEOUT,
+    )
+    .await
+}
+
+async fn sweep_with_permit(
+    dsn: &str,
+    connection: CleanupConnection,
+    keep: &str,
+    age: Duration,
+    lock_key: &str,
+) -> Result<(), StorageError> {
+    let version: i32 = cleanup_deadline(
+        async {
+            connection
+                .client
+                .query_one("SELECT current_setting('server_version_num')::int", &[])
+                .await
+                .map(|row| row.get(0))
+                .map_err(StorageError::from)
+        },
+        CLEANUP_OPERATION_TIMEOUT,
+    )
+    .await?;
+    if version < 170_000 {
+        return Err(StorageError(format!(
+            "slot cleanup requires PostgreSQL 17 or later (server is {version})"
+        )));
+    }
+    sweep_candidates(dsn, connection, keep, age, lock_key).await
+}
+
 impl Transport {
     /// Open the replication connection to `dsn` on `slot`, streaming
     /// `publication`, after [`Transport::prepare`]. The slot is never
@@ -515,54 +643,69 @@ impl Transport {
         prepare_slot(&config, slot, publication).await.map(drop)
     }
 
-    /// Drop only our own permanent slots that PostgreSQL has reported
-    /// inactive for at least `age`. A zero age disables cleanup. PostgreSQL
-    /// added `inactive_since` in version 17; refusing to guess on older
-    /// versions is safer than deleting a slot during a live reconnect.
-    pub async fn cleanup_inactive_slots(dsn: &str, age: Duration) -> Result<(), StorageError> {
-        if age.is_zero() {
-            return Ok(());
+    pub async fn cleanup_inactive_slots(
+        dsn: &str,
+        keep: &str,
+        age: Duration,
+        lock_key: &str,
+    ) -> Result<(), StorageError> {
+        sweep_slots(dsn, keep, age, lock_key).await
+    }
+
+    pub async fn cleanup_slots_at_startup(
+        dsn: &str,
+        keep: &str,
+        age: Duration,
+        timeout: Duration,
+        lock_key: &str,
+    ) -> Result<(), StorageError> {
+        validate_sweep_lock_key(lock_key)?;
+        if timeout.is_zero() || timeout.as_millis() > i64::MAX as u128 {
+            return Err(StorageError(
+                "startup cleanup timeout must be positive and fit in signed 64-bit milliseconds"
+                    .to_owned(),
+            ));
         }
-        let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
-        let version: i32 = client
-            .query_one("SELECT current_setting('server_version_num')::int", &[])
-            .await?
-            .get(0);
-        if version < 170_000 {
-            return Err(StorageError(format!(
-                "STREAMGRES_SLOT_CLEANUP_AGE_MS requires PostgreSQL 17 or later (server is {version}); PostgreSQL 16 has no inactive_since timestamp, so safe age-bounded cleanup is impossible"
-            )));
+        if age.as_secs_f64() > (i64::MAX / 1_000_000 - 1) as f64 {
+            return Err(StorageError(
+                "slot cleanup age exceeds the PostgreSQL interval range".to_owned(),
+            ));
         }
-        let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
-        let prefix = "xyne_sync_slot_";
-        let slots = client
-            .query(
-                "SELECT slot_name FROM pg_replication_slots \
-                 WHERE left(slot_name, length($1)) = $1 \
-                   AND NOT temporary AND NOT active \
-                 AND inactive_since <= clock_timestamp() - $2::bigint * interval '1 millisecond'",
-                &[&prefix, &age_ms],
-            )
-            .await?;
-        for row in slots {
-            let slot: String = row.get(0);
-            match client
-                .execute("SELECT pg_drop_replication_slot($1)", &[&slot])
-                .await
-            {
-                Ok(_) => log_info!("dropped inactive replication slot {slot} after {age:?}"),
-                // A feed may have claimed the slot after the candidate query.
-                // PostgreSQL refuses to drop an active slot; leave it alone.
-                Err(error) if error.code() == Some(&SqlState::OBJECT_IN_USE) => {
-                    log_info!(
-                        "inactive replication slot {slot} became active during cleanup; keeping it"
-                    )
+        cleanup_deadline(
+            async {
+                let connection = open_cleanup(dsn).await?;
+                loop {
+                    match connection
+                        .client
+                        .query_one(
+                            "SELECT pg_advisory_lock(hashtextextended($1, 0))",
+                            &[&lock_key],
+                        )
+                        .await
+                    {
+                        Ok(_) => break,
+                        Err(error) if error.code() == Some(&SqlState::LOCK_NOT_AVAILABLE) => {
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
+                sweep_with_permit(dsn, connection, keep, age, lock_key).await
+            },
+            timeout,
+        )
+        .await
+    }
+
+    pub async fn slot_failure(dsn: &str, slot: &str) -> Result<Option<String>, StorageError> {
+        cleanup_deadline(
+            async {
+                let connection = open_cleanup(dsn).await?;
+                slot_failure_on(&connection.client, slot).await
+            },
+            CLEANUP_OPERATION_TIMEOUT,
+        )
+        .await
     }
 
     /// Whether `slot` exists at `dsn`.
@@ -803,22 +946,169 @@ async fn prepare_slot(
     Ok(client)
 }
 
-/// An ordinary connection at `config`, once `slot` is known to exist
-/// there; an error naming it when it does not.
-async fn require_slot(config: &tokio_postgres::Config, slot: &str) -> Result<Client, StorageError> {
-    let client = super::open(config, &tokio::runtime::Handle::current()).await?;
-    let exists = client
+async fn sweep_candidates(
+    dsn: &str,
+    connection: CleanupConnection,
+    keep: &str,
+    age: Duration,
+    lock_key: &str,
+) -> Result<(), StorageError> {
+    let client = &connection.client;
+    let prefix = "xyne_sync_slot_";
+    let candidates = cleanup_deadline(
+        async {
+            client
+                .query(
+                    "SELECT slot_name::text
+             FROM pg_replication_slots
+             WHERE left(slot_name, length($1)) = $1
+               AND slot_name <> $2
+               AND database = current_database()
+               AND slot_type = 'logical'
+               AND NOT temporary
+               AND NOT synced
+               AND NOT active
+               AND inactive_since IS NOT NULL
+               AND inactive_since <= clock_timestamp() - ($3::double precision * interval '1 second')",
+                    &[&prefix, &keep, &age.as_secs_f64()],
+                )
+                .await
+                .map_err(StorageError::from)
+        },
+        CLEANUP_OPERATION_TIMEOUT,
+    )
+    .await?;
+    let slots: Vec<String> = candidates.iter().map(|row| row.get(0)).collect();
+    sweep_candidate_list(
+        dsn,
+        keep,
+        &slots,
+        CLEANUP_OPERATION_TIMEOUT,
+        Some(connection),
+        age,
+        lock_key,
+    )
+    .await;
+    Ok(())
+}
+
+async fn sweep_candidate_list(
+    dsn: &str,
+    keep: &str,
+    slots: &[String],
+    timeout: Duration,
+    mut worker: Option<CleanupConnection>,
+    age: Duration,
+    lock_key: &str,
+) {
+    for slot in slots {
+        let deadline = tokio::time::Instant::now() + timeout;
+        if worker.is_none() {
+            match tokio::time::timeout_at(deadline, acquire_sweep_connection(dsn, lock_key)).await {
+                Ok(Ok(Some(connection))) => worker = Some(connection),
+                Ok(Ok(None)) => return,
+                Ok(Err(error)) => {
+                    log_warn!(
+                        "reacquiring slot cleanup ownership for {slot}: {error}; continuing with other candidates"
+                    );
+                    continue;
+                }
+                Err(_) => {
+                    log_warn!(
+                        "reacquiring slot cleanup ownership for {slot}: candidate deadline exceeded; continuing with other candidates"
+                    );
+                    continue;
+                }
+            }
+        }
+        let connection = worker.as_ref().unwrap();
+        match tokio::time::timeout_at(
+            deadline,
+            drop_inactive_slot(&connection.client, slot, keep, age),
+        )
+        .await
+        {
+            Ok(Ok(true)) => log_info!("dropped inactive replication slot {slot}"),
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => {
+                let reconnect = connection.client.is_closed()
+                    || error
+                        .as_db_error()
+                        .is_none_or(|db| db.severity() != "ERROR");
+                let error = StorageError::from(error);
+                log_warn!(
+                    "sweeping replication slot {slot}: {error}; continuing with other candidates"
+                );
+                if reconnect {
+                    worker = None;
+                }
+            }
+            Err(_) => {
+                log_warn!(
+                    "sweeping replication slot {slot}: candidate exceeded its {} ms deadline; reconnecting before other candidates",
+                    timeout.as_millis()
+                );
+                worker = None;
+            }
+        }
+    }
+}
+
+async fn drop_inactive_slot(
+    client: &Client,
+    slot: &str,
+    _keep: &str,
+    _age: Duration,
+) -> Result<bool, tokio_postgres::Error> {
+    let outcome = client
+        .query("SELECT pg_drop_replication_slot($1)", &[&slot])
+        .await;
+    match outcome {
+        Ok(_) => Ok(true),
+        Err(error)
+            if matches!(
+                error.code(),
+                Some(&SqlState::OBJECT_IN_USE) | Some(&SqlState::UNDEFINED_OBJECT)
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn slot_failure_on(client: &Client, slot: &str) -> Result<Option<String>, StorageError> {
+    let row = client
         .query_opt(
-            "SELECT 1 FROM pg_replication_slots WHERE slot_name = $1",
+            "SELECT invalidation_reason, wal_status FROM pg_replication_slots WHERE slot_name = $1",
             &[&slot],
         )
-        .await?
-        .is_some();
-    if exists {
-        Ok(client)
-    } else {
-        Err(StorageError(format!("slot `{slot}` does not exist")))
+        .await?;
+    let Some(row) = row else {
+        return Ok(Some(format!("change-feed slot {slot} disappeared")));
+    };
+    let reason: Option<String> = row.get(0);
+    let wal_status: Option<String> = row.get(1);
+    if let Some(reason) = reason {
+        return Ok(Some(format!(
+            "change-feed slot {slot} is invalid ({reason})"
+        )));
     }
+    if wal_status.as_deref() == Some("lost") {
+        return Ok(Some(format!(
+            "change-feed slot {slot} lost its required WAL"
+        )));
+    }
+    Ok(None)
+}
+
+/// An ordinary connection at `config`, once `slot` is known to exist
+async fn require_slot(config: &tokio_postgres::Config, slot: &str) -> Result<Client, StorageError> {
+    let client = super::open(config, &tokio::runtime::Handle::current()).await?;
+    if let Some(failure) = slot_failure_on(&client, slot).await? {
+        return Err(StorageError(failure));
+    }
+    Ok(client)
 }
 
 /// Move `slot` up to `to` when its confirmed position is behind it,

@@ -13,9 +13,6 @@
 //! hold. Each process streams from a slot of its own, named
 //! [`SLOT_PREFIX`] and a fresh UUID: a restart needs nothing of the
 //! slot before it (the slot is moved up to the first snapshot anyway).
-//! At startup it can drop this server's inactive slots once they have
-//! exceeded an explicitly configured age; the PostgreSQL 17
-//! `inactive_since` timestamp makes that cleanup safe across restarts.
 //! Schema changes reach the feed as the messages of the schema-change
 //! event trigger ([`super::ddl`]); the server refuses to serve
 //! without that trigger ([`require_ddl_trigger`]).
@@ -48,8 +45,6 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 /// - `dsn`: the database, with the user and password in the URL.
 /// - `slot`: the replication slot of the change feed, this process's own
 ///   ([`slot_name`]).
-/// - `slot_cleanup_age`: how long an inactive slot of an ended process is
-///   retained before startup removes it (zero disables cleanup).
 /// - `publication`: the publication the feed streams.
 /// - `schemas`: the schemas whose tables the catalog carries.
 /// - `snapshot_rotation`: how often a fresh exported snapshot is minted
@@ -114,6 +109,66 @@ const POSITION_EVERY: Duration = Duration::from_millis(200);
 /// budget; Kubernetes retains five seconds of a 30-second grace period.
 const FEED_STOP_GRACE: Duration = Duration::from_secs(4);
 
+async fn periodic_sweep(
+    dsn: String,
+    slot: String,
+    mut stopped: watch::Receiver<bool>,
+    every: Duration,
+    age: Duration,
+    lock_key: String,
+) {
+    loop {
+        if *stopped.borrow() {
+            return;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(every) => {}
+            _ = stopped.changed() => return,
+        }
+        tokio::select! {
+            result = Transport::cleanup_inactive_slots(&dsn, &slot, age, &lock_key) => {
+                if let Err(error) = result {
+                    log_warn!("periodic slot cleanup failed: {error}");
+                }
+            }
+            _ = stopped.changed() => return,
+        }
+    }
+}
+
+struct SweepTask {
+    stop: watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SweepTask {
+    fn spawn(dsn: String, slot: String, every: Duration, age: Duration, lock_key: String) -> Self {
+        let (stop, stopped) = watch::channel(false);
+        let task = spawn_local(periodic_sweep(dsn, slot, stopped, every, age, lock_key));
+        Self {
+            stop,
+            task: Some(task),
+        }
+    }
+
+    async fn stop(mut self) {
+        self.stop.send_replace(true);
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for SweepTask {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 /// The running engine side: commands in, one event stream per consumer
 /// (the consumer of a client being the one at its id modulo their count),
 /// and the storage handle for the reads that are not the engine's (a
@@ -131,6 +186,14 @@ pub struct Started {
 pub struct FeedHandle {
     stop: watch::Sender<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    sweeper: Option<SweepTask>,
+}
+
+impl Drop for FeedHandle {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+        self.sweeper.take();
+    }
 }
 
 /// The service's task, kept on the engine thread: it resolves only when
@@ -273,17 +336,13 @@ pub fn spawn_feed(
                         Err(error) => {
                             failures += 1;
                             log_error!("opening the change feed (attempt {failures}): {error}");
-                            if let Ok(false) =
-                                Transport::slot_exists(&settings.dsn, &settings.slot).await
+                            if let Ok(Some(failure)) =
+                                Transport::slot_failure(&settings.dsn, &settings.slot).await
                             {
                                 log_error!(
-                                    "slot {} is gone, and a slot made again would skip the changes since; stopping so a restart begins on a fresh slot and snapshot",
-                                    settings.slot
+                                    "{failure}; stopping so a restart begins on a fresh slot and snapshot"
                                 );
-                                running_shutdown.fail(format!(
-                                    "change-feed slot {} disappeared",
-                                    settings.slot
-                                ));
+                                running_shutdown.fail(failure);
                                 return true;
                             }
                         }
@@ -314,6 +373,7 @@ pub fn spawn_feed(
         FeedHandle {
             stop,
             thread: Some(thread),
+            sweeper: None,
         },
     ))
 }
@@ -321,6 +381,9 @@ pub fn spawn_feed(
 /// Stop the feed thread and wait until its replication connection is closed.
 pub async fn stop_feed(mut feed: FeedHandle) -> Result<(), String> {
     feed.stop.send_replace(true);
+    if let Some(sweeper) = feed.sweeper.take() {
+        sweeper.stop().await;
+    }
     let Some(thread) = feed.thread.take() else {
         return Ok(());
     };
@@ -357,9 +420,55 @@ pub async fn start(
     stats: Arc<Stats>,
     shutdown: Shutdown,
 ) -> Result<(Started, ServiceTask), String> {
-    Transport::cleanup_inactive_slots(&settings.dsn, settings.slot_cleanup_age)
-        .await
-        .map_err(|error| format!("cleaning up inactive replication slots: {error}"))?;
+    if settings.slot_cleanup_enabled
+        && settings.slot_cleanup_age.as_secs_f64() > (i64::MAX / 1_000_000 - 1) as f64
+    {
+        return Err("slot cleanup age exceeds the PostgreSQL interval range".to_owned());
+    }
+    if settings.slot_cleanup_enabled
+        && (settings.slot_sweep_interval.is_zero()
+            || settings.slot_sweep_interval.as_millis() > i64::MAX as u128)
+    {
+        return Err(
+            "slot sweep interval must be positive and fit in signed 64-bit milliseconds".to_owned(),
+        );
+    }
+    if settings.slot_cleanup_enabled {
+        if settings.slot_sweep_lock_key.trim().is_empty()
+            || settings.slot_sweep_lock_key.contains('\0')
+        {
+            return Err("sweep lock key must be nonblank and contain no NUL".to_owned());
+        }
+        if settings.slot_cleanup_startup_timeout.is_zero()
+            || settings.slot_cleanup_startup_timeout.as_millis() > i64::MAX as u128
+        {
+            return Err(
+                "startup cleanup timeout must be positive and fit in signed 64-bit milliseconds"
+                    .to_owned(),
+            );
+        }
+        tokio::select! {
+            result = Transport::cleanup_slots_at_startup(
+                &settings.dsn, &settings.slot, settings.slot_cleanup_age,
+                settings.slot_cleanup_startup_timeout,
+                &settings.slot_sweep_lock_key,
+            ) => {
+                if let Err(error) = result {
+                    log_warn!("startup slot cleanup failed: {error}; continuing initialization");
+                }
+            }
+            _ = shutdown.wait() => return Err("startup cancelled by shutdown".to_owned()),
+        }
+    }
+    let sweeper = settings.slot_cleanup_enabled.then(|| {
+        SweepTask::spawn(
+            settings.dsn.clone(),
+            settings.slot.clone(),
+            settings.slot_sweep_interval,
+            settings.slot_cleanup_age,
+            settings.slot_sweep_lock_key.clone(),
+        )
+    });
     Transport::prepare(&settings.dsn, &settings.slot, &settings.publication)
         .await
         .map_err(|error| format!("preparing the change feed: {error}"))?;
@@ -382,12 +491,13 @@ pub async fn start(
             .with_read_idle_connections(settings.read_idle_connections)
             .with_read_timeout(settings.read_timeout);
     let pg = Arc::new(pg);
-    let (feed, feed_handle) = spawn_feed(
+    let (feed, mut feed_handle) = spawn_feed(
         settings.clone(),
         catalog.load(),
         pg.first_position(),
         shutdown,
     )?;
+    feed_handle.sweeper = sweeper;
     let cached = Sources::cached_from_env();
     let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
     if !cached.is_empty() {
