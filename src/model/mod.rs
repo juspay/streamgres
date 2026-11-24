@@ -12,7 +12,7 @@
 //! - [`frame`] — row identities, images, the [`DataFrameOperation`] delta
 //!   unit, and the engine's shared [`frame::TableFrame`] materialization
 //! - [`position`] — where a write, a read, or a frame row sits in the
-//!   source's history: one WAL location ([`Lsn`]; [`Snapshot`] for a
+//!   source's history: one WAL location ([`Position`]; [`Snapshot`] for a
 //!   read's result)
 //! - [`ids`] — the maps and sets keyed by the engine's own small ids,
 //!   on a hasher that costs one multiply
@@ -31,12 +31,12 @@ pub mod value;
 
 pub use frame::{DataFrameKey, DataFrameOperation, DataFrameRow};
 pub use ids::{IdMap, IdSet};
-pub use position::{Lsn, Snapshot};
+pub use position::{Position, Snapshot};
 pub use query::{
     ComparisonOperator, Condition, DeleteQuery, Disjunct, Driver, InsertQuery, Join,
     MultiTableReadQuery, Order, OrderBy, PageRead, SingleTableReadQuery, SubId, UpdateQuery, Where,
     WriteQuery,
 };
 pub use row::{RowData, RowSchema};
-pub use schema::{Catalog, ColumnName, DbColumn, DbTable, PutPlan, TableName};
+pub use schema::{Catalog, Collation, ColumnName, DbColumn, DbTable, PutPlan, TableName};
 pub use value::{SharedSet, Value, ValueType};

@@ -38,7 +38,7 @@ pub fn select_sql(query: &SingleTableReadQuery, table: &DbTable) -> String {
     let _ = write!(
         sql,
         " FROM {} WHERE {}",
-        quote_ident(query.table.as_str()),
+        quote_table(query.table.as_str()),
         render_where(&query.filter, &Scope::plain(table))
     );
     if query.limit != u32::MAX {
@@ -90,7 +90,7 @@ pub fn count_sql(
         .ok_or_else(|| format!("table `{}` is not in the catalog", query.main_table.table))?;
     Ok(format!(
         "SELECT count(*) FROM (SELECT 1 FROM {} AS {} WHERE {} LIMIT {cap}) AS capped",
-        quote_ident(query.main_table.table.as_str()),
+        quote_table(query.main_table.table.as_str()),
         scope.alias,
         scope.render_node()
     ))
@@ -103,7 +103,7 @@ pub fn count_sql(
 pub fn explain_sql(name: &str, table: &DbTable, filter: &Where) -> String {
     format!(
         "EXPLAIN (FORMAT JSON) SELECT 1 FROM {} WHERE {}",
-        quote_ident(name),
+        quote_table(name),
         render_where(filter, &Scope::plain(table))
     )
 }
@@ -222,7 +222,7 @@ impl<'a> Scope<'a> {
             .collect();
         format!(
             "EXISTS (SELECT 1 FROM {} AS {} WHERE ({} AND {}))",
-            quote_ident(join.sub.main_table.table.as_str()),
+            quote_table(join.sub.main_table.table.as_str()),
             sub.alias,
             pairs.join(" AND "),
             sub.render_node()
@@ -282,10 +282,11 @@ pub fn select_expr(column: &str, declared: &ValueType) -> String {
     }
 }
 
-/// `expr` as milliseconds since the epoch; `extract` is numeric, so the
-/// rounding to `int8` keeps the millisecond a `timestamp(3)` column has.
+/// `expr` as whole milliseconds since the epoch, rounded down as the
+/// change feed reads a timestamp's text ([`super::text::epoch_millis`]):
+/// a cast alone would round `.0005` up and disagree with it.
 fn epoch_millis(expr: &str) -> String {
-    format!("(extract(epoch from {expr}) * 1000)::int8")
+    format!("floor(extract(epoch from {expr}) * 1000)::int8")
 }
 
 /// A column as the SQL its conditions compare it by: the bare column
@@ -320,6 +321,15 @@ fn literal_as(value: &Value, declared: Option<&ValueType>) -> String {
 }
 
 /// A double-quoted identifier.
+/// A table as SQL names it from its catalog name: a bare name in
+/// `public`, `schema.table` outside it ([`super::catalog::table_name`]).
+pub fn quote_table(name: &str) -> String {
+    match name.split_once('.') {
+        Some((schema, table)) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
+        None => quote_ident(name),
+    }
+}
+
 pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -498,6 +508,14 @@ pub fn quote_literal(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A table outside `public` is named by its schema and its name, each
+    /// quoted.
+    #[test]
+    fn a_qualified_table_is_quoted_part_by_part() {
+        assert_eq!(quote_table("billing.invoices"), "\"billing\".\"invoices\"");
+        assert_eq!(quote_table("orders"), "\"orders\"");
+    }
     use crate::model::{DbColumn, Join, OrderBy, SharedSet};
 
     /// `tickets(id, status, points)`.
@@ -940,7 +958,7 @@ mod tests {
             "{sql}"
         );
         assert!(
-            sql.contains("(extract(epoch from \"createdAt\") * 1000)::int8"),
+            sql.contains("floor(extract(epoch from \"createdAt\") * 1000)::int8"),
             "the projection still reads milliseconds: {sql}"
         );
     }

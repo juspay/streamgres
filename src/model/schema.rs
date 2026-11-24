@@ -238,6 +238,39 @@ pub struct DbColumn {
     pub table: TableName,
     pub name: ColumnName,
     pub r#type: ValueType,
+    /// The OID of the column's type at the source, its base type for a
+    /// domain; 0 when the column was declared by hand.
+    pub type_oid: u32,
+    /// For an array column, the OID of its element type; 0 otherwise or
+    /// when it is not known.
+    pub element_oid: u32,
+    /// How the source compares the column's text, for a collatable type;
+    /// `None` for any other type, or when it is not known.
+    pub collation: Option<Collation>,
+    /// Whether the column's type is an enum, whose values are its labels
+    /// in text and binary alike.
+    pub enum_type: bool,
+}
+
+/// A text column's collation as the source resolves it: its name (the
+/// database's own for `default`) and whether texts spelled differently can
+/// compare equal under it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Collation {
+    pub name: String,
+    pub deterministic: bool,
+}
+
+impl Collation {
+    /// Whether texts order by their bytes, as the engine orders them: the
+    /// `C` collations, and code-point order, which for UTF-8 is byte order.
+    pub fn orders_bytewise(&self) -> bool {
+        self.deterministic
+            && matches!(
+                self.name.as_str(),
+                "C" | "POSIX" | "ucs_basic" | "pg_c_utf8" | "C.UTF-8" | "C.utf8"
+            )
+    }
 }
 
 /// A table: its name, its columns resolvable by name, and the names of the
@@ -252,6 +285,9 @@ pub struct DbTable {
     pub name: TableName,
     pub pkey: Vec<ColumnName>,
     pub columns: HashMap<ColumnName, DbColumn>,
+    /// The column names in the order the table declares them, the order
+    /// of `SELECT *`.
+    declared: Vec<ColumnName>,
     /// The layout every row decoded from this table shares: the key
     /// columns first, the rest by name.
     row_schema: Arc<RowSchema>,
@@ -364,7 +400,35 @@ impl DbColumn {
             table: TableName::from(""),
             name: name.into(),
             r#type,
+            type_oid: 0,
+            element_oid: 0,
+            collation: None,
+            enum_type: false,
         }
+    }
+
+    /// This column with its array element type's OID.
+    pub fn with_element_oid(mut self, element_oid: u32) -> Self {
+        self.element_oid = element_oid;
+        self
+    }
+
+    /// This column with the collation its text compares under.
+    pub fn with_collation(mut self, collation: Collation) -> Self {
+        self.collation = Some(collation);
+        self
+    }
+
+    /// This column as one of an enum type.
+    pub fn with_enum_type(mut self) -> Self {
+        self.enum_type = true;
+        self
+    }
+
+    /// This column with its source type's OID.
+    pub fn with_type_oid(mut self, type_oid: u32) -> Self {
+        self.type_oid = type_oid;
+        self
     }
 }
 
@@ -419,6 +483,7 @@ impl DbTable {
         let pkey: Vec<ColumnName> = pkey.into_iter().map(Into::into).collect();
 
         let mut by_name: HashMap<ColumnName, DbColumn> = HashMap::with_capacity(columns.len());
+        let declared: Vec<ColumnName> = columns.iter().map(|column| column.name.clone()).collect();
         for mut column in columns {
             column.table = name.clone();
             let column_name = column.name.clone();
@@ -451,10 +516,16 @@ impl DbTable {
             name,
             pkey,
             columns: by_name,
+            declared,
             row_schema,
             key_schema,
             put_plan,
         }
+    }
+
+    /// The column names in the order the table declares them.
+    pub fn declared(&self) -> &[ColumnName] {
+        &self.declared
     }
 
     /// The bytes and types the transport writes around the values of a

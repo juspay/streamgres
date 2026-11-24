@@ -16,7 +16,7 @@ use streamgres::ivm::{
     Engine, Fetch, FetchKind, MultiTableIVM, QueryPart, SubId, evaluate_with, order_rows,
 };
 use streamgres::model::*;
-use streamgres::sync::{Local, Lsn, MemoryStorage, Runtime, Snapshot};
+use streamgres::sync::{Local, MemoryStorage, Position, Runtime, Snapshot};
 
 /// The join layer under the synchronous driver: every read is landed
 /// inline.
@@ -545,7 +545,7 @@ fn a_recall_lands_after_the_window_that_issued_it_is_gone() {
         storage.apply(&write);
         lsn += 1;
     }
-    runtime.progress(Lsn(lsn));
+    runtime.progress(Position(u128::from(lsn)));
     let spec = specs()
         .into_iter()
         .find(|(name, _)| *name == "a page per parent under a gate")
@@ -557,7 +557,7 @@ fn a_recall_lands_after_the_window_that_issued_it_is_gone() {
         while let Some(fetch) = out.pop() {
             let snapshot = Snapshot {
                 rows: storage.rows(&fetch.query),
-                at: Lsn(lsn),
+                at: Position(u128::from(lsn)),
             };
             out.extend(runtime.fetched(fetch.id, snapshot).selects);
         }
@@ -573,7 +573,7 @@ fn a_recall_lands_after_the_window_that_issued_it_is_gone() {
     for write in [ticket(13, 0, 4), ticket(14, 2, 4)] {
         storage.apply(&write);
         lsn += 1;
-        out.extend(runtime.write(&write, Lsn(lsn)).selects);
+        out.extend(runtime.write(&write, Position(u128::from(lsn))).selects);
     }
     land_all(&mut runtime, &mut out, lsn);
     assert_eq!(
@@ -585,7 +585,7 @@ fn a_recall_lands_after_the_window_that_issued_it_is_gone() {
     let arrives = insert("users", 4, &[("rank", 1)]);
     storage.apply(&arrives);
     lsn += 1;
-    let mut selects = runtime.write(&arrives, Lsn(lsn)).selects;
+    let mut selects = runtime.write(&arrives, Position(u128::from(lsn))).selects;
     let recalled = selects
         .iter()
         .position(|fetch| fetch.kind == FetchKind::Lookup)
@@ -607,7 +607,7 @@ fn a_recall_lands_after_the_window_that_issued_it_is_gone() {
     });
     storage.apply(&gone);
     lsn += 1;
-    out.extend(runtime.write(&gone, Lsn(lsn)).selects);
+    out.extend(runtime.write(&gone, Position(u128::from(lsn))).selects);
     land_all(&mut runtime, &mut out, lsn);
     out.push(recall);
     land_all(&mut runtime, &mut out, lsn);
@@ -787,7 +787,7 @@ fn run_late(seed: u64, steps: usize) {
         storage.apply(&random_write(&mut random, &mut present));
         lsn += 1;
     }
-    runtime.progress(Lsn(lsn));
+    runtime.progress(Position(u128::from(lsn)));
     let mut out: Vec<(Fetch, Snapshot)> = Vec::new();
     let asked = |selects: Vec<Fetch>,
                  storage: &MemoryStorage,
@@ -796,7 +796,7 @@ fn run_late(seed: u64, steps: usize) {
         for fetch in selects {
             let snapshot = Snapshot {
                 rows: storage.rows(&fetch.query),
-                at: Lsn(lsn),
+                at: Position(u128::from(lsn)),
             };
             out.push((fetch, snapshot));
         }
@@ -841,7 +841,7 @@ fn run_late(seed: u64, steps: usize) {
             if trace {
                 eprintln!("--- step {step}: write {write:?}");
             }
-            let routed = runtime.write(&write, Lsn(lsn));
+            let routed = runtime.write(&write, Position(u128::from(lsn)));
             asked(routed.selects, &storage, lsn, &mut out);
         }
         if trace {

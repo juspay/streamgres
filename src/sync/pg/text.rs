@@ -357,6 +357,9 @@ mod tests {
     #[test]
     fn times_read_as_epoch_milliseconds() {
         assert_eq!(epoch_millis("1970-01-01 00:00:01.5"), Some(1_500));
+        // Below a millisecond rounds down, as storage reads cast it.
+        assert_eq!(epoch_millis("1970-01-01 00:00:01.0009"), Some(1_000));
+        assert_eq!(epoch_millis("1969-12-31 23:59:59.9995"), Some(-1));
         assert_eq!(epoch_millis("1970-01-01 01:00:00+01"), Some(0));
         assert_eq!(epoch_millis("1970-01-01 05:30:00.25+05:30"), Some(250));
         assert_eq!(epoch_millis("1970-01-02"), Some(86_400_000));

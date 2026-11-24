@@ -49,6 +49,9 @@ jobs:
       - name: Clippy, warnings denied
         run: cargo clippy --all-targets --locked -- -D warnings
 
+      - name: Clippy, the engine alone (no server feature)
+        run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
+
   test:
     name: Tests (accuracy)
     runs-on: ubuntu-latest

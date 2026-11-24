@@ -50,14 +50,17 @@ pub fn trigger_stack_sql(app: &str, shard: u32, publications: &[&str]) -> String
         .replace("@APP@", &app_literal)
 }
 
-pub(crate) struct FunctionSpec {
+/// One function of the trigger stack: its name, argument types, body and
+/// language, so a setup can tell whether the installed one is current.
+pub struct FunctionSpec {
     pub name: String,
     pub args: Vec<String>,
     pub body: String,
     pub language: String,
 }
 
-pub(crate) fn function_specs(app: &str, shard: u32, publications: &[&str]) -> Vec<FunctionSpec> {
+/// The functions [`trigger_stack_sql`] creates, one spec each.
+pub fn function_specs(app: &str, shard: u32, publications: &[&str]) -> Vec<FunctionSpec> {
     let sql = trigger_stack_sql(app, shard, publications);
     let mut specs = Vec::new();
     let mut rest = sql.as_str();
@@ -440,7 +443,7 @@ mod tests {
     /// app, shard and publication, then check the output in.
     #[test]
     fn the_checked_in_stack_is_the_generators() {
-        let checked_in = include_str!("../../scripts/sql/ddl-triggers.sql");
+        let checked_in = include_str!("../../../scripts/sql/ddl-triggers.sql");
         assert_eq!(checked_in, trigger_stack_sql("xyne", 0, &["xyne_sync_pub"]));
     }
 
