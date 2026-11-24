@@ -475,9 +475,12 @@ pub struct Feed {
     progress: Lsn,
 }
 
+// Bound individual cleanup operations and candidate attempts, never the whole list.
 const CLEANUP_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Own the driver as well as the client: dropping a query future alone does not
+// stop its detached connection task or close its socket.
 struct CleanupConnection {
     client: Client,
     driver: tokio::task::JoinHandle<()>,
@@ -492,6 +495,8 @@ impl Drop for CleanupConnection {
 async fn open_cleanup(dsn: &str) -> Result<CleanupConnection, StorageError> {
     let mut config: tokio_postgres::Config = dsn.parse()?;
     config.connect_timeout(CLEANUP_CONNECT_TIMEOUT);
+    // Server deadlines complement the client deadline if a query is already running.
+    // Preserve user connection options, then override only cleanup-session timeouts.
     let options = format!(
         "{} -cstatement_timeout=5000 -clock_timeout=1000",
         config.get_options().unwrap_or("")
@@ -549,6 +554,8 @@ async fn sweep_slots(
     sweep_with_permit(dsn, connection, keep, age, lock_key).await
 }
 
+// The same session owns the sweep permit and performs every metadata/drop query.
+// A replacement session must acquire ownership before continuing a stale list.
 async fn acquire_sweep_connection(
     dsn: &str,
     lock_key: &str,
@@ -559,6 +566,7 @@ async fn acquire_sweep_connection(
     Ok(acquired.then_some(connection))
 }
 
+// Derive a server-side 64-bit key from the bound string; never interpolate it.
 async fn try_sweep_lock(client: &Client, lock_key: &str) -> Result<bool, StorageError> {
     cleanup_deadline(
         async {
@@ -643,6 +651,9 @@ impl Transport {
         prepare_slot(&config, slot, publication).await.map(drop)
     }
 
+    /// Serialized startup/periodic cleanup using the supplied inactivity age.
+    /// Zero makes every otherwise eligible inactive slot immediately eligible.
+    /// A busy global sweep permit skips this attempt.
     pub async fn cleanup_inactive_slots(
         dsn: &str,
         keep: &str,
@@ -652,6 +663,8 @@ impl Transport {
         sweep_slots(dsn, keep, age, lock_key).await
     }
 
+    /// Await initial cleanup within one total budget, including connection, lock
+    /// contention, discovery and deletion. Periodic sweeps retain per-candidate limits.
     pub async fn cleanup_slots_at_startup(
         dsn: &str,
         keep: &str,
@@ -697,6 +710,8 @@ impl Transport {
         .await
     }
 
+    /// None means resumable; missing or invalid slots require a fresh snapshot.
+    /// Connection/query errors remain errors, never evidence of slot loss.
     pub async fn slot_failure(dsn: &str, slot: &str) -> Result<Option<String>, StorageError> {
         cleanup_deadline(
             async {
@@ -1039,6 +1054,8 @@ async fn sweep_candidate_list(
                 log_warn!(
                     "sweeping replication slot {slot}: {error}; continuing with other candidates"
                 );
+                // FATAL can arrive before is_closed() changes. Never reuse that session.
+                // Ordinary SQL errors outside a transaction keep ownership intact.
                 if reconnect {
                     worker = None;
                 }
@@ -1048,12 +1065,18 @@ async fn sweep_candidate_list(
                     "sweeping replication slot {slot}: candidate exceeded its {} ms deadline; reconnecting before other candidates",
                     timeout.as_millis()
                 );
+                // A timed-out future can still have a query in flight. Close the
+                // session, then reacquire the permit before issuing another query.
                 worker = None;
             }
         }
     }
 }
 
+// A candidate may have reconnected or disappeared since discovery. Reapply all
+// eligibility filters, then let PostgreSQL arbitrate the drop against active use.
+// This is not an atomic inactivity-age guarantee: a feed can connect and disconnect
+// between reading the view and the internal slot acquisition performed by the drop.
 async fn drop_inactive_slot(
     client: &Client,
     slot: &str,
@@ -1079,7 +1102,9 @@ async fn drop_inactive_slot(
         )
         .await;
     match outcome {
+        // No row means no drop occurred; do not log that as a deletion.
         Ok(rows) => Ok(!rows.is_empty()),
+        // Another feed or cleaner won the race. Both outcomes are harmless.
         Err(error)
             if matches!(
                 error.code(),
@@ -1092,6 +1117,8 @@ async fn drop_inactive_slot(
     }
 }
 
+// A slot can still exist after its required WAL is lost or PostgreSQL invalidates it.
+// `unreserved` alone is recoverable; only `lost` or a recorded reason is fatal here.
 async fn slot_failure_on(client: &Client, slot: &str) -> Result<Option<String>, StorageError> {
     let row = client
         .query_opt(
@@ -1118,6 +1145,7 @@ async fn slot_failure_on(client: &Client, slot: &str) -> Result<Option<String>, 
 }
 
 /// An ordinary connection at `config`, once `slot` is known to exist
+/// there and is not invalid; an error naming it otherwise.
 async fn require_slot(config: &tokio_postgres::Config, slot: &str) -> Result<Client, StorageError> {
     let client = super::open(config, &tokio::runtime::Handle::current()).await?;
     if let Some(failure) = slot_failure_on(&client, slot).await? {
@@ -2596,6 +2624,7 @@ mod slot_cleanup_tests {
             )
             .await
             .unwrap();
+        // Both cleaners must succeed regardless of which one wins deletion.
         let (a, b) = tokio::join!(
             Transport::cleanup_inactive_slots(
                 &configured,
@@ -2635,6 +2664,7 @@ mod slot_cleanup_tests {
                 .await
                 .unwrap()
         );
+        // The final query must enforce the supplied age even for a stale candidate.
         assert!(
             !drop_inactive_slot(&client, &keep, "", Duration::from_secs(3600))
                 .await

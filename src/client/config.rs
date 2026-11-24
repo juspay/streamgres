@@ -37,10 +37,16 @@ pub struct Config {
     /// The replication slot of the change feed, not configurable: each
     /// process names its own using the existing compatible naming scheme.
     pub slot: String,
+    /// STREAMGRES_SLOT_CLEANUP_ENABLED=false disables startup and periodic cleanup.
     pub slot_cleanup_enabled: bool,
+    /// STREAMGRES_SLOT_SWEEP_LOCK_KEY: shared logical advisory-lock name.
     pub slot_sweep_lock_key: String,
+    /// STREAMGRES_SLOT_CLEANUP_AGE_MS: inactivity age before cleanup (600000).
+    /// Zero makes inactive slots immediately eligible; use the enabled switch to disable.
     pub slot_cleanup_age: Duration,
+    /// Interval in milliseconds between completed cleanup attempts.
     pub slot_sweep_interval: Duration,
+    /// Total initial cleanup budget in milliseconds (10000), including lock waits.
     pub slot_cleanup_startup_timeout: Duration,
     /// `STREAMGRES_PUBLICATION`: the publication the change feed streams;
     /// startup creates it when absent and validates it when present.

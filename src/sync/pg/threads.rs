@@ -13,6 +13,9 @@
 //! hold. Each process streams from a slot of its own, named
 //! [`SLOT_PREFIX`] and a fresh UUID: a restart needs nothing of the
 //! slot before it (the slot is moved up to the first snapshot anyway).
+//! At startup and periodically it reclaims other instances' old inactive permanent
+//! slots using the configured age (PG 17+). One shared advisory lock serializes
+//! sweeps per database.
 //! Schema changes reach the feed as the messages of the schema-change
 //! event trigger ([`super::ddl`]); the server refuses to serve
 //! without that trigger ([`require_ddl_trigger`]).
@@ -70,10 +73,15 @@ pub struct Settings {
     /// Snapshot minting and replication always use `dsn` above.
     pub read_dsn: String,
     pub slot: String,
+    /// Enable startup and periodic slot cleanup.
     pub slot_cleanup_enabled: bool,
+    /// Same nonblank logical lock name across all cooperating cleaners.
     pub slot_sweep_lock_key: String,
+    /// Inactivity grace period; zero means immediate eligibility.
     pub slot_cleanup_age: Duration,
+    /// Positive interval between completed cleanup attempts.
     pub slot_sweep_interval: Duration,
+    /// Total budget for awaited initial cleanup; periodic attempts have no total cap.
     pub slot_cleanup_startup_timeout: Duration,
     pub publication: String,
     pub schemas: Vec<String>,
@@ -91,6 +99,7 @@ pub struct Settings {
 /// What every slot a server names for itself starts with.
 pub const SLOT_PREFIX: &str = "xyne_sync_slot_";
 
+/// Default logical identity of the shared cleanup advisory lock.
 pub const DEFAULT_SWEEP_LOCK_KEY: &str = "streamgres.slot_cleanup";
 
 /// A slot name of this process's own: [`SLOT_PREFIX`] and a fresh UUID
@@ -109,6 +118,7 @@ const POSITION_EVERY: Duration = Duration::from_millis(200);
 /// budget; Kubernetes retains five seconds of a 30-second grace period.
 const FEED_STOP_GRACE: Duration = Duration::from_secs(4);
 
+// The feed owns this task: shutdown cancels its timer and any in-progress sweep.
 async fn periodic_sweep(
     dsn: String,
     slot: String,
@@ -136,6 +146,8 @@ async fn periodic_sweep(
     }
 }
 
+// Own periodic cleanup before a feed exists, then transfer it into FeedHandle. Any failed
+// startup path drops this guard, cancelling both the timer and in-flight SQL.
 struct SweepTask {
     stop: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -186,9 +198,11 @@ pub struct Started {
 pub struct FeedHandle {
     stop: watch::Sender<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    // No cleanup connections are retained between sweeps.
     sweeper: Option<SweepTask>,
 }
 
+// Explicit stop_feed handles shutdown; Drop also stops a feed during failed startup.
 impl Drop for FeedHandle {
     fn drop(&mut self) {
         self.stop.send_replace(true);
@@ -336,6 +350,8 @@ pub fn spawn_feed(
                         Err(error) => {
                             failures += 1;
                             log_error!("opening the change feed (attempt {failures}): {error}");
+                            // Recreating a missing/invalid slot would skip changes in the old engine.
+                            // Preserve transient retries when PostgreSQL cannot confirm slot state.
                             if let Ok(Some(failure)) =
                                 Transport::slot_failure(&settings.dsn, &settings.slot).await
                             {
@@ -561,6 +577,8 @@ mod slot_cleanup_tests {
                     .await
                     .unwrap()
                     .unwrap();
+                // Startup can continue even though authentication never completes.
+                // Dropping the startup guard must close that in-flight connection.
                 drop(cleanup);
                 tokio::time::timeout(Duration::from_secs(2), server)
                     .await

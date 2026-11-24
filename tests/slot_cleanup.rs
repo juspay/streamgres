@@ -1,3 +1,6 @@
+//! Destructive live tests: use only a dedicated disposable PostgreSQL 17+ server.
+//! Tests intentionally sweep matching slots; do not point this at a shared instance.
+
 use std::time::Duration;
 use streamgres::sync::pg::Transport;
 const LOCK_KEY: &str = "streamgres.slot_cleanup";
