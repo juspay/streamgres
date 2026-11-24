@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 use tokio_postgres::Client;
 
-use super::catalog::{scalar_type, table_name};
+use super::catalog::{carriable_name, scalar_type, table_name};
 use super::text;
 use crate::ivm::SchemaChange;
 use crate::model::{Catalog, DbColumn, DbTable, TableName, Value, ValueType};
@@ -308,7 +308,9 @@ pub fn classify(
             catalog: catalog.clone(),
         });
     };
-    let served = |table: &PublishedTable| schemas.contains(&table.schema);
+    let served = |table: &PublishedTable| {
+        schemas.contains(&table.schema) && carriable_name(&table.schema, &table.name)
+    };
     let before: HashMap<String, &PublishedTable> = message
         .previous
         .iter()

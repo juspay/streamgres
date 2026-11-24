@@ -166,6 +166,12 @@ pub async fn load_catalog(
     }
     let mut tables = Vec::new();
     for ((schema, table), columns) in declared {
+        if !carriable_name(&schema, &table) {
+            notes.warnings.push(format!(
+                "{schema}.{table}: a dot in the schema or table name is not supported; left out"
+            ));
+            continue;
+        }
         let Some(pkey) = pkeys.get(&(schema.clone(), table.clone())) else {
             notes
                 .info
@@ -198,6 +204,21 @@ pub fn table_name(schema: &str, table: &str) -> String {
     } else {
         format!("{schema}.{table}")
     }
+}
+
+/// The schema and table a catalog name stands for, the inverse of
+/// [`table_name`]: `public` for a bare name. Unambiguous because a table
+/// whose schema or name holds a dot is never carried
+/// ([`carriable_name`]).
+pub fn source_name(name: &str) -> (&str, &str) {
+    name.split_once('.').unwrap_or(("public", name))
+}
+
+/// Whether a table of `schema` named `table` can be carried under a
+/// catalog name: not when either holds a dot, which would make its
+/// catalog name read as another table's.
+pub fn carriable_name(schema: &str, table: &str) -> bool {
+    !schema.contains('.') && !table.contains('.')
 }
 
 /// The engine's type for a Postgres column, from `information_schema`'s
@@ -285,6 +306,11 @@ mod tests {
         assert_eq!(value_type("bytea", "bytea"), None);
         assert_eq!(table_name("public", "tickets"), "tickets");
         assert_eq!(table_name("xyne_0", "clients"), "xyne_0.clients");
+        assert_eq!(source_name("tickets"), ("public", "tickets"));
+        assert_eq!(source_name("xyne_0.clients"), ("xyne_0", "clients"));
+        assert!(carriable_name("billing", "invoices"));
+        assert!(!carriable_name("bill.ing", "invoices"));
+        assert!(!carriable_name("billing", "in.voices"));
     }
 
     /// The catalog carries what the publication streams and nothing it

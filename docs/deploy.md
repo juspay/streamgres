@@ -172,6 +172,9 @@ DDL in that transaction's WAL.
   list stops startup: its rows or columns could not be kept up to date.
 - Tables without a primary key are skipped. So are columns of types the wire
   format cannot carry (`bytea`). The startup log lists both.
+- Tables whose schema or table name contains a dot are left out with a
+  warning: clients name a table outside `public` as `schema.table`, so such
+  a name would be ambiguous.
 - Tables with large TOASTed columns need `REPLICA IDENTITY FULL`.
 
 ### Schema changes

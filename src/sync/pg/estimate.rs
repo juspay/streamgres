@@ -173,20 +173,26 @@ impl Estimation {
 pub fn batch(statements: &[&str], columns: &[(&str, &str)]) -> String {
     let mut batch = statements.join("; ");
     if !columns.is_empty() {
-        let pairs: Vec<String> = columns
+        let triples: Vec<String> = columns
             .iter()
             .map(|(table, column)| {
-                format!("({}, {})", sql::quote_literal(table), sql::quote_literal(column))
+                let (schema, table) = super::catalog::source_name(table);
+                format!(
+                    "({}, {}, {})",
+                    sql::quote_literal(schema),
+                    sql::quote_literal(table),
+                    sql::quote_literal(column)
+                )
             })
             .collect();
         if !batch.is_empty() {
             batch.push_str("; ");
         }
         batch.push_str(&format!(
-            "SELECT tablename, attname, null_frac, n_distinct FROM pg_stats \
-             WHERE schemaname = ANY (current_schemas(false)) \
-             AND (tablename, attname) IN ({}) ORDER BY inherited",
-            pairs.join(", ")
+            "SELECT {}, attname, null_frac, n_distinct FROM pg_stats \
+             WHERE (schemaname, tablename, attname) IN ({}) ORDER BY inherited",
+            sql::catalog_name_sql("schemaname", "tablename"),
+            triples.join(", ")
         ));
     }
     batch
@@ -658,7 +664,14 @@ mod tests {
             Estimation::new(&participants_by_channel(), &probe_catalog()).expect("estimation");
         let batch = estimation.batch();
         assert_eq!(batch.matches("EXPLAIN (FORMAT JSON)").count(), 4);
-        assert!(batch.contains("('participants', 'channelId'), ('channel_members', 'channelId')"));
+        assert!(batch.contains(
+            "('public', 'participants', 'channelId'), ('public', 'channel_members', 'channelId')"
+        ));
+        let other = super::batch(&[], &[("billing.invoices", "customerId")]);
+        assert!(
+            other.contains("WHERE (schemaname, tablename, attname) IN (('billing', 'invoices', 'customerId'))"),
+            "{other}"
+        );
         assert_eq!(
             estimation.columns(),
             [
@@ -667,6 +680,6 @@ mod tests {
             ]
         );
         let only_stats = super::batch(&[], &[("participants", "channelId")]);
-        assert!(only_stats.starts_with("SELECT tablename"), "{only_stats}");
+        assert!(only_stats.starts_with("SELECT CASE WHEN schemaname"), "{only_stats}");
     }
 }

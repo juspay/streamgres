@@ -1847,3 +1847,115 @@ fn unchanged_out_of_line_values_are_never_lost() {
         cleanup(&dsn, &client, &names).await;
     });
 }
+
+/// A table outside `public` is read, counted, joined and estimated under
+/// its own schema, whatever the session's `search_path`: `public` holds a
+/// table of the same name with other rows, which a name left to the
+/// `search_path` would read instead.
+#[test]
+fn a_table_outside_public_is_read_under_its_schema() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let schema = "live_billing";
+        let invoices = "live_schema_invoices";
+        let customers = "live_schema_customers";
+        let slot = "xyne_sync_live_schema";
+        let publication = "xyne_sync_live_schema_pub";
+        let client = admin(&dsn).await;
+        PgStream::drop_slot(&dsn, slot, publication)
+            .await
+            .expect("drop slot");
+        client
+            .batch_execute(&format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE;
+                 DROP TABLE IF EXISTS {invoices}; DROP TABLE IF EXISTS {customers};
+                 CREATE SCHEMA {schema};
+                 CREATE TABLE {schema}.{invoices} (id int8 PRIMARY KEY, customer int8, status text);
+                 CREATE TABLE {invoices} (id int8 PRIMARY KEY, customer int8, status text);
+                 CREATE TABLE {customers} (id int8 PRIMARY KEY, name text);
+                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;
+                 INSERT INTO {customers} VALUES (1, 'meera'), (2, 'arjun');
+                 INSERT INTO {schema}.{invoices}
+                   SELECT g, 1 + g % 2, CASE WHEN g % 4 = 0 THEN 'DUE' ELSE 'PAID' END
+                   FROM generate_series(1, 400) g;
+                 INSERT INTO {invoices} VALUES (9001, 1, 'DUE');
+                 ANALYZE {schema}.{invoices}; ANALYZE {customers}; ANALYZE {invoices};"
+            ))
+            .await
+            .expect("prepare");
+        let qualified = format!("{schema}.{invoices}");
+        let catalog = Arc::new(Catalog::new(vec![
+            DbTable::new(
+                qualified.as_str(),
+                ["id"],
+                vec![
+                    DbColumn::new("id", ValueType::Int),
+                    DbColumn::new("customer", ValueType::Int),
+                    DbColumn::new("status", ValueType::String),
+                ],
+            ),
+            DbTable::new(
+                customers,
+                ["id"],
+                vec![
+                    DbColumn::new("id", ValueType::Int),
+                    DbColumn::new("name", ValueType::String),
+                ],
+            ),
+        ]));
+        let mut stream = PgStream::open(&dsn, slot, publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+
+        let due = SingleTableReadQuery::new(
+            qualified.as_str(),
+            Where::condition("status", ComparisonOperator::EQ, "DUE"),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        );
+        let read = storage.select(&due).await.expect("the read is served");
+        assert_eq!(read.rows.len(), 100, "the schema's own rows, not public's");
+        assert!(
+            read.rows
+                .iter()
+                .all(|(key, _)| key.pkey_value.get(&ColumnName::from("id"))
+                    != Some(&Value::Int(9001))),
+            "public's table of the same name is not read"
+        );
+
+        let of_meera = MultiTableReadQuery::new(
+            due.clone(),
+            vec![Join::inner(
+                MultiTableReadQuery::single(SingleTableReadQuery::new(
+                    customers,
+                    Where::condition("name", ComparisonOperator::EQ, "meera"),
+                    OrderBy::new("id", Order::ASC),
+                    u32::MAX,
+                )),
+                "customer",
+                "id",
+            )],
+        );
+        let counted = storage.count(&of_meera, 100_000).await.expect("count");
+        assert_eq!(counted, 100, "DUE invoices (even ids) all belong to customer 1, meera");
+        let all_due = MultiTableReadQuery::single(due);
+        assert_eq!(storage.count(&all_due, 100_000).await.expect("count"), 100);
+        storage
+            .estimate(&of_meera, 100_000)
+            .await
+            .expect("the join column's statistics are found under the schema");
+
+        let _ = client
+            .batch_execute(&format!(
+                "DROP SCHEMA IF EXISTS {schema} CASCADE;
+                 DROP TABLE IF EXISTS {invoices}; DROP TABLE IF EXISTS {customers};"
+            ))
+            .await;
+        let _ = PgStream::drop_slot(&dsn, slot, publication).await;
+    });
+}
