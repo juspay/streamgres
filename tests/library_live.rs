@@ -649,13 +649,22 @@ async fn row_security_is_excluded_and_enabling_it_invalidates_memory() {
 #[tokio::test(flavor = "multi_thread")]
 async fn unsupported_policy_does_not_depend_on_engine_readiness() {
     let Some(dsn) = dsn() else { return };
+    prepare(
+        &dsn,
+        "lib_unready",
+        "libunready",
+        "CREATE TABLE lib_unready.t (id bigint PRIMARY KEY);",
+    )
+    .await;
     let lib = Streamgres::connect(&dsn)
-        .app("lib_missing_trigger", 0)
-        .start_timeout(Duration::from_millis(20))
+        .schemas(["lib_unready"])
+        .publication("lib_unready_pub")
+        .app("libunready", 0)
+        .start_timeout(Duration::ZERO)
+        .allow_degraded_start()
         .start()
         .await
         .unwrap();
-    assert!(!lib.engine().running);
     let (result, trace) = lib
         .load_and_sync(Sql::new("SELECT 42 AS value"))
         .inspect()
@@ -664,6 +673,53 @@ async fn unsupported_policy_does_not_depend_on_engine_readiness() {
     assert_eq!(trace.served, Served::Unsupported);
     assert_eq!(lib.metrics().fallbacks, 0);
     lib.shutdown().await;
+    clean(&dsn, "lib_unready", "libunready").await;
+}
+
+/// A missing DDL trigger fails `start()` whether or not a degraded start
+/// is allowed; an engine not ready in time fails it unless allowed.
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_refuses_a_missing_trigger_and_requires_readiness() {
+    let Some(dsn) = dsn() else { return };
+    for degraded in [false, true] {
+        let builder = Streamgres::connect(&dsn).app("lib_no_trigger", 0);
+        let builder = if degraded {
+            builder.allow_degraded_start()
+        } else {
+            builder
+        };
+        let started = builder.start().await;
+        assert!(
+            matches!(started, Err(Error::Setup(_))),
+            "degraded {degraded}: {:?}",
+            started.err()
+        );
+    }
+
+    prepare(
+        &dsn,
+        "lib_ready",
+        "libready",
+        "CREATE TABLE lib_ready.t (id bigint PRIMARY KEY);",
+    )
+    .await;
+    let builder = Streamgres::connect(&dsn)
+        .schemas(["lib_ready"])
+        .publication("lib_ready_pub")
+        .app("libready", 0);
+    let started = builder.clone().start_timeout(Duration::ZERO).start().await;
+    assert!(
+        matches!(started, Err(Error::NotReady(_))),
+        "{:?}",
+        started.err()
+    );
+    let lib = builder
+        .start()
+        .await
+        .expect("ready within the default timeout");
+    assert!(lib.engine().running);
+    lib.shutdown().await;
+    clean(&dsn, "lib_ready", "libready").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1040,4 +1096,27 @@ async fn custom_type_binds_keep_their_oid_on_the_default_pool() {
 
     lib.shutdown().await;
     clean(&dsn, "lib_oid", "liboid").await;
+}
+
+/// A driver connection reports Postgres's SQLSTATE and a statement
+/// timeout as such, without its message being read.
+#[tokio::test(flavor = "multi_thread")]
+async fn session_errors_keep_their_sqlstate_and_timeouts() {
+    use streamgres::cache::{Session, SessionError};
+    let Some(dsn) = dsn() else { return };
+    let mut client = admin(&dsn).await;
+    let error = Session::query(&mut client, "SELECT 1 / 0", &[])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, SessionError::Database { code: Some(code), .. } if code == "22012"),
+        "{error:?}"
+    );
+    Session::execute(&mut client, "SET statement_timeout = 50")
+        .await
+        .unwrap();
+    let error = Session::query(&mut client, "SELECT pg_sleep(1)", &[])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, SessionError::Timeout(_)), "{error:?}");
 }

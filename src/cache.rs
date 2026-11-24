@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 
 pub use crate::sync::pg::connections::{
     Bind, Connection, ConnectionFuture, Connections, Lease, RawColumn, RawRows, Session,
+    SessionError,
 };
 pub use api::{
     Builder, Error, Fallback, Inspecting, LoadAndSync, OnUnsupported, Param, Sql, Streamgres,
@@ -388,7 +389,8 @@ impl Cache {
         let bind_bytes = binds.iter().fold(0usize, |bytes, bind| {
             bytes.saturating_add(bind.bytes.as_ref().map_or(0, Vec::len))
         });
-        let oversized = bind_bytes > (config.max_entry_bytes.min(config.max_bytes) / 16).min(1 << 20);
+        let oversized =
+            bind_bytes > (config.max_entry_bytes.min(config.max_bytes) / 16).min(1 << 20);
         let catalog = {
             let state = shared.read();
             state.readiness(config)?;

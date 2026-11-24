@@ -405,3 +405,36 @@ async fn raw_bridge_preserves_postgres_quoted_regions() {
         .unwrap();
     assert_eq!(rows.int(0, 0).unwrap(), Some(14));
 }
+
+/// The bridge reports a statement timeout as a timeout and a Postgres
+/// error with the SQLSTATE Diesel keeps.
+#[cfg(feature = "async-pool")]
+#[tokio::test(flavor = "multi_thread")]
+async fn bridge_errors_are_structured() {
+    use diesel_async::pooled_connection::{AsyncDieselConnectionManager, bb8};
+    use streamgres::cache::{Connections, Session, SessionError};
+    let Some(dsn) = dsn() else { return };
+    let manager = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(&dsn);
+    let pool = bb8::Pool::builder()
+        .max_size(1)
+        .build(manager)
+        .await
+        .expect("pool");
+    let connections = streamgres_diesel::connections(pool);
+    let mut checkout = connections.get().await.expect("checkout");
+    checkout
+        .execute("SET statement_timeout = 50")
+        .await
+        .unwrap();
+    let error = checkout.query("SELECT pg_sleep(1)", &[]).await.unwrap_err();
+    assert!(matches!(error, SessionError::Timeout(_)), "{error:?}");
+    checkout.execute("RESET statement_timeout").await.unwrap();
+    let error = checkout
+        .execute("CREATE TEMP TABLE once (id int UNIQUE); INSERT INTO once VALUES (1), (1)")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, SessionError::Database { code: Some(code), .. } if code == "23505"),
+        "{error:?}"
+    );
+}

@@ -457,7 +457,7 @@ pub async fn trigger_present<C: super::connections::Session + ?Sized>(
             &[super::connections::text(name)],
         )
         .await
-        .map_err(StorageError)?;
+        .map_err(StorageError::from)?;
     Ok(!rows.rows.is_empty() && rows.text(0, 0).map_err(StorageError)?.as_deref() != Some("D"))
 }
 

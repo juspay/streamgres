@@ -142,7 +142,7 @@ impl PgConfig {
     }
 
     /// The event trigger the engine hears schema changes through.
-    fn ddl_trigger(&self) -> String {
+    pub(crate) fn ddl_trigger(&self) -> String {
         format!("{}_ddl_end_{}", self.app, self.shard)
     }
 
@@ -249,7 +249,13 @@ impl PgEngine {
             .pop()
             .ok_or_else(|| "the engine gave no event stream".to_owned())?;
         let (samples, source) = mpsc::unbounded_channel();
-        tokio::task::spawn_local(sample_source(self.origin.connections.clone(), samples));
+        // Its own connection to the source, so a saturated pool cannot
+        // starve the freshness samples and push every read to the fallback.
+        let sampler: Arc<dyn Connections> = Arc::new(
+            connections::OwnPool::new(&config.dsn, 1)
+                .map_err(|error| format!("the sampling connection: {error}"))?,
+        );
+        tokio::task::spawn_local(sample_source(sampler, samples));
         let failed = Box::pin(async move {
             tokio::select! {
                 () = failing.wait() => failing

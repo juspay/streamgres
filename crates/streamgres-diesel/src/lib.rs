@@ -33,7 +33,7 @@ pub use ::diesel;
 pub use streamgres::cache::{
     Builder, Caller, Connection, ConnectionFuture, Connections, EngineState,
     Error as StreamgresError, Fallback, Inspect, KeptQuery, Lease, Metrics, OnUnsupported,
-    QueryState, Served, Streamgres, Trace, Ttl,
+    QueryState, Served, SessionError, Streamgres, Trace, Ttl,
 };
 
 #[cfg(feature = "async-pool")]

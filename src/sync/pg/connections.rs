@@ -40,6 +40,87 @@ pub struct RawRows {
     pub rows: Vec<Vec<Option<Vec<u8>>>>,
 }
 
+/// Why a statement on a [`Session`] failed, kept structured so callers
+/// can tell a timeout or a Postgres error apart without reading messages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionError {
+    /// Postgres refused or failed the statement; `code` is its SQLSTATE
+    /// when the driver reports one.
+    Database {
+        code: Option<String>,
+        message: String,
+    },
+    /// The statement ran out of time: Postgres cancelled it
+    /// (`statement_timeout`, SQLSTATE 57014) or a wait ran out.
+    Timeout(String),
+    /// Anything else: the connection, the protocol, the pool.
+    Other(String),
+}
+
+impl SessionError {
+    /// The SQLSTATE of a statement Postgres cancelled for its timeout.
+    pub const QUERY_CANCELED: &'static str = "57014";
+
+    /// A Postgres error with `code`, a timeout when that is 57014.
+    pub fn database(code: Option<&str>, message: impl Into<String>) -> Self {
+        let message = message.into();
+        if code == Some(Self::QUERY_CANCELED) {
+            return SessionError::Timeout(message);
+        }
+        SessionError::Database {
+            code: code.map(str::to_owned),
+            message,
+        }
+    }
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionError::Database {
+                code: Some(code),
+                message,
+            } => write!(f, "{message} (SQLSTATE {code})"),
+            SessionError::Database {
+                code: None,
+                message,
+            }
+            | SessionError::Timeout(message)
+            | SessionError::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for SessionError {}
+
+impl From<String> for SessionError {
+    fn from(message: String) -> Self {
+        SessionError::Other(message)
+    }
+}
+
+impl From<SessionError> for String {
+    fn from(error: SessionError) -> Self {
+        error.to_string()
+    }
+}
+
+impl From<SessionError> for crate::sync::StorageError {
+    fn from(error: SessionError) -> Self {
+        crate::sync::StorageError(error.to_string())
+    }
+}
+
+impl From<tokio_postgres::Error> for SessionError {
+    fn from(error: tokio_postgres::Error) -> Self {
+        match error.as_db_error() {
+            Some(db) => SessionError::database(Some(db.code().code()), db.message()),
+            None => SessionError::Other(error.to_string()),
+        }
+    }
+}
+
 /// What Streamgres runs on a connection.
 pub trait Session: Send {
     /// Runs one statement with `binds`, each sent in binary and declared by
@@ -48,11 +129,11 @@ pub trait Session: Send {
         &'a mut self,
         sql: &'a str,
         binds: &'a [Bind],
-    ) -> ConnectionFuture<'a, Result<RawRows, String>>;
+    ) -> ConnectionFuture<'a, Result<RawRows, SessionError>>;
 
     /// Runs statements that return no rows, `;`-separated, in one round
     /// trip.
-    fn execute<'a>(&'a mut self, sql: &'a str) -> ConnectionFuture<'a, Result<(), String>>;
+    fn execute<'a>(&'a mut self, sql: &'a str) -> ConnectionFuture<'a, Result<(), SessionError>>;
 }
 
 /// An application's checked-out connection. Dropping it returns it to its
@@ -114,7 +195,7 @@ impl Session for tokio_postgres::Client {
         &'a mut self,
         sql: &'a str,
         binds: &'a [Bind],
-    ) -> ConnectionFuture<'a, Result<RawRows, String>> {
+    ) -> ConnectionFuture<'a, Result<RawRows, SessionError>> {
         Box::pin(async move {
             // A type the driver does not know (an enum, a domain, their
             // arrays) is still declared by its own OID, as the application's
@@ -128,10 +209,7 @@ impl Session for tokio_postgres::Client {
                     })
                 })
                 .collect();
-            let statement = self
-                .prepare_typed(sql, &types)
-                .await
-                .map_err(|error| error.to_string())?;
+            let statement = self.prepare_typed(sql, &types).await?;
             let params: Vec<RawParam<'_>> = binds
                 .iter()
                 .map(|bind| RawParam(bind.bytes.as_deref()))
@@ -140,9 +218,7 @@ impl Session for tokio_postgres::Client {
                 .iter()
                 .map(|param| param as &(dyn ToSql + Sync))
                 .collect();
-            let rows = tokio_postgres::Client::query(self, &statement, &refs)
-                .await
-                .map_err(|error| error.to_string())?;
+            let rows = tokio_postgres::Client::query(self, &statement, &refs).await?;
             let columns: Vec<RawColumn> = statement
                 .columns()
                 .iter()
@@ -167,12 +243,8 @@ impl Session for tokio_postgres::Client {
         })
     }
 
-    fn execute<'a>(&'a mut self, sql: &'a str) -> ConnectionFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            self.batch_execute(sql)
-                .await
-                .map_err(|error| error.to_string())
-        })
+    fn execute<'a>(&'a mut self, sql: &'a str) -> ConnectionFuture<'a, Result<(), SessionError>> {
+        Box::pin(async move { self.batch_execute(sql).await.map_err(SessionError::from) })
     }
 }
 
@@ -214,11 +286,11 @@ impl Session for Lease {
         &'a mut self,
         sql: &'a str,
         binds: &'a [Bind],
-    ) -> ConnectionFuture<'a, Result<RawRows, String>> {
+    ) -> ConnectionFuture<'a, Result<RawRows, SessionError>> {
         self.connection().query(sql, binds)
     }
 
-    fn execute<'a>(&'a mut self, sql: &'a str) -> ConnectionFuture<'a, Result<(), String>> {
+    fn execute<'a>(&'a mut self, sql: &'a str) -> ConnectionFuture<'a, Result<(), SessionError>> {
         self.connection().execute(sql)
     }
 }
@@ -336,11 +408,11 @@ impl Session for Pooled {
         &'a mut self,
         sql: &'a str,
         binds: &'a [Bind],
-    ) -> ConnectionFuture<'a, Result<RawRows, String>> {
+    ) -> ConnectionFuture<'a, Result<RawRows, SessionError>> {
         Session::query(self.client(), sql, binds)
     }
 
-    fn execute<'a>(&'a mut self, sql: &'a str) -> ConnectionFuture<'a, Result<(), String>> {
+    fn execute<'a>(&'a mut self, sql: &'a str) -> ConnectionFuture<'a, Result<(), SessionError>> {
         Session::execute(self.client(), sql)
     }
 }

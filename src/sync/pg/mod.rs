@@ -72,7 +72,7 @@ use tokio::sync::{Notify, Semaphore};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 
-use self::connections::{Session, TextRow};
+use self::connections::{Session, SessionError, TextRow};
 
 use super::storage::{Storage, StorageError};
 use crate::log::{log_info, log_warn};
@@ -1004,11 +1004,9 @@ impl Pool {
     ) -> Result<Vec<Vec<TextRow>>, StorageError> {
         let _permit = self.permit().await?;
         let limit = self.timeout();
-        let timed = |error: String| match limit {
-            Some(limit) if error.contains("canceling statement due to statement timeout") => {
-                timed_out(what, limit)
-            }
-            _ => StorageError(error),
+        let timed = |error: SessionError| match (limit, &error) {
+            (Some(limit), SessionError::Timeout(_)) => timed_out(what, limit),
+            _ => StorageError(error.to_string()),
         };
         let work = async {
             match self.acquire().await? {

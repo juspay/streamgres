@@ -21,6 +21,7 @@ use diesel_async::pooled_connection::bb8::{Pool, PooledConnection};
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use streamgres::cache::{
     Bind, Connection, ConnectionFuture, Connections, Lease, RawColumn, RawRows, Session,
+    SessionError,
 };
 
 struct ApplicationPool {
@@ -80,24 +81,46 @@ impl Session for Checkout {
         &'a mut self,
         sql: &'a str,
         binds: &'a [Bind],
-    ) -> ConnectionFuture<'a, Result<RawRows, String>> {
+    ) -> ConnectionFuture<'a, Result<RawRows, SessionError>> {
         Box::pin(async move {
             let rows: Vec<RawRow> = RawQuery::with_strings(sql, binds, self.1)?
                 .load(&mut *self.0)
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(session_error)?;
             Ok(raw_rows(rows))
         })
     }
 
-    fn execute<'a>(&'a mut self, sql: &'a str) -> ConnectionFuture<'a, Result<(), String>> {
-        Box::pin(async move {
-            self.0
-                .batch_execute(sql)
-                .await
-                .map_err(|error| error.to_string())
-        })
+    fn execute<'a>(&'a mut self, sql: &'a str) -> ConnectionFuture<'a, Result<(), SessionError>> {
+        Box::pin(async move { self.0.batch_execute(sql).await.map_err(session_error) })
     }
+}
+
+/// A Diesel error as a [`SessionError`]. Diesel keeps an error's kind but
+/// not its SQLSTATE, so the kinds it names map back to their codes, and a
+/// statement timeout is known by the message Postgres always sends for it.
+fn session_error(error: diesel::result::Error) -> SessionError {
+    use diesel::result::{DatabaseErrorKind as Kind, Error};
+    let Error::DatabaseError(kind, info) = &error else {
+        return SessionError::Other(error.to_string());
+    };
+    let message = info.message();
+    if message.starts_with("canceling statement due to statement timeout") {
+        return SessionError::Timeout(message.to_owned());
+    }
+    let code = match kind {
+        Kind::UniqueViolation => Some("23505"),
+        Kind::ForeignKeyViolation => Some("23503"),
+        Kind::NotNullViolation => Some("23502"),
+        Kind::CheckViolation => Some("23514"),
+        Kind::ExclusionViolation => Some("23P01"),
+        Kind::RestrictViolation => Some("23001"),
+        Kind::SerializationFailure => Some("40001"),
+        Kind::ReadOnlyTransaction => Some("25006"),
+        Kind::ClosedConnection => return SessionError::Other(message.to_owned()),
+        _ => None,
+    };
+    SessionError::database(code, message)
 }
 
 impl Connection for Checkout {

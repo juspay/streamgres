@@ -44,7 +44,7 @@ pub async fn load_catalog<C: Session + ?Sized>(
             &schemas_bind,
         )
         .await
-        .map_err(StorageError)?;
+        .map_err(StorageError::from)?;
     let keys = client
         .query(
             "SELECT tc.table_schema, tc.table_name, kcu.column_name
@@ -58,7 +58,7 @@ pub async fn load_catalog<C: Session + ?Sized>(
             &schemas_bind,
         )
         .await
-        .map_err(StorageError)?;
+        .map_err(StorageError::from)?;
     let text = |rows: &RawRows, row: usize, column: usize| -> Result<String, StorageError> {
         rows.text(row, column)
             .map_err(StorageError)?
@@ -148,7 +148,7 @@ async fn database_collation<C: Session + ?Sized>(client: &mut C) -> Result<Strin
     let version = client
         .query("SELECT current_setting('server_version_num')::int4", &[])
         .await
-        .map_err(StorageError)?
+        .map_err(StorageError::from)?
         .int(0, 0)
         .map_err(StorageError)?
         .unwrap_or(0);
@@ -166,7 +166,7 @@ async fn database_collation<C: Session + ?Sized>(client: &mut C) -> Result<Strin
              FROM pg_database WHERE datname = current_database()"
         }
     };
-    let row = client.query(sql, &[]).await.map_err(StorageError)?;
+    let row = client.query(sql, &[]).await.map_err(StorageError::from)?;
     let field = |column: usize| -> Result<String, StorageError> {
         Ok(row.text(0, column).map_err(StorageError)?.unwrap_or_default())
     };

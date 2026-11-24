@@ -76,9 +76,12 @@ pub enum Error {
     Busy,
     /// The fallback's read of Postgres failed.
     Origin(String),
-    /// The engine did not become ready within the start timeout, and the
-    /// fallback is [`Fallback::Error`].
+    /// The engine did not become ready within the start timeout, and
+    /// [`Builder::allow_degraded_start`] was not set.
     NotReady(String),
+    /// The database is not set up for Streamgres: run
+    /// [`Builder::setup_sql`] as an administrator.
+    Setup(String),
     /// Streamgres could not start, or has stopped.
     Stopped(String),
     /// A blocking operation would prevent its application runtime from making progress.
@@ -93,6 +96,7 @@ impl std::fmt::Display for Error {
             Error::Busy => write!(f, "the fallback is busy"),
             Error::Origin(reason) => write!(f, "the fallback read failed: {reason}"),
             Error::NotReady(reason) => write!(f, "not ready: {reason}"),
+            Error::Setup(reason) => write!(f, "not set up: {reason}"),
             Error::Stopped(reason) => write!(f, "stopped: {reason}"),
             Error::BlockingContext => f.write_str("blocking application-pool operations cannot run in a current-thread Tokio context; await the operation or use a plain thread"),
         }
@@ -205,6 +209,7 @@ pub struct Builder {
     on_unsupported: OnUnsupported,
     pool_size: usize,
     debug_history: usize,
+    degraded_start: bool,
 }
 
 impl std::fmt::Debug for Builder {
@@ -309,6 +314,16 @@ impl Builder {
         self
     }
 
+    /// Lets [`Builder::start`] succeed before the engine is ready: reads go
+    /// to the fallback while it comes up. Without it, an engine not ready
+    /// within the start timeout is [`Error::NotReady`]. Either way, a setup
+    /// that cannot work (the DDL trigger missing) is [`Error::Setup`], and
+    /// [`Builder::fallback`] still decides what answers after startup.
+    pub fn allow_degraded_start(mut self) -> Self {
+        self.degraded_start = true;
+        self
+    }
+
     /// How long [`Builder::start`] waits for the engine to be ready, and
     /// how long one engine may take to start (default 30 seconds).
     pub fn start_timeout(mut self, timeout: Duration) -> Self {
@@ -332,9 +347,10 @@ impl Builder {
     }
 
     /// Starts the engine and waits up to the start timeout for it to be
-    /// ready. With [`Fallback::Postgres`] an engine not ready by then is
-    /// no error: reads fall back while it comes up. With
-    /// [`Fallback::Error`] it is [`Error::NotReady`].
+    /// ready: [`Error::Setup`] when the DDL trigger is missing, and
+    /// [`Error::NotReady`] when the engine is not ready by then, unless
+    /// [`Builder::allow_degraded_start`] lets reads fall back while it comes
+    /// up.
     ///
     /// Streamgres runs its connections and background work on a runtime
     /// of its own, so this future, and every read's, may be awaited on any
@@ -391,6 +407,18 @@ impl Builder {
             runtime,
             io: io.clone(),
         });
+        // A missing trigger is a setup mistake no wait will mend: refuse it
+        // now, whether or not a degraded start is allowed. A check that
+        // cannot run is left to the readiness wait.
+        match trigger_present(connections.as_ref(), &self.pg.ddl_trigger()).await {
+            Ok(false) => {
+                return Err(Error::Setup(
+                    "the DDL trigger is missing; install Builder::setup_sql".to_owned(),
+                ));
+            }
+            Ok(true) => {}
+            Err(reason) => log_warn!("Streamgres could not check its DDL trigger: {reason}"),
+        }
         let engine = PgEngine::new(self.pg, connections, io.handle().clone(), reads_on_origin);
         let start_timeout = self.cache.start_timeout;
         let recorder = Recorder::new(self.debug_history, self.cache.max_entries.saturating_mul(2));
@@ -400,15 +428,11 @@ impl Builder {
             .await
             .map_err(|error| Error::Stopped(error.to_string()))?;
         if let Err(refusal) = ready {
-            match self.fallback {
-                Fallback::Error => {
-                    stop(io.handle(), cache).await;
-                    return Err(Error::NotReady(refusal.to_string()));
-                }
-                Fallback::Postgres { .. } => {
-                    log_warn!("Streamgres started before its engine was ready: {refusal}");
-                }
+            if !self.degraded_start {
+                stop(io.handle(), cache).await;
+                return Err(Error::NotReady(refusal.to_string()));
             }
+            log_warn!("Streamgres started before its engine was ready: {refusal}");
         }
         let permits = match &self.fallback {
             Fallback::Postgres { max_concurrent, .. } => {
@@ -496,6 +520,7 @@ impl Streamgres {
             on_unsupported: OnUnsupported::default(),
             pool_size: 8,
             debug_history: 0,
+            degraded_start: false,
         }
     }
 
@@ -1038,6 +1063,17 @@ impl<'a> IntoFuture for Inspecting<'a> {
             (read, trace.expect("a traced read has a trace"))
         })
     }
+}
+
+/// Whether the DDL trigger `name` is installed, checked on one of
+/// `connections`.
+async fn trigger_present(connections: &dyn Connections, name: &str) -> Result<bool, String> {
+    let mut lease = connections.get().await?;
+    let present = crate::sync::pg::ddl::trigger_present(&mut lease, name)
+        .await
+        .map_err(|error| error.to_string())?;
+    lease.recycle();
+    Ok(present)
 }
 
 /// Stops `cache` on `runtime`'s blocking threads, off the caller's.

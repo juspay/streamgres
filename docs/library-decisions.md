@@ -104,12 +104,14 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 | `.fallback(..)` | `Postgres { 8, 1 s, 10 s }` | What answers a read refused at run time (section 7). |
 | `.on_unsupported(..)` | `Error` | Whether an unsupported statement is an error or goes to the fallback (section 7). |
 | `.start_timeout(d)` | 30 s | How long `start()` waits for readiness, and how long one engine may take to start. |
+| `.allow_degraded_start()` | off | Lets `start()` succeed before the engine is ready; reads fall back while it comes up. |
 | `.debug_history(n)` | 0 | Reads recorded per query for `inspect` (section 8). |
 | `Builder::setup_sql()` | none | The DDL trigger stack, for an administrator to run once. |
 
-- `start()` connects, starts the engine and waits up to `start_timeout` for it to be ready.
-  - With `Fallback::Postgres`, an engine not ready by then is not an error: reads fall back while it comes up.
-  - With `Fallback::Error`, it returns `Error::NotReady`.
+- `start()` connects, starts the engine and waits up to `start_timeout` for it to be ready. Setup, readiness and fallback are separate:
+  - a missing DDL trigger is `Error::Setup`, with or without a degraded start: no wait mends it;
+  - an engine not ready in time is `Error::NotReady`, unless `allow_degraded_start()` lets reads fall back while it comes up;
+  - `fallback(..)` decides only what answers refused reads once started.
 - `shutdown().await` stops the engine and waits for cleanup, including dropping its replication slot. Concurrent shutdown calls wait for the same supervisor join. Dropping the last handle starts the same cleanup in the background without waiting; process exit can cut it short.
 - Fixed, not on the builder:
 
@@ -161,7 +163,8 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 |---|---|
 | Memory hit | None |
 | Fallback reads | A checkout from Streamgres's pool |
-| Catalog, trigger check, custom types, reader check, WAL sampling | A checkout from Streamgres's pool |
+| Catalog, trigger check, custom types, reader check | A checkout from Streamgres's pool |
+| WAL position sampling | One connection of its own to `connect(dsn)`, apart from any pool |
 | Loading a query's rows | The engine's storage connections (4), each read one simple-query batch (`BEGIN`, snapshot import, `SELECT`, `COMMIT`) in Postgres's text format |
 | WAL replication, exported-snapshot minting, slot create and drop | Dedicated connections |
 
@@ -186,13 +189,17 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 - Every checkout must target the replicated database with one role, search path and session policy. Switching role or tenant per request is not supported by a shared cache.
 - Storage reads on those checkouts run statement by statement, and binary cells are converted to Postgres's text for the engine. Every column a storage read selects is cast to `int8`, `float8`, `text`, `bool`, `date` or `timestamp`, all of which the conversion covers.
 - Admission excludes every RLS-enabled table, including for bypass roles: the WAL stream does not enforce row policies. Embedded-library DDL commits invalidate reader checks even when column shapes do not change. Admission follows observed replication commits; immediate access revocation requires coordinating policy changes with application shutdown.
-- Source-position sampling has a two-second deadline covering checkout, execution and decoding. A failure records its cause, leaves freshness to expire, and retries rather than wedging the sampler.
+- A schema change needs a fresh reader check on a pool connection; while every pool connection is held by slow fallback reads, warm queries fall back until one frees.
+- Source-position sampling has a connection of its own, so a pool saturated by fallback reads cannot starve it and turn every read into a fallback. It samples the `connect(dsn)` endpoint, primary or standby. Each sample has a two-second deadline covering connecting, execution and decoding; a failure records its cause, drops the connection, leaves freshness to expire and retries.
 - `Connections` hands out a `Lease` over a `Session` (`query(sql, binds)` returning cells with their type OIDs, and `execute(sql)`). Any pool can implement it.
+- A `Session` declares every bind by its type OID, custom types included, as the application's own driver does; `unknown` would let Postgres infer a type the bind alone decides.
+- A `Session` fails with a `SessionError`: `Database` with the SQLSTATE when the driver reports one, `Timeout` for a cancelled or timed-out statement, `Other` for the connection, protocol or pool. Callers classify errors by variant, never by message.
 - `streamgres_diesel::connections(pool)` (feature `async-pool`) wraps a `diesel-async` bb8 pool through Diesel's public API:
   - each `$n` is pushed as a bind of the type Streamgres names at run time;
   - rows come back as their cells' bytes and available type OIDs; an all-NULL column may have OID zero, and an empty result may have no column descriptors;
   - parameter recognition respects escaped strings, nested comments, dollar quotes and identifier boundaries; the pool's fixed `standard_conforming_strings` policy is discovered once;
   - statements are not cached as prepared;
+  - Diesel keeps an error's kind but not its SQLSTATE: the kinds it names map back to their codes, and a statement timeout is recognised by the message Postgres always sends for it;
   - a discarded checkout is marked broken, so bb8 closes it.
 
 ## 7. Fallback
