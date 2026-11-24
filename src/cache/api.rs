@@ -104,7 +104,14 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Origin(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// A statement and its bind values, each sent in Postgres's binary
 /// format with its type.
@@ -197,6 +204,7 @@ impl<T: Param + Default> Param for Option<T> {
 /// How often Streamgres checks whether the engine's catalog changed, to
 /// read the database's types again.
 const TYPES_EVERY: Duration = Duration::from_millis(250);
+const TYPES_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How Streamgres starts: [`Streamgres::connect`], the settings, then
 /// [`Builder::start`].
@@ -408,49 +416,22 @@ impl Builder {
             runtime,
             io: io.clone(),
         });
-        // One deadline for all of startup: the trigger check, then the wait
-        // for readiness with what is left.
-        let start_timeout = self.cache.start_timeout;
-        let deadline = Instant::now() + start_timeout;
-        // A missing trigger is a setup mistake no wait will mend: refuse it
-        // now, whether or not a degraded start is allowed. A check that
-        // fails is left to the readiness wait; one that runs out of time is
-        // as not ready.
-        let checked = tokio::time::timeout(
-            start_timeout,
-            trigger_present(connections.as_ref(), &self.pg.ddl_trigger()),
-        )
-        .await;
-        match checked {
-            Ok(Ok(false)) => {
-                return Err(Error::Setup(
-                    "the DDL trigger is missing; install Builder::setup_sql".to_owned(),
-                ));
-            }
-            Ok(Ok(true)) => {}
-            Ok(Err(reason)) => log_warn!("Streamgres could not check its DDL trigger: {reason}"),
-            Err(_) => {
-                let reason = format!("checking the DDL trigger took longer than {start_timeout:?}");
-                if !self.degraded_start {
-                    return Err(Error::NotReady(reason));
-                }
-                log_warn!("Streamgres starts without checking its DDL trigger: {reason}");
-            }
-        }
+        let deadline = Instant::now()
+            .checked_add(self.cache.start_timeout)
+            .ok_or_else(|| Error::Stopped("the startup timeout is too large".to_owned()))?;
         let engine = PgEngine::new(self.pg, connections, io.handle().clone(), reads_on_origin);
         let recorder = Recorder::new(self.debug_history, self.cache.max_entries.saturating_mul(2));
         let cache = Arc::new(Cache::start(self.cache, Arc::new(engine)));
         let waiting = cache.clone();
-        let left = deadline.saturating_duration_since(Instant::now());
-        let ready = tokio::task::spawn_blocking(move || waiting.wait_ready(left))
+        let ready = tokio::task::spawn_blocking(move || waiting.wait_ready(deadline))
             .await
             .map_err(|error| Error::Stopped(error.to_string()))?;
-        if let Err(refusal) = ready {
-            if !self.degraded_start {
-                stop(io.handle(), cache).await;
-                return Err(Error::NotReady(refusal.to_string()));
+        match ready {
+            Ok(()) => {}
+            Err(reason @ Error::NotReady(_)) if self.degraded_start => {
+                log_warn!("Streamgres started before its engine was ready: {reason}");
             }
-            log_warn!("Streamgres started before its engine was ready: {refusal}");
+            Err(reason) => return Err(reason),
         }
         let permits = match &self.fallback {
             Fallback::Postgres { max_concurrent, .. } => {
@@ -475,7 +456,10 @@ impl Builder {
                 io,
             }),
         };
-        if let Err(reason) = lib.load_types().await {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if !left.is_zero()
+            && let Ok(Err(reason)) = tokio::time::timeout(left, lib.load_types(left.min(TYPES_TIMEOUT))).await
+        {
             log_warn!("initial type discovery: {reason}");
         }
         lib.watch_types();
@@ -626,7 +610,7 @@ impl Streamgres {
     /// what an adapter does when a type it must name is not known yet (one
     /// created since Streamgres last read them).
     pub async fn refresh_types(&self) -> Result<(), Error> {
-        self.load_types().await
+        self.load_types(TYPES_TIMEOUT).await
     }
 
     /// [`Self::refresh_types`] for synchronous code: it blocks this
@@ -638,7 +622,7 @@ impl Streamgres {
         let lib = self.clone();
         wait(
             self.inner.io.handle(),
-            async move { lib.load_types().await },
+            async move { lib.load_types(TYPES_TIMEOUT).await },
         )
         .map_err(Error::Stopped)?
     }
@@ -655,7 +639,7 @@ impl Streamgres {
                 let Some(inner) = inner.upgrade() else { break };
                 let version = inner.cache.catalog_version();
                 if version.is_some() && version != seen {
-                    match (Streamgres { inner }).load_types().await {
+                    match (Streamgres { inner }).load_types(TYPES_TIMEOUT).await {
                         Ok(()) => seen = version,
                         Err(reason) => log_warn!("refreshing types: {reason}"),
                     }
@@ -665,7 +649,7 @@ impl Streamgres {
     }
 
     /// Reads the origin's types again ([`Streamgres::type_oids`]).
-    async fn load_types(&self) -> Result<(), Error> {
+    async fn load_types(&self, timeout: Duration) -> Result<(), Error> {
         let observed = self.inner.type_generation.load(Ordering::Acquire);
         let _refresh = self.inner.type_refresh.lock().await;
         if self.inner.type_generation.load(Ordering::Acquire) != observed {
@@ -675,7 +659,7 @@ impl Streamgres {
             .inner
             .cache
             .engine()
-            .origin_types()
+            .origin_types(timeout)
             .await
             .map_err(|reason| {
                 Error::Origin(SessionError::Other(format!(
@@ -1085,17 +1069,6 @@ impl<'a> IntoFuture for Inspecting<'a> {
             (read, trace.expect("a traced read has a trace"))
         })
     }
-}
-
-/// Whether the DDL trigger `name` is installed, checked on one of
-/// `connections`.
-async fn trigger_present(connections: &dyn Connections, name: &str) -> Result<bool, String> {
-    let mut lease = connections.get().await?;
-    let present = crate::sync::pg::ddl::trigger_present(&mut lease, name)
-        .await
-        .map_err(|error| error.to_string())?;
-    lease.recycle();
-    Ok(present)
 }
 
 /// Stops `cache` on `runtime`'s blocking threads, off the caller's.

@@ -43,7 +43,7 @@ pub use api::{
 };
 pub(crate) use config::CacheConfig;
 pub use config::Ttl;
-pub(crate) use engine::{Engine, Instance, SendFuture, Serve, TypeOid};
+pub(crate) use engine::{Engine, EngineError, Instance, SendFuture, Serve, TypeOid};
 pub use inspect::{Caller, EngineState, Inspect, KeptQuery, QueryId, QueryState, Served, Trace};
 pub use metrics::Metrics;
 pub(crate) use reader::{CatalogVersion, Reader, ReaderCheck};
@@ -141,16 +141,22 @@ impl Cache {
     }
 
     /// Waits until the engine is up and caught up with the database, for
-    /// at most `timeout`; the reason it is not otherwise.
-    pub fn wait_ready(&self, timeout: Duration) -> Result<(), Refusal> {
-        let deadline = Instant::now() + timeout;
+    /// the deadline, or until the engine identifies invalid setup.
+    pub fn wait_ready(&self, deadline: Instant) -> Result<(), Error> {
         loop {
             let seen = self.shared.epoch();
-            let Err(refusal) = self.shared.read().readiness(&self.shared.config) else {
-                return Ok(());
+            let refusal = {
+                let state = self.shared.read();
+                if let Phase::Down(EngineError::Setup(reason)) = &state.phase {
+                    return Err(Error::Setup(reason.clone()));
+                }
+                match state.readiness(&self.shared.config) {
+                    Ok(()) => return Ok(()),
+                    Err(refusal) => refusal,
+                }
             };
             let Some(left) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(refusal);
+                return Err(Error::NotReady(refusal.to_string()));
             };
             self.shared.wait(seen, left.min(Duration::from_millis(100)));
         }
@@ -193,7 +199,7 @@ impl Cache {
     /// of a query the engine does not keep yet registers it, and every
     /// read until its first rows have all arrived is refused as
     /// [`Refusal::Filling`]: it never waits.
-    pub fn read(
+    fn read(
         &self,
         sql: &str,
         binds: &[Bind],
@@ -214,15 +220,9 @@ impl Cache {
         if let Some(rows) = local::get(&local_key, self.shared.now(), ttl) {
             return Ok(rows);
         }
-        let counters = &self.shared.counters;
         let answer = self.answer(sql, binds, reader, ttl);
-        match &answer {
-            Ok(_) => {}
-            Err(Refusal::Unsupported(_)) => Counters::bump(&counters.unsupported),
-            Err(Refusal::NotReady(_) | Refusal::Unavailable(_)) => {
-                Counters::bump(&counters.not_ready)
-            }
-            Err(Refusal::Filling) => {}
+        if let Err(refusal) = &answer {
+            self.count_refusal(refusal);
         }
         if let Ok(rows) = &answer {
             let state = self.shared.read();
@@ -257,6 +257,15 @@ impl Cache {
         answer
     }
 
+    fn count_refusal(&self, refusal: &Refusal) {
+        let counters = &self.shared.counters;
+        match refusal {
+            Refusal::Unsupported(_) => Counters::bump(&counters.unsupported),
+            Refusal::NotReady(_) | Refusal::Unavailable(_) => Counters::bump(&counters.not_ready),
+            Refusal::Filling => {}
+        }
+    }
+
     /// Admit a memory answer only after its client encoding succeeds.
     fn encoded(
         &self,
@@ -265,6 +274,17 @@ impl Cache {
         reader: &Reader,
         ttl: Option<Ttl>,
     ) -> Result<Rows, Refusal> {
+        if self.oversized_binds(binds) {
+            let admitted = self
+                .answer_catalog(reader)
+                .and_then(|(catalog, _)| self.admit_oversized(sql, binds, &catalog, Some(reader)));
+            let refusal = match admitted {
+                Ok(()) => Self::bind_budget_refusal(),
+                Err(refusal) => refusal,
+            };
+            self.count_refusal(&refusal);
+            return Err(refusal);
+        }
         let identity = {
             let state = self.shared.read();
             state.catalog().ok().and_then(|catalog| {
@@ -338,6 +358,43 @@ impl Cache {
         result
     }
 
+    fn oversized_binds(&self, binds: &[Bind]) -> bool {
+        let config = &self.shared.config;
+        let limit = (config.max_entry_bytes.min(config.max_bytes) / 16).min(1 << 20);
+        let mut left = limit;
+        for bind in binds {
+            let Some(remaining) = left.checked_sub(bind.bytes.as_ref().map_or(0, Vec::len)) else {
+                return true;
+            };
+            left = remaining;
+        }
+        false
+    }
+
+    fn bind_budget_refusal() -> Refusal {
+        Refusal::Unavailable("the bind values exceed the cache's evaluation budget".to_owned())
+    }
+
+    /// Classifies an oversized read using its shape, bind metadata, and
+    /// reader permissions without decoding or hashing the payload.
+    fn admit_oversized(
+        &self,
+        sql: &str,
+        binds: &[Bind],
+        catalog: &Arc<crate::model::Catalog>,
+        reader: Option<&Reader>,
+    ) -> Result<(), Refusal> {
+        let shape = self
+            .shared
+            .parsed
+            .shape_of(sql, &CatalogVersion::of(catalog), catalog)
+            .map_err(|reason| Refusal::Unsupported(reason.to_string()))?;
+        shape
+            .check_types(binds)
+            .map_err(|reason| Refusal::Unsupported(reason.to_string()))?;
+        self.admit(shape.unbound(), catalog, reader).map(drop)
+    }
+
     fn validate(
         &self,
         sql: &str,
@@ -345,13 +402,16 @@ impl Cache {
         catalog: &Arc<crate::model::Catalog>,
         reader: &Reader,
     ) -> Result<(), Refusal> {
+        if self.oversized_binds(binds) {
+            return self.admit_oversized(sql, binds, catalog, Some(reader));
+        }
         let version = CatalogVersion::of(catalog);
         let select = self
             .shared
             .parsed
             .get_or_parse(sql, binds, &version, catalog)
             .map_err(|reason| Refusal::Unsupported(reason.to_string()))?;
-        self.admit(&select, catalog, reader).map(drop)
+        self.admit(&select, catalog, Some(reader)).map(drop)
     }
 
     /// The tables `select` reads, when the engine can answer it for
@@ -361,20 +421,39 @@ impl Cache {
         &self,
         select: &Select,
         catalog: &'c crate::model::Catalog,
-        reader: &Reader,
+        reader: Option<&Reader>,
     ) -> Result<Vec<&'c crate::model::DbTable>, Refusal> {
         let mut tables = Vec::with_capacity(select.nodes.len());
         for node in &select.nodes {
             let table = catalog
                 .table(node.table.as_str())
                 .ok_or_else(|| Refusal::Unsupported(format!("unknown table `{}`", node.table)))?;
-            if let Some(reason) = reader.refuses(&node.table) {
+            if let Some(reason) = reader.and_then(|reader| reader.refuses(&node.table)) {
                 return Err(Refusal::Unsupported(reason));
             }
             tables.push(table);
         }
         rows::projected_columns(select, &tables)?;
         Ok(tables)
+    }
+
+    fn answer_catalog(
+        &self,
+        reader: &Reader,
+    ) -> Result<(Arc<crate::model::Catalog>, CatalogVersion), Refusal> {
+        let shared = &self.shared;
+        let catalog = {
+            let state = shared.read();
+            state.readiness(&shared.config)?;
+            state.catalog()?
+        };
+        let version = CatalogVersion::of(&catalog);
+        if !reader.is_current(&version) {
+            return Err(Refusal::NotReady(
+                "the reader was checked against an older catalog".to_owned(),
+            ));
+        }
+        Ok((catalog, version))
     }
 
     fn answer(
@@ -386,44 +465,14 @@ impl Cache {
     ) -> Result<CachedRows, Refusal> {
         let shared = &self.shared;
         let config = &shared.config;
-        let bind_bytes = binds.iter().fold(0usize, |bytes, bind| {
-            bytes.saturating_add(bind.bytes.as_ref().map_or(0, Vec::len))
-        });
-        let oversized =
-            bind_bytes > (config.max_entry_bytes.min(config.max_bytes) / 16).min(1 << 20);
-        let catalog = {
-            let state = shared.read();
-            state.readiness(config)?;
-            state.catalog()?
-        };
-        let version = CatalogVersion::of(&catalog);
-        if !reader.is_current(&version) {
-            return Err(Refusal::NotReady(
-                "the reader was checked against an older catalog".to_owned(),
-            ));
-        }
-        if oversized {
-            // Classified by its shape alone, so the values are never read; a
-            // statement that is supported is then refused for its size.
-            let shape = shared
-                .parsed
-                .shape_of(sql, &version, &catalog)
-                .map_err(|reason| Refusal::Unsupported(reason.to_string()))?;
-            shape
-                .check_types(binds)
-                .map_err(|reason| Refusal::Unsupported(reason.to_string()))?;
-            self.admit(shape.unbound(), &catalog, reader)?;
-            return Err(Refusal::Unavailable(
-                "the bind values exceed the cache's evaluation budget".to_owned(),
-            ));
-        }
+        let (catalog, version) = self.answer_catalog(reader)?;
         let select = shared
             .parsed
             .get_or_parse(sql, binds, &version, &catalog)
             .map_err(|reason| Refusal::Unsupported(reason.to_string()))?;
         // A statement returning a column the engine does not hold exactly
         // is refused before its query is kept for nothing.
-        let tables = self.admit(&select, &catalog, reader)?;
+        let tables = self.admit(&select, &catalog, Some(reader))?;
         let ttl = config.ttl_for(ttl);
 
         let mut subscribed = false;
@@ -632,27 +681,18 @@ impl Cache {
         let Ok(catalog) = state.catalog() else {
             return not_kept(QueryState::NotReady("the engine is not running".to_owned()));
         };
+        if self.oversized_binds(binds) {
+            return not_kept(match self.admit_oversized(sql, binds, &catalog, reader) {
+                Ok(()) => QueryState::Refused(Self::bind_budget_refusal().to_string()),
+                Err(refusal) => QueryState::Unsupported(refusal.to_string()),
+            });
+        }
         let version = CatalogVersion::of(&catalog);
         let select = match shared.parsed.get_or_parse(sql, binds, &version, &catalog) {
             Ok(select) => select,
             Err(reason) => return not_kept(QueryState::Unsupported(reason.to_string())),
         };
-        let mut tables = Vec::with_capacity(select.nodes.len());
-        for node in &select.nodes {
-            if let Some(reason) = reader.and_then(|reader| reader.refuses(&node.table)) {
-                return not_kept(QueryState::Unsupported(reason));
-            }
-            match catalog.table(node.table.as_str()) {
-                Some(table) => tables.push(table),
-                None => {
-                    return not_kept(QueryState::Unsupported(format!(
-                        "unknown table `{}`",
-                        node.table
-                    )));
-                }
-            }
-        }
-        if let Err(refusal) = rows::projected_columns(&select, &tables) {
+        if let Err(refusal) = self.admit(&select, &catalog, reader) {
             return not_kept(QueryState::Unsupported(refusal.to_string()));
         }
         if let Some(reason) = state.refused(&select.query, config.refusal_ttl) {

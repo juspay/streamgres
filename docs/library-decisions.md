@@ -110,9 +110,10 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 
 - `start()` connects, starts the engine and waits up to `start_timeout` for it to be ready. Setup, readiness and fallback are separate:
   - a missing DDL trigger is `Error::Setup`, with or without a degraded start: no wait mends it;
-  - one deadline, `start_timeout`, covers the trigger check and the readiness wait together; a check that cannot finish in it counts as not ready;
+  - one deadline, `start_timeout`, covers trigger verification, the readiness wait and initial type discovery. If no time remains for type discovery, the background watcher retries it once the catalog is available;
   - an engine not ready in time is `Error::NotReady`, unless `allow_degraded_start()` lets reads fall back while it comes up;
   - `fallback(..)` decides only what answers refused reads once started.
+- A failed `start()` returns at its deadline and leaves cleanup to the supervisor. A missing trigger fails before any replication slot exists; after a readiness timeout, a slot already created stays visible until that cleanup finishes.
 - `shutdown().await` stops the engine and waits for cleanup, including dropping its replication slot. Concurrent shutdown calls wait for the same supervisor join. Dropping the last handle starts the same cleanup in the background without waiting; process exit can cut it short.
 - Fixed, not on the builder:
 
@@ -202,7 +203,7 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 | `Database { code, message }` | Postgres refused or failed the statement | On Streamgres's own pool, `code` is the SQLSTATE Postgres returned. Through the Diesel bridge it is inferred from Diesel's error kind (see below), or `None`. |
 | `Timeout` | Postgres cancelled it for `statement_timeout`, or a Streamgres deadline (the fallback's `timeout`) passed | Streamgres's own deadlines always. Postgres's: told from a cancel request by its message, best effort for an untranslated server. |
 | `Cancelled` | Postgres cancelled it on request (`pg_cancel_backend`, a client cancel) | As for `Timeout`: both share SQLSTATE 57014. |
-| `Other` | The connection, protocol, pool or task | Yes. |
+| `Other` | The connection, protocol, pool or task | This category does not determine whether retrying will help. |
 - `streamgres_diesel::connections(pool)` (feature `async-pool`) wraps a `diesel-async` bb8 pool through Diesel's public API:
   - each `$n` is pushed as a bind of the type Streamgres names at run time;
   - rows come back as their cells' bytes and available type OIDs; an all-NULL column may have OID zero, and an empty result may have no column descriptors;
@@ -210,6 +211,8 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
   - statements are not cached as prepared;
   - Diesel keeps an error's kind but not its SQLSTATE: the kinds it names map to the code Postgres uses for them (an inference, not a code Postgres returned), other kinds have none, and a cancelled statement's reason comes from its message;
   - a discarded checkout is marked broken, so bb8 closes it.
+
+Diesel reads continue to return `QueryResult`. Known SQLSTATE values map to the corresponding Diesel database error kinds. Other Streamgres failures, including timeouts and cancellations, are boxed inside `QueryBuilderError` as a downcastable `StreamgresError`.
 
 ## 7. Fallback
 
@@ -224,7 +227,7 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 | `Fallback` | The statement goes to `Fallback`, as a run-time refusal does. |
 
 - `Fallback` applies to run-time refusals: not ready, loading, budgets, values not yet encodable.
-- A budget decides only whether memory answers, never whether a statement may reach Postgres. A statement whose bind values exceed the evaluation budget (the smaller of 1 MiB and 1/16 of the entry budget) is classified by its SQL alone, without reading the values: unsupported is still an error, and only a supported statement falls back.
+- A budget decides only whether memory answers, never whether a statement may reach Postgres. A statement whose bind values exceed the evaluation budget (the smaller of 1 MiB and 1/16 of the entry budget) is classified by its SQL shape, bind count and types, and the reader's permissions. Admission and inspection skip bound parsing for oversized values. Query tracing still fingerprints the binds. Only an admitted statement falls back.
 
 - A fallback read runs as its own task and holds its turn until it finishes, even if the caller is cancelled.
 - With `OnUnsupported::Error`, degraded-engine reads are validated against a source catalog before fallback. This admission check is single-flight and memoized for 250 ms. Failure to obtain that catalog is a visible readiness error, rather than permission to execute unclassified SQL.
@@ -244,7 +247,7 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 - The place of a read is captured with `#[track_caller]` on `load_and_sync`; the adapter passes on its own caller's place.
 - `debug_history(n)` records per query its callers (at most 16) and last `n` traces, for at most 20 000 queries, the least recently read forgotten. It takes a lock per read, so it is off by default.
 - A read that falls back is logged at debug level with its query id, place and reason.
-- `cargo run --release --example warm_reads -- <dsn> [callers] [seconds] [async|blocking]` measures warm reads through the public API: it warms every query it times until memory answers it, runs concurrent callers that each stop at their own deadline, and reports throughput, p50 and p99 with the share memory answered, so a run that was not warm throughout shows it. Each run uses a schema and trigger stack of its own, so runs can overlap.
+- `cargo run --release --example warm_reads -- <dsn> [callers] [seconds] [async|blocking]` measures warm reads through the public API: it warms every query it times until memory answers it, runs concurrent callers that each stop at their own deadline, and reports throughput, p50 and p99 with the share memory answered, so a run that was not warm throughout shows it. Each run creates and owns uniquely named fixtures. Async readers yield periodically between measured reads, and a run fails if any caller records no samples.
 
 - Successful memory metrics are incremented only after binary encoding. Unsupported and failed demo reads are not labeled as PostgreSQL answers or counted as successful fallbacks.
 - Recent history continues recording after the 16-caller aggregation limit. Caller aggregation and recent-trace retention have independent bounds.

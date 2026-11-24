@@ -58,6 +58,27 @@ pub(crate) struct Instance {
 /// serves until the instance fails or the cache stops.
 pub(crate) type Serve<'a> = Box<dyn FnOnce(Instance) -> LocalFuture<'a, Result<(), String>> + 'a>;
 
+/// The failure of one engine instance.
+#[derive(Debug)]
+pub(crate) enum EngineError {
+    Setup(String),
+    Retry(String),
+}
+
+impl EngineError {
+    pub(super) fn reason(&self) -> &str {
+        match self {
+            Self::Setup(reason) | Self::Retry(reason) => reason,
+        }
+    }
+}
+
+impl From<String> for EngineError {
+    fn from(reason: String) -> Self {
+        Self::Retry(reason)
+    }
+}
+
 /// An engine the cache can run and read the origin of.
 pub(crate) trait Engine: Send + Sync + 'static {
     /// Runs one instance on the calling thread: starts it within
@@ -69,7 +90,7 @@ pub(crate) trait Engine: Send + Sync + 'static {
         stopping: &Shutdown,
         start_timeout: Duration,
         serve: Serve<'_>,
-    ) -> Result<(), String>;
+    ) -> Result<(), EngineError>;
 
     /// Reads `sql` with `binds` from the origin itself, as the fallback
     /// for a read the engine cannot answer, within `timeout`.
@@ -93,7 +114,7 @@ pub(crate) trait Engine: Send + Sync + 'static {
     /// Every type of the origin's own schemas (enums, domains, composites)
     /// with its OID and its array type's OID: what an adapter names a
     /// custom type's parameters by.
-    fn origin_types(&self) -> SendFuture<'_, Result<Vec<TypeOid>, String>>;
+    fn origin_types(&self, timeout: Duration) -> SendFuture<'_, Result<Vec<TypeOid>, String>>;
 
     /// Runs `sql` with three text-array parameters on the origin and
     /// returns its one row's text columns: how the cache checks which
@@ -136,7 +157,7 @@ pub(super) fn spawn(shared: Arc<Shared>) -> Option<std::thread::JoinHandle<()>> 
     match spawned {
         Ok(handle) => Some(handle),
         Err(error) => {
-            shared.write().phase = Phase::Down(format!("the engine thread did not start: {error}"));
+            shared.write().phase = Phase::Down(format!("the engine thread did not start: {error}").into());
             shared.notify();
             None
         }
@@ -153,7 +174,7 @@ fn supervise(shared: &Shared) {
     });
 }
 
-fn supervise_with(shared: &Shared, mut run: impl FnMut(&Shared) -> Result<(), String>) {
+fn supervise_with(shared: &Shared, mut run: impl FnMut(&Shared) -> Result<(), EngineError>) {
     let mut backoff = FIRST_BACKOFF;
     let mut instances = 0u64;
     while !shared.stopping.requested() {
@@ -164,22 +185,21 @@ fn supervise_with(shared: &Shared, mut run: impl FnMut(&Shared) -> Result<(), St
         let started = Instant::now();
         let outcome =
             std::panic::catch_unwind(AssertUnwindSafe(|| run(shared))).unwrap_or_else(|panic| {
-                Err(format!(
+                Err(EngineError::Retry(format!(
                     "the engine panicked: {}",
                     panic_text(panic.as_ref())
-                ))
+                )))
             });
         {
             let mut state = shared.write();
             if matches!(state.phase, Phase::Stopped) {
                 return;
             }
-            let reason = match outcome {
-                Ok(()) => "the engine stopped".to_owned(),
-                Err(reason) => reason,
-            };
-            log_warn!("embedded engine down: {reason}; starting another in {backoff:?}");
-            state.phase = Phase::Down(reason);
+            let error = outcome
+                .err()
+                .unwrap_or_else(|| EngineError::Retry("the engine stopped".to_owned()));
+            log_warn!("embedded engine down: {}; starting another in {backoff:?}", error.reason());
+            state.phase = Phase::Down(error);
         }
         shared.notify();
         if started.elapsed() >= STEADY {
@@ -286,13 +306,13 @@ pub(super) mod tests {
             stopping: &Shutdown,
             _start_timeout: Duration,
             serve: Serve<'_>,
-        ) -> Result<(), String> {
+        ) -> Result<(), EngineError> {
             let instance = (self.0)(stopping)?;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| error.to_string())?;
-            runtime.block_on(serve(instance))
+            runtime.block_on(serve(instance)).map_err(EngineError::from)
         }
 
         fn read_origin<'a>(
@@ -313,7 +333,7 @@ pub(super) mod tests {
             Box::pin(async { Err("no origin".to_owned()) })
         }
 
-        fn origin_types(&self) -> SendFuture<'_, Result<Vec<TypeOid>, String>> {
+        fn origin_types(&self, _timeout: Duration) -> SendFuture<'_, Result<Vec<TypeOid>, String>> {
             Box::pin(async { Err("no origin".to_owned()) })
         }
 
@@ -345,7 +365,7 @@ pub(super) mod tests {
                 });
                 panic!("injected engine panic");
             }
-            recovered = matches!(&shared.read().phase, Phase::Down(reason) if reason.contains("injected engine panic"));
+            recovered = matches!(&shared.read().phase, Phase::Down(error) if error.reason().contains("injected engine panic"));
             shared.stop();
             Ok(())
         });

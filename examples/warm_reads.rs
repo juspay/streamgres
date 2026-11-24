@@ -4,8 +4,7 @@
 //! cargo run --release --example warm_reads -- <dsn> [callers] [seconds] [async|blocking]
 //! ```
 //!
-//! Sets up a table in a schema of its own (`bench_warm_<pid>`, so runs do
-//! not disturb each other), warms every query it will time
+//! Creates a schema for each run, warms every query it will time
 //! until memory answers each one, then runs `callers` concurrent readers
 //! for `seconds` (async tasks, or plain threads calling `.wait()`). It
 //! reports throughput, p50 and p99 latency, and the share of reads memory
@@ -34,21 +33,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(other) => return Err(format!("unknown mode `{other}`").into()),
     };
 
-    let run = std::process::id();
+    if callers == 0 || seconds == 0 {
+        return Err("callers and seconds must be positive".into());
+    }
+    let run = uuid::Uuid::new_v4().simple();
     let schema = format!("bench_warm_{run}");
     let app = format!("benchwarm{run}");
 
-    let (admin, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls).await?;
+    let (mut admin, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls).await?;
     tokio::spawn(connection);
     let builder = Streamgres::connect(&dsn)
         .schemas([schema.as_str()])
         .publication(format!("{schema}_pub"))
         .app(&app, 0);
-    admin
+    // Reserve both schema names in the same transaction as setup. A name
+    // conflict rolls back setup before this run owns any fixtures.
+    let setup = admin.transaction().await?;
+    setup
         .batch_execute(&format!(
-            "DROP PUBLICATION IF EXISTS {schema}_pub;
-             DROP SCHEMA IF EXISTS {schema} CASCADE;
-             CREATE SCHEMA {schema};
+            "CREATE SCHEMA {schema};
+             CREATE SCHEMA {app}_0;
              CREATE TABLE {schema}.t (id bigint PRIMARY KEY, grp bigint NOT NULL, name text NOT NULL);
              INSERT INTO {schema}.t
                SELECT n, n % {GROUPS}, 'row ' || n FROM generate_series(1, {}) AS n;
@@ -56,9 +60,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             GROUPS * ROWS_PER_GROUP
         ))
         .await?;
-    admin.batch_execute(&builder.setup_sql()).await?;
-    let lib = builder.start().await?;
+    setup.batch_execute(&builder.setup_sql()).await?;
+    setup.commit().await?;
 
+    let result = async {
+        let lib = builder.start().await?;
+        let result = measure(
+            &lib,
+            &schema,
+            callers,
+            Duration::from_secs(seconds),
+            blocking,
+        )
+        .await;
+        lib.shutdown().await;
+        result
+    }
+    .await;
+    let cleanup = admin
+        .batch_execute(&format!(
+            "DROP PUBLICATION {schema}_pub; DROP SCHEMA {schema} CASCADE; DROP SCHEMA {app}_0 CASCADE;"
+        ))
+        .await;
+    if let Err(error) = &cleanup
+        && result.is_err()
+    {
+        eprintln!("could not remove benchmark fixtures for {schema}: {error}");
+    }
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+async fn measure(
+    lib: &Streamgres,
+    schema: &str,
+    callers: usize,
+    duration: Duration,
+    blocking: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let text: std::sync::Arc<str> =
         format!("SELECT id, name FROM {schema}.t WHERE grp = $1 ORDER BY id").into();
     let query = move |group: i64| Sql::new(&*text).bind(group);
@@ -76,8 +116,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     // Every caller stops at this deadline on its own: a memory hit does not
     // yield, so a timer task on the same runtime could wait behind them.
-    let until = started + Duration::from_secs(seconds);
+    let until = started
+        .checked_add(duration)
+        .ok_or("benchmark duration is too large")?;
     let mut latencies: Vec<Duration> = Vec::new();
+    let mut active_callers = 0;
     if blocking {
         let workers: Vec<_> = (0..callers)
             .map(|caller| {
@@ -96,7 +139,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             })
             .collect();
         for worker in workers {
-            latencies.extend(worker.join().map_err(|_| "a reader thread panicked")?);
+            let samples = worker.join().map_err(|_| "a reader thread panicked")?;
+            active_callers += usize::from(!samples.is_empty());
+            latencies.extend(samples);
         }
     } else {
         let workers: Vec<_> = (0..callers)
@@ -110,18 +155,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         lib.load_and_sync(query(group)).await.expect("read");
                         own.push(at.elapsed());
                         group = (group + 1) % GROUPS;
+                        // Warm reads can complete without yielding.
+                        if own.len() % 64 == 0 {
+                            tokio::task::yield_now().await;
+                        }
                     }
                     own
                 })
             })
             .collect();
         for worker in workers {
-            latencies.extend(worker.await?);
+            let samples = worker.await?;
+            active_callers += usize::from(!samples.is_empty());
+            latencies.extend(samples);
         }
     }
     let elapsed = started.elapsed();
     let after = lib.metrics();
 
+    if active_callers != callers {
+        return Err(format!("only {active_callers} of {callers} callers recorded samples").into());
+    }
     let reads = latencies.len();
     let memory = after.answered.saturating_sub(before.answered);
     latencies.sort_unstable();
@@ -146,11 +200,5 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         after.fallbacks.saturating_sub(before.fallbacks),
     );
 
-    lib.shutdown().await;
-    admin
-        .batch_execute(&format!(
-            "DROP PUBLICATION {schema}_pub; DROP SCHEMA {schema} CASCADE; DROP SCHEMA {app}_0 CASCADE;"
-        ))
-        .await?;
     Ok(())
 }

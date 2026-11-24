@@ -1176,8 +1176,6 @@ fn comparison_types(column: u32, value: u32) -> bool {
         || (text(column) && text(value))
 }
 
-/// Bind parameter `number` decoded by its type, as one value or (for
-/// `ANY` / `ALL`) a list of values of the column's type.
 /// Bind `$number`, when its type compares with `declared` as Postgres
 /// compares them; its value is not read (an array's header gives its
 /// element type).
@@ -1211,6 +1209,8 @@ pub(super) fn typed_bind<'b>(
     Ok(bind)
 }
 
+/// Bind parameter `number` decoded as one value or, for `ANY` and `ALL`,
+/// as a list of values of the column's type.
 pub(super) fn decode_bind(
     binds: &[Bind],
     number: usize,

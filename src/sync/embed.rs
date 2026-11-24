@@ -10,10 +10,10 @@
 //! the engine is. When the instance ends it stops its feed and drops its
 //! slot.
 //!
-//! The origin reads (a fallback read, the reader check) run on a runtime
-//! the application's runtime, using its exclusive pool checkouts. Catalog,
-//! type and source-position queries use those checkouts too. Replication,
-//! snapshot exporters and slot lifecycle operations use the direct endpoint.
+//! Fallback reads, reader checks, catalog and type queries use exclusive
+//! origin pool checkouts. With an application pool, checkouts are obtained
+//! on the application's runtime. WAL sampling, replication, snapshot
+//! exporters and slot lifecycle operations use the direct endpoint.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use super::pg::connections::{self, Connections, Lease, Session, SessionError};
 use super::CatalogHandle;
 use super::pg::threads::{self, FeedHandle, Started};
 use super::pg::{Keepalive, Lsn, Settings, Transport};
-use crate::cache::{Column, Engine, Instance, Rows, SendFuture, Serve, TypeOid};
+use crate::cache::{Column, Engine, EngineError, Instance, Rows, SendFuture, Serve, TypeOid};
 use crate::log::log_warn;
 use crate::model::Position;
 use crate::parser::Bind;
@@ -139,7 +139,7 @@ impl PgConfig {
     }
 
     /// The event trigger the engine hears schema changes through.
-    pub(crate) fn ddl_trigger(&self) -> String {
+    fn ddl_trigger(&self) -> String {
         format!("{}_ddl_end_{}", self.app, self.shard)
     }
 
@@ -206,14 +206,16 @@ impl PgEngine {
         failing: Shutdown,
         slot: &str,
         cleanup: &std::cell::Cell<bool>,
-    ) -> Result<(Instance, FeedHandle), String> {
+    ) -> Result<(Instance, FeedHandle), EngineError> {
         let config = &self.config;
         let mut connection = self.origin.connections.get().await?;
         let present = super::pg::ddl::trigger_present(&mut connection, &config.ddl_trigger())
             .await
             .map_err(|error| format!("checking the DDL trigger: {error}"))?;
         if !present {
-            return Err("the DDL trigger is missing; install Builder::setup_sql".to_owned());
+            return Err(EngineError::Setup(
+                "the DDL trigger is missing; install Builder::setup_sql".to_owned(),
+            ));
         }
         let (catalog, notes) = super::pg::load_catalog(&mut connection, &config.schemas)
             .await
@@ -284,7 +286,7 @@ impl Engine for PgEngine {
         stopping: &Shutdown,
         start_timeout: Duration,
         serve: Serve<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<(), EngineError> {
         let engine = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -304,7 +306,7 @@ impl Engine for PgEngine {
                 let started = tokio::select! {
                     started = self.start(reads.handle().clone(), failing.clone(), &slot, &cleanup) => started?,
                     () = tokio::time::sleep(start_timeout) => {
-                        return Err(format!("the engine did not start within {start_timeout:?}"));
+                        return Err(EngineError::Retry(format!("the engine did not start within {start_timeout:?}")));
                     }
                     () = stopping.wait() => return Ok(()),
                 };
@@ -314,10 +316,10 @@ impl Engine for PgEngine {
                 if let Err(error) = threads::stop_feed(feed).await {
                     log_warn!("stopping the embedded engine's feed: {error}");
                 }
-                outcome
+                outcome.map_err(EngineError::from)
             })
         }))
-        .unwrap_or_else(|_| Err("the engine panicked".to_owned()));
+        .unwrap_or_else(|_| Err(EngineError::Retry("the engine panicked".to_owned())));
         failing.request();
         // Cancels the instance's tasks even when its future unwound.
         drop(local);
@@ -382,11 +384,11 @@ impl Engine for PgEngine {
         })
     }
 
-    fn origin_types(&self) -> SendFuture<'_, Result<Vec<TypeOid>, String>> {
+    fn origin_types(&self, timeout: Duration) -> SendFuture<'_, Result<Vec<TypeOid>, String>> {
         let origin = self.origin.clone();
         Box::pin(async move {
             origin
-                .run(Duration::from_secs(10), move |client| {
+                .run(timeout, move |client| {
                     Box::pin(async move {
                         let rows = client
                             .query(

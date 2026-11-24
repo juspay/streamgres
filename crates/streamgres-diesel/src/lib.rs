@@ -28,6 +28,12 @@
 //! (the transaction's own writes and snapshot are on its connection, not
 //! in Streamgres), and locking reads. A read here does not see a write
 //! the application just made until the change feed brings it.
+//!
+//! Read errors keep their Diesel `QueryResult` shape. Streamgres maps
+//! known SQLSTATE values to Diesel's corresponding database error kinds.
+//! Other Streamgres failures, including timeouts and cancellations, are
+//! boxed in `diesel::result::Error::QueryBuilderError` and can be
+//! downcast to [`StreamgresError`].
 
 pub use ::diesel;
 pub use streamgres::cache::{
@@ -298,10 +304,26 @@ impl PgMetadataLookup for Types {
 
 /// A Streamgres error as Diesel reports a failed query.
 fn streamgres_error(error: StreamgresError) -> Error {
-    Error::DatabaseError(
-        DatabaseErrorKind::Unknown,
-        Box::new(Message(error.to_string())),
-    )
+    use DatabaseErrorKind as Kind;
+    if let StreamgresError::Origin(SessionError::Database {
+        code: Some(code),
+        message,
+    }) = &error
+    {
+        let kind = match code.as_str() {
+            "23505" => Kind::UniqueViolation,
+            "23503" => Kind::ForeignKeyViolation,
+            "23502" => Kind::NotNullViolation,
+            "23514" => Kind::CheckViolation,
+            "23P01" => Kind::ExclusionViolation,
+            "23001" => Kind::RestrictViolation,
+            "40001" => Kind::SerializationFailure,
+            "25006" => Kind::ReadOnlyTransaction,
+            _ => return Error::QueryBuilderError(Box::new(error)),
+        };
+        return Error::DatabaseError(kind, Box::new(Message(message.clone())));
+    }
+    Error::QueryBuilderError(Box::new(error))
 }
 
 /// An error's text, as Diesel's database error information.
@@ -334,5 +356,31 @@ impl DatabaseErrorInformation for Message {
 
     fn statement_position(&self) -> Option<i32> {
         None
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn diesel_keeps_database_kinds_and_streamgres_read_errors() {
+        let unique = SessionError::database(Some("23505"), "duplicate key");
+        assert!(matches!(
+            streamgres_error(StreamgresError::Origin(unique)),
+            Error::DatabaseError(DatabaseErrorKind::UniqueViolation, _)
+        ));
+
+        for error in [
+            SessionError::Timeout("deadline reached".into()),
+            SessionError::Cancelled("user request".into()),
+            SessionError::database(Some("22012"), "division by zero"),
+        ] {
+            let expected = StreamgresError::Origin(error);
+            let Error::QueryBuilderError(source) = streamgres_error(expected.clone()) else {
+                panic!("expected the typed Streamgres error");
+            };
+            assert_eq!(source.downcast_ref::<StreamgresError>(), Some(&expected));
+        }
     }
 }

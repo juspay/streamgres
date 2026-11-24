@@ -118,7 +118,9 @@ fn session_error(error: diesel::result::Error) -> SessionError {
         Kind::RestrictViolation => Some("23001"),
         Kind::SerializationFailure => Some("40001"),
         Kind::ReadOnlyTransaction => Some("25006"),
-        Kind::ClosedConnection => return SessionError::Other(message.to_owned()),
+        Kind::ClosedConnection | Kind::UnableToSendCommand => {
+            return SessionError::Other(message.to_owned());
+        }
         _ => None,
     };
     SessionError::database(code, message)

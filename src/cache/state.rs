@@ -33,7 +33,7 @@ pub(super) enum Phase {
     Starting,
     Running(Running),
     /// It failed, and a fresh one will be started; why it failed.
-    Down(String),
+    Down(super::EngineError),
     Stopped,
 }
 
@@ -402,8 +402,9 @@ impl State {
                 None => Err(Refusal::NotReady("the engine is catching up".to_owned())),
             },
             Phase::Starting => Err(Refusal::NotReady("the engine is starting".to_owned())),
-            Phase::Down(reason) => Err(Refusal::NotReady(format!(
-                "the engine is restarting after: {reason}"
+            Phase::Down(error) => Err(Refusal::NotReady(format!(
+                "the engine is restarting after: {}",
+                error.reason()
             ))),
             Phase::Stopped => Err(Refusal::NotReady("the cache is stopped".to_owned())),
         }
