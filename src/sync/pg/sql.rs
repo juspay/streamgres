@@ -19,7 +19,7 @@ use std::cell::Cell;
 use std::fmt::Write;
 
 use crate::model::{
-    Catalog, ComparisonOperator, Condition, DbTable, MultiTableReadQuery, Order,
+    Catalog, ComparisonOperator, Condition, DbColumn, DbTable, MultiTableReadQuery, Order,
     SingleTableReadQuery, Value, ValueType, Where,
 };
 
@@ -32,8 +32,7 @@ pub fn select_sql(query: &SingleTableReadQuery, table: &DbTable) -> String {
         if index > 0 {
             sql.push_str(", ");
         }
-        let declared = &table.columns[*column].r#type;
-        sql.push_str(&select_expr(column.as_str(), declared));
+        sql.push_str(&select_expr(column.as_str()));
     }
     let _ = write!(
         sql,
@@ -257,35 +256,22 @@ pub fn select_columns(table: &DbTable) -> Vec<&crate::model::ColumnName> {
 /// way out, so decoding is uniform whatever the column's own type.
 pub fn cast_of(declared: &ValueType) -> &'static str {
     match declared {
-        ValueType::Int | ValueType::Timestamp => "int8",
+        ValueType::Int => "int8",
         ValueType::Float => "float8",
-        ValueType::String | ValueType::Json => "text",
+        ValueType::Numeric => "numeric",
+        ValueType::String | ValueType::Json | ValueType::Bytes | ValueType::Raw => "text",
         ValueType::Bool => "bool",
-        ValueType::Date => "date",
-        ValueType::Datetime => "timestamp",
+        ValueType::Date | ValueType::Day => "date",
+        ValueType::Datetime | ValueType::Timestamp => "timestamp",
+        ValueType::Time => "time",
         ValueType::List(_) | ValueType::Map(_, _) => "text",
     }
 }
 
-/// The SQL reading one column in the form the engine keeps it: a time
-/// column as epoch milliseconds, a JSON column as the text of its `jsonb`
-/// (the cast is nothing for a `jsonb` column, and gives a `json` column's
-/// stored text the one spelling `jsonb` has), an array or map column as
-/// JSON text, every other cast to its declared type's Postgres form.
-pub fn select_expr(column: &str, declared: &ValueType) -> String {
-    let quoted = quote_ident(column);
-    match declared {
-        ValueType::Timestamp => epoch_millis(&quoted),
-        ValueType::Json => format!("{quoted}::jsonb::text"),
-        ValueType::List(_) | ValueType::Map(_, _) => format!("to_json({quoted})::text"),
-        other => format!("{quoted}::{}", cast_of(other)),
-    }
-}
-
-/// `expr` as milliseconds since the epoch; `extract` is numeric, so the
-/// rounding to `int8` keeps the millisecond a `timestamp(3)` column has.
-fn epoch_millis(expr: &str) -> String {
-    format!("(extract(epoch from {expr}) * 1000)::int8")
+/// The SQL reading one column: the bare column, its value read in
+/// Postgres's binary format and decoded by its type.
+pub fn select_expr(column: &str) -> String {
+    quote_ident(column)
 }
 
 /// A column as the SQL its conditions compare it by: the bare column
@@ -303,20 +289,55 @@ fn column_expr(column: &str, scope: &Scope<'_>) -> String {
 }
 
 /// A literal compared against a column of `declared` type: the engine
-/// keeps a time as milliseconds since the epoch, so against a time
+/// keeps a time as microseconds since the epoch, so against a time
 /// column the number becomes the timestamp it names, and the column
 /// itself stays bare for the index; against a JSON column the text the
-/// engine holds is the `jsonb` it names.
-fn literal_as(value: &Value, declared: Option<&ValueType>) -> String {
-    if let (Value::String(text), Some(ValueType::Json)) = (value, declared) {
+/// engine holds is the `jsonb` it names. A `timestamptz` column gets a
+/// `timestamptz` literal, so the session timezone never shifts it; a
+/// `timestamp` column keeps the timezone-less form for the same reason.
+fn literal_as(value: &Value, declared: Option<&DbColumn>) -> String {
+    let r#type = declared.map(|column| &column.r#type);
+    let zoned = declared.is_some_and(|column| column.type_oid == super::binary::oid::TIMESTAMPTZ);
+    if let (Value::Json(json), Some(ValueType::Json)) = (value, r#type) {
+        return format!("{}::jsonb", quote_literal(json.standard()));
+    }
+    if let (Value::String(text), Some(ValueType::Json)) = (value, r#type) {
         return format!("{}::jsonb", quote_literal(text));
     }
-    let millis = match (value, declared) {
-        (Value::Int(millis), Some(ValueType::Timestamp)) => *millis,
-        (Value::Float(millis), Some(ValueType::Timestamp)) if millis.is_finite() => *millis as i64,
-        _ => return literal(value),
-    };
-    format!("(TIMESTAMP 'epoch' + {millis} * INTERVAL '1 millisecond')")
+    match (value, r#type) {
+        (Value::Timestamp(at), _) => match at.0 {
+            i64::MAX => if zoned {
+                "'infinity'::timestamptz".to_owned()
+            } else {
+                "'infinity'::timestamp".to_owned()
+            },
+            i64::MIN => if zoned {
+                "'-infinity'::timestamptz".to_owned()
+            } else {
+                "'-infinity'::timestamp".to_owned()
+            },
+            micros => {
+                let anchor = if zoned {
+                    "TIMESTAMPTZ '2000-01-01 00:00:00+00'"
+                } else {
+                    "TIMESTAMP '2000-01-01'"
+                };
+                format!("({anchor} + {micros} * INTERVAL '1 microsecond')")
+            }
+        },
+        (Value::Int(micros), Some(ValueType::Timestamp)) => {
+            let anchor = if zoned { "TIMESTAMPTZ" } else { "TIMESTAMP" };
+            format!("({anchor} 'epoch' + {micros} * INTERVAL '1 microsecond')")
+        }
+        (Value::Float(micros), Some(ValueType::Timestamp)) if micros.is_finite() => {
+            let anchor = if zoned { "TIMESTAMPTZ" } else { "TIMESTAMP" };
+            format!(
+                "({anchor} 'epoch' + {} * INTERVAL '1 microsecond')",
+                *micros as i64
+            )
+        }
+        _ => literal(value),
+    }
 }
 
 /// A double-quoted identifier.
@@ -354,10 +375,7 @@ fn render_condition(condition: &Condition, scope: &Scope<'_>) -> String {
         return render_composite(condition, scope);
     }
     let column = column_expr(condition.column.as_str(), scope);
-    let declared = scope
-        .table
-        .column(condition.column.as_str())
-        .map(|declared| &declared.r#type);
+    let declared = scope.table.column(condition.column.as_str());
     match condition.comparison_operator {
         IN | NOT_IN => {
             let members = members_of(&condition.value);
@@ -423,10 +441,7 @@ fn render_composite(condition: &Condition, scope: &Scope<'_>) -> String {
         let literals: Vec<String> = components
             .iter()
             .zip(&parts)
-            .map(|(component, part)| {
-                let declared = scope.table.column(part).map(|declared| &declared.r#type);
-                literal_as(component, declared)
-            })
+            .map(|(component, part)| literal_as(component, scope.table.column(part)))
             .collect();
         Some(format!("({})", literals.join(", ")))
     };
@@ -480,13 +495,36 @@ fn literal(value: &Value) -> String {
         }
         Value::Float(float) if float.is_infinite() => "'-Infinity'::float8".to_owned(),
         Value::Float(float) => format!("{float:?}::float8"),
+        Value::Numeric(number) => format!("{}::numeric", quote_literal(&number.to_string())),
         Value::Bool(true) => "TRUE".to_owned(),
         Value::Bool(false) => "FALSE".to_owned(),
         Value::Date(date) => format!("DATE '{}'", date.format("%Y-%m-%d")),
         Value::Datetime(datetime) => {
             format!("TIMESTAMP '{}'", datetime.format("%Y-%m-%d %H:%M:%S%.6f"))
         }
-        Value::List(_) | Value::Map(_) | Value::Set(_) => "NULL".to_owned(),
+        Value::Timestamp(at) => match at.0 {
+            i64::MAX => "'infinity'::timestamp".to_owned(),
+            i64::MIN => "'-infinity'::timestamp".to_owned(),
+            micros => format!("(TIMESTAMP '2000-01-01' + {micros} * INTERVAL '1 microsecond')"),
+        },
+        Value::Day(day) => match day.0 {
+            i32::MAX => "'infinity'::date".to_owned(),
+            i32::MIN => "'-infinity'::date".to_owned(),
+            days => format!("(DATE '2000-01-01' + {days})"),
+        },
+        Value::Time(time) => {
+            format!("(TIME '00:00' + {} * INTERVAL '1 microsecond')", time.0)
+        }
+        Value::Bytes(bytes) => {
+            use std::fmt::Write as _;
+            let mut hex = String::with_capacity(bytes.len() * 2);
+            for byte in bytes.iter() {
+                let _ = write!(hex, "{byte:02x}");
+            }
+            format!("'\\x{hex}'::bytea")
+        }
+        Value::Json(json) => format!("{}::jsonb", quote_literal(json.standard())),
+        Value::Raw(_) | Value::List(_) | Value::Map(_) | Value::Set(_) => "NULL".to_owned(),
     }
 }
 
@@ -558,7 +596,7 @@ mod tests {
                 ComparisonOperator::IN,
                 Value::Set(set)
             )),
-            "(\"org\", \"at\") IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond')))"
+            "(\"org\", \"at\") IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond')))"
         );
         assert_eq!(
             comments_where(Condition::new(
@@ -566,7 +604,7 @@ mod tests {
                 ComparisonOperator::EQ,
                 pair("acme", 1000)
             )),
-            "(\"org\", \"at\") = ('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond'))"
+            "(\"org\", \"at\") = ('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond'))"
         );
         assert_eq!(
             comments_where(Condition::new(
@@ -574,7 +612,7 @@ mod tests {
                 ComparisonOperator::NEQ,
                 pair("acme", 1000)
             )),
-            "((\"org\", \"at\") <> ('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond')) AND \"org\" IS NOT NULL AND \"at\" IS NOT NULL)"
+            "((\"org\", \"at\") <> ('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond')) AND \"org\" IS NOT NULL AND \"at\" IS NOT NULL)"
         );
         let with_null = Value::List(vec![Value::Null, Value::Int(1000)]);
         let narrow = Value::List(vec!["acme".into()]);
@@ -589,7 +627,7 @@ mod tests {
                     pair("acme", 1000)
                 ]),
             )),
-            "(\"org\", \"at\") IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond')))"
+            "(\"org\", \"at\") IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond')))"
         );
         assert_eq!(
             comments_where(Condition::new(
@@ -613,7 +651,7 @@ mod tests {
                 ComparisonOperator::NOT_IN,
                 Value::List(vec![pair("acme", 1000)])
             )),
-            "((\"org\", \"at\") NOT IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond'))) AND \"org\" IS NOT NULL AND \"at\" IS NOT NULL)"
+            "((\"org\", \"at\") NOT IN (('acme', (TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond'))) AND \"org\" IS NOT NULL AND \"at\" IS NOT NULL)"
         );
         assert_eq!(
             comments_where(Condition::new(
@@ -758,7 +796,7 @@ mod tests {
         );
         assert_eq!(
             select_sql(&query, &tickets()),
-            "SELECT \"id\"::int8, \"points\"::int8, \"status\"::text FROM \"tickets\" WHERE (\"status\" = 'it''s open' AND \"points\" >= 8)"
+            "SELECT \"id\", \"points\", \"status\" FROM \"tickets\" WHERE (\"status\" = 'it''s open' AND \"points\" >= 8)"
         );
     }
 
@@ -903,8 +941,9 @@ mod tests {
     }
 
     /// A time condition compares the bare column against the timestamp
-    /// the millisecond literal names, so an index on the column answers
-    /// it; the projection still returns milliseconds.
+    /// the microsecond literal names, so an index on the column answers
+    /// it; the projection still returns Postgres text, decoded to
+    /// microseconds.
     #[test]
     fn a_time_condition_compares_the_column_itself() {
         let table = DbTable::new(
@@ -931,17 +970,53 @@ mod tests {
         let sql = select_sql(&query, &table);
         assert!(
             sql.contains(
-                "\"createdAt\" > (TIMESTAMP 'epoch' + 1750000000000 * INTERVAL '1 millisecond')"
+                "\"createdAt\" > (TIMESTAMP 'epoch' + 1750000000000 * INTERVAL '1 microsecond')"
             ),
             "{sql}"
         );
         assert!(
-            sql.contains("\"createdAt\" IN ((TIMESTAMP 'epoch' + 1000 * INTERVAL '1 millisecond'), (TIMESTAMP 'epoch' + 2000 * INTERVAL '1 millisecond'))"),
+            sql.contains("\"createdAt\" IN ((TIMESTAMP 'epoch' + 1000 * INTERVAL '1 microsecond'), (TIMESTAMP 'epoch' + 2000 * INTERVAL '1 microsecond'))"),
             "{sql}"
         );
         assert!(
-            sql.contains("(extract(epoch from \"createdAt\") * 1000)::int8"),
-            "the projection still reads milliseconds: {sql}"
+            sql.contains("\"createdAt\""),
+            "the projection is the bare column: {sql}"
+        );
+    }
+
+    /// A `timestamptz` column's literal is a `timestamptz`, so the session
+    /// timezone cannot shift it; a `timestamp` column keeps the
+    /// timezone-less form, which is the point in time Postgres means.
+    #[test]
+    fn a_timestamptz_condition_is_zoned_and_a_timestamp_one_is_not() {
+        let table = |oid: u32| {
+            DbTable::new(
+                "events",
+                ["id"],
+                vec![
+                    DbColumn::new("id", ValueType::Int),
+                    DbColumn::new("at", ValueType::Timestamp).with_type_oid(oid),
+                ],
+            )
+        };
+        let at = Value::Timestamp(crate::model::Timestamp(1_000));
+        let query = SingleTableReadQuery::new(
+            crate::model::TableName::from("events"),
+            Where::condition("at", ComparisonOperator::EQ, at),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        );
+        let plain = select_sql(&query, &table(super::super::binary::oid::TIMESTAMP));
+        let zoned = select_sql(&query, &table(super::super::binary::oid::TIMESTAMPTZ));
+        assert!(
+            plain.contains("\"at\" = (TIMESTAMP '2000-01-01' + 1000 * INTERVAL '1 microsecond')"),
+            "{plain}"
+        );
+        assert!(
+            zoned.contains(
+                "\"at\" = (TIMESTAMPTZ '2000-01-01 00:00:00+00' + 1000 * INTERVAL '1 microsecond')"
+            ),
+            "{zoned}"
         );
     }
 
@@ -1053,8 +1128,8 @@ mod tests {
             "a text column stays bare: {sql}"
         );
         assert!(
-            sql.starts_with("SELECT \"id\"::text, \"actualFieldValue\"::jsonb::text,"),
-            "the cell is read as the text of its jsonb: {sql}"
+            sql.starts_with("SELECT \"id\", \"actualFieldValue\","),
+            "the cell is read in its binary form: {sql}"
         );
         let catalog = Catalog::new([values]);
         let count = count_sql(&MultiTableReadQuery::single(query), &catalog, 100).expect("known");

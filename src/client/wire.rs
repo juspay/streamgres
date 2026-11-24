@@ -1,6 +1,6 @@
 //! Rows and keys as the wire carries them: JSON objects keyed by column,
 //! with a JSON column's text embedded as the JSON it holds, a time as its
-//! milliseconds, and every column the row carries, whoever receives it.
+//! epoch milliseconds, and every column the row carries, whoever receives it.
 //! The row-patch entries of a poke are written straight into bytes
 //! ([`write_put`], [`write_del`]); a put once per row image, kept on the
 //! image and shared by every group's frame that carries it; the
@@ -55,7 +55,28 @@ pub fn write_put(out: &mut Vec<u8>, table: &DbTable, row: &DataFrameRow) {
 
 /// Append the `rowsPatch` entry deleting `key` from `table`:
 /// `{"op":"del","tableName":…,"id":{…}}`.
-pub fn write_del(out: &mut Vec<u8>, table: &str, key: &DataFrameKey) {
+pub fn write_del(out: &mut Vec<u8>, table: &DbTable, key: &DataFrameKey) {
+    out.extend_from_slice(b"{\"op\":\"del\",\"tableName\":");
+    write_text(out, table.name.as_str());
+    out.extend_from_slice(b",\"id\":{");
+    let mut first = true;
+    for (column, value) in key.pkey_value.iter() {
+        if !first {
+            out.push(b',');
+        }
+        first = false;
+        write_text(out, column.as_str());
+        out.push(b':');
+        let declared = table.column(column.as_str()).map(|column| &column.r#type);
+        write_value(out, value, declared);
+    }
+    out.extend_from_slice(b"}}");
+}
+
+/// Append the `rowsPatch` entry deleting `key` from a table the catalog
+/// no longer describes: the same shape with no declared types to guide
+/// the writing, so the delete still reaches the client.
+pub fn write_del_untyped(out: &mut Vec<u8>, table: &str, key: &DataFrameKey) {
     out.extend_from_slice(b"{\"op\":\"del\",\"tableName\":");
     write_text(out, table);
     out.extend_from_slice(b",\"id\":{");
@@ -74,7 +95,8 @@ pub fn write_del(out: &mut Vec<u8>, table: &str, key: &DataFrameKey) {
 
 /// Append one cell as JSON, in the light of its declared type: a JSON
 /// column's text is embedded as it is when it parses, a time as its
-/// milliseconds, a list item by item.
+/// epoch milliseconds (the engine keeps microseconds; the wire stays on
+/// the unit clients already speak), a list item by item.
 pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType>) {
     match value {
         Value::Null => out.extend_from_slice(b"null"),
@@ -95,6 +117,14 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
         Value::Float(float) => {
             if serde_json::to_writer(&mut *out, float).is_err() {
                 out.extend_from_slice(b"null");
+            }
+        }
+        Value::Numeric(number) => {
+            let text = number.to_string();
+            if matches!(number, crate::model::Numeric::Finite { .. }) {
+                out.extend_from_slice(text.as_bytes());
+            } else {
+                write_text(out, &text);
             }
         }
         Value::Bool(true) => out.extend_from_slice(b"true"),
@@ -122,12 +152,56 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
             }
             out.push(b']');
         }
-        Value::Map(_) | Value::Set(_) => {
+        Value::Json(json) => {
+            let text = json.standard();
+            if serde_json::from_str::<serde::de::IgnoredAny>(text).is_ok() {
+                out.extend_from_slice(text.as_bytes());
+            } else {
+                write_text(out, text);
+            }
+        }
+        Value::Map(_)
+        | Value::Set(_)
+        | Value::Timestamp(_)
+        | Value::Day(_)
+        | Value::Time(_)
+        | Value::Bytes(_)
+        | Value::Raw(_) => {
             if serde_json::to_writer(&mut *out, &value_json(value, declared)).is_err() {
                 out.extend_from_slice(b"null");
             }
         }
     }
+}
+
+/// A `time` as Postgres writes it: `HH:MM:SS`, then the fraction without
+/// trailing zeros when there is one.
+fn time_text(time: crate::model::Time) -> String {
+    let micros = time.0.rem_euclid(86_400_000_000);
+    let seconds = micros / 1_000_000;
+    let fraction = micros % 1_000_000;
+    let whole = format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    );
+    if fraction == 0 {
+        return whole;
+    }
+    let digits = format!("{fraction:06}");
+    format!("{whole}.{}", digits.trim_end_matches('0'))
+}
+
+/// A `bytea` as Postgres's hex text, `\x` and two digits a byte.
+fn bytea_text(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("\\x");
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 /// Append `text` as a JSON string, escaped.
@@ -148,10 +222,11 @@ pub fn row_json(row: &DataFrameRow, table: &DbTable) -> Json {
 }
 
 /// A key as a JSON object of its primary-key columns.
-pub fn key_json(key: &DataFrameKey) -> Json {
+pub fn key_json(key: &DataFrameKey, table: &DbTable) -> Json {
     let mut object = Map::with_capacity(key.pkey_value.len());
     for (column, value) in key.pkey_value.iter() {
-        object.insert(column.as_str().to_owned(), value_json(value, None));
+        let declared = table.column(column.as_str()).map(|column| &column.r#type);
+        object.insert(column.as_str().to_owned(), value_json(value, declared));
     }
     Json::Object(object)
 }
@@ -170,6 +245,14 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
         Value::Float(float) if whole(*float) => Json::from(*float as i64),
         Value::Float(float) => {
             serde_json::Number::from_f64(*float).map_or(Json::Null, Json::Number)
+        }
+        Value::Numeric(number) => {
+            let text = number.to_string();
+            if matches!(number, crate::model::Numeric::Finite { .. }) {
+                serde_json::from_str(&text).unwrap_or_else(|_| Json::String(text))
+            } else {
+                Json::String(text)
+            }
         }
         Value::Bool(flag) => Json::Bool(*flag),
         Value::Date(date) => date
@@ -200,6 +283,16 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
                 .map(|item| value_json(item, None))
                 .collect(),
         ),
+        Value::Json(json) => serde_json::from_str(json.standard())
+            .unwrap_or_else(|_| Json::String(json.standard().to_owned())),
+        Value::Timestamp(at) => at.unix_millis().map_or(Json::Null, Json::from),
+        Value::Day(day) => day
+            .midnight()
+            .and_then(|at| at.unix_millis())
+            .map_or(Json::Null, Json::from),
+        Value::Time(time) => Json::String(time_text(*time)),
+        Value::Bytes(bytes) => Json::String(bytea_text(bytes)),
+        Value::Raw(raw) => super::pg_text::raw_text(raw).map_or(Json::Null, Json::String),
     }
 }
 
@@ -324,6 +417,63 @@ mod tests {
         assert!(!whole(1e17), "beyond 2^53 a float is left as it is");
     }
 
+    /// A numeric keeps the digits Postgres wrote on the wire: scale
+    /// survives, and a value past 2⁵³ keeps every digit. The JSON tree
+    /// form goes through `serde_json::Number` (f64), so `value_json` is
+    /// only as precise as a JSON number is. A `numeric` special is not a
+    /// JSON number, so it travels as a string.
+    #[test]
+    fn numerics_keep_their_digits_on_the_wire() {
+        let n = |text: &str| crate::model::Numeric::parse(text).unwrap();
+        let mut out = Vec::new();
+        write_value(&mut out, &Value::Numeric(n("1.50")), None);
+        assert_eq!(out, b"1.50");
+        out.clear();
+        write_value(&mut out, &Value::Numeric(n("9007199254740993.00")), None);
+        assert_eq!(out, b"9007199254740993.00");
+        out.clear();
+        write_value(&mut out, &Value::Numeric(n("NaN")), None);
+        assert_eq!(out, b"\"NaN\"", "a special is not a JSON number");
+        out.clear();
+        write_value(&mut out, &Value::Numeric(n("-Infinity")), None);
+        assert_eq!(out, b"\"-Infinity\"");
+    }
+
+    /// A value the engine does not interpret travels as Postgres's text
+    /// for its type, and as null when there is no text for it.
+    #[test]
+    fn raw_values_round_trip_through_the_wire_as_postgres_text() {
+        use crate::model::Raw;
+        use bytes::Bytes;
+
+        let interval = Value::Raw(Raw {
+            type_oid: 1186,
+            bytes: Bytes::from(
+                [
+                    &11_045_000_000i64.to_be_bytes()[..],
+                    &2i32.to_be_bytes(),
+                    &12i32.to_be_bytes(),
+                ]
+                .concat(),
+            ),
+        });
+        let mut out = Vec::new();
+        write_value(&mut out, &interval, None);
+        assert_eq!(out, b"\"1 year 2 days 03:04:05\"");
+        assert_eq!(
+            value_json(&interval, None),
+            serde_json::json!("1 year 2 days 03:04:05")
+        );
+
+        let unknown = Value::Raw(Raw {
+            type_oid: 999_999,
+            bytes: Bytes::from_static(&[1, 2, 3]),
+        });
+        out.clear();
+        write_value(&mut out, &unknown, None);
+        assert_eq!(out, b"null", "a type with no text is not made up");
+    }
+
     /// JSON columns are embedded, times are numbers, and the client's
     /// schema filters the columns.
     #[test]
@@ -341,12 +491,12 @@ mod tests {
         let row = DataFrameRow::from(HashMap::from([
             ("id".into(), Value::from("a")),
             ("meta".into(), Value::from(r#"{"k":[1,2]}"#)),
-            ("at".into(), Value::Int(1_000)),
+            ("at".into(), Value::Timestamp(crate::model::Timestamp::from_unix_micros(1_500_000).unwrap())),
             ("extra".into(), Value::Int(7)),
         ]));
         let json = row_json(&row, &table);
         assert_eq!(json["meta"]["k"][1], 2);
-        assert_eq!(json["at"], 1_000);
+        assert_eq!(json["at"], 1_500, "a time travels as milliseconds");
         assert_eq!(json["extra"], 7, "every column the row carries is written");
 
         let mut bytes = Vec::new();
@@ -358,7 +508,7 @@ mod tests {
         let mut bytes = Vec::new();
         write_del(
             &mut bytes,
-            "t",
+            &table,
             &DataFrameKey::new([("id", Value::from("a\"b"))]),
         );
         let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");

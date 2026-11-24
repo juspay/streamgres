@@ -125,6 +125,16 @@ impl PublishedTable {
         let mut columns = Vec::with_capacity(self.columns.len());
         for (name, column) in &self.columns {
             match column_type(column) {
+                Some(r#type)
+                    if self.primary_key.iter().any(|key| key == name)
+                        && !super::catalog::keyable(&r#type) =>
+                {
+                    return Err(format!(
+                        "{}: key column `{name}` has a type the engine cannot key by, {}",
+                        self.catalog_name(),
+                        column.data_type
+                    ));
+                }
                 Some(r#type) => columns.push(DbColumn::new(name.as_str(), r#type)),
                 None if self.primary_key.iter().any(|key| key == name) => {
                     return Err(format!(
@@ -146,18 +156,19 @@ impl PublishedTable {
 
 /// The engine's type for a published column, mapped as the startup
 /// catalog maps `information_schema`: an array is a list of its element's
-/// type, an enum is a string, `bytea` is not carried.
+/// type, an enum is a string, a type the engine does not interpret is
+/// raw.
 pub fn column_type(column: &PublishedColumn) -> Option<ValueType> {
     if let Some(element) = column.data_type.strip_suffix("[]") {
         let element = element.trim_end_matches("[]");
         return Some(ValueType::List(Box::new(
-            scalar_type(element).unwrap_or(ValueType::String),
+            scalar_type(element).unwrap_or(ValueType::Raw),
         )));
     }
     if column.pg_type_class.as_deref() == Some("e") {
         return Some(ValueType::String);
     }
-    scalar_type(&column.data_type)
+    Some(scalar_type(&column.data_type).unwrap_or(ValueType::Raw))
 }
 
 /// The value every existing row holds for a column added with default
@@ -276,20 +287,27 @@ fn quoted_literal(text: &str) -> Option<String> {
 fn typed(text: &str, declared: &ValueType) -> Option<Value> {
     Some(match declared {
         ValueType::String => Value::String(text.to_owned()),
-        ValueType::Json => Value::String(text::json_as_jsonb(text)),
+        ValueType::Json => Value::Json(crate::model::JsonText::standard_only(text::json_as_jsonb(text))),
         ValueType::Int => Value::Int(text.parse().ok()?),
         ValueType::Float => Value::Float(text.parse().ok()?),
+        ValueType::Numeric => Value::Numeric(text::numeric_digits(text)?),
         ValueType::Bool => Value::Bool(match text {
             "t" | "true" | "1" => true,
             "f" | "false" | "0" => false,
             _ => return None,
         }),
-        ValueType::Timestamp => Value::Int(text::epoch_millis(text)?),
+        ValueType::Timestamp => Value::Timestamp(text::timestamp(text)?),
+        ValueType::Day => Value::Day(text::day(text)?),
+        ValueType::Time => Value::Time(text::time_of_day(text)?),
+        ValueType::Bytes => Value::Bytes(text::hex_bytes(text)?),
         ValueType::List(inner) => match text::array_literal(text, inner) {
             Value::List(items) => Value::List(items),
             _ => return None,
         },
-        ValueType::Date | ValueType::Datetime | ValueType::Map(_, _) => return None,
+        ValueType::Date
+        | ValueType::Datetime
+        | ValueType::Raw
+        | ValueType::Map(_, _) => return None,
     })
 }
 
@@ -548,7 +566,9 @@ mod tests {
         );
         assert_eq!(
             parse_default(Some("'{\"b\": 1, \"a\": [1.50]}'::jsonb"), &ValueType::Json),
-            Some(Value::from("{\"a\": [1.5], \"b\": 1}")),
+            Some(Value::Json(crate::model::JsonText::standard_only(
+                "{\"a\": [1.5], \"b\": 1}".to_owned()
+            ))),
             "a JSON default in the standard form"
         );
         assert_eq!(
@@ -563,9 +583,7 @@ mod tests {
                 Some("'2026-01-02 03:04:05+00'::timestamp with time zone"),
                 &ValueType::Timestamp
             ),
-            Some(Value::Int(
-                text::epoch_millis("2026-01-02 03:04:05+00").unwrap()
-            ))
+            Some(Value::Timestamp(text::timestamp("2026-01-02 03:04:05+00").unwrap()))
         );
         for expression in [
             "now()",
@@ -610,7 +628,9 @@ mod tests {
             column_type(&column("text[]", "b")),
             Some(ValueType::List(Box::new(ValueType::String)))
         );
-        assert_eq!(column_type(&column("bytea", "b")), None);
+        assert_eq!(column_type(&column("bytea", "b")), Some(ValueType::Bytes));
+        assert_eq!(column_type(&column("numeric", "b")), Some(ValueType::Numeric));
+        assert_eq!(column_type(&column("money", "b")), Some(ValueType::Raw));
     }
 
     /// A column added with a constant default, a table added, both

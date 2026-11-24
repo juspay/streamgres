@@ -30,12 +30,14 @@ pub const KIND: &str = "SchemaVersionNotSupported";
 /// times travel as epoch milliseconds, lists and maps as JSON.
 pub fn client_type(declared: &ValueType) -> &'static str {
     match declared {
-        ValueType::String => "string",
+        ValueType::String | ValueType::Time | ValueType::Bytes | ValueType::Raw => "string",
         ValueType::Int
         | ValueType::Float
         | ValueType::Date
         | ValueType::Datetime
-        | ValueType::Timestamp => "number",
+        | ValueType::Timestamp
+        | ValueType::Numeric
+        | ValueType::Day => "number",
         ValueType::Bool => "boolean",
         ValueType::Json | ValueType::List(_) | ValueType::Map(_, _) => "json",
     }

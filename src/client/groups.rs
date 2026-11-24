@@ -1726,7 +1726,12 @@ fn build_poke(
             Patch::Del(table, key) => {
                 dels += 1;
                 let mut bytes = Vec::with_capacity(64);
-                wire::write_del(&mut bytes, table.as_str(), key);
+                match catalog.table(table.as_str()) {
+                    Some(declared) => wire::write_del(&mut bytes, declared, key),
+                    // A table the catalog no longer holds: the delete still
+                    // goes out, written without declared types as before.
+                    None => wire::write_del_untyped(&mut bytes, table.as_str(), key),
+                }
                 Bytes::from(bytes)
             }
         };

@@ -1,10 +1,10 @@
 //! The text forms Postgres uses for the values the engine carries in a
-//! form of its own: the epoch-millisecond reading of a time, a JSON array
-//! read from `to_json(column)`, and the `{a,b}` array literal the change
-//! feed delivers, each turned into the [`Value`] the column's declared
-//! type calls for; and the **standard form** of a JSON value, the one text
-//! every JSON cell and every JSON literal is brought into, so that two
-//! equal values are two equal texts.
+//! form of its own: the epoch-microsecond reading of a time, and the
+//! `{a,b}` array literal column defaults and literals arrive in, each
+//! turned into the [`Value`] the column's declared type calls for; and
+//! the **standard form** of a JSON value, the one text every JSON cell
+//! and every JSON literal is brought into, so that two equal values are
+//! two equal texts.
 //!
 //! # The standard form of JSON
 //!
@@ -26,7 +26,9 @@
 
 use std::borrow::Cow;
 
-use crate::model::{Value, ValueType};
+use bytes::Bytes;
+
+use crate::model::{Day, Numeric, Time, Timestamp, Value, ValueType};
 
 /// A JSON value in the standard form (see the module docs): what a
 /// literal compared with a JSON column is written as, so equality of the
@@ -79,6 +81,10 @@ fn write_jsonb(value: &serde_json::Value, out: &mut String) {
 /// never an exponent, never a padded fraction, and zero without a sign.
 fn write_number(number: &serde_json::Number, out: &mut String) {
     use std::fmt::Write;
+    if let Ok(number) = crate::model::Numeric::parse(&number.to_string()) {
+        out.push_str(&standard_json(&number.to_string()));
+        return;
+    }
     if let Some(int) = number.as_i64() {
         let _ = write!(out, "{int}");
     } else if let Some(int) = number.as_u64() {
@@ -92,6 +98,20 @@ fn write_number(number: &serde_json::Number, out: &mut String) {
             None => out.push_str(&number.to_string()),
         }
     }
+}
+
+/// Whether `text` is plain decimal digits (with an optional sign and
+/// point) — the only spelling Postgres writes for a `numeric`, so an
+/// exponent form (`1e21`) is not one.
+fn is_plain_numeric(text: &str) -> bool {
+    let rest = text.strip_prefix(['-', '+']).unwrap_or(text);
+    let (int, frac) = match rest.split_once('.') {
+        Some((int, frac)) => (int, frac),
+        None => (rest, ""),
+    };
+    !int.is_empty()
+        && int.bytes().all(|byte| byte.is_ascii_digit())
+        && (frac.is_empty() || frac.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// A `jsonb` cell's text in the standard form: the text itself unless a
@@ -193,23 +213,173 @@ pub fn json_as_jsonb(text: &str) -> String {
     }
 }
 
-/// Milliseconds since the Unix epoch of a Postgres `timestamp`,
-/// `timestamptz` or `date` in its text form (`2026-09-15 10:00:00.123`,
+/// Validate client JSON input before comparing it with jsonb. Values
+/// outside the exact decimal representation, or containing a NUL code
+/// point PostgreSQL rejects, must fall back rather than silently miss.
+pub(crate) fn jsonb_input(text: &str) -> Result<String, &'static str> {
+    fn charge(remaining: &mut usize, bytes: usize) -> bool {
+        match remaining.checked_sub(bytes) {
+            Some(left) => {
+                *remaining = left;
+                true
+            }
+            None => false,
+        }
+    }
+    fn exact(value: &serde_json::Value, remaining: &mut usize) -> bool {
+        match value {
+            serde_json::Value::Number(number) => {
+                let Ok(number) = crate::model::Numeric::parse(&number.to_string()) else {
+                    return false;
+                };
+                charge(remaining, standard_json(&number.to_string()).len())
+            }
+            serde_json::Value::String(text) => {
+                !text.contains('\0') && charge(remaining, value.to_string().len())
+            }
+            serde_json::Value::Array(items) => {
+                charge(
+                    remaining,
+                    2usize.saturating_add(items.len().saturating_sub(1).saturating_mul(2)),
+                ) && items.iter().all(|item| exact(item, remaining))
+            }
+            serde_json::Value::Object(items) => {
+                charge(
+                    remaining,
+                    2usize.saturating_add(items.len().saturating_sub(1).saturating_mul(2)),
+                ) && items.iter().all(|(key, value)| {
+                    !key.contains('\0')
+                        && charge(
+                            remaining,
+                            serde_json::Value::String(key.clone())
+                                .to_string()
+                                .len()
+                                .saturating_add(2),
+                        )
+                        && exact(value, remaining)
+                })
+            }
+            serde_json::Value::Null => charge(remaining, 4),
+            serde_json::Value::Bool(value) => charge(remaining, if *value { 4 } else { 5 }),
+        }
+    }
+    let value = serde_json::from_str(text).map_err(|_| "invalid JSON input")?;
+    // A short exponent can expand into a very long decimal. Count the
+    // canonical output before allocating it, including nested documents.
+    if !exact(&value, &mut (1 << 20)) {
+        return Err("JSON input exceeds the exact evaluation budget");
+    }
+    Ok(jsonb_text(&value))
+}
+
+/// A `numeric` or `money` cell as an exact [`Numeric`]: the text Postgres
+/// wrote for a `numeric` (`1.50` keeps its scale), or a `money` adornment
+/// stripped from one (`$1,234.56` is `1234.56`). A `numeric` special
+/// (`NaN`, `Infinity`, `-Infinity`) is kept as such. The money path
+/// assumes the C locale (`lc_monetary`); a comma-decimal locale is not
+/// supported and its text is left alone rather than misread. `None` when
+/// the text is neither — a number in any other spelling (`1e21`) is left
+/// alone rather than mangled into different digits.
+pub fn numeric_digits(text: &str) -> Option<Numeric> {
+    let text = text.trim();
+    if matches!(text, "NaN" | "Infinity" | "-Infinity") || is_plain_numeric(text) {
+        return Numeric::parse(text).ok();
+    }
+    let only_money = text.chars().all(|character| {
+        character.is_ascii_digit()
+            || matches!(character, '.' | '-' | '+' | ',' | '$' | ' ' | '\u{a0}')
+    });
+    if !only_money {
+        return None;
+    }
+    let digits: String = text
+        .chars()
+        .filter(|character| {
+            character.is_ascii_digit() || matches!(character, '.' | '-' | '+')
+        })
+        .collect();
+    Numeric::parse(&digits).ok()
+}
+
+/// A Postgres `timestamp` or `timestamptz` in its text form
+/// (`2026-09-15 10:00:00.123456`, with an optional `+05:30` style
+/// offset, `infinity` or `-infinity`); a time without a zone is read as
+/// UTC. `None` when the text is not a timestamp.
+pub fn timestamp(text: &str) -> Option<Timestamp> {
+    let text = text.trim();
+    match text {
+        "infinity" => return Some(Timestamp::INFINITY),
+        "-infinity" => return Some(Timestamp::NEG_INFINITY),
+        _ => {}
+    }
+    let micros = epoch_micros(text).or_else(|| text.parse::<i64>().ok())?;
+    Timestamp::from_unix_micros(micros)
+}
+
+/// A Postgres `date` in its text form (`2026-09-15`, `infinity` or
+/// `-infinity`).
+pub fn day(text: &str) -> Option<Day> {
+    let text = text.trim();
+    match text {
+        "infinity" => return Some(Day::INFINITY),
+        "-infinity" => return Some(Day::NEG_INFINITY),
+        _ => {}
+    }
+    let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
+    let epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)?;
+    i32::try_from((date - epoch).num_days()).ok().map(Day)
+}
+
+/// A Postgres `time` in its text form (`HH:MM[:SS[.ffffff]]`).
+pub fn time_of_day(text: &str) -> Option<Time> {
+    let mut parts = text.splitn(3, ':');
+    let hours: i64 = parts.next()?.parse().ok()?;
+    let minutes: i64 = parts.next()?.parse().ok()?;
+    let (seconds, fraction) = match parts.next() {
+        Some(rest) => match rest.split_once('.') {
+            Some((seconds, fraction)) => (seconds.parse::<i64>().ok()?, fraction),
+            None => (rest.parse::<i64>().ok()?, ""),
+        },
+        None => (0, ""),
+    };
+    if fraction.len() > 6 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let micros: i64 = format!("{fraction:0<6}").parse().ok()?;
+    let total = ((hours * 60 + minutes) * 60 + seconds) * 1_000_000 + micros;
+    ((0..=86_400_000_000).contains(&total) && minutes < 60 && seconds < 60).then_some(Time(total))
+}
+
+/// The bytes of a Postgres `bytea`'s hex text (`\x0aff`).
+pub fn hex_bytes(text: &str) -> Option<Bytes> {
+    let digits = text.strip_prefix("\\x")?;
+    if digits.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for index in (0..digits.len()).step_by(2) {
+        out.push(u8::from_str_radix(digits.get(index..index + 2)?, 16).ok()?);
+    }
+    Some(out.into())
+}
+
+/// Microseconds since the Unix epoch of a Postgres `timestamp`,
+/// `timestamptz` or `date` in its text form (`2026-09-15 10:00:00.123456`,
 /// with an optional `+05:30` style offset, or `2026-09-15`); a timestamp
-/// without a zone is read as UTC, the protocol's convention. `None` when the text
-/// is not a time (`infinity` included).
-pub fn epoch_millis(text: &str) -> Option<i64> {
+/// without a zone is read as UTC, the protocol's convention. `None` when
+/// the text is not a time (`infinity` included).
+pub fn epoch_micros(text: &str) -> Option<i64> {
     let text = text.trim();
     if text.len() == 10 {
         let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").ok()?;
-        return Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis());
+        return Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp_micros());
     }
     let (naive, offset_seconds) = split_offset(text);
     let parsed = chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%d %H:%M:%S%.f")
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%d %H:%M:%S"))
         .or_else(|_| chrono::NaiveDateTime::parse_from_str(naive, "%Y-%m-%dT%H:%M:%S%.f"))
         .ok()?;
-    Some(parsed.and_utc().timestamp_millis() - offset_seconds * 1000)
+    Some(parsed.and_utc().timestamp_micros() - offset_seconds * 1_000_000)
 }
 
 /// Split a trailing `+HH`, `+HH:MM` or `+HHMM` zone offset off a timestamp
@@ -236,32 +406,6 @@ fn split_offset(text: &str) -> (&str, i64) {
 }
 
 /// A JSON array text (what `to_json(column)::text` returns for an array
-/// column) as a [`Value::List`] of `inner`-typed items; text that is not
-/// a JSON array is kept whole as a string.
-pub fn json_list(text: &str, inner: &ValueType) -> Value {
-    match serde_json::from_str::<serde_json::Value>(text) {
-        Ok(serde_json::Value::Array(items)) => {
-            Value::List(items.iter().map(|item| json_scalar(item, inner)).collect())
-        }
-        _ => Value::String(text.to_owned()),
-    }
-}
-
-/// One JSON scalar as the [`Value`] the item type calls for.
-fn json_scalar(item: &serde_json::Value, inner: &ValueType) -> Value {
-    match item {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(flag) => Value::Bool(*flag),
-        serde_json::Value::Number(number) => match (number.as_i64(), inner) {
-            (Some(int), ValueType::Float) => Value::Float(int as f64),
-            (Some(int), _) => Value::Int(int),
-            (None, _) => Value::Float(number.as_f64().unwrap_or(f64::NAN)),
-        },
-        serde_json::Value::String(text) => scalar_text(text, inner),
-        other => Value::String(other.to_string()),
-    }
-}
-
 /// A Postgres array literal (`{a,"b c",NULL}`) as a [`Value::List`] of
 /// `inner`-typed items.
 pub fn array_literal(text: &str, inner: &ValueType) -> Value {
@@ -331,19 +475,37 @@ fn array_item(text: &str, was_quoted: bool, inner: &ValueType) -> Value {
 /// does not parse as the type stays a string.
 fn scalar_text(text: &str, inner: &ValueType) -> Value {
     match inner {
-        ValueType::Int | ValueType::Timestamp => text
+        ValueType::Int => text
             .parse()
             .map(Value::Int)
             .unwrap_or_else(|_| Value::String(text.to_owned())),
+        ValueType::Timestamp => timestamp(text)
+            .map(Value::Timestamp)
+            .unwrap_or_else(|| Value::String(text.to_owned())),
         ValueType::Float => text
             .parse()
             .map(Value::Float)
             .unwrap_or_else(|_| Value::String(text.to_owned())),
+        ValueType::Numeric => numeric_digits(text)
+            .map(Value::Numeric)
+            .unwrap_or_else(|| Value::String(text.to_owned())),
         ValueType::Bool => match text {
             "t" | "true" => Value::Bool(true),
             "f" | "false" => Value::Bool(false),
             other => Value::String(other.to_owned()),
         },
+        ValueType::Day => day(text)
+            .map(Value::Day)
+            .unwrap_or_else(|| Value::String(text.to_owned())),
+        ValueType::Date => chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+            .map(Value::Date)
+            .unwrap_or_else(|_| Value::String(text.to_owned())),
+        ValueType::Time => time_of_day(text)
+            .map(Value::Time)
+            .unwrap_or_else(|| Value::String(text.to_owned())),
+        ValueType::Bytes => hex_bytes(text)
+            .map(Value::Bytes)
+            .unwrap_or_else(|| Value::String(text.to_owned())),
         _ => Value::String(text.to_owned()),
     }
 }
@@ -355,12 +517,78 @@ mod tests {
     /// Timestamps without a zone read as UTC, with a zone are shifted, and
     /// dates land on UTC midnight.
     #[test]
-    fn times_read_as_epoch_milliseconds() {
-        assert_eq!(epoch_millis("1970-01-01 00:00:01.5"), Some(1_500));
-        assert_eq!(epoch_millis("1970-01-01 01:00:00+01"), Some(0));
-        assert_eq!(epoch_millis("1970-01-01 05:30:00.25+05:30"), Some(250));
-        assert_eq!(epoch_millis("1970-01-02"), Some(86_400_000));
-        assert_eq!(epoch_millis("infinity"), None);
+    fn times_read_as_epoch_microseconds() {
+        assert_eq!(epoch_micros("1970-01-01 00:00:01.5"), Some(1_500_000));
+        assert_eq!(epoch_micros("1970-01-01 00:00:00.000001"), Some(1));
+        assert_eq!(epoch_micros("1970-01-01 01:00:00+01"), Some(0));
+        assert_eq!(epoch_micros("1970-01-01 05:30:00.25+05:30"), Some(250_000));
+        assert_eq!(epoch_micros("1970-01-02"), Some(86_400_000_000));
+        assert_eq!(epoch_micros("infinity"), None);
+    }
+
+    /// A `numeric` keeps its digits, a `money` spelling is stripped to
+    /// them, and a `bytea` text on a text column is left alone.
+    #[test]
+    fn numeric_money_and_bytea_decode_exactly() {
+        let n = |text: &str| Numeric::parse(text).unwrap();
+        assert_eq!(numeric_digits("1.50"), Some(n("1.50")));
+        assert_eq!(
+            numeric_digits("9007199254740993.00"),
+            Some(n("9007199254740993.00"))
+        );
+        assert_eq!(numeric_digits("$1,234.56"), Some(n("1234.56")));
+    }
+
+    /// A number in another spelling (`1e21`) is rejected, not stripped
+    /// into different digits; a `numeric` special is kept as such.
+    #[test]
+    fn numeric_digits_reject_unusual_spellings() {
+        assert_eq!(numeric_digits("1e21"), None);
+        assert_eq!(
+            numeric_digits("$1,234.56"),
+            Some(Numeric::parse("1234.56").unwrap())
+        );
+        assert_eq!(numeric_digits("NaN"), Some(Numeric::NaN));
+        assert_eq!(numeric_digits("Infinity"), Some(Numeric::Infinity));
+        assert_eq!(numeric_digits("-Infinity"), Some(Numeric::NegInfinity));
+    }
+
+    /// A `numeric` array literal keeps its digits. A fraction is never
+    /// routed through `f64`.
+    #[test]
+    fn numeric_arrays_keep_their_digits() {
+        let n = |text: &str| Numeric::parse(text).unwrap();
+        let numeric = ValueType::Numeric;
+        assert_eq!(
+            array_literal("{1.50,2.25}", &numeric),
+            Value::List(vec![
+                Value::Numeric(n("1.50")),
+                Value::Numeric(n("2.25"))
+            ])
+        );
+        assert_eq!(
+            array_literal("{9007199254740993.00, 1}", &numeric),
+            Value::List(vec![
+                Value::Numeric(n("9007199254740993.00")),
+                Value::Numeric(n("1"))
+            ])
+        );
+        assert_eq!(
+            array_literal("{NaN,NULL}", &numeric),
+            Value::List(vec![Value::Numeric(Numeric::NaN), Value::Null])
+        );
+    }
+
+    /// A microsecond is the same value from a timestamp's text, whatever
+    /// the ingest path that delivered it.
+    #[test]
+    fn timestamps_keep_microseconds_on_both_paths() {
+        let text = "2026-09-15 10:00:00.123456";
+        assert_eq!(
+            timestamp(text),
+            Some(Timestamp::from_unix_micros(epoch_micros(text).unwrap()).unwrap())
+        );
+        assert_eq!(epoch_micros(text).unwrap() % 1_000, 456);
     }
 
     /// Array literals split on unquoted commas, unquote, and read NULL.
@@ -380,19 +608,6 @@ mod tests {
             Value::List(vec![Value::Int(1), Value::Int(2)])
         );
         assert_eq!(array_literal("{}", &ValueType::String), Value::List(vec![]));
-    }
-
-    /// JSON arrays from `to_json` become the same lists.
-    #[test]
-    fn json_arrays_become_lists() {
-        assert_eq!(
-            json_list("[\"x\",null]", &ValueType::String),
-            Value::List(vec![Value::from("x"), Value::Null])
-        );
-        assert_eq!(
-            json_list("[1.5,2]", &ValueType::Float),
-            Value::List(vec![Value::Float(1.5), Value::Float(2.0)])
-        );
     }
 
     /// A JSON value is written as `jsonb` writes it: scalars as JSON, a

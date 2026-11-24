@@ -13,11 +13,16 @@
 //! - `Map`: equality is order-independent (as for any `HashMap`), so the
 //!   hash combines per-entry hashes with an order-independent fold.
 
-use chrono::{NaiveDate, NaiveDateTime};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
+
+use bytes::Bytes;
+use chrono::{NaiveDate, NaiveDateTime};
+
+pub use super::numeric::Numeric;
+pub use super::time::{Day, Time, Timestamp};
 
 /// A dynamically-typed database value.
 ///
@@ -35,6 +40,108 @@ pub enum Value {
     List(Vec<Value>),
     Map(std::collections::HashMap<Value, Value>),
     Set(SharedSet),
+    /// A JSON document: compared by its standard form, kept with the text
+    /// Postgres gave when that differs.
+    Json(JsonText),
+    /// A Postgres `numeric`, exact.
+    Numeric(Numeric),
+    /// A Postgres `timestamp` or `timestamptz`.
+    Timestamp(Timestamp),
+    /// A Postgres `date`.
+    Day(Day),
+    /// A Postgres `time`.
+    Time(Time),
+    /// A Postgres `bytea`.
+    Bytes(Bytes),
+    /// A value of a type the engine does not interpret, as Postgres's
+    /// binary form. It can be stored and sent on, never compared.
+    Raw(Raw),
+}
+
+/// A JSON document. Two documents are the same value when their standard
+/// forms are the same text ([`crate::sync::pg::text`]): that is what the
+/// engine compares, orders and hashes. The text Postgres stored or wrote
+/// is kept beside it when it is spelled otherwise (a `json` column keeps
+/// its input as written, a `jsonb` number its trailing zeros), so the
+/// document can be handed back exactly.
+#[derive(Debug, Clone)]
+pub struct JsonText {
+    standard: Box<str>,
+    text: Option<Box<str>>,
+    known: bool,
+}
+
+impl JsonText {
+    /// A document in `standard` form, given by its source as `text`.
+    pub fn new(standard: String, text: &str) -> Self {
+        let text = (text != standard).then(|| text.into());
+        JsonText {
+            standard: standard.into(),
+            text,
+            known: true,
+        }
+    }
+
+    /// A document known only in its standard form: a literal compared
+    /// with a column, or a value Postgres wrote without saying how it
+    /// spells it (a column's default filled into rows already held).
+    pub fn standard_only(standard: String) -> Self {
+        JsonText {
+            standard: standard.into(),
+            text: None,
+            known: false,
+        }
+    }
+
+    /// Whether [`JsonText::text`] is the text Postgres has, rather than
+    /// only the standard form.
+    pub fn is_known(&self) -> bool {
+        self.known
+    }
+
+    /// The standard form, what the engine compares.
+    pub fn standard(&self) -> &str {
+        &self.standard
+    }
+
+    /// The text the source gave.
+    pub fn text(&self) -> &str {
+        self.text.as_deref().unwrap_or(&self.standard)
+    }
+}
+
+impl PartialEq for JsonText {
+    fn eq(&self, other: &Self) -> bool {
+        self.standard == other.standard
+    }
+}
+
+impl Eq for JsonText {}
+
+impl Hash for JsonText {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.standard.hash(state);
+    }
+}
+
+impl PartialOrd for JsonText {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for JsonText {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.standard.cmp(&other.standard)
+    }
+}
+
+/// A value of a type the engine does not interpret: its type and its
+/// Postgres binary form.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Raw {
+    pub type_oid: u32,
+    pub bytes: Bytes,
 }
 
 /// The static type of a [`Value`], used to describe columns in a schema.
@@ -48,14 +155,21 @@ pub enum ValueType {
     Datetime,
     List(Box<ValueType>),
     Map(Box<ValueType>, Box<ValueType>),
-    /// A point in time carried as milliseconds since the Unix epoch, the
-    /// form protocol clients see for `timestamp`, `timestamptz` and `date`
-    /// columns; the cell is a [`Value::Int`].
+    /// A Postgres `timestamp` or `timestamptz`; the cell is a
+    /// [`Value::Timestamp`].
     Timestamp,
-    /// A JSON document carried as its text, the form the engine keeps for
-    /// `json` and `jsonb` columns; the cell is a [`Value::String`] and the
-    /// transport writes it out as the JSON it holds.
+    /// A Postgres `json` or `jsonb`; the cell is a [`Value::Json`].
     Json,
+    /// A Postgres `numeric`; the cell is a [`Value::Numeric`].
+    Numeric,
+    /// A Postgres `date`; the cell is a [`Value::Day`].
+    Day,
+    /// A Postgres `time`; the cell is a [`Value::Time`].
+    Time,
+    /// A Postgres `bytea`; the cell is a [`Value::Bytes`].
+    Bytes,
+    /// A type the engine does not interpret; the cell is a [`Value::Raw`].
+    Raw,
 }
 
 impl Value {
@@ -66,37 +180,66 @@ impl Value {
 
     /// Ordering comparison backing the `GT` / `GTE` / `LT` / `LTE` operators.
     ///
-    /// Values compare only within the same variant, except `Int` / `Float`
-    /// which coerce to `f64` (lossy above 2⁵³ — mixed-type comparisons of
-    /// such magnitudes may tie spuriously; same-variant comparisons are
-    /// always exact). Everything else — including anything involving
+    /// Values compare only within the same variant, except the numbers:
+    /// `Int` / `Float` coerce to `f64` (lossy above 2⁵³ — mixed-type
+    /// comparisons of such magnitudes may tie spuriously; same-variant
+    /// comparisons are always exact), `Int` / `Numeric` compare exactly,
+    /// and `Float` / `Numeric` compare as `f64`, as Postgres compares
+    /// `float8` with `numeric`. Floats order as Postgres orders them
+    /// ([`float_cmp`]). Everything else — including anything involving
     /// `Null` — returns `None`, which predicate evaluation treats as
     /// "does not match" (SQL three-valued logic collapsed to `false`).
     pub fn compare(&self, other: &Value) -> Option<Ordering> {
         use Value::*;
         match (self, other) {
             (Int(a), Int(b)) => Some(a.cmp(b)),
-            (Float(a), Float(b)) => a.partial_cmp(b),
-            (Int(a), Float(b)) => (*a as f64).partial_cmp(b),
-            (Float(a), Int(b)) => a.partial_cmp(&(*b as f64)),
+            (Float(a), Float(b)) => Some(float_cmp(*a, *b)),
+            (Int(a), Float(b)) => Some(float_cmp(*a as f64, *b)),
+            (Float(a), Int(b)) => Some(float_cmp(*a, *b as f64)),
             (String(a), String(b)) => Some(a.cmp(b)),
             (Bool(a), Bool(b)) => Some(a.cmp(b)),
             (Date(a), Date(b)) => Some(a.cmp(b)),
             (Datetime(a), Datetime(b)) => Some(a.cmp(b)),
+            (Json(a), Json(b)) => Some(a.cmp(b)),
+            (Numeric(a), Numeric(b)) => Some(a.cmp(b)),
+            (Int(a), Numeric(b)) => Some(self::Numeric::from_i64(*a).cmp(b)),
+            (Numeric(a), Int(b)) => Some(a.cmp(&self::Numeric::from_i64(*b))),
+            (Float(a), Numeric(b)) => Some(float_cmp(*a, b.to_f64())),
+            (Numeric(a), Float(b)) => Some(float_cmp(a.to_f64(), *b)),
+            (Timestamp(a), Timestamp(b)) => Some(a.cmp(b)),
+            (Day(a), Day(b)) => Some(a.cmp(b)),
+            (Time(a), Time(b)) => Some(a.cmp(b)),
+            (Bytes(a), Bytes(b)) => Some(a.cmp(b)),
             _ => None,
         }
     }
 
     /// Equality backing the `EQ` / `NEQ` / `IN` / `NOT_IN` operators:
-    /// strict equality plus `Int` / `Float` numeric coercion, so
-    /// `Int(5)` equals `Float(5.0)`.
+    /// strict equality plus numeric coercion between `Int`, `Float` and
+    /// `Numeric`, so `Int(5)` equals `Float(5.0)` and `Numeric(5.00)`, and
+    /// a float equals a numeric as Postgres casts the numeric to `float8`.
     pub fn loose_eq(&self, other: &Value) -> bool {
         match (self, other) {
-            (Value::Int(_), Value::Float(_)) | (Value::Float(_), Value::Int(_)) => {
+            (Value::Int(_), Value::Float(_))
+            | (Value::Float(_), Value::Int(_))
+            | (Value::Float(_), Value::Numeric(_))
+            | (Value::Numeric(_), Value::Float(_)) => {
                 self.compare(other) == Some(Ordering::Equal)
             }
-            _ => self == other,
+            (Value::Null, _) | (_, Value::Null) => self == other,
+            _ => self.equality_key_ref() == other.equality_key_ref(),
         }
+    }
+}
+
+/// Postgres's order of `float8`: every `NaN` equal to every other and
+/// above every number, infinity included; `-0` equal to `0`.
+pub fn float_cmp(a: f64, b: f64) -> Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
     }
 }
 
@@ -123,6 +266,13 @@ impl Value {
                 List(_) => 7,
                 Map(_) => 8,
                 Set(_) => 9,
+                Numeric(_) => 10,
+                Timestamp(_) => 11,
+                Day(_) => 12,
+                Time(_) => 13,
+                Bytes(_) => 14,
+                Raw(_) => 15,
+                Json(_) => 16,
             }
         }
         fn canonical_f64(f: f64) -> f64 {
@@ -149,6 +299,13 @@ impl Value {
                 .find(|ordering| *ordering != Ordering::Equal)
                 .unwrap_or_else(|| a.len().cmp(&b.len())),
             (Set(a), Set(b)) => a.address().cmp(&b.address()),
+            (Numeric(a), Numeric(b)) => a.cmp(b),
+            (Timestamp(a), Timestamp(b)) => a.cmp(b),
+            (Day(a), Day(b)) => a.cmp(b),
+            (Time(a), Time(b)) => a.cmp(b),
+            (Bytes(a), Bytes(b)) => a.cmp(b),
+            (Raw(a), Raw(b)) => a.cmp(b),
+            (Json(a), Json(b)) => a.cmp(b),
             (Map(a), Map(b)) => {
                 let mut left: Vec<_> = a.iter().collect();
                 let mut right: Vec<_> = b.iter().collect();
@@ -268,8 +425,11 @@ impl Value {
     /// The key under which a value takes part in equality tests: `None` for
     /// `NULL` (which equals nothing), the integer for an integral float
     /// within exact range (the coercion of [`Value::loose_eq`]), the value
-    /// itself otherwise. Two values are `loose_eq` iff their keys are equal,
-    /// which is what lets hash maps and sets stand in for equality tests.
+    /// itself otherwise. Two values of one column's type are `loose_eq` iff
+    /// their keys are equal, which is what lets hash maps and sets stand in
+    /// for equality tests. A float and a non-integral numeric keep keys of
+    /// their own, so a condition's value must have its column's type: the
+    /// parsers bring every literal and parameter to it.
     pub fn equality_key(&self) -> Option<Value> {
         self.equality_key_ref().map(std::borrow::Cow::into_owned)
     }
@@ -282,6 +442,10 @@ impl Value {
             Value::Float(f) if f.fract() == 0.0 && f.abs() <= EXACT_INTEGER_LIMIT => {
                 Some(std::borrow::Cow::Owned(Value::Int(*f as i64)))
             }
+            Value::Numeric(n) => match n.to_i64() {
+                Some(int) => Some(std::borrow::Cow::Owned(Value::Int(int))),
+                None => Some(std::borrow::Cow::Borrowed(self)),
+            },
             other => Some(std::borrow::Cow::Borrowed(other)),
         }
     }
@@ -305,6 +469,13 @@ impl PartialEq for Value {
             (List(a), List(b)) => a == b,
             (Map(a), Map(b)) => a == b,
             (Set(a), Set(b)) => a == b,
+            (Numeric(a), Numeric(b)) => a == b,
+            (Timestamp(a), Timestamp(b)) => a == b,
+            (Day(a), Day(b)) => a == b,
+            (Time(a), Time(b)) => a == b,
+            (Bytes(a), Bytes(b)) => a == b,
+            (Raw(a), Raw(b)) => a == b,
+            (Json(a), Json(b)) => a == b,
             _ => false,
         }
     }
@@ -330,6 +501,13 @@ impl Hash for Value {
             List(items) => items.hash(state),
             Map(entries) => unordered_map_hash(entries).hash(state),
             Set(set) => set.hash(state),
+            Numeric(n) => n.hash(state),
+            Timestamp(at) => at.hash(state),
+            Day(day) => day.hash(state),
+            Time(time) => time.hash(state),
+            Bytes(bytes) => bytes.hash(state),
+            Raw(raw) => raw.hash(state),
+            Json(json) => json.hash(state),
         }
     }
 }
@@ -458,6 +636,37 @@ mod tests {
         assert_send_sync::<crate::model::WriteQuery>();
         assert_send_sync::<crate::model::MultiTableReadQuery>();
         assert_send_sync::<crate::ivm::Delta>();
+    }
+
+    /// Numerics compare and equate by value with integers and with each
+    /// other, whatever their scale, and hash alike when equal.
+    #[test]
+    fn numerics_equate_by_value() {
+        let n = |text: &str| Value::Numeric(Numeric::parse(text).unwrap());
+        assert!(n("5.00").loose_eq(&Value::Int(5)));
+        assert!(Value::Int(5).loose_eq(&n("5")));
+        assert!(n("1.50").loose_eq(&n("1.5")));
+        assert!(!n("1.5").loose_eq(&Value::Int(1)));
+        assert_eq!(n("1.50"), n("1.5"));
+        assert_eq!(hash_of(&n("1.50")), hash_of(&n("1.5")));
+        assert_eq!(n("2").equality_key(), Some(Value::Int(2)));
+        assert_eq!(Value::Int(3).compare(&n("2.5")), Some(Ordering::Greater));
+        assert!(Value::Float(0.1).loose_eq(&n("0.10")));
+    }
+
+    /// Raw values compare with nothing, and equal only the same type and
+    /// bytes.
+    #[test]
+    fn raw_values_never_compare() {
+        let raw = |oid: u32, bytes: &'static [u8]| {
+            Value::Raw(Raw {
+                type_oid: oid,
+                bytes: Bytes::from_static(bytes),
+            })
+        };
+        assert_eq!(raw(1186, b"\x01").compare(&raw(1186, b"\x01")), None);
+        assert_eq!(raw(1186, b"\x01"), raw(1186, b"\x01"));
+        assert_ne!(raw(1186, b"\x01"), raw(869, b"\x01"));
     }
 
     /// [`Value::compare`] returns `None` for anything involving `Null`,
