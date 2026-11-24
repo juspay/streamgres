@@ -130,23 +130,6 @@ async fn cleanup_observes_subsecond_age_and_reports_missing_own_slot() {
 
 #[tokio::test]
 #[ignore = "destructive: run explicitly with --ignored --test-threads=1 on disposable PostgreSQL"]
-async fn impossible_age_fails_without_deleting_candidates() {
-    let (dsn, client) = database().await;
-    let slot = create_slot(&client).await;
-    assert!(
-        Transport::cleanup_inactive_slots(&dsn, "", Duration::MAX, LOCK_KEY)
-            .await
-            .is_err()
-    );
-    assert!(exists(&client, &slot).await);
-    client
-        .query_one("SELECT pg_drop_replication_slot($1)", &[&slot])
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-#[ignore = "destructive: run explicitly with --ignored --test-threads=1 on disposable PostgreSQL"]
 async fn initial_cleanup_frees_capacity_before_own_slot_creation() {
     let (dsn, client) = database().await;
     let capacity: i32 = client

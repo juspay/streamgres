@@ -96,6 +96,37 @@ pub struct Settings {
     pub ddl_prefix: String,
 }
 
+impl Settings {
+    fn validate_slot_cleanup(&self) -> Result<(), String> {
+        if !self.slot_cleanup_enabled {
+            return Ok(());
+        }
+        if self.slot_cleanup_age.as_secs_f64() > (i64::MAX / 1_000_000 - 1) as f64 {
+            return Err("slot cleanup age exceeds the PostgreSQL interval range".to_owned());
+        }
+        if self.slot_sweep_interval.is_zero()
+            || self.slot_sweep_interval.as_millis() > i64::MAX as u128
+        {
+            return Err(
+                "slot sweep interval must be positive and fit in signed 64-bit milliseconds"
+                    .to_owned(),
+            );
+        }
+        if self.slot_sweep_lock_key.trim().is_empty() || self.slot_sweep_lock_key.contains('\0') {
+            return Err("sweep lock key must be nonblank and contain no NUL".to_owned());
+        }
+        if self.slot_cleanup_startup_timeout.is_zero()
+            || self.slot_cleanup_startup_timeout.as_millis() > i64::MAX as u128
+        {
+            return Err(
+                "startup cleanup timeout must be positive and fit in signed 64-bit milliseconds"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// What every slot a server names for itself starts with.
 pub const SLOT_PREFIX: &str = "xyne_sync_slot_";
 
@@ -118,30 +149,18 @@ const POSITION_EVERY: Duration = Duration::from_millis(200);
 /// budget; Kubernetes retains five seconds of a 30-second grace period.
 const FEED_STOP_GRACE: Duration = Duration::from_secs(4);
 
-// The feed owns this task: shutdown cancels its timer and any in-progress sweep.
+// The task guard cancels both the timer and any in-progress sweep.
 async fn periodic_sweep(
     dsn: String,
     slot: String,
-    mut stopped: watch::Receiver<bool>,
     every: Duration,
     age: Duration,
     lock_key: String,
 ) {
     loop {
-        if *stopped.borrow() {
-            return;
-        }
-        tokio::select! {
-            _ = tokio::time::sleep(every) => {}
-            _ = stopped.changed() => return,
-        }
-        tokio::select! {
-            result = Transport::cleanup_inactive_slots(&dsn, &slot, age, &lock_key) => {
-                if let Err(error) = result {
-                    log_warn!("periodic slot cleanup failed: {error}");
-                }
-            }
-            _ = stopped.changed() => return,
+        tokio::time::sleep(every).await;
+        if let Err(error) = Transport::cleanup_inactive_slots(&dsn, &slot, age, &lock_key).await {
+            log_warn!("periodic slot cleanup failed: {error}");
         }
     }
 }
@@ -149,22 +168,16 @@ async fn periodic_sweep(
 // Own periodic cleanup before a feed exists, then transfer it into FeedHandle. Any failed
 // startup path drops this guard, cancelling both the timer and in-flight SQL.
 struct SweepTask {
-    stop: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl SweepTask {
     fn spawn(dsn: String, slot: String, every: Duration, age: Duration, lock_key: String) -> Self {
-        let (stop, stopped) = watch::channel(false);
-        let task = spawn_local(periodic_sweep(dsn, slot, stopped, every, age, lock_key));
-        Self {
-            stop,
-            task: Some(task),
-        }
+        let task = spawn_local(periodic_sweep(dsn, slot, every, age, lock_key));
+        Self { task: Some(task) }
     }
 
     async fn stop(mut self) {
-        self.stop.send_replace(true);
         if let Some(task) = self.task.take() {
             task.abort();
             let _ = task.await;
@@ -174,7 +187,6 @@ impl SweepTask {
 
 impl Drop for SweepTask {
     fn drop(&mut self) {
-        self.stop.send_replace(true);
         if let Some(task) = self.task.take() {
             task.abort();
         }
@@ -436,33 +448,10 @@ pub async fn start(
     stats: Arc<Stats>,
     shutdown: Shutdown,
 ) -> Result<(Started, ServiceTask), String> {
-    if settings.slot_cleanup_enabled
-        && settings.slot_cleanup_age.as_secs_f64() > (i64::MAX / 1_000_000 - 1) as f64
-    {
-        return Err("slot cleanup age exceeds the PostgreSQL interval range".to_owned());
-    }
-    if settings.slot_cleanup_enabled
-        && (settings.slot_sweep_interval.is_zero()
-            || settings.slot_sweep_interval.as_millis() > i64::MAX as u128)
-    {
-        return Err(
-            "slot sweep interval must be positive and fit in signed 64-bit milliseconds".to_owned(),
-        );
-    }
+
+    settings.validate_slot_cleanup()?;
+
     if settings.slot_cleanup_enabled {
-        if settings.slot_sweep_lock_key.trim().is_empty()
-            || settings.slot_sweep_lock_key.contains('\0')
-        {
-            return Err("sweep lock key must be nonblank and contain no NUL".to_owned());
-        }
-        if settings.slot_cleanup_startup_timeout.is_zero()
-            || settings.slot_cleanup_startup_timeout.as_millis() > i64::MAX as u128
-        {
-            return Err(
-                "startup cleanup timeout must be positive and fit in signed 64-bit milliseconds"
-                    .to_owned(),
-            );
-        }
         tokio::select! {
             result = Transport::cleanup_slots_at_startup(
                 &settings.dsn, &settings.slot, settings.slot_cleanup_age,

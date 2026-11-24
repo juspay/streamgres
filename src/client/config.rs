@@ -349,13 +349,10 @@ impl Config {
             read_dsn,
             schemas,
             slot: threads::slot_name(),
-            slot_cleanup_enabled: match first(&["STREAMGRES_SLOT_CLEANUP_ENABLED"]).as_deref() {
-                None | Some("true") | Some("1") | Some("on") => true,
-                Some("false") | Some("0") | Some("off") => false,
-                Some(other) => return Err(format!(
-                    "STREAMGRES_SLOT_CLEANUP_ENABLED must be a boolean, got `{other}`"
-                )),
-            },
+            slot_cleanup_enabled: first(&["STREAMGRES_SLOT_CLEANUP_ENABLED"])
+                .unwrap_or_else(|| "true".to_owned())
+                .parse::<bool>()
+                .map_err(|_| "STREAMGRES_SLOT_CLEANUP_ENABLED must be true or false".to_owned())?,
             slot_sweep_lock_key,
             slot_cleanup_age,
             slot_sweep_interval,
@@ -653,7 +650,11 @@ mod tests {
         let disabled = config_with(&[("STREAMGRES_SLOT_CLEANUP_ENABLED", "false")]);
         assert!(!disabled.slot_cleanup_enabled);
         assert!(!disabled.engine_settings().slot_cleanup_enabled);
-        assert!(config(&[("STREAMGRES_SLOT_CLEANUP_ENABLED", "invalid")]).is_err());
+        assert!(config_with(&[("STREAMGRES_SLOT_CLEANUP_ENABLED", "true")]).slot_cleanup_enabled);
+        for invalid in ["1", "0", "on", "off", "invalid"] {
+            let error = config(&[("STREAMGRES_SLOT_CLEANUP_ENABLED", invalid)]).unwrap_err();
+            assert!(error.contains("must be true or false"));
+        }
     }
 
     #[test]

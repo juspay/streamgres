@@ -528,49 +528,21 @@ async fn cleanup_deadline<T>(
     })?
 }
 
-fn validate_sweep_lock_key(lock_key: &str) -> Result<(), StorageError> {
-    if lock_key.trim().is_empty() || lock_key.contains('\0') {
-        return Err(StorageError(
-            "sweep lock key must be nonblank and contain no NUL".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-async fn sweep_slots(
-    dsn: &str,
-    keep: &str,
-    age: Duration,
-    lock_key: &str,
-) -> Result<(), StorageError> {
-    if age.as_secs_f64() > (i64::MAX / 1_000_000 - 1) as f64 {
-        return Err(StorageError(
-            "slot cleanup age exceeds the PostgreSQL interval range".to_owned(),
-        ));
-    }
-    let Some(connection) = acquire_sweep_connection(dsn, lock_key).await? else {
-        return Ok(());
-    };
-    sweep_with_permit(dsn, connection, keep, age, lock_key).await
-}
-
 // The same session owns the sweep permit and performs every metadata/drop query.
 // A replacement session must acquire ownership before continuing a stale list.
 async fn acquire_sweep_connection(
     dsn: &str,
     lock_key: &str,
 ) -> Result<Option<CleanupConnection>, StorageError> {
-    validate_sweep_lock_key(lock_key)?;
     let connection = open_cleanup(dsn).await?;
-    let acquired = try_sweep_lock(&connection.client, lock_key).await?;
-    Ok(acquired.then_some(connection))
-}
 
-// Derive a server-side 64-bit key from the bound string; never interpolate it.
-async fn try_sweep_lock(client: &Client, lock_key: &str) -> Result<bool, StorageError> {
-    cleanup_deadline(
+    // Hash the configured name into a shared advisory-lock key and try to take it
+    // without waiting. A busy lock skips this attempt; a successful session keeps
+    // ownership while it performs the sweep.
+    let acquired: bool = cleanup_deadline(
         async {
-            client
+            connection
+                .client
                 .query_one(
                     "SELECT pg_try_advisory_lock(hashtextextended($1, 0))",
                     &[&lock_key],
@@ -581,34 +553,9 @@ async fn try_sweep_lock(client: &Client, lock_key: &str) -> Result<bool, Storage
         },
         CLEANUP_OPERATION_TIMEOUT,
     )
-    .await
-}
-
-async fn sweep_with_permit(
-    dsn: &str,
-    connection: CleanupConnection,
-    keep: &str,
-    age: Duration,
-    lock_key: &str,
-) -> Result<(), StorageError> {
-    let version: i32 = cleanup_deadline(
-        async {
-            connection
-                .client
-                .query_one("SELECT current_setting('server_version_num')::int", &[])
-                .await
-                .map(|row| row.get(0))
-                .map_err(StorageError::from)
-        },
-        CLEANUP_OPERATION_TIMEOUT,
-    )
     .await?;
-    if version < 170_000 {
-        return Err(StorageError(format!(
-            "slot cleanup requires PostgreSQL 17 or later (server is {version})"
-        )));
-    }
-    sweep_candidates(dsn, connection, keep, age, lock_key).await
+
+    Ok(acquired.then_some(connection))
 }
 
 impl Transport {
@@ -653,18 +600,23 @@ impl Transport {
 
     /// Serialized startup/periodic cleanup using the supplied inactivity age.
     /// Zero makes every otherwise eligible inactive slot immediately eligible.
-    /// A busy global sweep permit skips this attempt.
+    /// A busy global sweep permit skips this attempt. Callers must supply the age
+    /// and key already validated during configuration/startup.
     pub async fn cleanup_inactive_slots(
         dsn: &str,
         keep: &str,
         age: Duration,
         lock_key: &str,
     ) -> Result<(), StorageError> {
-        sweep_slots(dsn, keep, age, lock_key).await
+        let Some(connection) = acquire_sweep_connection(dsn, lock_key).await? else {
+            return Ok(());
+        };
+        sweep_candidates(dsn, connection, keep, age, lock_key).await
     }
 
     /// Await initial cleanup within one total budget, including connection, lock
     /// contention, discovery and deletion. Periodic sweeps retain per-candidate limits.
+    /// Callers must supply the age, key and budget validated during startup.
     pub async fn cleanup_slots_at_startup(
         dsn: &str,
         keep: &str,
@@ -672,18 +624,6 @@ impl Transport {
         timeout: Duration,
         lock_key: &str,
     ) -> Result<(), StorageError> {
-        validate_sweep_lock_key(lock_key)?;
-        if timeout.is_zero() || timeout.as_millis() > i64::MAX as u128 {
-            return Err(StorageError(
-                "startup cleanup timeout must be positive and fit in signed 64-bit milliseconds"
-                    .to_owned(),
-            ));
-        }
-        if age.as_secs_f64() > (i64::MAX / 1_000_000 - 1) as f64 {
-            return Err(StorageError(
-                "slot cleanup age exceeds the PostgreSQL interval range".to_owned(),
-            ));
-        }
         cleanup_deadline(
             async {
                 let connection = open_cleanup(dsn).await?;
@@ -703,7 +643,7 @@ impl Transport {
                         Err(error) => return Err(error.into()),
                     }
                 }
-                sweep_with_permit(dsn, connection, keep, age, lock_key).await
+                sweep_candidates(dsn, connection, keep, age, lock_key).await
             },
             timeout,
         )
@@ -968,6 +908,23 @@ async fn sweep_candidates(
     age: Duration,
     lock_key: &str,
 ) -> Result<(), StorageError> {
+    let version: i32 = cleanup_deadline(
+        async {
+            connection
+                .client
+                .query_one("SELECT current_setting('server_version_num')::int", &[])
+                .await
+                .map(|row| row.get(0))
+                .map_err(StorageError::from)
+        },
+        CLEANUP_OPERATION_TIMEOUT,
+    )
+    .await?;
+    if version < 170_000 {
+        return Err(StorageError(format!(
+            "slot cleanup requires PostgreSQL 17 or later (server is {version})"
+        )));
+    }
     let client = &connection.client;
     let prefix = "xyne_sync_slot_";
     let candidates = cleanup_deadline(
@@ -994,34 +951,14 @@ async fn sweep_candidates(
     )
     .await?;
     let slots: Vec<String> = candidates.iter().map(|row| row.get(0)).collect();
-    sweep_candidate_list(
-        dsn,
-        keep,
-        &slots,
-        CLEANUP_OPERATION_TIMEOUT,
-        Some(connection),
-        age,
-        lock_key,
-    )
-    .await;
-    Ok(())
-}
-
-async fn sweep_candidate_list(
-    dsn: &str,
-    keep: &str,
-    slots: &[String],
-    timeout: Duration,
-    mut worker: Option<CleanupConnection>,
-    age: Duration,
-    lock_key: &str,
-) {
-    for slot in slots {
+    let timeout = CLEANUP_OPERATION_TIMEOUT;
+    let mut worker = Some(connection);
+    for slot in &slots {
         let deadline = tokio::time::Instant::now() + timeout;
         if worker.is_none() {
             match tokio::time::timeout_at(deadline, acquire_sweep_connection(dsn, lock_key)).await {
                 Ok(Ok(Some(connection))) => worker = Some(connection),
-                Ok(Ok(None)) => return,
+                Ok(Ok(None)) => return Ok(()),
                 Ok(Err(error)) => {
                     log_warn!(
                         "reacquiring slot cleanup ownership for {slot}: {error}; continuing with other candidates"
@@ -1071,6 +1008,7 @@ async fn sweep_candidate_list(
             }
         }
     }
+    Ok(())
 }
 
 // A candidate may have reconnected or disappeared since discovery. Reapply all
