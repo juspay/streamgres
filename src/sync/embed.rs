@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 
-use super::pg::connections::{self, Connections, Lease, Session};
+use super::pg::connections::{self, Connections, Lease, Session, SessionError};
 
 use super::CatalogHandle;
 use super::pg::threads::{self, FeedHandle, Started};
@@ -84,38 +84,35 @@ impl std::fmt::Debug for PgConfig {
     }
 }
 
-/// `dsn` with any password replaced by `***`: the one in a URL's
-/// `user:password@`, and every `password=` setting (key-value form or URL
-/// query).
+/// What `dsn` names, never the string itself: its user, hosts, ports and
+/// database as Postgres's client parses them. A password, in whatever form
+/// the DSN gives it, is never printed; neither is a DSN that does not parse.
 fn redacted(dsn: &str) -> String {
-    let mut out = dsn.to_owned();
-    if let Some(scheme) = out.find("://") {
-        let rest = scheme + 3;
-        let authority_end = out[rest..]
-            .find(['/', '?'])
-            .map_or(out.len(), |end| rest + end);
-        if let Some(at) = out[rest..authority_end].rfind('@').map(|at| rest + at)
-            && let Some(colon) = out[rest..at].find(':').map(|colon| rest + colon)
-        {
-            out.replace_range(colon + 1..at, "***");
-        }
-    }
-    let mut searched = 0;
-    while let Some(found) = out[searched..].find("password=").map(|at| searched + at) {
-        let value = found + "password=".len();
-        let end = if out[value..].starts_with('\'') {
-            out[value + 1..]
-                .find('\'')
-                .map_or(out.len(), |close| value + 1 + close + 1)
+    let Ok(config) = dsn.parse::<tokio_postgres::Config>() else {
+        return "<a DSN that does not parse>".to_owned();
+    };
+    let hosts: Vec<String> = config
+        .get_hosts()
+        .iter()
+        .map(|host| match host {
+            tokio_postgres::config::Host::Tcp(name) => name.clone(),
+            #[cfg(unix)]
+            tokio_postgres::config::Host::Unix(path) => path.display().to_string(),
+        })
+        .collect();
+    let ports: Vec<String> = config.get_ports().iter().map(u16::to_string).collect();
+    format!(
+        "user={} host={} port={} dbname={}{}",
+        config.get_user().unwrap_or("-"),
+        hosts.join(","),
+        ports.join(","),
+        config.get_dbname().unwrap_or("-"),
+        if config.get_password().is_some() {
+            " password=***"
         } else {
-            out[value..]
-                .find([' ', '&'])
-                .map_or(out.len(), |end| value + end)
-        };
-        out.replace_range(value..end, "***");
-        searched = value + 3;
-    }
-    out
+            ""
+        }
+    )
 }
 
 impl PgConfig {
@@ -348,7 +345,7 @@ impl Engine for PgEngine {
         binds: &'a [Bind],
         timeout: Duration,
         permit: tokio::sync::OwnedSemaphorePermit,
-    ) -> SendFuture<'a, Result<Rows, String>> {
+    ) -> SendFuture<'a, Result<Rows, SessionError>> {
         let origin = self.origin.clone();
         let sql = sql.to_owned();
         let binds = binds.to_vec();
@@ -467,16 +464,23 @@ struct Origin {
     runtime: tokio::runtime::Handle,
 }
 impl Origin {
-    async fn run<T: Send + 'static>(
+    /// Runs `work` on a checkout within `timeout`. The deadline is a
+    /// [`SessionError::Timeout`] and a failed checkout or task an `Other`;
+    /// `work`'s own error is returned as it is.
+    async fn run<T: Send + 'static, E: From<SessionError> + Send + 'static>(
         self: Arc<Self>,
         timeout: Duration,
-        work: impl for<'c> FnOnce(&'c mut Lease) -> SendFuture<'c, Result<T, String>> + Send + 'static,
-    ) -> Result<T, String> {
+        work: impl for<'c> FnOnce(&'c mut Lease) -> SendFuture<'c, Result<T, E>> + Send + 'static,
+    ) -> Result<T, E> {
         let runtime = self.runtime.clone();
         runtime
             .spawn(async move {
                 tokio::time::timeout(timeout, async {
-                    let mut connection = self.connections.get().await?;
+                    let mut connection = self
+                        .connections
+                        .get()
+                        .await
+                        .map_err(|reason| E::from(SessionError::Other(reason)))?;
                     let outcome = work(&mut connection).await;
                     if outcome.is_ok() {
                         connection.recycle();
@@ -484,20 +488,25 @@ impl Origin {
                     outcome
                 })
                 .await
-                .unwrap_or_else(|_| Err(format!("the read took longer than {timeout:?}")))
+                .unwrap_or_else(|_| {
+                    Err(E::from(SessionError::Timeout(format!(
+                        "the read took longer than {timeout:?}"
+                    ))))
+                })
             })
             .await
-            .map_err(|error| format!("the application read ended: {error}"))?
+            .unwrap_or_else(|error| {
+                Err(E::from(SessionError::Other(format!(
+                    "the read task ended: {error}"
+                ))))
+            })
     }
 }
 
 /// Reads `sql` with `binds` on `client`; each cell comes back as
 /// Postgres's binary bytes.
-async fn read(client: &mut Lease, sql: &str, binds: &[Bind]) -> Result<Rows, String> {
-    let raw = client
-        .query(sql, binds)
-        .await
-        .map_err(|error| format!("the fallback read: {error}"))?;
+async fn read(client: &mut Lease, sql: &str, binds: &[Bind]) -> Result<Rows, SessionError> {
+    let raw = client.query(sql, binds).await?;
     let columns: Arc<[Column]> = raw
         .columns
         .iter()
@@ -566,20 +575,23 @@ mod tests {
     #[test]
     fn the_dsn_is_redacted() {
         use super::redacted;
+        for dsn in [
+            "postgres://app:s3cret@db:5432/x",
+            "postgres://app:s3%40cret@db/x",
+            "postgres://db/x?password=s3cret&sslmode=require",
+            "host=db password='s3cret' user=app",
+            "host=db PASSWORD=s3cret user=app",
+            "host=db password = s3cret user=app",
+            r"host=db password='s3\'cret' user=app",
+            "not a dsn s3cret",
+        ] {
+            let shown = redacted(dsn);
+            assert!(!shown.contains("s3"), "{dsn} → {shown}");
+        }
         assert_eq!(
             redacted("postgres://app:s3cret@db:5432/x"),
-            "postgres://app:***@db:5432/x"
+            "user=app host=db port=5432 dbname=x password=***"
         );
-        assert_eq!(redacted("postgres://app@db/x"), "postgres://app@db/x");
-        assert_eq!(
-            redacted("postgres://db/x?password=s3cret&sslmode=require"),
-            "postgres://db/x?password=***&sslmode=require"
-        );
-        assert_eq!(
-            redacted("host=db password='a b' user=app"),
-            "host=db password=*** user=app"
-        );
-        assert_eq!(redacted("host=db password=s3cret"), "host=db password=***");
         let debug = format!("{:?}", super::PgConfig::new("postgres://app:s3cret@db/x"));
         assert!(!debug.contains("s3cret"), "{debug}");
     }

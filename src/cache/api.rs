@@ -21,7 +21,7 @@ use crate::log::{Level, enabled, log_debug, log_warn};
 use crate::parser::Bind;
 use crate::sync::embed::{PgConfig, PgEngine};
 use crate::sync::pg::binary::oid;
-use crate::sync::pg::connections::{Connections, Io, OnRuntime, OwnPool};
+use crate::sync::pg::connections::{Connections, Io, OnRuntime, OwnPool, SessionError};
 
 /// What answers a read the engine cannot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,8 +74,9 @@ pub enum Error {
     Refused(String),
     /// The fallback had no room within its wait.
     Busy,
-    /// The fallback's read of Postgres failed.
-    Origin(String),
+    /// The fallback's read of Postgres failed: a Postgres error with its
+    /// SQLSTATE, a timeout or cancellation, or the connection.
+    Origin(SessionError),
     /// The engine did not become ready within the start timeout, and
     /// [`Builder::allow_degraded_start`] was not set.
     NotReady(String),
@@ -407,24 +408,41 @@ impl Builder {
             runtime,
             io: io.clone(),
         });
+        // One deadline for all of startup: the trigger check, then the wait
+        // for readiness with what is left.
+        let start_timeout = self.cache.start_timeout;
+        let deadline = Instant::now() + start_timeout;
         // A missing trigger is a setup mistake no wait will mend: refuse it
         // now, whether or not a degraded start is allowed. A check that
-        // cannot run is left to the readiness wait.
-        match trigger_present(connections.as_ref(), &self.pg.ddl_trigger()).await {
-            Ok(false) => {
+        // fails is left to the readiness wait; one that runs out of time is
+        // as not ready.
+        let checked = tokio::time::timeout(
+            start_timeout,
+            trigger_present(connections.as_ref(), &self.pg.ddl_trigger()),
+        )
+        .await;
+        match checked {
+            Ok(Ok(false)) => {
                 return Err(Error::Setup(
                     "the DDL trigger is missing; install Builder::setup_sql".to_owned(),
                 ));
             }
-            Ok(true) => {}
-            Err(reason) => log_warn!("Streamgres could not check its DDL trigger: {reason}"),
+            Ok(Ok(true)) => {}
+            Ok(Err(reason)) => log_warn!("Streamgres could not check its DDL trigger: {reason}"),
+            Err(_) => {
+                let reason = format!("checking the DDL trigger took longer than {start_timeout:?}");
+                if !self.degraded_start {
+                    return Err(Error::NotReady(reason));
+                }
+                log_warn!("Streamgres starts without checking its DDL trigger: {reason}");
+            }
         }
         let engine = PgEngine::new(self.pg, connections, io.handle().clone(), reads_on_origin);
-        let start_timeout = self.cache.start_timeout;
         let recorder = Recorder::new(self.debug_history, self.cache.max_entries.saturating_mul(2));
         let cache = Arc::new(Cache::start(self.cache, Arc::new(engine)));
         let waiting = cache.clone();
-        let ready = tokio::task::spawn_blocking(move || waiting.wait_ready(start_timeout))
+        let left = deadline.saturating_duration_since(Instant::now());
+        let ready = tokio::task::spawn_blocking(move || waiting.wait_ready(left))
             .await
             .map_err(|error| Error::Stopped(error.to_string()))?;
         if let Err(refusal) = ready {
@@ -659,7 +677,11 @@ impl Streamgres {
             .engine()
             .origin_types()
             .await
-            .map_err(|reason| Error::Origin(format!("refreshing custom types: {reason}")))?;
+            .map_err(|reason| {
+                Error::Origin(SessionError::Other(format!(
+                    "refreshing custom types: {reason}"
+                )))
+            })?;
         let mut registry = TypeRegistry::default();
         for found in found {
             let oids = (found.oid, found.array_oid);
@@ -1096,7 +1118,9 @@ enum Begun {
 /// A read whose task on Streamgres's runtime ended without an answer.
 fn ended(reason: &str) -> Outcome {
     (
-        Err(Error::Origin(format!("the read ended: {reason}"))),
+        Err(Error::Origin(SessionError::Other(format!(
+            "the read ended: {reason}"
+        )))),
         Served::Failed,
         None,
     )

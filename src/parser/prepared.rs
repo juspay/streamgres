@@ -3,7 +3,7 @@
 //! without parsing again ([`PreparedSelect::bind`]). The engine's query is
 //! built only from bound values.
 use super::Select;
-use super::{Bind, ParseError, Tagged, decode_bind, select};
+use super::{Bind, ParseError, Tagged, decode_bind, select, typed_bind};
 use crate::ivm::QueryPart;
 use crate::model::{
     Catalog, ColumnName, ComparisonOperator, Condition, DbColumn, MultiTableReadQuery, Value,
@@ -55,6 +55,20 @@ impl Operand {
             }
         }
     }
+    /// Its parameters' types checked against their columns, no value read.
+    pub(super) fn check_type(&self, binds: &[Bind]) -> Result<(), ParseError> {
+        match self {
+            Self::Literal(_) => Ok(()),
+            Self::List(items) => items.iter().try_for_each(|item| item.check_type(binds)),
+            Self::Parameter {
+                number,
+                declared,
+                list,
+                at,
+            } => typed_bind(binds, *number, declared, *list, *at).map(drop),
+        }
+    }
+
     /// The operand with every parameter `NULL`: what the shape's checks
     /// that do not depend on values see.
     pub(super) fn validation(&self) -> Value {
@@ -102,6 +116,30 @@ pub(super) enum Count {
     Parameter { number: usize, null: u32, at: usize },
 }
 impl Count {
+    /// Its parameter, when bound as an integer; its value is not read.
+    fn typed(binds: &[Bind], number: usize, at: usize) -> Result<&Bind, ParseError> {
+        let error = || ParseError {
+            message: format!("${number}: a LIMIT or OFFSET must be a bound row count"),
+            position: at,
+        };
+        let bind = number
+            .checked_sub(1)
+            .and_then(|index| binds.get(index))
+            .ok_or_else(error)?;
+        use crate::sync::pg::binary::oid;
+        if !matches!(bind.type_oid, oid::INT8 | oid::INT2 | oid::INT4) {
+            return Err(error());
+        }
+        Ok(bind)
+    }
+
+    fn check_type(&self, binds: &[Bind]) -> Result<(), ParseError> {
+        match self {
+            Self::Literal(_) => Ok(()),
+            Self::Parameter { number, at, .. } => Self::typed(binds, *number, *at).map(drop),
+        }
+    }
+
     fn bind(&self, binds: &[Bind]) -> Result<u32, ParseError> {
         match self {
             Self::Literal(count) => Ok(*count),
@@ -110,14 +148,7 @@ impl Count {
                     message: format!("${number}: a LIMIT or OFFSET must be a bound row count"),
                     position: *at,
                 };
-                let bind = number
-                    .checked_sub(1)
-                    .and_then(|index| binds.get(index))
-                    .ok_or_else(error)?;
-                use crate::sync::pg::binary::oid;
-                if !matches!(bind.type_oid, oid::INT8 | oid::INT2 | oid::INT4) {
-                    return Err(error());
-                }
+                let bind = Self::typed(binds, *number, *at)?;
                 match &bind.bytes {
                     None => Ok(*null),
                     Some(bytes) => {
@@ -149,6 +180,29 @@ impl PreparedSelect {
     /// and projection.
     pub(crate) fn unbound(&self) -> &Select {
         &self.base
+    }
+
+    /// Whether `binds` fit the statement, by count and by each one's type
+    /// against its column, without reading a value: what classifies a
+    /// statement whose bind values are too large to read.
+    pub(crate) fn check_types(&self, binds: &[Bind]) -> Result<(), ParseError> {
+        if binds.len() != self.parameters {
+            return Err(ParseError {
+                message: format!(
+                    "expected {} bind parameters, received {}",
+                    self.parameters,
+                    binds.len()
+                ),
+                position: 0,
+            });
+        }
+        self.limit.check_type(binds)?;
+        self.offset.check_type(binds)?;
+        self.filters
+            .iter()
+            .map(|(_, filter)| filter)
+            .chain(self.post_filters.iter().map(|(_, filter)| filter))
+            .try_for_each(|filter| filter.check_types(binds))
     }
 
     /// The statement with `binds` substituted, each checked against its

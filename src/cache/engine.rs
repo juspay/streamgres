@@ -28,6 +28,7 @@ use crate::log::{log_info, log_warn};
 use crate::model::{MultiTableReadQuery, Position, SubId};
 use crate::parser::Bind;
 use crate::shutdown::Shutdown;
+use crate::sync::pg::connections::SessionError;
 use crate::sync::{CatalogHandle, Command, Event};
 
 /// A future the supervisor's thread polls; it need not be `Send`.
@@ -78,7 +79,7 @@ pub(crate) trait Engine: Send + Sync + 'static {
         binds: &'a [Bind],
         timeout: Duration,
         permit: tokio::sync::OwnedSemaphorePermit,
-    ) -> SendFuture<'a, Result<Rows, String>>;
+    ) -> SendFuture<'a, Result<Rows, SessionError>>;
 
     /// `position` as the source writes its own positions (a WAL location
     /// as `X/Y` for Postgres), for logs and inspection.
@@ -300,8 +301,8 @@ pub(super) mod tests {
             _binds: &'a [Bind],
             _timeout: Duration,
             _permit: tokio::sync::OwnedSemaphorePermit,
-        ) -> SendFuture<'a, Result<Rows, String>> {
-            Box::pin(async { Err("no origin".to_owned()) })
+        ) -> SendFuture<'a, Result<Rows, SessionError>> {
+            Box::pin(async { Err(SessionError::Other("no origin".to_owned())) })
         }
 
         fn check_origin<'a>(

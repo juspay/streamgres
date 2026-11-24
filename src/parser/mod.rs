@@ -1178,13 +1178,16 @@ fn comparison_types(column: u32, value: u32) -> bool {
 
 /// Bind parameter `number` decoded by its type, as one value or (for
 /// `ANY` / `ALL`) a list of values of the column's type.
-pub(super) fn decode_bind(
-    binds: &[Bind],
+/// Bind `$number`, when its type compares with `declared` as Postgres
+/// compares them; its value is not read (an array's header gives its
+/// element type).
+pub(super) fn typed_bind<'b>(
+    binds: &'b [Bind],
     number: usize,
     declared: &DbColumn,
     list: bool,
     at: usize,
-) -> Result<Value, ParseError> {
+) -> Result<&'b Bind, ParseError> {
     let bind = number
         .checked_sub(1)
         .and_then(|index| binds.get(index))
@@ -1205,6 +1208,17 @@ pub(super) fn decode_bind(
             position: at,
         });
     }
+    Ok(bind)
+}
+
+pub(super) fn decode_bind(
+    binds: &[Bind],
+    number: usize,
+    declared: &DbColumn,
+    list: bool,
+    at: usize,
+) -> Result<Value, ParseError> {
+    let bind = typed_bind(binds, number, declared, list, at)?;
     let Some(bytes) = &bind.bytes else {
         return Ok(Value::Null);
     };
@@ -1233,6 +1247,16 @@ enum Tagged {
 }
 
 impl Tagged {
+    /// Every parameter's type checked against its column, no value read.
+    fn check_types(&self, binds: &[Bind]) -> Result<(), ParseError> {
+        match self {
+            Tagged::Condition(_, predicate) => predicate.value.check_type(binds),
+            Tagged::And(parts) | Tagged::Or(parts) => {
+                parts.iter().try_for_each(|part| part.check_types(binds))
+            }
+        }
+    }
+
     /// A lone part, or `parts` under `group`.
     fn group(mut parts: Vec<Tagged>, group: fn(Vec<Tagged>) -> Tagged) -> Tagged {
         if parts.len() == 1 {

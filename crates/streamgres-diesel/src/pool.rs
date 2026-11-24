@@ -97,16 +97,17 @@ impl Session for Checkout {
 }
 
 /// A Diesel error as a [`SessionError`]. Diesel keeps an error's kind but
-/// not its SQLSTATE, so the kinds it names map back to their codes, and a
-/// statement timeout is known by the message Postgres always sends for it.
+/// not its SQLSTATE, so `code` here is inferred from that kind (the code
+/// Postgres uses for it, not one it returned), and a cancelled statement is
+/// told by its message: best effort, for an untranslated server.
 fn session_error(error: diesel::result::Error) -> SessionError {
     use diesel::result::{DatabaseErrorKind as Kind, Error};
     let Error::DatabaseError(kind, info) = &error else {
         return SessionError::Other(error.to_string());
     };
     let message = info.message();
-    if message.starts_with("canceling statement due to statement timeout") {
-        return SessionError::Timeout(message.to_owned());
+    if message.starts_with("canceling statement due to") {
+        return SessionError::database(Some(SessionError::QUERY_CANCELED), message);
     }
     let code = match kind {
         Kind::UniqueViolation => Some("23505"),

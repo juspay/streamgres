@@ -409,6 +409,9 @@ impl Cache {
                 .parsed
                 .shape_of(sql, &version, &catalog)
                 .map_err(|reason| Refusal::Unsupported(reason.to_string()))?;
+            shape
+                .check_types(binds)
+                .map_err(|reason| Refusal::Unsupported(reason.to_string()))?;
             self.admit(shape.unbound(), &catalog, reader)?;
             return Err(Refusal::Unavailable(
                 "the bind values exceed the cache's evaluation budget".to_owned(),

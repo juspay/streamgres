@@ -51,22 +51,34 @@ pub enum SessionError {
         code: Option<String>,
         message: String,
     },
-    /// The statement ran out of time: Postgres cancelled it
-    /// (`statement_timeout`, SQLSTATE 57014) or a wait ran out.
+    /// The statement ran out of time: Postgres cancelled it for its
+    /// `statement_timeout`, or one of Streamgres's own deadlines passed.
     Timeout(String),
+    /// Postgres cancelled the statement for another reason: a cancel
+    /// request from a client or an administrator (`pg_cancel_backend`).
+    Cancelled(String),
     /// Anything else: the connection, the protocol, the pool.
     Other(String),
 }
 
 impl SessionError {
-    /// The SQLSTATE of a statement Postgres cancelled for its timeout.
+    /// The SQLSTATE of a statement Postgres cancelled, for its timeout or
+    /// on request alike.
     pub const QUERY_CANCELED: &'static str = "57014";
 
-    /// A Postgres error with `code`, a timeout when that is 57014.
+    /// A Postgres error with `code`. A cancelled statement (57014) is a
+    /// [`SessionError::Timeout`] when its message names the statement
+    /// timeout, else [`SessionError::Cancelled`]: the code alone does not
+    /// tell them apart, and the message is Postgres's English one unless
+    /// the server translates its messages.
     pub fn database(code: Option<&str>, message: impl Into<String>) -> Self {
         let message = message.into();
         if code == Some(Self::QUERY_CANCELED) {
-            return SessionError::Timeout(message);
+            return if message.contains("statement timeout") {
+                SessionError::Timeout(message)
+            } else {
+                SessionError::Cancelled(message)
+            };
         }
         SessionError::Database {
             code: code.map(str::to_owned),
@@ -87,6 +99,7 @@ impl std::fmt::Display for SessionError {
                 message,
             }
             | SessionError::Timeout(message)
+            | SessionError::Cancelled(message)
             | SessionError::Other(message) => f.write_str(message),
         }
     }

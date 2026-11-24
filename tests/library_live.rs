@@ -1051,6 +1051,19 @@ async fn oversized_binds_do_not_bypass_the_unsupported_policy() {
         "the statement never reached Postgres"
     );
 
+    // Supported SQL, but a bind whose type has no Postgres comparison with
+    // its column: decided by the types alone, without reading the value.
+    let before = lib.metrics();
+    let mistyped = Sql::new("SELECT id FROM lib_budget.t WHERE id = $1").bind(large.as_str());
+    let (read, trace) = lib.load_and_sync(mistyped).inspect().await;
+    assert!(matches!(read, Err(Error::Unsupported(_))), "{read:?}");
+    assert_eq!(trace.served, Served::Unsupported);
+    let after = lib.metrics();
+    assert_eq!(
+        (after.fallbacks, after.fallback_errors),
+        (before.fallbacks, before.fallback_errors)
+    );
+
     let supported = Sql::new("SELECT id FROM lib_budget.t WHERE name = $1").bind(large.as_str());
     let (read, trace) = lib.load_and_sync(supported).inspect().await;
     assert_eq!(read.expect("Postgres answers").len(), 0);
@@ -1119,4 +1132,93 @@ async fn session_errors_keep_their_sqlstate_and_timeouts() {
         .await
         .unwrap_err();
     assert!(matches!(error, SessionError::Timeout(_)), "{error:?}");
+}
+
+/// A trigger check that never completes does not hold `start()` past
+/// its start timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hung_trigger_check_is_bounded_by_the_start_timeout() {
+    let Some(dsn) = dsn() else { return };
+    let never = || std::future::pending::<Result<streamgres::cache::Lease, String>>();
+    let started = tokio::time::timeout(
+        Duration::from_secs(5),
+        Streamgres::connect(&dsn)
+            .app("lib_hung_check", 0)
+            .connections(never)
+            .start_timeout(Duration::from_millis(300))
+            .start(),
+    )
+    .await
+    .expect("start() returns within its timeout");
+    assert!(
+        matches!(started, Err(Error::NotReady(_))),
+        "{:?}",
+        started.err()
+    );
+}
+
+/// A statement cancelled on request is a cancellation, not a timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_statement_is_not_a_timeout() {
+    use streamgres::cache::{Session, SessionError};
+    let Some(dsn) = dsn() else { return };
+    let mut client = admin(&dsn).await;
+    let pid = Session::query(&mut client, "SELECT pg_backend_pid()::int8", &[])
+        .await
+        .unwrap()
+        .int(0, 0)
+        .unwrap()
+        .unwrap();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        admin(&dsn)
+            .await
+            .execute("SELECT pg_cancel_backend($1::int4)", &[&(pid as i32)])
+            .await
+            .unwrap();
+    });
+    let error = Session::query(&mut client, "SELECT pg_sleep(5)", &[])
+        .await
+        .unwrap_err();
+    canceller.await.unwrap();
+    assert!(matches!(error, SessionError::Cancelled(_)), "{error:?}");
+}
+
+/// A failed fallback read keeps its structure through the public API.
+#[tokio::test(flavor = "multi_thread")]
+async fn fallback_failures_are_structured_in_the_public_error() {
+    use streamgres::cache::SessionError;
+    let Some(dsn) = dsn() else { return };
+    prepare(
+        &dsn,
+        "lib_origin",
+        "liborigin",
+        "CREATE TABLE lib_origin.t (id bigint PRIMARY KEY);",
+    )
+    .await;
+    let lib = Streamgres::connect(&dsn)
+        .schemas(["lib_origin"])
+        .publication("lib_origin_pub")
+        .app("liborigin", 0)
+        .on_unsupported(OnUnsupported::Fallback)
+        .fallback(Fallback::Postgres {
+            max_concurrent: 2,
+            wait: Duration::from_secs(1),
+            timeout: Duration::from_millis(300),
+        })
+        .start()
+        .await
+        .unwrap();
+    let read = lib.load_and_sync(Sql::new("SELECT 1 / 0")).await;
+    assert!(
+        matches!(&read, Err(Error::Origin(SessionError::Database { code: Some(code), .. })) if code == "22012"),
+        "{read:?}"
+    );
+    let read = lib.load_and_sync(Sql::new("SELECT pg_sleep(2)")).await;
+    assert!(
+        matches!(read, Err(Error::Origin(SessionError::Timeout(_)))),
+        "{read:?}"
+    );
+    lib.shutdown().await;
+    clean(&dsn, "lib_origin", "liborigin").await;
 }
