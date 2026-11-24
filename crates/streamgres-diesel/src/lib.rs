@@ -64,7 +64,7 @@ use diesel::pg::{
 use diesel::query_builder::bind_collector::RawBytesBindCollector;
 use diesel::query_builder::{AsQuery, QueryBuilder, QueryFragment, QueryId};
 use diesel::query_dsl::CompatibleType;
-use diesel::result::{DatabaseErrorInformation, DatabaseErrorKind, Error, QueryResult};
+use diesel::result::{DatabaseErrorKind, Error, QueryResult};
 use streamgres::cache::{Rows, Sql};
 
 use crate::row::CachedRow;
@@ -321,42 +321,9 @@ fn streamgres_error(error: StreamgresError) -> Error {
             "25006" => Kind::ReadOnlyTransaction,
             _ => return Error::QueryBuilderError(Box::new(error)),
         };
-        return Error::DatabaseError(kind, Box::new(Message(message.clone())));
+        return Error::DatabaseError(kind, Box::new(message.clone()));
     }
     Error::QueryBuilderError(Box::new(error))
-}
-
-/// An error's text, as Diesel's database error information.
-struct Message(String);
-
-impl DatabaseErrorInformation for Message {
-    fn message(&self) -> &str {
-        &self.0
-    }
-
-    fn details(&self) -> Option<&str> {
-        None
-    }
-
-    fn hint(&self) -> Option<&str> {
-        None
-    }
-
-    fn table_name(&self) -> Option<&str> {
-        None
-    }
-
-    fn column_name(&self) -> Option<&str> {
-        None
-    }
-
-    fn constraint_name(&self) -> Option<&str> {
-        None
-    }
-
-    fn statement_position(&self) -> Option<i32> {
-        None
-    }
 }
 
 #[cfg(test)]

@@ -404,6 +404,45 @@ async fn raw_bridge_preserves_postgres_quoted_regions() {
         .await
         .unwrap();
     assert_eq!(rows.int(0, 0).unwrap(), Some(14));
+    let more = [
+        binds[0].clone(),
+        streamgres::cache::Bind {
+            type_oid: 20,
+            bytes: Some(3i64.to_be_bytes().to_vec()),
+        },
+        streamgres::cache::Bind {
+            type_oid: 20,
+            bytes: None,
+        },
+    ];
+    let rows = lease
+        .query("SELECT $2 - $1 AS value, $3::bigint AS empty", &more)
+        .await
+        .unwrap();
+    assert_eq!(rows.int(0, 0).unwrap(), Some(-4));
+    assert_eq!(rows.int(0, 1).unwrap(), None);
+    lease
+        .execute("CREATE TYPE pg_temp.audit_mood AS ENUM ('ready')")
+        .await
+        .unwrap();
+    let oid = lease
+        .query("SELECT 'pg_temp.audit_mood'::regtype::oid::bigint", &[])
+        .await
+        .unwrap()
+        .int(0, 0)
+        .unwrap()
+        .unwrap();
+    let rows = lease
+        .query(
+            "SELECT pg_typeof($1)::oid::bigint",
+            &[streamgres::cache::Bind {
+                type_oid: u32::try_from(oid).unwrap(),
+                bytes: Some(b"ready".to_vec()),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.int(0, 0).unwrap(), Some(oid));
 }
 
 /// The bridge reports a statement timeout as a timeout and a Postgres

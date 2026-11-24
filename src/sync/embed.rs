@@ -27,7 +27,7 @@ use super::pg::connections::{self, Connections, Lease, Session, SessionError};
 use super::CatalogHandle;
 use super::pg::threads::{self, FeedHandle, Started};
 use super::pg::{Keepalive, Lsn, Settings, Transport};
-use crate::cache::{Column, Engine, EngineError, Instance, Rows, SendFuture, Serve, TypeOid};
+use crate::cache::{Column, Engine, EngineError, Instance, Rows, SendFuture, Serve, Sql, TypeOid};
 use crate::log::log_warn;
 use crate::model::Position;
 use crate::parser::Bind;
@@ -343,13 +343,12 @@ impl Engine for PgEngine {
 
     fn read_origin<'a>(
         &'a self,
-        sql: &'a str,
-        binds: &'a [Bind],
+        sql: Arc<Sql>,
         timeout: Duration,
         reuse_session: bool,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> SendFuture<'a, Result<Rows, SessionError>> {
-        if !is_read_statement(sql) {
+        if !is_read_statement(sql.text()) {
             return Box::pin(async {
                 Err(SessionError::Other(
                     "fallback accepts read statements only".to_owned(),
@@ -357,8 +356,6 @@ impl Engine for PgEngine {
             });
         }
         let origin = self.origin.clone();
-        let sql = sql.to_owned();
-        let binds = binds.to_vec();
         Box::pin(async move {
             let started = Instant::now();
             // Keep this permit until the whole database task has returned,
@@ -374,7 +371,7 @@ impl Engine for PgEngine {
                             ));
                         }
                         client
-                            .fallback_read(&sql, &binds, left, reuse_session)
+                            .fallback_read(sql.text(), sql.binds(), left, reuse_session)
                             .await
                             .map(|result| result.map(encode_rows))
                     })

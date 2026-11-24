@@ -22,11 +22,11 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
+use super::Sql;
 use super::rows::Rows;
 use super::state::{Phase, Running, Shared};
 use crate::log::{log_info, log_warn};
 use crate::model::{MultiTableReadQuery, Position, SubId};
-use crate::parser::Bind;
 use crate::shutdown::Shutdown;
 use crate::sync::pg::connections::SessionError;
 use crate::sync::{CatalogHandle, Command, Event};
@@ -92,12 +92,11 @@ pub(crate) trait Engine: Send + Sync + 'static {
         serve: Serve<'_>,
     ) -> Result<(), EngineError>;
 
-    /// Reads `sql` with `binds` from the origin itself, as the fallback
+    /// Reads the statement from the origin itself, as the fallback
     /// for a read the engine cannot answer, within `timeout`.
     fn read_origin<'a>(
         &'a self,
-        sql: &'a str,
-        binds: &'a [Bind],
+        sql: Arc<Sql>,
         timeout: Duration,
         reuse_session: bool,
         permit: tokio::sync::OwnedSemaphorePermit,
@@ -318,8 +317,7 @@ pub(super) mod tests {
 
         fn read_origin<'a>(
             &'a self,
-            _sql: &'a str,
-            _binds: &'a [Bind],
+            _sql: Arc<Sql>,
             _timeout: Duration,
             _reuse_session: bool,
             _permit: tokio::sync::OwnedSemaphorePermit,

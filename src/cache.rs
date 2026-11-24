@@ -110,6 +110,13 @@ struct FailedRead {
     bytes: usize,
 }
 
+/// A statement resolved during the encoding-refusal lookup.
+struct ResolvedRead {
+    version: CatalogVersion,
+    select: Arc<Select>,
+    stamp: Option<(u64, u64)>,
+}
+
 /// What a look at a query's entry found.
 enum Found {
     Answer(CachedRows),
@@ -193,70 +200,6 @@ impl Cache {
         });
     }
 
-    /// The rows `sql` with `binds` returns to `reader`, as Postgres would
-    /// return them at the position the engine has applied, its query kept
-    /// for `ttl` (the configured one when `None`) after this read. A read
-    /// of a query the engine does not keep yet registers it, and every
-    /// read until its first rows have all arrived is refused as
-    /// [`Refusal::Filling`]: it never waits.
-    fn read(
-        &self,
-        sql: &str,
-        binds: &[Bind],
-        reader: &Reader,
-        ttl: Option<Ttl>,
-    ) -> Result<CachedRows, Refusal> {
-        let revision = self
-            .shared
-            .revision
-            .load(std::sync::atomic::Ordering::Acquire);
-        let local_key = local::Key {
-            identity: &self.shared.identity,
-            revision,
-            sql,
-            binds,
-            reader,
-        };
-        if let Some(rows) = local::get(&local_key, self.shared.now(), ttl) {
-            return Ok(rows);
-        }
-        let answer = self.answer(sql, binds, reader, ttl);
-        if let Err(refusal) = &answer {
-            self.count_refusal(refusal);
-        }
-        if let Ok(rows) = &answer {
-            let state = self.shared.read();
-            if let Some(expires) = state.answer_deadline(&self.shared.config)
-                && revision
-                    == self
-                        .shared
-                        .revision
-                        .load(std::sync::atomic::Ordering::Acquire)
-                && let Ok(catalog) = state.catalog()
-                && let Ok(select) = self.shared.parsed.get_or_parse(
-                    sql,
-                    binds,
-                    &CatalogVersion::of(&catalog),
-                    &catalog,
-                )
-                && let Some(entry) = state
-                    .entry_of(&select.query)
-                    .and_then(|id| state.entries.get(&id))
-            {
-                let default_ttl = self.shared.config.ttl_for(None);
-                local::keep(
-                    local_key,
-                    expires,
-                    rows,
-                    self.shared.config.max_entry_bytes / 16,
-                    entry.usage.clone(),
-                    default_ttl,
-                );
-            }
-        }
-        answer
-    }
-
     fn count_refusal(&self, refusal: &Refusal) {
         let counters = &self.shared.counters;
         match refusal {
@@ -288,7 +231,24 @@ impl Cache {
             self.count_refusal(&refusal);
             return Err(refusal);
         }
-        let identity = {
+        let revision = self
+            .shared
+            .revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        let local_key = local::Key {
+            identity: &self.shared.identity,
+            revision,
+            sql,
+            binds,
+            reader,
+        };
+        if let Some(rows) = local::get(&local_key, self.shared.now(), ttl) {
+            let rows = rows::encode(&rows)?;
+            Counters::bump(&self.shared.counters.answered);
+            return Ok(rows);
+        }
+
+        let resolved = {
             let state = self.shared.read();
             state.catalog().ok().and_then(|catalog| {
                 let version = CatalogVersion::of(&catalog);
@@ -297,32 +257,68 @@ impl Cache {
                     .parsed
                     .get_or_parse(sql, binds, &version, &catalog)
                     .ok()?;
-                let id = state.entry_of(&select.query)?;
-                let entry = state.entries.get(&id)?;
-                entry.touch(self.shared.now(), self.shared.config.ttl_for(ttl));
-                Some((version, (id, entry.generation)))
+                let stamp = state
+                    .entry_of(&select.query)
+                    .and_then(|id| state.entries.get(&id).map(|entry| (id, entry)))
+                    .map(|(id, entry)| {
+                        // Retain existing entries even while readiness refuses a read.
+                        entry.touch(self.shared.now(), self.shared.config.ttl_for(ttl));
+                        (id, entry.generation)
+                    });
+                Some(ResolvedRead {
+                    version,
+                    select,
+                    stamp,
+                })
             })
         };
-        if let Some((version, stamp)) = &identity {
+        let identity = resolved
+            .as_ref()
+            .and_then(|read| read.stamp.map(|stamp| (&read.version, stamp)));
+        if let Some((version, stamp)) = identity {
             let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
             failures.retain(|failure| failure.at.elapsed() < self.shared.config.refusal_ttl);
             if let Some(failure) = failures.iter().find(|failure| {
                 failure.sql == sql
                     && failure.binds == binds
                     && failure.version == *version
-                    && failure.stamp == *stamp
+                    && failure.stamp == stamp
             }) {
                 return Err(Refusal::Unavailable(failure.reason.clone()));
             }
         }
-        let result = self
-            .read(sql, binds, reader, ttl)
-            .and_then(|rows| rows::encode(&rows));
-        if result.is_ok() {
+        let answer = self.answer(sql, binds, reader, ttl, resolved.as_ref());
+        if let Err(refusal) = &answer {
+            self.count_refusal(refusal);
+        }
+        let result = answer.and_then(|rows| {
+            let encoded = rows::encode(&rows)?;
+            // Only successful encodings can skip the shared refusal memo.
+            if let Some((_, (id, generation))) = identity {
+                let state = self.shared.read();
+                if revision
+                    == self
+                        .shared
+                        .revision
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    && let Some(expires) = state.answer_deadline(&self.shared.config)
+                    && let Some(entry) = state.entries.get(&id)
+                    && entry.generation == generation
+                {
+                    local::keep(
+                        local_key,
+                        expires,
+                        &rows,
+                        self.shared.config.max_entry_bytes / 16,
+                        entry.usage.clone(),
+                        self.shared.config.ttl_for(None),
+                    );
+                }
+            }
             Counters::bump(&self.shared.counters.answered);
-        } else if let (Err(Refusal::Unavailable(reason)), Some((version, stamp))) =
-            (&result, identity)
-        {
+            Ok(encoded)
+        });
+        if let (Err(Refusal::Unavailable(reason)), Some((version, stamp))) = (&result, identity) {
             let bytes = sql
                 .len()
                 .saturating_add(reason.len())
@@ -350,7 +346,7 @@ impl Cache {
                 failures.push(FailedRead {
                     sql: sql.to_owned(),
                     binds: binds.to_vec(),
-                    version,
+                    version: version.clone(),
                     stamp,
                     at: Instant::now(),
                     reason: reason.clone(),
@@ -465,14 +461,21 @@ impl Cache {
         binds: &[Bind],
         reader: &Reader,
         ttl: Option<Ttl>,
+        resolved: Option<&ResolvedRead>,
     ) -> Result<CachedRows, Refusal> {
         let shared = &self.shared;
         let config = &shared.config;
         let (catalog, version) = self.answer_catalog(reader)?;
-        let select = shared
-            .parsed
-            .get_or_parse(sql, binds, &version, &catalog)
-            .map_err(|reason| Refusal::Unsupported(reason.to_string()))?;
+        let (select, touched) = match resolved.filter(|read| read.version == version) {
+            Some(read) => (read.select.clone(), read.stamp.map(|(id, _)| id)),
+            None => (
+                shared
+                    .parsed
+                    .get_or_parse(sql, binds, &version, &catalog)
+                    .map_err(|reason| Refusal::Unsupported(reason.to_string()))?,
+                None,
+            ),
+        };
         // A statement returning a column the engine does not hold exactly
         // is refused before its query is kept for nothing.
         let tables = self.admit(&select, &catalog, Some(reader))?;
@@ -486,7 +489,7 @@ impl Cache {
                 if let Some(reason) = state.refused(&select.query, config.refusal_ttl) {
                     return Err(Refusal::Unavailable(reason.to_string()));
                 }
-                self.look(&state, &select, &version, ttl)?
+                self.look(&state, &select, &version, ttl, touched)?
             };
             match found {
                 Found::Answer(rows) => return Ok(rows),
@@ -557,6 +560,7 @@ impl Cache {
         select: &Select,
         version: &CatalogVersion,
         ttl: Ttl,
+        touched: Option<u64>,
     ) -> Result<Found, Refusal> {
         let Some(id) = state.entry_of(&select.query) else {
             return Ok(Found::Absent);
@@ -564,7 +568,9 @@ impl Cache {
         let Some(entry) = state.entries.get(&id) else {
             return Ok(Found::Absent);
         };
-        entry.touch(self.shared.now(), ttl);
+        if touched != Some(id) {
+            entry.touch(self.shared.now(), ttl);
+        }
         match &entry.fill {
             Fill::Pending(_) => return Ok(Found::Filling),
             Fill::Settling(_) => {
@@ -867,14 +873,14 @@ mod lifecycle_tests {
             "SELECT id FROM t".into(),
         );
         assert!(matches!(
-            cache.look(&state, &select, &version, Ttl::Forever).unwrap(),
+            cache.look(&state, &select, &version, Ttl::Forever, None).unwrap(),
             Found::Filling
         ));
         assert_eq!(state.entries[&id].ttl(), Ttl::Forever);
         state.entries.get_mut(&id).unwrap().usage = Arc::new(state::Usage::new(0, Ttl::Immediate));
         state.entries.get_mut(&id).unwrap().fill = Fill::Settling(Instant::now());
         assert!(matches!(
-            cache.look(&state, &select, &version, Ttl::Forever),
+            cache.look(&state, &select, &version, Ttl::Forever, None),
             Err(Refusal::NotReady(_))
         ));
         assert_eq!(state.entries[&id].ttl(), Ttl::Forever);

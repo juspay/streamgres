@@ -160,6 +160,10 @@ impl Sql {
     pub fn text(&self) -> &str {
         &self.text
     }
+
+    pub(crate) fn binds(&self) -> &[Bind] {
+        &self.binds
+    }
 }
 
 /// A value [`Sql::bind`] takes: its type's OID and its binary form.
@@ -839,7 +843,7 @@ impl Streamgres {
 
     /// The rest of a read [`Self::begin`] left, on Streamgres's runtime:
     /// the reader checked, and the fallback.
-    async fn finish(self, sql: Sql, ttl: Option<Ttl>, begun: Begun) -> Outcome {
+    async fn finish(self, sql: Arc<Sql>, ttl: Option<Ttl>, begun: Begun) -> Outcome {
         let refusal = match begun {
             Begun::Done(outcome) => return outcome,
             Begun::Refused(refusal) => refusal,
@@ -865,7 +869,7 @@ impl Streamgres {
             };
         }
         let reason = refusal.to_string();
-        let read = self.fall_back(&sql, refusal).await;
+        let read = self.fall_back(sql, refusal).await;
         let served = if read.is_ok() {
             Served::Postgres
         } else {
@@ -884,19 +888,20 @@ impl Streamgres {
         traced: bool,
     ) -> (Result<Rows, Error>, Option<Trace>) {
         let started = Instant::now();
-        let outcome = match self.begin(&sql, ttl) {
-            Begun::Done(outcome) => outcome,
-            begun => {
-                let (lib, task) = (self.clone(), sql.clone());
-                crate::sync::pg::connections::Task::new(
-                    self.inner.io.handle().spawn(lib.finish(task, ttl, begun)),
-                )
-                .join()
-                .await
-                .unwrap_or_else(|error| ended(&error.to_string()))
-            }
-        };
-        self.record(sql, at, started, outcome, traced)
+        let begun = self.begin(&sql, ttl);
+        if let Begun::Done(outcome) = begun {
+            return self.record(&sql, at, started, outcome, traced);
+        }
+        let sql = Arc::new(sql);
+        let lib = self.clone();
+        let request = sql.clone();
+        let outcome = crate::sync::pg::connections::Task::new(
+            self.inner.io.handle().spawn(lib.finish(request, ttl, begun)),
+        )
+        .join()
+        .await
+        .unwrap_or_else(|error| ended(&error.to_string()));
+        self.record(&sql, at, started, outcome, traced)
     }
 
     /// [`Self::traced`], blocking this thread instead of awaiting.
@@ -908,30 +913,32 @@ impl Streamgres {
         traced: bool,
     ) -> (Result<Rows, Error>, Option<Trace>) {
         let started = Instant::now();
-        let outcome = match self.begin(&sql, ttl) {
-            Begun::Done(outcome) => outcome,
-            begun => {
-                let (lib, task) = (self.clone(), sql.clone());
-                if !blocking_allowed(self.inner.application_pool) {
-                    (
-                        Err(Error::BlockingContext),
-                        Served::Failed,
-                        Some(Error::BlockingContext.to_string()),
-                    )
-                } else {
-                    wait(self.inner.io.handle(), lib.finish(task, ttl, begun))
-                        .unwrap_or_else(|reason| ended(&reason))
-                }
-            }
-        };
-        self.record(sql, at, started, outcome, traced)
+        let begun = self.begin(&sql, ttl);
+        if let Begun::Done(outcome) = begun {
+            return self.record(&sql, at, started, outcome, traced);
+        }
+        if !blocking_allowed(self.inner.application_pool) {
+            let outcome = (
+                Err(Error::BlockingContext),
+                Served::Failed,
+                Some(Error::BlockingContext.to_string()),
+            );
+            return self.record(&sql, at, started, outcome, traced);
+        }
+        let sql = Arc::new(sql);
+        let outcome = wait(
+            self.inner.io.handle(),
+            self.clone().finish(sql.clone(), ttl, begun),
+        )
+        .unwrap_or_else(|reason| ended(&reason));
+        self.record(&sql, at, started, outcome, traced)
     }
 
     /// Records how a read went, when anyone listens: the rows and, when
     /// `traced`, its trace.
     fn record(
         &self,
-        sql: Sql,
+        sql: &Sql,
         at: &'static Location<'static>,
         started: Instant,
         (read, served, reason): Outcome,
@@ -955,7 +962,7 @@ impl Streamgres {
         let trace = Trace {
             query: QueryId::of(&sql.text, &sql.binds),
             rows: read.as_ref().map_or(0, Rows::len),
-            sql: sql.text,
+            sql: sql.text.clone(),
             served,
             reason: reason.or_else(|| read.as_ref().err().map(ToString::to_string)),
             ttl: kept.ttl,
@@ -979,7 +986,7 @@ impl Streamgres {
     }
 
     /// The rows from the fallback, for a read the cache refused.
-    async fn fall_back(&self, sql: &Sql, refusal: Refusal) -> Result<Rows, Error> {
+    async fn fall_back(&self, sql: Arc<Sql>, refusal: Refusal) -> Result<Rows, Error> {
         let cache = &self.inner.cache;
         let Fallback::Postgres { wait, timeout, .. } = &self.inner.fallback else {
             cache.count_fallback(false);
@@ -997,8 +1004,7 @@ impl Streamgres {
         let read = cache
             .engine()
             .read_origin(
-                &sql.text,
-                &sql.binds,
+                sql,
                 *timeout,
                 self.inner.on_unsupported == OnUnsupported::Error,
                 permit,

@@ -595,30 +595,9 @@ impl Io {
 }
 
 impl Drop for Io {
-    /// Shuts the runtime down from a thread of its own: the last handle
-    /// may be dropped inside an async context, even on one of this
-    /// runtime's workers, where a runtime may not be dropped.
     fn drop(&mut self) {
-        let Some(runtime) = self.runtime.take() else {
-            return;
-        };
-        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(runtime)));
-        let handed = slot.clone();
-        let take = |slot: &std::sync::Mutex<Option<tokio::runtime::Runtime>>| {
-            slot.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .take()
-        };
-        let spawned = std::thread::Builder::new()
-            .name("streamgres-io-stop".to_owned())
-            .spawn(move || {
-                if let Some(runtime) = take(&handed) {
-                    runtime.shutdown_background();
-                }
-            });
-        if spawned.is_err()
-            && let Some(runtime) = take(&slot)
-        {
+        if let Some(runtime) = self.runtime.take() {
+            // Tokio permits background shutdown from an async context.
             runtime.shutdown_background();
         }
     }
@@ -642,14 +621,8 @@ impl Connections for OnRuntime {
         let connections = self.connections.clone();
         let runtime = self.runtime.clone();
         Box::pin(async move {
-            struct Pending(tokio::task::JoinHandle<Result<Lease, String>>);
-            impl Drop for Pending {
-                fn drop(&mut self) {
-                    self.0.abort();
-                }
-            }
-            let mut pending = Pending(runtime.spawn(async move { connections.get().await }));
-            (&mut pending.0)
+            Task::new(runtime.spawn(async move { connections.get().await }))
+                .join()
                 .await
                 .map_err(|error| format!("application checkout ended: {error}"))?
         })

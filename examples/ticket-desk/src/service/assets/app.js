@@ -579,7 +579,14 @@ async function loadMemory() {
   }
 }
 $("refresh-memory").onclick = () => loadMemory();
-async function loadShapes() {
+let loadingShapes;
+function loadShapes() {
+  loadingShapes ??= fetchShapes().finally(() => {
+    loadingShapes = undefined;
+  });
+  return loadingShapes;
+}
+async function fetchShapes() {
   try {
     const result = await api("/api/lookups");
     state.shapes = (result.shapes || []).map((shape) => ({
@@ -1306,7 +1313,7 @@ async function init() {
     loadWriter(),
     pollMetrics(),
   ]);
-  loadShapes();
+  if (!state.shapes.length) loadShapes();
   await race(false);
   let toured;
   try {
