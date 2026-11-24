@@ -35,8 +35,28 @@ fn dsn() -> Option<String> {
 }
 
 /// Run `body` on a current-thread runtime with a local task set (the
-/// engine and its storage are single-threaded).
+/// engine and its storage are single-threaded), beside the other
+/// scenarios but never beside one that installs event triggers
+/// ([`block_on_alone`]).
 fn block_on<F: std::future::Future>(body: F) -> F::Output {
+    let _shared = SCENARIOS.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    run(body)
+}
+
+/// Run `body` as [`block_on`] does, with no other scenario running: for a
+/// scenario that installs DDL event triggers, which fire on every other
+/// scenario's DDL in the same database while they exist.
+fn block_on_alone<F: std::future::Future>(body: F) -> F::Output {
+    let _alone = SCENARIOS.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    run(body)
+}
+
+/// What keeps a scenario that installs event triggers apart from the
+/// others.
+static SCENARIOS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// `body` on a fresh current-thread runtime with a local task set.
+fn run<F: std::future::Future>(body: F) -> F::Output {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -1472,7 +1492,7 @@ fn owners_added(events: &[Event], table: &str) -> BTreeMap<i64, Option<Value>> {
 #[test]
 fn schema_changes_follow_the_trigger() {
     let Some(dsn) = dsn() else { return };
-    block_on(async {
+    block_on_alone(async {
         let names = Names::new("ddl");
         let client = prepare(&dsn, &names).await;
         let catalog = Arc::new(names.catalog());
@@ -1865,24 +1885,33 @@ fn a_table_outside_public_is_read_under_its_schema() {
         PgStream::drop_slot(&dsn, slot, publication)
             .await
             .expect("drop slot");
-        client
-            .batch_execute(&format!(
-                "DROP SCHEMA IF EXISTS {schema} CASCADE;
-                 DROP TABLE IF EXISTS {invoices}; DROP TABLE IF EXISTS {customers};
-                 CREATE SCHEMA {schema};
-                 CREATE TABLE {schema}.{invoices} (id int8 PRIMARY KEY, customer int8, status text);
-                 CREATE TABLE {invoices} (id int8 PRIMARY KEY, customer int8, status text);
-                 CREATE TABLE {customers} (id int8 PRIMARY KEY, name text);
-                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;
-                 INSERT INTO {customers} VALUES (1, 'meera'), (2, 'arjun');
-                 INSERT INTO {schema}.{invoices}
+        // One statement per transaction: a multi-statement batch is one
+        // transaction, and DDL in it would hold the locks of any event
+        // trigger another scenario installs until the whole batch ends.
+        for statement in [
+            format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+            format!("DROP TABLE IF EXISTS {invoices}"),
+            format!("DROP TABLE IF EXISTS {customers}"),
+            format!("CREATE SCHEMA {schema}"),
+            format!(
+                "CREATE TABLE {schema}.{invoices} (id int8 PRIMARY KEY, customer int8, status text)"
+            ),
+            format!("CREATE TABLE {invoices} (id int8 PRIMARY KEY, customer int8, status text)"),
+            format!("CREATE TABLE {customers} (id int8 PRIMARY KEY, name text)"),
+            format!("CREATE PUBLICATION \"{publication}\" FOR ALL TABLES"),
+            format!("INSERT INTO {customers} VALUES (1, 'meera'), (2, 'arjun')"),
+            format!(
+                "INSERT INTO {schema}.{invoices}
                    SELECT g, 1 + g % 2, CASE WHEN g % 4 = 0 THEN 'DUE' ELSE 'PAID' END
-                   FROM generate_series(1, 400) g;
-                 INSERT INTO {invoices} VALUES (9001, 1, 'DUE');
-                 ANALYZE {schema}.{invoices}; ANALYZE {customers}; ANALYZE {invoices};"
-            ))
-            .await
-            .expect("prepare");
+                   FROM generate_series(1, 400) g"
+            ),
+            format!("INSERT INTO {invoices} VALUES (9001, 1, 'DUE')"),
+            format!("ANALYZE {schema}.{invoices}"),
+            format!("ANALYZE {customers}"),
+            format!("ANALYZE {invoices}"),
+        ] {
+            client.batch_execute(&statement).await.expect(&statement);
+        }
         let qualified = format!("{schema}.{invoices}");
         let catalog = Arc::new(Catalog::new(vec![
             DbTable::new(
@@ -1950,12 +1979,13 @@ fn a_table_outside_public_is_read_under_its_schema() {
             .await
             .expect("the join column's statistics are found under the schema");
 
-        let _ = client
-            .batch_execute(&format!(
-                "DROP SCHEMA IF EXISTS {schema} CASCADE;
-                 DROP TABLE IF EXISTS {invoices}; DROP TABLE IF EXISTS {customers};"
-            ))
-            .await;
+        for statement in [
+            format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+            format!("DROP TABLE IF EXISTS {invoices}"),
+            format!("DROP TABLE IF EXISTS {customers}"),
+        ] {
+            let _ = client.batch_execute(&statement).await;
+        }
         let _ = PgStream::drop_slot(&dsn, slot, publication).await;
     });
 }
