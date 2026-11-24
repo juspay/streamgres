@@ -1,26 +1,4 @@
-/* Coral palette and locally hosted typography. */
-@font-face {
-  font-family: "Google Sans Flex";
-  font-style: normal;
-  font-weight: 1 1000;
-  font-stretch: 25% 151%;
-  font-display: swap;
-  src: url("/fonts/google-sans-flex-latin.woff2") format("woff2");
-}
-@font-face {
-  font-family: Manrope;
-  font-style: normal;
-  font-weight: 200 800;
-  font-display: swap;
-  src: url("/fonts/manrope-latin.woff2") format("woff2");
-}
-@font-face {
-  font-family: "Geist Mono";
-  font-style: normal;
-  font-weight: 100 900;
-  font-display: swap;
-  src: url("/fonts/geist-mono-latin.woff2") format("woff2");
-}
+/* Coral palette and the system's own fonts. */
 :root {
   --bg: #ffffff;
   --surface: #ffffff;
@@ -43,8 +21,9 @@
   --danger: #b02b42;
   --shadow: none;
   --radius: 12px;
-  --mono: "Geist Mono", ui-monospace, monospace;
-  font-family: Manrope, "Segoe UI", sans-serif;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-family: var(--sans);
   color: var(--ink);
   background: var(--bg);
   font-synthesis: none;
@@ -231,21 +210,21 @@ p {
   margin: 0;
 }
 h2 {
-  font-family: "Google Sans Flex", Manrope, sans-serif;
+  font-family: var(--sans);
   font-size: 19px;
   font-weight: 500;
   letter-spacing: -0.4px;
   line-height: 1.3;
 }
 h3 {
-  font-family: "Google Sans Flex", Manrope, sans-serif;
+  font-family: var(--sans);
   font-size: 15px;
 }
 p {
   color: var(--muted);
 }
 h1 {
-  font-family: "Google Sans Flex", Manrope, sans-serif;
+  font-family: var(--sans);
   font-size: 36px;
   letter-spacing: -1.4px;
   line-height: 1.2;
@@ -300,13 +279,13 @@ h1 {
   line-height: 1.15;
 }
 .brand-product {
-  font-family: "Google Sans Flex", Manrope, sans-serif;
+  font-family: var(--sans);
   font-size: 20px;
   font-weight: 500;
   letter-spacing: -0.4px;
 }
 .brand small {
-  font-family: Manrope, sans-serif;
+  font-family: var(--sans);
   display: block;
   color: var(--muted);
   font-size: 12px;
@@ -1740,7 +1719,7 @@ dialog label {
     font-size: 20px;
   }
   .brand small {
-    font-family: Manrope, sans-serif;
+    font-family: var(--sans);
     font-size: 11px;
   }
   .brand svg {
@@ -1946,7 +1925,7 @@ dialog label {
     font-size: 19px;
   }
   .brand small {
-    font-family: Manrope, sans-serif;
+    font-family: var(--sans);
     font-size: 10px;
   }
   .top-actions {
@@ -2420,7 +2399,7 @@ dialog label {
 .memory-heading span {
   flex: 1;
   color: var(--muted, #666);
-  font-family: "Geist Mono", ui-monospace, monospace;
+  font-family: var(--mono);
   font-size: 0.8rem;
 }
 .inspect-result {
@@ -2444,7 +2423,7 @@ dialog label {
 }
 .inspect-facts dd {
   margin: 0.1rem 0 0;
-  font-family: "Geist Mono", ui-monospace, monospace;
+  font-family: var(--mono);
   font-size: 0.82rem;
   overflow-wrap: anywhere;
 }

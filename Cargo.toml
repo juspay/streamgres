@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/streamgres-diesel"]
+members = ["crates/streamgres-diesel", "examples/ticket-desk"]
 
 [package]
 name = "streamgres"

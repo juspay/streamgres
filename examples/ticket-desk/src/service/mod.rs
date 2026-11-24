@@ -293,7 +293,6 @@ pub fn router(app: Arc<App>) -> Router {
                 )
             }),
         )
-        .route("/fonts/{name}", get(font))
         .route("/api/metrics", get(metrics))
         .route("/api/lookups", get(lookups))
         .route("/api/query/{name}", get(named_query))
@@ -357,25 +356,6 @@ async fn guard(request: axum::extract::Request, next: axum::middleware::Next) ->
         axum::http::HeaderValue::from_static("no-store"),
     );
     response
-}
-
-async fn font(Path(name): Path<String>) -> Response {
-    let font: &'static [u8] = match name.as_str() {
-        "google-sans-flex-latin.woff2" => {
-            include_bytes!("assets/fonts/google-sans-flex-latin.woff2")
-        }
-        "manrope-latin.woff2" => include_bytes!("assets/fonts/manrope-latin.woff2"),
-        "geist-mono-latin.woff2" => include_bytes!("assets/fonts/geist-mono-latin.woff2"),
-        "licenses.txt" => {
-            return (
-                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-                include_str!("assets/fonts/LICENSES.txt"),
-            )
-                .into_response();
-        }
-        _ => return StatusCode::NOT_FOUND.into_response(),
-    };
-    ([(header::CONTENT_TYPE, "font/woff2")], font).into_response()
 }
 
 async fn query(

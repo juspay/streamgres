@@ -27,7 +27,3 @@ futures-util = "0.3"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
-
-# Its own workspace, so the showcase's service dependencies stay out of
-# the library's builds.
-[workspace]

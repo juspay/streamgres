@@ -155,7 +155,6 @@ a load run, every lab experiment, and that shutdown drops the slot.
 
 ## Visual identity
 
-Coral `#ff4f4f`, white and charcoal surfaces, fine grid lines, Google Sans Flex
-headings, Manrope body text and Geist Mono labels. The Latin webfonts are
-embedded and served locally; their licenses are in `src/service/assets/fonts`
-and at `/fonts/licenses.txt`.
+Coral `#ff4f4f`, white and charcoal surfaces, fine grid lines, and the
+system's own sans-serif and monospace fonts: the page loads nothing but
+its own HTML, CSS and JavaScript.
