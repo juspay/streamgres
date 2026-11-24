@@ -350,6 +350,18 @@ impl Cache {
             .parsed
             .get_or_parse(sql, binds, &version, catalog)
             .map_err(|reason| Refusal::Unsupported(reason.to_string()))?;
+        self.admit(&select, catalog, reader).map(drop)
+    }
+
+    /// The tables `select` reads, when the engine can answer it for
+    /// `reader`: every table known and readable as the engine reads it,
+    /// every returned column held exactly.
+    fn admit<'c>(
+        &self,
+        select: &Select,
+        catalog: &'c crate::model::Catalog,
+        reader: &Reader,
+    ) -> Result<Vec<&'c crate::model::DbTable>, Refusal> {
         let mut tables = Vec::with_capacity(select.nodes.len());
         for node in &select.nodes {
             let table = catalog
@@ -360,8 +372,8 @@ impl Cache {
             }
             tables.push(table);
         }
-        rows::projected_columns(&select, &tables)?;
-        Ok(())
+        rows::projected_columns(select, &tables)?;
+        Ok(tables)
     }
 
     fn answer(
@@ -376,11 +388,7 @@ impl Cache {
         let bind_bytes = binds.iter().fold(0usize, |bytes, bind| {
             bytes.saturating_add(bind.bytes.as_ref().map_or(0, Vec::len))
         });
-        if bind_bytes > (config.max_entry_bytes.min(config.max_bytes) / 16).min(1 << 20) {
-            return Err(Refusal::Unavailable(
-                "the bind values exceed the cache's evaluation budget".to_owned(),
-            ));
-        }
+        let oversized = bind_bytes > (config.max_entry_bytes.min(config.max_bytes) / 16).min(1 << 20);
         let catalog = {
             let state = shared.read();
             state.readiness(config)?;
@@ -392,23 +400,25 @@ impl Cache {
                 "the reader was checked against an older catalog".to_owned(),
             ));
         }
+        if oversized {
+            // Classified by its shape alone, so the values are never read; a
+            // statement that is supported is then refused for its size.
+            let shape = shared
+                .parsed
+                .shape_of(sql, &version, &catalog)
+                .map_err(|reason| Refusal::Unsupported(reason.to_string()))?;
+            self.admit(shape.unbound(), &catalog, reader)?;
+            return Err(Refusal::Unavailable(
+                "the bind values exceed the cache's evaluation budget".to_owned(),
+            ));
+        }
         let select = shared
             .parsed
             .get_or_parse(sql, binds, &version, &catalog)
             .map_err(|reason| Refusal::Unsupported(reason.to_string()))?;
-        let mut tables = Vec::with_capacity(select.nodes.len());
-        for node in &select.nodes {
-            let table = catalog
-                .table(node.table.as_str())
-                .ok_or_else(|| Refusal::Unsupported(format!("unknown table `{}`", node.table)))?;
-            if let Some(reason) = reader.refuses(&node.table) {
-                return Err(Refusal::Unsupported(reason));
-            }
-            tables.push(table);
-        }
         // A statement returning a column the engine does not hold exactly
         // is refused before its query is kept for nothing.
-        rows::projected_columns(&select, &tables)?;
+        let tables = self.admit(&select, &catalog, reader)?;
         let ttl = config.ttl_for(ttl);
 
         let mut subscribed = false;

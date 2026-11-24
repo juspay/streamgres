@@ -145,6 +145,12 @@ pub(crate) struct PreparedSelect {
     pub(super) parameters: usize,
 }
 impl PreparedSelect {
+    /// The statement before its binds are substituted: its tables, columns
+    /// and projection.
+    pub(crate) fn unbound(&self) -> &Select {
+        &self.base
+    }
+
     /// The statement with `binds` substituted, each checked against its
     /// column's type, without lexing or resolving names again.
     pub(crate) fn bind(&self, binds: &[Bind], catalog: &Catalog) -> Result<Select, ParseError> {

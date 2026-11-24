@@ -208,6 +208,7 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 | `Fallback` | The statement goes to `Fallback`, as a run-time refusal does. |
 
 - `Fallback` applies to run-time refusals: not ready, loading, budgets, values not yet encodable.
+- A budget decides only whether memory answers, never whether a statement may reach Postgres. A statement whose bind values exceed the evaluation budget (the smaller of 1 MiB and 1/16 of the entry budget) is classified by its SQL alone, without reading the values: unsupported is still an error, and only a supported statement falls back.
 
 - A fallback read runs as its own task and holds its turn until it finishes, even if the caller is cancelled.
 - With `OnUnsupported::Error`, degraded-engine reads are validated against a source catalog before fallback. This admission check is single-flight and memoized for 250 ms. Failure to obtain that catalog is a visible readiness error, rather than permission to execute unclassified SQL.

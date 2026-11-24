@@ -43,7 +43,7 @@ const SAMPLE_EVERY: Duration = Duration::from_millis(200);
 const SAMPLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Where the engine streams from and how it reads.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PgConfig {
     /// The database: its replication feed, its snapshots, and the origin
     /// reads.
@@ -65,6 +65,57 @@ pub struct PgConfig {
     /// Replication slots of this kind left inactive this long are dropped
     /// when an instance starts (PostgreSQL 17 and later); zero keeps them.
     pub slot_cleanup_age: Duration,
+}
+
+impl std::fmt::Debug for PgConfig {
+    /// Every field, the DSN without its password.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgConfig")
+            .field("dsn", &redacted(&self.dsn))
+            .field("publication", &self.publication)
+            .field("schemas", &self.schemas)
+            .field("app", &self.app)
+            .field("shard", &self.shard)
+            .field("read_connections", &self.read_connections)
+            .field("read_timeout", &self.read_timeout)
+            .field("snapshot_rotation", &self.snapshot_rotation)
+            .field("slot_cleanup_age", &self.slot_cleanup_age)
+            .finish()
+    }
+}
+
+/// `dsn` with any password replaced by `***`: the one in a URL's
+/// `user:password@`, and every `password=` setting (key-value form or URL
+/// query).
+fn redacted(dsn: &str) -> String {
+    let mut out = dsn.to_owned();
+    if let Some(scheme) = out.find("://") {
+        let rest = scheme + 3;
+        let authority_end = out[rest..]
+            .find(['/', '?'])
+            .map_or(out.len(), |end| rest + end);
+        if let Some(at) = out[rest..authority_end].rfind('@').map(|at| rest + at)
+            && let Some(colon) = out[rest..at].find(':').map(|colon| rest + colon)
+        {
+            out.replace_range(colon + 1..at, "***");
+        }
+    }
+    let mut searched = 0;
+    while let Some(found) = out[searched..].find("password=").map(|at| searched + at) {
+        let value = found + "password=".len();
+        let end = if out[value..].starts_with('\'') {
+            out[value + 1..]
+                .find('\'')
+                .map_or(out.len(), |close| value + 1 + close + 1)
+        } else {
+            out[value..]
+                .find([' ', '&'])
+                .map_or(out.len(), |end| value + end)
+        };
+        out.replace_range(value..end, "***");
+        searched = value + 3;
+    }
+    out
 }
 
 impl PgConfig {
@@ -505,6 +556,28 @@ async fn sample_source(
 
 #[cfg(test)]
 mod tests {
+    /// No password survives in what `Debug` prints.
+    #[test]
+    fn the_dsn_is_redacted() {
+        use super::redacted;
+        assert_eq!(
+            redacted("postgres://app:s3cret@db:5432/x"),
+            "postgres://app:***@db:5432/x"
+        );
+        assert_eq!(redacted("postgres://app@db/x"), "postgres://app@db/x");
+        assert_eq!(
+            redacted("postgres://db/x?password=s3cret&sslmode=require"),
+            "postgres://db/x?password=***&sslmode=require"
+        );
+        assert_eq!(
+            redacted("host=db password='a b' user=app"),
+            "host=db password=*** user=app"
+        );
+        assert_eq!(redacted("host=db password=s3cret"), "host=db password=***");
+        let debug = format!("{:?}", super::PgConfig::new("postgres://app:s3cret@db/x"));
+        assert!(!debug.contains("s3cret"), "{debug}");
+    }
+
     use super::*;
 
     #[tokio::test]

@@ -172,6 +172,18 @@ impl ParseMemo {
         }
         answer
     }
+    /// What `sql` parses to before any bind is substituted: classifies a
+    /// statement without reading its bind values.
+    pub fn shape_of(&self, sql: &str, version: &CatalogVersion, catalog: &Catalog) -> Shape {
+        if sql.len() > MAX_SQL_BYTES {
+            return Err("the SQL exceeds the cache's 64 KiB statement limit".into());
+        }
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        sql.hash(&mut hash);
+        version.hash(&mut hash);
+        self.shape(sql, version, catalog, hash.finish())
+    }
+
     fn shape(&self, sql: &str, version: &CatalogVersion, catalog: &Catalog, hash: u64) -> Shape {
         let shard = &self.shapes[usize::try_from(hash >> 60).unwrap_or(0) % SHARDS];
         let same = |key: &ShapeKey| &*key.sql == sql && key.version == *version;

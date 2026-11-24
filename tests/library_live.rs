@@ -58,6 +58,13 @@ async fn prepare(dsn: &str, schema: &str, app: &str, tables: &str) {
 
 /// Removes `schema`, its publication and `app`'s trigger stack, whose DDL
 /// triggers would otherwise fire for every later test on the server.
+/// Runs schema changes under the same lock as [`prepare`] and [`clean`]:
+/// each test's DDL fires every other test's DDL triggers.
+async fn ddl(dsn: &str, sql: &str) {
+    let _setup = SETUP.lock().await;
+    admin(dsn).await.batch_execute(sql).await.expect(sql);
+}
+
 async fn clean(dsn: &str, schema: &str, app: &str) {
     let _setup = SETUP.lock().await;
     admin(dsn)
@@ -605,7 +612,11 @@ async fn row_security_is_excluded_and_enabling_it_invalidates_memory() {
         .unwrap();
     let sql = Sql::new("SELECT id FROM lib_rls.t");
     until_memory(&lib, &sql).await;
-    admin(&dsn).await.batch_execute("ALTER TABLE lib_rls.t ENABLE ROW LEVEL SECURITY; CREATE POLICY tenant ON lib_rls.t USING (tenant=1);").await.unwrap();
+    ddl(
+        &dsn,
+        "ALTER TABLE lib_rls.t ENABLE ROW LEVEL SECURITY; CREATE POLICY tenant ON lib_rls.t USING (tenant=1);",
+    )
+    .await;
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         let (result, trace) = lib.load_and_sync(sql.clone()).inspect().await;
@@ -812,11 +823,7 @@ async fn unqualified_type_metadata_follows_session_visibility() {
         u32::try_from(expected).unwrap()
     );
     lib.shutdown().await;
-    admin(&dsn)
-        .await
-        .batch_execute("DROP SCHEMA lib_typehidden CASCADE")
-        .await
-        .unwrap();
+    ddl(&dsn, "DROP SCHEMA lib_typehidden CASCADE").await;
     clean(&dsn, "lib_typepath", "libtypepath").await;
 }
 
@@ -939,11 +946,7 @@ async fn the_first_catalog_observation_refreshes_custom_types() {
         .unwrap();
     // No explicit refresh or Diesel lookup retry: background discovery must
     // include a type created before its first catalog observation.
-    admin(&dsn)
-        .await
-        .batch_execute("CREATE TYPE lib_firsttype.first_type AS ENUM ('a')")
-        .await
-        .unwrap();
+    ddl(&dsn, "CREATE TYPE lib_firsttype.first_type AS ENUM ('a')").await;
     let deadline = Instant::now() + Duration::from_secs(10);
     while lib.type_oids("first_type", Some("lib_firsttype")).is_none() {
         assert!(
@@ -954,4 +957,49 @@ async fn the_first_catalog_observation_refreshes_custom_types() {
     }
     lib.shutdown().await;
     clean(&dsn, "lib_firsttype", "libfirsttype").await;
+}
+
+/// Bind values too large for the cache's budget never decide whether a
+/// statement may reach Postgres: an unsupported one is still an error,
+/// and only a supported one falls back.
+#[tokio::test(flavor = "multi_thread")]
+async fn oversized_binds_do_not_bypass_the_unsupported_policy() {
+    let Some(dsn) = dsn() else { return };
+    prepare(
+        &dsn,
+        "lib_budget",
+        "libbudget",
+        "CREATE TABLE lib_budget.t (id bigint PRIMARY KEY, name text); INSERT INTO lib_budget.t VALUES (1, 'a');",
+    )
+    .await;
+    let lib = Streamgres::connect(&dsn)
+        .schemas(["lib_budget"])
+        .publication("lib_budget_pub")
+        .app("libbudget", 0)
+        .start()
+        .await
+        .unwrap();
+    until_memory(&lib, &Sql::new("SELECT id FROM lib_budget.t")).await;
+    let large = "x".repeat(2 << 20);
+
+    let before = lib.metrics();
+    let unsupported =
+        Sql::new("SELECT id FROM lib_budget.t WHERE name ILIKE $1").bind(large.as_str());
+    let (read, trace) = lib.load_and_sync(unsupported).inspect().await;
+    assert!(matches!(read, Err(Error::Unsupported(_))), "{read:?}");
+    assert_eq!(trace.served, Served::Unsupported);
+    let after = lib.metrics();
+    assert_eq!(
+        (after.fallbacks, after.fallback_errors),
+        (before.fallbacks, before.fallback_errors),
+        "the statement never reached Postgres"
+    );
+
+    let supported = Sql::new("SELECT id FROM lib_budget.t WHERE name = $1").bind(large.as_str());
+    let (read, trace) = lib.load_and_sync(supported).inspect().await;
+    assert_eq!(read.expect("Postgres answers").len(), 0);
+    assert_eq!(trace.served, Served::Postgres);
+
+    lib.shutdown().await;
+    clean(&dsn, "lib_budget", "libbudget").await;
 }
