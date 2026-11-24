@@ -161,7 +161,11 @@ tables AS (SELECT json_build_object(
 
     SELECT json_build_object(
       'tables', COALESCE((SELECT json_agg("table" ORDER BY "schema", "name") FROM tables), '[]'::json),
-      'indexes', COALESCE((SELECT json_agg("index" ORDER BY "schema", "tableName", "name") FROM indexes), '[]'::json)
+      'indexes', COALESCE((SELECT json_agg("index" ORDER BY "schema", "tableName", "name") FROM indexes), '[]'::json),
+      'publications', COALESCE((SELECT json_object_agg(pubname, json_build_object(
+          'insert', pubinsert, 'update', pubupdate, 'delete', pubdelete,
+          'truncate', pubtruncate, 'viaRoot', pubviaroot) ORDER BY pubname)
+        FROM pg_publication WHERE pubname IN ('xyne_sync_pub')), '{}'::json)
     ) as "publishedSchema"
 $$ LANGUAGE sql;
 

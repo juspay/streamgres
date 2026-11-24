@@ -20,7 +20,7 @@ use streamgres::model::*;
 use streamgres::client::ddl_triggers::trigger_stack_sql;
 use streamgres::sync::pg::ddl::DdlSource;
 use streamgres::sync::pg::estimate_cache::EstimateCache;
-use streamgres::sync::pg::{PgStorage, PgStream};
+use streamgres::sync::pg::{PgStorage, PgStream, Transport};
 use streamgres::sync::{
     CatalogHandle, Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
 };
@@ -154,7 +154,7 @@ async fn prepare(dsn: &str, names: &Names) -> Client {
             "DROP TABLE IF EXISTS {t}; DROP TABLE IF EXISTS {u}; DROP TABLE IF EXISTS {e};
              CREATE TABLE {t} (id int8 PRIMARY KEY, status text, assigned_to int8, points int8);
              CREATE TABLE {u} (id int8 PRIMARY KEY, name text);
-             CREATE PUBLICATION \"{p}\" FOR ALL TABLES;
+             CREATE PUBLICATION \"{p}\" FOR ALL TABLES WITH (publish_via_partition_root = true);
              INSERT INTO {u} VALUES (7, 'meera'), (8, 'arjun');
              INSERT INTO {t} VALUES (1, 'OPEN', 7, 1), (2, 'OPEN', 7, 2), (3, 'OPEN', 8, 3);",
             t = names.tickets,
@@ -1037,7 +1037,7 @@ fn a_json_column_is_filtered_by_value() {
             .batch_execute(&format!(
                 "DROP TABLE IF EXISTS {table};
                  CREATE TABLE {table} (id int8 PRIMARY KEY, fixed jsonb, loose json);
-                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;
+                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES WITH (publish_via_partition_root = true);
                  INSERT INTO {table} VALUES
                    (1, '\"high\"', '\"high\"'), (2, '5', '5'), (3, 'true', 'true'),
                    (4, '{{\"b\": [1, 2], \"a\": \"x\"}}', '{{\"b\":[1,2],   \"a\":\"x\"}}'), (5, NULL, NULL),
@@ -1199,7 +1199,7 @@ fn a_compound_key_is_served_by_postgres() {
                 "DROP TABLE IF EXISTS {parents}; DROP TABLE IF EXISTS {children};
                  CREATE TABLE {parents} (id int8 PRIMARY KEY, org uuid, ticket int8);
                  CREATE TABLE {children} (id int8 PRIMARY KEY, org uuid, ticket int8);
-                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;
+                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES WITH (publish_via_partition_root = true);
                  INSERT INTO {parents} VALUES {};
                  INSERT INTO {children} VALUES {};",
                 parent_rows.join(", "),
@@ -1898,7 +1898,9 @@ fn a_table_outside_public_is_read_under_its_schema() {
             ),
             format!("CREATE TABLE {invoices} (id int8 PRIMARY KEY, customer int8, status text)"),
             format!("CREATE TABLE {customers} (id int8 PRIMARY KEY, name text)"),
-            format!("CREATE PUBLICATION \"{publication}\" FOR ALL TABLES"),
+            format!(
+                "CREATE PUBLICATION \"{publication}\" FOR ALL TABLES WITH (publish_via_partition_root = true)"
+            ),
             format!("INSERT INTO {customers} VALUES (1, 'meera'), (2, 'arjun')"),
             format!(
                 "INSERT INTO {schema}.{invoices}
@@ -1987,5 +1989,125 @@ fn a_table_outside_public_is_read_under_its_schema() {
             let _ = client.batch_execute(&statement).await;
         }
         let _ = PgStream::drop_slot(&dsn, slot, publication).await;
+    });
+}
+
+/// A change to what the publication sends reaches the feed through the
+/// trigger and stops it when the feed could no longer follow the served
+/// tables: turning off updates and deletes, or adding a row filter to a
+/// served table. A change to another publication does not touch it.
+#[test]
+fn a_publication_change_that_breaks_the_feed_stops_it() {
+    let Some(dsn) = dsn() else { return };
+    block_on_alone(async {
+        let names = Names::new("pubchange");
+        let other = "xyne_sync_live_pubchange_other";
+        let client = prepare(&dsn, &names).await;
+        client
+            .batch_execute(&format!(
+                "DROP PUBLICATION \"{p}\";
+                 CREATE PUBLICATION \"{p}\" FOR TABLE {t}, {u}
+                   WITH (publish_via_partition_root = true);
+                 DROP PUBLICATION IF EXISTS \"{other}\";
+                 CREATE PUBLICATION \"{other}\" FOR TABLE {u};
+                 DROP SCHEMA IF EXISTS xspub_0 CASCADE;",
+                p = names.publication,
+                t = names.tickets,
+                u = names.users,
+            ))
+            .await
+            .expect("publications");
+        client
+            .batch_execute(&trigger_stack_sql("xspub", 0, &[names.publication.as_str()]))
+            .await
+            .expect("install the schema-change trigger stack");
+        let open = || async {
+            let stream = PgStream::open_with(
+                &dsn,
+                &names.slot,
+                &names.publication,
+                Arc::new(names.catalog()),
+                DdlSource {
+                    prefix: "xspub/0/ddl".to_owned(),
+                    schemas: vec!["public".to_owned()],
+                },
+            )
+            .await
+            .expect("open stream");
+            let (transport, mut feed) = stream.split();
+            let (out, transactions) = mpsc::channel(64);
+            let streaming = spawn_local(async move {
+                transport
+                    .stream(Duration::from_millis(50), &mut feed, &[], out)
+                    .await
+            });
+            (streaming, transactions)
+        };
+
+        let (streaming, mut transactions) = open().await;
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{other}\" SET (publish = 'insert');
+                 INSERT INTO {t} VALUES (40, 'OPEN', 7, 40);",
+                t = names.tickets
+            ))
+            .await
+            .expect("another publication changes");
+        tokio::time::timeout(Duration::from_secs(10), transactions.recv())
+            .await
+            .expect("the feed goes on past another publication's change")
+            .expect("a transaction");
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{}\" SET (publish = 'insert')",
+                names.publication
+            ))
+            .await
+            .expect("turn off updates and deletes");
+        let error = tokio::time::timeout(Duration::from_secs(10), streaming)
+            .await
+            .expect("the feed stops")
+            .expect("the feed task")
+            .expect_err("updates and deletes turned off stop the feed");
+        assert!(error.0.contains("no longer publishes update, delete"), "{error}");
+        assert!(error.0.contains("ALTER PUBLICATION"), "{error}");
+
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{}\" SET (publish = 'insert, update, delete, truncate')",
+                names.publication
+            ))
+            .await
+            .expect("restore the publication");
+        Transport::drop_slot_only(&dsn, &names.slot)
+            .await
+            .expect("drop the stopped feed's slot");
+        let (streaming, _transactions) = open().await;
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{p}\" SET TABLE {t} WHERE (points > 0), {u}",
+                p = names.publication,
+                t = names.tickets,
+                u = names.users,
+            ))
+            .await
+            .expect("add a row filter");
+        let error = tokio::time::timeout(Duration::from_secs(10), streaming)
+            .await
+            .expect("the feed stops")
+            .expect("the feed task")
+            .expect_err("a row filter on a served table stops the feed");
+        assert!(error.0.contains("row filter"), "{error}");
+        assert!(error.0.contains(&format!("`{}`", names.tickets)), "{error}");
+
+        let _ = client
+            .batch_execute(&format!(
+                "DROP EVENT TRIGGER IF EXISTS xspub_ddl_start_0;
+                 DROP EVENT TRIGGER IF EXISTS xspub_ddl_end_0;
+                 DROP SCHEMA IF EXISTS xspub_0 CASCADE;
+                 DROP PUBLICATION IF EXISTS \"{other}\";"
+            ))
+            .await;
+        cleanup(&dsn, &client, &names).await;
     });
 }

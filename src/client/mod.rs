@@ -70,7 +70,7 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use tokio::sync::mpsc;
 
-pub use config::Config;
+pub use config::{Config, TriggerIdentity};
 
 use crate::log::{self, log_error, log_info, log_warn};
 use crate::shutdown::Shutdown;

@@ -188,6 +188,72 @@ pub struct Config {
     pub admin_endpoints: bool,
 }
 
+/// A variable's value from `lookup`, as every setting reads it: an empty
+/// value is unset, and a `STREAMGRES_*` name falls back to its
+/// `STREAMGRES_SYNC_*` and `XYNE_SYNC_*` spellings.
+fn setting(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String> {
+    lookup(name)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            name.strip_prefix("STREAMGRES_")
+                .and_then(|suffix| lookup(&format!("STREAMGRES_SYNC_{suffix}")))
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            name.strip_prefix("STREAMGRES_")
+                .and_then(|suffix| lookup(&format!("XYNE_SYNC_{suffix}")))
+                .filter(|value| !value.is_empty())
+        })
+}
+
+/// What the DDL trigger stack is installed for: the app and shard that
+/// name it, and the publication its schema describes. Read alone by
+/// `server print-ddl-triggers`, which needs nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerIdentity {
+    /// `STREAMGRES_APP_ID` (or `ZERO_APP_ID`), default `zero`.
+    pub app_id: String,
+    /// `STREAMGRES_SHARD` (or `ZERO_SHARD_NUM`), default 0.
+    pub shard: u32,
+    /// `STREAMGRES_PUBLICATION`, default `xyne_sync_pub`.
+    pub publication: String,
+}
+
+impl TriggerIdentity {
+    /// The identity the environment describes.
+    pub fn from_env() -> Result<TriggerIdentity, String> {
+        Self::from_lookup(&|name: &str| std::env::var(name).ok())
+    }
+
+    /// The identity `lookup` describes, with the server's defaults.
+    pub fn from_lookup(
+        lookup: &impl Fn(&str) -> Option<String>,
+    ) -> Result<TriggerIdentity, String> {
+        let first = |names: &[&str]| names.iter().find_map(|name| setting(lookup, name));
+        let app_id =
+            first(&["STREAMGRES_APP_ID", "ZERO_APP_ID"]).unwrap_or_else(|| "zero".to_owned());
+        let shard = match first(&["STREAMGRES_SHARD", "ZERO_SHARD_NUM"]) {
+            Some(text) => text
+                .parse::<u32>()
+                .map_err(|_| format!("STREAMGRES_SHARD must be a number, got `{text}`"))?,
+            None => 0,
+        };
+        let publication =
+            first(&["STREAMGRES_PUBLICATION"]).unwrap_or_else(|| "xyne_sync_pub".to_owned());
+        Ok(TriggerIdentity {
+            app_id,
+            shard,
+            publication,
+        })
+    }
+
+    /// The DDL trigger stack setup installs for this identity, as SQL that
+    /// can be run by hand on the primary to install or replace it.
+    pub fn trigger_stack_sql(&self) -> String {
+        super::ddl_triggers::trigger_stack_sql(&self.app_id, self.shard, &[&self.publication])
+    }
+}
+
 impl Config {
     /// Read the configuration; an error names the missing or malformed
     /// variable.
@@ -198,21 +264,7 @@ impl Config {
     /// The configuration `lookup` describes (the environment's, or a
     /// test's): an unset or empty variable takes its default.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, String> {
-        let value = |name: &str| {
-            lookup(name)
-                .filter(|value| !value.is_empty())
-                .or_else(|| {
-                    name.strip_prefix("STREAMGRES_")
-                        .and_then(|suffix| lookup(&format!("STREAMGRES_SYNC_{suffix}")))
-                        .filter(|value| !value.is_empty())
-                })
-                .or_else(|| {
-                    name.strip_prefix("STREAMGRES_")
-                        .and_then(|suffix| lookup(&format!("XYNE_SYNC_{suffix}")))
-                        .filter(|value| !value.is_empty())
-                })
-        };
-        let first = |names: &[&str]| names.iter().find_map(|name| value(name));
+        let first = |names: &[&str]| names.iter().find_map(|name| setting(&lookup, name));
         let millis = |name: &str, default: u64| -> Result<Duration, String> {
             match first(&[name]) {
                 Some(text) => text
@@ -231,14 +283,11 @@ impl Config {
             .ok_or("STREAMGRES_QUERY_URL (or ZERO_QUERY_URL) must name the query endpoint")?;
         let mutate_url = first(&["STREAMGRES_MUTATE_URL", "ZERO_MUTATE_URL"])
             .ok_or("STREAMGRES_MUTATE_URL (or ZERO_MUTATE_URL) must name the mutate endpoint")?;
-        let app_id =
-            first(&["STREAMGRES_APP_ID", "ZERO_APP_ID"]).unwrap_or_else(|| "zero".to_owned());
-        let shard = match first(&["STREAMGRES_SHARD", "ZERO_SHARD_NUM"]) {
-            Some(text) => text
-                .parse::<u32>()
-                .map_err(|_| format!("STREAMGRES_SHARD must be a number, got `{text}`"))?,
-            None => 0,
-        };
+        let TriggerIdentity {
+            app_id,
+            shard,
+            publication,
+        } = TriggerIdentity::from_lookup(&lookup)?;
         let ddl_trigger = format!("{app_id}_ddl_end_{shard}");
         let ddl_prefix = format!("{app_id}/{shard}/ddl");
         let schemas = match first(&["STREAMGRES_SCHEMAS"]) {
@@ -320,8 +369,7 @@ impl Config {
             schemas,
             slot: threads::slot_name(),
             slot_cleanup_age: millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
-            publication: first(&["STREAMGRES_PUBLICATION"])
-                .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
+            publication,
             ddl_trigger,
             ddl_prefix,
             snapshot_rotation: millis("STREAMGRES_SNAPSHOT_ROTATION_MS", 1_000)?,

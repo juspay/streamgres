@@ -113,7 +113,9 @@ functions, and event triggers. Existing objects are validated without
 replacement; mismatches stop startup. The publication is created with
 `publish_via_partition_root = true`; one created before that setting was
 required stops startup with the `ALTER PUBLICATION` command that fixes it. The master role must be a PostgreSQL
-superuser to create the publication and event triggers. Choose
+superuser to create the publication and event triggers. `server
+print-ddl-triggers` prints the trigger SQL setup installs for the configured
+app, shard and publication, for installing or replacing it by hand. Choose
 `STREAMGRES_PUBLICATION` and `STREAMGRES_SCHEMAS` for the publication scope.
 Trigger names and the WAL message prefix come from `STREAMGRES_APP_ID` and
 `STREAMGRES_SHARD`; the triggers record the published schema before and after
@@ -192,6 +194,12 @@ naming the change. That includes dropping or renaming a column or table,
 changing a type or key, and adding a column with an expression default such as
 `now()`. Once restarted, the server loads the schema as it then is, and every
 client starts over. Plan those migrations as a restart.
+
+**A publication change that would leave served tables stale also stops the
+server**: turning off one of its change types or
+`publish_via_partition_root`, or adding a row filter to a served table. The
+log line gives the `ALTER PUBLICATION` that restores it; until then, startup
+refuses the publication. Changes to other publications are ignored.
 
 A client whose schema names a table or column the database does not have yet
 is refused with `SchemaVersionNotSupported`. Migrate the database before

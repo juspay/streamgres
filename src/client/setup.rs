@@ -11,6 +11,9 @@ use crate::sync::pg::sql::quote_ident;
 
 const SETUP_LOCK: i64 = 0x5354_524d_4752_4553;
 
+/// How to replace a DDL trigger stack setup refuses, and when not to.
+const REINSTALL: &str = "To install the stack this Streamgres version expects, run once on the primary and restart: `server print-ddl-triggers | psql \"$STREAMGRES_MASTER_PG_DSN\"`. If another deployment on this database uses the same STREAMGRES_APP_ID and STREAMGRES_SHARD, give this one its own instead: reinstalling would break the other.";
+
 pub async fn ensure(master_dsn: &str, config: &Config) -> Result<(), String> {
     let schema = config.upstream_schema();
     if !config.schemas.contains(&schema) {
@@ -242,7 +245,7 @@ async fn ensure_triggers(
             .is_some_and(|row| row.get(0));
         if snapshot_populated {
             return Err(format!(
-                "schema `{schema}` has a published schema snapshot but no DDL trigger stack; refusing to replace the snapshot"
+                "schema `{schema}` has a published schema snapshot but no DDL trigger stack; refusing to replace the snapshot. {REINSTALL}"
             ));
         }
         tx.batch_execute(&ddl_triggers::trigger_stack_sql(
@@ -285,7 +288,9 @@ async fn validate_triggers(
             )
             .await
             .map_err(|error| format!("validating DDL function `{signature}`: {error}"))?
-            .ok_or_else(|| format!("DDL trigger stack is incomplete: missing `{signature}`"))?;
+            .ok_or_else(|| {
+                format!("DDL trigger stack is incomplete: missing `{signature}`. {REINSTALL}")
+            })?;
         let result = match spec.name.as_str() {
             "get_trigger_context" => "record",
             "notice_ignore" | "update_schemas" => "void",
@@ -304,7 +309,7 @@ async fn validate_triggers(
             || row.get::<_, String>(3) != result
         {
             return Err(format!(
-                "DDL function `{signature}` differs from the expected Streamgres definition"
+                "DDL function `{signature}` differs from what this Streamgres version installs. {REINSTALL}"
             ));
         }
     }
@@ -353,7 +358,7 @@ async fn validate_triggers(
             )
             .await
             .map_err(|error| format!("validating DDL event trigger `{name}`: {error}"))?
-            .ok_or_else(|| format!("DDL trigger stack is incomplete: missing `{name}`"))?;
+            .ok_or_else(|| format!("DDL trigger stack is incomplete: missing `{name}`. {REINSTALL}"))?;
         let mut actual_tags = row.get::<_, Option<Vec<String>>>(2).unwrap_or_default();
         actual_tags.sort();
         if row.get::<_, String>(0) != event
@@ -368,7 +373,7 @@ async fn validate_triggers(
             || !row.get::<_, bool>(5)
         {
             return Err(format!(
-                "DDL event trigger `{name}` differs from the expected Streamgres definition"
+                "DDL event trigger `{name}` differs from what this Streamgres version installs. {REINSTALL}"
             ));
         }
     }
@@ -399,7 +404,7 @@ async fn validate_triggers(
     };
     if !matches {
         return Err(format!(
-            "schema `{schema}` has a missing or stale published schema snapshot"
+            "schema `{schema}` has a missing or stale published schema snapshot. {REINSTALL}"
         ));
     }
     Ok(())
@@ -666,7 +671,8 @@ mod tests {
                    'indexes', (SELECT COALESCE(json_agg(item ORDER BY item->>'schema' DESC, item->>'tableName' DESC, item->>'name' DESC), '[]'::json)
                               FROM json_array_elements(current->'indexes') AS i(item)),
                    'tables', (SELECT COALESCE(json_agg(item ORDER BY item->>'schema' DESC, item->>'name' DESC), '[]'::json)
-                              FROM json_array_elements(current->'tables') AS t(item))
+                              FROM json_array_elements(current->'tables') AS t(item)),
+                   'publications', current->'publications'
                  )",
                 quote_ident(&schema)
             ))
@@ -766,6 +772,37 @@ mod tests {
             .await
             .unwrap();
         ensure(&dsn, &config).await.unwrap();
+
+        // A stack that differs (here, a function edited by hand; after an
+        // upgrade, an older version's) is refused with the command that
+        // replaces it, and what that command prints, run by hand, is
+        // accepted.
+        client
+            .batch_execute(&format!(
+                "CREATE OR REPLACE FUNCTION {}.get_trigger_context()
+                 RETURNS record AS $$
+                 DECLARE result record;
+                 BEGIN SELECT 'edited' AS \"query\" INTO result; RETURN result; END
+                 $$ LANGUAGE plpgsql",
+                quote_ident(&schema)
+            ))
+            .await
+            .unwrap();
+        let refused = ensure(&dsn, &config).await.unwrap_err();
+        assert!(refused.contains("get_trigger_context"), "{refused}");
+        assert!(refused.contains("server print-ddl-triggers"), "{refused}");
+        let identity = crate::client::TriggerIdentity::from_lookup(&|name: &str| match name {
+            "STREAMGRES_APP_ID" => Some(app.clone()),
+            "STREAMGRES_PUBLICATION" => Some(publication.clone()),
+            _ => None,
+        })
+        .unwrap();
+        client
+            .batch_execute(&identity.trigger_stack_sql())
+            .await
+            .unwrap();
+        ensure(&dsn, &config).await.unwrap();
+
         let mut conflicting = config.clone();
         conflicting.app_id.push('x');
         let other_schema = conflicting.upstream_schema();

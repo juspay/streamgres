@@ -4,7 +4,10 @@
 //! zero-cache serves ([`crate::sync::pg::ddl`] reads the messages).
 //!
 //! Ported statement for statement from zero-cache's
-//! `change-source/pg/schema/{ddl,published}.ts` (Rocicorp, Apache-2.0).
+//! `change-source/pg/schema/{ddl,published}.ts` (Rocicorp, Apache-2.0),
+//! with one addition: the published schema also carries each
+//! publication's flags (`publications`), so that a change to what the
+//! publication sends is a schema change the server hears of.
 
 use crate::sync::pg::sql::{quote_ident, quote_literal};
 
@@ -270,7 +273,11 @@ tables AS (SELECT json_build_object(
 
     SELECT json_build_object(
       'tables', COALESCE((SELECT json_agg("table" ORDER BY "schema", "name") FROM tables), '[]'::json),
-      'indexes', COALESCE((SELECT json_agg("index" ORDER BY "schema", "tableName", "name") FROM indexes), '[]'::json)
+      'indexes', COALESCE((SELECT json_agg("index" ORDER BY "schema", "tableName", "name") FROM indexes), '[]'::json),
+      'publications', COALESCE((SELECT json_object_agg(pubname, json_build_object(
+          'insert', pubinsert, 'update', pubupdate, 'delete', pubdelete,
+          'truncate', pubtruncate, 'viaRoot', pubviaroot) ORDER BY pubname)
+        FROM pg_publication WHERE pubname IN (@PUBLICATIONS@)), '{}'::json)
     ) as "publishedSchema"
 $$ LANGUAGE sql;
 
@@ -461,6 +468,7 @@ mod tests {
         assert!(sql.contains("json_agg(\"table\" ORDER BY \"schema\", \"name\")"));
         assert!(sql.contains("json_agg(\"index\" ORDER BY \"schema\", \"tableName\", \"name\")"));
         assert!(sql.contains("json_object_agg(\"col\", \"dir\" ORDER BY \"pos\")"));
+        assert!(sql.contains("FROM pg_publication WHERE pubname IN ('zero_public_0', 'zero_meta')"));
         let unfilled = sql
             .split('@')
             .skip(1)

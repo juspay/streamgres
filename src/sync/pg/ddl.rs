@@ -19,6 +19,7 @@ use serde::Deserialize;
 use tokio_postgres::Client;
 
 use super::catalog::{carriable_name, scalar_type, table_name};
+use super::sql::quote_ident;
 use super::text;
 use crate::ivm::SchemaChange;
 use crate::model::{Catalog, DbColumn, DbTable, TableName, Value, ValueType};
@@ -61,14 +62,62 @@ pub struct DdlEvent {
     pub tag: String,
 }
 
-/// The published schema at one moment: its tables (indexes are not read).
+/// The published schema at one moment: its tables (indexes are not read)
+/// and what each of the server's publications sends.
 #[derive(Debug, Deserialize)]
 pub struct PublishedSchema {
     pub tables: Vec<PublishedTable>,
+    #[serde(default)]
+    pub publications: HashMap<String, PublicationFlags>,
 }
 
-/// One published table: its schema and name, its columns by name, and its
-/// primary key in order.
+/// What a publication sends: its change types and whether a partitioned
+/// table's changes come under its root's name.
+#[derive(Debug, Deserialize)]
+pub struct PublicationFlags {
+    pub insert: bool,
+    pub update: bool,
+    pub delete: bool,
+    pub truncate: bool,
+    #[serde(rename = "viaRoot")]
+    pub via_root: bool,
+}
+
+impl PublicationFlags {
+    /// Why the change feed could no longer follow its tables under these
+    /// flags, with the command that restores them; `None` when it can.
+    /// The rule setup applies before the server starts.
+    fn broken(&self, name: &str) -> Option<String> {
+        let missing: Vec<&str> = [
+            ("insert", self.insert),
+            ("update", self.update),
+            ("delete", self.delete),
+            ("truncate", self.truncate),
+        ]
+        .into_iter()
+        .filter(|(_, on)| !on)
+        .map(|(kind, _)| kind)
+        .collect();
+        if !missing.is_empty() {
+            return Some(format!(
+                "publication `{name}` no longer publishes {}, so those changes would never arrive; restore it with ALTER PUBLICATION {} SET (publish = 'insert, update, delete, truncate')",
+                missing.join(", "),
+                quote_ident(name)
+            ));
+        }
+        if !self.via_root {
+            return Some(format!(
+                "publication `{name}` no longer publishes partitioned tables through their root, so their changes would arrive under the partitions' names; restore it with ALTER PUBLICATION {} SET (publish_via_partition_root = true)",
+                quote_ident(name)
+            ));
+        }
+        None
+    }
+}
+
+/// One published table: its schema and name, its columns by name, its
+/// primary key in order, and how each of the server's publications
+/// publishes it.
 #[derive(Debug, Deserialize)]
 pub struct PublishedTable {
     pub schema: String,
@@ -76,6 +125,15 @@ pub struct PublishedTable {
     pub columns: HashMap<String, PublishedColumn>,
     #[serde(rename = "primaryKey", default)]
     pub primary_key: Vec<String>,
+    #[serde(default)]
+    pub publications: HashMap<String, TablePublication>,
+}
+
+/// How one publication publishes a table: its row filter, if any.
+#[derive(Debug, Deserialize)]
+pub struct TablePublication {
+    #[serde(rename = "rowFilter")]
+    pub row_filter: Option<String>,
 }
 
 /// One published column: its type as `pg_type` names it (an array as
@@ -311,6 +369,23 @@ pub fn classify(
     let served = |table: &PublishedTable| {
         schemas.contains(&table.schema) && carriable_name(&table.schema, &table.name)
     };
+    let mut publications: Vec<_> = after.publications.iter().collect();
+    publications.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, flags) in publications {
+        if let Some(reason) = flags.broken(name) {
+            return Err(reason);
+        }
+    }
+    for table in after.tables.iter().filter(|table| served(table)) {
+        for (publication, entry) in &table.publications {
+            if let Some(filter) = &entry.row_filter {
+                return Err(format!(
+                    "table `{}` is now published by `{publication}` with a row filter ({filter}), so rows outside it would never be updated; remove the filter",
+                    table.catalog_name()
+                ));
+            }
+        }
+    }
     let before: HashMap<String, &PublishedTable> = message
         .previous
         .iter()
@@ -631,6 +706,100 @@ mod tests {
             Some(ValueType::List(Box::new(ValueType::String)))
         );
         assert_eq!(column_type(&column("bytea", "b")), None);
+    }
+
+    /// A `ddlUpdate` whose schema after the change carries `publications`
+    /// (the trigger's flags object) beside `after`'s tables.
+    fn message_with_publications(previous: &str, after: &str, publications: &str) -> DdlMessage {
+        DdlMessage::parse(&format!(
+            r#"{{"type": "ddlUpdate", "version": 1, "event": {{"tag": "ALTER PUBLICATION"}},
+                 "previousSchema": {{"tables": [{previous}], "indexes": []}},
+                 "schema": {{"tables": [{after}], "indexes": [], "publications": {publications}}}}}"#
+        ))
+        .expect("a message")
+    }
+
+    /// The trigger's flags object for publication `pub` with every flag on
+    /// but `off`.
+    fn flags_without(off: &str) -> String {
+        let flag = |name: &str| name != off;
+        format!(
+            r#"{{"pub": {{"insert": {}, "update": {}, "delete": {}, "truncate": {}, "viaRoot": {}}}}}"#,
+            flag("insert"),
+            flag("update"),
+            flag("delete"),
+            flag("truncate"),
+            flag("viaRoot")
+        )
+    }
+
+    /// A publication that stops sending a change type, or stops sending
+    /// partitioned tables through their root, stops the feed with the
+    /// command that restores it; one that sends everything changes nothing.
+    #[test]
+    fn a_publication_that_stops_sending_a_change_stops_the_feed() {
+        let tickets = published("tickets", TICKETS, &["id"]);
+        for off in ["insert", "update", "delete", "truncate"] {
+            let error = classify(
+                &catalog(),
+                &["public".into()],
+                &message_with_publications(&tickets, &tickets, &flags_without(off)),
+            )
+            .expect_err(off);
+            assert!(error.contains(&format!("no longer publishes {off}")), "{error}");
+            assert!(
+                error.contains(
+                    "ALTER PUBLICATION \"pub\" SET (publish = 'insert, update, delete, truncate')"
+                ),
+                "{error}"
+            );
+        }
+        let error = classify(
+            &catalog(),
+            &["public".into()],
+            &message_with_publications(&tickets, &tickets, &flags_without("viaRoot")),
+        )
+        .expect_err("via root");
+        assert!(
+            error.contains("SET (publish_via_partition_root = true)"),
+            "{error}"
+        );
+        let intact = classify(
+            &catalog(),
+            &["public".into()],
+            &message_with_publications(&tickets, &tickets, &flags_without("")),
+        )
+        .expect("every flag on");
+        assert!(intact.changes.is_empty());
+    }
+
+    /// A row filter on a served table stops the feed; one on a table of a
+    /// schema the server does not serve changes nothing.
+    #[test]
+    fn a_row_filter_on_a_served_table_stops_the_feed() {
+        let tickets = published("tickets", TICKETS, &["id"]);
+        let filtered = tickets.replace(
+            r#""publications": {}"#,
+            r#""publications": {"pub": {"rowFilter": "(id > 0)"}}"#,
+        );
+        assert_ne!(tickets, filtered, "the payload carries the filter");
+        let error = classify(
+            &catalog(),
+            &["public".into()],
+            &message_with_publications(&tickets, &filtered, &flags_without("")),
+        )
+        .expect_err("a filtered served table");
+        assert!(error.contains("`tickets`"), "{error}");
+        assert!(error.contains("row filter ((id > 0))"), "{error}");
+
+        let elsewhere = filtered.replace(r#""schema": "public""#, r#""schema": "audit""#);
+        let unserved = classify(
+            &catalog(),
+            &["public".into()],
+            &message_with_publications(&tickets, &format!("{tickets}, {elsewhere}"), &flags_without("")),
+        )
+        .expect("a filter outside the served schemas");
+        assert!(unserved.changes.is_empty());
     }
 
     /// A table added with a dot in its name is not carried: its catalog
