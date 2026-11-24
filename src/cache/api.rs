@@ -115,10 +115,19 @@ impl std::error::Error for Error {
 
 /// A statement and its bind values, each sent in Postgres's binary
 /// format with its type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Sql {
     text: String,
     binds: Vec<Bind>,
+}
+
+impl std::fmt::Debug for Sql {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sql")
+            .field("statement_bytes", &self.text.len())
+            .field("bind_count", &self.binds.len())
+            .finish()
+    }
 }
 
 impl Sql {
@@ -721,13 +730,14 @@ impl Streamgres {
         }
         let cache = &self.inner.cache;
         let check = cache.reader_check()?;
+        let checked = Instant::now();
         let row = cache
             .engine()
             .check_origin(check.sql, [check.names, check.as_written, check.qualified])
             .await
             .map_err(Refusal::NotReady)?;
         let excluded = row.first().map(String::as_str).unwrap_or("");
-        let reader = Reader::new(excluded, check.version);
+        let reader = Reader::checked_at(excluded, check.version, checked);
         *self
             .inner
             .reader
@@ -803,6 +813,7 @@ impl Streamgres {
             let engine = self.inner.cache.engine();
             let catalog = engine.origin_catalog().await.map_err(Refusal::NotReady)?;
             let check = super::ReaderCheck::of(&catalog);
+            let checked = Instant::now();
             let row = engine
                 .check_origin(check.sql, [check.names, check.as_written, check.qualified])
                 .await
@@ -810,7 +821,7 @@ impl Streamgres {
             let excluded = row
                 .first()
                 .ok_or_else(|| Refusal::NotReady("admission check returned no row".into()))?;
-            let reader = Reader::new(excluded, check.version);
+            let reader = Reader::checked_at(excluded, check.version, checked);
             *admission = Some(Admission {
                 catalog,
                 reader,
@@ -985,7 +996,13 @@ impl Streamgres {
         };
         let read = cache
             .engine()
-            .read_origin(&sql.text, &sql.binds, *timeout, permit)
+            .read_origin(
+                &sql.text,
+                &sql.binds,
+                *timeout,
+                self.inner.on_unsupported == OnUnsupported::Error,
+                permit,
+            )
             .await;
         cache.count_fallback(read.is_ok());
         read.map_err(Error::Origin)

@@ -18,6 +18,10 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Covers authorization changes that have no database-local DDL event.
+const AUTHORIZATION_TTL: Duration = Duration::from_secs(5);
 
 use crate::model::{Catalog, TableName};
 use crate::sync::pg::sql::{quote_ident, quote_table};
@@ -112,6 +116,7 @@ impl ReaderCheck {
 pub struct Reader {
     excluded: Option<HashSet<TableName>>,
     version: CatalogVersion,
+    checked: Instant,
 }
 
 impl Reader {
@@ -119,18 +124,28 @@ impl Reader {
     /// the JSON array of table names returned by the check, checked
     /// against catalog `version`. Invalid input refuses every table, never
     /// grants access.
+    #[cfg(test)]
     pub fn new(excluded: &str, version: CatalogVersion) -> Self {
+        Self::checked_at(excluded, version, Instant::now())
+    }
+
+    pub fn checked_at(excluded: &str, version: CatalogVersion, checked: Instant) -> Self {
         Reader {
             excluded: serde_json::from_str::<Vec<String>>(excluded)
                 .ok()
                 .map(|names| names.into_iter().map(TableName::from).collect()),
             version,
+            checked,
         }
     }
 
     /// Whether this reader was checked against `version`.
     pub fn is_current(&self, version: &CatalogVersion) -> bool {
-        self.version == *version
+        self.version == *version && self.is_fresh()
+    }
+
+    pub(super) fn is_fresh(&self) -> bool {
+        self.checked.elapsed() < AUTHORIZATION_TTL
     }
 
     /// Why this reader cannot be answered for `table`, if it cannot.
@@ -148,6 +163,14 @@ impl Reader {
 mod tests {
     use super::*;
     use crate::model::{DbColumn, DbTable, ValueType};
+
+    #[test]
+    fn authorization_expires_even_when_catalog_is_unchanged() {
+        let version = CatalogVersion::of(&Arc::new(Catalog::new(vec![])));
+        let checked = Instant::now() - AUTHORIZATION_TTL;
+        let reader = Reader::checked_at("[]", version.clone(), checked);
+        assert!(!reader.is_current(&version));
+    }
 
     #[test]
     fn exclusions_preserve_every_character_and_fail_closed() {

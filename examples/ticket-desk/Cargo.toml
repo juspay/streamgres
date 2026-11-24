@@ -12,6 +12,8 @@ name = "demo"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
+subtle = "2"
 streamgres-diesel = { version = "0.1.0", path = "../../crates/streamgres-diesel" }
 # The Postgres backend without libpq: every connection is diesel-async's.
 diesel = { version = "=2.3.14", default-features = false, features = ["postgres_backend", "chrono"] }

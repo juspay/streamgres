@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:17
+    pull_policy: always
     environment:
       POSTGRES_DB: ticketdesk
       POSTGRES_USER: postgres
@@ -19,6 +20,7 @@ services:
       dockerfile: examples/ticket-desk/Dockerfile
     environment:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ticketdesk
+      DEMO_AUTH_TOKEN: ${DEMO_AUTH_TOKEN:?set DEMO_AUTH_TOKEN for the ticket desk}
       DEMO_WRITER_RATE: "8"
     ports:
       - "127.0.0.1:${DEMO_HTTP_PORT:-8080}:8080"

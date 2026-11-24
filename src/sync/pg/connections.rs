@@ -15,6 +15,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use bytes::BytesMut;
 use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
@@ -203,6 +204,83 @@ impl<'a> FromSql<'a> for RawCell {
     }
 }
 
+async fn prepare_binary(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    binds: &[Bind],
+) -> Result<tokio_postgres::Statement, SessionError> {
+    // Declare custom types by their own OID so Postgres never infers them
+    // as unknown, which can fail when the bind alone gives the type.
+    let types: Vec<Type> = binds
+        .iter()
+        .map(|bind| {
+            Type::from_oid(bind.type_oid).unwrap_or_else(|| {
+                Type::new(String::new(), bind.type_oid, Kind::Simple, String::new())
+            })
+        })
+        .collect();
+    Ok(client.prepare_typed(sql, &types).await?)
+}
+
+async fn query_binary(
+    client: &tokio_postgres::Client,
+    statement: &tokio_postgres::Statement,
+    binds: &[Bind],
+) -> Result<RawRows, SessionError> {
+    let params: Vec<RawParam<'_>> = binds
+        .iter()
+        .map(|bind| RawParam(bind.bytes.as_deref()))
+        .collect();
+    let refs: Vec<&(dyn ToSql + Sync)> = params
+        .iter()
+        .map(|param| param as &(dyn ToSql + Sync))
+        .collect();
+    let rows = client.query(statement, &refs).await?;
+    let columns: Vec<RawColumn> = statement
+        .columns()
+        .iter()
+        .map(|column| RawColumn {
+            name: column.name().to_owned(),
+            type_oid: column.type_().oid(),
+        })
+        .collect();
+    let rows = rows
+        .iter()
+        .map(|row| {
+            (0..columns.len())
+                .map(|index| {
+                    row.try_get::<_, RawCell>(index)
+                        .map(|cell| cell.0)
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(RawRows { columns, rows })
+}
+
+const FALLBACK_TIMEOUTS: &str = "SELECT pg_catalog.set_config(name,
+    CASE WHEN setting::pg_catalog.int8 = 0 THEN $1
+         ELSE LEAST(setting::pg_catalog.int8, $1::pg_catalog.int8)::pg_catalog.text
+    END, true)
+    FROM pg_catalog.pg_settings
+    WHERE name IN ('statement_timeout', 'idle_in_transaction_session_timeout')";
+
+async fn fallback_sequential(
+    session: &mut dyn Session,
+    sql: &str,
+    binds: &[Bind],
+    millis: u128,
+) -> Result<RawRows, SessionError> {
+    session.execute("BEGIN READ ONLY").await?;
+    session
+        .query(FALLBACK_TIMEOUTS, &[text(&millis.to_string())])
+        .await?;
+    let rows = session.query(sql, binds).await?;
+    session.execute("ROLLBACK").await?;
+    Ok(rows)
+}
+
 impl Session for tokio_postgres::Client {
     fn query<'a>(
         &'a mut self,
@@ -210,49 +288,8 @@ impl Session for tokio_postgres::Client {
         binds: &'a [Bind],
     ) -> ConnectionFuture<'a, Result<RawRows, SessionError>> {
         Box::pin(async move {
-            // A type the driver does not know (an enum, a domain, their
-            // arrays) is still declared by its own OID, as the application's
-            // driver declares it: `unknown` would leave Postgres to infer it,
-            // which fails or differs where the bind alone gives the type.
-            let types: Vec<Type> = binds
-                .iter()
-                .map(|bind| {
-                    Type::from_oid(bind.type_oid).unwrap_or_else(|| {
-                        Type::new(String::new(), bind.type_oid, Kind::Simple, String::new())
-                    })
-                })
-                .collect();
-            let statement = self.prepare_typed(sql, &types).await?;
-            let params: Vec<RawParam<'_>> = binds
-                .iter()
-                .map(|bind| RawParam(bind.bytes.as_deref()))
-                .collect();
-            let refs: Vec<&(dyn ToSql + Sync)> = params
-                .iter()
-                .map(|param| param as &(dyn ToSql + Sync))
-                .collect();
-            let rows = tokio_postgres::Client::query(self, &statement, &refs).await?;
-            let columns: Vec<RawColumn> = statement
-                .columns()
-                .iter()
-                .map(|column| RawColumn {
-                    name: column.name().to_owned(),
-                    type_oid: column.type_().oid(),
-                })
-                .collect();
-            let rows = rows
-                .iter()
-                .map(|row| {
-                    (0..columns.len())
-                        .map(|index| {
-                            row.try_get::<_, RawCell>(index)
-                                .map(|cell| cell.0)
-                                .map_err(|error| error.to_string())
-                        })
-                        .collect::<Result<Vec<_>, String>>()
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            Ok(RawRows { columns, rows })
+            let statement = prepare_binary(self, sql, binds).await?;
+            query_binary(self, &statement, binds).await
         })
     }
 
@@ -267,30 +304,61 @@ impl Connection for tokio_postgres::Client {
     }
 }
 
-/// An exclusive checkout, discarded unless its operation completes
-/// successfully ([`Lease::recycle`]); timeout, cancellation and unwinding
-/// discard it too.
+/// An exclusive checkout, discarded unless Streamgres explicitly
+/// returns it to its pool.
 pub struct Lease {
-    connection: Option<Box<dyn Connection>>,
+    connection: Option<LeasedConnection>,
+}
+
+enum LeasedConnection {
+    Application(Box<dyn Connection>),
+    BuiltIn(Pooled),
 }
 
 impl Lease {
     pub fn new(connection: impl Connection) -> Self {
         Self {
-            connection: Some(Box::new(connection)),
+            connection: Some(LeasedConnection::Application(Box::new(connection))),
         }
     }
 
-    /// Returns the connection to its pool after a successful operation.
+    /// Returns a clean connection to its pool.
     pub(crate) fn recycle(mut self) {
         self.connection.take();
     }
 
-    fn connection(&mut self) -> &mut dyn Connection {
-        // Taken only while consuming or dropping the lease.
+    fn connection(&mut self) -> &mut LeasedConnection {
         self.connection
-            .as_deref_mut()
+            .as_mut()
             .expect("a live checkout has a connection")
+    }
+
+    fn session(&mut self) -> &mut dyn Session {
+        match self.connection() {
+            LeasedConnection::Application(connection) => connection.as_mut(),
+            LeasedConnection::BuiltIn(connection) => connection,
+        }
+    }
+
+    /// An outer error discards the checkout. A built-in checkout may
+    /// return an inner query error after PostgreSQL confirms rollback.
+    pub(crate) async fn fallback_read(
+        &mut self,
+        sql: &str,
+        binds: &[Bind],
+        remaining: Duration,
+        reuse: bool,
+    ) -> Result<Result<RawRows, SessionError>, SessionError> {
+        let millis = remaining.as_millis().clamp(1, i32::MAX as u128);
+        match self.connection() {
+            LeasedConnection::BuiltIn(connection) => {
+                connection.fallback_read(sql, binds, millis, reuse).await
+            }
+            LeasedConnection::Application(connection) => {
+                let rows = fallback_sequential(connection.as_mut(), sql, binds, millis).await?;
+                Ok(Ok(rows))
+            }
+        }
     }
 }
 
@@ -300,18 +368,22 @@ impl Session for Lease {
         sql: &'a str,
         binds: &'a [Bind],
     ) -> ConnectionFuture<'a, Result<RawRows, SessionError>> {
-        self.connection().query(sql, binds)
+        self.session().query(sql, binds)
     }
 
     fn execute<'a>(&'a mut self, sql: &'a str) -> ConnectionFuture<'a, Result<(), SessionError>> {
-        self.connection().execute(sql)
+        self.session().execute(sql)
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        if let Some(connection) = self.connection.take() {
-            connection.discard();
+        match self.connection.take() {
+            Some(LeasedConnection::Application(connection)) => connection.discard(),
+            Some(LeasedConnection::BuiltIn(mut connection)) => {
+                connection.client.take();
+            }
+            None => {}
         }
     }
 }
@@ -333,14 +405,14 @@ where
 }
 
 /// Streamgres's own pool: up to `size` connections to the database,
-/// opened as needed and kept while idle. A connection returned after a
-/// failed or cancelled operation is closed, never reused.
+/// opened as needed and kept while idle. Unverified sessions are closed
+/// when a checkout is dropped.
 pub(crate) struct OwnPool(std::sync::Arc<OwnShared>);
 
 struct OwnShared {
     config: tokio_postgres::Config,
     permits: std::sync::Arc<tokio::sync::Semaphore>,
-    idle: std::sync::Mutex<Vec<tokio_postgres::Client>>,
+    idle: std::sync::Mutex<Vec<DrivenClient>>,
 }
 
 impl OwnPool {
@@ -374,7 +446,7 @@ impl Connections for OwnPool {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .pop();
                 match client {
-                    Some(client) if client.is_closed() => continue,
+                    Some(client) if client.client.is_closed() => continue,
                     other => break other,
                 }
             };
@@ -386,33 +458,83 @@ impl Connections for OwnPool {
                             shared.config.connect(tokio_postgres::NoTls).await.map_err(
                                 |error| format!("connecting Streamgres's pool: {error}"),
                             )?;
-                        tokio::spawn(async move {
+                        let driver = tokio::spawn(async move {
                             let _ = connection.await;
                         });
-                        client
+                        DrivenClient { client, driver }
                     }
                 };
-            Ok(Lease::new(Pooled {
-                client: Some(client),
-                shared,
-                _permit: permit,
-            }))
+            Ok(Lease {
+                connection: Some(LeasedConnection::BuiltIn(Pooled {
+                    client: Some(client),
+                    shared,
+                    _permit: permit,
+                })),
+            })
         })
+    }
+}
+
+/// Owns the socket's driver. A discarded session closes its socket
+/// instead of leaving the detached driver draining a timed-out request.
+struct DrivenClient {
+    client: tokio_postgres::Client,
+    driver: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for DrivenClient {
+    fn drop(&mut self) {
+        self.driver.abort();
     }
 }
 
 /// A connection of [`OwnPool`], returned to it when dropped.
 struct Pooled {
-    client: Option<tokio_postgres::Client>,
+    client: Option<DrivenClient>,
     shared: std::sync::Arc<OwnShared>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl Pooled {
     fn client(&mut self) -> &mut tokio_postgres::Client {
-        self.client
+        &mut self
+            .client
             .as_mut()
             .expect("a pooled connection has its client until dropped")
+            .client
+    }
+
+    async fn fallback_read(
+        &mut self,
+        sql: &str,
+        binds: &[Bind],
+        millis: u128,
+        reuse: bool,
+    ) -> Result<Result<RawRows, SessionError>, SessionError> {
+        let client = self.client();
+        // Only the computed integer enters this batch. The application
+        // statement is prepared separately after the transaction is ready.
+        let timeouts = FALLBACK_TIMEOUTS.replace("$1", &format!("'{millis}'"));
+        client
+            .batch_execute(&format!("BEGIN READ ONLY; {timeouts}"))
+            .await?;
+        let statement = prepare_binary(client, sql, binds).await?;
+        if !reuse {
+            // The lease closes the socket, which ends the transaction.
+            let rows = query_binary(client, &statement, binds).await?;
+            return Ok(Ok(rows));
+        }
+        // Poll execution first so both messages reach Postgres in order.
+        // Wait for rollback even when execution reports an error.
+        let (query, rollback) = tokio::join!(
+            biased;
+            query_binary(client, &statement, binds),
+            client.batch_execute("ROLLBACK"),
+        );
+        match rollback {
+            Ok(()) => Ok(query),
+            Err(error) => Err(query.err().unwrap_or_else(|| error.into())),
+        }
     }
 }
 
@@ -430,17 +552,10 @@ impl Session for Pooled {
     }
 }
 
-impl Connection for Pooled {
-    fn discard(mut self: Box<Self>) {
-        // Closed with its client, never back in the pool.
-        self.client.take();
-    }
-}
-
 impl Drop for Pooled {
     fn drop(&mut self) {
         if let Some(client) = self.client.take()
-            && !client.is_closed()
+            && !client.client.is_closed()
         {
             self.shared
                 .idle
@@ -851,3 +966,7 @@ mod tests {
         assert!(rows.int(1, 0).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "connections/fallback_tests.rs"]
+mod fallback_tests;

@@ -1,7 +1,9 @@
 """HTTP checks against the isolated container showcase; standard library only."""
 
 import argparse
+import base64
 import json
+import os
 import subprocess
 import time
 import urllib.request
@@ -23,11 +25,15 @@ record = {}
 
 def call(path, data=None):
     payload = None if data is None else json.dumps(data).encode()
+    headers = {"Content-Type": "application/json"} if payload else {}
     request = urllib.request.Request(
         base + path,
         data=payload,
-        headers={"Content-Type": "application/json"} if payload else {},
+        headers=headers,
     )
+    if token := os.environ.get("DEMO_AUTH_TOKEN"):
+        encoded = base64.b64encode(f"demo:{token}".encode()).decode()
+        request.add_unredirected_header("Authorization", f"Basic {encoded}")
     with urllib.request.urlopen(request, timeout=45) as response:
         return json.load(response)
 

@@ -21,7 +21,7 @@ Open <http://127.0.0.1:8080>. `--init` creates and seeds a missing fixture and
 installs the publication and trigger stack; it keeps an existing dataset.
 `--seed` replaces the demo's rows. `DEMO_SCALE` multiplies the fixture's 180
 tickets across three organizations. Add `--lab` to enable the schema and fault
-experiments (loopback only).
+experiments. They require a loopback connection or authentication.
 
 Other commands:
 
@@ -107,6 +107,7 @@ DROP TYPE IF EXISTS ticket_kind;
 ## Run in containers
 
 ```sh
+export DEMO_AUTH_TOKEN="$(openssl rand -hex 32)"
 docker compose -f examples/ticket-desk/docker-compose.yml up --build -d
 ```
 
@@ -115,11 +116,20 @@ Postgres is internal to the Compose network and keeps its data in a volume.
 The image runs as UID 10001 and needs no libpq. SIGTERM and Ctrl-C stop
 Streamgres gracefully, dropping its replication slot.
 
+### Listener authentication
+
+A direct loopback listener works without credentials. For any listener bound
+outside loopback, including the Compose container, set a strong
+`DEMO_AUTH_TOKEN` before starting. Sign in as `demo` with the token as the
+password. The container smoke script reads the same environment variable.
+Use TLS at the reverse proxy when exposing the demo beyond the local machine.
+
 ## Configuration
 
 | Flag | Environment | Default |
 |---|---|---|
 | `--listen` | `DEMO_LISTEN` | `127.0.0.1:8080` |
+| None | `DEMO_AUTH_TOKEN` | Unset. Required outside loopback. |
 | `--pool-size` | `DEMO_POOL_SIZE` | 8: the app pool has 2 more; Streamgres opens its own 8 |
 | `--writer-rate` | `DEMO_WRITER_RATE` | 8 operations per second |
 | `--max-bytes` | `DEMO_MAX_BYTES` | 268435456 |

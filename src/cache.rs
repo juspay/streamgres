@@ -274,6 +274,9 @@ impl Cache {
         reader: &Reader,
         ttl: Option<Ttl>,
     ) -> Result<Rows, Refusal> {
+        if !reader.is_fresh() {
+            return Err(Refusal::NotReady("the reader's authorization check expired".to_owned()));
+        }
         if self.oversized_binds(binds) {
             let admitted = self
                 .answer_catalog(reader)

@@ -99,6 +99,7 @@ pub(crate) trait Engine: Send + Sync + 'static {
         sql: &'a str,
         binds: &'a [Bind],
         timeout: Duration,
+        reuse_session: bool,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> SendFuture<'a, Result<Rows, SessionError>>;
 
@@ -320,6 +321,7 @@ pub(super) mod tests {
             _sql: &'a str,
             _binds: &'a [Bind],
             _timeout: Duration,
+            _reuse_session: bool,
             _permit: tokio::sync::OwnedSemaphorePermit,
         ) -> SendFuture<'a, Result<Rows, SessionError>> {
             Box::pin(async { Err(SessionError::Other("no origin".to_owned())) })

@@ -77,7 +77,7 @@ async fn the_desk_over_http() {
     let base = format!("http://{}", listener.local_addr().unwrap());
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(
-        axum::serve(listener, service::router(app.clone()))
+        axum::serve(listener, service::router(app.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>())
             .with_graceful_shutdown(async {
                 let _ = stop_rx.await;
             })
@@ -243,7 +243,7 @@ async fn the_desk_over_http() {
     .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(axum::serve(listener, service::router(app.clone())).into_future());
+    let server = tokio::spawn(axum::serve(listener, service::router(app.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>()).into_future());
     let answer = post(
         &client,
         &base,

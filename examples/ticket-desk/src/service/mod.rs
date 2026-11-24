@@ -15,6 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use subtle::ConstantTimeEq as _;
+
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event as SseEvent, KeepAlive};
@@ -318,8 +321,39 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
-/// Lab routes only through a loopback host, changes only from the page's
-/// own origin, and nothing cached by the browser.
+#[derive(Clone)]
+struct Authenticated;
+
+/// Protect the entire listener when it is exposed outside loopback.
+async fn require_auth(
+    State(expected): State<Arc<str>>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !has_valid_auth(request.headers(), &expected) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Basic realm=\"Ticket desk\"")],
+        )
+            .into_response();
+    }
+    request.extensions_mut().insert(Authenticated);
+    next.run(request).await
+}
+
+fn has_valid_auth(headers: &axum::http::HeaderMap, expected: &str) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .is_some_and(|(scheme, encoded)| {
+            scheme.eq_ignore_ascii_case("basic")
+                && bool::from(encoded.as_bytes().ct_eq(expected.as_bytes()))
+        })
+}
+
+/// Requests require authentication or an actual loopback peer with a
+/// loopback Host. Origin validation is separate from authentication.
 async fn guard(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let host = request
         .headers()
@@ -327,16 +361,17 @@ async fn guard(request: axum::extract::Request, next: axum::middleware::Next) ->
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_owned();
-    if request.uri().path().starts_with("/api/lab/") {
-        let local = host
-            .parse::<axum::http::uri::Authority>()
-            .is_ok_and(|host| matches!(host.host(), "127.0.0.1" | "localhost" | "[::1]" | "::1"));
-        if !local {
-            return ApiError::BadRequest(
-                "Experiments are available only through a loopback host.".into(),
-            )
+    let authenticated = request.extensions().get::<Authenticated>().is_some();
+    let loopback_host = host
+        .parse::<axum::http::uri::Authority>()
+        .is_ok_and(|host| matches!(host.host(), "127.0.0.1" | "localhost" | "[::1]" | "::1"));
+    let loopback_peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+        .is_some_and(|peer| peer.0.ip().is_loopback());
+    if !(authenticated || loopback_host && loopback_peer) {
+        return ApiError::BadRequest("Use a loopback connection or authenticate.".into())
             .into_response();
-        }
     }
     if !matches!(
         *request.method(),
@@ -346,6 +381,7 @@ async fn guard(request: axum::extract::Request, next: axum::middleware::Next) ->
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
         && origin != format!("http://{host}")
+        && !(authenticated && origin == format!("https://{host}"))
     {
         return ApiError::BadRequest("Cross-origin changes are not accepted.".into())
             .into_response();
@@ -914,6 +950,10 @@ pub async fn serve(dsn: String, options: Options) -> Result<(), String> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|error| format!("Installing the shutdown handler: {error}"))?;
     let listen = options.listen;
+    let token = std::env::var("DEMO_AUTH_TOKEN").ok().filter(|token| !token.is_empty());
+    if !listen.ip().is_loopback() && token.is_none() {
+        return Err("Set DEMO_AUTH_TOKEN before listening outside loopback.".to_owned());
+    }
     let app = start(dsn, options).await?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
@@ -923,7 +963,17 @@ pub async fn serve(dsn: String, options: Options) -> Result<(), String> {
         listener.local_addr().map_err(|error| error.to_string())?
     );
     let shutdown = app.clone();
-    axum::serve(listener, router(app))
+    let mut routes = router(app);
+    if let Some(token) = token {
+        let expected: Arc<str> = base64::engine::general_purpose::STANDARD
+            .encode(format!("demo:{token}"))
+            .into();
+        routes = routes.layer(axum::middleware::from_fn_with_state(expected, require_auth));
+    }
+    axum::serve(
+        listener,
+        routes.into_make_service_with_connect_info::<SocketAddr>(),
+    )
         .with_graceful_shutdown(async move {
             #[cfg(unix)]
             tokio::select! {
@@ -936,4 +986,18 @@ pub async fn serve(dsn: String, options: Options) -> Result<(), String> {
         })
         .await
         .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod authentication_tests {
+    use super::*;
+
+    #[test]
+    fn basic_auth_requires_the_expected_credential() {
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(!has_valid_auth(&headers, "ZGVtbzpsb2NhbA=="));
+        headers.insert(header::AUTHORIZATION, "Basic ZGVtbzpsb2NhbA==".parse().unwrap());
+        assert!(has_valid_auth(&headers, "ZGVtbzpsb2NhbA=="));
+        assert!(!has_valid_auth(&headers, "ZGVtbzpsb2NhYg=="));
+    }
 }

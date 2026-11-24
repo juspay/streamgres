@@ -171,7 +171,7 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 | WAL replication, exported-snapshot minting, slot create and drop | Dedicated connections |
 
 - Streamgres's pool is its own: `pool_size` connections to `connect(dsn)`, opened on demand and kept idle. The application's pool is never used or sized for it.
-- A checkout is exclusive and outside a transaction. A successful operation returns it; failure, timeout, cancellation and unwinding close it, so an unfinished transaction is never reused.
+- A checkout is exclusive and outside a transaction. A successful operation normally returns it. Failure, timeout, cancellation and unwinding discard it. Fallback in permissive SQL mode discards the checkout even after success, since arbitrary read expressions can change session state.
 - The role of `connect(dsn)` needs replication privileges and read access to the carried tables.
 - `Debug` of a `Builder` shows the DSN only as its parsed user, hosts, ports and database (and `password=***` when one is set), never the string itself.
 
@@ -191,8 +191,8 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 - Those checkouts run on the application's Tokio runtime, the one `start()` is called on, so connections the pool opens never depend on Streamgres's runtime. With `.connections(..)`, `start()` must be called inside it.
 - Every checkout must target the replicated database with one role, search path and session policy. Switching role or tenant per request is not supported by a shared cache.
 - Storage reads on those checkouts run statement by statement, and binary cells are converted to Postgres's text for the engine. Every column a storage read selects is cast to `int8`, `float8`, `text`, `bool`, `date` or `timestamp`, all of which the conversion covers.
-- Admission excludes every RLS-enabled table, including for bypass roles: the WAL stream does not enforce row policies. Embedded-library DDL commits invalidate reader checks even when column shapes do not change. Admission follows observed replication commits; immediate access revocation requires coordinating policy changes with application shutdown.
-- A schema change needs a fresh reader check on a pool connection; while every pool connection is held by slow fallback reads, warm queries fall back until one frees.
+- Admission excludes every RLS-enabled table, including for bypass roles: the WAL stream does not enforce row policies. Embedded-library DDL commits invalidate reader checks even when column shapes do not change. Reinstall `Builder::setup_sql()` on existing installations to enable the database-local GRANT and REVOKE invalidation trigger. An authorization check expires after five seconds even without a WAL signal, covering role membership changes and installations awaiting the trigger upgrade. Failed revalidation cannot authorize a memory read. Immediate revocation still requires coordinating with the application.
+- A schema change or an expired authorization check needs a fresh reader check on a pool connection; while every pool connection is held by slow fallback reads, warm queries fall back until one frees.
 - Source-position sampling has a connection of its own, so a pool saturated by fallback reads cannot starve it and turn every read into a fallback. It samples the `connect(dsn)` endpoint, primary or standby. Each sample has a two-second deadline covering connecting, execution and decoding; a failure records its cause, drops the connection, leaves freshness to expire and retries.
 - `Connections` hands out a `Lease` over a `Session` (`query(sql, binds)` returning cells with their type OIDs, and `execute(sql)`). Any pool can implement it.
 - A `Session` declares every bind by its type OID, custom types included, as the application's own driver does; `unknown` would let Postgres infer a type the bind alone decides.
@@ -229,9 +229,10 @@ Diesel reads continue to return `QueryResult`. Known SQLSTATE values map to the 
 - `Fallback` applies to run-time refusals: not ready, loading, budgets, values not yet encodable.
 - A budget decides only whether memory answers, never whether a statement may reach Postgres. A statement whose bind values exceed the evaluation budget (the smaller of 1 MiB and 1/16 of the entry budget) is classified by its SQL shape, bind count and types, and the reader's permissions. Admission and inspection skip bound parsing for oversized values. Query tracing still fingerprints the binds. Only an admitted statement falls back.
 
-- A fallback read runs as its own task and holds its turn until it finishes, even if the caller is cancelled.
+- Fallback only accepts a single read statement and runs it in a read-only transaction with transaction-local server timeouts. The built-in pool batches transaction and timeout setup, prepares the read to preserve column metadata for empty results, and pipelines execution with rollback on reusable checkouts. It recycles a checkout only after PostgreSQL confirms rollback, including after a failed read. With `OnUnsupported::Fallback`, it discards the session to avoid leaking session changes. The built-in pool closes that checkout without a separate rollback request. This API expects application-controlled SQL. Use a least-privilege database role for fallback.
+- A fallback read runs as its own task and holds its turn until the work completes or reaches its deadline, even if the caller is cancelled. The built-in pool aborts the connection driver when discarding a session.
 - With `OnUnsupported::Error`, degraded-engine reads are validated against a source catalog before fallback. This admission check is single-flight and memoized for 250 ms. Failure to obtain that catalog is a visible readiness error, rather than permission to execute unclassified SQL.
-- Each fallback read prepares its statement and runs it: two round trips. Statements are not cached.
+- On an established built-in connection, a typical fallback read waits for three exchanges covering setup, preparation, and execution with any rollback. Cold type lookups can add waits. Prepared fallback statements are not cached. The manual `concurrent_fallback_benchmark` test reports read latency and pool wait for the built-in path.
 - The reader check runs once per catalog version. It catches tables whose name resolves elsewhere under the connection's search path, and tables the role may not read. Reads of those tables are unsupported.
 - `Metrics` counts `fallbacks` (Postgres answered) and `fallback_errors` (busy, timed out, failed, or `Fallback::Error`).
 
@@ -246,7 +247,7 @@ Diesel reads continue to return `QueryResult`. Known SQLSTATE values map to the 
 
 - The place of a read is captured with `#[track_caller]` on `load_and_sync`; the adapter passes on its own caller's place.
 - `debug_history(n)` records per query its callers (at most 16) and last `n` traces, for at most 20 000 queries, the least recently read forgotten. It takes a lock per read, so it is off by default.
-- A read that falls back is logged at debug level with its query id, place and reason.
+- A read that falls back is logged at debug level with its query id, place and reason. `Sql` debug output contains only counts. Explicit inspection can retain full SQL and error text and should be shared only with authorized operators.
 - `cargo run --release --example warm_reads -- <dsn> [callers] [seconds] [async|blocking]` measures warm reads through the public API: it warms every query it times until memory answers it, runs concurrent callers that each stop at their own deadline, and reports throughput, p50 and p99 with the share memory answered, so a run that was not warm throughout shows it. Each run creates and owns uniquely named fixtures. Async readers yield periodically between measured reads, and a run fails if any caller records no samples.
 
 - Successful memory metrics are incremented only after binary encoding. Unsupported and failed demo reads are not labeled as PostgreSQL answers or counted as successful fallbacks.

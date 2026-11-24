@@ -346,20 +346,40 @@ impl Engine for PgEngine {
         sql: &'a str,
         binds: &'a [Bind],
         timeout: Duration,
+        reuse_session: bool,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) -> SendFuture<'a, Result<Rows, SessionError>> {
+        if !is_read_statement(sql) {
+            return Box::pin(async {
+                Err(SessionError::Other(
+                    "fallback accepts read statements only".to_owned(),
+                ))
+            });
+        }
         let origin = self.origin.clone();
         let sql = sql.to_owned();
         let binds = binds.to_vec();
         Box::pin(async move {
+            let started = Instant::now();
+            // Keep this permit until the whole database task has returned,
+            // even if the application drops its awaiter.
             origin
-                .run(timeout, move |client| {
+                .run_with_session_reuse(timeout, reuse_session, move |client| {
                     Box::pin(async move {
                         let _permit = permit;
-                        read(client, &sql, &binds).await
+                        let left = timeout.saturating_sub(started.elapsed());
+                        if left.is_zero() {
+                            return Err(SessionError::Timeout(
+                                "the fallback deadline expired".to_owned(),
+                            ));
+                        }
+                        client
+                            .fallback_read(&sql, &binds, left, reuse_session)
+                            .await
+                            .map(|result| result.map(encode_rows))
                     })
                 })
-                .await
+                .await?
         })
     }
 
@@ -474,6 +494,15 @@ impl Origin {
         timeout: Duration,
         work: impl for<'c> FnOnce(&'c mut Lease) -> SendFuture<'c, Result<T, E>> + Send + 'static,
     ) -> Result<T, E> {
+        self.run_with_session_reuse(timeout, true, work).await
+    }
+
+    async fn run_with_session_reuse<T: Send + 'static, E: From<SessionError> + Send + 'static>(
+        self: Arc<Self>,
+        timeout: Duration,
+        reuse_session: bool,
+        work: impl for<'c> FnOnce(&'c mut Lease) -> SendFuture<'c, Result<T, E>> + Send + 'static,
+    ) -> Result<T, E> {
         let runtime = self.runtime.clone();
         runtime
             .spawn(async move {
@@ -484,7 +513,7 @@ impl Origin {
                         .await
                         .map_err(|reason| E::from(SessionError::Other(reason)))?;
                     let outcome = work(&mut connection).await;
-                    if outcome.is_ok() {
+                    if outcome.is_ok() && reuse_session {
                         connection.recycle();
                     }
                     outcome
@@ -505,10 +534,46 @@ impl Origin {
     }
 }
 
-/// Reads `sql` with `binds` on `client`; each cell comes back as
-/// Postgres's binary bytes.
-async fn read(client: &mut Lease, sql: &str, binds: &[Bind]) -> Result<Rows, SessionError> {
-    let raw = client.query(sql, binds).await?;
+/// Restricts fallback to statements that cannot end the protective
+/// transaction. PostgreSQL enforces read-only execution inside it.
+fn is_read_statement(mut sql: &str) -> bool {
+    loop {
+        sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace() || c == '(');
+        if let Some(comment) = sql.strip_prefix("--") {
+            sql = comment.find(['\n', '\r']).map_or("", |end| &comment[end..]);
+        } else if let Some(comment) = sql.strip_prefix("/*") {
+            let mut depth = 1usize;
+            let mut rest = comment;
+            while depth != 0 {
+                let Some(delimiter) = rest.find(['/', '*']) else {
+                    return false;
+                };
+                rest = &rest[delimiter..];
+                if let Some(next) = rest.strip_prefix("/*") {
+                    depth += 1;
+                    rest = next;
+                } else if let Some(next) = rest.strip_prefix("*/") {
+                    depth -= 1;
+                    rest = next;
+                } else {
+                    rest = &rest[1..];
+                }
+            }
+            sql = rest;
+        } else {
+            let end = sql
+                .find(|c: char| c.is_ascii_whitespace() || matches!(c, '(' | '/' | '-'))
+                .unwrap_or(sql.len());
+            let keyword = &sql[..end];
+            return ["SELECT", "WITH", "TABLE", "VALUES", "SHOW", "EXPLAIN"]
+                .iter()
+                .any(|read| keyword.eq_ignore_ascii_case(read));
+        }
+    }
+}
+
+/// Packs a Postgres result into the public row representation.
+fn encode_rows(raw: connections::RawRows) -> Rows {
     let columns: Arc<[Column]> = raw
         .columns
         .iter()
@@ -525,7 +590,7 @@ async fn read(client: &mut Lease, sql: &str, binds: &[Bind]) -> Result<Rows, Ses
             }));
         }
     }
-    Ok(Rows::from_parts(columns, buffer, cells))
+    Rows::from_parts(columns, buffer, cells)
 }
 
 /// Samples where the source's WAL is every [`SAMPLE_EVERY`], apart from
@@ -573,6 +638,18 @@ async fn sample_source(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fallback_classifies_read_and_control_statements() {
+        for sql in ["SELECT 1", "/* outer /* nested */ tail */ SELECT 1", "-- note\rVALUES (1)"] {
+            assert!(super::is_read_statement(sql));
+        }
+        for sql in ["BEGIN", "SET search_path = public", "ROLLBACK", "/* unfinished"] {
+            assert!(!super::is_read_statement(sql));
+        }
+        let shown = format!("{:?}", crate::cache::Sql::new("SELECT 'private_literal'").bind("private_bind"));
+        assert!(!shown.contains("private_literal") && !shown.contains("private_bind"));
+    }
+
     /// No password survives in what `Debug` prints.
     #[test]
     fn the_dsn_is_redacted() {
