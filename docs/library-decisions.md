@@ -235,6 +235,7 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 - The place of a read is captured with `#[track_caller]` on `load_and_sync`; the adapter passes on its own caller's place.
 - `debug_history(n)` records per query its callers (at most 16) and last `n` traces, for at most 20 000 queries, the least recently read forgotten. It takes a lock per read, so it is off by default.
 - A read that falls back is logged at debug level with its query id, place and reason.
+- `cargo run --release --example warm_reads -- <dsn> [callers] [seconds] [async|blocking]` measures warm reads through the public API: it warms every query it times until memory answers it, runs concurrent callers, and reports throughput, p50 and p99 with the share memory answered, so a run that was not warm throughout shows it.
 
 - Successful memory metrics are incremented only after binary encoding. Unsupported and failed demo reads are not labeled as PostgreSQL answers or counted as successful fallbacks.
 - Recent history continues recording after the 16-caller aggregation limit. Caller aggregation and recent-trace retention have independent bounds.
