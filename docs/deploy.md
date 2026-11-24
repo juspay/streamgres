@@ -10,7 +10,7 @@ For a local first run, see the README's Quick start.
 
 ## 1. What you need
 
-- **PostgreSQL** with `wal_level = logical`. It can be a primary, a logical
+- **PostgreSQL 17+** with `wal_level = logical`. It can be a primary, a logical
   replica, or a physical standby on PostgreSQL 17+. Section 3 has the details.
 - **An application server** with two HTTP endpoints. The *query* endpoint turns
   a query name and its arguments into a query AST. The *mutate* endpoint
@@ -90,8 +90,7 @@ The change feed writes nothing to the database it follows. Its position comes
 from commits and PostgreSQL keepalives. `STREAMGRES_PG_DSN` can point at:
 - the primary,
 - a logical replica, or
-- a physical standby (PostgreSQL 16 or later, the first version that can do
-  logical decoding on a standby).
+- a physical standby on PostgreSQL 17+.
 
 Ordinary SQL reads can optionally use a separate endpoint:
 `STREAMGRES_READ_PG_DSN` may point to PgBouncer configured for transaction
@@ -120,7 +119,9 @@ DDL in that transaction's WAL.
 ### Replication slots
 
 - Each process creates a fresh permanent slot before its first snapshot and feed
-  opening. Graceful shutdown stops the feed and attempts to drop its slot.
+  opening. Graceful shutdown stops the feed and attempts to drop its slot. The
+  standalone SIGTERM handler is installed when HTTP serving begins; termination
+  during initialization can leave an orphan for a later sweep.
 - Enabled instances await an initial sweep before creating their slot, within
   `STREAMGRES_SLOT_CLEANUP_STARTUP_TIMEOUT_MS` (default 10000, positive milliseconds).
   This total budget includes connection, lock waiting, discovery and deletion. Startup

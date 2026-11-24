@@ -23,7 +23,7 @@ and the conventions the code follows.
 You need:
 
 - Rust **1.88+** (CI builds with 1.89.0)
-- PostgreSQL with `wal_level = logical` for the live tests
+- PostgreSQL 17+ with `wal_level = logical` for the live tests
 - Node.js 22 for the scripts in `scripts/` (optional)
 - Docker for the image (optional)
 
@@ -49,6 +49,29 @@ STREAMGRES_PG_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
   cargo test --release
 ```
 
+Replication-slot cleanup tests use the same **`STREAMGRES_PG_DSN`**. They delete
+matching slots and fill replication-slot capacity, so they are marked `#[ignore]`
+and must be run explicitly and serially against disposable PostgreSQL:
+
+```bash
+STREAMGRES_PG_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
+  cargo test --release --locked --test slot_cleanup -- --ignored --test-threads=1
+```
+
+The existing CI test job runs this command after the regular suite, reusing its PG17
+server. The normal `cargo test` run skips these destructive tests even when the DSN
+is set. Missing the DSN during an explicit run fails instead of silently skipping.
+
+For an isolated local cluster, use PostgreSQL 17 or 18 binaries including `test_decoding`:
+
+```bash
+PG_BIN=/path/to/postgresql/bin bash docs/test-slot-cleanup.sh
+```
+
+Cleanup regressions call public transport/startup APIs and inspect PostgreSQL state.
+A byte-forwarding network gate controls lock overlap and connection failures without
+matching SQL text or calling private cleanup helpers.
+
 To run the server locally, follow the [Quick start](README.md#quick-start) in
 the README.
 
@@ -59,7 +82,7 @@ Every pull request runs:
 | Job | What it runs |
 | --- | --- |
 | Lints | `cargo clippy --all-targets --locked -- -D warnings` |
-| Tests | `cargo test --release --locked` against PostgreSQL 17 |
+| Tests | `cargo test --release --locked` against PG17, followed by explicit serial cleanup tests on the same PG17 server |
 | Benchmark | `bench` on your branch and the base branch, five alternating rounds, compared by `scripts/bench-compare.py` |
 | Image | builds `docker/server/Dockerfile` and drives it end to end with `scripts/smoke.mjs` |
 

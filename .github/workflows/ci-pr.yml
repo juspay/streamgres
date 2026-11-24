@@ -80,6 +80,18 @@ jobs:
       - name: Unit, scenario, randomized and live PostgreSQL tests
         run: cargo test --release --locked
 
+      - name: Slot cleanup tests
+        run: |
+          (
+            while true; do
+              docker exec pg psql -U postgres -d postgres -qc 'SELECT pg_log_standby_snapshot()' >/dev/null
+              sleep 0.5
+            done
+          ) &
+          heartbeat_pid=$!
+          trap 'kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true' EXIT
+          cargo test --release --locked --test slot_cleanup -- --ignored --test-threads=1
+
   perf:
     name: Benchmark against the base branch (performance)
     runs-on: ubuntu-latest
