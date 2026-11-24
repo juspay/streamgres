@@ -149,8 +149,10 @@ fn pieces(sql: &str, standard_strings: bool) -> Vec<Piece<'_>> {
                     at += 1;
                 }
             }
+            // A line comment ends at a line feed or, as Postgres also reads
+            // it, a carriage return.
             b'-' if bytes.get(at + 1) == Some(&b'-') => {
-                while at < bytes.len() && bytes[at] != b'\n' {
+                while at < bytes.len() && !matches!(bytes[at], b'\n' | b'\r') {
                     at += 1;
                 }
             }
@@ -416,5 +418,7 @@ mod tests {
         );
         assert_eq!(parameters(r"SELECT 'it\'s $1', $2", false), [2]);
         assert_eq!(parameters(r"SELECT '\' AS value, $1", true), [1]);
+        assert_eq!(parameters("SELECT 1 -- note\r$1", true), [1]);
+        assert_eq!(parameters("SELECT 1 -- note\r\n$1 -- $2", true), [1]);
     }
 }

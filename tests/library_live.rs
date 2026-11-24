@@ -1003,3 +1003,41 @@ async fn oversized_binds_do_not_bypass_the_unsupported_policy() {
     lib.shutdown().await;
     clean(&dsn, "lib_budget", "libbudget").await;
 }
+
+/// A custom type's bind keeps its own OID on Streamgres's pool: an
+/// optional filter (`$1 IS NULL OR …`), which Postgres can type only from
+/// the bind, reads on the fallback as it does for the application.
+#[tokio::test(flavor = "multi_thread")]
+async fn custom_type_binds_keep_their_oid_on_the_default_pool() {
+    let Some(dsn) = dsn() else { return };
+    prepare(
+        &dsn,
+        "lib_oid",
+        "liboid",
+        "CREATE TYPE lib_oid.state AS ENUM ('open', 'closed');
+         CREATE TABLE lib_oid.t (id bigint PRIMARY KEY, state lib_oid.state NOT NULL);
+         INSERT INTO lib_oid.t VALUES (1, 'open'), (2, 'closed');",
+    )
+    .await;
+    let lib = Streamgres::connect(&dsn)
+        .schemas(["lib_oid"])
+        .publication("lib_oid_pub")
+        .app("liboid", 0)
+        .on_unsupported(OnUnsupported::Fallback)
+        .start()
+        .await
+        .unwrap();
+    let (state, _) = lib
+        .type_oids("state", Some("lib_oid"))
+        .expect("the enum's OIDs");
+    let sql = Sql::new("SELECT id FROM lib_oid.t WHERE $1 IS NULL OR state = $1")
+        .bind_raw(state, Some(b"open".to_vec()));
+
+    let (read, trace) = lib.load_and_sync(sql).inspect().await;
+    assert_eq!(trace.served, Served::Postgres, "{trace}");
+    let rows = read.expect("the fallback types the bind by its OID");
+    assert_eq!((rows.len(), int8(&rows, 0, 0)), (1, Some(1)));
+
+    lib.shutdown().await;
+    clean(&dsn, "lib_oid", "liboid").await;
+}

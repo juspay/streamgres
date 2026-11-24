@@ -17,7 +17,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use bytes::BytesMut;
-use tokio_postgres::types::{FromSql, IsNull, ToSql, Type, to_sql_checked};
+use tokio_postgres::types::{FromSql, IsNull, Kind, ToSql, Type, to_sql_checked};
 
 use super::binary::oid;
 pub use crate::parser::Bind;
@@ -42,9 +42,8 @@ pub struct RawRows {
 
 /// What Streamgres runs on a connection.
 pub trait Session: Send {
-    /// Runs one statement with `binds`, each sent in binary as its own type
-    /// (an unknown OID as `unknown`, which Postgres resolves); every cell
-    /// comes back in binary.
+    /// Runs one statement with `binds`, each sent in binary and declared by
+    /// its own type OID; every cell comes back in binary.
     fn query<'a>(
         &'a mut self,
         sql: &'a str,
@@ -117,9 +116,17 @@ impl Session for tokio_postgres::Client {
         binds: &'a [Bind],
     ) -> ConnectionFuture<'a, Result<RawRows, String>> {
         Box::pin(async move {
+            // A type the driver does not know (an enum, a domain, their
+            // arrays) is still declared by its own OID, as the application's
+            // driver declares it: `unknown` would leave Postgres to infer it,
+            // which fails or differs where the bind alone gives the type.
             let types: Vec<Type> = binds
                 .iter()
-                .map(|bind| Type::from_oid(bind.type_oid).unwrap_or(Type::UNKNOWN))
+                .map(|bind| {
+                    Type::from_oid(bind.type_oid).unwrap_or_else(|| {
+                        Type::new(String::new(), bind.type_oid, Kind::Simple, String::new())
+                    })
+                })
                 .collect();
             let statement = self
                 .prepare_typed(sql, &types)
