@@ -502,6 +502,7 @@ impl Config {
             ],
             ddl_trigger: self.ddl_trigger.clone(),
             ddl_prefix: self.ddl_prefix.clone(),
+            settle_reports: false,
         }
     }
 }

@@ -31,34 +31,90 @@ const DDL_TAGS: [&str; 7] = [
 /// already. Ported statement for statement from zero-cache's
 /// `change-source/pg/schema/{ddl,published}.ts`.
 pub fn trigger_stack_sql(app: &str, shard: u32, publications: &[&str]) -> String {
-    let tags: Vec<String> = DDL_TAGS.iter().map(|tag| quote_literal(tag)).collect();
-    let tags = tags.join(", ");
-    let publications: Vec<String> = publications
-        .iter()
-        .map(|name| quote_literal(name))
-        .collect();
-    let app_literal = app.replace('\'', "''");
-    TRIGGER_STACK
-        .replace("@SCHEMA@", &quote_ident(&format!("{app}_{shard}")))
-        .replace("@START@", &quote_ident(&format!("{app}_ddl_start_{shard}")))
-        .replace("@END@", &quote_ident(&format!("{app}_ddl_end_{shard}")))
-        .replace("@SHARD@", &shard.to_string())
-        .replace("@PUBLICATIONS@", &publications.join(", "))
-        .replace("@TAGS_AND_COMMENT@", &format!("{tags}, 'COMMENT'"))
-        .replace("@TAGS@", &tags)
-        .replace("@LOCK@", &DDL_LOCK.to_string())
-        .replace("@APP@", &app_literal)
+    render_trigger_stack(app, shard, publications).0
 }
 
-pub(crate) struct FunctionSpec {
+fn render_trigger_stack(app: &str, shard: u32, publications: &[&str]) -> (String, String) {
+    // PostgreSQL's outer function-body literal and the SQL inside it
+    // are separate quoting contexts. Render only original template
+    // tokens, then pick a delimiter absent from all substituted text.
+    let tags = DDL_TAGS
+        .iter()
+        .map(|tag| quote_literal(tag))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let publications = publications
+        .iter()
+        .map(|name| setup_literal(name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parameters = [
+        ("SCHEMA", quote_ident(&format!("{app}_{shard}"))),
+        ("START", quote_ident(&format!("{app}_ddl_start_{shard}"))),
+        ("END", quote_ident(&format!("{app}_ddl_end_{shard}"))),
+        ("AUTH", quote_ident(&format!("{app}_acl_end_{shard}"))),
+        ("PUBLICATIONS", publications),
+        ("END_TAGS", format!("{tags}, 'COMMENT'")),
+        ("TAGS", tags),
+        ("LOCK", DDL_LOCK.to_string()),
+        ("PREFIX", setup_literal(&format!("{app}/{shard}/ddl"))),
+        ("APP_SHARD", setup_literal(&format!("{app}_{shard}"))),
+    ];
+    let parts: Vec<String> = TRIGGER_STACK
+        .split("$$")
+        .map(|mut section| {
+            let mut rendered = String::new();
+            while let Some((prefix, suffix)) = section.split_once('@') {
+                rendered.push_str(prefix);
+                if let Some((token, rest)) = suffix.split_once('@')
+                    && let Some((_, value)) = parameters.iter().find(|(name, _)| *name == token)
+                {
+                    rendered.push_str(value);
+                    section = rest;
+                } else {
+                    // PostgreSQL operators such as <@ are literal text.
+                    rendered.push('@');
+                    section = suffix;
+                }
+            }
+            rendered.push_str(section);
+            rendered
+        })
+        .collect();
+    let delimiter = if parts.iter().all(|part| !part.contains("$$")) {
+        "$$".to_owned()
+    } else {
+        (0u64..)
+            .map(|id| format!("$streamgres_body_{id}$"))
+            .find(|delimiter| parts.iter().all(|part| !part.contains(delimiter.as_str())))
+            .expect("finite template text cannot contain every delimiter")
+    };
+    (parts.join(&delimiter), delimiter)
+}
+
+/// Quoting independent of the connection's standard_conforming_strings.
+fn setup_literal(value: &str) -> String {
+    if value.contains('\\') {
+        format!("E{}", quote_literal(&value.replace('\\', "\\\\")))
+    } else {
+        quote_literal(value)
+    }
+}
+
+/// One function of the trigger stack: its name, argument types, body and
+/// language, so a setup can tell whether the installed one is current.
+pub struct FunctionSpec {
     pub name: String,
     pub args: Vec<String>,
     pub body: String,
     pub language: String,
 }
 
-pub(crate) fn function_specs(app: &str, shard: u32, publications: &[&str]) -> Vec<FunctionSpec> {
-    let sql = trigger_stack_sql(app, shard, publications);
+/// The functions [`trigger_stack_sql`] creates, one spec each.
+pub fn function_specs(app: &str, shard: u32, publications: &[&str]) -> Vec<FunctionSpec> {
+    let (sql, delimiter) = render_trigger_stack(app, shard, publications);
+    let opening = format!("AS {delimiter}");
+    let closing = format!("{delimiter} LANGUAGE ");
     let mut specs = Vec::new();
     let mut rest = sql.as_str();
     while let Some(start) = rest.find("FUNCTION ") {
@@ -81,15 +137,15 @@ pub(crate) fn function_specs(app: &str, shard: u32, publications: &[&str]) -> Ve
             .filter_map(|arg| arg.split_whitespace().last())
             .map(str::to_ascii_lowercase)
             .collect();
-        let Some(body_start) = rest[header_end..].find("AS $$") else {
+        let Some(body_start) = rest[header_end..].find(&opening) else {
             break;
         };
-        let body_start = header_end + body_start + "AS $$".len();
-        let Some(body_end) = rest[body_start..].find("$$ LANGUAGE ") else {
+        let body_start = header_end + body_start + opening.len();
+        let Some(body_end) = rest[body_start..].find(&closing) else {
             break;
         };
         let body = rest[body_start..body_start + body_end].to_owned();
-        let language_start = body_start + body_end + "$$ LANGUAGE ".len();
+        let language_start = body_start + body_end + closing.len();
         let Some(language_end) = rest[language_start..].find(';') else {
             break;
         };
@@ -123,7 +179,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION @SCHEMA@.notice_ignore(reason TEXT, tag TEXT, target record)
 RETURNS void AS $$
 BEGIN
-  RAISE NOTICE '@APP@_@SHARD@ ignoring % % %', reason, tag,
+  RAISE NOTICE '% ignoring % % %', @APP_SHARD@, reason, tag,
     COALESCE(row_to_json(target)::text, '');
 END
 $$ LANGUAGE plpgsql;
@@ -311,9 +367,9 @@ BEGIN
     'context', @SCHEMA@.get_trigger_context()
   ) INTO message;
 
-  PERFORM pg_logical_emit_message(true, '@APP@/@SHARD@/ddl', message);
+  PERFORM pg_logical_emit_message(true, @PREFIX@, message);
 
-  RAISE NOTICE 'Emitted @APP@_@SHARD@ % for % %', event_type, tag,
+  RAISE NOTICE 'Emitted % % for % %', @APP_SHARD@, event_type, tag,
     COALESCE(row_to_json(target)::text, '');
 END
 $$ LANGUAGE plpgsql;
@@ -415,8 +471,19 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION @SCHEMA@.emit_acl_change()
+RETURNS event_trigger AS $$
+BEGIN
+  PERFORM pg_catalog.pg_logical_emit_message(true, @PREFIX@, '{"type":"aclChanged"}');
+END
+$$ LANGUAGE plpgsql;
+
+ALTER FUNCTION @SCHEMA@.emit_acl_change() SET search_path TO pg_catalog;
+ALTER FUNCTION @SCHEMA@.emit_acl_change() SECURITY DEFINER;
+
 DROP EVENT TRIGGER IF EXISTS @START@;
 DROP EVENT TRIGGER IF EXISTS @END@;
+DROP EVENT TRIGGER IF EXISTS @AUTH@;
 
 CREATE EVENT TRIGGER @START@
   ON ddl_command_start
@@ -425,8 +492,13 @@ CREATE EVENT TRIGGER @START@
 
 CREATE EVENT TRIGGER @END@
   ON ddl_command_end
-  WHEN TAG IN (@TAGS_AND_COMMENT@)
+  WHEN TAG IN (@END_TAGS@)
   EXECUTE PROCEDURE @SCHEMA@.emit_ddl_end();
+
+CREATE EVENT TRIGGER @AUTH@
+  ON ddl_command_end
+  WHEN TAG IN ('GRANT', 'REVOKE')
+  EXECUTE PROCEDURE @SCHEMA@.emit_acl_change();
 "#;
 
 #[cfg(test)]
@@ -440,8 +512,18 @@ mod tests {
     /// app, shard and publication, then check the output in.
     #[test]
     fn the_checked_in_stack_is_the_generators() {
-        let checked_in = include_str!("../../scripts/sql/ddl-triggers.sql");
+        let checked_in = include_str!("../../../scripts/sql/ddl-triggers.sql");
         assert_eq!(checked_in, trigger_stack_sql("xyne", 0, &["xyne_sync_pub"]));
+    }
+
+    #[test]
+    fn setup_preserves_delimiters_inside_configured_names() {
+        let publication = "archive$$@PREFIX@";
+        let sql = trigger_stack_sql("test", 0, &[publication]);
+        let specs = function_specs("test", 0, &[publication]);
+        assert!(sql.contains("AS $streamgres_body_0$"));
+        assert!(specs.iter().any(|spec| spec.body.contains(publication)));
+        assert!(sql.contains("WHEN TAG IN ('GRANT', 'REVOKE')"));
     }
 
     /// The stack is named after the app and the shard the way zero-cache

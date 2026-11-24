@@ -15,7 +15,7 @@ use tokio::task::{LocalSet, spawn_local};
 use streamgres::ivm::MultiTableIVM;
 use streamgres::model::*;
 use streamgres::sync::{
-    Command, Event, Lsn, MemoryStorage, Service, Storage, StorageError, SubId, Transaction,
+    Command, Event, MemoryStorage, Position, Service, Storage, StorageError, SubId, Transaction,
 };
 
 /// Run `body` on a current-thread runtime with a local task set (the
@@ -92,6 +92,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
         .map(|event| match event {
             Event::Registered { .. } => "registered",
             Event::Hydrated(_) => "hydrated",
+            Event::Unsettled(_) => "unsettled",
             Event::Landed { .. } => "landed",
             Event::Refused { .. } => "refused",
             Event::Committed { .. } => "committed",
@@ -107,9 +108,11 @@ fn updates_of(event: &Event) -> &[streamgres::ivm::Delta] {
         Event::Registered { updates, .. }
         | Event::Landed { updates }
         | Event::Committed { updates, .. } => updates,
-        Event::Hydrated(_) | Event::Refused { .. } | Event::Capped { .. } | Event::Heavy { .. } => {
-            &[]
-        }
+        Event::Hydrated(_)
+        | Event::Unsettled(_)
+        | Event::Refused { .. }
+        | Event::Capped { .. }
+        | Event::Heavy { .. } => &[],
     }
 }
 
@@ -263,7 +266,7 @@ fn a_commit_arrives_as_one_batch() {
         commands
             .send(Command::Transaction(Transaction::new(
                 vec![insert(10, "OPEN"), insert(11, "OPEN"), insert(12, "DONE")],
-                Lsn(100),
+                Position(100),
             )))
             .await
             .expect("send");
@@ -302,8 +305,8 @@ fn a_commit_reports_the_position_and_the_watched_writes() {
         commands
             .send(Command::Transaction(Transaction {
                 writes: vec![insert(1, "OPEN")],
-                at: Lsn(42),
-                progress: Lsn(50),
+                at: Position(42),
+                progress: Position(50),
                 watched: vec![insert(1, "OPEN")],
                 schema: Vec::new(),
                 catalog: None,
@@ -323,7 +326,7 @@ fn a_commit_reports_the_position_and_the_watched_writes() {
         });
         assert_eq!(
             committed,
-            Some((Lsn(50), 1)),
+            Some((Position(50), 1)),
             "the progress mark and the watched write are reported, got {:?}",
             shapes(&seen)
         );
@@ -348,17 +351,17 @@ impl Storage for Refusing {
     }
 
     /// [`MemoryStorage::advance`].
-    fn advance(&self, feed: Lsn) {
+    fn advance(&self, feed: Position) {
         self.0.advance(feed)
     }
 
     /// [`MemoryStorage::floor`].
-    fn floor(&self) -> Lsn {
+    fn floor(&self) -> Position {
         self.0.floor()
     }
 
     /// [`MemoryStorage::absorb`].
-    fn absorb(&self, write: &WriteQuery, at: Lsn) {
+    fn absorb(&self, write: &WriteQuery, at: Position) {
         self.0.absorb(write, at)
     }
 }
@@ -415,17 +418,17 @@ impl Storage for Gated {
     }
 
     /// [`MemoryStorage::advance`].
-    fn advance(&self, feed: Lsn) {
+    fn advance(&self, feed: Position) {
         self.inner.advance(feed)
     }
 
     /// [`MemoryStorage::floor`].
-    fn floor(&self) -> Lsn {
+    fn floor(&self) -> Position {
         self.inner.floor()
     }
 
     /// [`MemoryStorage::absorb`].
-    fn absorb(&self, write: &WriteQuery, at: Lsn) {
+    fn absorb(&self, write: &WriteQuery, at: Position) {
         self.inner.absorb(write, at)
     }
 }
@@ -540,7 +543,7 @@ fn deltas_reach_the_sink_that_owns_each_subscription() {
         commands
             .send(Command::Transaction(Transaction::new(
                 vec![insert(2, "OPEN")],
-                Lsn(1),
+                Position(1),
             )))
             .await
             .expect("send");
@@ -561,7 +564,7 @@ fn deltas_reach_the_sink_that_owns_each_subscription() {
         commands
             .send(Command::Transaction(Transaction::new(
                 vec![insert(3, "OPEN")],
-                Lsn(2),
+                Position(2),
             )))
             .await
             .expect("send");
@@ -665,19 +668,22 @@ fn a_transaction_the_feed_repeats_is_applied_once() {
         drain(&mut events).await;
 
         let committed = |id: i64, at: u64| {
-            let mut transaction = Transaction::new(vec![insert(id, "OPEN")], Lsn(at));
+            let mut transaction =
+                Transaction::new(vec![insert(id, "OPEN")], Position(u128::from(at)));
             transaction.committed_at_micros = 1;
             transaction
         };
-        assert!(Transaction::mark(Lsn(5)).is_mark());
+        assert!(Transaction::mark(Position(5)).is_mark());
         assert!(!committed(1, 10).is_mark());
-        assert!(committed(1, 10).repeats(Lsn(10)));
-        assert!(!committed(1, 10).repeats(Lsn(9)));
-        assert!(!Transaction::mark(Lsn(5)).repeats(Lsn(10)));
+        assert!(committed(1, 10).repeats(Position(10)));
+        assert!(!committed(1, 10).repeats(Position(9)));
+        assert!(!Transaction::mark(Position(5)).repeats(Position(10)));
 
         feed.send(committed(1, 10)).await.expect("feed");
         feed.send(committed(2, 20)).await.expect("feed");
-        feed.send(Transaction::mark(Lsn(25))).await.expect("feed");
+        feed.send(Transaction::mark(Position(25)))
+            .await
+            .expect("feed");
         feed.send(committed(2, 20)).await.expect("feed");
         feed.send(committed(1, 10)).await.expect("feed");
         feed.send(committed(3, 30)).await.expect("feed");
@@ -688,14 +694,17 @@ fn a_transaction_the_feed_repeats_is_applied_once() {
             "two transactions, the mark, and the one after the repeats"
         );
         assert_eq!(ids(&seen), vec![1, 2, 3], "each row added once");
-        let positions: Vec<Lsn> = seen
+        let positions: Vec<Position> = seen
             .iter()
             .filter_map(|event| match event {
                 Event::Committed { position, .. } => Some(*position),
                 _ => None,
             })
             .collect();
-        assert_eq!(positions, vec![Lsn(10), Lsn(20), Lsn(25), Lsn(30)]);
+        assert_eq!(
+            positions,
+            vec![Position(10), Position(20), Position(25), Position(30)]
+        );
     });
 }
 
@@ -719,8 +728,8 @@ fn a_serving_consumer_is_not_woken_for_nothing() {
             Transaction {
                 watched: if watched { vec![write.clone()] } else { Vec::new() },
                 writes: vec![write],
-                at: Lsn(at),
-                progress: Lsn(at),
+                at: Position(u128::from(at)),
+                progress: Position(u128::from(at)),
                 schema: Vec::new(),
                 catalog: None,
                 received: std::time::Instant::now(),

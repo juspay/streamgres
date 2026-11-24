@@ -31,7 +31,13 @@
 //! single-quoted with `''` for an embedded quote; `TRUE` / `FALSE` as a
 //! filter parse to the vacuous `AND(vec![])` / `OR(vec![])`.
 //!
-//! # v1 restrictions (each rejected with a clear error, never narrowed silently)
+//! The grammar and restrictions below describe [`parse`]: the single-table
+//! reads and writes of the in-process engine API ([`parse_read`],
+//! [`parse_write`]). The embedded cache reads with [`parse_select`], whose
+//! projection, bind and join grammar is documented in `select`. The two
+//! share filter parsing and validation.
+//!
+//! # Single-table restrictions
 //!
 //! - Single table only — `LEFT JOIN` is recognised and refused.
 //! - Writes address **exactly one row by primary key**: the `WHERE` of an
@@ -59,10 +65,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::model::{
-    ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameRow, DbTable, DeleteQuery,
-    InsertQuery, Order, OrderBy, SingleTableReadQuery, UpdateQuery, Value, ValueType, Where,
-    WriteQuery,
+    ColumnName, ComparisonOperator, Condition, DataFrameKey, DataFrameRow, DbColumn, DbTable,
+    DeleteQuery, InsertQuery, Order, OrderBy, SingleTableReadQuery, UpdateQuery, Value, ValueType,
+    Where, WriteQuery,
 };
+use crate::sync::pg::binary;
 
 /// Hard cap on `(` / `[` nesting depth. The parser descends recursively, so
 /// without a bound a client-supplied string with thousands of nested parens
@@ -72,6 +79,13 @@ pub const MAX_NESTING_DEPTH: usize = 128;
 /// The authoritative table schemas live in the model; re-exported here
 /// because the parser is their primary consumer.
 pub use crate::model::Catalog;
+
+mod prepared;
+mod select;
+pub(crate) use prepared::PreparedSelect;
+use prepared::{Operand, Predicate};
+pub(crate) use select::ResultPlan;
+pub use select::{Projection, Select, parse_select};
 
 /// A successfully parsed statement — either side of the read/write split.
 #[derive(Debug, Clone, PartialEq)]
@@ -86,6 +100,7 @@ pub fn parse(sql: &str, catalog: &Catalog) -> Result<ParsedQuery, ParseError> {
         tokens: lex(sql)?,
         pos: 0,
         depth: 0,
+        binds: Vec::new(),
     };
     let parsed = parser.query(catalog)?;
     if !matches!(parser.peek(), Tok::Eof) {
@@ -151,6 +166,8 @@ pub fn point_at(source: &str, error: &ParseError) -> String {
 /// One lexed token.
 ///
 /// - `Word`: identifiers and keywords alike; keywords match case-insensitively.
+/// - `Quoted`: a double-quoted identifier, never a keyword.
+/// - `Param`: a `$n` bind parameter, by its 1-based number.
 /// - `Str`: the unquoted content of a single-quoted string literal.
 /// - `Num`: raw numeric text; the parser decides int vs float.
 /// - `Sym`: operators and punctuation, normalised (`<>` lexes as `!=`).
@@ -158,6 +175,8 @@ pub fn point_at(source: &str, error: &ParseError) -> String {
 #[derive(Debug, Clone, PartialEq)]
 enum Tok {
     Word(String),
+    Quoted(String),
+    Param(usize),
     Str(String),
     Num(String),
     Sym(&'static str),
@@ -208,6 +227,45 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
                 tok: Tok::Num(number),
                 at,
             });
+        } else if c == '"' {
+            chars.next();
+            let mut name = String::new();
+            loop {
+                match chars.next() {
+                    Some((_, '"')) if peek_at_is(&chars, 0, '"') => {
+                        name.push('"');
+                        chars.next();
+                    }
+                    Some((_, '"')) => break,
+                    Some((_, c)) => name.push(c),
+                    None => {
+                        return Err(ParseError {
+                            message: "unterminated quoted name".into(),
+                            position: at,
+                        });
+                    }
+                }
+            }
+            tokens.push(Spanned {
+                tok: Tok::Quoted(name),
+                at,
+            });
+        } else if c == '$' {
+            chars.next();
+            let mut digits = String::new();
+            take_digits(&mut chars, &mut digits);
+            let number = digits
+                .parse::<usize>()
+                .ok()
+                .filter(|number| *number > 0)
+                .ok_or(ParseError {
+                    message: "expected a parameter number after `$`".into(),
+                    position: at,
+                })?;
+            tokens.push(Spanned {
+                tok: Tok::Param(number),
+                at,
+            });
         } else if c == '\'' {
             chars.next();
             let mut text = String::new();
@@ -245,6 +303,19 @@ fn lex(source: &str) -> Result<Vec<Spanned>, ParseError> {
                 '*' => "*",
                 '-' => "-",
                 '=' => "=",
+                '.' => ".",
+                ';' => ";",
+                ':' => {
+                    if peek_at_is(&chars, 0, ':') {
+                        chars.next();
+                        "::"
+                    } else {
+                        return Err(ParseError {
+                            message: "unexpected character `:`".into(),
+                            position: at,
+                        });
+                    }
+                }
                 '>' => {
                     if peek_at_is(&chars, 0, '=') {
                         chars.next();
@@ -333,6 +404,15 @@ struct Parser {
     tokens: Vec<Spanned>,
     pos: usize,
     depth: usize,
+    binds: Vec<Bind>,
+}
+
+/// One bind parameter as a Postgres client sends it: its type's OID and
+/// its value in binary format, `None` for `NULL`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Bind {
+    pub type_oid: u32,
+    pub bytes: Option<Vec<u8>>,
 }
 
 impl Parser {
@@ -379,6 +459,8 @@ impl Parser {
     fn describe(&self) -> String {
         match self.peek() {
             Tok::Word(word) => format!("`{word}`"),
+            Tok::Quoted(name) => format!("`\"{name}\"`"),
+            Tok::Param(number) => format!("`${number}`"),
             Tok::Str(text) => format!("string `{text}`"),
             Tok::Num(number) => format!("number `{number}`"),
             Tok::Sym(symbol) => format!("`{symbol}`"),
@@ -432,10 +514,10 @@ impl Parser {
         }
     }
 
-    /// A bare-word identifier.
+    /// An identifier: a bare word as written, or a double-quoted name.
     fn ident(&mut self) -> Result<String, ParseError> {
         match self.peek().clone() {
-            Tok::Word(word) => {
+            Tok::Word(word) | Tok::Quoted(word) => {
                 self.bump();
                 Ok(word)
             }
@@ -443,20 +525,64 @@ impl Parser {
         }
     }
 
-    /// A table name, resolved against the catalog.
+    /// A dotted name of up to `parts` identifiers (`a`, `a.b`, `a.b.c`).
+    fn dotted(&mut self, parts: usize) -> Result<Vec<String>, ParseError> {
+        let mut names = vec![self.ident()?];
+        while names.len() < parts && self.eat_sym(".") {
+            names.push(self.ident()?);
+        }
+        Ok(names)
+    }
+
+    /// A table name, bare or schema-qualified, resolved against the
+    /// catalog, where a table outside `public` is named `schema.table`.
     fn table<'c>(&mut self, catalog: &'c Catalog) -> Result<&'c DbTable, ParseError> {
         let at = self.at();
-        let name = self.ident()?;
+        let names = self.dotted(2)?;
+        if names.iter().any(|name| name.contains('.')) {
+            return Err(ParseError {
+                message: "a dot inside a table or schema identifier is not supported".to_owned(),
+                position: at,
+            });
+        }
+        let name = match names.as_slice() {
+            [schema, table] if schema == "public" => table.clone(),
+            [schema, table] => format!("{schema}.{table}"),
+            _ => names.concat(),
+        };
         catalog.table(&name).ok_or(ParseError {
             message: format!("unknown table `{name}`"),
             position: at,
         })
     }
 
-    /// A column name, validated to exist on `table`.
+    /// A column of `table`, bare or qualified by the table (and its
+    /// schema), validated to exist.
     fn column_name(&mut self, table: &DbTable) -> Result<ColumnName, ParseError> {
         let at = self.at();
-        let name = self.ident()?;
+        let mut names = self.dotted(3)?;
+        let name = names.pop().unwrap_or_default();
+        if names.iter().any(|name| name.contains('.')) {
+            return Err(ParseError {
+                message: "a dot inside a table or schema qualifier is not supported".to_owned(),
+                position: at,
+            });
+        }
+        let qualifier = match names.as_slice() {
+            [] => None,
+            [table] => Some(table.clone()),
+            [schema, table] if schema == "public" => Some(table.clone()),
+            [schema, table] => Some(format!("{schema}.{table}")),
+            _ => None,
+        };
+        if let Some(qualifier) = qualifier
+            && !names_table(table.name.as_str(), &qualifier)
+        {
+            return Err(ParseError {
+                message: format!("`{qualifier}` is not the table read, `{}`", table.name),
+                position: at,
+            });
+        }
         if table.column(&name).is_some() {
             Ok(ColumnName::from(name))
         } else {
@@ -732,44 +858,73 @@ impl Parser {
         Ok(pkey_value)
     }
 
-    /// `OR` is the loosest binder, so it sits at the top of the chain.
+    /// A filter over one table.
     fn filter(&mut self, table: &DbTable) -> Result<Where, ParseError> {
-        let mut parts = vec![self.conjunct(table)?];
+        self.filter_in(&OneTable(table))?.bind(&self.binds)
+    }
+
+    /// A filter over the tables of `scope`, each condition tagged with the
+    /// table it names. `OR` is the loosest binder, so it sits at the top.
+    fn filter_in(&mut self, scope: &dyn Scope) -> Result<Tagged, ParseError> {
+        let mut parts = vec![self.conjunct(scope)?];
         while self.eat_word("OR") {
-            parts.push(self.conjunct(table)?);
+            parts.push(self.conjunct(scope)?);
         }
-        Ok(collapse(parts, Where::OR))
+        Ok(Tagged::group(parts, Tagged::Or))
     }
 
     /// `AND` chain of primaries; binds tighter than `OR`.
-    fn conjunct(&mut self, table: &DbTable) -> Result<Where, ParseError> {
-        let mut parts = vec![self.primary(table)?];
+    fn conjunct(&mut self, scope: &dyn Scope) -> Result<Tagged, ParseError> {
+        let mut parts = vec![self.primary(scope)?];
         while self.eat_word("AND") {
-            parts.push(self.primary(table)?);
+            parts.push(self.primary(scope)?);
         }
-        Ok(collapse(parts, Where::AND))
+        Ok(Tagged::group(parts, Tagged::And))
     }
 
     /// A parenthesised filter, a `TRUE` / `FALSE` literal, or one condition.
     ///
     /// `TRUE` / `FALSE` parse to the identities: an empty `AND` is true, an
     /// empty `OR` is false.
-    fn primary(&mut self, table: &DbTable) -> Result<Where, ParseError> {
+    fn primary(&mut self, scope: &dyn Scope) -> Result<Tagged, ParseError> {
         if self.eat_sym("(") {
             self.descend()?;
-            let filter = self.filter(table)?;
+            let filter = self.filter_in(scope)?;
             self.expect_sym(")")?;
             self.depth -= 1;
             return Ok(filter);
         }
         if self.eat_word("TRUE") {
-            return Ok(Where::AND(Vec::new()));
+            return Ok(Tagged::And(Vec::new()));
         }
         if self.eat_word("FALSE") {
-            return Ok(Where::OR(Vec::new()));
+            return Ok(Tagged::Or(Vec::new()));
+        }
+        if self.eat_word("NOT") {
+            let at = self.at();
+            self.descend()?;
+            let negated = self.primary(scope)?.negated();
+            self.depth -= 1;
+            return negated.ok_or(ParseError {
+                message: "NOT of this condition is not supported".to_owned(),
+                position: at,
+            });
         }
 
-        let column = self.column_name(table)?;
+        let (node, declared) = scope.resolve(self)?;
+        let column = declared.name.clone();
+        let tag = |condition: Predicate| Tagged::Condition(node, condition);
+        let ends_condition = matches!(self.peek(), Tok::Eof | Tok::Sym(")" | ";"))
+            || ["AND", "OR", "ORDER", "LIMIT", "OFFSET", "FOR"]
+                .iter()
+                .any(|word| self.is_word(word));
+        if declared.r#type == ValueType::Bool && ends_condition {
+            return Ok(tag(Predicate::new(
+                column,
+                ComparisonOperator::EQ,
+                Value::Bool(true),
+            )));
+        }
         if self.eat_word("IS") {
             let comparison_operator = if self.eat_word("NOT") {
                 ComparisonOperator::IS_NOT
@@ -782,11 +937,44 @@ impl Parser {
                     self.describe()
                 ));
             }
-            return Ok(Where::Condition(Condition {
+            return Ok(tag(Predicate {
                 column,
                 comparison_operator,
-                value: Value::Null,
+                value: Value::Null.into(),
             }));
+        }
+        let negated = self.eat_word("NOT");
+        if self.eat_word("BETWEEN") {
+            let low = self.operand(declared)?;
+            self.expect_word("AND")?;
+            let high = self.operand(declared)?;
+            let within = Tagged::And(vec![
+                tag(Predicate::new(column.clone(), ComparisonOperator::GTE, low)),
+                tag(Predicate::new(column, ComparisonOperator::LTE, high)),
+            ]);
+            return match (negated, within.clone().negated()) {
+                (false, _) => Ok(within),
+                (true, Some(outside)) => Ok(outside),
+                (true, None) => self.err("NOT BETWEEN is not supported here"),
+            };
+        }
+        if self.eat_word("IN") {
+            let comparison_operator = if negated {
+                ComparisonOperator::NOT_IN
+            } else {
+                ComparisonOperator::IN
+            };
+            return Ok(tag(Predicate {
+                column,
+                comparison_operator,
+                value: self.value_list(declared)?,
+            }));
+        }
+        if negated {
+            return self.err(format!(
+                "expected IN or BETWEEN after NOT, found {}",
+                self.describe()
+            ));
         }
         let comparison_operator = if self.eat_sym("=") {
             ComparisonOperator::EQ
@@ -800,44 +988,79 @@ impl Parser {
             ComparisonOperator::LTE
         } else if self.eat_sym("<") {
             ComparisonOperator::LT
-        } else if self.eat_word("IN") {
-            return Ok(Where::Condition(Condition {
-                column,
-                comparison_operator: ComparisonOperator::IN,
-                value: self.value_list()?,
-            }));
-        } else if self.eat_word("NOT") {
-            self.expect_word("IN")?;
-            return Ok(Where::Condition(Condition {
-                column,
-                comparison_operator: ComparisonOperator::NOT_IN,
-                value: self.value_list()?,
-            }));
         } else {
             return self.err(format!(
-                "expected a comparison operator, [NOT] IN or IS [NOT] NULL after a column, found {}",
+                "expected a comparison operator, [NOT] IN, BETWEEN or IS [NOT] NULL after a column, found {}",
                 self.describe()
             ));
         };
-        Ok(Where::Condition(Condition {
+        let quantified = match comparison_operator {
+            ComparisonOperator::EQ if self.eat_word("ANY") => Some(ComparisonOperator::IN),
+            ComparisonOperator::NEQ if self.eat_word("ALL") => Some(ComparisonOperator::NOT_IN),
+            _ if self.is_word("ANY") || self.is_word("ALL") => {
+                return self.err("only `= ANY` and `!= ALL` are supported");
+            }
+            _ => None,
+        };
+        if let Some(comparison_operator) = quantified {
+            self.expect_sym("(")?;
+            let at = self.at();
+            let Tok::Param(number) = *self.peek() else {
+                return self.err("ANY / ALL take one array parameter");
+            };
+            self.bump();
+            self.expect_sym(")")?;
+            // A `NULL` array makes the comparison `NULL`, true of no row,
+            // and so is its negation: a list holding one `NULL` is both.
+            let value = Operand::Parameter {
+                number,
+                declared: declared.clone(),
+                list: true,
+                at,
+            };
+            return Ok(tag(Predicate {
+                column,
+                comparison_operator,
+                value,
+            }));
+        }
+        Ok(tag(Predicate {
             column,
             comparison_operator,
-            value: self.value()?,
+            value: self.operand(declared)?,
         }))
     }
 
     /// The parenthesised value list of `IN` / `NOT IN`.
-    fn value_list(&mut self) -> Result<Value, ParseError> {
+    fn value_list(&mut self, declared: &DbColumn) -> Result<Operand, ParseError> {
         self.expect_sym("(")?;
         let mut items = Vec::new();
         if !self.is_sym(")") {
-            items.push(self.value()?);
+            items.push(self.operand(declared)?);
             while self.eat_sym(",") {
-                items.push(self.value()?);
+                items.push(self.operand(declared)?);
             }
         }
         self.expect_sym(")")?;
-        Ok(Value::List(items))
+        Ok(Operand::List(items))
+    }
+
+    /// The value compared with `declared`: a bind parameter, or a literal,
+    /// either brought to the column's type where the two differ only in
+    /// form ([`coerce_read`]).
+    fn operand(&mut self, declared: &DbColumn) -> Result<Operand, ParseError> {
+        let at = self.at();
+        if let Tok::Param(number) = *self.peek() {
+            self.bump();
+            return Ok(Operand::Parameter {
+                number,
+                declared: declared.clone(),
+                list: false,
+                at,
+            });
+        }
+        let value = self.value()?;
+        Ok(Operand::Literal(coerce_read(value, &declared.r#type)))
     }
 
     /// One literal: `NULL`, `TRUE` / `FALSE`, a (possibly `-`-negated)
@@ -903,12 +1126,261 @@ impl Parser {
     }
 }
 
-/// Unwrap a lone part; otherwise group `parts` under `group`.
-fn collapse(mut parts: Vec<Where>, group: fn(Vec<Where>) -> Where) -> Where {
-    if parts.len() == 1 {
-        parts.pop().expect("just checked the length")
+/// The tables a filter's references resolve against.
+trait Scope {
+    /// The column the reference at the parser's position names: which of
+    /// the scope's tables it is on, and its definition.
+    fn resolve<'s>(&'s self, parser: &mut Parser) -> Result<(usize, &'s DbColumn), ParseError>;
+}
+
+/// One table as a scope: every reference is to it.
+struct OneTable<'t>(&'t DbTable);
+
+impl Scope for OneTable<'_> {
+    fn resolve<'s>(&'s self, parser: &mut Parser) -> Result<(usize, &'s DbColumn), ParseError> {
+        let at = parser.at();
+        let name = parser.column_name(self.0)?;
+        let column = self.0.column(name.as_str()).ok_or(ParseError {
+            message: format!("unknown column `{name}`"),
+            position: at,
+        })?;
+        Ok((0, column))
+    }
+}
+
+/// Whether `qualifier`, written before a column, names the table the
+/// catalog calls `table`: its catalog name, or, for a table outside
+/// `public`, its bare name, which `FROM schema.table` gives it too.
+pub(super) fn names_table(table: &str, qualifier: &str) -> bool {
+    table == qualifier
+        || table
+            .rsplit_once('.')
+            .is_some_and(|(_, bare)| bare == qualifier)
+}
+
+/// PostgreSQL binary parameters are already typed. Only known implicit
+/// comparison families may share an engine value representation. OID zero
+/// denotes a synthetic catalog without PostgreSQL metadata (engine tests).
+fn comparison_types(column: u32, value: u32) -> bool {
+    use binary::oid;
+    if column == 0 || value == 0 || column == value {
+        return true;
+    }
+    let integer = |oid| matches!(oid, oid::INT2 | oid::INT4 | oid::INT8);
+    let float = |oid| matches!(oid, oid::FLOAT4 | oid::FLOAT8);
+    let text = |oid| matches!(oid, oid::TEXT | oid::VARCHAR | oid::NAME);
+    (integer(column) && integer(value))
+        || (float(column) && (float(value) || integer(value) || value == oid::NUMERIC))
+        || (column == oid::NUMERIC && integer(value))
+        || (integer(column) && value == oid::NUMERIC)
+        || (text(column) && text(value))
+}
+
+/// Bind `$number`, when its type compares with `declared` as Postgres
+/// compares them; its value is not read (an array's header gives its
+/// element type).
+pub(super) fn typed_bind<'b>(
+    binds: &'b [Bind],
+    number: usize,
+    declared: &DbColumn,
+    list: bool,
+    at: usize,
+) -> Result<&'b Bind, ParseError> {
+    let bind = number
+        .checked_sub(1)
+        .and_then(|index| binds.get(index))
+        .ok_or(ParseError {
+            message: format!("no value is bound for ${number}"),
+            position: at,
+        })?;
+    let bound = if list {
+        binary::bound_element(bind.type_oid, bind.bytes.as_deref())
     } else {
-        group(parts)
+        Some(bind.type_oid)
+    };
+    if !bound.is_some_and(|oid| comparison_types(declared.type_oid, oid)) {
+        return Err(ParseError {
+            message: format!(
+                "${number}: parameter and column types do not have a supported Postgres comparison"
+            ),
+            position: at,
+        });
+    }
+    Ok(bind)
+}
+
+/// Bind parameter `number` decoded as one value or, for `ANY` and `ALL`,
+/// as a list of values of the column's type.
+pub(super) fn decode_bind(
+    binds: &[Bind],
+    number: usize,
+    declared: &DbColumn,
+    list: bool,
+    at: usize,
+) -> Result<Value, ParseError> {
+    let bind = typed_bind(binds, number, declared, list, at)?;
+    let Some(bytes) = &bind.bytes else {
+        return Ok(Value::Null);
+    };
+    let decoded = if list {
+        binary::decode(
+            &ValueType::List(Box::new(declared.r#type.clone())),
+            bind.type_oid,
+            bytes,
+        )
+    } else {
+        binary::decode(&declared.r#type, bind.type_oid, bytes)
+    }
+    .map_err(|error| ParseError {
+        message: format!("${number}: {error}"),
+        position: at,
+    })?;
+    Ok(coerce_read(decoded, &declared.r#type))
+}
+
+/// A predicate tree retaining its table identity and unbound operands.
+#[derive(Debug, Clone)]
+enum Tagged {
+    Condition(usize, Predicate),
+    And(Vec<Tagged>),
+    Or(Vec<Tagged>),
+}
+
+impl Tagged {
+    /// Every parameter's type checked against its column, no value read.
+    fn check_types(&self, binds: &[Bind]) -> Result<(), ParseError> {
+        match self {
+            Tagged::Condition(_, predicate) => predicate.value.check_type(binds),
+            Tagged::And(parts) | Tagged::Or(parts) => {
+                parts.iter().try_for_each(|part| part.check_types(binds))
+            }
+        }
+    }
+
+    /// A lone part, or `parts` under `group`.
+    fn group(mut parts: Vec<Tagged>, group: fn(Vec<Tagged>) -> Tagged) -> Tagged {
+        if parts.len() == 1 {
+            parts.pop().unwrap_or_else(|| group(Vec::new()))
+        } else {
+            group(parts)
+        }
+    }
+
+    /// `NOT` of the filter, pushed down to its conditions: each takes the
+    /// opposite operator and `AND` and `OR` change places. SQL's three
+    /// values survive it, since a condition on a `NULL` holds under
+    /// neither operator of a pair. `None` for a condition with no
+    /// opposite.
+    fn negated(self) -> Option<Tagged> {
+        use ComparisonOperator::*;
+        Some(match self {
+            Tagged::Condition(node, condition) => {
+                let comparison_operator = match condition.comparison_operator {
+                    EQ => NEQ,
+                    NEQ => EQ,
+                    GT => LTE,
+                    GTE => LT,
+                    LT => GTE,
+                    LTE => GT,
+                    IN => NOT_IN,
+                    NOT_IN => IN,
+                    IS => IS_NOT,
+                    IS_NOT => IS,
+                    EXISTS => return None,
+                };
+                Tagged::Condition(
+                    node,
+                    Predicate {
+                        comparison_operator,
+                        ..condition
+                    },
+                )
+            }
+            Tagged::And(parts) => Tagged::Or(
+                parts
+                    .into_iter()
+                    .map(Tagged::negated)
+                    .collect::<Option<_>>()?,
+            ),
+            Tagged::Or(parts) => Tagged::And(
+                parts
+                    .into_iter()
+                    .map(Tagged::negated)
+                    .collect::<Option<_>>()?,
+            ),
+        })
+    }
+
+    /// Evaluates literals and parameters without reparsing the SQL shape.
+    fn bind(&self, binds: &[Bind]) -> Result<Where, ParseError> {
+        Ok(match self {
+            Tagged::Condition(_, condition) => Where::Condition(condition.bind(binds)?),
+            Tagged::And(parts) => Where::AND(
+                parts
+                    .iter()
+                    .map(|part| part.bind(binds))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Tagged::Or(parts) => Where::OR(
+                parts
+                    .iter()
+                    .map(|part| part.bind(binds))
+                    .collect::<Result<_, _>>()?,
+            ),
+        })
+    }
+
+    /// A type-independent filter for compile-time schema checks.
+    fn validation(&self) -> Where {
+        match self {
+            Tagged::Condition(_, condition) => Where::Condition(Condition {
+                column: condition.column.clone(),
+                comparison_operator: condition.comparison_operator,
+                value: condition.value.validation(),
+            }),
+            Tagged::And(parts) => Where::AND(parts.iter().map(Tagged::validation).collect()),
+            Tagged::Or(parts) => Where::OR(parts.iter().map(Tagged::validation).collect()),
+        }
+    }
+
+    /// The one table every condition of this filter names; `None` when it
+    /// names none or several.
+    fn only_node(&self) -> Option<usize> {
+        let mut found = None;
+        let mut several = false;
+        self.visit(&mut |node| match found {
+            None => found = Some(node),
+            Some(seen) if seen != node => several = true,
+            Some(_) => {}
+        });
+        if several { None } else { found }
+    }
+
+    /// Whether no condition of the filter names a table: a constant
+    /// (`TRUE`, `FALSE`, or the two combined).
+    fn names_no_table(&self) -> bool {
+        let mut any = false;
+        self.visit(&mut |_| any = true);
+        !any
+    }
+
+    /// The filter's top-level conjuncts.
+    fn conjuncts(self) -> Vec<Tagged> {
+        match self {
+            Tagged::And(parts) => parts.into_iter().flat_map(Tagged::conjuncts).collect(),
+            other => vec![other],
+        }
+    }
+
+    fn visit(&self, each: &mut dyn FnMut(usize)) {
+        match self {
+            Tagged::Condition(node, _) => each(*node),
+            Tagged::And(parts) | Tagged::Or(parts) => {
+                for part in parts {
+                    part.visit(each);
+                }
+            }
+        }
     }
 }
 
@@ -1009,6 +1481,22 @@ fn coerce_to_column_type(
         .map(|candidate| &candidate.r#type)
         .expect("column names are validated against the table before coercion");
     coerce_to_type(value, declared, column.as_str(), at)
+}
+
+/// A value compared with a column of `declared`, brought to the column's
+/// type where the two are the same value in another form: an integer for
+/// a float. Any other value is kept as it is and compares as itself.
+fn coerce_read(value: Value, declared: &ValueType) -> Value {
+    match (value, declared) {
+        (Value::Int(int), ValueType::Float) => Value::Float(int as f64),
+        (Value::List(items), ValueType::List(inner)) => Value::List(
+            items
+                .into_iter()
+                .map(|item| coerce_read(item, inner))
+                .collect(),
+        ),
+        (value, _) => value,
+    }
 }
 
 /// Recursive worker for [`coerce_to_column_type`], matching a value (and

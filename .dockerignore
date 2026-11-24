@@ -4,3 +4,8 @@
 !Cargo.lock
 !clippy.toml
 !src
+!crates
+!crates/streamgres-diesel
+!crates/streamgres-diesel/**
+# A workspace member: its manifest alone lets Cargo load the workspace.
+!examples/ticket-desk/Cargo.toml

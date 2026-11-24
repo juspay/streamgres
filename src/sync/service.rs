@@ -44,7 +44,7 @@ use super::storage::{Storage, StorageError};
 use crate::ivm::{Audience, Delta, Engine, Fetch, FetchId, SchemaChange, Subs};
 use crate::model::frame::SharedRow;
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
+    Catalog, DataFrameKey, DataFrameRow, IdMap, Position, Snapshot, SubId, TableName, WriteQuery,
 };
 use crate::stats::Stats;
 
@@ -82,8 +82,8 @@ pub enum Command<Q> {
 #[derive(Debug)]
 pub struct Transaction {
     pub writes: Vec<WriteQuery>,
-    pub at: Lsn,
-    pub progress: Lsn,
+    pub at: Position,
+    pub progress: Position,
     pub watched: Vec<WriteQuery>,
     pub schema: Vec<SchemaChange>,
     pub catalog: Option<Arc<Catalog>>,
@@ -97,7 +97,7 @@ impl Transaction {
     /// committed at or below `position` has been delivered, and nothing
     /// was written. It is one step like any other, which is what moves
     /// the engine, and the snapshots waiting on it, while nobody writes.
-    pub fn mark(position: Lsn) -> Self {
+    pub fn mark(position: Position) -> Self {
         Self::new(Vec::new(), position)
     }
 
@@ -107,7 +107,7 @@ impl Transaction {
     /// from the last position the server saw confirmed, so the
     /// transactions received after that confirmation come again; commit
     /// records end at distinct locations, so the comparison is exact.
-    pub fn repeats(&self, position: Lsn) -> bool {
+    pub fn repeats(&self, position: Position) -> bool {
         !self.is_mark() && self.at <= position
     }
 
@@ -120,7 +120,7 @@ impl Transaction {
 
     /// A transaction of `writes` committed at `at`, the feed's progress
     /// mark being that same location, with nothing watched, received now.
-    pub fn new(writes: Vec<WriteQuery>, at: Lsn) -> Self {
+    pub fn new(writes: Vec<WriteQuery>, at: Position) -> Self {
         Transaction {
             writes,
             at,
@@ -165,7 +165,13 @@ impl Transaction {
 ///   floor. With several consumers, one already serving hears only the
 ///   commits with deltas for it or watched writes.
 /// - `Hydrated`: subscriptions whose first rows have all arrived (every
-///   part of their tree is live), each named once.
+///   part of their tree is live), each named once; with settle reports
+///   ([`Service::with_settle_reports`]), named again each time they settle
+///   after being `Unsettled`.
+/// - `Unsettled`: with settle reports only, subscriptions a step issued
+///   storage reads for, so their rows are incomplete until they are
+///   `Hydrated` again. It comes before the step's own event, so a consumer
+///   never takes the step's rows as complete.
 /// - `Capped`: a page of the subscription stopped reaching past the rows
 ///   its join gate rejects, so it holds fewer rows than asked for: a
 ///   query to report by name. The subscription stays.
@@ -190,13 +196,14 @@ pub enum Event {
     },
     Committed {
         updates: Vec<Delta>,
-        position: Lsn,
-        floor: Lsn,
+        position: Position,
+        floor: Position,
         watched: Vec<WriteQuery>,
         received: Instant,
         routed: Instant,
     },
     Hydrated(Vec<SubId>),
+    Unsettled(Vec<SubId>),
     Capped {
         sub: SubId,
     },
@@ -217,8 +224,8 @@ enum Outcome {
     },
     Landed,
     Committed {
-        position: Lsn,
-        floor: Lsn,
+        position: Position,
+        floor: Position,
         watched: Vec<WriteQuery>,
         received: Instant,
         routed: Instant,
@@ -257,6 +264,9 @@ pub struct Service<E: Engine, S: Storage> {
     /// the commit has deltas for it or watched writes: each send wakes its
     /// thread.
     serving: bool,
+    /// Whether consumers are told when a subscription's rows become
+    /// incomplete and complete again.
+    settle_reports: bool,
     results: mpsc::UnboundedReceiver<(FetchId, Result<Snapshot, StorageError>)>,
     report: mpsc::UnboundedSender<(FetchId, Result<Snapshot, StorageError>)>,
     /// The catalog the clients' side reads, when the service is to keep
@@ -266,7 +276,7 @@ pub struct Service<E: Engine, S: Storage> {
     /// position it took effect at, waiting for the storage floor to reach
     /// that position before the clients' side sees them, and the tables
     /// the change touched.
-    pending: VecDeque<(Lsn, Arc<Catalog>, Vec<TableName>)>,
+    pending: VecDeque<(Position, Arc<Catalog>, Vec<TableName>)>,
 }
 
 impl<E, S> Service<E, S>
@@ -298,6 +308,7 @@ where
             reaper: spawn_reaper(),
             lag_warned: None,
             serving: false,
+            settle_reports: false,
             results,
             report,
             catalog: None,
@@ -328,6 +339,14 @@ where
         if !sinks.is_empty() {
             self.sinks = sinks;
         }
+        self
+    }
+
+    /// Tell consumers each time a subscription's rows become incomplete
+    /// (`Unsettled`) and complete again (`Hydrated`), for a consumer that
+    /// must never answer from rows a read is still filling.
+    pub fn with_settle_reports(mut self) -> Self {
+        self.settle_reports = true;
         self
     }
 
@@ -499,7 +518,9 @@ where
         self.adopt(floor);
         let routed = Instant::now();
         if let Some(stats) = &self.stats {
-            stats.feed_lsn.store(at.0, Ordering::Relaxed);
+            stats
+                .feed_lsn
+                .store(u64::try_from(at.0).unwrap_or(u64::MAX), Ordering::Relaxed);
             stats.publish_engine(self.runtime.engine_stats(), self.runtime.stats());
             stats.publish_footprint(self.runtime.engine_footprint());
         }
@@ -568,7 +589,7 @@ where
     /// snapshot now rather than at its next tick, and the catalog waits
     /// for the storage floor to reach `at` before the clients' side sees
     /// it ([`Service::adopt`]).
-    fn migrate(&mut self, at: Lsn, changes: &[SchemaChange], catalog: Arc<Catalog>) {
+    fn migrate(&mut self, at: Position, changes: &[SchemaChange], catalog: Arc<Catalog>) {
         let started = Instant::now();
         for change in changes {
             self.storage.alter(change);
@@ -597,7 +618,7 @@ where
     /// Publish to the clients' side every waiting catalog whose position
     /// the storage `floor` has reached: from here on every read it plans
     /// and every query it translates meets a snapshot that has the change.
-    fn adopt(&mut self, floor: Lsn) {
+    fn adopt(&mut self, floor: Position) {
         while self.pending.front().is_some_and(|(at, _, _)| *at <= floor) {
             let Some((at, catalog, touched)) = self.pending.pop_front() else {
                 break;
@@ -733,6 +754,9 @@ where
     /// hydrated.
     fn dispatch(&mut self, step: Step, outcome: Outcome) {
         let Step { updates, selects } = step;
+        if self.settle_reports {
+            self.unsettle(&selects);
+        }
         match outcome {
             Outcome::Registered {
                 sink,
@@ -796,6 +820,29 @@ where
             self.swept = Instant::now();
             let all: Vec<SubId> = self.awaiting.keys().copied().collect();
             self.settle(&all);
+        }
+    }
+
+    /// Name, to the sink of each, the settled subscriptions `reads` were
+    /// issued for, and await them again.
+    fn unsettle(&mut self, reads: &[Fetch]) {
+        let mut per_sink: Vec<Vec<SubId>> = (0..self.sinks.len()).map(|_| Vec::new()).collect();
+        for read in reads {
+            for sub in self.runtime.engine().waiting_on(read) {
+                if self.awaiting.contains_key(&sub) {
+                    continue;
+                }
+                let Some(&sink) = self.owners.get(&sub) else {
+                    continue;
+                };
+                self.awaiting.insert(sub, ());
+                per_sink[sink].push(sub);
+            }
+        }
+        for (sink, subs) in self.sinks.iter().zip(per_sink) {
+            if !subs.is_empty() {
+                let _ = sink.send(Event::Unsettled(subs));
+            }
         }
     }
 

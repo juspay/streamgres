@@ -1893,7 +1893,7 @@ mod tests {
         ) -> Result<crate::model::Snapshot, crate::sync::StorageError> {
             Ok(crate::model::Snapshot {
                 rows: Vec::new(),
-                at: crate::model::Lsn::default(),
+                at: crate::model::Position::default(),
             })
         }
 
@@ -1921,11 +1921,11 @@ mod tests {
         }
 
         /// Nothing to follow.
-        fn advance(&self, _feed: crate::model::Lsn) {}
+        fn advance(&self, _feed: crate::model::Position) {}
 
         /// Always current.
-        fn floor(&self) -> crate::model::Lsn {
-            crate::model::Lsn::default()
+        fn floor(&self) -> crate::model::Position {
+            crate::model::Position::default()
         }
     }
 

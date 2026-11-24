@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use crate::ivm::{SchemaChange, complete_image, conform, evaluate, evaluate_with, order_rows};
 use crate::model::{Catalog, ComparisonOperator, Condition, MultiTableReadQuery, Snapshot, Value};
-use crate::model::{DataFrameKey, DataFrameRow, Lsn, SingleTableReadQuery, TableName, WriteQuery};
+use crate::model::{
+    DataFrameKey, DataFrameRow, Position, SingleTableReadQuery, TableName, WriteQuery,
+};
 
 /// A failed storage read; the runtime parks the read and hands it out
 /// again once the stream moves, unless the read was refused (the message
@@ -109,15 +111,15 @@ pub trait Storage {
 
     /// The stream has been delivered (and applied by the engine) up to
     /// `feed`: a snapshot at or below it may now serve reads.
-    fn advance(&self, feed: Lsn);
+    fn advance(&self, feed: Position);
 
     /// The lowest location a read issued from now on can be positioned
     /// at; the runtime keeps every delivered write above it.
-    fn floor(&self) -> Lsn;
+    fn floor(&self) -> Position;
 
     /// A write the stream delivered at `at`, before it is routed: a source
     /// mirroring tables in memory applies it. No-op by default.
-    fn absorb(&self, write: &WriteQuery, at: Lsn) {
+    fn absorb(&self, write: &WriteQuery, at: Position) {
         let _ = (write, at);
     }
 
@@ -131,7 +133,7 @@ pub trait Storage {
     /// schema change committed at `at` asks of a source whose reads
     /// describe the tables in SQL. A source answering from memory has no
     /// use for it. No-op by default.
-    fn follow(&self, at: Lsn, catalog: Arc<Catalog>) {
+    fn follow(&self, at: Position, catalog: Arc<Catalog>) {
         let _ = (at, catalog);
     }
 
@@ -246,7 +248,7 @@ fn exists_position(inner: &[usize], operand: &Value) -> Option<usize> {
 #[derive(Default)]
 pub struct MemoryStorage {
     tables: RefCell<HashMap<TableName, Vec<(DataFrameKey, DataFrameRow)>>>,
-    position: Cell<Lsn>,
+    position: Cell<Position>,
 }
 
 impl MemoryStorage {
@@ -298,7 +300,7 @@ impl MemoryStorage {
     }
 
     /// The location the store was last advanced to.
-    pub fn position(&self) -> Lsn {
+    pub fn position(&self) -> Position {
         self.position.get()
     }
 
@@ -336,19 +338,19 @@ impl Storage for MemoryStorage {
     }
 
     /// The store is current at `feed`.
-    fn advance(&self, feed: Lsn) {
+    fn advance(&self, feed: Position) {
         if feed > self.position.get() {
             self.position.set(feed);
         }
     }
 
     /// Reads are never behind the position.
-    fn floor(&self) -> Lsn {
+    fn floor(&self) -> Position {
         self.position.get()
     }
 
     /// Apply the write and move the position to it.
-    fn absorb(&self, write: &WriteQuery, at: Lsn) {
+    fn absorb(&self, write: &WriteQuery, at: Position) {
         self.apply(write);
         self.advance(at);
     }

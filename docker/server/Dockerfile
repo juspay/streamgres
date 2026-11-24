@@ -24,6 +24,8 @@ FROM ${BUILD_IMAGE} AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock clippy.toml ./
 COPY src ./src
+COPY crates/streamgres-diesel ./crates/streamgres-diesel
+COPY examples/ticket-desk/Cargo.toml ./examples/ticket-desk/Cargo.toml
 RUN cargo build --release --locked --bin server \
     && mkdir -p /out/app /out/var/lib/streamgres \
     && cp target/release/server /out/app/server

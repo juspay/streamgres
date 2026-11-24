@@ -1,32 +1,23 @@
-//! Where in the source's history a write or a storage read sits: one WAL
-//! location ([`Lsn`]) for both. The engine itself never compares
-//! locations; the runtime does, to bring a read's result up to the point
-//! the engine has reached before the engine sees it (see `sync::Runtime`).
+//! Where in the source's history a write or a storage read sits: one
+//! [`Position`] for both. The engine itself never compares positions; the
+//! runtime does, to bring a read's result up to the point the engine has
+//! reached before the engine sees it (see `sync::Runtime`).
 
 use std::fmt;
 
 use super::frame::{DataFrameKey, DataFrameRow};
 
-/// A WAL location: the 64-bit form of Postgres's `X/Y`. A write carries
-/// the location of its transaction's commit; a read carries the location
-/// its snapshot reflects every commit up to.
+/// A point in the source's history, ordered as the source orders its
+/// commits. Each backend says what it is: a WAL location for Postgres
+/// (`sync::pg::Position`), a hybrid-logical timestamp for a database that has
+/// those. A write carries the position of its transaction's commit; a read
+/// carries the position its snapshot reflects every commit up to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct Lsn(pub u64);
+pub struct Position(pub u128);
 
-impl Lsn {
-    /// Parse Postgres's `X/Y` spelling (both halves hexadecimal).
-    pub fn parse(text: &str) -> Option<Lsn> {
-        let (high, low) = text.trim().split_once('/')?;
-        let high = u64::from_str_radix(high, 16).ok()?;
-        let low = u64::from_str_radix(low, 16).ok()?;
-        Some(Lsn((high << 32) | low))
-    }
-}
-
-impl fmt::Display for Lsn {
-    /// Postgres's `X/Y` spelling.
+impl fmt::Display for Position {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:X}/{:X}", self.0 >> 32, self.0 & 0xFFFF_FFFF)
+        write!(f, "{}", self.0)
     }
 }
 
@@ -35,21 +26,5 @@ impl fmt::Display for Lsn {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
     pub rows: Vec<(DataFrameKey, DataFrameRow)>,
-    pub at: Lsn,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `X/Y` parses hexadecimal halves into one ordered number and prints
-    /// back the same way.
-    #[test]
-    fn lsn_round_trips() {
-        let lsn = Lsn::parse("1/A0").unwrap();
-        assert_eq!(lsn, Lsn((1 << 32) | 0xA0));
-        assert_eq!(lsn.to_string(), "1/A0");
-        assert!(Lsn::parse("0/FFFFFFFF").unwrap() < Lsn::parse("1/0").unwrap());
-        assert!(Lsn::parse("nonsense").is_none());
-    }
+    pub at: Position,
 }
