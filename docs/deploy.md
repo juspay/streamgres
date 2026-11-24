@@ -110,9 +110,18 @@ idle. PgBouncer's own pool settings control the PostgreSQL backend connections.
 `STREAMGRES_MASTER_PG_DSN` connects to the writable primary. On first startup,
 Streamgres creates the `<app>_<shard>` mutation schema, publication, DDL
 functions, and event triggers. Existing objects are validated without
-replacement; mismatches stop startup. The publication is created with
-`publish_via_partition_root = true`; one created before that setting was
-required stops startup with the `ALTER PUBLICATION` command that fixes it. The master role must be a PostgreSQL
+replacement; mismatches stop startup. A missing publication is created as
+`FOR TABLES IN SCHEMA` the `STREAMGRES_SCHEMAS` schemas, with
+`publish_via_partition_root = true`. An existing one may have any shape:
+`FOR ALL TABLES`, schemas, tables listed one by one, or a mix. Startup
+requires only that it publishes inserts, updates, deletes and truncates and
+sets `publish_via_partition_root = true`; otherwise it stops with the `ALTER
+PUBLICATION` command that fixes it. The server confirms mutations by following
+`<app>_<shard>.clients` and `<app>_<shard>.mutations`, which setup creates, so
+setup adds them to the publication when it lacks them. Change an existing publication with `ALTER
+PUBLICATION`: the DDL triggers do not hear `DROP` or `CREATE PUBLICATION`, so
+recreating it leaves the stored schema snapshot stale, and startup refuses
+until `server print-ddl-triggers` is run again. The master role must be a PostgreSQL
 superuser to create the publication and event triggers. `server
 print-ddl-triggers` prints the trigger SQL setup installs for the configured
 app, shard and publication, for installing or replacing it by hand. Choose

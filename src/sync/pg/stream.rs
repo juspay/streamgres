@@ -782,7 +782,7 @@ async fn prepare_slot(
         .is_some();
     if !published {
         return Err(StorageError(format!(
-            "publication `{publication}` does not exist; create it before starting streamgres (for example, on the primary: CREATE PUBLICATION \"{publication}\" FOR ALL TABLES)"
+            "publication `{publication}` does not exist; create it before starting streamgres (for example, on the primary: CREATE PUBLICATION \"{publication}\" FOR ALL TABLES WITH (publish_via_partition_root = true))"
         )));
     }
     let exists = client

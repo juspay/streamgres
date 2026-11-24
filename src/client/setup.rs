@@ -125,53 +125,61 @@ async fn ensure_locked(tx: &Transaction<'_>, config: &Config, schema: &str) -> R
     let publication = &config.publication;
     let existing = tx
         .query_opt(
-            "SELECT puballtables, pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot
+            "SELECT pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot
              FROM pg_publication WHERE pubname = $1",
             &[publication],
         )
         .await
         .map_err(|error| format!("checking publication `{publication}`: {error}"))?;
     if let Some(row) = existing {
-        let flags = [
-            row.get::<_, bool>(0),
-            row.get::<_, bool>(1),
-            row.get::<_, bool>(2),
-            row.get::<_, bool>(3),
-            row.get::<_, bool>(4),
-            row.get::<_, bool>(5),
-        ];
-        let actual = tx
-            .query(
-                "SELECT n.nspname FROM pg_publication_namespace pn
-                 JOIN pg_namespace n ON n.oid = pn.pnnspid
-                 WHERE pn.pnpubid = (SELECT oid FROM pg_publication WHERE pubname = $1)",
-                &[publication],
-            )
-            .await
-            .map_err(|error| format!("checking publication `{publication}` schemas: {error}"))?
+        let missing: Vec<&str> = ["insert", "update", "delete", "truncate"]
             .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<std::collections::BTreeSet<_>>();
-        let wanted = config.schemas.iter().cloned().collect();
-        let explicit: i64 = tx
-            .query_one(
-                "SELECT count(*) FROM pg_publication_rel
-                 WHERE prpubid = (SELECT oid FROM pg_publication WHERE pubname = $1)",
-                &[publication],
-            )
-            .await
-            .map_err(|error| format!("checking publication `{publication}` tables: {error}"))?
-            .get(0);
-        if flags == [false, true, true, true, true, false] && actual == wanted && explicit == 0 {
+            .zip(0..)
+            .filter(|(_, column)| !row.get::<_, bool>(*column))
+            .map(|(kind, _)| kind)
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "publication `{publication}` does not publish {}, so those changes would never reach clients; run on the primary: ALTER PUBLICATION {} SET (publish = 'insert, update, delete, truncate')",
+                missing.join(", "),
+                quote_ident(publication)
+            ));
+        }
+        if !row.get::<_, bool>(4) {
             return Err(format!(
                 "publication `{publication}` publishes partitions under their own names; the catalog serves partitioned tables through their root, so run on the primary: ALTER PUBLICATION {} SET (publish_via_partition_root = true)",
                 quote_ident(publication)
             ));
         }
-        if flags != [false, true, true, true, true, true] || actual != wanted || explicit != 0 {
-            return Err(format!(
-                "publication `{publication}` differs: expected schema scopes {wanted:?}, all change types, publish_via_partition_root = true, no explicit tables; found scopes {actual:?}, flags {flags:?}, {explicit} explicit tables"
-            ));
+        let published = tx
+            .query(
+                "SELECT tablename FROM pg_publication_tables
+                 WHERE pubname = $1 AND schemaname = $2",
+                &[publication, &schema],
+            )
+            .await
+            .map_err(|error| format!("checking publication `{publication}` tables: {error}"))?
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<std::collections::BTreeSet<_>>();
+        let unpublished: Vec<String> = ["clients", "mutations"]
+            .into_iter()
+            .filter(|table| !published.contains(*table))
+            .map(|table| format!("{}.{}", quote_ident(schema), quote_ident(table)))
+            .collect();
+        if !unpublished.is_empty() {
+            tx.batch_execute(&format!(
+                "ALTER PUBLICATION {} ADD TABLE {}",
+                quote_ident(publication),
+                unpublished.join(", ")
+            ))
+            .await
+            .map_err(|error| {
+                format!(
+                    "adding {} to publication `{publication}`, which the server follows to confirm mutations: {error}",
+                    unpublished.join(", ")
+                )
+            })?;
         }
     } else {
         let schemas = config
@@ -358,7 +366,9 @@ async fn validate_triggers(
             )
             .await
             .map_err(|error| format!("validating DDL event trigger `{name}`: {error}"))?
-            .ok_or_else(|| format!("DDL trigger stack is incomplete: missing `{name}`. {REINSTALL}"))?;
+            .ok_or_else(|| {
+                format!("DDL trigger stack is incomplete: missing `{name}`. {REINSTALL}")
+            })?;
         let mut actual_tags = row.get::<_, Option<Vec<String>>>(2).unwrap_or_default();
         actual_tags.sort();
         if row.get::<_, String>(0) != event
@@ -404,7 +414,7 @@ async fn validate_triggers(
     };
     if !matches {
         return Err(format!(
-            "schema `{schema}` has a missing or stale published schema snapshot. {REINSTALL}"
+            "schema `{schema}` has a missing or stale published schema snapshot: the schema or the publication changed without the DDL triggers seeing it. Dropping and recreating the publication does this, since the triggers only hear ALTER PUBLICATION. {REINSTALL}"
         ));
     }
     Ok(())
@@ -478,8 +488,12 @@ fn schema_snapshots_match(current: &str, expected: &str) -> Result<bool, String>
         .map_err(|error| format!("unreadable stored schema snapshot: {error}"))?;
     let mut expected: SchemaSnapshot = serde_json::from_str(expected)
         .map_err(|error| format!("unreadable current schema snapshot: {error}"))?;
-    current.tables.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
-    expected.tables.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
+    current
+        .tables
+        .sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
+    expected
+        .tables
+        .sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
     current.indexes.sort_by(|a, b| {
         (&a.schema, &a.table_name, &a.name).cmp(&(&b.schema, &b.table_name, &b.name))
     });
@@ -639,11 +653,107 @@ mod tests {
         assert!(!schema_snapshots_match(stored, reordered_index_columns).unwrap());
     }
 
+    /// Held by each test that installs a DDL trigger stack: the triggers
+    /// fire on every DDL in the database, so two such tests at once
+    /// deadlock on each other's tables.
+    static DATABASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A first start against a publication made beforehand, in any shape,
+    /// succeeds and adds the mutation tables to it when it lacks them.
+    #[tokio::test]
+    async fn first_setup_accepts_any_publication_shape_and_adds_the_mutation_tables() {
+        let Ok(dsn) = std::env::var("STREAMGRES_SETUP_TEST_DSN") else {
+            return;
+        };
+        let _alone = DATABASE.lock().await;
+        let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        let connection = tokio::spawn(connection);
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let extra = format!("sgextra{tag}");
+        let probe = format!("public.{}", quote_ident(&format!("sgprobe{tag}")));
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {}; CREATE TABLE {probe} (id bigint PRIMARY KEY)",
+                quote_ident(&extra)
+            ))
+            .await
+            .unwrap();
+        for (index, shape) in [
+            "FOR ALL TABLES".to_owned(),
+            format!("FOR TABLES IN SCHEMA public, {}", quote_ident(&extra)),
+            format!("FOR TABLE {probe}"),
+            format!(
+                "FOR TABLES IN SCHEMA {}, TABLE {probe}",
+                quote_ident(&extra)
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let app = format!("sgshape{index}{tag}");
+            let schema = format!("{app}_0");
+            let publication = format!("{app}_pub");
+            let schemas = format!("public,{schema}");
+            client
+                .batch_execute(&format!(
+                    "CREATE PUBLICATION {} {shape} WITH (publish_via_partition_root = true)",
+                    quote_ident(&publication)
+                ))
+                .await
+                .unwrap();
+            let config = Config::from_lookup(|name| match name {
+                "STREAMGRES_PG_DSN" | "STREAMGRES_MASTER_PG_DSN" => Some(dsn.clone()),
+                "STREAMGRES_QUERY_URL" => Some("http://localhost/query".to_owned()),
+                "STREAMGRES_MUTATE_URL" => Some("http://localhost/push".to_owned()),
+                "STREAMGRES_APP_ID" => Some(app.clone()),
+                "STREAMGRES_SCHEMAS" => Some(schemas.clone()),
+                "STREAMGRES_PUBLICATION" => Some(publication.clone()),
+                _ => None,
+            })
+            .unwrap();
+            ensure(&dsn, &config)
+                .await
+                .unwrap_or_else(|error| panic!("{shape}: {error}"));
+            ensure(&dsn, &config)
+                .await
+                .unwrap_or_else(|error| panic!("{shape}, again: {error}"));
+            let published: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM pg_publication_tables
+                     WHERE pubname = $1 AND schemaname = $2
+                       AND tablename IN ('clients', 'mutations')",
+                    &[&publication, &schema],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(published, 2, "{shape}");
+            client
+                .batch_execute(&format!(
+                    "DROP PUBLICATION {}; DROP SCHEMA {} CASCADE",
+                    quote_ident(&publication),
+                    quote_ident(&schema)
+                ))
+                .await
+                .unwrap();
+        }
+        client
+            .batch_execute(&format!(
+                "DROP TABLE {probe}; DROP SCHEMA {}",
+                quote_ident(&extra)
+            ))
+            .await
+            .unwrap();
+        drop(client);
+        connection.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn fresh_setup_is_repeatable_and_existing_tables_are_validated() {
         let Ok(dsn) = std::env::var("STREAMGRES_SETUP_TEST_DSN") else {
             return;
         };
+        let _alone = DATABASE.lock().await;
         let app = format!("sgtest{}", uuid::Uuid::new_v4().simple());
         let schema = format!("{app}_0");
         let publication = format!("{app}_pub");
@@ -707,7 +817,9 @@ mod tests {
         assert!(added);
         let index = format!("{}.ddl_probe_idx", quote_ident(&schema));
         client
-            .batch_execute(&format!("CREATE INDEX ddl_probe_idx ON {probe} (probe_added)"))
+            .batch_execute(&format!(
+                "CREATE INDEX ddl_probe_idx ON {probe} (probe_added)"
+            ))
             .await
             .unwrap();
         let index_added: bool = client
@@ -803,26 +915,22 @@ mod tests {
             .unwrap();
         ensure(&dsn, &config).await.unwrap();
 
-        let mut conflicting = config.clone();
-        conflicting.app_id.push('x');
-        let other_schema = conflicting.upstream_schema();
-        conflicting.schemas = vec!["public".to_owned(), other_schema.clone()];
-        assert!(
-            ensure(&dsn, &conflicting)
-                .await
-                .unwrap_err()
-                .contains("publication")
-        );
-        assert!(
-            client
-                .query_opt(
-                    "SELECT 1 FROM pg_namespace WHERE nspname = $1",
-                    &[&other_schema]
-                )
-                .await
-                .unwrap()
-                .is_none()
-        );
+        // A second deployment, with its own app ID, can share the
+        // publication: its mutation tables are added, and the first
+        // deployment's setup still validates.
+        let mut sharing = config.clone();
+        sharing.app_id.push('x');
+        let other_schema = sharing.upstream_schema();
+        sharing.schemas = vec!["public".to_owned(), other_schema.clone()];
+        ensure(&dsn, &sharing).await.unwrap();
+        ensure(&dsn, &config).await.unwrap();
+        client
+            .batch_execute(&format!(
+                "DROP SCHEMA {} CASCADE",
+                quote_ident(&other_schema)
+            ))
+            .await
+            .unwrap();
         client
             .batch_execute(&format!(
                 "ALTER TABLE {}.\"clients\" ADD COLUMN extra text",
