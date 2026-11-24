@@ -531,3 +531,109 @@ pub async fn start(
         service,
     ))
 }
+
+#[cfg(test)]
+mod slot_cleanup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn periodic_cleanup_guard_drop_cancels_inflight_connection() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted, connected) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = accepted.send(());
+            let mut bytes = Vec::new();
+            socket.read_to_end(&mut bytes).await.unwrap();
+        });
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let cleanup = SweepTask::spawn(
+                    format!("host=127.0.0.1 port={port} user=test dbname=test"),
+                    slot_name(),
+                    Duration::from_millis(10),
+                    Duration::ZERO,
+                    DEFAULT_SWEEP_LOCK_KEY.to_owned(),
+                );
+                tokio::time::timeout(Duration::from_secs(2), connected)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                drop(cleanup);
+                tokio::time::timeout(Duration::from_secs(2), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn periodic_slot_cleanup_runs_and_stops() {
+        let Ok(dsn) = std::env::var("STREAMGRES_SLOT_TEST_DSN") else {
+            return;
+        };
+        let configured = dsn.clone();
+        let (admin, driver) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        let driver = tokio::spawn(driver);
+        let initial = slot_name();
+        admin
+            .query_one(
+                "SELECT * FROM pg_create_logical_replication_slot($1, 'test_decoding')",
+                &[&initial],
+            )
+            .await
+            .unwrap();
+        let (stop, stopped) = watch::channel(false);
+        let task = tokio::spawn(periodic_sweep(
+            configured,
+            String::new(),
+            stopped,
+            Duration::from_millis(25),
+            Duration::ZERO,
+            DEFAULT_SWEEP_LOCK_KEY.to_owned(),
+        ));
+        for slot in [initial, slot_name()] {
+            if !Transport::slot_exists(&dsn, &slot).await.unwrap() {
+                admin
+                    .query_one(
+                        "SELECT * FROM pg_create_logical_replication_slot($1, 'test_decoding')",
+                        &[&slot],
+                    )
+                    .await
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while Transport::slot_exists(&dsn, &slot).await.unwrap() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("initial/periodic cleanup did not delete an orphan");
+        }
+        stop.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let retained = slot_name();
+        admin
+            .query_one(
+                "SELECT * FROM pg_create_logical_replication_slot($1, 'test_decoding')",
+                &[&retained],
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(Transport::slot_exists(&dsn, &retained).await.unwrap());
+        admin
+            .query_one("SELECT pg_drop_replication_slot($1)", &[&retained])
+            .await
+            .unwrap();
+        driver.abort();
+    }
+}
