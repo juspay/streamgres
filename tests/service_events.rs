@@ -105,7 +105,7 @@ fn shapes(events: &[Event]) -> Vec<&'static str> {
 fn updates_of(event: &Event) -> &[streamgres::ivm::Delta] {
     match event {
         Event::Registered { updates, .. }
-        | Event::Landed { updates }
+        | Event::Landed { updates, .. }
         | Event::Committed { updates, .. } => updates,
         Event::Hydrated(_) | Event::Refused { .. } | Event::Capped { .. } | Event::Heavy { .. } => {
             &[]
@@ -767,5 +767,105 @@ fn a_serving_consumer_is_not_woken_for_nothing() {
             shapes(&other_seen)
         );
         assert_eq!(ids(&drain(&mut owner).await), vec![3]);
+    });
+}
+
+/// A row of `table` with key `id` and the given cells.
+fn row_of(table: &str, id: i64, cells: &[(&str, Value)]) -> WriteQuery {
+    let mut data: HashMap<ColumnName, Value> = cells
+        .iter()
+        .map(|(column, value)| ((*column).into(), value.clone()))
+        .collect();
+    data.insert("id".into(), Value::Int(id));
+    WriteQuery::INSERT(InsertQuery {
+        table: TableName::from(table),
+        pkey_value: DataFrameKey::new(pkey(id)),
+        record: DataFrameRow::from(data),
+    })
+}
+
+/// My memberships, each with its conversation.
+fn my_conversations() -> MultiTableReadQuery {
+    let members = SingleTableReadQuery::new(
+        "members",
+        Where::condition("user", ComparisonOperator::EQ, "me"),
+        OrderBy::new("id", Order::ASC),
+        u32::MAX,
+    );
+    let convs = SingleTableReadQuery::new(
+        "convs",
+        Where::AND(Vec::new()),
+        OrderBy::new("id", Order::ASC),
+        u32::MAX,
+    );
+    MultiTableReadQuery::new(
+        members,
+        vec![Join::left(MultiTableReadQuery::single(convs), "conv", "id")],
+    )
+}
+
+/// A commit whose rows need a storage read names that read as opened for the
+/// waiting subscription, and the landing that brings the rows closes it; a
+/// registration's own reads are never announced.
+#[test]
+fn a_commit_names_the_reads_its_rows_wait_on() {
+    block_on(async {
+        let storage = Rc::new(MemoryStorage::new());
+        storage.apply(&row_of("convs", 7, &[("title", Value::from("seven"))]));
+        let (commands, mut events) = start(storage);
+
+        commands
+            .send(Command::Register {
+                sink: 0,
+                query: my_conversations(),
+                token: 1,
+            })
+            .await
+            .expect("send");
+        let hydration = drain(&mut events).await;
+        let (_, sub) = registered(&hydration).expect("registered");
+        for event in &hydration {
+            if let Event::Landed { closed, opened, .. } = event {
+                assert!(
+                    closed.is_none() && opened.is_empty(),
+                    "a registration's reads are not announced"
+                );
+            }
+        }
+
+        commands
+            .send(Command::Transaction(Transaction::new(
+                vec![row_of(
+                    "members",
+                    1,
+                    &[("conv", Value::Int(7)), ("user", Value::from("me"))],
+                )],
+                Lsn(100),
+            )))
+            .await
+            .expect("send");
+        let seen = drain(&mut events).await;
+
+        let opened = seen
+            .iter()
+            .find_map(|event| match event {
+                Event::Committed { opened, .. } => Some(opened.clone()),
+                _ => None,
+            })
+            .expect("the commit");
+        assert_eq!(opened.len(), 1, "the commit opens one read, got {seen:?}");
+        let (read, waiting) = &opened[0];
+        assert_eq!(
+            waiting,
+            &vec![sub],
+            "the read is announced to the subscription waiting on it"
+        );
+        assert!(
+            seen.iter().any(|event| matches!(
+                event,
+                Event::Landed { closed: Some(closed), updates, .. } if closed == read && !updates.is_empty()
+            )),
+            "the landing that brings the conversation closes the read, got {seen:?}"
+        );
     });
 }

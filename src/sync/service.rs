@@ -153,7 +153,7 @@ impl Transaction {
 ///   `reads`, how many storage reads the registration issued (zero when
 ///   the frames already held answered it). It precedes every other event
 ///   about the subscription.
-/// - `Landed`: a storage read landed, with the deltas it produced.
+/// - `Landed`: a storage read landed, with the deltas it produced; `closed` and `opened` as for `Committed`.
 /// - `Refused`: a storage read the subscription depended on was refused
 ///   (it returned more rows than a read may), so the subscription is gone;
 ///   `reason` is what the client can be told.
@@ -163,7 +163,8 @@ impl Transaction {
 ///   clock, when the feed decoded the transaction and when the engine
 ///   finished with it. A consumer serves once the position covers the
 ///   floor. With several consumers, one already serving hears only the
-///   commits with deltas for it or watched writes.
+///   commits with deltas, watched writes or opened reads for it.
+///   `opened` lists the reads its rows wait on, each later closed by a `Landed`.
 /// - `Hydrated`: subscriptions whose first rows have all arrived (every
 ///   part of their tree is live), each named once.
 /// - `Capped`: a page of the subscription stopped reaching past the rows
@@ -183,6 +184,8 @@ pub enum Event {
     },
     Landed {
         updates: Vec<Delta>,
+        closed: Option<FetchId>,
+        opened: Vec<Opened>,
     },
     Refused {
         sub: SubId,
@@ -195,6 +198,7 @@ pub enum Event {
         watched: Vec<WriteQuery>,
         received: Instant,
         routed: Instant,
+        opened: Vec<Opened>,
     },
     Hydrated(Vec<SubId>),
     Capped {
@@ -207,6 +211,9 @@ pub enum Event {
     },
 }
 
+/// A read a commit's rows wait on, and the subscriptions waiting on it.
+pub type Opened = (FetchId, Vec<SubId>);
+
 /// How a step ended: what its deltas travel inside of.
 enum Outcome {
     Registered {
@@ -215,7 +222,9 @@ enum Outcome {
         sub: SubId,
         reads: usize,
     },
-    Landed,
+    Landed {
+        closed: Option<(FetchId, Vec<usize>)>,
+    },
     Committed {
         position: Lsn,
         floor: Lsn,
@@ -242,6 +251,10 @@ pub struct Service<E: Engine, S: Storage> {
     awaiting: IdMap<SubId, ()>,
     /// When each read in flight was handed to the driver, for `read_io`.
     issued: IdMap<FetchId, Instant>,
+    /// Reads a commit's rows wait on, with the sinks told they are open.
+    open_reads: IdMap<FetchId, Vec<usize>>,
+    /// The lowest read id not yet seen, so a retried read is not taken for a new one.
+    unseen: u64,
     /// When every awaited subscription was last checked for completion;
     /// the checks otherwise touch only what a step could have completed.
     swept: Instant,
@@ -294,6 +307,8 @@ where
             owners: IdMap::default(),
             awaiting: IdMap::default(),
             issued: IdMap::default(),
+            open_reads: IdMap::default(),
+            unseen: 0,
             swept: Instant::now(),
             reaper: spawn_reaper(),
             lag_warned: None,
@@ -383,7 +398,8 @@ where
                         if let Some(stats) = &self.stats {
                             stats.land_step.record(started.elapsed());
                         }
-                        self.dispatch(step, Outcome::Landed);
+                        let closed = self.open_reads.remove(&id).map(|sinks| (id, sinks));
+                        self.dispatch(step, Outcome::Landed { closed });
                         self.settle(&waiting);
                         self.reap();
                     }
@@ -391,6 +407,16 @@ where
                         self.issued.remove(&id);
                         if let Some(reason) = error.refusal() {
                             log_warn!("storage read {} refused: {reason}", id.0);
+                            for sink in self.open_reads.remove(&id).unwrap_or_default() {
+                                self.send_to(
+                                    sink,
+                                    Event::Landed {
+                                        updates: Vec::new(),
+                                        closed: Some(id),
+                                        opened: Vec::new(),
+                                    },
+                                );
+                            }
                             for sub in self.runtime.refused(id) {
                                 self.awaiting.remove(&sub);
                                 if let Some(sink) = self.owners.remove(&sub) {
@@ -733,6 +759,12 @@ where
     /// hydrated.
     fn dispatch(&mut self, step: Step, outcome: Outcome) {
         let Step { updates, selects } = step;
+        let fenced = match &outcome {
+            Outcome::Committed { .. } => true,
+            Outcome::Landed { closed } => closed.is_some(),
+            _ => false,
+        };
+        let mut opened = self.open(&selects, fenced).into_iter();
         match outcome {
             Outcome::Registered {
                 sink,
@@ -750,10 +782,20 @@ where
                     },
                 );
             }
-            Outcome::Landed => {
-                for (sink, batch) in self.sinks.iter().zip(self.partition(updates)) {
-                    if !batch.is_empty() {
-                        let _ = sink.send(Event::Landed { updates: batch });
+            Outcome::Landed { closed } => {
+                let (id, told) = closed.unzip();
+                let told = told.unwrap_or_default();
+                for (index, (sink, batch)) in
+                    self.sinks.iter().zip(self.partition(updates)).enumerate()
+                {
+                    let opened = opened.next().unwrap_or_default();
+                    let closed = id.filter(|_| told.contains(&index));
+                    if !batch.is_empty() || closed.is_some() || !opened.is_empty() {
+                        let _ = sink.send(Event::Landed {
+                            updates: batch,
+                            closed,
+                            opened,
+                        });
                     }
                 }
             }
@@ -766,7 +808,8 @@ where
             } => {
                 let skip_empty = self.serving && self.sinks.len() > 1 && watched.is_empty();
                 for (sink, batch) in self.sinks.iter().zip(self.partition(updates)) {
-                    if skip_empty && batch.is_empty() {
+                    let opened = opened.next().unwrap_or_default();
+                    if skip_empty && batch.is_empty() && opened.is_empty() {
                         continue;
                     }
                     let _ = sink.send(Event::Committed {
@@ -776,6 +819,7 @@ where
                         watched: watched.clone(),
                         received,
                         routed,
+                        opened,
                     });
                 }
                 self.serving |= floor.0 != 0 && position >= floor;
@@ -797,6 +841,36 @@ where
             let all: Vec<SubId> = self.awaiting.keys().copied().collect();
             self.settle(&all);
         }
+    }
+
+    /// Track the step's new reads when `fenced`, returning per sink the reads its subscriptions wait on.
+    fn open(&mut self, selects: &[Fetch], fenced: bool) -> Vec<Vec<Opened>> {
+        let mut opened: Vec<Vec<Opened>> = (0..self.sinks.len()).map(|_| Vec::new()).collect();
+        let unseen = self.unseen;
+        for fetch in selects {
+            if fetch.id.0 < unseen {
+                continue;
+            }
+            self.unseen = self.unseen.max(fetch.id.0 + 1);
+            if !fenced {
+                continue;
+            }
+            let mut told = Vec::new();
+            for sub in self.runtime.waiting_on(fetch.id) {
+                let Some(&sink) = self.owners.get(&sub) else {
+                    continue;
+                };
+                match opened[sink].last_mut() {
+                    Some((id, subs)) if *id == fetch.id => subs.push(sub),
+                    _ => {
+                        opened[sink].push((fetch.id, vec![sub]));
+                        told.push(sink);
+                    }
+                }
+            }
+            self.open_reads.insert(fetch.id, told);
+        }
+        opened
     }
 
     /// Name those of `candidates` that are awaited and whose first rows
