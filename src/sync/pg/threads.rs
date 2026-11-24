@@ -75,7 +75,11 @@ pub struct Settings {
     /// Snapshot minting and replication always use `dsn` above.
     pub read_dsn: String,
     pub slot: String,
+    pub slot_cleanup_enabled: bool,
+    pub slot_sweep_lock_key: String,
     pub slot_cleanup_age: Duration,
+    pub slot_sweep_interval: Duration,
+    pub slot_cleanup_startup_timeout: Duration,
     pub publication: String,
     pub schemas: Vec<String>,
     pub snapshot_rotation: Duration,
@@ -91,6 +95,8 @@ pub struct Settings {
 
 /// What every slot a server names for itself starts with.
 pub const SLOT_PREFIX: &str = "xyne_sync_slot_";
+
+pub const DEFAULT_SWEEP_LOCK_KEY: &str = "streamgres.slot_cleanup";
 
 /// A slot name of this process's own: [`SLOT_PREFIX`] and a fresh UUID
 /// (lowercase hex, no dashes, as slot names allow).
