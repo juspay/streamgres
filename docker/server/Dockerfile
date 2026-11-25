@@ -24,6 +24,9 @@ FROM ${BUILD_IMAGE} AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock clippy.toml ./
 COPY src ./src
+# Cargo.toml declares tests by name ([[test]]); cargo reads them to parse
+# the manifest, even when building the server alone.
+COPY tests ./tests
 COPY crates/streamgres-diesel ./crates/streamgres-diesel
 COPY examples/ticket-desk/Cargo.toml ./examples/ticket-desk/Cargo.toml
 RUN cargo build --release --locked --bin server \

@@ -11,8 +11,7 @@
 //! slot.
 //!
 //! Fallback reads, reader checks, catalog and type queries use exclusive
-//! origin pool checkouts. With an application pool, checkouts are obtained
-//! on the application's runtime. WAL sampling, replication, snapshot
+//! checkouts of Streamgres's own pool. WAL sampling, replication, snapshot
 //! exporters and slot lifecycle operations use the direct endpoint.
 
 use std::panic::AssertUnwindSafe;
@@ -135,7 +134,7 @@ impl PgConfig {
     /// The SQL that installs the schema-change trigger stack the engine
     /// needs, for an administrator to run once.
     pub fn setup_sql(&self) -> String {
-        super::pg::ddl_triggers::trigger_stack_sql(&self.app, self.shard, &[&self.publication])
+        super::pg::ddl_triggers::library_stack_sql(&self.app, self.shard, &[&self.publication])
     }
 
     /// The event trigger the engine hears schema changes through.
@@ -173,20 +172,14 @@ impl PgConfig {
 pub(crate) struct PgEngine {
     config: PgConfig,
     origin: Arc<Origin>,
-    /// Whether storage reads run on the origin's connections (the
-    /// application's) rather than the engine's own read connections, which
-    /// read Postgres's text directly.
-    reads_on_origin: bool,
 }
 
 impl PgEngine {
-    /// The engine for `config`, its origin work run on `runtime`. Storage
-    /// reads run on `connections` when `reads_on_origin`.
+    /// The engine for `config`, its origin work run on `runtime`.
     pub fn new(
         config: PgConfig,
         connections: Arc<dyn Connections>,
         runtime: tokio::runtime::Handle,
-        reads_on_origin: bool,
     ) -> Self {
         Self {
             origin: Arc::new(Origin {
@@ -194,7 +187,6 @@ impl PgEngine {
                 runtime,
             }),
             config,
-            reads_on_origin,
         }
     }
 
@@ -227,15 +219,13 @@ impl PgEngine {
         let catalog = Arc::new(CatalogHandle::new(catalog));
         let settings = config.settings(slot.to_owned());
         cleanup.set(true);
-        let (started, service) = threads::start_with_connections(
+        let (started, service) = threads::start(
             &settings,
             catalog.clone(),
             reads,
             1,
             Stats::shared(),
             failing.clone(),
-            self.reads_on_origin
-                .then(|| self.origin.connections.clone()),
         )
         .await?;
         let Started {

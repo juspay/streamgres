@@ -4,6 +4,8 @@
 !Cargo.lock
 !clippy.toml
 !src
+# Cargo.toml names tests ([[test]]), so their files must exist to parse it.
+!tests
 !crates
 !crates/streamgres-diesel
 !crates/streamgres-diesel/**

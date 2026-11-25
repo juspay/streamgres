@@ -34,12 +34,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-pub use crate::sync::pg::connections::{
-    Bind, Connection, ConnectionFuture, Connections, Lease, RawColumn, RawRows, Session,
-    SessionError,
-};
+pub use crate::sync::pg::connections::{Bind, SessionError};
 pub use api::{
-    Builder, Error, Fallback, Inspecting, LoadAndSync, OnUnsupported, Param, Sql, Streamgres,
+    Builder, Error, Fallback, Inspecting, LoadAndSync, OnUnsupported, Op, Param, Sql, Streamgres,
+    block_on,
 };
 pub(crate) use config::CacheConfig;
 pub use config::Ttl;

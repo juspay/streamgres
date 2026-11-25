@@ -1,6 +1,6 @@
 //! Synchronous Diesel code reading through Streamgres with no runtime of
-//! its own: `diesel::PgConnection` for writes, `sync::LoadAndSync` for
-//! reads, on a plain test thread.
+//! its own: `diesel::PgConnection` for writes, the same `load_and_sync`
+//! ended with `.wait()` for reads, on a plain test thread.
 
 use std::future::{Future, IntoFuture};
 use std::pin::pin;
@@ -11,8 +11,7 @@ use std::time::{Duration, Instant};
 
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
-use streamgres_diesel::sync::LoadAndSync;
-use streamgres_diesel::{Served, Streamgres, Ttl};
+use streamgres_diesel::{LoadAndSync, Served, Streamgres, Ttl};
 
 diesel::table! {
     desk_sync.tickets (id) {
@@ -20,6 +19,13 @@ diesel::table! {
         team_id -> Int8,
         title -> Text,
     }
+}
+
+/// A model that is not `Send`: decoded on the calling thread by `.wait()`.
+#[derive(Debug, Queryable)]
+struct LocalTitle {
+    #[diesel(deserialize_as = String)]
+    title: std::rc::Rc<str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Queryable, Selectable)]
@@ -77,7 +83,7 @@ fn sync_diesel_reads_need_no_runtime() {
         .max_lag(Duration::from_secs(5));
     conn.batch_execute(&builder.setup_sql())
         .expect("trigger stack");
-    let lib = builder.start_blocking().expect("start");
+    let lib = builder.start().wait().expect("start");
 
     let team = || {
         tickets::table
@@ -88,7 +94,7 @@ fn sync_diesel_reads_need_no_runtime() {
     let direct: Vec<Ticket> = team().load(&mut conn).expect("Diesel's own read");
 
     // The first read registers the query and Postgres answers it.
-    let (first, trace) = team().load_and_sync_inspect::<Ticket>(&lib, None);
+    let (first, trace) = team().load_and_sync::<Ticket>(&lib).inspect().wait();
     assert_eq!(first.expect("first read"), direct);
     assert_ne!(trace.expect("a trace").served, Served::Memory);
 
@@ -96,7 +102,11 @@ fn sync_diesel_reads_need_no_runtime() {
     let until_memory = |want: &dyn Fn(&[Ticket]) -> bool| {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let (rows, trace) = team().load_and_sync_inspect::<Ticket>(&lib, Some(Ttl::Forever));
+            let (rows, trace) = team()
+                .load_and_sync::<Ticket>(&lib)
+                .ttl(Ttl::Forever)
+                .inspect()
+                .wait();
             let rows = rows.expect("read");
             if trace.expect("a trace").served == Served::Memory && want(&rows) {
                 return rows;
@@ -106,10 +116,12 @@ fn sync_diesel_reads_need_no_runtime() {
         }
     };
     assert_eq!(until_memory(&|_| true), direct);
-    let plain: Vec<Ticket> = team().load_and_sync(&lib).expect("plain read");
+    let plain: Vec<Ticket> = team().load_and_sync(&lib).wait().expect("plain read");
     assert_eq!(plain, direct);
     let kept: Vec<Ticket> = team()
-        .load_and_sync_ttl(&lib, Duration::from_secs(60))
+        .load_and_sync(&lib)
+        .ttl(Duration::from_secs(60))
+        .wait()
         .expect("read with a ttl");
     assert_eq!(kept, direct);
 
@@ -128,24 +140,35 @@ fn sync_diesel_reads_need_no_runtime() {
     let (refused, trace) = tickets::table
         .filter(tickets::title.ilike("%b%"))
         .select(Ticket::as_select())
-        .load_and_sync_inspect::<Ticket>(&lib, None);
+        .load_and_sync::<Ticket>(&lib)
+        .inspect()
+        .wait();
     assert!(refused.is_err());
     assert_eq!(trace.expect("a trace").served, Served::Unsupported);
 
+    // A model that is not `Send` reads through `.wait()` too.
+    let titles: Vec<LocalTitle> = tickets::table
+        .filter(tickets::team_id.eq(1))
+        .order(tickets::id)
+        .select((tickets::title,))
+        .load_and_sync(&lib)
+        .wait()
+        .expect("a thread-local model");
+    assert_eq!(titles.len(), changed.len());
+    assert_eq!(&*titles[1].title, "b2");
+
     // The async read is awaitable on an executor that is not Tokio.
     let awaited: Vec<Ticket> =
-        block_on(streamgres_diesel::LoadAndSync::load_and_sync(team(), &lib).into_future())
-            .expect("awaited read");
+        block_on(team().load_and_sync(&lib).into_future()).expect("awaited read");
     assert_eq!(awaited, changed);
     let other_team = tickets::table
         .filter(tickets::team_id.eq(2))
         .select(Ticket::as_select());
     let fallback: Vec<Ticket> =
-        block_on(streamgres_diesel::LoadAndSync::load_and_sync(other_team, &lib).into_future())
-            .expect("awaited fallback read");
+        block_on(other_team.load_and_sync(&lib).into_future()).expect("awaited fallback read");
     assert_eq!(fallback.len(), 1);
 
-    lib.shutdown_blocking().expect("shutdown");
+    lib.shutdown().wait();
     drop(lib);
     conn.batch_execute(
         "DROP PUBLICATION desk_sync_pub;

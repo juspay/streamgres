@@ -365,19 +365,6 @@ pub async fn start(
     stats: Arc<Stats>,
     shutdown: Shutdown,
 ) -> Result<(Started, ServiceTask), String> {
-    start_with_connections(settings, catalog, reads, consumers, stats, shutdown, None).await
-}
-
-/// Embedded library variant: all ordinary storage reads borrow app checkouts.
-pub async fn start_with_connections(
-    settings: &Settings,
-    catalog: Arc<CatalogHandle>,
-    reads: tokio::runtime::Handle,
-    consumers: usize,
-    stats: Arc<Stats>,
-    shutdown: Shutdown,
-    connections: Option<Arc<dyn super::connections::Connections>>,
-) -> Result<(Started, ServiceTask), String> {
     Transport::cleanup_inactive_slots(&settings.dsn, settings.slot_cleanup_age)
         .await
         .map_err(|error| format!("cleaning up inactive replication slots: {error}"))?;
@@ -394,25 +381,14 @@ pub async fn start_with_connections(
         .parse()
         .map_err(|error| format!("connecting the read pool: {error}"))?;
     settings.keepalive.apply(&mut read_config);
-    let pg = match connections {
-        Some(connections) => {
-            PgStorage::connect_with_connections(config, catalog.load(), reads, connections).await
-        }
-        None => {
-            PgStorage::connect_configured_with_read_config(
-                config,
-                read_config,
-                catalog.load(),
-                reads,
-            )
+    let pg =
+        PgStorage::connect_configured_with_read_config(config, read_config, catalog.load(), reads)
             .await
-        }
-    }
-    .map_err(|error| format!("connecting the storage: {error}"))?
-    .with_rotation(settings.snapshot_rotation)
-    .with_read_connections(settings.read_connections)
-    .with_read_idle_connections(settings.read_idle_connections)
-    .with_read_timeout(settings.read_timeout);
+            .map_err(|error| format!("connecting the storage: {error}"))?
+            .with_rotation(settings.snapshot_rotation)
+            .with_read_connections(settings.read_connections)
+            .with_read_idle_connections(settings.read_idle_connections)
+            .with_read_timeout(settings.read_timeout);
     let pg = Arc::new(pg);
     let (feed, feed_handle) = spawn_feed_notifying(
         settings.clone(),

@@ -21,8 +21,9 @@
 //! as a row from Postgres. It needs no connection of the application's:
 //! the same call serves Diesel and `diesel-async` code alike.
 //!
-//! Synchronous Diesel code imports [`sync::LoadAndSync`] instead: the
-//! same `query.load_and_sync(&lib)`, returning the rows.
+//! Synchronous Diesel code ends the same read with [`Load::wait`]
+//! instead of `.await`: `query.load_and_sync(&lib).wait()`. The thread
+//! sleeps while Postgres answers, as it would on `libpq`.
 //!
 //! What stays on Diesel: every write, every read inside a transaction
 //! (the transaction's own writes and snapshot are on its connection, not
@@ -37,17 +38,11 @@
 
 pub use ::diesel;
 pub use streamgres::cache::{
-    Builder, Caller, Connection, ConnectionFuture, Connections, EngineState,
-    Error as StreamgresError, Fallback, Inspect, KeptQuery, Lease, Metrics, OnUnsupported,
-    QueryState, Served, SessionError, Streamgres, Trace, Ttl,
+    Builder, Caller, EngineState, Error as StreamgresError, Fallback, Inspect, KeptQuery, Metrics,
+    OnUnsupported, Op, QueryState, Served, SessionError, Streamgres, Trace, Ttl,
 };
 
-#[cfg(feature = "async-pool")]
-mod pool;
 mod row;
-pub mod sync;
-#[cfg(feature = "async-pool")]
-pub use pool::connections;
 
 use std::borrow::Cow;
 use std::future::{Future, IntoFuture};
@@ -65,7 +60,7 @@ use diesel::query_builder::bind_collector::RawBytesBindCollector;
 use diesel::query_builder::{AsQuery, QueryBuilder, QueryFragment, QueryId};
 use diesel::query_dsl::CompatibleType;
 use diesel::result::{DatabaseErrorKind, Error, QueryResult};
-use streamgres::cache::{Rows, Sql};
+use streamgres::cache::{Rows, Sql, block_on};
 
 use crate::row::CachedRow;
 
@@ -106,7 +101,8 @@ pub trait LoadAndSync: AsQuery + Sized {
 
 impl<T: AsQuery> LoadAndSync for T {}
 
-/// A read of [`LoadAndSync::load_and_sync`]: await it for the rows.
+/// A read of [`LoadAndSync::load_and_sync`]: await it for the rows, or
+/// [`Load::wait`] for them in synchronous code.
 #[must_use = "a read does nothing until it is awaited"]
 pub struct Load<'a, ST, U> {
     lib: &'a Streamgres,
@@ -129,6 +125,28 @@ impl<'a, ST, U> Load<'a, ST, U> {
     /// trace comes back whether the read succeeded or not.
     pub fn inspect(self) -> LoadInspecting<'a, ST, U> {
         LoadInspecting(self)
+    }
+
+    /// The read for synchronous code: the rows, this thread blocked until
+    /// they are here. A memory hit returns at once; any other read is
+    /// made on Streamgres's runtime. The rows are decoded on this thread,
+    /// so `U` need not be `Send`.
+    ///
+    /// For synchronous code only: in async code, a `LocalSet` included, use
+    /// `.await`. Tokio panics when a read that must wait blocks inside a
+    /// `LocalSet` on a multi-thread runtime.
+    pub fn wait(self) -> QueryResult<Vec<U>>
+    where
+        ST: CompatibleType<U, Pg>,
+        U: FromSqlRow<<ST as CompatibleType<U, Pg>>::SqlType, Pg>,
+    {
+        let Load {
+            lib, sql, ttl, at, ..
+        } = self;
+        let rows = Self::core(lib, block_on(sql)?, ttl, at)
+            .wait()
+            .map_err(streamgres_error)?;
+        decode::<<ST as CompatibleType<U, Pg>>::SqlType, U>(&rows)
     }
 
     /// The core read this one is.
@@ -167,9 +185,33 @@ where
     }
 }
 
-/// A read with its trace ([`Load::inspect`]): await it for both.
+/// A read with its trace ([`Load::inspect`]): await it, or
+/// [`LoadInspecting::wait`], for both.
 #[must_use = "a read does nothing until it is awaited"]
 pub struct LoadInspecting<'a, ST, U>(Load<'a, ST, U>);
+
+impl<'a, ST, U> LoadInspecting<'a, ST, U>
+where
+    ST: CompatibleType<U, Pg>,
+    U: FromSqlRow<<ST as CompatibleType<U, Pg>>::SqlType, Pg>,
+{
+    /// The read and its trace for synchronous code ([`Load::wait`]),
+    /// decoded on this thread; likewise for synchronous code only.
+    pub fn wait(self) -> (QueryResult<Vec<U>>, Option<Trace>) {
+        let Load {
+            lib, sql, ttl, at, ..
+        } = self.0;
+        let sql = match block_on(sql) {
+            Ok(sql) => sql,
+            Err(error) => return (Err(error), None),
+        };
+        let (rows, trace) = Load::<ST, U>::core(lib, sql, ttl, at).inspect().wait();
+        let rows = rows
+            .map_err(streamgres_error)
+            .and_then(|rows| decode::<<ST as CompatibleType<U, Pg>>::SqlType, U>(&rows));
+        (rows, Some(trace))
+    }
+}
 
 impl<'a, ST, U> IntoFuture for LoadInspecting<'a, ST, U>
 where

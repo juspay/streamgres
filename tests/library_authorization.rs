@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use streamgres::cache::{Error, Lease, Served, Sql, Streamgres};
+use streamgres::cache::{Error, Served, Sql, Streamgres};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cached_reads_follow_database_local_revocation() {
@@ -20,7 +20,7 @@ async fn cached_reads_follow_database_local_revocation() {
     // information_schema.table_constraints needs a privilege beyond SELECT.
     admin
         .batch_execute(&format!(
-            "CREATE ROLE {role}; CREATE SCHEMA {schema};
+            "CREATE ROLE {role} LOGIN REPLICATION PASSWORD 'reader'; CREATE SCHEMA {schema};
              CREATE TABLE {schema}.t (id bigint PRIMARY KEY);
              INSERT INTO {schema}.t VALUES (1);
              GRANT USAGE ON SCHEMA {schema} TO {role};
@@ -29,7 +29,13 @@ async fn cached_reads_follow_database_local_revocation() {
         ))
         .await
         .expect("fixtures");
-    let builder = Streamgres::connect(&dsn)
+    // Streamgres connects as the reader itself: its own pool checks what
+    // that role may read.
+    let Some(reader_dsn) = as_role(&dsn, &role) else {
+        eprintln!("STREAMGRES_PG_DSN is not a URL: authorization scenario skipped");
+        return;
+    };
+    let builder = Streamgres::connect(&reader_dsn)
         .app(&app, 0)
         .schemas([schema.as_str()])
         .publication(format!("{schema}_pub"));
@@ -37,27 +43,7 @@ async fn cached_reads_follow_database_local_revocation() {
         .batch_execute(&builder.setup_sql())
         .await
         .expect("setup");
-    let lib = builder
-        .connections({
-            let role = role.clone();
-            move || {
-                let (dsn, role) = (dsn.clone(), role.clone());
-                async move {
-                    let (client, driver) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    tokio::spawn(driver);
-                    client
-                        .batch_execute(&format!("SET ROLE {role}"))
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(Lease::new(client))
-                }
-            }
-        })
-        .start()
-        .await
-        .expect("start");
+    let lib = builder.start().await.expect("start");
     let sql = Sql::new(format!("SELECT id FROM {schema}.t"));
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
@@ -95,4 +81,11 @@ async fn cached_reads_follow_database_local_revocation() {
         ))
         .await
         .expect("cleanup");
+}
+
+/// `dsn` (a URL) with `role` and its password as the user.
+fn as_role(dsn: &str, role: &str) -> Option<String> {
+    let (scheme, rest) = dsn.split_once("://")?;
+    let (_, host) = rest.split_once('@')?;
+    Some(format!("{scheme}://{role}:reader@{host}"))
 }

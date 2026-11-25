@@ -9,11 +9,8 @@ description = "Diesel queries answered by an embedded Streamgres"
 
 [features]
 default = []
-async-pool = ["dep:diesel-async", "dep:tokio"]
 
 [dependencies]
-tokio = { version = "1", optional = true, features = ["sync"] }
-diesel-async = { version = "=0.7.4", optional = true, features = ["postgres", "bb8"] }
 streamgres = { version = "0.1.0", path = "../..", default-features = false }
 # A cached row implements Diesel's `Row`, which needs the third-party
 # backend interface.
