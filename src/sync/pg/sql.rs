@@ -20,7 +20,7 @@ use std::fmt::Write;
 
 use crate::model::{
     Catalog, ComparisonOperator, Condition, DbTable, MultiTableReadQuery, Order,
-    SingleTableReadQuery, Value, ValueType, Where,
+    SingleTableReadQuery, TableName, Value, ValueType, Where,
 };
 
 /// The `SELECT` for `query` over `table`'s declared columns, in the
@@ -323,14 +323,9 @@ fn literal_as(value: &Value, declared: Option<&ValueType>) -> String {
 /// (`"public"."orders"`, `"billing"."invoices"`), so the session's
 /// `search_path` never decides which table is read.
 pub fn quote_table(name: &str) -> String {
-    let (schema, table) = super::catalog::source_name(name);
-    format!("{}.{}", quote_ident(schema), quote_ident(table))
-}
-
-/// The SQL expression of a table's catalog name ([`super::catalog::table_name`])
-/// from the `schema` and `table` columns of a system catalog or view.
-pub fn catalog_name_sql(schema: &str, table: &str) -> String {
-    format!("CASE WHEN {schema} = 'public' THEN {table}::text ELSE {schema} || '.' || {table} END")
+    let name = TableName::from(name);
+    let (schema, table) = name.source();
+    format!("{}.{}", quote_ident(&schema), quote_ident(&table))
 }
 
 /// A double-quoted identifier.
@@ -1076,15 +1071,17 @@ mod tests {
     }
 
     /// A table is named with its schema, `public` included, so the
-    /// session's `search_path` never decides which table is read.
+    /// session's `search_path` never decides which table is read; a
+    /// dot or quote in a name stays inside its part.
     #[test]
     fn a_table_is_named_with_its_schema() {
         assert_eq!(quote_table("orders"), "\"public\".\"orders\"");
         assert_eq!(quote_table("billing.invoices"), "\"billing\".\"invoices\"");
-        assert_eq!(quote_table("billing.say\"hi"), "\"billing\".\"say\"\"hi\"");
+        assert_eq!(quote_table("\"public\".\"a.b\""), "\"public\".\"a.b\"");
+        assert_eq!(quote_table("\"a.b\".\"x\""), "\"a.b\".\"x\"");
         assert_eq!(
-            catalog_name_sql("n.nspname", "c.relname"),
-            "CASE WHEN n.nspname = 'public' THEN c.relname::text ELSE n.nspname || '.' || c.relname END"
+            quote_table("\"billing\".\"say\"\"hi\""),
+            "\"billing\".\"say\"\"hi\""
         );
     }
 }

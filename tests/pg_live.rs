@@ -1992,6 +1992,126 @@ fn a_table_outside_public_is_read_under_its_schema() {
     });
 }
 
+/// Tables whose names would read alike as one string, `public."a.b"`,
+/// `a.b` (schema `a`) and `"a.b".x`, are all carried, each read from
+/// its own table, and each write reaches the catalog as its own table's.
+#[test]
+fn tables_with_dots_in_their_names_are_each_their_own() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let slot = "xyne_sync_live_dots";
+        let publication = "xyne_sync_live_dots_pub";
+        let client = admin(&dsn).await;
+        PgStream::drop_slot(&dsn, slot, publication)
+            .await
+            .expect("drop slot");
+        let sources = [
+            ("public", "live.dots", "\"public\".\"live.dots\""),
+            ("live", "dots", "live.dots"),
+            ("live.dots", "x", "\"live.dots\".\"x\""),
+        ];
+        // One statement per transaction, as in the other scenarios.
+        let mut statements = vec![
+            "DROP TABLE IF EXISTS public.\"live.dots\"".to_owned(),
+            "DROP SCHEMA IF EXISTS live CASCADE".to_owned(),
+            "DROP SCHEMA IF EXISTS \"live.dots\" CASCADE".to_owned(),
+            "CREATE SCHEMA live".to_owned(),
+            "CREATE SCHEMA \"live.dots\"".to_owned(),
+        ];
+        for (index, (schema, table, _)) in sources.iter().enumerate() {
+            let quoted = format!("\"{schema}\".\"{table}\"");
+            statements.push(format!("CREATE TABLE {quoted} (id int8 PRIMARY KEY, origin text)"));
+            statements.push(format!("INSERT INTO {quoted} VALUES ({}, '{schema}/{table}')", index + 1));
+        }
+        statements.push(format!(
+            "CREATE PUBLICATION \"{publication}\" FOR TABLE public.\"live.dots\", live.dots, \"live.dots\".x WITH (publish_via_partition_root = true)"
+        ));
+        for statement in &statements {
+            client.batch_execute(statement).await.expect(statement);
+        }
+
+        let schemas = ["public".to_owned(), "live".to_owned(), "live.dots".to_owned()];
+        let (catalog, _) = streamgres::sync::pg::load_catalog(&client, publication, &schemas)
+            .await
+            .expect("the catalog loads");
+        for (schema, table, name) in sources {
+            let carried = catalog
+                .table_by_source(schema, table)
+                .unwrap_or_else(|| panic!("{schema}/{table} is carried"));
+            assert_eq!(carried.name.as_str(), name);
+        }
+        let catalog = Arc::new(catalog);
+        let mut stream = PgStream::open(&dsn, slot, publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+
+        for (index, (schema, table, name)) in sources.iter().enumerate() {
+            let whole = SingleTableReadQuery::new(
+                *name,
+                Where::AND(vec![]),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            );
+            let read = storage.select(&whole).await.expect("the table is read");
+            assert_eq!(read.rows.len(), 1, "{name}");
+            let (key, row) = &read.rows[0];
+            assert_eq!(
+                key.pkey_value.get(&ColumnName::from("id")),
+                Some(&Value::Int(index as i64 + 1)),
+                "{name} is read from its own table"
+            );
+            assert_eq!(
+                row.data.get(&ColumnName::from("origin")),
+                Some(&Value::from(format!("{schema}/{table}").as_str())),
+                "{name}"
+            );
+        }
+
+        for (index, (schema, table, _)) in sources.iter().enumerate() {
+            client
+                .batch_execute(&format!(
+                    "INSERT INTO \"{schema}\".\"{table}\" VALUES ({}, 'fed')",
+                    100 + index
+                ))
+                .await
+                .expect("insert");
+        }
+        let fed = stream.poll().await.expect("poll");
+        let mut routed: Vec<(String, Option<Value>)> = fed
+            .writes
+            .iter()
+            .map(|(write, _)| {
+                (
+                    write.table().as_str().to_owned(),
+                    write.pkey_value().pkey_value.get(&ColumnName::from("id")).cloned(),
+                )
+            })
+            .collect();
+        routed.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected: Vec<(String, Option<Value>)> = sources
+            .iter()
+            .enumerate()
+            .map(|(index, (_, _, name))| ((*name).to_owned(), Some(Value::Int(100 + index as i64))))
+            .collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(routed, expected, "each write reaches its own table");
+
+        for statement in [
+            "DROP TABLE IF EXISTS public.\"live.dots\"",
+            "DROP SCHEMA IF EXISTS live CASCADE",
+            "DROP SCHEMA IF EXISTS \"live.dots\" CASCADE",
+        ] {
+            let _ = client.batch_execute(statement).await;
+        }
+        let _ = PgStream::drop_slot(&dsn, slot, publication).await;
+    });
+}
+
 /// A change to what the publication sends reaches the feed through the
 /// trigger and stops it when the feed could no longer follow the served
 /// tables: turning off updates and deletes, or adding a row filter to a

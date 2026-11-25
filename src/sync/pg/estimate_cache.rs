@@ -42,11 +42,11 @@ pub const DEFAULT_CAPACITY: usize = 300_000;
 /// statistics moved.
 pub const SIZES_EVERY: Duration = Duration::from_secs(300);
 
-/// The tables' sizes as [`EstimateCache::sizes`] takes them: catalog
-/// name ([`super::catalog::table_name`]), `reltuples`, `relpages`; every
-/// table outside the system schemas, whatever the session's `search_path`.
-pub const SIZES_SQL: &str = "SELECT CASE WHEN n.nspname = 'public' THEN c.relname::text \
-     ELSE n.nspname || '.' || c.relname END, c.reltuples::text, c.relpages::text \
+/// The tables' sizes: schema, table, `reltuples`, `relpages`, which
+/// [`EstimateCache::sizes`] takes under the table's catalog name
+/// ([`crate::model::TableName::of`]); every table outside the system
+/// schemas, whatever the session's `search_path`.
+pub const SIZES_SQL: &str = "SELECT n.nspname, c.relname, c.reltuples::text, c.relpages::text \
      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
      WHERE c.relkind IN ('r', 'p') AND n.nspname <> 'information_schema' \
      AND n.nspname NOT LIKE 'pg\\_%'";

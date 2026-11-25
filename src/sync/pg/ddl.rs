@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 use tokio_postgres::Client;
 
-use super::catalog::{carriable_name, scalar_type, table_name};
+use super::catalog::{scalar_type, table_name};
 use super::sql::quote_ident;
 use super::text;
 use crate::ivm::SchemaChange;
@@ -366,9 +366,7 @@ pub fn classify(
             catalog: catalog.clone(),
         });
     };
-    let served = |table: &PublishedTable| {
-        schemas.contains(&table.schema) && carriable_name(&table.schema, &table.name)
-    };
+    let served = |table: &PublishedTable| schemas.contains(&table.schema);
     let mut publications: Vec<_> = after.publications.iter().collect();
     publications.sort_by(|a, b| a.0.cmp(b.0));
     for (name, flags) in publications {
@@ -393,24 +391,6 @@ pub fn classify(
         .filter(|table| served(table))
         .map(|table| (table.catalog_name(), table))
         .collect();
-    let existed = |table: &PublishedTable| {
-        message
-            .previous
-            .iter()
-            .flat_map(|schema| schema.tables.iter())
-            .any(|before| before.schema == table.schema && before.name == table.name)
-    };
-    for table in after.tables.iter().filter(|table| {
-        schemas.contains(&table.schema)
-            && !carriable_name(&table.schema, &table.name)
-            && !existed(table)
-    }) {
-        crate::log::log_warn!(
-            "new table not carried: {}.{}: a dot in the schema or table name is not supported",
-            table.schema,
-            table.name
-        );
-    }
     let mut changes = Vec::new();
     let mut catalog_now = catalog.clone();
     let mut present: HashSet<String> = HashSet::new();
@@ -802,11 +782,10 @@ mod tests {
         assert!(unserved.changes.is_empty());
     }
 
-    /// A table added with a dot in its name is not carried: its catalog
-    /// name would read as `weird`'s table `name`. Nothing changes and the
-    /// feed goes on.
+    /// A table added with a dot in its name is carried under its quoted
+    /// name, never read as schema `weird`'s table `name`.
     #[test]
-    fn a_new_table_with_a_dotted_name_is_left_out() {
+    fn a_new_table_with_a_dotted_name_is_added_under_its_quoted_name() {
         let tickets = published("tickets", TICKETS, &["id"]);
         let dotted = published("weird.name", &[("id", "int8", None)], &["id"]);
         let classified = classify(
@@ -815,8 +794,13 @@ mod tests {
             &message(&tickets, &format!("{tickets}, {dotted}")),
         )
         .unwrap();
-        assert!(classified.changes.is_empty(), "{:?}", classified.changes);
+        assert_eq!(classified.changes.len(), 1, "{:?}", classified.changes);
         assert!(classified.catalog.table("weird.name").is_none());
+        let added = classified
+            .catalog
+            .table_by_source("public", "weird.name")
+            .expect("the dotted table is carried");
+        assert_eq!(added.name.as_str(), "\"public\".\"weird.name\"");
     }
 
     /// A column added with a constant default, a table added, both

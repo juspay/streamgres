@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tokio_postgres::Client;
 
 use super::StorageError;
-use crate::model::{Catalog, DbColumn, DbTable, ValueType};
+use crate::model::{Catalog, DbColumn, DbTable, TableName, ValueType};
 
 /// What the load left out and why, one line per table or column: a
 /// warning for what an operator would expect to be served, an
@@ -166,12 +166,6 @@ pub async fn load_catalog(
     }
     let mut tables = Vec::new();
     for ((schema, table), columns) in declared {
-        if !carriable_name(&schema, &table) {
-            notes.warnings.push(format!(
-                "{schema}.{table}: a dot in the schema or table name is not supported; left out"
-            ));
-            continue;
-        }
         let Some(pkey) = pkeys.get(&(schema.clone(), table.clone())) else {
             notes
                 .info
@@ -196,29 +190,10 @@ pub async fn load_catalog(
     Ok((Catalog::new(tables), notes))
 }
 
-/// The catalog name of a table: bare in `public`, schema-qualified
-/// elsewhere.
+/// The catalog name of a table ([`TableName::of`]): bare in `public`,
+/// schema-qualified elsewhere, quoted when a part holds a dot or quote.
 pub fn table_name(schema: &str, table: &str) -> String {
-    if schema == "public" {
-        table.to_owned()
-    } else {
-        format!("{schema}.{table}")
-    }
-}
-
-/// The schema and table a catalog name stands for, the inverse of
-/// [`table_name`]: `public` for a bare name. Unambiguous because a table
-/// whose schema or name holds a dot is never carried
-/// ([`carriable_name`]).
-pub fn source_name(name: &str) -> (&str, &str) {
-    name.split_once('.').unwrap_or(("public", name))
-}
-
-/// Whether a table of `schema` named `table` can be carried under a
-/// catalog name: not when either holds a dot, which would make its
-/// catalog name read as another table's.
-pub fn carriable_name(schema: &str, table: &str) -> bool {
-    !schema.contains('.') && !table.contains('.')
+    TableName::of(schema, table).as_str().to_owned()
 }
 
 /// The engine's type for a Postgres column, from `information_schema`'s
@@ -306,11 +281,7 @@ mod tests {
         assert_eq!(value_type("bytea", "bytea"), None);
         assert_eq!(table_name("public", "tickets"), "tickets");
         assert_eq!(table_name("xyne_0", "clients"), "xyne_0.clients");
-        assert_eq!(source_name("tickets"), ("public", "tickets"));
-        assert_eq!(source_name("xyne_0.clients"), ("xyne_0", "clients"));
-        assert!(carriable_name("billing", "invoices"));
-        assert!(!carriable_name("bill.ing", "invoices"));
-        assert!(!carriable_name("billing", "in.voices"));
+        assert_eq!(table_name("public", "a.b"), "\"public\".\"a.b\"");
     }
 
     /// The catalog carries what the publication streams and nothing it

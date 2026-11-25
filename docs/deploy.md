@@ -183,9 +183,12 @@ DDL in that transaction's WAL.
   list stops startup: its rows or columns could not be kept up to date.
 - Tables without a primary key are skipped. So are columns of types the wire
   format cannot carry (`bytea`). The startup log lists both.
-- Tables whose schema or table name contains a dot are left out with a
-  warning: clients name a table outside `public` as `schema.table`, so such
-  a name would be ambiguous.
+- Clients name a table bare in `public` (`tickets`) and as `schema.table`
+  elsewhere (`billing.invoices`). When the schema or table name contains a
+  `.` or `"`, both parts are double-quoted as in SQL: `public."a.b"` is
+  named `"public"."a.b"`, and table `x` of schema `a.b` is `"a.b"."x"`. No
+  two tables share a name, so `public."a.b"` and table `b` of schema `a`
+  (named `a.b`) are both served.
 - Tables with large TOASTed columns need `REPLICA IDENTITY FULL`.
 
 ### Schema changes

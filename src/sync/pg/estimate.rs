@@ -176,11 +176,12 @@ pub fn batch(statements: &[&str], columns: &[(&str, &str)]) -> String {
         let triples: Vec<String> = columns
             .iter()
             .map(|(table, column)| {
-                let (schema, table) = super::catalog::source_name(table);
+                let name = crate::model::TableName::from(*table);
+                let (schema, table) = name.source();
                 format!(
                     "({}, {}, {})",
-                    sql::quote_literal(schema),
-                    sql::quote_literal(table),
+                    sql::quote_literal(&schema),
+                    sql::quote_literal(&table),
                     sql::quote_literal(column)
                 )
             })
@@ -189,9 +190,8 @@ pub fn batch(statements: &[&str], columns: &[(&str, &str)]) -> String {
             batch.push_str("; ");
         }
         batch.push_str(&format!(
-            "SELECT {}, attname, null_frac, n_distinct FROM pg_stats \
+            "SELECT schemaname, tablename, attname, null_frac, n_distinct FROM pg_stats \
              WHERE (schemaname, tablename, attname) IN ({}) ORDER BY inherited",
-            sql::catalog_name_sql("schemaname", "tablename"),
             triples.join(", ")
         ));
     }
@@ -227,11 +227,12 @@ pub fn parse(
                     .parse::<f64>()
                     .map_err(|_| format!("`{}` is not a number", field(index)))
             };
+            let table = crate::model::TableName::of(field(0), field(1));
             stats
-                .entry((field(0).to_owned(), field(1).to_owned()))
+                .entry((table.as_str().to_owned(), field(2).to_owned()))
                 .or_insert(ColumnStats {
-                    null_frac: number(2)?,
-                    n_distinct: number(3)?,
+                    null_frac: number(3)?,
+                    n_distinct: number(4)?,
                 });
         }
     }
@@ -680,6 +681,11 @@ mod tests {
             ]
         );
         let only_stats = super::batch(&[], &[("participants", "channelId")]);
-        assert!(only_stats.starts_with("SELECT CASE WHEN schemaname"), "{only_stats}");
+        assert!(
+            only_stats.contains("IN (('public', 'participants', 'channelId'))"),
+            "{only_stats}"
+        );
+        let dotted = super::batch(&[], &[("\"public\".\"a.b\"", "id")]);
+        assert!(dotted.contains("IN (('public', 'a.b', 'id'))"), "{dotted}");
     }
 }

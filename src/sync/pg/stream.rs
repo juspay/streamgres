@@ -294,12 +294,9 @@ impl Decoder {
             return Ok(());
         };
         if let BaseEvent::Relation(relation) = &event {
-            let qualified = format!("{}.{}", relation.relation_namespace, relation.name);
-            let declared = self.catalog.table(&qualified).or_else(|| {
-                (relation.relation_namespace == "public")
-                    .then(|| self.catalog.table(&relation.name))
-                    .flatten()
-            });
+            let declared = self
+                .catalog
+                .table_by_source(&relation.relation_namespace, &relation.name);
             self.relations.insert(
                 relation.oid,
                 Relation {
