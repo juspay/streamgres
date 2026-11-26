@@ -7,14 +7,25 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
+description = "A subscription-native sync engine for PostgreSQL."
+repository = "https://github.com/juspay/streamgres"
+# What crates.io gets: the source, plus the two files outside src that src reads (the bench's catalog and the unit test's SQL copy).
+include = [
+    "src/**/*",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "scripts/sql/ddl-triggers.sql",
+    "tests/streamgres_queries/catalog.rs",
+]
 
 [features]
-# The server: the Zero sync protocol over WebSockets, telemetry export,
-# continuous profiling, and the `server`, `bench` and `load` binaries.
-# Without it the crate is the engine alone (model, IVM, parser, the
-# Postgres feed and storage), for a process that embeds it: no HTTP
-# stack, no WebSocket server, no profiler, no allocator of its own.
-default = ["server"]
+# By default the crate is the library: the engine (model, IVM, parser, the
+# Postgres feed and storage) and the cache, for a process that embeds it,
+# with no HTTP stack, no WebSocket server, no profiler, no allocator of its own.
+# The `server` feature adds the Zero sync protocol over WebSockets, telemetry
+# export, continuous profiling, and the `server`, `bench` and `load` binaries.
+default = []
 server = [
     "dep:axum",
     "dep:libc",

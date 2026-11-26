@@ -3,7 +3,7 @@
 
     bench-compare.py --base base-1.txt base-2.txt --head head-1.txt head-2.txt
 
-Every file is the output of `cargo run --release --bin bench`. Each table row
+Every file is the output of `cargo run --release --features server --bin bench`. Each table row
 that has a `us/write` or `us/register` column is one measurement, named by its
 scenario, its first cell and, when that names a phase, its second. A build's value for a
 measurement is the smallest over its runs (noise on a shared runner only ever

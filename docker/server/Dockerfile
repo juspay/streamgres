@@ -29,7 +29,7 @@ COPY src ./src
 COPY tests ./tests
 COPY crates/streamgres-diesel ./crates/streamgres-diesel
 COPY examples/ticket-desk/Cargo.toml ./examples/ticket-desk/Cargo.toml
-RUN cargo build --release --locked --bin server \
+RUN cargo build --release --locked --features server --bin server \
     && mkdir -p /out/app /out/var/lib/streamgres \
     && cp target/release/server /out/app/server
 

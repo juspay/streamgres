@@ -73,7 +73,7 @@ Max:
 | Over the wire, writes spread over 20 channels | 7 400 updates/s, every row delivered, 1.7 cores |
 
 Treat these as relative numbers: they are single runs on a shared workstation.
-Run `cargo run --release --bin bench` to measure on your own hardware.
+Run `cargo run --release --features server --bin bench` to measure on your own hardware.
 
 ---
 
@@ -99,7 +99,7 @@ the configured app ID, shard or publication.
 
 ```bash
 cp .env.example .env     # set STREAMGRES_PG_DSN, STREAMGRES_QUERY_URL, STREAMGRES_MUTATE_URL
-cargo run --release --bin server
+cargo run --release --features server --bin server
 ```
 
 The server listens on `0.0.0.0:4848`. Point the client's `server` option at
@@ -194,10 +194,10 @@ for one subscriber or ten thousand.
 ## Development
 
 ```bash
-cargo test                          # unit and scenario tests
+cargo test --all-features            # unit and scenario tests, library and server
 cargo run --bin streamgres           # demo: SQL in, routed operations and cost counters out
-cargo run --release --bin bench     # benchmarks: routing, registration, windows, joins
-cargo clippy --all-targets
+cargo run --release --features server --bin bench     # benchmarks: routing, registration, windows, joins
+cargo clippy --all-targets --all-features
 ```
 
 Tests against a real PostgreSQL run when `STREAMGRES_PG_DSN` is set, and report
@@ -208,9 +208,9 @@ needs a PostgreSQL with `wal_level = logical` and a database with `bench` in
 its name, whose tables it drops and makes again:
 
 ```bash
-cargo build --release --bin server
+cargo build --release --features server --bin server
 XYNE_SYNC_PG_DSN=postgresql://postgres@localhost:5432/xyne_bench \
-  cargo run --release --bin load -- --connections 200 --duration 60
+  cargo run --release --features server --bin load -- --connections 200 --duration 60
 ```
 
 The options (clients, users, channels, write rate, rows per transaction, push
@@ -281,7 +281,7 @@ docs/        deployment and observability guides
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, what CI checks and the code
 conventions. In short:
 
-- Run `cargo test && cargo clippy --all-targets && cargo run --bin streamgres`
+- Run `cargo test --all-features && cargo clippy --all-targets --all-features && cargo run --bin streamgres`
   before opening a pull request. The demo must end with every check `PASS`.
 - Engine behaviour lives in `src/ivm/`. A change to *what matches* belongs in
   `predicate.rs`, with a test alongside it. Routing changes are expected to

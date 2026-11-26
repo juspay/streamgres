@@ -11,7 +11,7 @@ description = "Diesel queries answered by an embedded Streamgres"
 default = []
 
 [dependencies]
-streamgres = { version = "0.1.0", path = "../..", default-features = false }
+streamgres = { version = "0.1.0", path = "../.." }
 # A cached row implements Diesel's `Row`, which needs the third-party
 # backend interface.
 diesel = { version = "=2.3.14", default-features = false, features = ["postgres_backend", "i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }

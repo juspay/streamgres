@@ -46,11 +46,11 @@ jobs:
       - name: Install rust cache
         uses: Swatinem/rust-cache@v2.7.7
 
-      - name: Clippy, warnings denied
-        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Clippy, the server, warnings denied
+        run: cargo clippy --all-targets --locked --features server -- -D warnings
 
-      - name: Clippy, the engine alone (no server feature)
-        run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
+      - name: Clippy, the library alone (default features)
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Clippy, the library's Diesel adapter and the ticket desk example
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -128,10 +128,14 @@ jobs:
             ../base -> target
 
       - name: Build the benchmark of this branch
-        run: cargo build --release --locked --bin bench
+        run: cargo build --release --locked --features server --bin bench
 
       - name: Build the benchmark of the base branch
-        run: cargo build --release --locked --bin bench --manifest-path ../base/Cargo.toml
+        # A base branch from before the `server` feature builds its bench without the flag.
+        run: |
+          features=""
+          if grep -q '^server = ' ../base/Cargo.toml; then features="--features server"; fi
+          cargo build --release --locked $features --bin bench --manifest-path ../base/Cargo.toml
 
       - name: Run both, alternating, five rounds
         run: |

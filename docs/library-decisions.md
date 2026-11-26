@@ -288,7 +288,7 @@ Brought in, because the library cannot run without them:
 
 | Change | Why |
 |---|---|
-| `server` feature (default on) | `default-features = false` builds the engine without axum, WebSockets, the profiler or jemalloc. |
+| `server` feature (default off) | The default build is the library: the engine without axum, WebSockets, the profiler or jemalloc. `--features server` adds the server and its binaries. |
 | Opaque `Position` (`u128`); `sync::pg::Lsn` holds WAL locations | The cache and runtime order by position, not by Postgres's `X/Y`. Postgres logs still print `X/Y`. |
 | Columns carry `type_oid`, `element_oid`, `collation`, `enum_type`; tables their declared order | Encoding rows for Diesel, the exactness check, `SELECT *` order. |
 | `parse_select` and prepared statements | Parses ORM `SELECT`s with binds. The Zero parser's tests are unchanged and pass. |
