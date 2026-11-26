@@ -83,8 +83,9 @@ async fn library_join_plans_match_postgres_and_follow_writes() {
         .await
         .unwrap();
     tokio::spawn(connection);
+    // `departments.name` is ordered from memory, which needs a byte-order collation.
     client.batch_execute("DROP PUBLICATION IF EXISTS lib_joins_pub; DROP SCHEMA IF EXISTS lib_joins CASCADE; CREATE SCHEMA lib_joins;
-        CREATE TABLE lib_joins.departments(id bigint PRIMARY KEY,org bigint,name text);
+        CREATE TABLE lib_joins.departments(id bigint PRIMARY KEY,org bigint,name text COLLATE \"C\");
         CREATE TABLE lib_joins.people(id bigint PRIMARY KEY,org bigint,dept bigint,manager bigint,active boolean,name text);
         CREATE TABLE lib_joins.notes(id bigint PRIMARY KEY,person_id bigint,kind text);
         CREATE TABLE lib_joins.keys_a(aid bigint PRIMARY KEY,k1 bigint,k2 bigint,av text);

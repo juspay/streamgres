@@ -8,12 +8,13 @@ The library is one call, `load_and_sync`, in the core crate and in the Diesel ad
 |---|---|---|
 | `Streamgres`, `Builder`, `Sql`, `Rows`, `Ttl`, `Fallback`, `OnUnsupported`, `Error`, `Metrics` | `src/cache/api.rs`, `config.rs`, `rows.rs`, `metrics.rs` | Public (`streamgres::cache::…`) |
 | `Trace`, `Inspect`, `KeptQuery`, `EngineState`, `Caller`, `QueryState`, `Served` | `src/cache/inspect.rs` | Public |
-| `Connections`, `Connection`, `Session`, `Lease`, `Bind`, `RawRows` | `src/sync/pg/connections.rs` | Public |
+| `Bind`, `SessionError`; `Op` and `block_on` (await or wait) | `src/sync/pg/connections.rs`, `src/cache/api.rs` | Public |
+| Streamgres's own pool and connections: `Session`, `Lease`, `OwnPool` | `src/sync/pg/connections.rs` | Private to the library API |
 | The query cache: kept queries, ttl, budgets, reuse, admission, encoding | `src/cache.rs`, `src/cache/state.rs`, `rows.rs`, `parse.rs`, `local.rs`, `reader.rs` | Private |
 | Result composition: joins, post-filters, ordering, projection, paging | `src/compose.rs` | Private |
 | The seam to the engine: `trait Engine`, `Instance`, the supervisor | `src/cache/engine.rs` | `pub(crate)` |
 | The Postgres engine behind the seam: start, feed, slot, sampling, origin reads | `src/sync/embed.rs` (`PgEngine`) | Private |
-| Diesel adapter: `q.load_and_sync(&lib)` (async `LoadAndSync`, blocking `sync::LoadAndSync`), `q.inspect(&lib)`, `connections(pool)` | `crates/streamgres-diesel` | Public crate |
+| Diesel adapter: `q.load_and_sync(&lib)` (`.await` it, or `.wait()`), `q.inspect(&lib)` | `crates/streamgres-diesel` | Public crate |
 | Ticket desk: the adapter's showcase and test bed | `examples/ticket-desk` | Example |
 
 - The cache reaches the engine only through `trait Engine`. It imports nothing from the engine's threads, feed or storage.
@@ -43,27 +44,28 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
     .await?;
 ```
 
-Synchronous Diesel code makes the same call with the blocking trait, as `diesel::RunQueryDsl::load` stands beside `diesel_async::RunQueryDsl::load`:
+Synchronous Diesel code makes the same call and ends it with `.wait()` instead of `.await`. There is one trait and one builder; the caller picks how to wait at each call:
 
 ```rust
-use streamgres_diesel::sync::LoadAndSync;
-
-let lib = Streamgres::connect(dsn).publication("app_pub").start_blocking()?;
+let lib = Streamgres::connect(dsn).publication("app_pub").start().wait()?;
 
 let cfg: Vec<MerchantConfig> = merchant_config::table
     .filter(merchant_config::merchant_id.eq(mid))
     .select(MerchantConfig::as_select())
-    .load_and_sync(&lib)?;
+    .load_and_sync(&lib)
+    .ttl(Duration::from_secs(300))
+    .wait()?;
 ```
 
-| Async (`LoadAndSync`) | Blocking (`sync::LoadAndSync`) |
+| Async | Blocking |
 |---|---|
-| `.load_and_sync(&lib).await` | `.load_and_sync(&lib)` |
-| `.load_and_sync(&lib).ttl(ttl).await` | `.load_and_sync_ttl(&lib, ttl)` |
-| `.load_and_sync(&lib).inspect().await` | `.load_and_sync_inspect(&lib, ttl)` |
-| `start().await`, `shutdown().await` | `start_blocking()`, `shutdown_blocking()` |
+| `.load_and_sync(&lib).await` | `.load_and_sync(&lib).wait()` |
+| `.load_and_sync(&lib).ttl(ttl).await` | `.load_and_sync(&lib).ttl(ttl).wait()` |
+| `.load_and_sync(&lib).inspect().await` | `.load_and_sync(&lib).inspect().wait()` |
+| `start().await`, `shutdown().await`, `refresh_types().await` | `start().wait()`, `shutdown().wait()`, `refresh_types().wait()` |
 
-- A module imports one of the two traits, as with Diesel's.
+- `.wait()` runs the same future as `.await`, parking the calling thread until Streamgres's runtime wakes it. On a multi-thread Tokio worker it moves the worker's other tasks off first (`block_in_place`).
+- Every I/O runs on Streamgres's own runtime, so waiting never needs the caller's runtime and cannot deadlock it, a current-thread runtime included.
 - Core reads have the same pair: await `lib.load_and_sync(sql)`, or call `.wait()` on it.
 
 | Case | What happens |
@@ -92,7 +94,6 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 |---|---|---|
 | `connect(dsn)` | required | The database: Streamgres's own pool, the feed, snapshot exports and the slot (section 6). |
 | `.pool_size(n)` | 8 | Connections in Streamgres's own pool. |
-| `.connections(pool)` | none | Optional. Runs ordinary queries on the application's pool instead of Streamgres's own (section 6). |
 | `.publication(name)` | `streamgres` | The publication the feed streams. |
 | `.schemas([..])` | `public` | The schemas whose tables are carried. |
 | `.app(id, shard)` | `streamgres`, `0` | Names the schema-change trigger stack. |
@@ -185,33 +186,23 @@ let cfg: Vec<MerchantConfig> = merchant_config::table
 - Dropping an awaited slow read cancels its queued task. Once an origin task has begun database work, it retains its concurrency permit until it finishes or times out; cancellation cannot free a turn while SQL is still running.
 - The runtime outlives the engine that uses it. When the last handle goes, it is shut down from a thread of its own, so a handle may be dropped anywhere, an async context included.
 
-**The application's pool (optional)**
+**Only Streamgres's own connections**
 
-- `.connections(pool)` runs fallback reads, catalog work and storage reads on the application's checkouts instead. Replication, snapshot minting, slots and WAL position sampling keep their dedicated connections.
-- Those checkouts run on the application's Tokio runtime, the one `start()` is called on, so connections the pool opens never depend on Streamgres's runtime. With `.connections(..)`, `start()` must be called inside it.
-- Every checkout must target the replicated database with one role, search path and session policy. Switching role or tenant per request is not supported by a shared cache.
-- Storage reads on those checkouts run statement by statement, and binary cells are converted to Postgres's text for the engine. Every column a storage read selects is cast to `int8`, `float8`, `text`, `bool`, `date` or `timestamp`, all of which the conversion covers.
+- Streamgres never uses or borrows the application's pool. Fallback reads, catalog work, reader checks and storage reads all run on its own connections, on its own runtime. Why: the application's load cannot starve Streamgres's checks and Streamgres's fallback reads cannot starve the application's writes; errors keep Postgres's real SQLSTATE; storage reads stay one simple-query batch; and no read ever needs the caller's runtime.
+- The cost is connections per process: `pool_size`, the storage reads, the feed, snapshot minting and the sampling connection. Size `pool_size` and the server's `max_connections` for the number of replicas.
+- The role of `connect(dsn)` reads on behalf of every caller: give it read access to the carried tables only.
 - Admission excludes every RLS-enabled table, including for bypass roles: the WAL stream does not enforce row policies. Embedded-library DDL commits invalidate reader checks even when column shapes do not change. Reinstall `Builder::setup_sql()` on existing installations to enable the database-local GRANT and REVOKE invalidation trigger. An authorization check expires after five seconds even without a WAL signal, covering role membership changes and installations awaiting the trigger upgrade. Failed revalidation cannot authorize a memory read. Immediate revocation still requires coordinating with the application.
 - A schema change or an expired authorization check needs a fresh reader check on a pool connection; while every pool connection is held by slow fallback reads, warm queries fall back until one frees.
 - Source-position sampling has a connection of its own, so a pool saturated by fallback reads cannot starve it and turn every read into a fallback. It samples the `connect(dsn)` endpoint, primary or standby. Each sample has a two-second deadline covering connecting, execution and decoding; a failure records its cause, drops the connection, leaves freshness to expire and retries.
-- `Connections` hands out a `Lease` over a `Session` (`query(sql, binds)` returning cells with their type OIDs, and `execute(sql)`). Any pool can implement it.
-- A `Session` declares every bind by its type OID, custom types included, as the application's own driver does; `unknown` would let Postgres infer a type the bind alone decides.
-- A `Session` fails with a `SessionError`, and a fallback read's failure reaches the caller as `Error::Origin(SessionError)`:
+- Streamgres's own `Session` declares every bind by its type OID, custom types included, as the application's own driver does; `unknown` would let Postgres infer a type the bind alone decides.
+- A fallback read's failure reaches the caller as `Error::Origin(SessionError)`:
 
 | Variant | Meaning | Reliable for retry decisions |
 |---|---|---|
-| `Database { code, message }` | Postgres refused or failed the statement | On Streamgres's own pool, `code` is the SQLSTATE Postgres returned. Through the Diesel bridge it is inferred from Diesel's error kind (see below), or `None`. |
+| `Database { code, message }` | Postgres refused or failed the statement | `code` is the SQLSTATE Postgres returned. |
 | `Timeout` | Postgres cancelled it for `statement_timeout`, or a Streamgres deadline (the fallback's `timeout`) passed | Streamgres's own deadlines always. Postgres's: told from a cancel request by its message, best effort for an untranslated server. |
 | `Cancelled` | Postgres cancelled it on request (`pg_cancel_backend`, a client cancel) | As for `Timeout`: both share SQLSTATE 57014. |
 | `Other` | The connection, protocol, pool or task | This category does not determine whether retrying will help. |
-- `streamgres_diesel::connections(pool)` (feature `async-pool`) wraps a `diesel-async` bb8 pool through Diesel's public API:
-  - each `$n` is pushed as a bind of the type Streamgres names at run time;
-  - rows come back as their cells' bytes and available type OIDs; an all-NULL column may have OID zero, and an empty result may have no column descriptors;
-  - parameter recognition respects escaped strings, nested comments, dollar quotes and identifier boundaries; the pool's fixed `standard_conforming_strings` policy is discovered once;
-  - statements are not cached as prepared;
-  - Diesel keeps an error's kind but not its SQLSTATE: the kinds it names map to the code Postgres uses for them (an inference, not a code Postgres returned), other kinds have none, and a cancelled statement's reason comes from its message;
-  - a discarded checkout is marked broken, so bb8 closes it.
-
 Diesel reads continue to return `QueryResult`. Known SQLSTATE values map to the corresponding Diesel database error kinds. Other Streamgres failures, including timeouts and cancellations, are boxed inside `QueryBuilderError` as a downcastable `StreamgresError`.
 
 ## 7. Fallback
@@ -272,7 +263,7 @@ A query is answered from memory only if every column it returns or compares hold
 
 - Numeric and timestamp columns pass the projection admission check. Integrating main's exact values still requires updating and validating the library codec, bind handling and parser. Until then, a value the encoder cannot write exactly sends the read to the fallback, a run-time refusal. Nothing is encoded lossily.
 - Bind values arrive in Postgres's binary format with their type OIDs. A bind whose type does not compare with its column the way Postgres compares them is refused.
-- Custom type OIDs (enums, domains) are read at start. A watcher checks catalog identity every 250 ms, including its first observation, and retries failed refreshes without marking them complete; 250 ms is the polling interval, not a completion deadline. Unqualified names use PostgreSQL type visibility for the configured search path. An awaited or blocking Diesel read that names an unknown type refreshes once and renders again; refresh errors preserve the underlying pool or query error. `refresh_types()` and `refresh_types_blocking()` return `Result<(), Error>`.
+- Custom type OIDs (enums, domains) are read at start. A watcher checks catalog identity every 250 ms, including its first observation, and retries failed refreshes without marking them complete; 250 ms is the polling interval, not a completion deadline. Unqualified names use PostgreSQL type visibility for the configured search path. An awaited or blocking Diesel read that names an unknown type refreshes once and renders again; refresh errors preserve the underlying query error. `refresh_types()` returns `Result<(), Error>`, awaited or waited.
 
 **SQL shapes**
 
@@ -304,7 +295,6 @@ Brought in, because the library cannot run without them:
 | Settle reports (`Event::Unsettled`, opt-in) | The cache never answers from rows a storage read is still filling. Off for the server. |
 | Tables quoted part by part (`"schema"."table"`) | Tables outside `public` could not be read at all. |
 | An absorbed `ADD COLUMN` keeps the other columns as they were | Otherwise every column lost its OID and collation, and `SELECT *` order changed. |
-| Storage reads over application connections, when `.connections()` is given | Section 6. Otherwise, and for the server, storage reads are unchanged. |
 | A storage read rounds a timestamp down to the millisecond | The feed's text parse truncates; the `::int8` cast rounded, so a value with half a millisecond or more read 1 ms apart from the feed's copy. |
 | `sync::pg::binary` for the exact types only | Decodes binds and encodes rows. |
 | `log_debug!` in the engine-only build | Fallback reads log at debug level. |
@@ -337,11 +327,9 @@ Left out, for separate PRs:
 
 ## 12. Known limits of v1
 
+- `.wait()` is for synchronous code. Inside a `LocalSet` on a multi-thread Tokio runtime, a read that must wait (a miss) panics: Tokio cannot move a `LocalSet`'s pinned tasks off the thread, so it forbids blocking there. A memory hit returns before any blocking and works anywhere. Async code, a `LocalSet` included, uses `.await`.
 - A query's reads until it has loaded go to the fallback; with `Fallback::Error` they fail.
-- Blocking operations use `block_in_place` on a multithread Tokio runtime so application-pool work can progress. Slow blocking reads, startup, metadata refresh and shutdown return `Error::BlockingContext` when an application pool is used inside a current-thread Tokio context. Await those operations or invoke them on a plain thread. `shutdown_blocking()` returns `Result<(), Error>`.
-- An application pool (`.connections`) must be a Tokio pool used from a Tokio runtime.
 - On an idle database the engine is ready only once the feed reports a position past the latest sample, which can take until the server's next keepalive; `start()` may wait for most of `start_timeout`.
-- With `.connections()`, a basic snapshot read requires transaction setup, statement preparation, statement execution and commit: typically four round trips rather than one native simple-query batch.
 - Not yet covered: publication coverage, numeric predicate exactness, JSON value exactness, and schemas that change under a `SELECT *`.
 
 ## 13. Open for review

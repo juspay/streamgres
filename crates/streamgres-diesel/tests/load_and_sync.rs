@@ -5,9 +5,6 @@
 //! Set `STREAMGRES_PG_DSN` (a database with `wal_level = logical`); without
 //! it the test is skipped.
 
-#[path = "../../../tests/support/connections.rs"]
-mod application;
-
 use std::time::{Duration, Instant};
 
 use diesel::prelude::*;
@@ -126,7 +123,6 @@ async fn admin(dsn: &str) -> tokio_postgres::Client {
 async fn diesel_queries_are_answered_from_memory_and_follow_writes() {
     let Some(dsn) = dsn() else { return };
     let builder = Streamgres::connect(&dsn)
-        .connections(application::connections(&dsn))
         .publication("desk_live_pub")
         .schemas(["desk_live"])
         .app("desklive", 0)
@@ -134,26 +130,15 @@ async fn diesel_queries_are_answered_from_memory_and_follow_writes() {
         // The bind-type refresh below runs a statement Streamgres does not
         // support (no FROM) through the fallback.
         .on_unsupported(OnUnsupported::Fallback);
-    #[cfg(feature = "async-pool")]
-    let application_pool = {
-        use diesel_async::pooled_connection::{AsyncDieselConnectionManager, bb8};
-        let manager = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(&dsn);
-        bb8::Pool::builder()
-            .max_size(2)
-            .build(manager)
-            .await
-            .expect("app pool")
-    };
-    #[cfg(feature = "async-pool")]
-    let builder = builder.connections(streamgres_diesel::connections(application_pool.clone()));
     let client = admin(&dsn).await;
+    // `teams.name` is ordered from memory, which needs a byte-order collation.
     client
         .batch_execute(
             "DROP PUBLICATION IF EXISTS desk_live_pub;
              DROP SCHEMA IF EXISTS desk_live CASCADE;
              CREATE SCHEMA desk_live;
              CREATE TYPE desk_live.ticket_state AS ENUM ('open', 'closed');
-             CREATE TABLE desk_live.teams (id int8 PRIMARY KEY, name text NOT NULL);
+             CREATE TABLE desk_live.teams (id int8 PRIMARY KEY, name text COLLATE \"C\" NOT NULL);
              CREATE TABLE desk_live.tickets (id int8 PRIMARY KEY, team_id int8 NOT NULL,
                  title text NOT NULL, state desk_live.ticket_state NOT NULL, priority int4 NOT NULL);
              INSERT INTO desk_live.teams VALUES (1, 'billing'), (2, 'support');
@@ -294,19 +279,6 @@ async fn diesel_queries_are_answered_from_memory_and_follow_writes() {
     assert!(inspected.rows >= 3);
 
     lib.shutdown().await;
-    #[cfg(feature = "async-pool")]
-    {
-        use diesel_async::SimpleAsyncConnection;
-        let mut connection = application_pool
-            .get()
-            .await
-            .expect("application pool survives library shutdown");
-        connection
-            .batch_execute("SELECT 1")
-            .await
-            .expect("pool remains usable");
-        assert!(application_pool.state().connections <= 2);
-    }
     // The trigger stack's DDL triggers would fire for every later test.
     client
         .batch_execute(
@@ -337,143 +309,4 @@ where
         assert!(Instant::now() < deadline, "never answered from memory");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-}
-
-#[cfg(feature = "async-pool")]
-#[tokio::test]
-async fn interrupted_raw_transactions_are_not_returned_to_the_app() {
-    use diesel_async::pooled_connection::{AsyncDieselConnectionManager, bb8};
-    use streamgres::cache::{Connections, Session};
-    let Some(dsn) = dsn() else { return };
-    let manager = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(&dsn);
-    let pool = bb8::Pool::builder()
-        .max_size(1)
-        .build(manager)
-        .await
-        .expect("pool");
-    let connections = streamgres_diesel::connections(pool.clone());
-    let mut checkout = connections.get().await.expect("checkout");
-    let pid = |rows: streamgres::cache::RawRows| rows.int(0, 0).unwrap().unwrap();
-    let before = pid(checkout
-        .query("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap());
-    checkout.execute("BEGIN; SELECT 1").await.unwrap();
-    drop(checkout);
-    let mut replacement = connections.get().await.expect("replacement checkout");
-    let after = pid(replacement
-        .query("SELECT pg_backend_pid()", &[])
-        .await
-        .unwrap());
-    assert_ne!(
-        before, after,
-        "an interrupted transaction must discard its physical connection"
-    );
-}
-
-#[cfg(feature = "async-pool")]
-#[tokio::test]
-async fn raw_bridge_preserves_postgres_quoted_regions() {
-    use diesel_async::pooled_connection::{AsyncDieselConnectionManager, bb8};
-    use streamgres::cache::{Connections, Session};
-    let Some(dsn) = dsn() else { return };
-    let manager = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(&dsn);
-    let pool = bb8::Pool::builder()
-        .max_size(1)
-        .build(manager)
-        .await
-        .unwrap();
-    let connections = streamgres_diesel::connections(pool);
-    let mut lease = connections.get().await.unwrap();
-    for sql in [
-        r"SELECT E'it\'s $1' AS value",
-        "SELECT 1 AS value /* outer /* inner */ $1 */",
-        "SELECT $é$ $1 $é$ AS value",
-    ] {
-        lease
-            .query(sql, &[])
-            .await
-            .expect("valid Postgres quoted SQL");
-    }
-    let binds = [streamgres::cache::Bind {
-        type_oid: 20,
-        bytes: Some(7i64.to_be_bytes().to_vec()),
-    }];
-    let rows = lease
-        .query("SELECT $1::bigint + $1::bigint", &binds)
-        .await
-        .unwrap();
-    assert_eq!(rows.int(0, 0).unwrap(), Some(14));
-    let more = [
-        binds[0].clone(),
-        streamgres::cache::Bind {
-            type_oid: 20,
-            bytes: Some(3i64.to_be_bytes().to_vec()),
-        },
-        streamgres::cache::Bind {
-            type_oid: 20,
-            bytes: None,
-        },
-    ];
-    let rows = lease
-        .query("SELECT $2 - $1 AS value, $3::bigint AS empty", &more)
-        .await
-        .unwrap();
-    assert_eq!(rows.int(0, 0).unwrap(), Some(-4));
-    assert_eq!(rows.int(0, 1).unwrap(), None);
-    lease
-        .execute("CREATE TYPE pg_temp.audit_mood AS ENUM ('ready')")
-        .await
-        .unwrap();
-    let oid = lease
-        .query("SELECT 'pg_temp.audit_mood'::regtype::oid::bigint", &[])
-        .await
-        .unwrap()
-        .int(0, 0)
-        .unwrap()
-        .unwrap();
-    let rows = lease
-        .query(
-            "SELECT pg_typeof($1)::oid::bigint",
-            &[streamgres::cache::Bind {
-                type_oid: u32::try_from(oid).unwrap(),
-                bytes: Some(b"ready".to_vec()),
-            }],
-        )
-        .await
-        .unwrap();
-    assert_eq!(rows.int(0, 0).unwrap(), Some(oid));
-}
-
-/// The bridge reports a statement timeout as a timeout and a Postgres
-/// error with the SQLSTATE Diesel keeps.
-#[cfg(feature = "async-pool")]
-#[tokio::test(flavor = "multi_thread")]
-async fn bridge_errors_are_structured() {
-    use diesel_async::pooled_connection::{AsyncDieselConnectionManager, bb8};
-    use streamgres::cache::{Connections, Session, SessionError};
-    let Some(dsn) = dsn() else { return };
-    let manager = AsyncDieselConnectionManager::<diesel_async::AsyncPgConnection>::new(&dsn);
-    let pool = bb8::Pool::builder()
-        .max_size(1)
-        .build(manager)
-        .await
-        .expect("pool");
-    let connections = streamgres_diesel::connections(pool);
-    let mut checkout = connections.get().await.expect("checkout");
-    checkout
-        .execute("SET statement_timeout = 50")
-        .await
-        .unwrap();
-    let error = checkout.query("SELECT pg_sleep(1)", &[]).await.unwrap_err();
-    assert!(matches!(error, SessionError::Timeout(_)), "{error:?}");
-    checkout.execute("RESET statement_timeout").await.unwrap();
-    let error = checkout
-        .execute("CREATE TEMP TABLE once (id int UNIQUE); INSERT INTO once VALUES (1), (1)")
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&error, SessionError::Database { code: Some(code), .. } if code == "23505"),
-        "{error:?}"
-    );
 }

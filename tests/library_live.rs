@@ -833,26 +833,13 @@ async fn encoding_refusal_is_plan_scoped_and_never_counted_as_memory() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unqualified_type_metadata_follows_session_visibility() {
-    use streamgres::cache::Lease;
     let Some(dsn) = dsn() else { return };
     prepare(&dsn,"lib_typepath","libtypepath","CREATE TYPE lib_typepath.shadow_type AS ENUM ('a'); CREATE TYPE lib_typepath.hidden_type AS ENUM ('b'); CREATE SCHEMA lib_typehidden; CREATE TYPE lib_typehidden.shadow_type AS ENUM ('b'); CREATE TABLE lib_typepath.t (id bigint PRIMARY KEY);").await;
-    let mut config: tokio_postgres::Config = dsn.parse().unwrap();
-    config.options("-csearch_path=lib_typehidden,lib_typepath,public");
-    let connections = move || {
-        let config = config.clone();
-        async move {
-            let (client, connection) = config
-                .connect(tokio_postgres::NoTls)
-                .await
-                .map_err(|e| e.to_string())?;
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            Ok(Lease::new(client))
-        }
-    };
-    let lib = Streamgres::connect(&dsn)
-        .connections(connections)
+    // Streamgres's own connections take the search path from the DSN.
+    let separator = if dsn.contains('?') { '&' } else { '?' };
+    let with_path =
+        format!("{dsn}{separator}options=-csearch_path%3Dlib_typehidden%2Clib_typepath%2Cpublic");
+    let lib = Streamgres::connect(&with_path)
         .schemas(["lib_typepath"])
         .publication("lib_typepath_pub")
         .app("libtypepath", 0)
@@ -883,104 +870,36 @@ async fn unqualified_type_metadata_follows_session_visibility() {
     clean(&dsn, "lib_typepath", "libtypepath").await;
 }
 
+/// Every I/O of Streamgres's runs on its own runtime, so waiting on it
+/// from the only thread of a current-thread runtime cannot deadlock.
 #[tokio::test(flavor = "current_thread")]
-async fn blocking_app_pool_operations_reject_a_current_thread_runtime() {
-    use streamgres::cache::Lease;
+async fn blocking_operations_work_on_a_current_thread_runtime() {
     let Some(dsn) = dsn() else { return };
     prepare(
         &dsn,
         "lib_block",
         "libblock",
-        "CREATE TABLE lib_block.t (id bigint PRIMARY KEY);",
+        "CREATE TABLE lib_block.t (id bigint PRIMARY KEY); INSERT INTO lib_block.t VALUES (1);",
     )
     .await;
-    let app_dsn = dsn.clone();
-    let connections = move || {
-        let dsn = app_dsn.clone();
-        async move {
-            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| e.to_string())?;
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            Ok(Lease::new(client))
-        }
-    };
     let lib = Streamgres::connect(&dsn)
-        .connections(connections)
         .schemas(["lib_block"])
         .publication("lib_block_pub")
         .app("libblock", 0)
         .on_unsupported(OnUnsupported::Fallback)
         .start()
-        .await
+        .wait()
         .unwrap();
-    let result = lib.load_and_sync(Sql::new("SELECT 1")).wait();
-    assert_eq!(result.unwrap_err(), Error::BlockingContext);
-    assert_eq!(
-        lib.refresh_types_blocking().unwrap_err(),
-        Error::BlockingContext
-    );
-    assert_eq!(lib.shutdown_blocking().unwrap_err(), Error::BlockingContext);
-    lib.shutdown().await;
+    let fallback = lib.load_and_sync(Sql::new("SELECT 1")).wait().unwrap();
+    assert_eq!(fallback.len(), 1);
+    let rows = lib
+        .load_and_sync(Sql::new("SELECT id FROM lib_block.t"))
+        .wait()
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    lib.refresh_types().wait().unwrap();
+    lib.shutdown().wait();
     clean(&dsn, "lib_block", "libblock").await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn refresh_errors_preserve_the_pool_failure() {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
-    use streamgres::cache::Lease;
-    let Some(dsn) = dsn() else { return };
-    prepare(
-        &dsn,
-        "lib_refresh",
-        "librefresh",
-        "CREATE TABLE lib_refresh.t (id bigint PRIMARY KEY);",
-    )
-    .await;
-    let fail = Arc::new(AtomicBool::new(false));
-    let gate = fail.clone();
-    let app_dsn = dsn.clone();
-    let connections = move || {
-        let fail = gate.clone();
-        let dsn = app_dsn.clone();
-        async move {
-            if fail.load(Ordering::Acquire) {
-                return Err("pool unavailable for metadata".to_owned());
-            }
-            let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
-                .await
-                .map_err(|e| e.to_string())?;
-            tokio::spawn(async move {
-                let _ = connection.await;
-            });
-            Ok(Lease::new(client))
-        }
-    };
-    let lib = Streamgres::connect(&dsn)
-        .connections(connections)
-        .schemas(["lib_refresh"])
-        .publication("lib_refresh_pub")
-        .app("librefresh", 0)
-        .start()
-        .await
-        .unwrap();
-    // Let the first background refresh complete before forcing the next checkout.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    fail.store(true, Ordering::Release);
-    let error = lib.refresh_types().await.unwrap_err();
-    assert!(
-        error.to_string().contains("pool unavailable for metadata"),
-        "{error}"
-    );
-    fail.store(false, Ordering::Release);
-    lib.refresh_types().await.unwrap();
-    lib.shutdown().await;
-    clean(&dsn, "lib_refresh", "librefresh").await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -993,6 +912,11 @@ async fn the_first_catalog_observation_refreshes_custom_types() {
         "CREATE TABLE lib_firsttype.t (id bigint PRIMARY KEY);",
     )
     .await;
+    // Connected before start, so the type is made within one round trip of
+    // it: well before the watcher's first look, 250 ms later. CREATE TYPE
+    // fires no DDL trigger, so it need not wait on the setup lock, which
+    // other tests' setups can hold past that first look.
+    let client = admin(&dsn).await;
     let lib = Streamgres::connect(&dsn)
         .schemas(["lib_firsttype"])
         .publication("lib_firsttype_pub")
@@ -1002,7 +926,10 @@ async fn the_first_catalog_observation_refreshes_custom_types() {
         .unwrap();
     // No explicit refresh or Diesel lookup retry: background discovery must
     // include a type created before its first catalog observation.
-    ddl(&dsn, "CREATE TYPE lib_firsttype.first_type AS ENUM ('a')").await;
+    client
+        .batch_execute("CREATE TYPE lib_firsttype.first_type AS ENUM ('a')")
+        .await
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     while lib.type_oids("first_type", Some("lib_firsttype")).is_none() {
         assert!(
@@ -1115,7 +1042,8 @@ async fn custom_type_binds_keep_their_oid_on_the_default_pool() {
 /// timeout as such, without its message being read.
 #[tokio::test(flavor = "multi_thread")]
 async fn session_errors_keep_their_sqlstate_and_timeouts() {
-    use streamgres::cache::{Session, SessionError};
+    use streamgres::cache::SessionError;
+    use streamgres::sync::pg::connections::Session;
     let Some(dsn) = dsn() else { return };
     let mut client = admin(&dsn).await;
     let error = Session::query(&mut client, "SELECT 1 / 0", &[])
@@ -1139,12 +1067,13 @@ async fn session_errors_keep_their_sqlstate_and_timeouts() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hung_trigger_check_is_bounded_by_the_start_timeout() {
     let Some(dsn) = dsn() else { return };
-    let never = || std::future::pending::<Result<streamgres::cache::Lease, String>>();
+    let _ = dsn;
+    // TEST-NET-1: connections there hang until their own timeout.
+    let unreachable = "postgresql://u:p@192.0.2.1:5432/db?connect_timeout=30";
     let started = tokio::time::timeout(
         Duration::from_secs(5),
-        Streamgres::connect(&dsn)
+        Streamgres::connect(unreachable)
             .app("lib_hung_check", 0)
-            .connections(never)
             .start_timeout(Duration::from_millis(300))
             .start(),
     )
@@ -1160,7 +1089,8 @@ async fn a_hung_trigger_check_is_bounded_by_the_start_timeout() {
 /// A statement cancelled on request is a cancellation, not a timeout.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_statement_is_not_a_timeout() {
-    use streamgres::cache::{Session, SessionError};
+    use streamgres::cache::SessionError;
+    use streamgres::sync::pg::connections::Session;
     let Some(dsn) = dsn() else { return };
     let mut client = admin(&dsn).await;
     let pid = Session::query(&mut client, "SELECT pg_backend_pid()::int8", &[])

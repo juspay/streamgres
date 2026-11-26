@@ -14,7 +14,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION "xyne_0".notice_ignore(reason TEXT, tag TEXT, target record)
 RETURNS void AS $$
 BEGIN
-  RAISE NOTICE '% ignoring % % %', 'xyne_0', reason, tag,
+  RAISE NOTICE 'xyne_0 ignoring % % %', reason, tag,
     COALESCE(row_to_json(target)::text, '');
 END
 $$ LANGUAGE plpgsql;
@@ -204,7 +204,7 @@ BEGIN
 
   PERFORM pg_logical_emit_message(true, 'xyne/0/ddl', message);
 
-  RAISE NOTICE 'Emitted % % for % %', 'xyne_0', event_type, tag,
+  RAISE NOTICE 'Emitted xyne_0 % for % %', event_type, tag,
     COALESCE(row_to_json(target)::text, '');
 END
 $$ LANGUAGE plpgsql;
@@ -306,19 +306,8 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION "xyne_0".emit_acl_change()
-RETURNS event_trigger AS $$
-BEGIN
-  PERFORM pg_catalog.pg_logical_emit_message(true, 'xyne/0/ddl', '{"type":"aclChanged"}');
-END
-$$ LANGUAGE plpgsql;
-
-ALTER FUNCTION "xyne_0".emit_acl_change() SET search_path TO pg_catalog;
-ALTER FUNCTION "xyne_0".emit_acl_change() SECURITY DEFINER;
-
 DROP EVENT TRIGGER IF EXISTS "xyne_ddl_start_0";
 DROP EVENT TRIGGER IF EXISTS "xyne_ddl_end_0";
-DROP EVENT TRIGGER IF EXISTS "xyne_acl_end_0";
 
 CREATE EVENT TRIGGER "xyne_ddl_start_0"
   ON ddl_command_start
@@ -329,8 +318,3 @@ CREATE EVENT TRIGGER "xyne_ddl_end_0"
   ON ddl_command_end
   WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE', 'CREATE INDEX', 'DROP TABLE', 'DROP INDEX', 'ALTER PUBLICATION', 'ALTER SCHEMA', 'COMMENT')
   EXECUTE PROCEDURE "xyne_0".emit_ddl_end();
-
-CREATE EVENT TRIGGER "xyne_acl_end_0"
-  ON ddl_command_end
-  WHEN TAG IN ('GRANT', 'REVOKE')
-  EXECUTE PROCEDURE "xyne_0".emit_acl_change();

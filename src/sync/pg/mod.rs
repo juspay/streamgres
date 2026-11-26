@@ -72,7 +72,7 @@ use tokio::sync::{Notify, Semaphore};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
 
-use self::connections::{Session, SessionError, TextRow};
+use self::connections::TextRow;
 
 use super::storage::{Storage, StorageError};
 use crate::log::{log_info, log_warn};
@@ -381,7 +381,6 @@ impl Aliases {
 /// - `alive`: cleared when the storage drops, which ends the minting task.
 /// - `runtime`: where the reads, the connections and the minter run.
 struct Pool {
-    application: Option<Arc<dyn connections::Connections>>,
     config: Config,
     read_config: Config,
     idle: Mutex<Vec<Client>>,
@@ -457,34 +456,8 @@ impl PgStorage {
         catalog: Arc<Catalog>,
         runtime: Handle,
     ) -> Result<Self, StorageError> {
-        Self::connect_using(config, read_config, catalog, runtime, None).await
-    }
-
-    /// Ordinary SQL uses the application's checkouts; exported snapshots
-    /// still require the direct replication endpoint.
-    pub async fn connect_with_connections(
-        config: Config,
-        catalog: Arc<Catalog>,
-        runtime: Handle,
-        connections: Arc<dyn connections::Connections>,
-    ) -> Result<Self, StorageError> {
-        Self::connect_using(config.clone(), config, catalog, runtime, Some(connections)).await
-    }
-
-    async fn connect_using(
-        config: Config,
-        read_config: Config,
-        catalog: Arc<Catalog>,
-        runtime: Handle,
-        application: Option<Arc<dyn connections::Connections>>,
-    ) -> Result<Self, StorageError> {
-        let idle = if application.is_some() {
-            Vec::new()
-        } else {
-            vec![open(&read_config, &runtime).await?]
-        };
+        let idle = vec![open(&read_config, &runtime).await?];
         let pool = Arc::new(Pool {
-            application,
             config,
             read_config,
             idle: Mutex::new(idle),
@@ -527,7 +500,6 @@ impl PgStorage {
     /// Let at most `limit` reads hold a connection at once (at least one).
     pub fn with_read_connections(self, limit: usize) -> Self {
         let pool = Arc::new(Pool {
-            application: self.pool.application.clone(),
             config: self.pool.config.clone(),
             read_config: self.pool.read_config.clone(),
             idle: Mutex::new(std::mem::take(&mut *self.pool.lock_idle())),
@@ -892,11 +864,6 @@ async fn estimated(
         .map_err(StorageError)
 }
 
-enum ReadConnection {
-    Native(Client),
-    Application(connections::Lease),
-}
-
 impl Pool {
     /// The aliases, read through a poisoned lock (the state is only ever
     /// changed whole).
@@ -944,24 +911,13 @@ impl Pool {
     /// that ended while it sat idle (the server restarted, the network
     /// lost it and the keepalive probes found out) is let go here rather
     /// than handed to a read that would wait on it.
-    async fn acquire(&self) -> Result<ReadConnection, StorageError> {
-        if let Some(application) = &self.application {
-            return application
-                .get()
-                .await
-                .map(ReadConnection::Application)
-                .map_err(StorageError);
-        }
+    async fn acquire(&self) -> Result<Client, StorageError> {
         loop {
             let idle = self.lock_idle().pop();
             match idle {
                 Some(client) if client.is_closed() => continue,
-                Some(client) => return Ok(ReadConnection::Native(client)),
-                None => {
-                    return open(&self.read_config(), &self.runtime)
-                        .await
-                        .map(ReadConnection::Native);
-                }
+                Some(client) => return Ok(client),
+                None => return open(&self.read_config(), &self.runtime).await,
             }
         }
     }
@@ -989,10 +945,7 @@ impl Pool {
     /// Runs `statements` on a pooled connection, within the read timeout,
     /// with `before` and `after` (transaction control, returning nothing
     /// the caller wants) around them; the rows of each of `statements`, in
-    /// order. On Streamgres's own connections it is all one simple-query
-    /// batch, one round trip. On an application connection, `before` and
-    /// `after` are a round trip each and every statement one more, its
-    /// binary cells read back as the text Postgres would have sent. `what`
+    /// order, all in one simple-query batch, one round trip. `what`
     /// names the work in the refusal of a batch that did not finish in
     /// time: Postgres cancelled it, or the wait ended first.
     async fn run(
@@ -1004,56 +957,34 @@ impl Pool {
     ) -> Result<Vec<Vec<TextRow>>, StorageError> {
         let _permit = self.permit().await?;
         let limit = self.timeout();
-        let timed = |error: SessionError| match (limit, &error) {
-            (Some(limit), SessionError::Timeout(_)) => timed_out(what, limit),
-            _ => StorageError(error.to_string()),
-        };
         let work = async {
-            match self.acquire().await? {
-                ReadConnection::Native(client) => {
-                    let batch = before
-                        .iter()
-                        .chain(statements)
-                        .chain(after)
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    match client.simple_query(&batch).await {
-                        Ok(messages) => {
-                            self.release(client);
-                            let results = per_statement(messages);
-                            let wanted = before.len()..before.len() + statements.len();
-                            results.get(wanted).map(<[_]>::to_vec).ok_or_else(|| {
-                                StorageError(format!(
-                                    "{} results for a batch of {} statements",
-                                    results.len(),
-                                    before.len() + statements.len() + after.len()
-                                ))
-                            })
-                        }
-                        Err(error) => match limit {
-                            Some(limit) if error.code() == Some(&SqlState::QUERY_CANCELED) => {
-                                Err(timed_out(what, limit))
-                            }
-                            _ => Err(error.into()),
-                        },
-                    }
+            let client = self.acquire().await?;
+            let batch = before
+                .iter()
+                .chain(statements)
+                .chain(after)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("; ");
+            match client.simple_query(&batch).await {
+                Ok(messages) => {
+                    self.release(client);
+                    let results = per_statement(messages);
+                    let wanted = before.len()..before.len() + statements.len();
+                    results.get(wanted).map(<[_]>::to_vec).ok_or_else(|| {
+                        StorageError(format!(
+                            "{} results for a batch of {} statements",
+                            results.len(),
+                            before.len() + statements.len() + after.len()
+                        ))
+                    })
                 }
-                ReadConnection::Application(mut lease) => {
-                    if !before.is_empty() {
-                        lease.execute(&before.join("; ")).await.map_err(timed)?;
+                Err(error) => match limit {
+                    Some(limit) if error.code() == Some(&SqlState::QUERY_CANCELED) => {
+                        Err(timed_out(what, limit))
                     }
-                    let mut results = Vec::with_capacity(statements.len());
-                    for statement in statements {
-                        let rows = lease.query(statement, &[]).await.map_err(timed)?;
-                        results.push(rows.into_text().map_err(StorageError)?);
-                    }
-                    if !after.is_empty() {
-                        lease.execute(&after.join("; ")).await.map_err(timed)?;
-                    }
-                    lease.recycle();
-                    Ok(results)
-                }
+                    _ => Err(error.into()),
+                },
             }
         };
         match limit {

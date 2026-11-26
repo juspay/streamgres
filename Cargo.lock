@@ -2411,7 +2411,6 @@ name = "streamgres-diesel"
 version = "0.1.0"
 dependencies = [
  "diesel",
- "diesel-async",
  "streamgres",
  "tokio",
  "tokio-postgres",

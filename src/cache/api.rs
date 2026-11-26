@@ -21,13 +21,13 @@ use crate::log::{Level, enabled, log_debug, log_warn};
 use crate::parser::Bind;
 use crate::sync::embed::{PgConfig, PgEngine};
 use crate::sync::pg::binary::oid;
-use crate::sync::pg::connections::{Connections, Io, OnRuntime, OwnPool, SessionError};
+use crate::sync::pg::connections::{Io, OnRuntime, OwnPool, SessionError, Task};
 
 /// What answers a read the engine cannot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fallback {
-    /// Postgres answers it, over Streamgres's pool
-    /// ([`Builder::pool_size`], or [`Builder::connections`]): at most
+    /// Postgres answers it, over Streamgres's own pool
+    /// ([`Builder::pool_size`]): at most
     /// `max_concurrent` such reads at once, each waiting at most `wait`
     /// for its turn and taking at most `timeout`.
     Postgres {
@@ -85,8 +85,6 @@ pub enum Error {
     Setup(String),
     /// Streamgres could not start, or has stopped.
     Stopped(String),
-    /// A blocking operation would prevent its application runtime from making progress.
-    BlockingContext,
 }
 
 impl std::fmt::Display for Error {
@@ -99,7 +97,6 @@ impl std::fmt::Display for Error {
             Error::NotReady(reason) => write!(f, "not ready: {reason}"),
             Error::Setup(reason) => write!(f, "not set up: {reason}"),
             Error::Stopped(reason) => write!(f, "stopped: {reason}"),
-            Error::BlockingContext => f.write_str("blocking application-pool operations cannot run in a current-thread Tokio context; await the operation or use a plain thread"),
         }
     }
 }
@@ -224,7 +221,6 @@ const TYPES_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone)]
 #[must_use]
 pub struct Builder {
-    connections: Option<Arc<dyn Connections>>,
     pg: PgConfig,
     cache: CacheConfig,
     fallback: Fallback,
@@ -238,10 +234,6 @@ impl std::fmt::Debug for Builder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Builder")
             .field("pg", &self.pg)
-            .field(
-                "connections",
-                &self.connections.as_ref().map(|_| "application-owned"),
-            )
             .finish_non_exhaustive()
     }
 }
@@ -252,14 +244,6 @@ impl Builder {
     /// uses connections of its own besides.
     pub fn pool_size(mut self, size: usize) -> Self {
         self.pool_size = size;
-        self
-    }
-
-    /// Runs Streamgres's ordinary queries on these connections instead of
-    /// a pool of its own: an application pool it shares
-    /// (`streamgres_diesel::connections`). Optional.
-    pub fn connections(mut self, connections: impl Connections) -> Self {
-        self.connections = Some(Arc::new(connections));
         self
     }
 
@@ -372,67 +356,37 @@ impl Builder {
     /// ready: [`Error::Setup`] when the DDL trigger is missing, and
     /// [`Error::NotReady`] when the engine is not ready by then, unless
     /// [`Builder::allow_degraded_start`] lets reads fall back while it comes
-    /// up.
+    /// up. Await it, or call [`Op::wait`] from synchronous code.
     ///
     /// Streamgres runs its connections and background work on a runtime
     /// of its own, so this future, and every read's, may be awaited on any
     /// executor.
-    pub async fn start(self) -> Result<Streamgres, Error> {
-        let app = tokio::runtime::Handle::try_current().ok();
-        let io = Arc::new(Io::new().map_err(Error::Stopped)?);
-        let runtime = io.handle().clone();
-        runtime
-            .spawn(self.start_on(io, app))
-            .await
-            .unwrap_or_else(|error| Err(Error::Stopped(format!("starting Streamgres: {error}"))))
+    pub fn start(self) -> Op<'static, Result<Streamgres, Error>> {
+        Op::new(async move {
+            let io = Arc::new(Io::new().map_err(Error::Stopped)?);
+            let runtime = io.handle().clone();
+            Task::new(runtime.spawn(self.start_on(io)))
+                .join()
+                .await
+                .unwrap_or_else(|error| {
+                    Err(Error::Stopped(format!("starting Streamgres: {error}")))
+                })
+        })
     }
 
-    /// [`Self::start`] for synchronous code: it blocks this thread until
-    /// Streamgres has started. Not for an async context.
-    pub fn start_blocking(self) -> Result<Streamgres, Error> {
-        if !blocking_allowed(self.connections.is_some()) {
-            return Err(Error::BlockingContext);
-        }
-        let io = Arc::new(Io::new().map_err(Error::Stopped)?);
-        let app = tokio::runtime::Handle::try_current().ok();
-        let runtime = io.handle().clone();
-        wait(&runtime, self.start_on(io, app))
-            .unwrap_or_else(|reason| Err(Error::Stopped(format!("starting Streamgres: {reason}"))))
-    }
-
-    /// Starts Streamgres; run on `io`, which it then runs on. `app` is
-    /// the caller's runtime, if any: an application pool is used there.
-    async fn start_on(
-        self,
-        io: Arc<Io>,
-        app: Option<tokio::runtime::Handle>,
-    ) -> Result<Streamgres, Error> {
-        let reads_on_origin = self.connections.is_some();
-        let (connections, runtime): (Arc<dyn Connections>, _) = match self.connections {
-            Some(connections) => (
-                connections,
-                app.ok_or_else(|| {
-                    Error::Stopped(
-                        "an application pool (`.connections`) is used on the application's \
-                         Tokio runtime: start Streamgres inside it"
-                            .to_owned(),
-                    )
-                })?,
-            ),
-            None => (
-                Arc::new(OwnPool::new(&self.pg.dsn, self.pool_size).map_err(Error::Stopped)?),
-                io.handle().clone(),
-            ),
-        };
+    /// Starts Streamgres; run on `io`, which it then runs on, its own pool
+    /// included.
+    async fn start_on(self, io: Arc<Io>) -> Result<Streamgres, Error> {
+        let pool = OwnPool::new(&self.pg.dsn, self.pool_size).map_err(Error::Stopped)?;
         let connections = Arc::new(OnRuntime {
-            connections,
-            runtime,
+            connections: Arc::new(pool),
+            runtime: io.handle().clone(),
             io: io.clone(),
         });
         let deadline = Instant::now()
             .checked_add(self.cache.start_timeout)
             .ok_or_else(|| Error::Stopped("the startup timeout is too large".to_owned()))?;
-        let engine = PgEngine::new(self.pg, connections, io.handle().clone(), reads_on_origin);
+        let engine = PgEngine::new(self.pg, connections, io.handle().clone());
         let recorder = Recorder::new(self.debug_history, self.cache.max_entries.saturating_mul(2));
         let cache = Arc::new(Cache::start(self.cache, Arc::new(engine)));
         let waiting = cache.clone();
@@ -464,7 +418,6 @@ impl Builder {
                 type_generation: AtomicU64::new(0),
                 reader_refresh: AsyncMutex::new(()),
                 admission: AsyncMutex::new(None),
-                application_pool: reads_on_origin,
                 recorder,
                 io,
             }),
@@ -505,7 +458,6 @@ struct Inner {
     type_generation: AtomicU64,
     reader_refresh: AsyncMutex<()>,
     admission: AsyncMutex<Option<Admission>>,
-    application_pool: bool,
     /// The reads recorded for inspection.
     recorder: Recorder,
     /// Streamgres's runtime; last, so it outlives what runs on it.
@@ -528,7 +480,6 @@ impl Streamgres {
     /// Starts configuring Streamgres for the database at `dsn`.
     pub fn connect(dsn: impl Into<String>) -> Builder {
         Builder {
-            connections: None,
             pg: PgConfig::new(dsn),
             cache: CacheConfig::default(),
             fallback: Fallback::default(),
@@ -621,23 +572,17 @@ impl Streamgres {
 
     /// Reads the database's types again, for [`Streamgres::type_oids`]:
     /// what an adapter does when a type it must name is not known yet (one
-    /// created since Streamgres last read them).
-    pub async fn refresh_types(&self) -> Result<(), Error> {
-        self.load_types(TYPES_TIMEOUT).await
-    }
-
-    /// [`Self::refresh_types`] for synchronous code: it blocks this
-    /// thread until the types are read.
-    pub fn refresh_types_blocking(&self) -> Result<(), Error> {
-        if !blocking_allowed(self.inner.application_pool) {
-            return Err(Error::BlockingContext);
-        }
+    /// created since Streamgres last read them). Await it, or call
+    /// [`Op::wait`] from synchronous code.
+    pub fn refresh_types(&self) -> Op<'static, Result<(), Error>> {
         let lib = self.clone();
-        wait(
-            self.inner.io.handle(),
-            async move { lib.load_types(TYPES_TIMEOUT).await },
-        )
-        .map_err(Error::Stopped)?
+        Op::new(async move {
+            let runtime = lib.inner.io.handle().clone();
+            Task::new(runtime.spawn(async move { lib.load_types(TYPES_TIMEOUT).await }))
+                .join()
+                .await
+                .unwrap_or_else(|error| Err(Error::Stopped(error.to_string())))
+        })
     }
 
     /// Reads the database's types again each time the engine's catalog
@@ -702,24 +647,12 @@ impl Streamgres {
     }
 
     /// Stops the engine and waits for it to clean up (its replication
-    /// slot dropped). Reads after this go to the fallback.
-    pub async fn shutdown(&self) {
-        stop(self.inner.io.handle(), self.inner.cache.clone()).await;
-    }
-
-    /// [`Self::shutdown`] for synchronous code: it blocks this thread
-    /// until the engine has cleaned up. Not for an async context.
-    pub fn shutdown_blocking(&self) -> Result<(), Error> {
-        if !blocking_allowed(self.inner.application_pool) {
-            return Err(Error::BlockingContext);
-        }
+    /// slot dropped). Reads after this go to the fallback. Await it, or
+    /// call [`Op::wait`] from synchronous code.
+    pub fn shutdown(&self) -> Op<'static, ()> {
         let cache = self.inner.cache.clone();
-        let outcome = wait(self.inner.io.handle(), async move {
-            tokio::task::spawn_blocking(move || cache.stop()).await
-        });
-        outcome
-            .map_err(Error::Stopped)?
-            .map_err(|error| Error::Stopped(error.to_string()))
+        let runtime = self.inner.io.handle().clone();
+        Op::new(async move { stop(&runtime, cache).await })
     }
 
     /// Streamgres's own connection as checked against the catalog the
@@ -895,42 +828,12 @@ impl Streamgres {
         let sql = Arc::new(sql);
         let lib = self.clone();
         let request = sql.clone();
-        let outcome = crate::sync::pg::connections::Task::new(
+        let outcome = Task::new(
             self.inner.io.handle().spawn(lib.finish(request, ttl, begun)),
         )
         .join()
         .await
         .unwrap_or_else(|error| ended(&error.to_string()));
-        self.record(&sql, at, started, outcome, traced)
-    }
-
-    /// [`Self::traced`], blocking this thread instead of awaiting.
-    fn traced_blocking(
-        &self,
-        sql: Sql,
-        ttl: Option<Ttl>,
-        at: &'static Location<'static>,
-        traced: bool,
-    ) -> (Result<Rows, Error>, Option<Trace>) {
-        let started = Instant::now();
-        let begun = self.begin(&sql, ttl);
-        if let Begun::Done(outcome) = begun {
-            return self.record(&sql, at, started, outcome, traced);
-        }
-        if !blocking_allowed(self.inner.application_pool) {
-            let outcome = (
-                Err(Error::BlockingContext),
-                Served::Failed,
-                Some(Error::BlockingContext.to_string()),
-            );
-            return self.record(&sql, at, started, outcome, traced);
-        }
-        let sql = Arc::new(sql);
-        let outcome = wait(
-            self.inner.io.handle(),
-            self.clone().finish(sql.clone(), ttl, begun),
-        )
-        .unwrap_or_else(|reason| ended(&reason));
         self.record(&sql, at, started, outcome, traced)
     }
 
@@ -1051,10 +954,12 @@ impl<'a> LoadAndSync<'a> {
     /// The read for synchronous code: the rows, this thread blocked until
     /// they are here. A memory hit returns at once; any other read is
     /// made on Streamgres's runtime. Needs no runtime of the caller's.
+    ///
+    /// For synchronous code only: in async code, a `LocalSet` included, use
+    /// `.await`. Tokio panics when a read that must wait blocks inside a
+    /// `LocalSet` on a multi-thread runtime.
     pub fn wait(self) -> Result<Rows, Error> {
-        self.lib
-            .traced_blocking(self.sql, self.ttl, self.at, false)
-            .0
+        block_on(self.into_future())
     }
 }
 
@@ -1073,11 +978,9 @@ pub struct Inspecting<'a>(LoadAndSync<'a>);
 
 impl Inspecting<'_> {
     /// The read and its trace for synchronous code
-    /// ([`LoadAndSync::wait`]).
+    /// ([`LoadAndSync::wait`]); likewise for synchronous code only.
     pub fn wait(self) -> (Result<Rows, Error>, Trace) {
-        let LoadAndSync { lib, sql, ttl, at } = self.0;
-        let (read, trace) = lib.traced_blocking(sql, ttl, at, true);
-        (read, trace.expect("a traced read has a trace"))
+        block_on(self.into_future())
     }
 }
 
@@ -1122,19 +1025,56 @@ fn ended(reason: &str) -> Outcome {
     )
 }
 
-/// Runs `work` on `runtime` and blocks this thread until it is done.
-fn wait<T: Send + 'static>(
-    runtime: &tokio::runtime::Handle,
-    work: impl Future<Output = T> + Send + 'static,
-) -> Result<T, String> {
-    let run = || {
-        let (done, outcome) = std::sync::mpsc::sync_channel(1);
-        runtime.spawn(async move {
-            let _ = done.send(work.await);
-        });
-        outcome
-            .recv()
-            .map_err(|_| "the task ended without finishing".to_owned())
+/// An operation of Streamgres's: a future to await or spawn, or
+/// [`Op::wait`] for it in synchronous code. Either way its I/O runs on
+/// Streamgres's own runtime.
+#[must_use = "an operation does nothing until it is awaited or waited for"]
+pub struct Op<'a, T>(Pin<Box<dyn Future<Output = T> + Send + 'a>>);
+
+impl<'a, T> Op<'a, T> {
+    fn new(work: impl Future<Output = T> + Send + 'a) -> Self {
+        Op(Box::pin(work))
+    }
+
+    /// Blocks this thread until the operation is done.
+    ///
+    /// For synchronous code only: in async code, a `LocalSet` included, use
+    /// `.await`. Tokio panics when a read that must wait blocks inside a
+    /// `LocalSet` on a multi-thread runtime.
+    pub fn wait(self) -> T {
+        block_on(self.0)
+    }
+}
+
+impl<T> Future for Op<'_, T> {
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<T> {
+        self.0.as_mut().poll(cx)
+    }
+}
+
+/// Runs `work` to completion on this thread, which sleeps while it waits.
+/// Only for Streamgres's own futures and those built on them: they do
+/// their I/O on Streamgres's runtime and need no reactor of the caller's.
+/// What is ready at once (a memory hit) returns before any blocking
+/// machinery, so it works anywhere, a `LocalSet` included. Otherwise, on
+/// a multi-thread Tokio worker, the worker's other tasks move off first,
+/// so they are not held up. That move is impossible inside a `LocalSet` on
+/// a multi-thread runtime, where its tasks are pinned to this thread, so
+/// Tokio panics there: async code awaits instead of calling this.
+pub fn block_on<F: Future>(work: F) -> F::Output {
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut context = std::task::Context::from_waker(&waker);
+    let mut work = std::pin::pin!(work);
+    if let std::task::Poll::Ready(output) = work.as_mut().poll(&mut context) {
+        return output;
+    }
+    let mut run = || loop {
+        std::thread::park();
+        if let std::task::Poll::Ready(output) = work.as_mut().poll(&mut context) {
+            return output;
+        }
     };
     match tokio::runtime::Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
@@ -1144,10 +1084,11 @@ fn wait<T: Send + 'static>(
     }
 }
 
-fn blocking_allowed(application_pool: bool) -> bool {
-    !application_pool
-        || tokio::runtime::Handle::try_current().is_ok_and(|handle| {
-            handle.runtime_flavor() != tokio::runtime::RuntimeFlavor::CurrentThread
-        })
-        || tokio::runtime::Handle::try_current().is_err()
+/// A waker that unparks the thread that made it.
+struct Unpark(std::thread::Thread);
+
+impl std::task::Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
 }
