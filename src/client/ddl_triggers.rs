@@ -397,7 +397,8 @@ BEGIN
       INTO relevant;
 
   ELSIF target.object_type = 'publication' THEN
-    SELECT 1 WHERE target.object_identity = ANY (publications)
+    SELECT pb.pubname FROM pg_publication AS pb
+      WHERE pb.oid = target.objid AND pb.pubname = ANY (publications)
       INTO relevant;
 
   ELSIF TG_TAG LIKE 'CREATE %' AND target.object_type IS NULL THEN

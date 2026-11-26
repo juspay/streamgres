@@ -2231,3 +2231,77 @@ fn a_publication_change_that_breaks_the_feed_stops_it() {
         cleanup(&dsn, &client, &names).await;
     });
 }
+
+/// The trigger recognizes a change to the publication by the object, not
+/// by how PostgreSQL spells its name: one whose name needs quoting
+/// (`xyne-sync-live-quoted-pub`, which PostgreSQL identifies as
+/// `"xyne-sync-live-quoted-pub"`) still stops the feed when it stops
+/// sending what the served tables need.
+#[test]
+fn a_change_to_a_publication_with_a_quoted_name_reaches_the_feed() {
+    let Some(dsn) = dsn() else { return };
+    block_on_alone(async {
+        let mut names = Names::new("quotedpub");
+        names.publication = "xyne-sync-live-quoted-pub".to_owned();
+        let client = prepare(&dsn, &names).await;
+        client
+            .batch_execute("DROP SCHEMA IF EXISTS xsquoted_0 CASCADE;")
+            .await
+            .expect("no leftover stack");
+        client
+            .batch_execute(&trigger_stack_sql("xsquoted", 0, &[names.publication.as_str()]))
+            .await
+            .expect("install the schema-change trigger stack");
+        let stream = PgStream::open_with(
+            &dsn,
+            &names.slot,
+            &names.publication,
+            Arc::new(names.catalog()),
+            DdlSource {
+                prefix: "xsquoted/0/ddl".to_owned(),
+                schemas: vec!["public".to_owned()],
+            },
+        )
+        .await
+        .expect("open stream");
+        let (transport, mut feed) = stream.split();
+        let (out, _transactions) = mpsc::channel(64);
+        let streaming = spawn_local(async move {
+            transport
+                .stream(Duration::from_millis(50), &mut feed, &[], out)
+                .await
+        });
+
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{}\" SET (publish = 'insert')",
+                names.publication
+            ))
+            .await
+            .expect("turn off updates and deletes");
+        let error = tokio::time::timeout(Duration::from_secs(10), streaming)
+            .await
+            .expect("the feed stops")
+            .expect("the feed task")
+            .expect_err("updates and deletes turned off stop the feed");
+        assert!(
+            error.0.contains("no longer publishes update, delete"),
+            "{error}"
+        );
+
+        let _ = client
+            .batch_execute(
+                "DROP EVENT TRIGGER IF EXISTS xsquoted_ddl_start_0;
+                 DROP EVENT TRIGGER IF EXISTS xsquoted_ddl_end_0;
+                 DROP SCHEMA IF EXISTS xsquoted_0 CASCADE;",
+            )
+            .await;
+        let _ = client
+            .batch_execute(&format!(
+                "DROP PUBLICATION IF EXISTS \"{}\"",
+                names.publication
+            ))
+            .await;
+        cleanup(&dsn, &client, &names).await;
+    });
+}

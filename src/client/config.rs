@@ -510,16 +510,18 @@ impl Config {
     }
 
     /// The catalog name of the table holding each client's last mutation
-    /// id, `<upstream schema>.clients`.
-    pub fn clients_table(&self) -> String {
-        format!("{}.clients", self.upstream_schema())
+    /// id, `<upstream schema>.clients`, built the way the catalog names
+    /// every table, so the feed's writes to it match.
+    pub fn clients_table(&self) -> TableName {
+        TableName::of(&self.upstream_schema(), "clients")
     }
 
     /// The catalog name of the table the application server records the
     /// result of a failed mutation in, until its client has received it,
-    /// `<upstream schema>.mutations`.
-    pub fn mutations_table(&self) -> String {
-        format!("{}.mutations", self.upstream_schema())
+    /// `<upstream schema>.mutations`, built the way the catalog names
+    /// every table.
+    pub fn mutations_table(&self) -> TableName {
+        TableName::of(&self.upstream_schema(), "mutations")
     }
 
     /// What the engine side needs: the database to follow and read, and
@@ -544,10 +546,7 @@ impl Config {
                 interval: self.pg_keepalive_interval,
                 retries: self.pg_keepalive_retries,
             },
-            watched: vec![
-                TableName::from(self.clients_table().as_str()),
-                TableName::from(self.mutations_table().as_str()),
-            ],
+            watched: vec![self.clients_table(), self.mutations_table()],
             ddl_trigger: self.ddl_trigger.clone(),
             ddl_prefix: self.ddl_prefix.clone(),
         }
@@ -571,6 +570,30 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| (*value).to_owned()),
         })
+    }
+
+    /// The mutation tables are watched under the names the catalog gives
+    /// them, so the feed's writes to them match even when the app id
+    /// makes the schema name one the catalog quotes.
+    #[test]
+    fn the_mutation_tables_are_watched_under_their_catalog_names() {
+        let plain = config(&[("STREAMGRES_APP_ID", "zero")]).unwrap();
+        assert_eq!(plain.clients_table().as_str(), "zero_0.clients");
+        assert_eq!(plain.mutations_table().as_str(), "zero_0.mutations");
+
+        let dotted = config(&[("STREAMGRES_APP_ID", "my.app")]).unwrap();
+        assert_eq!(dotted.clients_table().as_str(), "\"my.app_0\".\"clients\"");
+        assert_eq!(
+            dotted.mutations_table().as_str(),
+            "\"my.app_0\".\"mutations\""
+        );
+        assert_eq!(
+            dotted.engine_settings().watched,
+            vec![
+                TableName::of("my.app_0", "clients"),
+                TableName::of("my.app_0", "mutations")
+            ]
+        );
     }
 
     #[test]

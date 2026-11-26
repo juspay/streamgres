@@ -571,8 +571,8 @@ pub async fn run(
     let (outbox, outbox_rx) = mpsc::unbounded_channel();
     spawn_local(forward(outbox_rx, commands));
     let mut core = Groups {
-        clients_table: TableName::from(config.clients_table().as_str()),
-        mutations_table: TableName::from(config.mutations_table().as_str()),
+        clients_table: config.clients_table(),
+        mutations_table: config.mutations_table(),
         config,
         catalog,
         shard,
@@ -1967,8 +1967,8 @@ mod tests {
             let (outbox, commands) = mpsc::unbounded_channel();
             let (requests, _requests_rx) = mpsc::channel(16);
             let core = Groups {
-                clients_table: TableName::from(config.clients_table().as_str()),
-                mutations_table: TableName::from(config.mutations_table().as_str()),
+                clients_table: config.clients_table(),
+                mutations_table: config.mutations_table(),
                 config: Arc::new(config),
                 catalog: Arc::new(CatalogHandle::new(catalog)),
                 shard: 0,
@@ -3357,8 +3357,8 @@ mod tests {
             let (outbox, mut commands) = mpsc::unbounded_channel();
             let (requests, _requests_rx) = mpsc::channel(16);
             let mut core = Groups {
-                clients_table: TableName::from(config.clients_table().as_str()),
-                mutations_table: TableName::from(config.mutations_table().as_str()),
+                clients_table: config.clients_table(),
+                mutations_table: config.mutations_table(),
                 config: Arc::new(config.clone()),
                 catalog: Arc::new(CatalogHandle::new(catalog.clone())),
                 shard: 0,
@@ -4016,8 +4016,8 @@ mod tests {
                 let (outbox, mut commands) = mpsc::unbounded_channel();
                 let (requests, _requests_rx) = mpsc::channel(16);
                 let mut core = Groups {
-                    clients_table: TableName::from(config.clients_table().as_str()),
-                    mutations_table: TableName::from(config.mutations_table().as_str()),
+                    clients_table: config.clients_table(),
+                    mutations_table: config.mutations_table(),
                     config: Arc::new(config.clone()),
                     catalog: Arc::new(CatalogHandle::new(catalog.clone())),
                     shard,
