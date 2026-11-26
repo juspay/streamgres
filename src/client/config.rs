@@ -232,6 +232,14 @@ impl TriggerIdentity {
         let first = |names: &[&str]| names.iter().find_map(|name| setting(lookup, name));
         let app_id =
             first(&["STREAMGRES_APP_ID", "ZERO_APP_ID"]).unwrap_or_else(|| "zero".to_owned());
+        if !app_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(format!(
+                "STREAMGRES_APP_ID must consist of lowercase letters, digits and `_`, as in Zero, got `{app_id}`"
+            ));
+        }
         let shard = match first(&["STREAMGRES_SHARD", "ZERO_SHARD_NUM"]) {
             Some(text) => text
                 .parse::<u32>()
@@ -573,27 +581,36 @@ mod tests {
     }
 
     /// The mutation tables are watched under the names the catalog gives
-    /// them, so the feed's writes to them match even when the app id
-    /// makes the schema name one the catalog quotes.
+    /// them.
     #[test]
     fn the_mutation_tables_are_watched_under_their_catalog_names() {
-        let plain = config(&[("STREAMGRES_APP_ID", "zero")]).unwrap();
-        assert_eq!(plain.clients_table().as_str(), "zero_0.clients");
-        assert_eq!(plain.mutations_table().as_str(), "zero_0.mutations");
-
-        let dotted = config(&[("STREAMGRES_APP_ID", "my.app")]).unwrap();
-        assert_eq!(dotted.clients_table().as_str(), "\"my.app_0\".\"clients\"");
+        let config = config(&[("STREAMGRES_APP_ID", "zero"), ("STREAMGRES_SHARD", "2")]).unwrap();
+        assert_eq!(config.clients_table().as_str(), "zero_2.clients");
+        assert_eq!(config.mutations_table().as_str(), "zero_2.mutations");
         assert_eq!(
-            dotted.mutations_table().as_str(),
-            "\"my.app_0\".\"mutations\""
-        );
-        assert_eq!(
-            dotted.engine_settings().watched,
+            config.engine_settings().watched,
             vec![
-                TableName::of("my.app_0", "clients"),
-                TableName::of("my.app_0", "mutations")
+                TableName::of("zero_2", "clients"),
+                TableName::of("zero_2", "mutations")
             ]
         );
+    }
+
+    /// The app id names schemas, triggers and the WAL message prefix, so
+    /// it takes only what Zero allows: lowercase letters, digits and `_`.
+    #[test]
+    fn an_app_id_outside_zeros_alphabet_is_refused() {
+        for app_id in ["my.app", "My_App", "my-app", "my app", "a\"b"] {
+            let error = config(&[("STREAMGRES_APP_ID", app_id)]).unwrap_err();
+            assert!(error.contains("STREAMGRES_APP_ID"), "{error}");
+            assert!(error.contains(app_id), "{error}");
+        }
+        for app_id in ["zero", "my_app_2", "_x"] {
+            assert_eq!(
+                config(&[("STREAMGRES_APP_ID", app_id)]).unwrap().app_id,
+                app_id
+            );
+        }
     }
 
     #[test]

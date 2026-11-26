@@ -263,7 +263,7 @@ depend on what the defaults happen to be:
 | variable | example | meaning |
 |---|---|---|
 | `STREAMGRES_BASE_PATH` | `/sync` | URL path prefix clients connect under. A client's server URL ends in it |
-| `STREAMGRES_APP_ID` | `xyne` | app id. With the shard, it names the `<app>_<shard>` schema of the mutation tables, the event trigger and its message prefix |
+| `STREAMGRES_APP_ID` | `zero` | app id: lowercase letters, digits and `_`, as in Zero. With the shard, it names the `<app>_<shard>` schema of the mutation tables, the event trigger and its message prefix |
 | `STREAMGRES_SHARD` | `0` | shard number |
 
 ### Recommended for production

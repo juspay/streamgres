@@ -69,6 +69,7 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::types::PgLsn;
 
 use super::ddl::{self, DdlSource};
+use super::sql::quote_ident;
 use crate::ivm::SchemaChange;
 use crate::log::{log_info, log_warn};
 use crate::model::{
@@ -794,7 +795,8 @@ async fn prepare_slot(
         .is_some();
     if !published {
         return Err(StorageError(format!(
-            "publication `{publication}` does not exist; create it before starting streamgres (for example, on the primary: CREATE PUBLICATION \"{publication}\" FOR ALL TABLES WITH (publish_via_partition_root = true))"
+            "publication `{publication}` does not exist; create it before starting streamgres (for example, on the primary: CREATE PUBLICATION {} FOR ALL TABLES WITH (publish_via_partition_root = true))",
+            quote_ident(publication)
         )));
     }
     let exists = client
@@ -995,7 +997,10 @@ impl PgStream {
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
         client
-            .batch_execute(&format!("DROP PUBLICATION IF EXISTS \"{publication}\""))
+            .batch_execute(&format!(
+                "DROP PUBLICATION IF EXISTS {}",
+                quote_ident(publication)
+            ))
             .await?;
         Ok(())
     }
@@ -1110,10 +1115,17 @@ fn replication_config(
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
         .unwrap_or_default();
     let database = config.get_dbname().unwrap_or(user);
-    ReplicationConfig::new(host, user, password, database, slot, publication)
-        .with_port(port)
-        .with_tls(TlsConfig::disabled())
-        .with_status_interval(Duration::from_secs(1))
+    ReplicationConfig::new(
+        host,
+        user,
+        password,
+        database,
+        slot,
+        quote_ident(publication),
+    )
+    .with_port(port)
+    .with_tls(TlsConfig::disabled())
+    .with_status_interval(Duration::from_secs(1))
 }
 
 /// The primary key of a decoded row image, laid out on the table's

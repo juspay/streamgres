@@ -2232,24 +2232,28 @@ fn a_publication_change_that_breaks_the_feed_stops_it() {
     });
 }
 
-/// The trigger recognizes a change to the publication by the object, not
-/// by how PostgreSQL spells its name: one whose name needs quoting
-/// (`xyne-sync-live-quoted-pub`, which PostgreSQL identifies as
-/// `"xyne-sync-live-quoted-pub"`) still stops the feed when it stops
-/// sending what the served tables need.
+/// A publication whose name needs quoting (`xyne_sync_live_Quoted-Pub`)
+/// is followed under its exact name, not the lowercased one PostgreSQL
+/// reads from an unquoted name, and the trigger recognizes a change to it
+/// by the object, not by how PostgreSQL spells it (`"xyne_sync_live_Quoted-Pub"`):
+/// turning off updates still stops the feed.
 #[test]
 fn a_change_to_a_publication_with_a_quoted_name_reaches_the_feed() {
     let Some(dsn) = dsn() else { return };
     block_on_alone(async {
         let mut names = Names::new("quotedpub");
-        names.publication = "xyne-sync-live-quoted-pub".to_owned();
+        names.publication = "xyne_sync_live_Quoted-Pub".to_owned();
         let client = prepare(&dsn, &names).await;
         client
             .batch_execute("DROP SCHEMA IF EXISTS xsquoted_0 CASCADE;")
             .await
             .expect("no leftover stack");
         client
-            .batch_execute(&trigger_stack_sql("xsquoted", 0, &[names.publication.as_str()]))
+            .batch_execute(&trigger_stack_sql(
+                "xsquoted",
+                0,
+                &[names.publication.as_str()],
+            ))
             .await
             .expect("install the schema-change trigger stack");
         let stream = PgStream::open_with(
