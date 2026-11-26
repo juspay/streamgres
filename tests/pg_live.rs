@@ -1878,6 +1878,7 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
                    n numeric(30, 4), b bool, t text, vc varchar(10), ch char(3), u uuid,
                    j json, jb jsonb, ts timestamp, tz timestamptz, d date, tm time,
                    by bytea, iv interval, ints int4[], texts text[], mood live_exact.mood,
+                   moods live_exact.mood[],
                    addr inet, tv tsvector, cash money);
                  CREATE PUBLICATION \"{publication}\" FOR TABLE {table};"
             ))
@@ -1907,11 +1908,11 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
                     '00010203-0405-0607-0809-0a0b0c0d0e0f', '{{ \"b\":1.50, \"a\":2 }}',
                     '{{\"a\": 1.50}}', '2026-09-11 10:00:00.123456', '2026-09-11 10:00:00.5+05:30',
                     '2026-09-11', '23:59:59.999999', '\\x00ff10', '1 year 2 days 03:04:05',
-                    '{{1,NULL,3}}', '{{\"a b\",c}}', 'busy', '10.0.0.1/8',
+                    '{{1,NULL,3}}', '{{\"a b\",c}}', 'busy', '{{calm,busy}}', '10.0.0.1/8',
                     'a fat cat:3A sat:5,7B it''s', '-1234.56'),
                    (2, NULL, NULL, 'NaN', '-Infinity', 'NaN', NULL, NULL, NULL, NULL, NULL,
                     NULL, NULL, 'infinity', '-infinity', 'infinity', NULL, '\\x', NULL,
-                    '{{}}', NULL, NULL, NULL, NULL, NULL);"
+                    '{{}}', NULL, NULL, '{{}}', NULL, NULL, NULL);"
             ))
             .await
             .expect("insert");
@@ -1999,6 +2000,11 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
         assert!(matches!(cell("addr"), Value::Raw(raw) if raw.type_oid == 869));
         assert_eq!(cell("mood"), Value::from("busy"));
         assert_eq!(
+            cell("moods"),
+            Value::List(vec![Value::from("calm"), Value::from("busy")]),
+            "an enum array keeps its labels"
+        );
+        assert_eq!(
             cell("ints"),
             Value::List(vec![Value::Int(1), Value::Null, Value::Int(3)])
         );
@@ -2064,10 +2070,12 @@ fn a_nested_domain_survives_an_unrelated_add_column() {
                  CREATE DOMAIN live_domain_mapper.local_at AS timestamp;
                  CREATE TABLE live_domain_mapper.probe (
                    id bigint PRIMARY KEY,
+                   cents live_domain_mapper.cents,
                    account live_domain_mapper.account_id,
                    at live_domain_mapper.local_at
                  );
-                 INSERT INTO live_domain_mapper.probe VALUES (1, 100, '2026-01-02 03:04:05');",
+                 INSERT INTO live_domain_mapper.probe
+                   VALUES (1, 50, 100, '2026-01-02 03:04:05');",
             )
             .await
             .expect("create nested domains");
@@ -2077,6 +2085,11 @@ fn a_nested_domain_survives_an_unrelated_add_column() {
                 .expect("catalog")
                 .0;
         let table_info = loaded.table(table).expect("the table is carried");
+        assert_eq!(
+            table_info.column("cents").expect("cents").r#type,
+            ValueType::Int,
+            "a single-level domain maps to Int, not Raw"
+        );
         assert_eq!(
             table_info.column("account").expect("account").r#type,
             ValueType::Int,
@@ -2130,6 +2143,11 @@ fn a_nested_domain_survives_an_unrelated_add_column() {
         .expect("an unrelated column does not stop the feed");
         assert_eq!(classified.changes.len(), 1, "{:?}", classified.changes);
         let widened = classified.catalog.table(table).expect("the widened table");
+        assert_eq!(
+            widened.column("cents").expect("cents").r#type,
+            ValueType::Int,
+            "the classification agrees with startup: no Raw, no false type change"
+        );
         assert_eq!(
             widened.column("account").expect("account").r#type,
             ValueType::Int,

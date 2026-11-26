@@ -517,9 +517,10 @@ fn literal(value: &Value) -> String {
             i32::MIN => "'-infinity'::date".to_owned(),
             days => format!("(DATE '2000-01-01' + {days})"),
         },
-        Value::Time(time) => {
-            format!("(TIME '00:00' + {} * INTERVAL '1 microsecond')", time.0)
-        }
+        // A time is written as itself, not as arithmetic from midnight:
+        // Postgres keeps `24:00:00` distinct from `00:00:00`, and midnight
+        // plus a day's microseconds wraps back to `00:00:00`.
+        Value::Time(time) => format!("TIME '{}'", time_of_day(time.0)),
         Value::Bytes(bytes) => {
             use std::fmt::Write as _;
             let mut hex = String::with_capacity(bytes.len() * 2);
@@ -536,6 +537,25 @@ fn literal(value: &Value) -> String {
 /// A single-quoted string literal, quotes doubled.
 pub fn quote_literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
+}
+
+/// A `time`'s microseconds as Postgres's `HH:MM:SS[.ffffff]`, hours counted
+/// past 24 when the value carries them: `24:00:00` is a distinct `time` in
+/// Postgres, so it is written as itself and never wrapped to midnight.
+fn time_of_day(micros: i64) -> String {
+    let seconds = micros.div_euclid(1_000_000);
+    let fraction = micros.rem_euclid(1_000_000);
+    let whole = format!(
+        "{:02}:{:02}:{:02}",
+        seconds.div_euclid(3600),
+        seconds.div_euclid(60) % 60,
+        seconds % 60
+    );
+    if fraction == 0 {
+        return whole;
+    }
+    let digits = format!("{fraction:06}");
+    format!("{whole}.{}", digits.trim_end_matches('0'))
 }
 
 #[cfg(test)]
@@ -987,6 +1007,34 @@ mod tests {
             sql.contains("\"createdAt\""),
             "the projection is the bare column: {sql}"
         );
+    }
+
+    /// A `time` literal is written as the time itself, not as arithmetic
+    /// from midnight: Postgres keeps `24:00:00` distinct from `00:00:00`,
+    /// and midnight plus a day's microseconds wraps back to midnight.
+    #[test]
+    fn a_time_literal_keeps_end_of_day_distinct_from_midnight() {
+        let table = DbTable::new(
+            "events",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("at", ValueType::Time),
+            ],
+        );
+        let query = |micros: i64| {
+            SingleTableReadQuery::new(
+                crate::model::TableName::from("events"),
+                Where::condition("at", ComparisonOperator::EQ, Value::Time(crate::model::Time(micros))),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            )
+        };
+        let midnight = select_sql(&query(0), &table);
+        let end_of_day = select_sql(&query(86_400_000_000), &table);
+        assert!(midnight.contains("TIME '00:00:00'"), "{midnight}");
+        assert!(end_of_day.contains("TIME '24:00:00'"), "{end_of_day}");
+        assert_ne!(midnight, end_of_day, "the two times stay distinct");
     }
 
     /// A `timestamptz` column's literal is a `timestamptz`, so the session

@@ -176,8 +176,12 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
 
 /// A `time` as Postgres writes it: `HH:MM:SS`, then the fraction without
 /// trailing zeros when there is one.
+///
+/// `24:00:00` is its own value in Postgres, distinct from `00:00:00` and
+/// ordering after it, so the hour is never wrapped onto a single day: the
+/// value is written with the hour it actually carries.
 fn time_text(time: crate::model::Time) -> String {
-    let micros = time.0.rem_euclid(86_400_000_000);
+    let micros = time.0;
     let seconds = micros / 1_000_000;
     let fraction = micros % 1_000_000;
     let whole = format!(
@@ -312,6 +316,17 @@ mod tests {
     use super::*;
     use crate::model::{DbColumn, DbTable};
     use std::collections::HashMap;
+
+    /// Postgres keeps end of day as its own `time`, distinct from midnight
+    /// and ordering after it, so the client is shown `24:00:00` and never a
+    /// wrapped `00:00:00`.
+    #[test]
+    fn a_time_keeps_the_hour_postgres_stored() {
+        assert_eq!(time_text(crate::model::Time(0)), "00:00:00");
+        assert_eq!(time_text(crate::model::Time(86_400_000_000)), "24:00:00");
+        assert_eq!(time_text(crate::model::Time(86_399_999_999)), "23:59:59.999999");
+        assert_eq!(time_text(crate::model::Time(1_500_000)), "00:00:01.5");
+    }
 
     /// A row on its table's layout, written from the table's plan, comes
     /// out byte for byte as the same row looked up column by column:
@@ -473,6 +488,35 @@ mod tests {
         out.clear();
         write_value(&mut out, &unknown, None);
         assert_eq!(out, b"null", "a type with no text is not made up");
+    }
+
+    /// An enum array reaches the client with its labels, not the `[null]`
+    /// a raw element would produce.
+    #[test]
+    fn an_enum_array_keeps_its_labels_on_the_wire() {
+        let table = DbTable::new(
+            "t",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::String),
+                DbColumn::new("moods", ValueType::List(Box::new(ValueType::String))),
+            ],
+        );
+        let row = DataFrameRow::from(HashMap::from([
+            ("id".into(), Value::from("a")),
+            (
+                "moods".into(),
+                Value::List(vec![Value::from("open"), Value::from("closed")]),
+            ),
+        ]));
+        assert_eq!(
+            row_json(&row, &table)["moods"],
+            serde_json::json!(["open", "closed"])
+        );
+        let mut bytes = Vec::new();
+        write_put(&mut bytes, &table, &row);
+        let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(written["value"]["moods"], serde_json::json!(["open", "closed"]));
     }
 
     /// JSON columns are embedded, times are numbers, and the client's

@@ -843,6 +843,7 @@ mod tests {
                     DbColumn::new("createdAt", ValueType::Timestamp),
                     DbColumn::new("visibleTo", ValueType::String),
                     DbColumn::new("metadata", ValueType::Json),
+                    DbColumn::new("labels", ValueType::List(Box::new(ValueType::String))),
                 ],
             ),
             DbTable::new(
@@ -1134,6 +1135,31 @@ mod tests {
             Where::condition("createdAt", EQ, at),
             "the 1500ms the client saw is the same instant again"
         );
+    }
+
+    /// A list column is readable but not filtered on: a list operand renders
+    /// as `NULL` in the snapshot SQL, so equality would select nothing where
+    /// the engine's own evaluation might match. Both paths must agree before
+    /// the filter is offered.
+    #[test]
+    fn a_list_column_is_readable_but_not_filtered_on() {
+        let ast: Ast = serde_json::from_value(serde_json::json!({
+            "table": "messages",
+            "where": {"type": "simple", "op": "=", "left": {"type": "column", "name": "labels"},
+                      "right": {"type": "literal", "value": ["a"]}},
+        }))
+        .unwrap();
+        let error = translate(&ast, &catalog()).expect_err("a list is not filtered on");
+        assert!(error.contains("does not compare"), "{error}");
+
+        let ast: Ast = serde_json::from_value(serde_json::json!({
+            "table": "messages",
+            "where": {"type": "simple", "op": "IN", "left": {"type": "column", "name": "labels"},
+                      "right": {"type": "literal", "value": [["a"], ["b"]]}},
+        }))
+        .unwrap();
+        let error = translate(&ast, &catalog()).expect_err("a list is not a membership target");
+        assert!(error.contains("does not compare"), "{error}");
     }
 
     /// A numeric literal holds only the decoder's forms: a JSON number is

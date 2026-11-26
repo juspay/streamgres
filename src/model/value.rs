@@ -216,7 +216,14 @@ pub fn supports(capability: Capability, declared: &ValueType) -> bool {
             declared,
             ValueType::Raw | ValueType::List(_) | ValueType::Map(_, _) | ValueType::Json
         ),
-        Capability::Filter => !matches!(declared, ValueType::Raw),
+        // A list has no SQL literal here: a list operand renders as `NULL`,
+        // so a snapshot read returns no rows where the engine's own
+        // evaluation might match. Until both paths agree, list columns are
+        // readable but not filtered on.
+        Capability::Filter => !matches!(
+            declared,
+            ValueType::Raw | ValueType::List(_) | ValueType::Map(_, _)
+        ),
         Capability::Order => matches!(
             declared,
             ValueType::String
