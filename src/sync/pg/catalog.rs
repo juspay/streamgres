@@ -1,10 +1,14 @@
 //! The catalog read from the database itself: every table of the chosen
 //! schemas that has a primary key, each column mapped onto the engine's
 //! exact value type for its Postgres type and carrying the type's OID (a
-//! domain's base type), so a server needs no hand-written schema. A type
-//! the engine does not interpret is carried raw. Tables of the `public`
-//! schema keep their bare names; any other table is named
+//! domain's underlying base type), so a server needs no hand-written schema.
+//! A type the engine does not interpret is carried raw. Tables of the
+//! `public` schema keep their bare names; any other table is named
 //! `schema.table`, which is also how the change feed matches it.
+//!
+//! Columns are described by [`PgType`], the one mapper startup and
+//! schema-change messages both use, so a domain cannot be classified one
+//! way when the catalog loads and another when a later migration arrives.
 
 use std::collections::BTreeMap;
 
@@ -16,6 +20,57 @@ use crate::model::{Catalog, DbColumn, DbTable, ValueType};
 /// What the load left out and why, one line per table or column.
 pub type Notes = Vec<String>;
 
+/// A column's type after every domain has been followed to its final,
+/// non-domain base — what PostgreSQL itself reports in a result's
+/// description, and what binary decoding dispatches on.
+#[derive(Debug, Clone, Copy)]
+pub struct PgType<'a> {
+    /// `pg_type.typname` of the base (`int8`, `_mood`, `timestamptz`, ...).
+    pub base_name: &'a str,
+    /// The base's type class: `b` base, `e` enum, and so on.
+    pub base_class: &'a str,
+    /// The base type's OID.
+    pub base_oid: u32,
+    /// For an array base, its element's `typname`; empty otherwise.
+    pub element_name: &'a str,
+    /// For an array base, its element's type class; empty otherwise.
+    pub element_class: &'a str,
+    /// The array's element OID; 0 for a non-array.
+    pub element_oid: u32,
+    /// Whether the base is an array, independent of a known element OID.
+    pub is_array: bool,
+    /// Whether the column's declared type is a domain.
+    pub is_domain: bool,
+}
+
+impl PgType<'_> {
+    /// The engine's type for this column. Domains contribute only their
+    /// final base, so `account_id` over `cents` over `bigint` is an `Int`.
+    pub fn value_type(&self) -> ValueType {
+        let scalar = |name: &str, class: &str| {
+            if class == "e" {
+                ValueType::String
+            } else {
+                scalar_type(name).unwrap_or(ValueType::Raw)
+            }
+        };
+        if self.is_array {
+            ValueType::List(Box::new(scalar(self.element_name, self.element_class)))
+        } else {
+            scalar(self.base_name, self.base_class)
+        }
+    }
+
+    /// This type as a catalog column, with the OIDs a binary decode and a
+    /// result-type check need.
+    pub fn to_db_column(&self, name: &str) -> DbColumn {
+        DbColumn::new(name, self.value_type())
+            .with_type_oid(self.base_oid)
+            .with_element_oid(self.element_oid)
+            .with_is_domain(self.is_domain)
+    }
+}
+
 /// Read the catalog of `schemas` through `client`.
 pub async fn load_catalog(
     client: &Client,
@@ -23,19 +78,34 @@ pub async fn load_catalog(
 ) -> Result<(Catalog, Notes), StorageError> {
     let columns = client
         .query(
-            "SELECT c.table_schema, c.table_name, c.column_name, c.data_type, c.udt_name,
-                    COALESCE(NULLIF(ty.typbasetype, 0), ty.oid)::int8 AS type_oid,
-                    base.typtype::text AS type_class,
+            "WITH RECURSIVE type_chain(oid, base_oid, typtype, typbasetype, depth) AS (
+                 SELECT oid, oid, typtype, typbasetype, 0 FROM pg_type
+                 UNION ALL
+                 SELECT r.oid, base.oid, base.typtype, base.typbasetype, r.depth + 1
+                 FROM type_chain r JOIN pg_type base ON base.oid = r.typbasetype
+                 WHERE r.typtype = 'd' AND r.depth < 64
+             ), leaf_types AS (
+                 SELECT DISTINCT ON (oid) oid, base_oid
+                 FROM type_chain WHERE typtype != 'd'
+                 ORDER BY oid, depth DESC
+             )
+             SELECT c.table_schema, c.table_name, c.column_name,
+                    base.typname, base.typtype::text AS base_class,
+                    base.oid::int8 AS base_oid,
+                    COALESCE(elem.typname, '') AS element_name,
+                    COALESCE(elem.typtype::text, '') AS element_class,
                     base.typelem::int8 AS element_oid,
-                    ty.typtype = 'd' AS is_domain
+                    declared.typtype = 'd' AS is_domain
              FROM information_schema.columns c
              JOIN information_schema.tables t
                ON t.table_schema = c.table_schema AND t.table_name = c.table_name
              JOIN pg_namespace ns ON ns.nspname = c.table_schema
              JOIN pg_class rel ON rel.relnamespace = ns.oid AND rel.relname = c.table_name
              JOIN pg_attribute att ON att.attrelid = rel.oid AND att.attname = c.column_name
-             JOIN pg_type ty ON ty.oid = att.atttypid
-             JOIN pg_type base ON base.oid = COALESCE(NULLIF(ty.typbasetype, 0), ty.oid)
+             JOIN pg_type declared ON declared.oid = att.atttypid
+             JOIN leaf_types leaf ON leaf.oid = declared.oid
+             JOIN pg_type base ON base.oid = leaf.base_oid
+             LEFT JOIN pg_type elem ON elem.oid = base.typelem
              WHERE t.table_type = 'BASE TABLE' AND c.table_schema = ANY($1)
              ORDER BY c.table_schema, c.table_name, c.ordinal_position",
             &[&schemas],
@@ -72,22 +142,22 @@ pub async fn load_catalog(
         let schema: String = row.get(0);
         let table: String = row.get(1);
         let column: String = row.get(2);
-        let data_type: String = row.get(3);
-        let udt_name: String = row.get(4);
-        let type_oid = u32::try_from(row.get::<_, i64>(5)).unwrap_or(0);
-        let class: String = row.get(6);
-        let r#type = if class == "e" {
-            ValueType::String
-        } else {
-            value_type(&data_type, &udt_name)
-        };
-        let element_oid = u32::try_from(row.get::<_, i64>(7)).unwrap_or(0);
-        let is_domain: bool = row.get(8);
+        let base_name: String = row.get(3);
+        let base_class: String = row.get(4);
+        let element_name: String = row.get(6);
+        let element_class: String = row.get(7);
         declared.entry((schema, table)).or_default().push(
-            DbColumn::new(column, r#type)
-                .with_type_oid(type_oid)
-                .with_element_oid(element_oid)
-                .with_is_domain(is_domain),
+            PgType {
+                base_name: &base_name,
+                base_class: &base_class,
+                base_oid: u32::try_from(row.get::<_, i64>(5)).unwrap_or(0),
+                element_name: &element_name,
+                element_class: &element_class,
+                element_oid: u32::try_from(row.get::<_, i64>(8)).unwrap_or(0),
+                is_array: row.get::<_, i64>(8) != 0,
+                is_domain: row.get(9),
+            }
+            .to_db_column(&column),
         );
     }
     let mut tables = Vec::new();
@@ -135,6 +205,10 @@ pub fn keyable(declared: &ValueType) -> bool {
 /// `data_type` and `udt_name`; a type the engine does not interpret is
 /// [`ValueType::Raw`]. An enum is told apart by its type class, which the
 /// caller checks first.
+///
+/// Schema-change messages written before the trigger reported a column's
+/// underlying type are still read this way; new messages go through
+/// [`PgType`] instead.
 pub fn value_type(data_type: &str, udt_name: &str) -> ValueType {
     match data_type {
         "ARRAY" => {
@@ -203,5 +277,52 @@ mod tests {
         assert!(keyable(&ValueType::Numeric));
         assert_eq!(table_name("public", "tickets"), "tickets");
         assert_eq!(table_name("xyne_0", "clients"), "xyne_0.clients");
+    }
+
+    /// The shared mapper classifies by the final base type: a domain and a
+    /// domain over a domain both read as their underlying built-in, while
+    /// an enum base keeps its labels.
+    #[test]
+    fn the_mapper_uses_the_final_base_type() {
+        let plain = PgType {
+            base_name: "int8",
+            base_class: "b",
+            base_oid: 20,
+            element_name: "",
+            element_class: "",
+            element_oid: 0,
+            is_array: false,
+            is_domain: true,
+        };
+        assert_eq!(plain.value_type(), ValueType::Int);
+        assert_eq!(plain.to_db_column("id").type_oid, 20);
+        assert!(plain.to_db_column("id").is_domain);
+
+        let enum_base = PgType {
+            base_name: "mood",
+            base_class: "e",
+            base_oid: 40_000,
+            element_name: "",
+            element_class: "",
+            element_oid: 0,
+            is_array: false,
+            is_domain: true,
+        };
+        assert_eq!(enum_base.value_type(), ValueType::String);
+
+        let enum_array = PgType {
+            base_name: "_mood",
+            base_class: "b",
+            base_oid: 40_001,
+            element_name: "mood",
+            element_class: "e",
+            element_oid: 40_000,
+            is_array: true,
+            is_domain: true,
+        };
+        assert_eq!(
+            enum_array.value_type(),
+            ValueType::List(Box::new(ValueType::String))
+        );
     }
 }

@@ -2045,6 +2045,113 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
     });
 }
 
+/// A table with a nested domain and a timestamp domain absorbs an unrelated
+/// column: the catalog's final base classification and the trigger's column
+/// metadata agree, so the feed does not report either existing column as a
+/// changed type.
+#[test]
+fn a_nested_domain_survives_an_unrelated_add_column() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let table = "live_domain_mapper.probe";
+        let client = admin(&dsn).await;
+        client
+            .batch_execute(
+                "DROP SCHEMA IF EXISTS live_domain_mapper CASCADE;
+                 CREATE SCHEMA live_domain_mapper;
+                 CREATE DOMAIN live_domain_mapper.cents AS bigint;
+                 CREATE DOMAIN live_domain_mapper.account_id AS live_domain_mapper.cents;
+                 CREATE DOMAIN live_domain_mapper.local_at AS timestamp;
+                 CREATE TABLE live_domain_mapper.probe (
+                   id bigint PRIMARY KEY,
+                   account live_domain_mapper.account_id,
+                   at live_domain_mapper.local_at
+                 );
+                 INSERT INTO live_domain_mapper.probe VALUES (1, 100, '2026-01-02 03:04:05');",
+            )
+            .await
+            .expect("create nested domains");
+        let loaded =
+            streamgres::sync::pg::catalog::load_catalog(&client, &["live_domain_mapper".to_owned()])
+                .await
+                .expect("catalog")
+                .0;
+        let table_info = loaded.table(table).expect("the table is carried");
+        assert_eq!(
+            table_info.column("account").expect("account").r#type,
+            ValueType::Int,
+            "domain over domain resolves to its final scalar base"
+        );
+        assert_eq!(
+            table_info.column("at").expect("at").r#type,
+            ValueType::Timestamp
+        );
+        let catalog = Arc::new(Catalog::new(vec![table_info.clone()]));
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        storage.advance(storage.first_position());
+        client
+            .batch_execute(&format!(
+                "DROP PUBLICATION IF EXISTS domainmap_pub;
+                 CREATE PUBLICATION domainmap_pub FOR TABLE {table};"
+            ))
+            .await
+            .expect("create a scoped publication");
+        client
+            .batch_execute(&trigger_stack_sql("domainmap", 0, &["domainmap_pub"]))
+            .await
+            .expect("install the trigger stack");
+        let before: String = client
+            .query_one("SELECT \"domainmap_0\".schema_specs()::text", &[])
+            .await
+            .expect("schema before")
+            .get(0);
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE {table} ADD COLUMN owner text DEFAULT 'nobody';"
+            ))
+            .await
+            .expect("unrelated add column");
+        let after: String = client
+            .query_one("SELECT \"domainmap_0\".schema_specs()::text", &[])
+            .await
+            .expect("schema after")
+            .get(0);
+        let message = streamgres::sync::pg::ddl::DdlMessage::parse(&format!(
+            r#"{{"type":"ddlUpdate","version":1,"event":{{"tag":"ALTER TABLE"}},"context":{{"query":"alter table"}},"previousSchema":{before},"schema":{after}}}"#
+        ))
+        .expect("the trigger's message parses");
+        let classified = streamgres::sync::pg::ddl::classify(
+            &catalog,
+            &["live_domain_mapper".to_owned()],
+            &message,
+        )
+        .expect("an unrelated column does not stop the feed");
+        assert_eq!(classified.changes.len(), 1, "{:?}", classified.changes);
+        let widened = classified.catalog.table(table).expect("the widened table");
+        assert_eq!(
+            widened.column("account").expect("account").r#type,
+            ValueType::Int,
+            "the nested domain's base survives the migration"
+        );
+        assert_eq!(
+            widened.column("at").expect("at").r#type,
+            ValueType::Timestamp
+        );
+        drop(storage);
+        let _ = client
+            .batch_execute(
+                "DROP PUBLICATION IF EXISTS domainmap_pub;
+                 DROP EVENT TRIGGER IF EXISTS domainmap_ddl_start_0;
+                 DROP EVENT TRIGGER IF EXISTS domainmap_ddl_end_0;
+                 DROP SCHEMA IF EXISTS domainmap_0 CASCADE;
+                 DROP SCHEMA IF EXISTS live_domain_mapper CASCADE;",
+            )
+            .await;
+    });
+}
+
 /// A scalar domain is described by its built-in base OID, so its read can
 /// stream without a separate prepare. A result large enough to pend data
 /// proves that the driver needs no type lookup while the rows are arriving.

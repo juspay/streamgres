@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 use tokio_postgres::Client;
 
-use super::catalog::{scalar_type, table_name};
+use super::catalog::table_name;
 use super::text;
 use crate::ivm::SchemaChange;
 use crate::model::{Catalog, DbColumn, DbTable, TableName, Value, ValueType};
@@ -83,29 +83,63 @@ pub struct PublishedTable {
 /// expression's text when it has one.
 #[derive(Debug, Deserialize)]
 pub struct PublishedColumn {
-    #[serde(rename = "dataType")]
+    #[serde(rename = "dataType", default)]
     pub data_type: String,
     #[serde(rename = "typeOID", default)]
     pub type_oid: Option<i64>,
     #[serde(rename = "pgTypeClass")]
     pub pg_type_class: Option<String>,
+    #[serde(rename = "baseTypeOID", default)]
+    pub base_type_oid: Option<i64>,
+    #[serde(rename = "basePgTypeClass", default)]
+    pub base_pg_type_class: Option<String>,
+    #[serde(rename = "baseType", default)]
+    pub base_type: Option<String>,
+    #[serde(rename = "elementOID", default)]
+    pub element_oid: Option<i64>,
+    #[serde(rename = "baseElemTypeClass", default)]
+    pub base_elem_type_class: Option<String>,
+    #[serde(rename = "isArray", default)]
+    pub is_array: bool,
     pub dflt: Option<String>,
 }
 
 impl PublishedColumn {
-    /// The engine's column, carrying the type OIDs a binary decode needs:
-    /// the base type, and the array's element type (looked up when the
-    /// payload did not name one).
-    pub fn to_db_column(&self, name: &str, r#type: ValueType) -> DbColumn {
-        let type_oid = self
-            .type_oid
-            .and_then(|oid| u32::try_from(oid).ok())
-            .unwrap_or(0);
-        let element_oid = super::binary::array_element(type_oid).unwrap_or(0);
-        DbColumn::new(name, r#type)
-            .with_type_oid(type_oid)
-            .with_element_oid(element_oid)
-            .with_is_domain(self.pg_type_class.as_deref() == Some("d"))
+    /// Adapt the trigger's final-base metadata to the shared mapper. Older
+    /// payloads have no base fields and retain their old fallback behavior.
+    fn pg_type(&self) -> super::catalog::PgType<'_> {
+        let oid = |value: i64| u32::try_from(value).unwrap_or(0);
+        let declared_oid = self.type_oid.map_or(0, oid);
+        let base_name = self.base_type.as_deref().unwrap_or_else(|| {
+            self.data_type.trim_end_matches("[]")
+        });
+        let is_array = self.is_array || self.data_type.ends_with("[]");
+        super::catalog::PgType {
+            base_name,
+            base_class: self
+                .base_pg_type_class
+                .as_deref()
+                .or(self.pg_type_class.as_deref())
+                .unwrap_or(""),
+            base_oid: self.base_type_oid.map_or(declared_oid, oid),
+            element_name: if is_array {
+                self.data_type.trim_end_matches("[]")
+            } else {
+                ""
+            },
+            element_class: self.base_elem_type_class.as_deref().unwrap_or(""),
+            element_oid: self.element_oid.map_or_else(
+                || super::binary::array_element(declared_oid).unwrap_or(0),
+                oid,
+            ),
+            is_array,
+            is_domain: self.base_type_oid.is_some() && self.pg_type_class.as_deref() == Some("d"),
+        }
+    }
+
+    /// Both ingestion paths construct a complete column from the shared mapper.
+    pub fn to_db_column(&self, name: &str, _type: ValueType) -> DbColumn {
+        self.pg_type().to_db_column(name)
     }
 }
 
@@ -178,16 +212,7 @@ impl PublishedTable {
 /// type, an enum is a string, a type the engine does not interpret is
 /// raw.
 pub fn column_type(column: &PublishedColumn) -> Option<ValueType> {
-    if let Some(element) = column.data_type.strip_suffix("[]") {
-        let element = element.trim_end_matches("[]");
-        return Some(ValueType::List(Box::new(
-            scalar_type(element).unwrap_or(ValueType::Raw),
-        )));
-    }
-    if column.pg_type_class.as_deref() == Some("e") {
-        return Some(ValueType::String);
-    }
-    Some(scalar_type(&column.data_type).unwrap_or(ValueType::Raw))
+    Some(column.pg_type().value_type())
 }
 
 /// The value every existing row holds for a column added with default
@@ -584,6 +609,24 @@ mod tests {
         assert_eq!(held.column("owner").unwrap().type_oid, 1);
     }
 
+    /// Declared domains use the same mapper as startup: nested declarations
+    /// resolve to the final base, never to a user-defined `Raw` type.
+    #[test]
+    fn schema_change_types_resolve_nested_domains_to_the_final_base() {
+        let column: PublishedColumn = serde_json::from_str(r#"{
+            "dataType": "account_id", "pgTypeClass": "d", "typeOID": 50001,
+            "baseTypeOID": 20, "baseType": "int8", "basePgTypeClass": "b",
+            "isArray": false, "elementOID": 0, "baseElemTypeClass": "",
+            "dflt": null
+        }"#)
+        .unwrap();
+        assert_eq!(column_type(&column), Some(ValueType::Int));
+        let column = column.to_db_column("id", ValueType::Raw);
+        assert_eq!(column.type_oid, 20);
+        assert_eq!(column.element_oid, 0);
+        assert!(column.is_domain);
+    }
+
     const TICKETS: &[(&str, &str, Option<&str>)] =
         &[("id", "int8", None), ("status", "text", None)];
 
@@ -672,6 +715,12 @@ mod tests {
             data_type: data_type.to_owned(),
             type_oid: None,
             pg_type_class: Some(class.to_owned()),
+            base_type_oid: None,
+            base_pg_type_class: None,
+            base_type: None,
+            element_oid: None,
+            base_elem_type_class: None,
+            is_array: false,
             dflt: None,
         };
         assert_eq!(column_type(&column("int8", "b")), Some(ValueType::Int));
