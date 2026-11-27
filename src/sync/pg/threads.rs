@@ -38,7 +38,7 @@ use super::ddl::{self, DdlSource};
 use super::{Feed, Keepalive, PgStorage, Transport, load_catalog};
 use crate::ivm::MultiTableIVM;
 use crate::log::{log_error, log_info, log_warn};
-use crate::model::{Catalog, Lsn, MultiTableReadQuery, TableName};
+use crate::model::{Catalog, MultiTableReadQuery, Position, TableName};
 use crate::shutdown::Shutdown;
 use crate::stats::Stats;
 use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Transaction};
@@ -87,6 +87,10 @@ pub struct Settings {
     pub watched: Vec<TableName>,
     pub ddl_trigger: String,
     pub ddl_prefix: String,
+    /// Whether the service tells its consumer when a subscription's rows
+    /// become incomplete and complete again
+    /// ([`crate::sync::Service::with_settle_reports`]).
+    pub settle_reports: bool,
 }
 
 /// What every slot a server names for itself starts with.
@@ -134,13 +138,13 @@ pub type ServiceTask = tokio::task::JoinHandle<Runtime<MultiTableIVM>>;
 
 /// Load the catalog of `schemas` over a connection of its own.
 pub async fn load_catalog_at(dsn: &str, schemas: &[String]) -> Result<Catalog, String> {
-    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+    let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
         .await
         .map_err(|error| format!("connecting to the database: {error}"))?;
     let handle = tokio::spawn(async move {
         let _ = connection.await;
     });
-    let (catalog, notes) = load_catalog(&client, schemas)
+    let (catalog, notes) = load_catalog(&mut client, schemas)
         .await
         .map_err(|error| format!("reading the catalog: {error}"))?;
     drop(client);
@@ -166,13 +170,13 @@ pub async fn load_catalog_at(dsn: &str, schemas: &[String]) -> Result<Catalog, S
 /// that would not hear of them could go on serving rows in a shape the
 /// clients no longer expect.
 pub async fn require_ddl_trigger(dsn: &str, name: &str) -> Result<(), String> {
-    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+    let (mut client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
         .await
         .map_err(|error| format!("connecting to the database: {error}"))?;
     let handle = tokio::spawn(async move {
         let _ = connection.await;
     });
-    let present = ddl::trigger_present(&client, name)
+    let present = ddl::trigger_present(&mut client, name)
         .await
         .map_err(|error| format!("looking for the DDL event trigger `{name}`: {error}"))?;
     drop(client);
@@ -198,8 +202,18 @@ pub async fn require_ddl_trigger(dsn: &str, name: &str) -> Result<(), String> {
 pub fn spawn_feed(
     settings: Settings,
     catalog: Arc<Catalog>,
-    start: Lsn,
+    start: Position,
     shutdown: Shutdown,
+) -> Result<(mpsc::Receiver<Transaction>, FeedHandle), String> {
+    spawn_feed_notifying(settings, catalog, start, shutdown, None)
+}
+
+fn spawn_feed_notifying(
+    settings: Settings,
+    catalog: Arc<Catalog>,
+    start: Position,
+    shutdown: Shutdown,
+    admission: Option<Arc<CatalogHandle>>,
 ) -> Result<(mpsc::Receiver<Transaction>, FeedHandle), String> {
     let (out, transactions) = mpsc::channel(1024);
     let (stop, mut stop_rx) = watch::channel(false);
@@ -216,7 +230,7 @@ pub fn spawn_feed(
                     prefix: settings.ddl_prefix.clone(),
                     schemas: settings.schemas.clone(),
                 };
-                let mut feed = Feed::with_ddl(catalog, ddl);
+                let mut feed = Feed::with_ddl(catalog, ddl).with_admission(admission);
                 let mut start = Some(start);
                 let mut failures = 0u32;
                 loop {
@@ -376,11 +390,12 @@ pub async fn start(
             .with_read_idle_connections(settings.read_idle_connections)
             .with_read_timeout(settings.read_timeout);
     let pg = Arc::new(pg);
-    let (feed, feed_handle) = spawn_feed(
+    let (feed, feed_handle) = spawn_feed_notifying(
         settings.clone(),
         catalog.load(),
         pg.first_position(),
         shutdown,
+        settings.settle_reports.then(|| catalog.clone()),
     )?;
     let cached = Sources::cached_from_env();
     let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
@@ -397,6 +412,11 @@ pub async fn start(
     let first = sinks[0].clone();
     let engine = MultiTableIVM::new().with_row_limit(super::read_row_limit());
     let (service, commands) = Service::new(engine, storage, first);
+    let service = if settings.settle_reports {
+        service.with_settle_reports()
+    } else {
+        service
+    };
     let service = spawn_local(
         service
             .with_feed(feed)

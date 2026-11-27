@@ -16,7 +16,6 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
-use tokio_postgres::Client;
 
 use super::catalog::{scalar_type, table_name};
 use super::text;
@@ -448,14 +447,18 @@ fn column_changes(held: &DbTable, published: &PublishedTable) -> Result<Vec<Sche
 
 /// Whether the event trigger `name` exists on `ddl_command_end` and is
 /// enabled; what the server insists on before it serves.
-pub async fn trigger_present(client: &Client, name: &str) -> Result<bool, StorageError> {
-    let row = client
-        .query_opt(
+pub async fn trigger_present<C: super::connections::Session + ?Sized>(
+    client: &mut C,
+    name: &str,
+) -> Result<bool, StorageError> {
+    let rows = client
+        .query(
             "SELECT evtenabled::text FROM pg_event_trigger WHERE evtname = $1 AND evtevent = 'ddl_command_end'",
-            &[&name],
+            &[super::connections::text(name)],
         )
-        .await?;
-    Ok(row.is_some_and(|row| row.get::<_, String>(0) != "D"))
+        .await
+        .map_err(StorageError::from)?;
+    Ok(!rows.rows.is_empty() && rows.text(0, 0).map_err(StorageError)?.as_deref() != Some("D"))
 }
 
 #[cfg(test)]

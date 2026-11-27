@@ -4,3 +4,10 @@
 !Cargo.lock
 !clippy.toml
 !src
+# Cargo.toml names tests ([[test]]), so their files must exist to parse it.
+!tests
+!crates
+!crates/streamgres-diesel
+!crates/streamgres-diesel/**
+# A workspace member: its manifest alone lets Cargo load the workspace.
+!examples/ticket-desk/Cargo.toml

@@ -36,7 +36,7 @@ use crate::ivm::{
 };
 use crate::model::frame::SharedRow;
 use crate::model::{
-    DataFrameKey, DataFrameRow, IdMap, Lsn, Snapshot, SubId, TableName, WriteQuery,
+    DataFrameKey, DataFrameRow, IdMap, Position, Snapshot, SubId, TableName, WriteQuery,
 };
 
 /// What one runtime step produced: deltas to deliver, and reads the
@@ -52,14 +52,14 @@ pub struct Step {
 /// issued under, and whether it is parked awaiting the stream.
 struct InFlight {
     fetch: Fetch,
-    floor: Lsn,
+    floor: Position,
     parked: bool,
 }
 
 /// One write the stream delivered, kept while a read may still be
 /// positioned below it.
 struct Delivered {
-    at: Lsn,
+    at: Position,
     write: WriteQuery,
 }
 
@@ -128,8 +128,8 @@ pub struct Runtime<E: Engine> {
     /// thread; the frames hold the ones that matter by reference.
     landed: Vec<Vec<(DataFrameKey, DataFrameRow)>>,
     recent: VecDeque<Delivered>,
-    position: Lsn,
-    floor: Lsn,
+    position: Position,
+    floor: Position,
     stats: SyncStats,
 }
 
@@ -141,8 +141,8 @@ impl<E: Engine> Runtime<E> {
             in_flight: IdMap::default(),
             landed: Vec::new(),
             recent: VecDeque::new(),
-            position: Lsn(0),
-            floor: Lsn(0),
+            position: Position(0),
+            floor: Position(0),
             stats: SyncStats::default(),
         }
     }
@@ -175,13 +175,13 @@ impl<E: Engine> Runtime<E> {
 
     /// Where the engine is: the location of the last write routed or
     /// progress mark seen.
-    pub fn position(&self) -> Lsn {
+    pub fn position(&self) -> Position {
         self.position
     }
 
     /// The lowest location a read issued from now on can be positioned
     /// at, as last told by the driver.
-    pub fn floor(&self) -> Lsn {
+    pub fn floor(&self) -> Position {
         self.floor
     }
 
@@ -215,7 +215,7 @@ impl<E: Engine> Runtime<E> {
     /// Route one write committed at `at`, remembering it for reads
     /// positioned below it. Writes arrive in commit order, so `at` never
     /// goes backwards (two writes of one transaction share a location).
-    pub fn write(&mut self, write: &WriteQuery, at: Lsn) -> Step {
+    pub fn write(&mut self, write: &WriteQuery, at: Position) -> Step {
         debug_assert!(at >= self.position, "the stream delivers in commit order");
         self.position = self.position.max(at);
         self.stats.writes_buffered += 1;
@@ -242,7 +242,7 @@ impl<E: Engine> Runtime<E> {
 
     /// The feed has delivered everything up to `lsn` without a write to
     /// carry that fact (an idle tick, the end of a batch).
-    pub fn progress(&mut self, lsn: Lsn) -> Step {
+    pub fn progress(&mut self, lsn: Position) -> Step {
         self.position = self.position.max(lsn);
         let mut step = Step::default();
         self.wake(&mut step);
@@ -251,7 +251,7 @@ impl<E: Engine> Runtime<E> {
 
     /// The driver learned the storage's floor: no read issued from now on
     /// is positioned below `floor`. Never moves backwards.
-    pub fn set_floor(&mut self, floor: Lsn) {
+    pub fn set_floor(&mut self, floor: Position) {
         if floor > self.floor {
             self.floor = floor;
             self.trim();
@@ -395,7 +395,7 @@ impl<E: Engine> Runtime<E> {
         &mut self,
         fetch: &Fetch,
         rows: Vec<(DataFrameKey, DataFrameRow)>,
-        at: Lsn,
+        at: Position,
     ) -> (Vec<(DataFrameKey, DataFrameRow)>, Option<DataFrameRow>) {
         let table: &TableName = &fetch.query.table;
         let query = &fetch.query;
@@ -475,7 +475,7 @@ impl<E: Engine> Runtime<E> {
             .in_flight
             .values()
             .map(|flight| flight.floor)
-            .fold(self.floor, Lsn::min);
+            .fold(self.floor, Position::min);
         while self
             .recent
             .front()

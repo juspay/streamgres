@@ -48,10 +48,14 @@
 //! end of its commit record, the same scale the aliases' consistent
 //! points are on.
 
+pub mod binary;
 pub mod catalog;
+pub mod connections;
 pub mod ddl;
+pub mod ddl_triggers;
 pub mod estimate;
 pub mod estimate_cache;
+pub mod lsn;
 pub mod replication;
 pub mod sql;
 pub mod stream;
@@ -66,17 +70,20 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore};
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow};
+use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage};
+
+use self::connections::TextRow;
 
 use super::storage::{Storage, StorageError};
 use crate::log::{log_info, log_warn};
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameRow, DbTable, Lsn, MultiTableReadQuery, RowData,
+    Catalog, DataFrameKey, DataFrameRow, DbTable, MultiTableReadQuery, Position, RowData,
     SingleTableReadQuery, Snapshot, Value, ValueType,
 };
 use replication::ReplicationConnection;
 
 pub use catalog::load_catalog;
+pub use lsn::Lsn;
 pub use stream::{Batch, Feed, PgStream, Transport};
 pub use threads::{Settings, Started};
 
@@ -113,11 +120,11 @@ pub fn read_row_limit() -> usize {
         "STREAMGRES_SYNC_JOIN_LIMIT",
         "XYNE_SYNC_JOIN_LIMIT",
     ]
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .and_then(|value| value.trim().parse().ok())
-        .filter(|limit| *limit > 0)
-        .unwrap_or(DEFAULT_READ_ROW_LIMIT)
+    .iter()
+    .find_map(|name| std::env::var(name).ok())
+    .and_then(|value| value.trim().parse().ok())
+    .filter(|limit| *limit > 0)
+    .unwrap_or(DEFAULT_READ_ROW_LIMIT)
 }
 
 /// How the kernel probes a connection to the database while it is silent,
@@ -163,7 +170,7 @@ impl Keepalive {
 /// its temporary slot.
 pub struct Alias {
     pub snapshot: String,
-    pub lsn: Lsn,
+    pub lsn: Position,
     _minter: ReplicationConnection,
 }
 
@@ -304,7 +311,7 @@ struct Aliases {
     catalog: Arc<Catalog>,
     /// Catalogs handed in for positions the current alias has not reached,
     /// each with the position it applies from, in order.
-    upcoming: VecDeque<(Lsn, Arc<Catalog>)>,
+    upcoming: VecDeque<(Position, Arc<Catalog>)>,
 }
 
 impl Aliases {
@@ -331,7 +338,7 @@ impl Aliases {
     /// Make the newest waiting alias at or below `feed` current, dropping
     /// the older ones it supersedes, and bring into force every catalog
     /// handed in for a position the current alias has reached.
-    fn advance(&mut self, feed: Lsn) {
+    fn advance(&mut self, feed: Position) {
         while self.waiting.front().is_some_and(|alias| alias.lsn <= feed) {
             self.current = self.waiting.pop_front();
         }
@@ -449,11 +456,11 @@ impl PgStorage {
         catalog: Arc<Catalog>,
         runtime: Handle,
     ) -> Result<Self, StorageError> {
-        let client = open(&read_config, &runtime).await?;
+        let idle = vec![open(&read_config, &runtime).await?];
         let pool = Arc::new(Pool {
             config,
             read_config,
-            idle: Mutex::new(vec![client]),
+            idle: Mutex::new(idle),
             permits: Arc::new(Semaphore::new(DEFAULT_READ_CONNECTIONS)),
             idle_limit: AtomicUsize::new(DEFAULT_READ_IDLE_CONNECTIONS),
             row_limit: AtomicUsize::new(read_row_limit()),
@@ -466,7 +473,8 @@ impl PgStorage {
             runtime,
         });
         let first = Arc::new(mint(&pool.config).await?);
-        pool.first.store(first.lsn.0, Ordering::Relaxed);
+        pool.first
+            .store(crate::sync::pg::lsn::wal(first.lsn), Ordering::Relaxed);
         pool.lock_aliases().waiting.push_back(first);
         rotate(pool.clone());
         Ok(PgStorage {
@@ -556,8 +564,8 @@ impl PgStorage {
     /// The consistent point of the first alias minted: everything the
     /// storage will ever read is at or past it, so it is where the feed
     /// starts.
-    pub fn first_position(&self) -> Lsn {
-        Lsn(self.pool.first.load(Ordering::Relaxed))
+    pub fn first_position(&self) -> Position {
+        Position(u128::from(self.pool.first.load(Ordering::Relaxed)))
     }
 
     /// Mint an alias now, without waiting for the rotation's next tick.
@@ -567,7 +575,7 @@ impl PgStorage {
 
     /// The current alias's consistent point, for inspection; `None` until
     /// the stream has passed the first alias.
-    pub fn alias_position(&self) -> Option<Lsn> {
+    pub fn alias_position(&self) -> Option<Position> {
         self.pool
             .lock_aliases()
             .current
@@ -579,18 +587,23 @@ impl PgStorage {
     /// its rows as text; for the few reads that are not the engine's (a
     /// client's mutation ids at connect time). With a timeout, use a
     /// transaction so the server-side limit ends with this read.
-    pub async fn simple_query(&self, sql: &str) -> Result<Vec<SimpleQueryRow>, StorageError> {
+    pub async fn simple_query(&self, sql: &str) -> Result<Vec<TextRow>, StorageError> {
         let pool = self.pool.clone();
         let sql = sql.to_owned();
         run_on(&self.pool.runtime, async move {
-            let batch = match pool.timeout() {
-                Some(limit) => format!(
-                    "BEGIN READ ONLY; SET LOCAL statement_timeout = {}; {sql}; COMMIT",
-                    limit.as_millis()
+            let (before, after) = match pool.timeout() {
+                Some(limit) => (
+                    vec![
+                        "BEGIN READ ONLY".to_owned(),
+                        format!("SET LOCAL statement_timeout = {}", limit.as_millis()),
+                    ],
+                    vec!["COMMIT".to_owned()],
                 ),
-                None => sql,
+                None => (Vec::new(), Vec::new()),
             };
-            pool.run("a statement", &batch).await
+            pool.run("a statement", &before, &[sql], &after)
+                .await
+                .map(only)
         })
         .await
     }
@@ -686,10 +699,18 @@ impl Storage for PgStorage {
         let query = query.clone();
         run_on(&self.pool.runtime, async move {
             let catalog = pool.lock_aliases().catalog.clone();
-            let estimation =
-                estimate::Estimation::new(&query, &catalog).map_err(StorageError)?;
+            let estimation = estimate::Estimation::new(&query, &catalog).map_err(StorageError)?;
             if cache.sizes_due() {
-                match pool.run("reading the tables' sizes", estimate_cache::SIZES_SQL).await {
+                match pool
+                    .run(
+                        "reading the tables' sizes",
+                        &[],
+                        &[estimate_cache::SIZES_SQL.to_owned()],
+                        &[],
+                    )
+                    .await
+                    .map(only)
+                {
                     Ok(rows) => cache.sizes(rows.iter().map(|row| {
                         let field = |index: usize| row.get(index).unwrap_or_default().to_owned();
                         (field(0), field(1), field(2))
@@ -705,14 +726,14 @@ impl Storage for PgStorage {
     }
 
     /// Flip to the newest minted alias the stream has passed.
-    fn advance(&self, feed: Lsn) {
+    fn advance(&self, feed: Position) {
         self.pool.lock_aliases().advance(feed);
     }
 
     /// Reads on the alias that first reaches `at`, and every later one,
     /// describe their tables by `catalog`; the estimates answered so far
     /// are forgotten, a table having perhaps changed shape.
-    fn follow(&self, at: Lsn, catalog: Arc<Catalog>) {
+    fn follow(&self, at: Position, catalog: Arc<Catalog>) {
         self.pool.lock_aliases().upcoming.push_back((at, catalog));
         self.estimates.clear();
     }
@@ -723,7 +744,7 @@ impl Storage for PgStorage {
     }
 
     /// The current alias's consistent point; zero while there is none.
-    fn floor(&self) -> Lsn {
+    fn floor(&self) -> Position {
         self.alias_position().unwrap_or_default()
     }
 }
@@ -755,7 +776,9 @@ async fn estimated(
     let mut answers: Vec<Option<Answer>> = vec![None; keys.len()];
     let mut failure = None;
     for _ in 0..2 {
-        let missing: Vec<usize> = (0..keys.len()).filter(|&at| answers[at].is_none()).collect();
+        let missing: Vec<usize> = (0..keys.len())
+            .filter(|&at| answers[at].is_none())
+            .collect();
         if missing.is_empty() {
             break;
         }
@@ -784,8 +807,8 @@ async fn estimated(
                 })
                 .collect();
             let batch = estimate::batch(&asked, &stats_of);
-            let parsed = match pool.run_messages(what, &batch).await {
-                Ok(messages) => estimate::parse(messages, asked.len(), !stats_of.is_empty())
+            let parsed = match pool.run(what, &[], &batch, &[]).await {
+                Ok(results) => estimate::parse(results, asked.len(), !stats_of.is_empty())
                     .map_err(StorageError),
                 Err(error) => Err(error),
             };
@@ -836,7 +859,9 @@ async fn estimated(
             }
         }
     }
-    estimation.evaluate(&explained, &stats).map_err(StorageError)
+    estimation
+        .evaluate(&explained, &stats)
+        .map_err(StorageError)
 }
 
 impl Pool {
@@ -917,29 +942,42 @@ impl Pool {
         config
     }
 
-    /// Run one simple-query batch on a pooled connection, within the read
-    /// timeout, and return the rows of its last statement that had any.
-    /// `what` names the work in the refusal of a batch that did not
-    /// finish in time: PostgreSQL cancelled it, or the wait ended first.
-    async fn run(&self, what: &str, batch: &str) -> Result<Vec<SimpleQueryRow>, StorageError> {
-        self.run_messages(what, batch).await.map(rows_of)
-    }
-
-    /// [`Pool::run`], every message of the batch returned: the results of
-    /// each of its statements.
-    async fn run_messages(
+    /// Runs `statements` on a pooled connection, within the read timeout,
+    /// with `before` and `after` (transaction control, returning nothing
+    /// the caller wants) around them; the rows of each of `statements`, in
+    /// order, all in one simple-query batch, one round trip. `what`
+    /// names the work in the refusal of a batch that did not finish in
+    /// time: Postgres cancelled it, or the wait ended first.
+    async fn run(
         &self,
         what: &str,
-        batch: &str,
-    ) -> Result<Vec<SimpleQueryMessage>, StorageError> {
+        before: &[String],
+        statements: &[String],
+        after: &[String],
+    ) -> Result<Vec<Vec<TextRow>>, StorageError> {
         let _permit = self.permit().await?;
         let limit = self.timeout();
         let work = async {
             let client = self.acquire().await?;
-            match client.simple_query(batch).await {
+            let batch = before
+                .iter()
+                .chain(statements)
+                .chain(after)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("; ");
+            match client.simple_query(&batch).await {
                 Ok(messages) => {
                     self.release(client);
-                    Ok(messages)
+                    let results = per_statement(messages);
+                    let wanted = before.len()..before.len() + statements.len();
+                    results.get(wanted).map(<[_]>::to_vec).ok_or_else(|| {
+                        StorageError(format!(
+                            "{} results for a batch of {} statements",
+                            results.len(),
+                            before.len() + statements.len() + after.len()
+                        ))
+                    })
                 }
                 Err(error) => match limit {
                     Some(limit) if error.code() == Some(&SqlState::QUERY_CANCELED) => {
@@ -958,8 +996,9 @@ impl Pool {
         }
     }
 
-    /// Return a connection after a successful statement; a failed one's
-    /// connection is dropped instead, in case it is broken or mid-abort.
+    /// Keeps one of Streamgres's own connections for the next read after
+    /// a successful batch; a failed one's connection is dropped instead,
+    /// in case it is broken or mid-abort.
     fn release(&self, client: Client) {
         let mut idle = self.lock_idle();
         if idle.len() < self.idle_limit.load(Ordering::Relaxed) {
@@ -967,35 +1006,36 @@ impl Pool {
         }
     }
 
-    /// Run one positioned statement as a single simple-query batch: the
-    /// read-only transaction opened, the alias's exported snapshot
-    /// imported as its first statement, `sql` run against it, and the
-    /// transaction committed, all in one round trip ([`Pool::run`]); the
-    /// rows of `sql` come back as text.
+    /// Runs one positioned statement: the read-only transaction opened,
+    /// the alias's exported snapshot imported as its first statement,
+    /// `sql` run against it, and the transaction committed ([`Pool::run`]);
+    /// the rows of `sql` come back as text.
     async fn read(
         &self,
         alias: &Alias,
         what: &str,
         sql: &str,
         delay: Option<Duration>,
-    ) -> Result<Vec<SimpleQueryRow>, StorageError> {
-        let mut batch = format!(
-            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '{}';",
-            alias.snapshot.replace('\'', "''")
-        );
+    ) -> Result<Vec<TextRow>, StorageError> {
+        let mut before = vec![
+            "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY".to_owned(),
+            format!(
+                "SET TRANSACTION SNAPSHOT '{}'",
+                alias.snapshot.replace('\'', "''")
+            ),
+        ];
         if let Some(limit) = self.timeout() {
-            batch.push_str(&format!(
-                " SET LOCAL statement_timeout = {};",
+            before.push(format!(
+                "SET LOCAL statement_timeout = {}",
                 limit.as_millis()
             ));
         }
         if let Some(delay) = delay {
-            batch.push_str(&format!(" SELECT pg_sleep({});", delay.as_secs_f64()));
+            before.push(format!("SELECT pg_sleep({})", delay.as_secs_f64()));
         }
-        batch.push(' ');
-        batch.push_str(sql);
-        batch.push_str("; COMMIT");
-        self.run(what, &batch).await
+        self.run(what, &before, &[sql.to_owned()], &["COMMIT".to_owned()])
+            .await
+            .map(only)
     }
 }
 
@@ -1010,19 +1050,25 @@ async fn run_on<T: Send + 'static>(
     }
 }
 
-/// The data rows of the last statement of a simple-query batch that
-/// returned any (the positioned `SELECT`; a `pg_sleep` before it returns a
-/// row of its own, and the `COMMIT` after it returns none).
-fn rows_of(messages: Vec<SimpleQueryMessage>) -> Vec<SimpleQueryRow> {
+/// The rows of each statement of a simple-query batch, in order: every
+/// statement ends with a `CommandComplete`, whether it returned rows or
+/// not.
+fn per_statement(messages: Vec<SimpleQueryMessage>) -> Vec<Vec<TextRow>> {
+    let mut results = Vec::new();
     let mut rows = Vec::new();
     for message in messages {
         match message {
-            SimpleQueryMessage::RowDescription(_) => rows.clear(),
-            SimpleQueryMessage::Row(row) => rows.push(row),
+            SimpleQueryMessage::Row(row) => rows.push(TextRow::from(&row)),
+            SimpleQueryMessage::CommandComplete(_) => results.push(std::mem::take(&mut rows)),
             _ => {}
         }
     }
-    rows
+    results
+}
+
+/// The rows of a batch's only statement.
+fn only(mut results: Vec<Vec<TextRow>>) -> Vec<TextRow> {
+    results.pop().unwrap_or_default()
 }
 
 /// The table of `query` in `catalog`.
@@ -1076,15 +1122,16 @@ async fn open(config: &Config, runtime: &Handle) -> Result<Client, StorageError>
 }
 
 /// Parse Postgres's `X/Y`.
-pub fn parse_lsn(text: &str) -> Result<Lsn, StorageError> {
-    Lsn::parse(text).ok_or_else(|| StorageError(format!("unreadable WAL location `{text}`")))
+pub fn parse_lsn(text: &str) -> Result<Position, StorageError> {
+    crate::sync::pg::lsn::parse(text)
+        .ok_or_else(|| StorageError(format!("unreadable WAL location `{text}`")))
 }
 
 /// One result row, in [`sql::select_columns`] order, as the engine's
 /// (identity, image) pair; the names come from the catalog, so no name is
 /// allocated per row.
 fn decode_row(
-    row: &SimpleQueryRow,
+    row: &TextRow,
     table: &DbTable,
 ) -> Result<(DataFrameKey, DataFrameRow), StorageError> {
     let schema = table.row_schema().clone();
@@ -1249,7 +1296,7 @@ mod tests {
         let alias = |lsn: u64| {
             Arc::new(Alias {
                 snapshot: format!("snap-{lsn}"),
-                lsn: Lsn(lsn),
+                lsn: Position(u128::from(lsn)),
                 _minter: ReplicationConnection::detached(),
             })
         };
@@ -1257,15 +1304,15 @@ mod tests {
         aliases.waiting.push_back(alias(10));
         aliases.waiting.push_back(alias(20));
         aliases.waiting.push_back(alias(30));
-        aliases.advance(Lsn(5));
+        aliases.advance(Position(5));
         assert!(aliases.current.is_none());
-        aliases.advance(Lsn(25));
-        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(20)));
+        aliases.advance(Position(25));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Position(20)));
         assert_eq!(aliases.waiting.len(), 1);
-        aliases.advance(Lsn(25));
-        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(20)));
-        aliases.advance(Lsn(30));
-        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(30)));
+        aliases.advance(Position(25));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Position(20)));
+        aliases.advance(Position(30));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Position(30)));
         assert!(aliases.waiting.is_empty());
     }
 
@@ -1277,7 +1324,7 @@ mod tests {
         let alias = |lsn: u64| {
             Arc::new(Alias {
                 snapshot: format!("snap-{lsn}"),
-                lsn: Lsn(lsn),
+                lsn: Position(u128::from(lsn)),
                 _minter: ReplicationConnection::detached(),
             })
         };
@@ -1286,17 +1333,17 @@ mod tests {
         let before = Arc::new(Catalog::new(vec![table("a")]));
         let after = Arc::new(Catalog::new(vec![table("a"), table("b")]));
         let mut aliases = Aliases::new(before.clone());
-        aliases.upcoming.push_back((Lsn(15), after.clone()));
+        aliases.upcoming.push_back((Position(15), after.clone()));
         aliases.waiting.push_back(alias(10));
         aliases.waiting.push_back(alias(20));
-        aliases.advance(Lsn(12));
-        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(10)));
+        aliases.advance(Position(12));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Position(10)));
         assert!(
             Arc::ptr_eq(&aliases.catalog, &before),
             "10 is before the change at 15"
         );
-        aliases.advance(Lsn(20));
-        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(20)));
+        aliases.advance(Position(20));
+        assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Position(20)));
         assert!(Arc::ptr_eq(&aliases.catalog, &after));
         assert!(aliases.upcoming.is_empty());
     }

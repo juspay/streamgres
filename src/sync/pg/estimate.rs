@@ -42,7 +42,7 @@
 
 use std::collections::HashMap;
 
-use tokio_postgres::SimpleQueryMessage;
+use super::connections::TextRow;
 
 use super::sql;
 use crate::model::{Catalog, ComparisonOperator, MultiTableReadQuery, Value, Where};
@@ -128,8 +128,9 @@ impl Estimation {
         })
     }
 
-    /// Every statement and join column of the tree as one batch.
-    pub fn batch(&self) -> String {
+    /// Every statement and join column of the tree, as the statements of
+    /// one batch.
+    pub fn batch(&self) -> Vec<String> {
         let statements: Vec<&str> = self.statements.iter().map(|(_, sql)| sql.as_str()).collect();
         let columns: Vec<(&str, &str)> = self
             .columns
@@ -152,8 +153,8 @@ impl Estimation {
 
     /// The rows [`Estimation::batch`]'s answer puts the tree at, no higher
     /// than `cap`.
-    pub fn rows(&self, messages: Vec<SimpleQueryMessage>, cap: u64) -> Result<u64, String> {
-        let (explained, stats) = parse(messages, self.statements.len(), !self.columns.is_empty())?;
+    pub fn rows(&self, results: Vec<Vec<TextRow>>, cap: u64) -> Result<u64, String> {
+        let (explained, stats) = parse(results, self.statements.len(), !self.columns.is_empty())?;
         Ok(capped(self.evaluate(&explained, &stats)?, cap))
     }
 
@@ -169,9 +170,9 @@ impl Estimation {
 }
 
 /// `statements` (`EXPLAIN`s), then the statistics of `columns` (`(table,
-/// column)`, none: no statistics query), as one simple-query batch.
-pub fn batch(statements: &[&str], columns: &[(&str, &str)]) -> String {
-    let mut batch = statements.join("; ");
+/// column)`, none: no statistics query): the statements of one batch.
+pub fn batch(statements: &[&str], columns: &[(&str, &str)]) -> Vec<String> {
+    let mut batch: Vec<String> = statements.iter().map(|sql| (*sql).to_owned()).collect();
     if !columns.is_empty() {
         let pairs: Vec<String> = columns
             .iter()
@@ -179,10 +180,7 @@ pub fn batch(statements: &[&str], columns: &[(&str, &str)]) -> String {
                 format!("({}, {})", sql::quote_literal(table), sql::quote_literal(column))
             })
             .collect();
-        if !batch.is_empty() {
-            batch.push_str("; ");
-        }
-        batch.push_str(&format!(
+        batch.push(format!(
             "SELECT tablename, attname, null_frac, n_distinct FROM pg_stats \
              WHERE schemaname = ANY (current_schemas(false)) \
              AND (tablename, attname) IN ({}) ORDER BY inherited",
@@ -197,11 +195,10 @@ pub fn batch(statements: &[&str], columns: &[(&str, &str)]) -> String {
 /// order, and the statistics of the columns `pg_stats` has (a column it
 /// lacks is absent).
 pub fn parse(
-    messages: Vec<SimpleQueryMessage>,
+    results: Vec<Vec<TextRow>>,
     statements: usize,
     columns: bool,
 ) -> Result<(Vec<f64>, Statistics), String> {
-    let results = split(messages);
     if results.len() != statements + usize::from(columns) {
         return Err(format!(
             "{} results for {statements} statements",
@@ -461,23 +458,8 @@ fn reached(sub_rows: f64, sub_total: f64, sub: ColumnStats, total: f64, main: Co
     ((keys / main_values).min(1.0) * (1.0 - main.null_frac)).clamp(0.0, 1.0)
 }
 
-/// The rows of each statement of a batch, in order: one entry per
-/// statement that completed.
-fn split(messages: Vec<SimpleQueryMessage>) -> Vec<Vec<tokio_postgres::SimpleQueryRow>> {
-    let mut results = Vec::new();
-    let mut rows = Vec::new();
-    for message in messages {
-        match message {
-            SimpleQueryMessage::Row(row) => rows.push(row),
-            SimpleQueryMessage::CommandComplete(_) => results.push(std::mem::take(&mut rows)),
-            _ => {}
-        }
-    }
-    results
-}
-
 /// The `Plan Rows` of an `EXPLAIN (FORMAT JSON)`'s top node.
-fn plan_rows(rows: &[tokio_postgres::SimpleQueryRow]) -> Result<f64, String> {
+fn plan_rows(rows: &[TextRow]) -> Result<f64, String> {
     let text = rows
         .first()
         .and_then(|row| row.get(0))
@@ -656,7 +638,7 @@ mod tests {
     fn the_batch_asks_the_join_columns_statistics() {
         let estimation =
             Estimation::new(&participants_by_channel(), &probe_catalog()).expect("estimation");
-        let batch = estimation.batch();
+        let batch = estimation.batch().join("; ");
         assert_eq!(batch.matches("EXPLAIN (FORMAT JSON)").count(), 4);
         assert!(batch.contains("('participants', 'channelId'), ('channel_members', 'channelId')"));
         assert_eq!(
@@ -667,6 +649,7 @@ mod tests {
             ]
         );
         let only_stats = super::batch(&[], &[("participants", "channelId")]);
-        assert!(only_stats.starts_with("SELECT tablename"), "{only_stats}");
+        assert_eq!(only_stats.len(), 1);
+        assert!(only_stats[0].starts_with("SELECT tablename"), "{only_stats:?}");
     }
 }

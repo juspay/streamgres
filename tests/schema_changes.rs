@@ -18,7 +18,7 @@ use tokio::task::{LocalSet, spawn_local};
 use streamgres::ivm::{Engine, MultiTableIVM, QueryPart, SchemaChange, SingleTableIVM};
 use streamgres::model::*;
 use streamgres::sync::{
-    CatalogHandle, Command, Event, Lsn, MemoryStorage, Runtime, Service, Snapshot, Storage,
+    CatalogHandle, Command, Event, MemoryStorage, Position, Runtime, Service, Snapshot, Storage,
     StorageError, Transaction,
 };
 
@@ -143,9 +143,9 @@ fn a_column_added_reaches_held_routed_and_landed_rows() {
     db.apply(&insert(&before, 1, "OPEN", 1, None));
     db.apply(&insert(&before, 2, "OPEN", 2, None));
     db.apply(&insert(&before, 3, "DONE", 3, None));
-    db.advance(Lsn(3));
+    db.advance(Position(3));
     let mut runtime = Runtime::new(SingleTableIVM::new());
-    runtime.progress(Lsn(3));
+    runtime.progress(Position(3));
 
     let (open, step) = runtime.register(open_tickets());
     let read = step.selects[0].clone();
@@ -153,7 +153,7 @@ fn a_column_added_reaches_held_routed_and_landed_rows() {
         read.id,
         Snapshot {
             rows: db.rows(&read.query),
-            at: Lsn(3),
+            at: Position(3),
         },
     );
     assert_eq!(landed.updates.len(), 2, "1 and 2 are open");
@@ -177,7 +177,7 @@ fn a_column_added_reaches_held_routed_and_landed_rows() {
     );
 
     let old_shape = insert(&before, 4, "OPEN", 4, None);
-    let step = runtime.write(&old_shape, Lsn(4));
+    let step = runtime.write(&old_shape, Position(4));
     let delivered = step
         .updates
         .iter()
@@ -196,7 +196,7 @@ fn a_column_added_reaches_held_routed_and_landed_rows() {
     assert!(Arc::ptr_eq(delivered.data.schema(), after.row_schema()));
 
     let new_shape = insert(&after, 5, "OPEN", 5, Some("meera"));
-    runtime.write(&new_shape, Lsn(5));
+    runtime.write(&new_shape, Position(5));
     let held = owners(runtime.engine().rows_for(open), after.row_schema());
     assert_eq!(
         held[&5],
@@ -217,7 +217,7 @@ fn a_column_added_reaches_held_routed_and_landed_rows() {
         read.id,
         Snapshot {
             rows: db.rows(&read.query),
-            at: Lsn(5),
+            at: Position(5),
         },
     );
     let landed_row = landed
@@ -300,8 +300,8 @@ fn a_memory_table_takes_the_column() {
 /// service asked of it.
 struct Trailing {
     inner: MemoryStorage,
-    floor: Cell<Lsn>,
-    followed: Cell<Option<Lsn>>,
+    floor: Cell<Position>,
+    followed: Cell<Option<Position>>,
     minted: Cell<usize>,
 }
 
@@ -310,15 +310,15 @@ impl Storage for Trailing {
         self.inner.select(query).await
     }
 
-    fn advance(&self, feed: Lsn) {
+    fn advance(&self, feed: Position) {
         self.inner.advance(feed);
     }
 
-    fn floor(&self) -> Lsn {
+    fn floor(&self) -> Position {
         self.floor.get()
     }
 
-    fn absorb(&self, write: &WriteQuery, at: Lsn) {
+    fn absorb(&self, write: &WriteQuery, at: Position) {
         self.inner.absorb(write, at);
     }
 
@@ -326,7 +326,7 @@ impl Storage for Trailing {
         self.inner.alter(change);
     }
 
-    fn follow(&self, at: Lsn, _catalog: Arc<Catalog>) {
+    fn follow(&self, at: Position, _catalog: Arc<Catalog>) {
         self.followed.set(Some(at));
     }
 
@@ -356,7 +356,7 @@ async fn drain(events: &mut mpsc::UnboundedReceiver<Event>) -> Vec<Event> {
 }
 
 /// A transaction of the feed that committed at `at` carrying `changes`.
-fn migration(at: Lsn, changes: Vec<SchemaChange>, catalog: Arc<Catalog>) -> Transaction {
+fn migration(at: Position, changes: Vec<SchemaChange>, catalog: Arc<Catalog>) -> Transaction {
     let mut transaction = Transaction::new(Vec::new(), at).with_schema(changes, catalog);
     transaction.committed_at_micros = 1;
     transaction
@@ -376,7 +376,7 @@ fn the_clients_catalog_switches_when_the_floor_reaches_the_change() {
         let handle = Arc::new(CatalogHandle::from_arc(before.clone()));
         let storage = Rc::new(Trailing {
             inner: MemoryStorage::new(),
-            floor: Cell::new(Lsn(5)),
+            floor: Cell::new(Position(5)),
             followed: Cell::new(None),
             minted: Cell::new(0),
         });
@@ -398,7 +398,7 @@ fn the_clients_catalog_switches_when_the_floor_reaches_the_change() {
         let change = owner_added(after.table("tickets").expect("tickets"));
         commands
             .send(Command::Transaction(migration(
-                Lsn(10),
+                Position(10),
                 vec![change],
                 after.clone(),
             )))
@@ -413,7 +413,7 @@ fn the_clients_catalog_switches_when_the_floor_reaches_the_change() {
         );
         assert_eq!(
             storage.followed.get(),
-            Some(Lsn(10)),
+            Some(Position(10)),
             "the storage reads by the new catalog from 10 on"
         );
         assert_eq!(storage.minted.get(), 1, "a snapshot is minted at once");
@@ -422,17 +422,17 @@ fn the_clients_catalog_switches_when_the_floor_reaches_the_change() {
             "the floor (5) has not reached the change (10)"
         );
 
-        storage.floor.set(Lsn(9));
+        storage.floor.set(Position(9));
         commands
-            .send(Command::Transaction(Transaction::mark(Lsn(12))))
+            .send(Command::Transaction(Transaction::mark(Position(12))))
             .await
             .expect("send");
         drain(&mut events).await;
         assert!(handle.holds(&before), "a floor at 9 is still short of it");
 
-        storage.floor.set(Lsn(10));
+        storage.floor.set(Position(10));
         commands
-            .send(Command::Transaction(Transaction::mark(Lsn(13))))
+            .send(Command::Transaction(Transaction::mark(Position(13))))
             .await
             .expect("send");
         drain(&mut events).await;

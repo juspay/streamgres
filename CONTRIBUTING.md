@@ -31,11 +31,11 @@ Build and test:
 
 ```bash
 cargo build
-cargo test                          # unit and scenario tests
-cargo clippy --all-targets -- -D warnings
+cargo test --all-features            # unit and scenario tests, library and server
+cargo clippy --all-targets --all-features -- -D warnings
 cargo run --bin streamgres           # Streamgres demo: every check must end in PASS
-cargo run --release --bin bench     # benchmarks
-cargo run --release --bin load      # the server over the wire: latency, cores, memory (needs STREAMGRES_PG_DSN)
+cargo run --release --features server --bin bench     # benchmarks
+cargo run --release --features server --bin load      # the server over the wire: latency, cores, memory (needs STREAMGRES_PG_DSN)
 ```
 
 The tests against a real PostgreSQL run when `STREAMGRES_PG_DSN` is set and
@@ -46,7 +46,7 @@ docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17 \
   -c wal_level=logical -c max_replication_slots=32 -c max_wal_senders=32
 
 STREAMGRES_PG_DSN=postgresql://postgres:postgres@localhost:5432/postgres \
-  cargo test --release
+  cargo test --release --all-features
 ```
 
 To run the server locally, follow the [Quick start](README.md#quick-start) in
@@ -58,8 +58,8 @@ Every pull request runs:
 
 | Job | What it runs |
 | --- | --- |
-| Lints | `cargo clippy --all-targets --locked -- -D warnings` |
-| Tests | `cargo test --release --locked` against PostgreSQL 17 |
+| Lints | `cargo clippy --all-targets --locked` with and without `--features server`, `-D warnings` |
+| Tests | `cargo test --release --locked --workspace --all-features` against PostgreSQL 17 |
 | Benchmark | `bench` on your branch and the base branch, five alternating rounds, compared by `scripts/bench-compare.py` |
 | Image | builds `docker/server/Dockerfile` and drives it end to end with `scripts/smoke.mjs` |
 
@@ -133,4 +133,4 @@ you say otherwise, any contribution you submit is licensed under the same
 terms, as section 5 of the licence provides.
 
 Code ported from other Apache-2.0 projects must keep its original attribution
-comments, as `src/client/ddl_triggers.rs` does.
+comments, as `src/sync/pg/ddl_triggers.rs` does.

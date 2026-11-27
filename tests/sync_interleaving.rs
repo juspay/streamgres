@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use streamgres::ivm::{Engine, Fetch, MultiTableIVM, QueryPart, SingleTableIVM, SubId};
 use streamgres::model::*;
-use streamgres::sync::{Lsn, MemoryStorage, Runtime, Snapshot, Step};
+use streamgres::sync::{MemoryStorage, Position, Runtime, Snapshot, Step};
 
 /// `tickets(id, status, assigned_to, points)`.
 fn tickets_table() -> DbTable {
@@ -145,10 +145,10 @@ impl Db {
 
     /// Commit a write: apply it to the store and position it at the next
     /// WAL location.
-    fn commit(&mut self, write: &WriteQuery) -> Lsn {
+    fn commit(&mut self, write: &WriteQuery) -> Position {
         self.storage.apply(write);
         self.lsn += 1;
-        Lsn(self.lsn)
+        Position(u128::from(self.lsn))
     }
 
     /// Seed rows before any subscription exists (committed, positioned,
@@ -164,13 +164,13 @@ impl Db {
     fn snapshot(&self, fetch: &Fetch) -> Snapshot {
         Snapshot {
             rows: self.storage.rows(&fetch.query),
-            at: Lsn(self.lsn),
+            at: Position(u128::from(self.lsn)),
         }
     }
 
     /// The current WAL location.
-    fn head(&self) -> Lsn {
-        Lsn(self.lsn)
+    fn head(&self) -> Position {
+        Position(u128::from(self.lsn))
     }
 }
 

@@ -112,8 +112,8 @@ use super::wire;
 use crate::ivm::{Delta, QueryPart};
 use crate::log::{Level, log_debug, log_event, log_info, log_warn};
 use crate::model::{
-    Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, Lsn,
-    MultiTableReadQuery, RowData, SubId, TableName, Value, WriteQuery,
+    Catalog, DataFrameKey, DataFrameOperation, DataFrameRow, IdMap, IdSet, MultiTableReadQuery,
+    Position, RowData, SubId, TableName, Value, WriteQuery,
 };
 use crate::stats::Stats;
 use crate::sync::{CatalogHandle, Command, Event};
@@ -694,6 +694,8 @@ impl Groups {
             Event::Refused { sub, reason } => self.refused(sub, &reason),
             Event::Capped { sub } => self.capped(sub),
             Event::Heavy { sub, table, rows } => self.heavy(sub, table.as_str(), rows),
+            // The server never asks for settle reports.
+            Event::Unsettled(_) => {}
             Event::Hydrated(subs) => {
                 for sub in subs {
                     let Some((group_id, hash)) = self.by_sub.get(&sub).cloned() else {
@@ -790,7 +792,7 @@ impl Groups {
 
     /// Start serving once the engine's position covers the storage's
     /// snapshots; the requests that arrived meanwhile run then.
-    fn serve_when_covered(&mut self, position: Lsn, floor: Lsn) {
+    fn serve_when_covered(&mut self, position: Position, floor: Position) {
         if self.ready || floor.0 == 0 || position < floor {
             return;
         }

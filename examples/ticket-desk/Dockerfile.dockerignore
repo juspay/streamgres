@@ -1,0 +1,8 @@
+.git
+**/target
+**/.env
+**/.env.*
+.cargo
+.stublibs
+.DS_Store
+crates/streamgres-demo

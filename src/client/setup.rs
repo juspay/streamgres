@@ -6,7 +6,7 @@ use serde_json::Value;
 use tokio_postgres::{NoTls, Transaction};
 
 use super::Config;
-use super::ddl_triggers::{self, FunctionSpec};
+use crate::sync::pg::ddl_triggers::{self, FunctionSpec};
 use crate::sync::pg::sql::quote_ident;
 
 const SETUP_LOCK: i64 = 0x5354_524d_4752_4553;

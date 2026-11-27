@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:17
+    pull_policy: always
+    environment:
+      POSTGRES_DB: ticketdesk
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=32", "-c", "max_wal_senders=32"]
+    volumes:
+      - ticketdesk-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ticketdesk"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+  demo:
+    build:
+      context: ../..
+      dockerfile: examples/ticket-desk/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/ticketdesk
+      DEMO_AUTH_TOKEN: ${DEMO_AUTH_TOKEN:?set DEMO_AUTH_TOKEN for the ticket desk}
+      DEMO_WRITER_RATE: "8"
+    ports:
+      - "127.0.0.1:${DEMO_HTTP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    init: true
+    stop_grace_period: 30s
+volumes:
+  ticketdesk-data:

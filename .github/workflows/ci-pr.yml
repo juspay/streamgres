@@ -46,14 +46,21 @@ jobs:
       - name: Install rust cache
         uses: Swatinem/rust-cache@v2.7.7
 
-      - name: Clippy, warnings denied
+      - name: Clippy, the server, warnings denied
+        run: cargo clippy --all-targets --locked --features server -- -D warnings
+
+      - name: Clippy, the library alone (default features)
         run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Clippy, the library's Diesel adapter and the ticket desk example
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
     name: Tests (accuracy)
     runs-on: ubuntu-latest
     env:
       STREAMGRES_PG_DSN: postgresql://postgres:postgres@localhost:5432/postgres
+      TICKETDESK_TEST_DSN: postgresql://postgres:postgres@localhost:5432/ticketdesk_tests
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -74,11 +81,13 @@ jobs:
       - name: Start PostgreSQL with logical replication
         run: |
           docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:17 \
-            -c wal_level=logical -c max_replication_slots=32 -c max_wal_senders=32
+            -c wal_level=logical -c max_replication_slots=64 -c max_wal_senders=64 \
+            -c max_connections=400
           until docker exec pg pg_isready -U postgres; do sleep 1; done
+          docker exec pg createdb -U postgres ticketdesk_tests
 
       - name: Unit, scenario, randomized and live PostgreSQL tests
-        run: cargo test --release --locked
+        run: cargo test --release --locked --workspace --all-features
 
   perf:
     name: Benchmark against the base branch (performance)
@@ -119,10 +128,14 @@ jobs:
             ../base -> target
 
       - name: Build the benchmark of this branch
-        run: cargo build --release --locked --bin bench
+        run: cargo build --release --locked --features server --bin bench
 
       - name: Build the benchmark of the base branch
-        run: cargo build --release --locked --bin bench --manifest-path ../base/Cargo.toml
+        # A base branch from before the `server` feature builds its bench without the flag.
+        run: |
+          features=""
+          if grep -q '^server = ' ../base/Cargo.toml; then features="--features server"; fi
+          cargo build --release --locked $features --bin bench --manifest-path ../base/Cargo.toml
 
       - name: Run both, alternating, five rounds
         run: |
