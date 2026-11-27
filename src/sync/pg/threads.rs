@@ -13,9 +13,9 @@
 //! hold. Each process streams from a slot of its own, named
 //! [`SLOT_PREFIX`] and a fresh UUID: a restart needs nothing of the
 //! slot before it (the slot is moved up to the first snapshot anyway).
-//! At startup it can drop this server's inactive slots once they have
-//! exceeded an explicitly configured age; the PostgreSQL 17
-//! `inactive_since` timestamp makes that cleanup safe across restarts.
+//! At startup and periodically it reclaims other instances' old inactive permanent
+//! slots using the configured age (PG 17+). One shared advisory lock serializes
+//! sweeps per database.
 //! Schema changes reach the feed as the messages of the schema-change
 //! event trigger ([`super::ddl`]); the server refuses to serve
 //! without that trigger ([`require_ddl_trigger`]).
@@ -35,6 +35,7 @@ use tokio::sync::watch;
 use tokio::task::spawn_local;
 
 use super::ddl::{self, DdlSource};
+use super::stream::SlotOwner;
 use super::{Feed, Keepalive, PgStorage, Transport, load_catalog};
 use crate::ivm::MultiTableIVM;
 use crate::log::{log_error, log_info, log_warn};
@@ -48,8 +49,6 @@ use crate::sync::{CatalogHandle, Command, Event, Runtime, Service, Sources, Tran
 /// - `dsn`: the database, with the user and password in the URL.
 /// - `slot`: the replication slot of the change feed, this process's own
 ///   ([`slot_name`]).
-/// - `slot_cleanup_age`: how long an inactive slot of an ended process is
-///   retained before startup removes it (zero disables cleanup).
 /// - `publication`: the publication the feed streams.
 /// - `schemas`: the schemas whose tables the catalog carries.
 /// - `snapshot_rotation`: how often a fresh exported snapshot is minted
@@ -75,7 +74,16 @@ pub struct Settings {
     /// Snapshot minting and replication always use `dsn` above.
     pub read_dsn: String,
     pub slot: String,
+    /// Enable startup and periodic slot cleanup.
+    pub slot_cleanup_enabled: bool,
+    /// Same nonblank logical lock name across all cooperating cleaners.
+    pub slot_sweep_lock_key: String,
+    /// Inactivity grace period; zero disables cleanup.
     pub slot_cleanup_age: Duration,
+    /// Positive interval between completed cleanup attempts.
+    pub slot_sweep_interval: Duration,
+    /// Total budget for awaited initial cleanup; periodic attempts have no total cap.
+    pub slot_cleanup_startup_timeout: Duration,
     pub publication: String,
     pub schemas: Vec<String>,
     pub snapshot_rotation: Duration,
@@ -89,8 +97,42 @@ pub struct Settings {
     pub ddl_prefix: String,
 }
 
+impl Settings {
+    pub(crate) fn validate_slot_cleanup(&self) -> Result<(), String> {
+        if !self.slot_cleanup_enabled || self.slot_cleanup_age.is_zero() {
+            return Ok(());
+        }
+        if self.slot_cleanup_age.as_secs_f64() > (i64::MAX / 1_000_000 - 1) as f64 {
+            return Err("slot cleanup age exceeds the PostgreSQL interval range".to_owned());
+        }
+        if self.slot_sweep_interval.is_zero()
+            || self.slot_sweep_interval.as_millis() > i64::MAX as u128
+        {
+            return Err(
+                "slot sweep interval must be positive and fit in signed 64-bit milliseconds"
+                    .to_owned(),
+            );
+        }
+        if self.slot_sweep_lock_key.trim().is_empty() || self.slot_sweep_lock_key.contains('\0') {
+            return Err("sweep lock key must be nonblank and contain no NUL".to_owned());
+        }
+        if self.slot_cleanup_startup_timeout.is_zero()
+            || self.slot_cleanup_startup_timeout.as_millis() > i64::MAX as u128
+        {
+            return Err(
+                "startup cleanup timeout must be positive and fit in signed 64-bit milliseconds"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
 /// What every slot a server names for itself starts with.
 pub const SLOT_PREFIX: &str = "xyne_sync_slot_";
+
+/// Default logical identity of the shared cleanup advisory lock.
+pub const DEFAULT_SWEEP_LOCK_KEY: &str = "streamgres.slot_cleanup";
 
 /// A slot name of this process's own: [`SLOT_PREFIX`] and a fresh UUID
 /// (lowercase hex, no dashes, as slot names allow).
@@ -107,6 +149,50 @@ const POSITION_EVERY: Duration = Duration::from_millis(200);
 /// The feed has four seconds of the process's 25-second application shutdown
 /// budget; Kubernetes retains five seconds of a 30-second grace period.
 const FEED_STOP_GRACE: Duration = Duration::from_secs(4);
+
+// The task guard cancels both the timer and any in-progress sweep.
+async fn periodic_sweep(
+    dsn: String,
+    slot: String,
+    every: Duration,
+    age: Duration,
+    lock_key: String,
+) {
+    loop {
+        tokio::time::sleep(every).await;
+        if let Err(error) = Transport::cleanup_inactive_slots(&dsn, &slot, age, &lock_key).await {
+            log_warn!("periodic slot cleanup failed: {error}");
+        }
+    }
+}
+
+// Own periodic cleanup before a feed exists, then transfer it into FeedHandle. Any failed
+// startup path drops this guard, cancelling both the timer and in-flight SQL.
+struct SweepTask {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SweepTask {
+    fn spawn(dsn: String, slot: String, every: Duration, age: Duration, lock_key: String) -> Self {
+        let task = spawn_local(periodic_sweep(dsn, slot, every, age, lock_key));
+        Self { task: Some(task) }
+    }
+
+    async fn stop(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for SweepTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
 
 /// The running engine side: commands in, one event stream per consumer
 /// (the consumer of a client being the one at its id modulo their count),
@@ -125,6 +211,16 @@ pub struct Started {
 pub struct FeedHandle {
     stop: watch::Sender<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    // No cleanup connections are retained between sweeps.
+    sweeper: Option<SweepTask>,
+}
+
+// Explicit stop_feed handles shutdown; Drop also stops a feed during failed startup.
+impl Drop for FeedHandle {
+    fn drop(&mut self) {
+        self.stop.send_replace(true);
+        self.sweeper.take();
+    }
 }
 
 /// The service's task, kept on the engine thread: it resolves only when
@@ -201,6 +297,22 @@ pub fn spawn_feed(
     start: Lsn,
     shutdown: Shutdown,
 ) -> Result<(mpsc::Receiver<Transaction>, FeedHandle), String> {
+    spawn_feed_with_owner(settings, catalog, start, shutdown, None, None)
+}
+
+fn spawn_feed_with_owner(
+    settings: Settings,
+    catalog: Arc<Catalog>,
+    start: Lsn,
+    shutdown: Shutdown,
+    mut owner: Option<SlotOwner>,
+    mut startup_guard: Option<tokio_postgres::Client>,
+) -> Result<(mpsc::Receiver<Transaction>, FeedHandle), String> {
+    let mut config = settings
+        .dsn
+        .parse()
+        .map_err(|e| format!("feed connection: {e}"))?;
+    settings.keepalive.apply(&mut config);
     let (out, transactions) = mpsc::channel(1024);
     let (stop, mut stop_rx) = watch::channel(false);
     let thread = std::thread::Builder::new()
@@ -220,35 +332,38 @@ pub fn spawn_feed(
                 let mut start = Some(start);
                 let mut failures = 0u32;
                 loop {
-                    let opened = match start {
-                        Some(from) => Transport::open_from(
-                            &settings.dsn,
-                            &settings.slot,
-                            &settings.publication,
-                            from,
-                        )
-                        .await,
-                        None => Transport::open(
-                            &settings.dsn,
-                            &settings.slot,
-                            &settings.publication,
-                        )
-                        .await,
+                    let opened = tokio::select! {
+                        opened = SlotOwner::open_feed(&mut owner, &config, &settings.slot, &settings.publication, start) => opened,
+                        _ = stop_rx.changed() => return true,
                     };
                     match opened {
                         Ok(transport) => {
-                            log_info!("change feed open on slot {}", settings.slot);
                             start = None;
-                            failures = 0;
-                            let outcome = transport
-                                .stream_with_shutdown(
+                            let streaming = transport
+                                .stream_with_guard(
                                     POSITION_EVERY,
                                     &mut feed,
                                     &settings.watched,
                                     out.clone(),
                                     stop_rx.clone(),
-                                )
-                                .await;
+                                    &mut startup_guard,
+                                );
+                            // Repair a lost ownership session while the walsender is still active.
+                            let maintain_owner = async {
+                                loop {
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    if owner.as_ref().is_none_or(|owner| owner.client.is_closed()) {
+                                        match SlotOwner::claim(&config, &settings.slot).await {
+                                            Ok(replacement) => owner = Some(replacement),
+                                            Err(error) => log_warn!("restoring slot ownership: {error}"),
+                                        }
+                                    }
+                                }
+                            };
+                            let outcome = tokio::select! {
+                                result = streaming => result,
+                                () = maintain_owner => unreachable!(),
+                            };
                             if *stop_rx.borrow() {
                                 return true;
                             }
@@ -256,7 +371,10 @@ pub fn spawn_feed(
                                 return false;
                             }
                             match outcome {
-                                Ok(()) => log_warn!("change feed dropped; reopening the slot"),
+                                Ok(received_event) => {
+                                    failures = if received_event { 0 } else { failures.saturating_add(1) };
+                                    log_warn!("change feed dropped; reopening the slot");
+                                }
                                 Err(error) => {
                                     log_error!("change feed failed: {error}");
                                     running_shutdown.fail(format!("change feed failed: {error}"));
@@ -265,19 +383,19 @@ pub fn spawn_feed(
                             }
                         }
                         Err(error) => {
-                            failures += 1;
+                            failures = failures.saturating_add(1);
                             log_error!("opening the change feed (attempt {failures}): {error}");
-                            if let Ok(false) =
-                                Transport::slot_exists(&settings.dsn, &settings.slot).await
-                            {
+                            // Recreating a missing/invalid slot would skip changes in the old engine.
+                            // Preserve transient retries when PostgreSQL cannot confirm slot state.
+                            let inspected = tokio::select! {
+                                _ = stop_rx.changed() => return true,
+                                result = Transport::slot_failure(&settings.dsn, &settings.slot) => result,
+                            };
+                            if let Ok(Some(failure)) = inspected {
                                 log_error!(
-                                    "slot {} is gone, and a slot made again would skip the changes since; stopping so a restart begins on a fresh slot and snapshot",
-                                    settings.slot
+                                    "{failure}; stopping so a restart begins on a fresh slot and snapshot"
                                 );
-                                running_shutdown.fail(format!(
-                                    "change-feed slot {} disappeared",
-                                    settings.slot
-                                ));
+                                running_shutdown.fail(failure);
                                 return true;
                             }
                         }
@@ -308,6 +426,7 @@ pub fn spawn_feed(
         FeedHandle {
             stop,
             thread: Some(thread),
+            sweeper: None,
         },
     ))
 }
@@ -315,6 +434,9 @@ pub fn spawn_feed(
 /// Stop the feed thread and wait until its replication connection is closed.
 pub async fn stop_feed(mut feed: FeedHandle) -> Result<(), String> {
     feed.stop.send_replace(true);
+    if let Some(sweeper) = feed.sweeper.take() {
+        sweeper.stop().await;
+    }
     let Some(thread) = feed.thread.take() else {
         return Ok(());
     };
@@ -351,67 +473,160 @@ pub async fn start(
     stats: Arc<Stats>,
     shutdown: Shutdown,
 ) -> Result<(Started, ServiceTask), String> {
-    Transport::cleanup_inactive_slots(&settings.dsn, settings.slot_cleanup_age)
-        .await
-        .map_err(|error| format!("cleaning up inactive replication slots: {error}"))?;
-    Transport::prepare(&settings.dsn, &settings.slot, &settings.publication)
-        .await
-        .map_err(|error| format!("preparing the change feed: {error}"))?;
+    settings.validate_slot_cleanup()?;
+    start_validated(settings, catalog, reads, consumers, stats, shutdown).await
+}
+
+// The standalone server validates before database setup. Both entry points run
+// the same checks once and use the same engine startup path.
+pub(crate) async fn start_validated(
+    settings: &Settings,
+    catalog: Arc<CatalogHandle>,
+    reads: tokio::runtime::Handle,
+    consumers: usize,
+    stats: Arc<Stats>,
+    shutdown: Shutdown,
+) -> Result<(Started, ServiceTask), String> {
     let mut config: tokio_postgres::Config = settings
         .dsn
         .parse()
         .map_err(|error| format!("connecting the storage: {error}"))?;
     settings.keepalive.apply(&mut config);
-    let mut read_config: tokio_postgres::Config = settings
-        .read_dsn
-        .parse()
-        .map_err(|error| format!("connecting the read pool: {error}"))?;
-    settings.keepalive.apply(&mut read_config);
-    let pg =
-        PgStorage::connect_configured_with_read_config(config, read_config, catalog.load(), reads)
-            .await
-            .map_err(|error| format!("connecting the storage: {error}"))?
-            .with_rotation(settings.snapshot_rotation)
-            .with_read_connections(settings.read_connections)
-            .with_read_idle_connections(settings.read_idle_connections)
-            .with_read_timeout(settings.read_timeout);
-    let pg = Arc::new(pg);
-    let (feed, feed_handle) = spawn_feed(
-        settings.clone(),
-        catalog.load(),
-        pg.first_position(),
-        shutdown,
-    )?;
-    let cached = Sources::cached_from_env();
-    let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
-    if !cached.is_empty() {
-        let rows = storage
-            .warm()
-            .await
-            .map_err(|error| format!("warming the memory tables: {error}"))?;
-        log_info!("memory tables warmed with {rows} rows");
+    // Claim even when this instance does not sweep: a peer may have cleanup enabled.
+    let owner = tokio::select! {
+        result = SlotOwner::claim(&config, &settings.slot) => {
+            result.map_err(|error| format!("claiming the change-feed slot: {error}"))?
+        }
+        _ = shutdown.wait() => return Err("startup cancelled by shutdown".to_owned()),
+    };
+    let cleanup_requested = settings.slot_cleanup_enabled && !settings.slot_cleanup_age.is_zero();
+    let cleanup = cleanup_requested && owner.server_version >= 170_000;
+    if cleanup_requested && !cleanup {
+        log_warn!(
+            "age-based slot cleanup needs PostgreSQL 17+ (inactive_since); continuing without cleanup on server {}",
+            owner.server_version
+        );
     }
-    let (sinks, events): (Vec<_>, Vec<_>) = (0..consumers.max(1))
-        .map(|_| mpsc::unbounded_channel())
-        .unzip();
-    let first = sinks[0].clone();
-    let engine = MultiTableIVM::new().with_row_limit(super::read_row_limit());
-    let (service, commands) = Service::new(engine, storage, first);
-    let service = spawn_local(
-        service
-            .with_feed(feed)
-            .with_catalog(catalog)
-            .with_sinks(sinks)
-            .with_stats(stats)
-            .run(),
-    );
-    Ok((
-        Started {
-            commands,
-            events,
-            storage: pg,
-            feed: feed_handle,
-        },
-        service,
-    ))
+    if cleanup {
+        tokio::select! {
+            result = Transport::cleanup_slots_at_startup(
+                &settings.dsn, &settings.slot, settings.slot_cleanup_age,
+                settings.slot_cleanup_startup_timeout,
+                &settings.slot_sweep_lock_key,
+            ) => {
+                if let Err(error) = result {
+                    log_warn!("startup slot cleanup failed: {error}; continuing initialization");
+                }
+            }
+            _ = shutdown.wait() => return Err("startup cancelled by shutdown".to_owned()),
+        }
+    }
+    let sweeper = cleanup.then(|| {
+        SweepTask::spawn(
+            settings.dsn.clone(),
+            settings.slot.clone(),
+            settings.slot_sweep_interval,
+            settings.slot_cleanup_age,
+            settings.slot_sweep_lock_key.clone(),
+        )
+    });
+    let startup_guard = tokio::select! {
+        result = SlotOwner::startup_guard(&config, &settings.slot) => {
+            result.map_err(|error| format!("guarding slot creation: {error}"))?
+        }
+        _ = shutdown.wait() => return Err("startup cancelled by shutdown".to_owned()),
+    };
+    let created = owner
+        .prepare(&settings.slot, &settings.publication)
+        .await
+        .map_err(|error| format!("preparing the change feed: {error}"))?;
+    // Retain this exact backend through rollback so another managed owner cannot
+    // claim the name between initialization failure and removal of our new slot.
+    let rollback_client = owner.client.clone();
+    let startup_shutdown = shutdown.clone();
+    let result = async {
+        let mut read_config: tokio_postgres::Config = settings
+            .read_dsn
+            .parse()
+            .map_err(|error| format!("connecting the read pool: {error}"))?;
+        settings.keepalive.apply(&mut read_config);
+        let connecting = PgStorage::connect_configured_with_read_config(
+            config,
+            read_config,
+            catalog.load(),
+            reads,
+        );
+        let pg = tokio::select! {
+            _ = startup_shutdown.wait() => return Err("startup cancelled by shutdown".to_owned()),
+            result = connecting => result,
+        }
+        .map_err(|error| format!("connecting the storage: {error}"))?
+        .with_rotation(settings.snapshot_rotation)
+        .with_read_connections(settings.read_connections)
+        .with_read_idle_connections(settings.read_idle_connections)
+        .with_read_timeout(settings.read_timeout);
+        let pg = Arc::new(pg);
+        let (feed, mut feed_handle) = spawn_feed_with_owner(
+            settings.clone(),
+            catalog.load(),
+            pg.first_position(),
+            shutdown,
+            Some(owner),
+            Some(startup_guard),
+        )?;
+        feed_handle.sweeper = sweeper;
+        let cached = Sources::cached_from_env();
+        let storage = Rc::new(Sources::new(pg.clone(), catalog.load(), cached.clone()));
+        if !cached.is_empty() {
+            let warmed = tokio::select! {
+                _ = startup_shutdown.wait() => {
+                    stop_feed(feed_handle).await?;
+                    return Err("startup cancelled by shutdown".to_owned());
+                }
+                result = storage.warm() => result,
+            };
+            let rows = match warmed {
+                Ok(rows) => rows,
+                Err(error) => {
+                    stop_feed(feed_handle).await?;
+                    return Err(format!("warming the memory tables: {error}"));
+                }
+            };
+            log_info!("memory tables warmed with {rows} rows");
+        }
+        let (sinks, events): (Vec<_>, Vec<_>) = (0..consumers.max(1))
+            .map(|_| mpsc::unbounded_channel())
+            .unzip();
+        let first = sinks[0].clone();
+        let engine = MultiTableIVM::new().with_row_limit(super::read_row_limit());
+        let (service, commands) = Service::new(engine, storage, first);
+        let service = spawn_local(
+            service
+                .with_feed(feed)
+                .with_catalog(catalog)
+                .with_sinks(sinks)
+                .with_stats(stats)
+                .run(),
+        );
+        Ok((
+            Started {
+                commands,
+                events,
+                storage: pg,
+                feed: feed_handle,
+            },
+            service,
+        ))
+    }
+    .await;
+    if created
+        && result.is_err()
+        && let Err(error) = super::stream::rollback_new_slot(&rollback_client, &settings.slot).await
+    {
+        log_warn!(
+            "rolling back slot {} after startup failed: {error}",
+            settings.slot
+        );
+    }
+    result
 }

@@ -1302,7 +1302,7 @@ impl Server {
             .env("STREAMGRES_MUTATE_URL", format!("http://127.0.0.1:{app_port}/push"))
             .env("STREAMGRES_APP_ID", APP_ID)
             .env("STREAMGRES_SHARD", SHARD.to_string())
-            .env("STREAMGRES_SLOT_CLEANUP_AGE_MS", "0")
+            .env("STREAMGRES_SLOT_CLEANUP_ENABLED", "false")
             .env("STREAMGRES_WARM_START_MS", "0")
             .env("STREAMGRES_METRICS_INTERVAL_MS", "1000")
             .env("STREAMGRES_GROUP_THREADS", opts.group_threads.to_string())

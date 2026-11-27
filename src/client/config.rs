@@ -37,11 +37,17 @@ pub struct Config {
     /// The replication slot of the change feed, not configurable: each
     /// process names its own using the existing compatible naming scheme.
     pub slot: String,
-    /// `STREAMGRES_SLOT_CLEANUP_AGE_MS`: how long a Streamgres feed slot
-    /// must have stayed inactive before startup drops it (zero disables
-    /// cleanup). PostgreSQL 17 or later is required when this is enabled,
-    /// because that is where `inactive_since` is available.
+    /// STREAMGRES_SLOT_CLEANUP_ENABLED=false disables startup and periodic cleanup.
+    pub slot_cleanup_enabled: bool,
+    /// STREAMGRES_SLOT_SWEEP_LOCK_KEY: shared logical advisory-lock name.
+    pub slot_sweep_lock_key: String,
+    /// STREAMGRES_SLOT_CLEANUP_AGE_MS: inactivity age before cleanup (default zero).
+    /// Zero disables startup and periodic cleanup.
     pub slot_cleanup_age: Duration,
+    /// Interval in milliseconds between completed cleanup attempts.
+    pub slot_sweep_interval: Duration,
+    /// Total initial cleanup budget in milliseconds (10000), including lock waits.
+    pub slot_cleanup_startup_timeout: Duration,
     /// `STREAMGRES_PUBLICATION`: the publication the change feed streams;
     /// startup creates it when absent and validates it when present.
     pub publication: String,
@@ -222,6 +228,31 @@ impl Config {
                 None => Ok(Duration::from_millis(default)),
             }
         };
+        let slot_cleanup_enabled = first(&["STREAMGRES_SLOT_CLEANUP_ENABLED"])
+            .unwrap_or_else(|| "true".to_owned())
+            .parse::<bool>()
+            .map_err(|_| "STREAMGRES_SLOT_CLEANUP_ENABLED must be true or false".to_owned())?;
+        let slot_cleanup_age = if slot_cleanup_enabled {
+            millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?
+        } else {
+            Duration::ZERO
+        };
+        // Disabled deployments can leave unused settings untouched during rollouts.
+        let (slot_sweep_interval, slot_cleanup_startup_timeout, slot_sweep_lock_key) =
+            if slot_cleanup_age.is_zero() {
+                (
+                    Duration::from_secs(60),
+                    Duration::from_secs(10),
+                    threads::DEFAULT_SWEEP_LOCK_KEY.to_owned(),
+                )
+            } else {
+                (
+                    millis("STREAMGRES_SLOT_SWEEP_INTERVAL_MS", 60_000)?,
+                    millis("STREAMGRES_SLOT_CLEANUP_STARTUP_TIMEOUT_MS", 10_000)?,
+                    first(&["STREAMGRES_SLOT_SWEEP_LOCK_KEY"])
+                        .unwrap_or_else(|| threads::DEFAULT_SWEEP_LOCK_KEY.to_owned()),
+                )
+            };
         let dsn = first(&["STREAMGRES_PG_DSN", "ZERO_UPSTREAM_DB"])
             .ok_or("STREAMGRES_PG_DSN (or ZERO_UPSTREAM_DB) must name the database")?;
         let master_dsn = first(&["STREAMGRES_MASTER_PG_DSN"])
@@ -319,7 +350,11 @@ impl Config {
             read_dsn,
             schemas,
             slot: threads::slot_name(),
-            slot_cleanup_age: millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
+            slot_cleanup_enabled,
+            slot_sweep_lock_key,
+            slot_cleanup_age,
+            slot_sweep_interval,
+            slot_cleanup_startup_timeout,
             publication: first(&["STREAMGRES_PUBLICATION"])
                 .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
             ddl_trigger,
@@ -483,7 +518,11 @@ impl Config {
             dsn: self.dsn.clone(),
             read_dsn: self.read_dsn.clone(),
             slot: self.slot.clone(),
+            slot_cleanup_enabled: self.slot_cleanup_enabled,
+            slot_sweep_lock_key: self.slot_sweep_lock_key.clone(),
             slot_cleanup_age: self.slot_cleanup_age,
+            slot_sweep_interval: self.slot_sweep_interval,
+            slot_cleanup_startup_timeout: self.slot_cleanup_startup_timeout,
             publication: self.publication.clone(),
             schemas: self.schemas.clone(),
             snapshot_rotation: self.snapshot_rotation,
@@ -523,6 +562,126 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| (*value).to_owned()),
         })
+    }
+
+    fn cleanup_config(vars: &[(&str, &str)]) -> Result<Config, String> {
+        let mut vars = vars.to_vec();
+        vars.push(("STREAMGRES_SLOT_CLEANUP_AGE_MS", "1000"));
+        let config = config(&vars)?;
+        config.engine_settings().validate_slot_cleanup()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn sweep_lock_key_is_configurable() {
+        assert_eq!(
+            config(&[]).unwrap().slot_sweep_lock_key,
+            threads::DEFAULT_SWEEP_LOCK_KEY
+        );
+        assert_eq!(
+            cleanup_config(&[("STREAMGRES_SLOT_SWEEP_LOCK_KEY", "")])
+                .unwrap()
+                .slot_sweep_lock_key,
+            threads::DEFAULT_SWEEP_LOCK_KEY
+        );
+        let custom = "orders:cleanup:掃除'";
+        let configured = cleanup_config(&[("STREAMGRES_SLOT_SWEEP_LOCK_KEY", custom)]).unwrap();
+        assert_eq!(configured.slot_sweep_lock_key, custom);
+        assert_eq!(configured.engine_settings().slot_sweep_lock_key, custom);
+        for invalid in ["   ", "\t", "bad\0key"] {
+            assert!(cleanup_config(&[("STREAMGRES_SLOT_SWEEP_LOCK_KEY", invalid)]).is_err());
+        }
+    }
+
+    #[test]
+    fn startup_slot_cleanup_timeout_is_configurable() {
+        assert_eq!(
+            config(&[]).unwrap().slot_cleanup_startup_timeout,
+            Duration::from_secs(10)
+        );
+        let configured =
+            cleanup_config(&[("STREAMGRES_SLOT_CLEANUP_STARTUP_TIMEOUT_MS", "250")]).unwrap();
+        assert_eq!(
+            configured.engine_settings().slot_cleanup_startup_timeout,
+            Duration::from_millis(250)
+        );
+        for invalid in ["0", "-1", "1.5", "invalid", "18446744073709551615"] {
+            assert!(
+                cleanup_config(&[("STREAMGRES_SLOT_CLEANUP_STARTUP_TIMEOUT_MS", invalid)]).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn slot_cleanup_age_is_configurable() {
+        assert_eq!(config(&[]).unwrap().slot_cleanup_age, Duration::ZERO);
+        for millis in [0, 1, 250, 3_600_000] {
+            let text = millis.to_string();
+            let configured = cleanup_config(&[("STREAMGRES_SLOT_CLEANUP_AGE_MS", &text)]).unwrap();
+            assert_eq!(configured.slot_cleanup_age, Duration::from_millis(millis));
+            assert_eq!(
+                configured.engine_settings().slot_cleanup_age,
+                configured.slot_cleanup_age
+            );
+        }
+        for invalid in ["-1", "1.5", "invalid", "18446744073709551615"] {
+            assert!(cleanup_config(&[("STREAMGRES_SLOT_CLEANUP_AGE_MS", invalid)]).is_err());
+        }
+    }
+
+    #[test]
+    fn slot_sweep_interval_is_configurable() {
+        assert_eq!(
+            config(&[]).unwrap().slot_sweep_interval,
+            Duration::from_secs(60)
+        );
+        for millis in [1, 250, 120_000, 3_600_000] {
+            let text = millis.to_string();
+            let configured =
+                cleanup_config(&[("STREAMGRES_SLOT_SWEEP_INTERVAL_MS", &text)]).unwrap();
+            assert_eq!(
+                configured.slot_sweep_interval,
+                Duration::from_millis(millis)
+            );
+            assert_eq!(
+                configured.engine_settings().slot_sweep_interval,
+                configured.slot_sweep_interval
+            );
+        }
+        for invalid in ["0", "-1", "1.5", "invalid", "18446744073709551615"] {
+            assert!(cleanup_config(&[("STREAMGRES_SLOT_SWEEP_INTERVAL_MS", invalid)]).is_err());
+        }
+    }
+
+    #[test]
+    fn slot_cleanup_can_be_disabled() {
+        assert!(config(&[]).unwrap().slot_cleanup_enabled);
+        let disabled = cleanup_config(&[("STREAMGRES_SLOT_CLEANUP_ENABLED", "false")]).unwrap();
+        assert!(!disabled.slot_cleanup_enabled);
+        assert!(!disabled.engine_settings().slot_cleanup_enabled);
+        assert!(
+            cleanup_config(&[("STREAMGRES_SLOT_CLEANUP_ENABLED", "true")])
+                .unwrap()
+                .slot_cleanup_enabled
+        );
+        for disabled in [
+            ("STREAMGRES_SLOT_CLEANUP_ENABLED", "false"),
+            ("STREAMGRES_SLOT_CLEANUP_AGE_MS", "0"),
+        ] {
+            assert!(
+                cleanup_config(&[
+                    disabled,
+                    ("STREAMGRES_SLOT_SWEEP_INTERVAL_MS", "invalid"),
+                    ("STREAMGRES_SLOT_SWEEP_LOCK_KEY", "  ")
+                ])
+                .is_ok()
+            );
+        }
+        for invalid in ["1", "0", "on", "off", "invalid"] {
+            let error =
+                cleanup_config(&[("STREAMGRES_SLOT_CLEANUP_ENABLED", invalid)]).unwrap_err();
+            assert!(error.contains("must be true or false"));
+        }
     }
 
     #[test]
@@ -615,17 +774,6 @@ mod tests {
         );
         let error = config(&[("STREAMGRES_METRICS_PREFIX", "bad-prefix")]).unwrap_err();
         assert!(error.contains("STREAMGRES_METRICS_PREFIX"), "{error}");
-    }
-
-    #[test]
-    fn inactive_slot_cleanup_is_off_unless_an_age_is_set() {
-        assert_eq!(config(&[]).unwrap().slot_cleanup_age, Duration::ZERO);
-        let config = config_with(&[("STREAMGRES_SLOT_CLEANUP_AGE_MS", "3600000")]);
-        assert_eq!(config.slot_cleanup_age, Duration::from_secs(3600));
-        assert_eq!(
-            config.engine_settings().slot_cleanup_age,
-            Duration::from_secs(3600)
-        );
     }
 
     #[test]

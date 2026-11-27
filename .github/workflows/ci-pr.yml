@@ -80,6 +80,26 @@ jobs:
       - name: Unit, scenario, randomized and live PostgreSQL tests
         run: cargo test --release --locked
 
+      - name: Slot cleanup tests
+        run: |
+          (
+            while true; do
+              docker exec pg psql -U postgres -d postgres -qc 'SELECT pg_log_standby_snapshot()' >/dev/null
+              sleep 0.5
+            done
+          ) &
+          heartbeat_pid=$!
+          trap 'kill "$heartbeat_pid" 2>/dev/null || true; wait "$heartbeat_pid" 2>/dev/null || true' EXIT
+          cargo test --release --locked --test slot_cleanup -- --ignored --test-threads=1
+
+      - name: PostgreSQL 16 feed startup and reconnect
+        env:
+          STREAMGRES_PG_DSN: postgresql://postgres:postgres@localhost:5433/postgres
+        run: |
+          docker run -d --name pg16 -e POSTGRES_PASSWORD=postgres -p 5433:5432 postgres:16 -c wal_level=logical
+          until docker exec pg16 pg_isready -h 127.0.0.1 -U postgres; do sleep 1; done
+          cargo test --release --locked --test slot_cleanup feed_opens_and_reconnects_with_cleanup_disabled -- --ignored --exact
+
   perf:
     name: Benchmark against the base branch (performance)
     runs-on: ubuntu-latest

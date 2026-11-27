@@ -178,27 +178,26 @@ const DRAIN_GRACE: Duration = Duration::from_secs(5);
 /// do not reconnect in the same instant.
 const DRAIN_STAGGER_MS: u64 = 3_000;
 
-/// Resolves on ctrl-c or, on unix, `SIGTERM` (what `docker stop` sends).
-async fn signalled() {
+/// Register before engine startup so a rollout can cancel snapshot initialization.
+pub(super) fn watch_signals(shutdown: Shutdown) -> Result<tokio::task::JoinHandle<()>, String> {
     #[cfg(unix)]
-    {
+    let waiting = {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut terminate = match signal(SignalKind::terminate()) {
-            Ok(terminate) => terminate,
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
+        let mut term =
+            signal(SignalKind::terminate()).map_err(|e| format!("SIGTERM listener: {e}"))?;
+        let mut interrupt =
+            signal(SignalKind::interrupt()).map_err(|e| format!("SIGINT listener: {e}"))?;
+        async move {
+            tokio::select! { _ = term.recv() => (), _ = interrupt.recv() => () }
         }
-    }
+    };
     #[cfg(not(unix))]
-    {
+    let waiting = async {
         let _ = tokio::signal::ctrl_c().await;
-    }
+    };
+    Ok(tokio::spawn(async move {
+        tokio::select! { _ = waiting => shutdown.request(), _ = shutdown.wait() => () }
+    }))
 }
 
 /// Where in the stagger window this connection says goodbye: a hash of
@@ -212,6 +211,13 @@ fn goodbye_after(wsid: &str) -> Duration {
 
 /// Bind and serve until ctrl-c.
 pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
+    let signals = watch_signals(state.shutdown.clone())?;
+    let result = serve_until_shutdown(state).await;
+    signals.abort();
+    result
+}
+
+pub(super) async fn serve_until_shutdown(state: Arc<AppState>) -> Result<(), String> {
     let address = state.config.bind.clone();
     let listener = tokio::net::TcpListener::bind(&address)
         .await
@@ -229,15 +235,9 @@ pub async fn serve(state: Arc<AppState>) -> Result<(), String> {
     let shutdown = state.shutdown.clone();
     let serving_shutdown = shutdown.clone();
     let serving = axum::serve(listener, router(state)).with_graceful_shutdown(async move {
-        let signalled = tokio::select! {
-            _ = signalled() => true,
-            _ = serving_shutdown.wait() => false,
-        };
+        serving_shutdown.wait().await;
         log_info!("shutting down: closing the clients, {DRAIN_GRACE:?} at most");
         warm.save();
-        if signalled {
-            serving_shutdown.request();
-        }
     });
     let grace = async {
         shutdown.wait().await;
@@ -1515,5 +1515,4 @@ mod tests {
             assert_eq!(reply[1]["kind"], "PushFailed", "{response}");
         }
     }
-
 }

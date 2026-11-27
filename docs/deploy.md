@@ -10,7 +10,7 @@ For a local first run, see the README's Quick start.
 
 ## 1. What you need
 
-- **PostgreSQL** with `wal_level = logical`. It can be a primary, a logical
+- **PostgreSQL 16+** with `wal_level = logical`. It can be a primary, a logical
   replica, or a physical standby on PostgreSQL 16+. Section 3 has the details.
 - **An application server** with two HTTP endpoints. The *query* endpoint turns
   a query name and its arguments into a query AST. The *mutate* endpoint
@@ -78,8 +78,10 @@ branch name and the short commit SHA.
   for its change feed, `xyne_sync_slot_<uuid>`, plus short-lived ones,
   `xyne_sync_snap_*`, behind its read snapshots.
 - **Spare connections.** Without PgBouncer, allow about
-  `STREAMGRES_READ_CONNECTIONS` direct read connections, plus the feed and a
-  few snapshot-minting connections. With PgBouncer, size PostgreSQL's read
+  `STREAMGRES_READ_CONNECTIONS` direct read connections, the feed, its dedicated slot-owner
+  connection, one startup guard until the first feed event, and the snapshot-minting
+  connections. An enabled cleaner also uses
+  one short-lived SQL connection while it attempts a sweep. With PgBouncer, size PostgreSQL's read
   connection budget for PgBouncer's server pool instead.
 - **A role** with `REPLICATION` and `SELECT` on the served schemas.
 - **A direct connection for replication.** `STREAMGRES_PG_DSN` connects
@@ -90,8 +92,7 @@ The change feed writes nothing to the database it follows. Its position comes
 from commits and PostgreSQL keepalives. `STREAMGRES_PG_DSN` can point at:
 - the primary,
 - a logical replica, or
-- a physical standby (PostgreSQL 16 or later, the first version that can do
-  logical decoding on a standby).
+- a physical standby on PostgreSQL 16+.
 
 Ordinary SQL reads can optionally use a separate endpoint:
 `STREAMGRES_READ_PG_DSN` may point to PgBouncer configured for transaction
@@ -119,18 +120,88 @@ DDL in that transaction's WAL.
 
 ### Replication slots
 
-- **Each server process creates its own slot** at startup, on the database
-  `STREAMGRES_PG_DSN` names. On `SIGTERM` it drops the slot. A restart needs
-  nothing from the previous slot.
-- **A slot left behind by a crash holds WAL.** Either:
-  - set `STREAMGRES_SLOT_CLEANUP_AGE_MS` so the next startup drops inactive
-    `xyne_sync_slot_*` slots older than that age (needs PostgreSQL 17+, which
-    records `inactive_since`), or
-  - drop them by hand: `SELECT pg_drop_replication_slot('<slot name>');`
-  - Either way, set `max_slot_wal_keep_size` as a safety net.
-- **A process whose slot disappears while it runs stops.** It does not
-  silently recreate the slot, which would skip the changes in between. The
-  restarted process begins on a fresh slot and snapshot.
+- Each process creates a fresh permanent slot before its first snapshot and feed
+  opening. Graceful shutdown stops the feed and attempts to drop its slot. The
+  standalone server registers SIGTERM before starting the engine. A shutdown during
+  snapshot initialization cancels that work and attempts to remove the slot created
+  by this startup. A forced kill or an unavailable database can still leave an orphan.
+- Enabled instances await an initial sweep before creating their slot, within
+  `STREAMGRES_SLOT_CLEANUP_STARTUP_TIMEOUT_MS` (default 10000, positive milliseconds).
+  This total budget includes connection, lock waiting, discovery and deletion. Startup
+  waits for a busy sweeper lock within that budget; timeout/error warns and initialization
+  continues. Shutdown cancels the wait. A guarded background task then handles periodic
+  cleanup, starting after the first configured interval; failed startup/shutdown cancels it.
+  Before scanning, each periodic attempt tries
+  the session advisory lock derived from `STREAMGRES_SLOT_SWEEP_LOCK_KEY`
+  (default `streamgres.slot_cleanup`); a busy attempt skips. The holder
+  retains it for the sweep and releases it afterward. This serializes cooperating
+  cleaners in the same database on the same PostgreSQL server, not across servers.
+  PostgreSQL hashes the bound string with `hashtextextended(key, 0)` into a 64-bit lock
+  key. Every cooperating instance must use the same exact nonblank string. Different
+  names do not coordinate; changing the name does not change the candidate scope.
+  Unset/empty environment values use the default; whitespace-only and NUL values fail
+  validation. Leading/trailing whitespace in otherwise nonblank keys is significant.
+- `STREAMGRES_SLOT_CLEANUP_AGE_MS` is the minimum inactivity age in milliseconds.
+  Zero or unset keeps startup and periodic cleanup disabled, including after an
+  upgrade. Set the same positive value on cleaners in a deployment. PG16 can
+  open and reconnect feeds. If age cleanup is requested on PG16, startup logs
+  a warning and omits both sweeps because PG16 lacks `inactive_since`.
+- Every instance claims its slot name on a dedicated SQL connection before
+  creating the slot and keeps that session across feed disconnects. Budget one
+  extra connection per instance, including instances with sweeping disabled.
+  During startup one additional direct SQL session guards the slot through the first
+  replication event. A cleaner must acquire both slot keys before deletion, so
+  losing the lifetime owner alone during snapshot initialization is recoverable.
+  The owner session sets `idle_session_timeout=0` so quiet feeds retain ownership.
+  While streaming, the engine checks once a second whether its ownership client
+  has closed and tries to reclaim the lock if needed. Healthy checks run locally.
+  Before reopening the feed it checks the slot through the owner session,
+  reclaiming ownership if the session has closed. Session loss releases ownership
+  when PostgreSQL detects disconnect. If both the owner and feed are lost, the
+  configured grace period determines when a peer can reclaim the slot.
+- Discovery considers inactive permanent logical slots with the shared prefix
+  in the current database, excluding synced slots and the cleaner's own slot.
+  For each candidate the cleaner tries both advisory locks for the slot in a short
+  transaction, then rechecks all predicates and the age before dropping.
+  Busy, active and already missing slots are skipped. During a mixed-version
+  rollout, set both `STREAMGRES_SLOT_CLEANUP_ENABLED=false` and age zero
+  until every instance uses the ownership protocol. This also covers earlier
+  development builds that treated zero as immediate eligibility. Then enable
+  cleaning with the desired positive age.
+- `STREAMGRES_SLOT_SWEEP_INTERVAL_MS` sets a positive interval (default 60000).
+  Each wait uses exactly that interval, measured after the previous attempt completes;
+  slow sweeps do not cause catch-up bursts. Integer milliseconds support subsecond through
+  long intervals. `STREAMGRES_SLOT_CLEANUP_ENABLED=false` disables both startup and
+  periodic cleanup. Shutdown and failed startup cancel the background task.
+- PG17+ tracks `inactive_since` automatically. No tracking feature must be enabled.
+  Each sweep uses one short-lived SQL connection for acquiring the shared lock,
+  scanning candidates, and deleting them. Normal SQL errors retain session ownership
+  and continue. Fatal/closed connections and client deadlines discard the session;
+  any replacement must acquire the same lock before continuing. If busy, that attempt
+  ends and periodic cleanup retries later. No cleanup connection remains between attempts.
+- Attempts are bounded individually, not as a whole list: 5 seconds to connect,
+  5 seconds per SQL statement, 1 second for SQL lock waits, and a 30-second client
+  deadline per candidate/metadata operation. Candidate errors log and continue;
+  discovery errors end the attempt. Server deadlines bound already submitted statements.
+  An idle cleaner backend, including one idle in a transaction, expires after 15 seconds.
+  Busy periodic lock attempts are logged. The cleanup
+  DSN must reach PostgreSQL directly or use session pooling, never transaction pooling:
+  session advisory locks require the same PostgreSQL backend throughout the sweep.
+- Own-slot recovery is separate: a valid disconnected feed reconnects with backoff.
+  Confirmed missing/invalid own-slot state stops the standalone server so an external
+  restart creates a fresh slot and snapshot. Inspection errors do not establish slot
+  loss. Engine-only rebuilding is not implemented by this change.
+- The shared lock limits concurrent scans, not their total frequency: instances may
+  take turns scanning within one interval. Large fleets should use a longer interval
+  or enable cleanup on a subset. Final eligibility checks scan the slot view per
+  candidate, so cleanup work increases with both slot count and candidate count.
+  Initial cleanup adds up to its configured budget to initialization: include that in
+  startup-probe budgets. It is best effort; timeout, insufficiently old candidates, or
+  DB/permission errors can still leave capacity exhausted and slot creation can fail.
+  Already completed drops are not rolled back on timeout. Each waiting startup holds
+  one SQL connection, so large rollouts still need enough connection capacity. Slots from separate applications sharing this prefix/database share the cleanup scope; the
+  shortest configured age can determine retention. Active lagging slots are never
+  reclaimed by this inactivity policy, so it is not a WAL/disk usage cap.
 
 ### Physical standbys
 
@@ -253,7 +324,11 @@ depend on what the defaults happen to be:
 | `STREAMGRES_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams |
 | `STREAMGRES_FORWARD_COOKIES` | `true` | forward the connection's cookies to the application server |
 | `STREAMGRES_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is created |
-| `STREAMGRES_SLOT_CLEANUP_AGE_MS` | `0` (off) | at startup, drop inactive slots of ended processes older than this (PostgreSQL 17+) |
+| `STREAMGRES_SLOT_SWEEP_LOCK_KEY` | `streamgres.slot_cleanup` | shared string identifying the advisory lock; identical across cooperating instances |
+| `STREAMGRES_SLOT_CLEANUP_STARTUP_TIMEOUT_MS` | `10000` | total initial cleanup budget in milliseconds, including lock contention |
+| `STREAMGRES_SLOT_SWEEP_INTERVAL_MS` | `60000` | fixed wait in milliseconds after each completed attempt |
+| `STREAMGRES_SLOT_CLEANUP_ENABLED` | `true` | enable startup and periodic cleanup on this instance |
+| `STREAMGRES_SLOT_CLEANUP_AGE_MS` | `0` | inactivity threshold in milliseconds; zero disables cleanup |
 | `STREAMGRES_READ_TIMEOUT_MS` | `10000` | longest a database read may take before it is cancelled and its query refused. `0` means no limit |
 | `STREAMGRES_BACKEND_TIMEOUT_MS` | `30000` | longest a call to the application server may take. `0` means no limit |
 | `STREAMGRES_PG_KEEPALIVE_IDLE_MS`, `_INTERVAL_MS`, `_RETRIES` | `30000`, `10000`, `3` | TCP keepalive on database connections. `0` idle time turns it off |
