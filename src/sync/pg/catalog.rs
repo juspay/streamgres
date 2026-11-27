@@ -11,14 +11,16 @@
 //! (one left out of it, an unlogged table, a partition published through
 //! its root) or a column it does not send (a generated column) would be
 //! read once and never changed again, so neither is carried. A served
-//! table the publication streams only in part (a row filter or a column
-//! list) cannot be followed at all, and the load refuses it.
+//! table the publication streams only in part (a row filter, or a column
+//! list leaving out any column but a generated one) cannot be followed at
+//! all, and the load refuses it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use tokio_postgres::Client;
 
 use super::StorageError;
+use super::publication::{PublicationShape, When};
 use crate::model::{Catalog, DbColumn, DbTable, TableName, ValueType};
 
 /// What the load left out and why, one line per table or column: a
@@ -31,32 +33,25 @@ pub struct Notes {
 }
 
 /// Read the catalog through `client`: the tables `publication` streams in
-/// `schemas`. An error when the publication does not exist, or streams a
-/// table of `schemas` with a row filter or a column list.
+/// `schemas`. An error when the publication does not exist or breaks one
+/// of the publication rules ([`PublicationShape::check`]).
 pub async fn load_catalog(
     client: &Client,
     publication: &str,
     schemas: &[String],
 ) -> Result<(Catalog, Notes), StorageError> {
-    if client
-        .query_opt(
-            "SELECT 1 FROM pg_publication WHERE pubname = $1",
-            &[&publication],
-        )
-        .await?
-        .is_none()
-    {
+    let Some(shape) = PublicationShape::read(client, publication, schemas).await? else {
         return Err(StorageError(format!(
             "publication `{publication}` does not exist on the database the change feed follows"
         )));
-    }
+    };
+    shape.check(When::Startup).map_err(StorageError)?;
     let columns = client
         .query(
             "SELECT c.table_schema::text, c.table_name::text, c.column_name::text,
                     c.data_type::text, c.udt_name::text,
                     c.column_name::name = ANY (p.attnames) AS published,
-                    c.is_generated::text <> 'NEVER' AS generated,
-                    p.rowfilter IS NOT NULL AS filtered
+                    c.is_generated::text <> 'NEVER' AS generated
              FROM pg_publication_tables p
              JOIN information_schema.columns c
                ON c.table_schema = p.schemaname AND c.table_name = p.tablename
@@ -121,8 +116,6 @@ pub async fn load_catalog(
         }
     }
     let mut declared: BTreeMap<(String, String), Vec<DbColumn>> = BTreeMap::new();
-    let mut filtered: BTreeSet<String> = BTreeSet::new();
-    let mut narrowed: BTreeSet<String> = BTreeSet::new();
     for row in &columns {
         let schema: String = row.get(0);
         let table: String = row.get(1);
@@ -131,16 +124,12 @@ pub async fn load_catalog(
         let udt_name: String = row.get(4);
         let published: bool = row.get(5);
         let generated: bool = row.get(6);
-        if row.get::<_, bool>(7) {
-            filtered.insert(format!("{schema}.{table}"));
-        }
         if !published {
+            // The publication rules refuse any other column left out.
             if generated {
                 notes.warnings.push(format!(
                     "{schema}.{table}.{column}: a generated column the publication does not send; left out"
                 ));
-            } else {
-                narrowed.insert(format!("{schema}.{table}"));
             }
             continue;
         }
@@ -152,23 +141,11 @@ pub async fn load_catalog(
             )),
         }
     }
-    if !filtered.is_empty() {
-        return Err(StorageError(format!(
-            "publication `{publication}` streams {} with a row filter: rows outside it would be read once and never updated; remove the filter",
-            filtered.into_iter().collect::<Vec<_>>().join(", ")
-        )));
-    }
-    if !narrowed.is_empty() {
-        return Err(StorageError(format!(
-            "publication `{publication}` streams {} with a column list: clients expect every column; remove the column list",
-            narrowed.into_iter().collect::<Vec<_>>().join(", ")
-        )));
-    }
     let mut tables = Vec::new();
     for ((schema, table), columns) in declared {
         let Some(pkey) = pkeys.get(&(schema.clone(), table.clone())) else {
             notes
-                .info
+                .warnings
                 .push(format!("{schema}.{table}: no primary key, left out"));
             continue;
         };
@@ -182,18 +159,12 @@ pub async fn load_catalog(
             continue;
         }
         tables.push(DbTable::new(
-            table_name(&schema, &table),
+            TableName::of(&schema, &table),
             pkey.iter().map(String::as_str),
             columns,
         ));
     }
     Ok((Catalog::new(tables), notes))
-}
-
-/// The catalog name of a table ([`TableName::of`]): bare in `public`,
-/// schema-qualified elsewhere, quoted when a part holds a dot or quote.
-pub fn table_name(schema: &str, table: &str) -> String {
-    TableName::of(schema, table).as_str().to_owned()
 }
 
 /// The engine's type for a Postgres column, from `information_schema`'s
@@ -279,9 +250,6 @@ mod tests {
         assert_eq!(value_type("bigint", "int8"), Some(ValueType::Int));
         assert_eq!(value_type("numeric", "numeric"), Some(ValueType::Float));
         assert_eq!(value_type("bytea", "bytea"), None);
-        assert_eq!(table_name("public", "tickets"), "tickets");
-        assert_eq!(table_name("xyne_0", "clients"), "xyne_0.clients");
-        assert_eq!(table_name("public", "a.b"), "\"public\".\"a.b\"");
     }
 
     /// The catalog carries what the publication streams and nothing it
@@ -300,8 +268,10 @@ mod tests {
         let connection = tokio::spawn(connection);
         let tag = uuid::Uuid::new_v4().simple().to_string();
         let schema = format!("sgcat{tag}");
-        let [whole, filtered, narrowed, single] =
-            ["whole", "filtered", "narrowed", "single"].map(|kind| format!("sgcat_{kind}_{tag}"));
+        let [whole, filtered, narrowed, listed, single, inserts, leaves] = [
+            "whole", "filtered", "narrowed", "listed", "single", "inserts", "leaves",
+        ]
+        .map(|kind| format!("sgcat_{kind}_{tag}"));
         client
             .batch_execute(&format!(
                 r#"CREATE SCHEMA "{schema}";
@@ -317,9 +287,17 @@ mod tests {
                    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
                  CREATE PUBLICATION "{whole}" FOR TABLES IN SCHEMA "{schema}"
                    WITH (publish_via_partition_root = true);
-                 CREATE PUBLICATION "{filtered}" FOR TABLE "{schema}".plain WHERE (id > 0);
-                 CREATE PUBLICATION "{narrowed}" FOR TABLE "{schema}".plain (id);
-                 CREATE PUBLICATION "{single}" FOR TABLE "{schema}".plain;"#
+                 CREATE PUBLICATION "{filtered}" FOR TABLE "{schema}".plain WHERE (id > 0)
+                   WITH (publish_via_partition_root = true);
+                 CREATE PUBLICATION "{narrowed}" FOR TABLE "{schema}".plain (id)
+                   WITH (publish_via_partition_root = true);
+                 CREATE PUBLICATION "{listed}" FOR TABLE "{schema}".plain (id, name)
+                   WITH (publish_via_partition_root = true);
+                 CREATE PUBLICATION "{single}" FOR TABLE "{schema}".plain
+                   WITH (publish_via_partition_root = true);
+                 CREATE PUBLICATION "{inserts}" FOR TABLE "{schema}".plain
+                   WITH (publish = 'insert', publish_via_partition_root = true);
+                 CREATE PUBLICATION "{leaves}" FOR TABLE "{schema}".plain;"#
             ))
             .await
             .unwrap();
@@ -338,7 +316,7 @@ mod tests {
             assert!(warned(".scratch: unlogged"), "{notes:?}");
             assert!(warned(".plain.total: a generated column"), "{notes:?}");
             assert!(told(".events_jan: a partition"), "{notes:?}");
-            assert!(told(".keyless: no primary key"), "{notes:?}");
+            assert!(warned(".keyless: no primary key"), "{notes:?}");
 
             let (catalog, notes) = load_catalog(&client, &single, &schemas).await.unwrap();
             let names: Vec<_> = catalog.tables().map(|table| table.name.to_string()).collect();
@@ -352,9 +330,40 @@ mod tests {
             );
 
             let error = load_catalog(&client, &filtered, &schemas).await.unwrap_err();
-            assert!(error.0.contains("row filter"), "{error:?}");
+            assert!(
+                error
+                    .0
+                    .contains(&format!("has a row filter on `{schema}.plain` (id > 0)")),
+                "{error:?}"
+            );
+            let error = load_catalog(&client, &inserts, &schemas).await.unwrap_err();
+            assert!(
+                error
+                    .0
+                    .contains("does not publish update, delete, truncate"),
+                "{error:?}"
+            );
+            let error = load_catalog(&client, &leaves, &schemas).await.unwrap_err();
+            assert!(
+                error
+                    .0
+                    .contains("does not publish partitioned tables through their root"),
+                "{error:?}"
+            );
             let error = load_catalog(&client, &narrowed, &schemas).await.unwrap_err();
-            assert!(error.0.contains("column list"), "{error:?}");
+            assert!(
+                error
+                    .0
+                    .contains(&format!("leaves out columns of `{schema}.plain` (name)")),
+                "{error:?}"
+            );
+            // A list naming every column but the generated one leaves out
+            // nothing PostgreSQL would otherwise send.
+            let (catalog, _) = load_catalog(&client, &listed, &schemas).await.unwrap();
+            let plain = catalog.table(&format!("{schema}.plain")).unwrap();
+            let mut columns: Vec<_> = plain.columns.keys().map(|name| name.to_string()).collect();
+            columns.sort();
+            assert_eq!(columns, ["id", "name"]);
             let error = load_catalog(&client, &format!("sgcat_missing_{tag}"), &schemas)
                 .await
                 .unwrap_err();
@@ -363,7 +372,7 @@ mod tests {
         let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(outcome)).await;
         client
             .batch_execute(&format!(
-                r#"DROP PUBLICATION "{whole}", "{filtered}", "{narrowed}", "{single}";
+                r#"DROP PUBLICATION "{whole}", "{filtered}", "{narrowed}", "{listed}", "{single}", "{inserts}", "{leaves}";
                  DROP SCHEMA "{schema}" CASCADE;"#
             ))
             .await

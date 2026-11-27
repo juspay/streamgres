@@ -7,6 +7,7 @@ use tokio_postgres::{NoTls, Transaction};
 
 use super::Config;
 use super::ddl_triggers::{self, FunctionSpec};
+use crate::sync::pg::publication::{PublicationShape, When};
 use crate::sync::pg::sql::quote_ident;
 
 const SETUP_LOCK: i64 = 0x5354_524d_4752_4553;
@@ -123,34 +124,11 @@ async fn ensure_locked(tx: &Transaction<'_>, config: &Config, schema: &str) -> R
     }
 
     let publication = &config.publication;
-    let existing = tx
-        .query_opt(
-            "SELECT pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot
-             FROM pg_publication WHERE pubname = $1",
-            &[publication],
-        )
+    let existing = PublicationShape::read(tx, publication, &config.schemas)
         .await
         .map_err(|error| format!("checking publication `{publication}`: {error}"))?;
-    if let Some(row) = existing {
-        let missing: Vec<&str> = ["insert", "update", "delete", "truncate"]
-            .into_iter()
-            .zip(0..)
-            .filter(|(_, column)| !row.get::<_, bool>(*column))
-            .map(|(kind, _)| kind)
-            .collect();
-        if !missing.is_empty() {
-            return Err(format!(
-                "publication `{publication}` does not publish {}, so those changes would never reach clients; run on the primary: ALTER PUBLICATION {} SET (publish = 'insert, update, delete, truncate')",
-                missing.join(", "),
-                quote_ident(publication)
-            ));
-        }
-        if !row.get::<_, bool>(4) {
-            return Err(format!(
-                "publication `{publication}` publishes partitions under their own names; the catalog serves partitioned tables through their root, so run on the primary: ALTER PUBLICATION {} SET (publish_via_partition_root = true)",
-                quote_ident(publication)
-            ));
-        }
+    if let Some(shape) = existing {
+        shape.check(When::Startup)?;
         let published = tx
             .query(
                 "SELECT tablename FROM pg_publication_tables
@@ -746,6 +724,78 @@ mod tests {
             .unwrap();
         drop(client);
         connection.await.unwrap().unwrap();
+    }
+
+    /// Setup refuses a publication that breaks a publication rule before
+    /// it changes anything: a row filter on a served table, here. The
+    /// publication is left as it was, without the mutation tables, and
+    /// the mutation schema is not created.
+    #[tokio::test]
+    async fn setup_refuses_a_row_filter_on_a_served_table_and_changes_nothing() {
+        let Ok(dsn) = std::env::var("STREAMGRES_SETUP_TEST_DSN") else {
+            return;
+        };
+        let _alone = DATABASE.lock().await;
+        let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        let connection = tokio::spawn(connection);
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let app = format!("sgfilter{tag}");
+        let schema = format!("{app}_0");
+        let publication = format!("{app}_pub");
+        let table = format!("sgfiltered{tag}");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{t} (id bigint PRIMARY KEY);
+                 CREATE PUBLICATION {p} FOR TABLE public.{t} WHERE (id > 0)
+                   WITH (publish_via_partition_root = true)",
+                t = quote_ident(&table),
+                p = quote_ident(&publication)
+            ))
+            .await
+            .unwrap();
+        let config = Config::from_lookup(|name| match name {
+            "STREAMGRES_PG_DSN" | "STREAMGRES_MASTER_PG_DSN" => Some(dsn.clone()),
+            "STREAMGRES_QUERY_URL" => Some("http://localhost/query".to_owned()),
+            "STREAMGRES_MUTATE_URL" => Some("http://localhost/push".to_owned()),
+            "STREAMGRES_APP_ID" => Some(app.clone()),
+            "STREAMGRES_SCHEMAS" => Some(format!("public,{schema}")),
+            "STREAMGRES_PUBLICATION" => Some(publication.clone()),
+            _ => None,
+        })
+        .unwrap();
+        let outcome = ensure(&dsn, &config).await;
+        let published: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_publication_tables WHERE pubname = $1",
+                &[&publication],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let created = client
+            .query_opt("SELECT 1 FROM pg_namespace WHERE nspname = $1", &[&schema])
+            .await
+            .unwrap()
+            .is_some();
+        client
+            .batch_execute(&format!(
+                "DROP PUBLICATION {}; DROP TABLE public.{}; DROP SCHEMA IF EXISTS {} CASCADE",
+                quote_ident(&publication),
+                quote_ident(&table),
+                quote_ident(&schema)
+            ))
+            .await
+            .unwrap();
+        drop(client);
+        connection.await.unwrap().unwrap();
+
+        let error = outcome.unwrap_err();
+        assert!(
+            error.contains(&format!("has a row filter on `{table}` (id > 0)")),
+            "{error}"
+        );
+        assert_eq!(published, 1, "the mutation tables were not added");
+        assert!(!created, "the mutation schema was not created");
     }
 
     #[tokio::test]

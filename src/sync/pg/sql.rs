@@ -328,10 +328,8 @@ pub fn quote_table(name: &str) -> String {
     format!("{}.{}", quote_ident(&schema), quote_ident(&table))
 }
 
-/// A double-quoted identifier.
-pub fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
+/// A double-quoted identifier, by the same rule [`TableName`] quotes with.
+pub use crate::model::schema::quote_ident;
 
 /// The filter tree as a boolean expression in `scope`.
 fn render_where(filter: &Where, scope: &Scope<'_>) -> String {

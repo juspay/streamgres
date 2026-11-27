@@ -18,8 +18,8 @@ use std::collections::{HashMap, HashSet};
 use serde::Deserialize;
 use tokio_postgres::Client;
 
-use super::catalog::{scalar_type, table_name};
-use super::sql::quote_ident;
+use super::catalog::scalar_type;
+use super::publication::{PublicationShape, When};
 use super::text;
 use crate::ivm::SchemaChange;
 use crate::model::{Catalog, DbColumn, DbTable, TableName, Value, ValueType};
@@ -72,7 +72,8 @@ pub struct PublishedSchema {
 }
 
 /// What a publication sends: its change types and whether a partitioned
-/// table's changes come under its root's name.
+/// table's changes come under its root's name, which the publication
+/// rules ([`PublicationShape::check`]) look at.
 #[derive(Debug, Deserialize)]
 pub struct PublicationFlags {
     pub insert: bool,
@@ -84,34 +85,25 @@ pub struct PublicationFlags {
 }
 
 impl PublicationFlags {
-    /// Why the change feed could no longer follow its tables under these
-    /// flags, with the command that restores them; `None` when it can.
-    /// The rule setup applies before the server starts.
-    fn broken(&self, name: &str) -> Option<String> {
-        let missing: Vec<&str> = [
-            ("insert", self.insert),
-            ("update", self.update),
-            ("delete", self.delete),
-            ("truncate", self.truncate),
-        ]
-        .into_iter()
-        .filter(|(_, on)| !on)
-        .map(|(kind, _)| kind)
-        .collect();
-        if !missing.is_empty() {
-            return Some(format!(
-                "publication `{name}` no longer publishes {}, so those changes would never arrive; restore it with ALTER PUBLICATION {} SET (publish = 'insert, update, delete, truncate')",
-                missing.join(", "),
-                quote_ident(name)
-            ));
+    /// The shape the publication rules look at: these flags of
+    /// publication `name`, the served tables it streams with a row
+    /// filter, and those whose columns it leaves out.
+    fn shape(
+        &self,
+        name: &str,
+        filtered: Vec<(TableName, String)>,
+        left_out: Vec<(TableName, Vec<String>)>,
+    ) -> PublicationShape {
+        PublicationShape {
+            name: name.to_owned(),
+            insert: self.insert,
+            update: self.update,
+            delete: self.delete,
+            truncate: self.truncate,
+            via_root: self.via_root,
+            filtered,
+            left_out,
         }
-        if !self.via_root {
-            return Some(format!(
-                "publication `{name}` no longer publishes partitioned tables through their root, so their changes would arrive under the partitions' names; restore it with ALTER PUBLICATION {} SET (publish_via_partition_root = true)",
-                quote_ident(name)
-            ));
-        }
-        None
     }
 }
 
@@ -129,11 +121,15 @@ pub struct PublishedTable {
     pub publications: HashMap<String, TablePublication>,
 }
 
-/// How one publication publishes a table: its row filter, if any.
+/// How one publication publishes a table: its row filter, if any, and
+/// the table's columns its column list leaves out (generated ones aside),
+/// in table order.
 #[derive(Debug, Deserialize)]
 pub struct TablePublication {
     #[serde(rename = "rowFilter")]
     pub row_filter: Option<String>,
+    #[serde(rename = "leftOut", default)]
+    pub left_out: Vec<String>,
 }
 
 /// One published column: its type as `pg_type` names it (an array as
@@ -169,8 +165,8 @@ impl DdlMessage {
 
 impl PublishedTable {
     /// The catalog name of the table.
-    pub fn catalog_name(&self) -> String {
-        table_name(&self.schema, &self.name)
+    pub fn catalog_name(&self) -> TableName {
+        TableName::of(&self.schema, &self.name)
     }
 
     /// The table as the catalog would carry it: its carriable columns and
@@ -369,22 +365,24 @@ pub fn classify(
     let served = |table: &PublishedTable| schemas.contains(&table.schema);
     let mut publications: Vec<_> = after.publications.iter().collect();
     publications.sort_by(|a, b| a.0.cmp(b.0));
+    let mut tables: Vec<&PublishedTable> = after.tables.iter().filter(|table| served(table)).collect();
+    tables.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
     for (name, flags) in publications {
-        if let Some(reason) = flags.broken(name) {
-            return Err(reason);
-        }
+        let published = || {
+            tables
+                .iter()
+                .filter_map(|table| Some((table.catalog_name(), table.publications.get(name)?)))
+        };
+        let filtered = published()
+            .filter_map(|(table, publication)| Some((table, publication.row_filter.clone()?)))
+            .collect();
+        let left_out = published()
+            .filter(|(_, publication)| !publication.left_out.is_empty())
+            .map(|(table, publication)| (table, publication.left_out.clone()))
+            .collect();
+        flags.shape(name, filtered, left_out).check(When::Live)?;
     }
-    for table in after.tables.iter().filter(|table| served(table)) {
-        for (publication, entry) in &table.publications {
-            if let Some(filter) = &entry.row_filter {
-                return Err(format!(
-                    "table `{}` is now published by `{publication}` with a row filter ({filter}), so rows outside it would never be updated; remove the filter",
-                    table.catalog_name()
-                ));
-            }
-        }
-    }
-    let before: HashMap<String, &PublishedTable> = message
+    let before: HashMap<TableName, &PublishedTable> = message
         .previous
         .iter()
         .flat_map(|schema| schema.tables.iter())
@@ -393,11 +391,11 @@ pub fn classify(
         .collect();
     let mut changes = Vec::new();
     let mut catalog_now = catalog.clone();
-    let mut present: HashSet<String> = HashSet::new();
+    let mut present: HashSet<TableName> = HashSet::new();
     for table in after.tables.iter().filter(|table| served(table)) {
         let name = table.catalog_name();
         present.insert(name.clone());
-        match catalog.table(&name) {
+        match catalog.table(name.as_str()) {
             None => {
                 if before.contains_key(&name) {
                     continue;
@@ -413,7 +411,7 @@ pub fn classify(
             Some(held) => {
                 for change in column_changes(held, table)? {
                     if let SchemaChange::ColumnAdded { column, .. } = &change
-                        && let Some(current) = catalog_now.table(&name)
+                        && let Some(current) = catalog_now.table(name.as_str())
                     {
                         catalog_now =
                             with_table(&catalog_now, with_column(current, column.clone()));
@@ -424,7 +422,7 @@ pub fn classify(
         }
     }
     for (name, _) in before {
-        if !present.contains(&name) && catalog.table(&name).is_some() {
+        if !present.contains(&name) && catalog.table(name.as_str()).is_some() {
             return Err(format!("table `{name}` was removed or renamed"));
         }
     }
@@ -770,7 +768,10 @@ mod tests {
         )
         .expect_err("a filtered served table");
         assert!(error.contains("`tickets`"), "{error}");
-        assert!(error.contains("row filter ((id > 0))"), "{error}");
+        assert!(
+            error.contains("now has a row filter on `tickets` (id > 0)"),
+            "{error}"
+        );
 
         let elsewhere = filtered.replace(r#""schema": "public""#, r#""schema": "audit""#);
         let unserved = classify(
@@ -779,6 +780,51 @@ mod tests {
             &message_with_publications(&tickets, &format!("{tickets}, {elsewhere}"), &flags_without("")),
         )
         .expect("a filter outside the served schemas");
+        assert!(unserved.changes.is_empty());
+    }
+
+    /// A served table whose column list leaves out a column, whether the
+    /// list was narrowed or a column was added the list does not name,
+    /// stops the feed naming the columns; a list naming every column, or
+    /// one on a table of a schema the server does not serve, changes
+    /// nothing.
+    #[test]
+    fn a_column_left_out_of_a_served_table_stops_the_feed() {
+        let tickets = published("tickets", TICKETS, &["id"]);
+        let listed = |left_out: &str| {
+            tickets.replace(
+                r#""publications": {}"#,
+                &format!(r#""publications": {{"pub": {{"rowFilter": null, "leftOut": [{left_out}]}}}}"#),
+            )
+        };
+        let narrowed = listed(r#""description""#);
+        assert_ne!(tickets, narrowed, "the payload carries the list");
+        let error = classify(
+            &catalog(),
+            &["public".into()],
+            &message_with_publications(&tickets, &narrowed, &flags_without("")),
+        )
+        .expect_err("a column left out");
+        assert!(
+            error.contains("publication `pub` now leaves out columns of `tickets` (description)"),
+            "{error}"
+        );
+
+        let whole = classify(
+            &catalog(),
+            &["public".into()],
+            &message_with_publications(&tickets, &listed(""), &flags_without("")),
+        )
+        .expect("a list naming every column");
+        assert!(whole.changes.is_empty());
+
+        let elsewhere = narrowed.replace(r#""schema": "public""#, r#""schema": "audit""#);
+        let unserved = classify(
+            &catalog(),
+            &["public".into()],
+            &message_with_publications(&tickets, &format!("{tickets}, {elsewhere}"), &flags_without("")),
+        )
+        .expect("a list outside the served schemas");
         assert!(unserved.changes.is_empty());
     }
 

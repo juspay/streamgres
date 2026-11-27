@@ -52,6 +52,7 @@ pub mod catalog;
 pub mod ddl;
 pub mod estimate;
 pub mod estimate_cache;
+pub mod publication;
 pub mod replication;
 pub mod sql;
 pub mod stream;

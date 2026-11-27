@@ -155,6 +155,10 @@ WITH published_columns AS (SELECT
   pg_get_expr(pd.adbin, pd.adrelid) as "dflt",
   NULLIF(ARRAY_POSITION(conkey, attnum), -1) AS "keyPos",
   pb.rowfilter as "rowFilter",
+  ARRAY(SELECT a.attname::text FROM pg_attribute a
+    WHERE a.attrelid = pc.oid AND a.attnum > 0 AND NOT a.attisdropped
+      AND a.attgenerated = '' AND NOT (a.attname = ANY(pb.attnames))
+    ORDER BY a.attnum) AS "leftOut",
   pb.pubname as "publication"
 FROM pg_attribute
 JOIN pg_class pc ON pc.oid = attrelid
@@ -207,7 +211,7 @@ tables AS (SELECT json_build_object(
   'publications', json_object_agg(
     DISTINCT
     "publication",
-    jsonb_build_object('rowFilter', "rowFilter") ORDER BY "publication"
+    jsonb_build_object('rowFilter', "rowFilter", 'leftOut', to_jsonb("leftOut")) ORDER BY "publication"
   )
 ) AS "table", "schema", "name" FROM published_columns
   GROUP BY "schema", "schemaOID", "name", "oid", "replicaIdentity"),

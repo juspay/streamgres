@@ -2232,6 +2232,148 @@ fn a_publication_change_that_breaks_the_feed_stops_it() {
     });
 }
 
+/// A column list that names every column of a served table is followed,
+/// and the feed stops once the publication leaves one out, each way it can
+/// come to: a column added to the table that the list does not name, the
+/// list narrowed, a table added with a list that leaves one out.
+#[test]
+fn a_column_left_out_of_a_served_table_stops_the_feed() {
+    let Some(dsn) = dsn() else { return };
+    block_on_alone(async {
+        let names = Names::new("collist");
+        let client = prepare(&dsn, &names).await;
+        let whole = format!(
+            "{t} (id, status, assigned_to, points), {u}",
+            t = names.tickets,
+            u = names.users
+        );
+        client
+            .batch_execute(&format!(
+                "DROP PUBLICATION \"{p}\";
+                 CREATE PUBLICATION \"{p}\" FOR TABLE {whole}
+                   WITH (publish_via_partition_root = true);
+                 CREATE TABLE {e} (id int8 PRIMARY KEY, note text);
+                 DROP SCHEMA IF EXISTS xscol_0 CASCADE;",
+                p = names.publication,
+                e = names.extra,
+            ))
+            .await
+            .expect("a publication listing every column");
+        client
+            .batch_execute(&trigger_stack_sql("xscol", 0, &[names.publication.as_str()]))
+            .await
+            .expect("install the schema-change trigger stack");
+        let open = || async {
+            Transport::drop_slot_only(&dsn, &names.slot)
+                .await
+                .expect("drop the last feed's slot");
+            let stream = PgStream::open_with(
+                &dsn,
+                &names.slot,
+                &names.publication,
+                Arc::new(names.catalog()),
+                DdlSource {
+                    prefix: "xscol/0/ddl".to_owned(),
+                    schemas: vec!["public".to_owned()],
+                },
+            )
+            .await
+            .expect("open stream");
+            let (transport, mut feed) = stream.split();
+            let (out, transactions) = mpsc::channel(64);
+            let streaming = spawn_local(async move {
+                transport
+                    .stream(Duration::from_millis(50), &mut feed, &[], out)
+                    .await
+            });
+            (streaming, transactions)
+        };
+        async fn stopped(
+            streaming: tokio::task::JoinHandle<Result<(), streamgres::sync::StorageError>>,
+            what: &str,
+        ) -> String {
+            tokio::time::timeout(Duration::from_secs(10), streaming)
+                .await
+                .expect("the feed stops")
+                .expect("the feed task")
+                .expect_err(what)
+                .0
+        }
+
+        let (streaming, mut transactions) = open().await;
+        client
+            .batch_execute(&format!("INSERT INTO {} VALUES (40, 'OPEN', 7, 40)", names.tickets))
+            .await
+            .expect("insert");
+        tokio::time::timeout(Duration::from_secs(10), transactions.recv())
+            .await
+            .expect("a list naming every column is followed")
+            .expect("a transaction");
+        client
+            .batch_execute(&format!("ALTER TABLE {} ADD COLUMN priority int8", names.tickets))
+            .await
+            .expect("add a column the list does not name");
+        let error = stopped(streaming, "a column added outside the list").await;
+        assert!(
+            error.contains(&format!("now leaves out columns of `{}` (priority)", names.tickets)),
+            "{error}"
+        );
+
+        client
+            .batch_execute(&format!("ALTER TABLE {} DROP COLUMN priority", names.tickets))
+            .await
+            .expect("drop the column again");
+        let (streaming, _transactions) = open().await;
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{p}\" SET TABLE {t} (id, status), {u}",
+                p = names.publication,
+                t = names.tickets,
+                u = names.users,
+            ))
+            .await
+            .expect("narrow the list");
+        let error = stopped(streaming, "a narrowed list").await;
+        assert!(
+            error.contains(&format!(
+                "now leaves out columns of `{}` (assigned_to, points)",
+                names.tickets
+            )),
+            "{error}"
+        );
+
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{}\" SET TABLE {whole}",
+                names.publication
+            ))
+            .await
+            .expect("restore the list");
+        let (streaming, _transactions) = open().await;
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{}\" ADD TABLE {} (id)",
+                names.publication, names.extra
+            ))
+            .await
+            .expect("add a table with a narrow list");
+        let error = stopped(streaming, "a table added with a narrow list").await;
+        assert!(
+            error.contains(&format!("now leaves out columns of `{}` (note)", names.extra)),
+            "{error}"
+        );
+
+        let _ = client
+            .batch_execute(
+                "DROP EVENT TRIGGER IF EXISTS xscol_ddl_start_0;
+                 DROP EVENT TRIGGER IF EXISTS xscol_ddl_end_0;
+                 DROP SCHEMA IF EXISTS xscol_0 CASCADE;",
+            )
+            .await;
+        cleanup(&dsn, &client, &names).await;
+    });
+}
+
 /// A publication whose name needs quoting (`xyne_sync_live_Quoted-Pub`)
 /// is followed under its exact name, not the lowercased one PostgreSQL
 /// reads from an unquoted name, and the trigger recognizes a change to it

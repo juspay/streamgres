@@ -43,7 +43,7 @@ impl TableName {
     pub fn of(schema: &str, table: &str) -> TableName {
         let plain = |name: &str| !name.contains(['.', '"']);
         let name = if !plain(schema) || !plain(table) {
-            format!("{}.{}", quoted(schema), quoted(table))
+            format!("{}.{}", quote_ident(schema), quote_ident(table))
         } else if schema == "public" {
             table.to_owned()
         } else {
@@ -75,8 +75,10 @@ impl TableName {
     }
 }
 
-/// `name` double-quoted, with each `"` in it doubled.
-fn quoted(name: &str) -> String {
+/// `name` double-quoted, with each `"` in it doubled: an SQL identifier,
+/// and each part of a [`TableName`] that needs quoting. The one quoting
+/// rule, so table names and the SQL built from them always agree.
+pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 

@@ -114,9 +114,10 @@ replacement; mismatches stop startup. A missing publication is created as
 `FOR TABLES IN SCHEMA` the `STREAMGRES_SCHEMAS` schemas, with
 `publish_via_partition_root = true`. An existing one may have any shape:
 `FOR ALL TABLES`, schemas, tables listed one by one, or a mix. Startup
-requires only that it publishes inserts, updates, deletes and truncates and
-sets `publish_via_partition_root = true`; otherwise it stops with the `ALTER
-PUBLICATION` command that fixes it. The server confirms mutations by following
+requires only that it publishes inserts, updates, deletes and truncates, sets
+`publish_via_partition_root = true`, and sends every column of a served table
+with no row filter (a column list must name every column but generated ones);
+otherwise it stops, before changing anything, and says what to fix. The server confirms mutations by following
 `<app>_<shard>.clients` and `<app>_<shard>.mutations`, which setup creates, so
 setup adds them to the publication when it lacks them. Change an existing publication with `ALTER
 PUBLICATION`: the DDL triggers do not hear `DROP` or `CREATE PUBLICATION`, so
@@ -179,10 +180,12 @@ DDL in that transaction's WAL.
   served.
 - Generated columns are left out with a warning: PostgreSQL does not send
   them in the change feed.
-- A served table that the publication streams with a row filter or a column
-  list stops startup: its rows or columns could not be kept up to date.
-- Tables without a primary key are skipped. So are columns of types the wire
-  format cannot carry (`bytea`). The startup log lists both.
+- A served table that the publication streams with a row filter, or with a
+  column list that leaves out a column, stops startup: its rows or columns
+  could not be kept up to date. A list naming every column is fine.
+- Tables without a primary key are skipped with a startup warning. Columns of
+  types the wire format cannot carry (`bytea`) are skipped too, and the
+  startup log lists them.
 - Clients name a table bare in `public` (`tickets`) and as `schema.table`
   elsewhere (`billing.invoices`). When the schema or table name contains a
   `.` or `"`, both parts are double-quoted as in SQL: `public."a.b"` is
@@ -209,9 +212,13 @@ client starts over. Plan those migrations as a restart.
 
 **A publication change that would leave served tables stale also stops the
 server**: turning off one of its change types or
-`publish_via_partition_root`, or adding a row filter to a served table. The
-log line gives the `ALTER PUBLICATION` that restores it; until then, startup
-refuses the publication. Changes to other publications are ignored.
+`publish_via_partition_root`, adding a row filter to a served table, or
+leaving one of its columns out. A column is left out by narrowing a table's
+column list, by adding a table with a list that leaves one out, or by adding a
+column to a table whose list does not name it, so with a column list,
+`ALTER TABLE ... ADD COLUMN` also needs the column added to the list. The
+log line says how to restore it; until then, startup refuses the publication
+for the same reason. Changes to other publications are ignored.
 
 A client whose schema names a table or column the database does not have yet
 is refused with `SchemaVersionNotSupported`. Migrate the database before
