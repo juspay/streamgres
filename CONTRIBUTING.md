@@ -62,7 +62,7 @@ The existing CI test job runs this command after the regular suite, reusing its 
 server. The normal `cargo test` run skips these destructive tests even when the DSN
 is set. Missing the DSN during an explicit run fails instead of silently skipping.
 
-For an isolated local cluster, use PostgreSQL 17 or 18 binaries including `test_decoding`:
+For an isolated local cluster, point the runner at a PostgreSQL installation including `test_decoding`. PG16 runs the feed startup/reconnect regression. PG17+ runs the full slot cleanup suite:
 
 ```bash
 PG_BIN=/path/to/postgresql/bin bash docs/test-slot-cleanup.sh

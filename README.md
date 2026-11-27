@@ -82,8 +82,7 @@ Run `cargo run --release --bin bench` to measure on your own hardware.
 ### Requirements
 
 - Rust **1.88+** (edition 2024)
-- PostgreSQL **17+**, required for slot cleanup using `inactive_since`,
-  with `wal_level = logical` and spare `max_replication_slots` /
+- PostgreSQL **16+** (age-based slot cleanup requires **17+**) with `wal_level = logical` and spare `max_replication_slots` /
   `max_wal_senders`: one slot for the change feed, plus up to three short-lived
   slots for read snapshots
 - An application server exposing the query and mutate endpoints a Zero client

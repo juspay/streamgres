@@ -52,6 +52,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use super::threads::SLOT_PREFIX;
 use bytes::Bytes;
 use pgoutput::events::base::event::BaseEvent;
 use pgoutput::events::base::tuple_data::{
@@ -64,8 +65,9 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio::time::MissedTickBehavior;
 use tokio_postgres::Client;
+use tokio_postgres::Statement;
 use tokio_postgres::config::Host;
-use tokio_postgres::error::SqlState;
+use tokio_postgres::error::{Severity, SqlState};
 use tokio_postgres::types::PgLsn;
 
 use super::ddl::{self, DdlSource};
@@ -420,7 +422,7 @@ impl Decoder {
 pub struct PgStream {
     transport: Transport,
     feed: Feed,
-    client: Client,
+    client: Arc<Client>,
 }
 
 /// The replication connection of a change feed on `slot`, and how to
@@ -428,6 +430,9 @@ pub struct PgStream {
 /// Nothing in it is tied to a thread: it receives raw replication events
 /// and confirms positions back to the slot.
 pub struct Transport {
+    // PgStream::split transfers this session along with the replication connection.
+    _slot_owner: Option<Arc<Client>>,
+    startup_guard: Option<Client>,
     feed: ReplicationClient,
     config: tokio_postgres::Config,
     slot: String,
@@ -475,6 +480,90 @@ pub struct Feed {
     progress: Lsn,
 }
 
+// A separate SQL session holds ownership while the feed is starting, active, or
+// reconnecting. The two-integer namespace is distinct from the cleaner's bigint key.
+const OWNER_LOCK_SPACE: i32 = 0x5347_534c;
+const STARTUP_LOCK_SPACE: i32 = 0x5347_5354;
+
+pub(super) struct SlotOwner {
+    pub(super) client: Arc<Client>,
+    pub(super) server_version: i32,
+}
+
+impl SlotOwner {
+    pub(super) async fn claim(
+        config: &tokio_postgres::Config,
+        slot: &str,
+    ) -> Result<Self, StorageError> {
+        let (client, server_version) = claim_slot_key(config, slot, OWNER_LOCK_SPACE).await?;
+        Ok(Self {
+            client: Arc::new(client),
+            server_version,
+        })
+    }
+
+    pub(super) async fn startup_guard(
+        config: &tokio_postgres::Config,
+        slot: &str,
+    ) -> Result<Client, StorageError> {
+        // The snapshot can outlive either SQL session. Acquire both keys before
+        // creating the slot; cleaners need both keys to remove it.
+        let (guard, _) = claim_slot_key(config, slot, STARTUP_LOCK_SPACE).await?;
+        Ok(guard)
+    }
+
+    pub(super) async fn prepare(
+        &self,
+        slot: &str,
+        publication: &str,
+    ) -> Result<bool, StorageError> {
+        prepare_slot(&self.client, slot, publication).await
+    }
+
+    pub(super) async fn open_feed(
+        owner: &mut Option<Self>,
+        config: &tokio_postgres::Config,
+        slot: &str,
+        publication: &str,
+        start: Option<Lsn>,
+    ) -> Result<Transport, StorageError> {
+        if owner.as_ref().is_none_or(|owner| owner.client.is_closed()) {
+            *owner = Some(Self::claim(config, slot).await?);
+        }
+        // Check on the session that holds ownership before every open/reopen.
+        let client = &owner.as_ref().unwrap().client;
+        if let Some(failure) = slot_failure_on(client, slot).await? {
+            return Err(StorageError(failure));
+        }
+        if let Some(start) = start {
+            advance_slot(client, slot, start).await?;
+        }
+        Transport::connect(config.clone(), slot, publication).await
+    }
+}
+
+async fn claim_slot_key(
+    config: &tokio_postgres::Config,
+    slot: &str,
+    space: i32,
+) -> Result<(Client, i32), StorageError> {
+    let mut config = config.clone();
+    // A healthy owner can be idle for the entire lifetime of an active feed.
+    config.options(format!(
+        "{} -cidle_session_timeout=0",
+        config.get_options().unwrap_or("")
+    ));
+    let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+    let row = client.query_one(
+            "SELECT pg_try_advisory_lock($1, hashtext($2)), current_setting('server_version_num')::int",
+            &[&space, &slot],
+        ).await?;
+    if !row.get::<_, bool>(0) {
+        return Err(StorageError(format!("another session owns slot {slot}")));
+    }
+    Ok((client, row.get(1)))
+}
+
 // Bound individual cleanup operations and candidate attempts, never the whole list.
 const CLEANUP_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const CLEANUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -484,6 +573,7 @@ const CLEANUP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 struct CleanupConnection {
     client: Client,
     driver: tokio::task::JoinHandle<()>,
+    candidate_statements: Option<(Statement, Statement)>,
 }
 
 impl Drop for CleanupConnection {
@@ -498,7 +588,7 @@ async fn open_cleanup(dsn: &str) -> Result<CleanupConnection, StorageError> {
     // Server deadlines complement the client deadline if a query is already running.
     // Preserve user connection options, then override only cleanup-session timeouts.
     let options = format!(
-        "{} -cstatement_timeout=5000 -clock_timeout=1000",
+        "{} -cstatement_timeout=5000 -clock_timeout=1000 -cidle_session_timeout=15000 -cidle_in_transaction_session_timeout=15000",
         config.get_options().unwrap_or("")
     );
     config.options(&options);
@@ -513,7 +603,11 @@ async fn open_cleanup(dsn: &str) -> Result<CleanupConnection, StorageError> {
             log_warn!("slot cleanup connection ended: {error}");
         }
     });
-    Ok(CleanupConnection { client, driver })
+    Ok(CleanupConnection {
+        client,
+        driver,
+        candidate_statements: None,
+    })
 }
 
 async fn cleanup_deadline<T>(
@@ -555,10 +649,85 @@ async fn acquire_sweep_connection(
     )
     .await?;
 
+    if !acquired {
+        log_info!("slot cleanup skipped: sweep lock {lock_key:?} is busy");
+    }
     Ok(acquired.then_some(connection))
 }
 
+/// Keeps the slot protected between preparation, snapshot creation, and feed startup.
+pub struct PreparedSlot {
+    config: tokio_postgres::Config,
+    slot: String,
+    publication: String,
+    owner: SlotOwner,
+    guard: Client,
+    created: bool,
+}
+
+impl PreparedSlot {
+    /// Abandon preparation. Remove only a slot created by this attempt, using
+    /// the same ownership session so a lost lock cannot delete a successor.
+    pub async fn abort(self) -> Result<(), StorageError> {
+        if self.created {
+            rollback_new_slot(&self.owner.client, &self.slot).await?;
+        }
+        Ok(())
+    }
+
+    /// Open after the snapshot, optionally advancing to its starting position.
+    pub async fn open(self, start: Option<Lsn>) -> Result<Transport, StorageError> {
+        let original = self.owner.client.clone();
+        let mut owner = Some(self.owner);
+        let opened = SlotOwner::open_feed(
+            &mut owner,
+            &self.config,
+            &self.slot,
+            &self.publication,
+            start,
+        )
+        .await;
+        let mut transport = match opened {
+            Ok(transport) => transport,
+            Err(error) => {
+                if self.created
+                    && let Err(rollback) = rollback_new_slot(&original, &self.slot).await
+                {
+                    log_warn!(
+                        "rolling back slot {} after open failed: {rollback}",
+                        self.slot
+                    );
+                }
+                return Err(error);
+            }
+        };
+        transport._slot_owner = owner.map(|owner| owner.client);
+        transport.startup_guard = Some(self.guard);
+        Ok(transport)
+    }
+}
+
 impl Transport {
+    /// Prepare a managed slot and retain both ownership sessions until opening the feed.
+    pub async fn prepare_owned(
+        dsn: &str,
+        slot: &str,
+        publication: &str,
+    ) -> Result<PreparedSlot, StorageError> {
+        let config = dsn.parse()?;
+        let owner = SlotOwner::claim(&config, slot).await?;
+        let guard = SlotOwner::startup_guard(&config, slot).await?;
+        let created = owner.prepare(slot, publication).await?;
+        Ok(PreparedSlot {
+            config,
+            slot: slot.into(),
+            publication: publication.into(),
+            owner,
+            guard,
+            created,
+        })
+    }
+
     /// Open the replication connection to `dsn` on `slot`, streaming
     /// `publication`, after [`Transport::prepare`]. The slot is never
     /// created here: one that has gone missing since it was prepared
@@ -566,9 +735,7 @@ impl Transport {
     /// change in between, so its absence is an error
     /// ([`Transport::slot_exists`] tells it apart).
     pub async fn open(dsn: &str, slot: &str, publication: &str) -> Result<Self, StorageError> {
-        let config: tokio_postgres::Config = dsn.parse()?;
-        require_slot(&config, slot).await?;
-        Self::connect(config, slot, publication).await
+        Self::open_existing(dsn, slot, publication, None).await
     }
 
     /// [`Transport::open`], the slot first moved up to `start` when it is
@@ -582,9 +749,27 @@ impl Transport {
         publication: &str,
         start: Lsn,
     ) -> Result<Self, StorageError> {
-        let config: tokio_postgres::Config = dsn.parse()?;
+        Self::open_existing(dsn, slot, publication, Some(start)).await
+    }
+
+    async fn open_existing(
+        dsn: &str,
+        slot: &str,
+        publication: &str,
+        start: Option<Lsn>,
+    ) -> Result<Self, StorageError> {
+        let config = dsn.parse()?;
+        if slot.starts_with(SLOT_PREFIX) {
+            let mut owner = None;
+            let mut transport =
+                SlotOwner::open_feed(&mut owner, &config, slot, publication, start).await?;
+            transport._slot_owner = owner.map(|owner| owner.client);
+            return Ok(transport);
+        }
         let client = require_slot(&config, slot).await?;
-        advance_slot(&client, slot, start).await?;
+        if let Some(start) = start {
+            advance_slot(&client, slot, start).await?;
+        }
         Self::connect(config, slot, publication).await
     }
 
@@ -592,22 +777,26 @@ impl Transport {
     /// this process's fresh feed `slot`. Done before the first read snapshot
     /// is minted, so that the slot holds the log from before that snapshot's
     /// point. The server never creates publications: that DDL belongs to
-    /// deployment setup and must not race among pods at startup.
+    /// deployment setup and must not race among pods at startup. Standalone callers
+    /// should use [`Transport::prepare_owned`] for managed slots.
     pub async fn prepare(dsn: &str, slot: &str, publication: &str) -> Result<(), StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        prepare_slot(&config, slot, publication).await.map(drop)
+        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
+        prepare_slot(&client, slot, publication).await.map(|_| ())
     }
 
-    /// Serialized startup/periodic cleanup using the supplied inactivity age.
-    /// Zero makes every otherwise eligible inactive slot immediately eligible.
-    /// A busy global sweep permit skips this attempt. Callers must supply the age
-    /// and key already validated during configuration/startup.
+    /// Periodic, nonblocking lock acquisition on the slot-hosting server. Cleaners
+    /// in the same database using the same key serialize their sweeps. A busy
+    /// lock or zero age skips this attempt and returns `Ok(())`.
     pub async fn cleanup_inactive_slots(
         dsn: &str,
         keep: &str,
         age: Duration,
         lock_key: &str,
     ) -> Result<(), StorageError> {
+        if age.is_zero() {
+            return Ok(());
+        }
         let Some(connection) = acquire_sweep_connection(dsn, lock_key).await? else {
             return Ok(());
         };
@@ -624,6 +813,9 @@ impl Transport {
         timeout: Duration,
         lock_key: &str,
     ) -> Result<(), StorageError> {
+        if age.is_zero() {
+            return Ok(());
+        }
         cleanup_deadline(
             async {
                 let connection = open_cleanup(dsn).await?;
@@ -717,6 +909,8 @@ impl Transport {
             .await
             .map_err(|error| StorageError(format!("replication connection: {error}")))?;
         Ok(Transport {
+            _slot_owner: None,
+            startup_guard: None,
             feed,
             config,
             slot: slot.to_owned(),
@@ -794,23 +988,49 @@ impl Transport {
         feed: &mut Feed,
         watched: &[TableName],
         out: mpsc::Sender<Committed>,
-        mut shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<bool>,
     ) -> Result<(), StorageError> {
+        let mut guard = self.startup_guard.take();
+        self.stream_with_guard(every, feed, watched, out, shutdown, &mut guard)
+            .await
+            .map(|_| ())
+    }
+
+    // The engine keeps its guard across reconnects, including failed openings
+    // before the first event. Starting the driver's worker alone proves nothing.
+    pub(super) async fn stream_with_guard(
+        self,
+        every: Duration,
+        feed: &mut Feed,
+        watched: &[TableName],
+        out: mpsc::Sender<Committed>,
+        mut shutdown: watch::Receiver<bool>,
+        startup_guard: &mut Option<Client>,
+    ) -> Result<bool, StorageError> {
+        tokio::select! {
+            _ = shutdown.wait_for(|stop| *stop) => Ok(false),
+            result = self.stream_events(every, feed, watched, out, startup_guard) => result,
+        }
+    }
+
+    async fn stream_events(
+        mut self,
+        every: Duration,
+        feed: &mut Feed,
+        watched: &[TableName],
+        out: mpsc::Sender<Committed>,
+        startup_guard: &mut Option<Client>,
+    ) -> Result<bool, StorageError> {
+        let mut received_event = false;
         let mut ticker = tokio::time::interval(every);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut watch = Watch::new();
         loop {
             let event = tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_ok() && *shutdown.borrow() {
-                        return Ok(());
-                    }
-                    continue;
-                }
                 _ = ticker.tick() => {
                     let position = feed.progress();
                     if position > Lsn(0) && out.send(Committed::mark(position)).await.is_err() {
-                        return Ok(());
+                        return Ok(received_event);
                     }
                     if watch.due(Instant::now()) && !self.slot_is_held().await {
                         log_warn!(
@@ -818,7 +1038,7 @@ impl Transport {
                             watch.heard.elapsed().as_secs_f64(),
                             self.slot
                         );
-                        return Ok(());
+                        return Ok(received_event);
                     }
                     continue;
                 }
@@ -826,12 +1046,17 @@ impl Transport {
             };
             let event = match event {
                 Ok(Some(event)) => event,
-                Ok(None) => return Ok(()),
+                Ok(None) => return Ok(received_event),
                 Err(error) => {
                     eprintln!("change feed ended: {error}");
-                    return Ok(());
+                    return Ok(received_event);
                 }
             };
+            if !received_event {
+                log_info!("change feed open on slot {}", self.slot);
+                received_event = true;
+            }
+            startup_guard.take();
             heard();
             watch.heard();
             let transaction = feed.absorb(event)?;
@@ -857,20 +1082,32 @@ impl Transport {
                 decode: transaction.decode,
             };
             if out.send(committed).await.is_err() {
-                return Ok(());
+                return Ok(received_event);
             }
         }
     }
 }
 
+pub(super) async fn rollback_new_slot(client: &Client, slot: &str) -> Result<(), StorageError> {
+    cleanup_deadline(async {
+        let rows = client.execute(
+            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = $1 AND NOT active",
+            &[&slot],
+        ).await?;
+        if rows != 1 {
+            return Err(StorageError(format!("could not confirm removal of startup slot {slot}")));
+        }
+        Ok(())
+    }, Duration::from_secs(4)).await
+}
+
 /// Require `publication` and create this process's new `slot` (see
-/// [`Transport::prepare`]); the ordinary connection used.
+/// [`Transport::prepare`]).
 async fn prepare_slot(
-    config: &tokio_postgres::Config,
+    client: &Client,
     slot: &str,
     publication: &str,
-) -> Result<Client, StorageError> {
-    let client = super::open(config, &tokio::runtime::Handle::current()).await?;
+) -> Result<bool, StorageError> {
     let published = client
         .query_opt(
             "SELECT 1 FROM pg_publication WHERE pubname = $1",
@@ -898,8 +1135,18 @@ async fn prepare_slot(
             )
             .await?;
     }
-    Ok(client)
+    Ok(!exists)
 }
+
+const ELIGIBLE_SLOT: &str = "left(slot_name, length($1)) = $1
+    AND slot_name <> $2
+    AND database = current_database()
+    AND slot_type = 'logical'
+    AND NOT temporary
+    AND NOT synced
+    AND NOT active
+    AND inactive_since IS NOT NULL
+    AND clock_timestamp() - inactive_since >= ($3::double precision * interval '1 second')";
 
 async fn sweep_candidates(
     dsn: &str,
@@ -926,23 +1173,14 @@ async fn sweep_candidates(
         )));
     }
     let client = &connection.client;
-    let prefix = "xyne_sync_slot_";
     let candidates = cleanup_deadline(
         async {
             client
                 .query(
-                    "SELECT slot_name::text
-             FROM pg_replication_slots
-             WHERE left(slot_name, length($1)) = $1
-               AND slot_name <> $2
-               AND database = current_database()
-               AND slot_type = 'logical'
-               AND NOT temporary
-               AND NOT synced
-               AND NOT active
-               AND inactive_since IS NOT NULL
-               AND clock_timestamp() - inactive_since >= ($3::double precision * interval '1 second')",
-                    &[&prefix, &keep, &age.as_secs_f64()],
+                    &format!(
+                        "SELECT slot_name::text FROM pg_replication_slots WHERE {ELIGIBLE_SLOT}"
+                    ),
+                    &[&SLOT_PREFIX, &keep, &age.as_secs_f64()],
                 )
                 .await
                 .map_err(StorageError::from)
@@ -973,12 +1211,9 @@ async fn sweep_candidates(
                 }
             }
         }
-        let connection = worker.as_ref().unwrap();
-        match tokio::time::timeout_at(
-            deadline,
-            drop_inactive_slot(&connection.client, slot, keep, age),
-        )
-        .await
+        let connection = worker.as_mut().unwrap();
+        match tokio::time::timeout_at(deadline, drop_inactive_slot(connection, slot, keep, age))
+            .await
         {
             Ok(Ok(true)) => log_info!("dropped inactive replication slot {slot}"),
             Ok(Ok(false)) => {}
@@ -986,7 +1221,7 @@ async fn sweep_candidates(
                 let reconnect = connection.client.is_closed()
                     || error
                         .as_db_error()
-                        .is_none_or(|db| db.severity() != "ERROR");
+                        .is_none_or(|db| db.parsed_severity() != Some(Severity::Error));
                 let error = StorageError::from(error);
                 log_warn!(
                     "sweeping replication slot {slot}: {error}; continuing with other candidates"
@@ -1011,37 +1246,48 @@ async fn sweep_candidates(
     Ok(())
 }
 
-// A candidate may have reconnected or disappeared since discovery. Reapply all
-// eligibility filters, then let PostgreSQL arbitrate the drop against active use.
-// This is not an atomic inactivity-age guarantee: a feed can connect and disconnect
-// between reading the view and the internal slot acquisition performed by the drop.
+// Take the slot owner's key before reading the final eligibility state. A
+// transaction-scoped lock is released on commit, SQL error/rollback, or disconnect.
 async fn drop_inactive_slot(
-    client: &Client,
+    connection: &mut CleanupConnection,
     slot: &str,
     keep: &str,
     age: Duration,
 ) -> Result<bool, tokio_postgres::Error> {
-    let prefix = "xyne_sync_slot_";
-    let outcome = client
-        .query(
-            "SELECT pg_drop_replication_slot(slot_name)
-             FROM pg_replication_slots
-             WHERE left(slot_name, length($1)) = $1
-               AND slot_name <> $2
-               AND database = current_database()
-               AND slot_type = 'logical'
-               AND NOT temporary
-               AND NOT synced
-               AND NOT active
-               AND inactive_since IS NOT NULL
-               AND clock_timestamp() - inactive_since >= ($3::double precision * interval '1 second')
-               AND slot_name = $4",
-            &[&prefix, &keep, &age.as_secs_f64(), &slot],
-        )
+    let client = &mut connection.client;
+    if connection.candidate_statements.is_none() {
+        let lock = client
+            .prepare(
+                "SELECT pg_try_advisory_xact_lock($1, hashtext($2))
+                    AND pg_try_advisory_xact_lock($3, hashtext($2))",
+            )
+            .await?;
+        let drop_slot = client
+            .prepare(&format!(
+                "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
+             WHERE slot_name = $4 AND {ELIGIBLE_SLOT}"
+            ))
+            .await?;
+        connection.candidate_statements = Some((lock, drop_slot));
+    }
+    let (lock, drop_slot) = connection.candidate_statements.as_ref().unwrap();
+    let tx = client.transaction().await?;
+    let free: bool = tx
+        .query_one(lock, &[&OWNER_LOCK_SPACE, &slot, &STARTUP_LOCK_SPACE])
+        .await?
+        .get(0);
+    if !free {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    let outcome = tx
+        .query(drop_slot, &[&SLOT_PREFIX, &keep, &age.as_secs_f64(), &slot])
         .await;
     match outcome {
-        // No row means no drop occurred; do not log that as a deletion.
-        Ok(rows) => Ok(!rows.is_empty()),
+        Ok(rows) => {
+            tx.commit().await?;
+            Ok(!rows.is_empty())
+        }
         // Another feed or cleaner won the race. Both outcomes are harmless.
         Err(error)
             if matches!(
@@ -1060,7 +1306,12 @@ async fn drop_inactive_slot(
 async fn slot_failure_on(client: &Client, slot: &str) -> Result<Option<String>, StorageError> {
     let row = client
         .query_opt(
-            "SELECT invalidation_reason, wal_status FROM pg_replication_slots WHERE slot_name = $1",
+            // PG16 reports recovery conflicts via conflicting. Looking up optional
+            // fields on the row also handles newer invalidation reasons on PG17+.
+            "SELECT coalesce(to_jsonb(s)->>'invalidation_reason',
+                             CASE WHEN (to_jsonb(s)->>'conflicting')::boolean THEN 'recovery conflict' END),
+                    wal_status
+             FROM pg_replication_slots s WHERE slot_name = $1",
             &[&slot],
         )
         .await?;
@@ -1204,23 +1455,15 @@ impl Feed {
 
 impl PgStream {
     /// Open the feed of `slot` at `dsn`, streaming `publication` and
-    /// decoding with `catalog`; the slot and the publication are created
-    /// first when missing ([`Transport::prepare`]).
+    /// decoding with `catalog`. The publication must exist. Managed slot names
+    /// acquire ownership before creation and retain it across [`PgStream::split`].
     pub async fn open(
         dsn: &str,
         slot: &str,
         publication: &str,
         catalog: Arc<Catalog>,
     ) -> Result<Self, StorageError> {
-        Transport::prepare(dsn, slot, publication).await?;
-        let transport = Transport::open(dsn, slot, publication).await?;
-        let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
-        Ok(PgStream {
-            transport,
-            feed: Feed::new(catalog),
-            client,
-        })
+        Self::open_feed(dsn, slot, publication, Feed::new(catalog)).await
     }
 
     /// [`PgStream::open`], the feed following the schema changes `ddl`
@@ -1232,13 +1475,39 @@ impl PgStream {
         catalog: Arc<Catalog>,
         ddl: DdlSource,
     ) -> Result<Self, StorageError> {
-        Transport::prepare(dsn, slot, publication).await?;
-        let transport = Transport::open(dsn, slot, publication).await?;
+        Self::open_feed(dsn, slot, publication, Feed::with_ddl(catalog, ddl)).await
+    }
+
+    async fn open_feed(
+        dsn: &str,
+        slot: &str,
+        publication: &str,
+        feed: Feed,
+    ) -> Result<Self, StorageError> {
         let config: tokio_postgres::Config = dsn.parse()?;
-        let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
-        Ok(PgStream {
+        let managed = slot.starts_with(SLOT_PREFIX);
+        let (client, startup_guard) = if managed {
+            let owner = SlotOwner::claim(&config, slot).await?;
+            let guard = SlotOwner::startup_guard(&config, slot).await?;
+            (owner.client, Some(guard))
+        } else {
+            (
+                Arc::new(super::open(&config, &tokio::runtime::Handle::current()).await?),
+                None,
+            )
+        };
+        prepare_slot(&client, slot, publication).await?;
+        if let Some(failure) = slot_failure_on(&client, slot).await? {
+            return Err(StorageError(failure));
+        }
+        let mut transport = Transport::connect(config, slot, publication).await?;
+        if managed {
+            transport._slot_owner = Some(client.clone());
+            transport.startup_guard = startup_guard;
+        }
+        Ok(Self {
             transport,
-            feed: Feed::with_ddl(catalog, ddl),
+            feed,
             client,
         })
     }
@@ -1288,6 +1557,7 @@ impl PgStream {
             let event = event
                 .map_err(|error| StorageError(format!("replication stream: {error}")))?
                 .ok_or_else(|| StorageError("the replication stream ended".to_owned()))?;
+            self.transport.startup_guard.take();
             let transaction = self.feed.absorb(event)?;
             self.transport.acknowledge(self.feed.progress());
             if let Some(transaction) = transaction {

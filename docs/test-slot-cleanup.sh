@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Point PG_BIN at PostgreSQL 17 or 18's bin directory. Run as a normal user.
-: "${PG_BIN:?Set PG_BIN to a PostgreSQL 17+ bin directory}"
+# Point PG_BIN at PostgreSQL 16 or later's bin directory. Run as a normal user.
+: "${PG_BIN:?Set PG_BIN to a PostgreSQL 16+ bin directory}"
 export PATH="$PG_BIN:$HOME/.cargo/bin:$PATH"
 cd "$(dirname "$0")/.."
 cluster=$(mktemp -d "/tmp/streamgres-slots.XXXXXX")
@@ -38,5 +38,9 @@ psql "$STREAMGRES_PG_DSN" -c 'SELECT version()'
 ) &
 heartbeat_pid=$!
 
-cargo test --lib slot_cleanup -- --test-threads=1
+if [[ $(psql "$STREAMGRES_PG_DSN" -Atqc "SHOW server_version_num") -lt 170000 ]]; then
+    cargo test --locked --test slot_cleanup feed_opens_and_reconnects_with_cleanup_disabled -- --ignored --exact
+    exit
+fi
+cargo test --lib client::config::tests -- --test-threads=1
 cargo test --test slot_cleanup -- --ignored --test-threads=1

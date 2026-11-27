@@ -26,6 +26,10 @@ fn quoted(value: &str) -> String {
 
 impl Proxy {
     pub async fn start(dsn: &str, application: &str) -> Self {
+        Self::with_gate(dsn, application, false).await
+    }
+
+    pub async fn with_gate(dsn: &str, application: &str, initially_paused: bool) -> Self {
         let config: tokio_postgres::Config = dsn.parse().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -58,7 +62,7 @@ impl Proxy {
             let (mut client_read, mut client_write) = tokio::io::split(client);
             let (mut server_read, mut server_write) = tokio::io::split(upstream);
             let replies = async {
-                let mut paused = false;
+                let mut paused = initially_paused;
                 let mut buffer = [0u8; 8192];
                 loop {
                     let command = if paused {

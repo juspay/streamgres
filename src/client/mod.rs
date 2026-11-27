@@ -115,6 +115,8 @@ async fn join_worker(
 pub fn serve(mut config: Config) -> Result<(), String> {
     log::set_level(config.log);
     log::set_format(config.log_format);
+    let settings = config.engine_settings();
+    settings.validate_slot_cleanup()?;
     let master_dsn = std::mem::take(&mut config.master_dsn);
     let server = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -125,7 +127,6 @@ pub fn serve(mut config: Config) -> Result<(), String> {
     drop(master_dsn);
     let config = Arc::new(config);
     let shutdown = Shutdown::new();
-    let settings = config.engine_settings();
     let cleanup_settings = settings.clone();
     let _profiler = crate::profile::start(crate::profile::Config::from_env()?)?;
     let catalog = Arc::new(CatalogHandle::new(
@@ -154,6 +155,10 @@ pub fn serve(mut config: Config) -> Result<(), String> {
     let reads_handle = reads.handle().clone();
     let engine_shutdown = shutdown.clone();
     let (started_tx, started_rx) = std::sync::mpsc::channel::<Result<threads::Started, String>>();
+    let _signals = {
+        let _runtime = server.enter();
+        connection::watch_signals(shutdown.clone())?
+    };
     let engine_thread = std::thread::Builder::new()
         .name("streamgres-engine".to_owned())
         .spawn(move || {
@@ -163,7 +168,7 @@ pub fn serve(mut config: Config) -> Result<(), String> {
                 .expect("engine runtime");
             let local = tokio::task::LocalSet::new();
             local.block_on(&runtime, async move {
-                match threads::start(
+                match threads::start_validated(
                     &settings,
                     engine_catalog,
                     reads_handle,
@@ -194,124 +199,132 @@ pub fn serve(mut config: Config) -> Result<(), String> {
                     Err(error) => {
                         let reason = format!("starting engine: {error}");
                         let _ = started_tx.send(Err(error));
-                        engine_shutdown.fail(reason);
+                        if !engine_shutdown.requested() {
+                            engine_shutdown.fail(reason);
+                        }
                     }
                 }
             });
         })
         .map_err(|error| format!("engine thread: {error}"))?;
+    let started = started_rx
+        .recv()
+        .map_err(|_| "the engine thread ended before it was up".to_owned())?;
+    if started.is_err() && shutdown.requested() && shutdown.failure().is_none() {
+        return Ok(());
+    }
     let threads::Started {
         commands,
         events,
         storage,
         feed,
-    } = started_rx
-        .recv()
-        .map_err(|_| "the engine thread ended before it was up".to_owned())??;
+    } = started?;
 
-    let (readiness, ready) = tokio::sync::watch::channel(false);
-    let mut requests = Vec::with_capacity(shards);
     let mut group_threads = Vec::with_capacity(shards);
-    for (shard, events) in events.into_iter().enumerate() {
-        let (requests_tx, requests_rx) = mpsc::channel::<groups::Request>(1024);
-        requests.push(requests_tx.clone());
-        let config = config.clone();
-        let catalog = catalog.clone();
-        let commands = commands.clone();
-        let stats = stats.clone();
-        let readiness = readiness.clone();
-        let group_shutdown = shutdown.clone();
-        let thread = std::thread::Builder::new()
-            .name(format!("streamgres-groups-{shard}"))
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("groups runtime");
-                let local = tokio::task::LocalSet::new();
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    local.block_on(
-                        &runtime,
-                        groups::run(
-                            config,
-                            catalog,
-                            shard,
-                            shards,
-                            commands,
-                            events,
-                            requests_rx,
-                            requests_tx,
-                            stats,
-                            readiness,
-                        ),
-                    )
-                }));
-                match outcome {
-                    Ok(()) if group_shutdown.requested() => {
-                        log_info!("group thread {shard} stopped during shutdown")
+    let served = (|| {
+        let (readiness, ready) = tokio::sync::watch::channel(false);
+        let mut requests = Vec::with_capacity(shards);
+        for (shard, events) in events.into_iter().enumerate() {
+            let (requests_tx, requests_rx) = mpsc::channel::<groups::Request>(1024);
+            requests.push(requests_tx.clone());
+            let config = config.clone();
+            let catalog = catalog.clone();
+            let commands = commands.clone();
+            let stats = stats.clone();
+            let readiness = readiness.clone();
+            let group_shutdown = shutdown.clone();
+            let thread = std::thread::Builder::new()
+                .name(format!("streamgres-groups-{shard}"))
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("groups runtime");
+                    let local = tokio::task::LocalSet::new();
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        local.block_on(
+                            &runtime,
+                            groups::run(
+                                config,
+                                catalog,
+                                shard,
+                                shards,
+                                commands,
+                                events,
+                                requests_rx,
+                                requests_tx,
+                                stats,
+                                readiness,
+                            ),
+                        )
+                    }));
+                    match outcome {
+                        Ok(()) if group_shutdown.requested() => {
+                            log_info!("group thread {shard} stopped during shutdown")
+                        }
+                        Ok(()) => {
+                            let reason = format!("group thread {shard} stopped");
+                            log_error!("{reason}");
+                            group_shutdown.fail(reason);
+                        }
+                        Err(_) => {
+                            let reason = format!("group thread {shard} panicked");
+                            log_error!("{reason}");
+                            group_shutdown.fail(reason);
+                        }
                     }
-                    Ok(()) => {
-                        let reason = format!("group thread {shard} stopped");
-                        log_error!("{reason}");
-                        group_shutdown.fail(reason);
-                    }
-                    Err(_) => {
-                        let reason = format!("group thread {shard} panicked");
-                        log_error!("{reason}");
-                        group_shutdown.fail(reason);
-                    }
-                }
-            })
-            .map_err(|error| format!("group thread {shard}: {error}"))?;
-        group_threads.push(thread);
-    }
+                })
+                .map_err(|error| format!("group thread {shard}: {error}"))?;
+            group_threads.push(thread);
+        }
 
-    let backend = Arc::new(backend::Backend::new(&config)?);
-    let mutations = Arc::new(connection::MutationReader::new(
-        storage.clone(),
-        &config.upstream_schema(),
-        catalog.clone(),
-    ));
-    let plans = Arc::new(plan::PlanCache::new(config.plan_ttl, config.plan_cache));
-    let warm = Arc::new(warm::WarmStart::new(
-        config.plan_file.clone(),
-        config.plan_cache,
-    ));
-    let transforms = Arc::new(transform::TransformCache::new(
-        config.transform_ttl,
-        config.transform_cache,
-    ));
-    let warm_budget = config.warm_start;
-    let metrics_interval = config.metrics_interval;
-    let (warmed_tx, warmed) = tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
-    let state = Arc::new(connection::AppState {
-        config,
-        requests,
-        backend,
-        storage,
-        catalog,
-        plans,
-        mutations,
-        stats,
-        ready,
-        warm: warm.clone(),
-        warmed,
-        transforms,
-        shutdown: shutdown.clone(),
-    });
-    drop(readiness);
-    if warm.enabled() {
-        let shapes = warm.load();
-        let saver = warm.clone();
-        server.spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                saver.save();
-            }
+        let backend = Arc::new(backend::Backend::new(&config)?);
+        let mutations = Arc::new(connection::MutationReader::new(
+            storage.clone(),
+            &config.upstream_schema(),
+            catalog.clone(),
+        ));
+        let plans = Arc::new(plan::PlanCache::new(config.plan_ttl, config.plan_cache));
+        let warm = Arc::new(warm::WarmStart::new(
+            config.plan_file.clone(),
+            config.plan_cache,
+        ));
+        let transforms = Arc::new(transform::TransformCache::new(
+            config.transform_ttl,
+            config.transform_cache,
+        ));
+        let warm_budget = config.warm_start;
+        let metrics_interval = config.metrics_interval;
+        let (warmed_tx, warmed) =
+            tokio::sync::watch::channel(!warm.enabled() || warm_budget.is_zero());
+        let state = Arc::new(connection::AppState {
+            config,
+            requests,
+            backend,
+            storage,
+            catalog,
+            plans,
+            mutations,
+            stats,
+            ready,
+            warm: warm.clone(),
+            warmed,
+            transforms,
+            shutdown: shutdown.clone(),
         });
-        if !warm_budget.is_zero() {
-            let state = state.clone();
+        drop(readiness);
+        if warm.enabled() {
+            let shapes = warm.load();
+            let saver = warm.clone();
             server.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    saver.save();
+                }
+            });
+            if !warm_budget.is_zero() {
+                let state = state.clone();
+                server.spawn(async move {
                 let mut ready = state.ready.clone();
                 while !*ready.borrow() {
                     if ready.changed().await.is_err() {
@@ -348,12 +361,14 @@ pub fn serve(mut config: Config) -> Result<(), String> {
                 }
                 let _ = warmed_tx.send(true);
             });
+            }
         }
-    }
-    sampler::spawn(state.clone(), metrics_interval);
-    crate::otel::spawn(crate::otel::Config::from_env(), state.stats.clone());
-    log_info!("client side up");
-    let served = server.block_on(connection::serve(state));
+        sampler::spawn(state.clone(), metrics_interval);
+        crate::otel::spawn(crate::otel::Config::from_env(), state.stats.clone());
+        log_info!("client side up");
+        server.block_on(connection::serve_until_shutdown(state))
+    })();
+    shutdown.request();
     server.block_on(async {
         if let Err(error) = threads::stop_feed(feed).await {
             log_warn!("stopping change feed during shutdown: {error}");
