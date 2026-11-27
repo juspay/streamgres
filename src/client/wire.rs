@@ -174,29 +174,6 @@ pub fn write_value(out: &mut Vec<u8>, value: &Value, declared: Option<&ValueType
     }
 }
 
-/// A `time` as Postgres writes it: `HH:MM:SS`, then the fraction without
-/// trailing zeros when there is one.
-///
-/// `24:00:00` is its own value in Postgres, distinct from `00:00:00` and
-/// ordering after it, so the hour is never wrapped onto a single day: the
-/// value is written with the hour it actually carries.
-fn time_text(time: crate::model::Time) -> String {
-    let micros = time.0;
-    let seconds = micros / 1_000_000;
-    let fraction = micros % 1_000_000;
-    let whole = format!(
-        "{:02}:{:02}:{:02}",
-        seconds / 3600,
-        seconds / 60 % 60,
-        seconds % 60
-    );
-    if fraction == 0 {
-        return whole;
-    }
-    let digits = format!("{fraction:06}");
-    format!("{whole}.{}", digits.trim_end_matches('0'))
-}
-
 /// A `bytea` as Postgres's hex text, `\x` and two digits a byte.
 fn bytea_text(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -294,7 +271,7 @@ pub fn value_json(value: &Value, declared: Option<&ValueType>) -> Json {
             .midnight()
             .and_then(|at| at.unix_millis())
             .map_or(Json::Null, Json::from),
-        Value::Time(time) => Json::String(time_text(*time)),
+        Value::Time(time) => Json::String(time.text()),
         Value::Bytes(bytes) => Json::String(bytea_text(bytes)),
         Value::Raw(raw) => raw
             .client_text
@@ -320,12 +297,44 @@ mod tests {
     /// Postgres keeps end of day as its own `time`, distinct from midnight
     /// and ordering after it, so the client is shown `24:00:00` and never a
     /// wrapped `00:00:00`.
+    ///
+    /// This goes through [`value_json`], the wire's own arm for a time, so
+    /// it covers the projection the client actually receives rather than
+    /// only the formatter it happens to share.
     #[test]
-    fn a_time_keeps_the_hour_postgres_stored() {
-        assert_eq!(time_text(crate::model::Time(0)), "00:00:00");
-        assert_eq!(time_text(crate::model::Time(86_400_000_000)), "24:00:00");
-        assert_eq!(time_text(crate::model::Time(86_399_999_999)), "23:59:59.999999");
-        assert_eq!(time_text(crate::model::Time(1_500_000)), "00:00:01.5");
+    fn a_time_reaches_the_client_with_the_hour_postgres_stored() {
+        let shown = |micros| value_json(&Value::Time(crate::model::Time(micros)), None);
+        assert_eq!(shown(0), Json::String("00:00:00".to_owned()));
+        assert_eq!(shown(86_400_000_000), Json::String("24:00:00".to_owned()));
+        assert_eq!(
+            shown(86_399_999_999),
+            Json::String("23:59:59.999999".to_owned())
+        );
+        assert_eq!(shown(1_500_000), Json::String("00:00:01.5".to_owned()));
+        assert_ne!(
+            shown(0),
+            shown(86_400_000_000),
+            "the client can tell end of day from midnight"
+        );
+
+        // A row's time travels through the same projection into the bytes a
+        // `put` carries, so both forms agree with the tree.
+        let table = DbTable::new(
+            "events",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("at", ValueType::Time),
+            ],
+        );
+        let row = DataFrameRow::from(HashMap::from([
+            ("id".into(), Value::Int(1)),
+            ("at".into(), Value::Time(crate::model::Time(86_400_000_000))),
+        ]));
+        let mut bytes = Vec::new();
+        write_put(&mut bytes, &table, &row);
+        let written: Json = serde_json::from_slice(&bytes).expect("valid JSON");
+        assert_eq!(written["value"]["at"], "24:00:00");
     }
 
     /// A row on its table's layout, written from the table's plan, comes
@@ -436,10 +445,10 @@ mod tests {
     }
 
     /// A numeric keeps the digits Postgres wrote on the wire: scale
-    /// survives, and a value past 2⁵³ keeps every digit. The JSON tree
-    /// form goes through `serde_json::Number` (f64), so `value_json` is
-    /// only as precise as a JSON number is. A `numeric` special is not a
-    /// JSON number, so it travels as a string.
+    /// survives, and a value past 2⁵³ keeps every digit. `serde_json` is
+    /// built with `arbitrary_precision`, so parsing the engine's own text
+    /// into a `Number` keeps it exactly; a `numeric` special is not a JSON
+    /// number, so it travels as a string.
     #[test]
     fn numerics_keep_their_digits_on_the_wire() {
         let n = |text: &str| crate::model::Numeric::parse(text).unwrap();

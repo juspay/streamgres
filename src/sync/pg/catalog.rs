@@ -29,12 +29,18 @@ pub struct PgType<'a> {
     pub base_name: &'a str,
     /// The base's type class: `b` base, `e` enum, and so on.
     pub base_class: &'a str,
+    /// Whether the base's binary output is UTF-8 text (`typsend` is
+    /// `textsend`): an unknown type like `hstore` or `citext` still reads
+    /// as text then, where `tsvector` or `bytea` must stay raw.
+    pub base_sends_text: bool,
     /// The base type's OID.
     pub base_oid: u32,
     /// For an array base, its element's `typname`; empty otherwise.
     pub element_name: &'a str,
     /// For an array base, its element's type class; empty otherwise.
     pub element_class: &'a str,
+    /// For an array base, whether its element's binary output is text.
+    pub element_sends_text: bool,
     /// The array's element OID; 0 for a non-array.
     pub element_oid: u32,
     /// Whether the base is an array, independent of a known element OID.
@@ -47,17 +53,28 @@ impl PgType<'_> {
     /// The engine's type for this column. Domains contribute only their
     /// final base, so `account_id` over `cents` over `bigint` is an `Int`.
     pub fn value_type(&self) -> ValueType {
-        let scalar = |name: &str, class: &str| {
+        let scalar = |name: &str, class: &str, sends_text: bool| {
             if class == "e" {
                 ValueType::String
+            } else if let Some(known) = scalar_type(name) {
+                known
+            } else if sends_text {
+                // A type the engine does not know by name whose binary form
+                // is UTF-8 text reads as a string, as it did before; framing
+                // it as `Raw` would project it as `null`.
+                ValueType::String
             } else {
-                scalar_type(name).unwrap_or(ValueType::Raw)
+                ValueType::Raw
             }
         };
         if self.is_array {
-            ValueType::List(Box::new(scalar(self.element_name, self.element_class)))
+            ValueType::List(Box::new(scalar(
+                self.element_name,
+                self.element_class,
+                self.element_sends_text,
+            )))
         } else {
-            scalar(self.base_name, self.base_class)
+            scalar(self.base_name, self.base_class, self.base_sends_text)
         }
     }
 
@@ -94,7 +111,10 @@ pub async fn load_catalog(
                     base.oid::int8 AS base_oid,
                     COALESCE(elem.typname, '') AS element_name,
                     COALESCE(elem.typtype::text, '') AS element_class,
+                    (base.typsend = 'textsend'::regproc) AS sends_text,
+                    (elem.typsend = 'textsend'::regproc) AS element_sends_text,
                     base.typelem::int8 AS element_oid,
+                    base.typelem <> 0 AND base.typlen = -1 AS is_array,
                     declared.typtype = 'd' AS is_domain
              FROM information_schema.columns c
              JOIN information_schema.tables t
@@ -144,18 +164,26 @@ pub async fn load_catalog(
         let column: String = row.get(2);
         let base_name: String = row.get(3);
         let base_class: String = row.get(4);
+        let base_oid = u32::try_from(row.get::<_, i64>(5)).unwrap_or(0);
         let element_name: String = row.get(6);
         let element_class: String = row.get(7);
+        let base_sends_text: bool = row.get(8);
+        let element_sends_text: bool = row.get::<_, Option<bool>>(9).unwrap_or(false);
         declared.entry((schema, table)).or_default().push(
             PgType {
                 base_name: &base_name,
                 base_class: &base_class,
-                base_oid: u32::try_from(row.get::<_, i64>(5)).unwrap_or(0),
+                base_sends_text,
+                base_oid,
                 element_name: &element_name,
                 element_class: &element_class,
-                element_oid: u32::try_from(row.get::<_, i64>(8)).unwrap_or(0),
-                is_array: row.get::<_, i64>(8) != 0,
-                is_domain: row.get(9),
+                element_sends_text,
+                element_oid: u32::try_from(row.get::<_, i64>(10)).unwrap_or(0),
+                // `typelem` alone is not array-ness: `name`, `point` and
+                // `oidvector` carry a nonzero `typelem` and are scalars.
+                // PostgreSQL marks a true array with `typlen = -1`.
+                is_array: row.get(11),
+                is_domain: row.get(12),
             }
             .to_db_column(&column),
         );
@@ -287,9 +315,11 @@ mod tests {
         let plain = PgType {
             base_name: "int8",
             base_class: "b",
+            base_sends_text: false,
             base_oid: 20,
             element_name: "",
             element_class: "",
+            element_sends_text: false,
             element_oid: 0,
             is_array: false,
             is_domain: true,
@@ -301,9 +331,11 @@ mod tests {
         let enum_base = PgType {
             base_name: "mood",
             base_class: "e",
+            base_sends_text: false,
             base_oid: 40_000,
             element_name: "",
             element_class: "",
+            element_sends_text: false,
             element_oid: 0,
             is_array: false,
             is_domain: true,
@@ -313,9 +345,11 @@ mod tests {
         let enum_array = PgType {
             base_name: "_mood",
             base_class: "b",
+            base_sends_text: false,
             base_oid: 40_001,
             element_name: "mood",
             element_class: "e",
+            element_sends_text: false,
             element_oid: 40_000,
             is_array: true,
             is_domain: true,

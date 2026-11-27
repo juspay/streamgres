@@ -37,7 +37,7 @@ pub fn select_sql(query: &SingleTableReadQuery, table: &DbTable) -> String {
     let _ = write!(
         sql,
         " FROM {} WHERE {}",
-        quote_ident(query.table.as_str()),
+        quote_table(query.table.as_str()),
         render_where(&query.filter, &Scope::plain(table))
     );
     if query.limit != u32::MAX {
@@ -89,7 +89,7 @@ pub fn count_sql(
         .ok_or_else(|| format!("table `{}` is not in the catalog", query.main_table.table))?;
     Ok(format!(
         "SELECT count(*) FROM (SELECT 1 FROM {} AS {} WHERE {} LIMIT {cap}) AS capped",
-        quote_ident(query.main_table.table.as_str()),
+        quote_table(query.main_table.table.as_str()),
         scope.alias,
         scope.render_node()
     ))
@@ -221,7 +221,7 @@ impl<'a> Scope<'a> {
             .collect();
         format!(
             "EXISTS (SELECT 1 FROM {} AS {} WHERE ({} AND {}))",
-            quote_ident(join.sub.main_table.table.as_str()),
+            quote_table(join.sub.main_table.table.as_str()),
             sub.alias,
             pairs.join(" AND "),
             sub.render_node()
@@ -340,14 +340,20 @@ fn literal_as(value: &Value, declared: Option<&DbColumn>) -> String {
     }
 }
 
-/// A double-quoted identifier, each dot-separated part quoted so a
-/// schema-qualified name (`live_exact.values`) is two identifiers, not
-/// one name that happens to contain a dot.
+/// One identifier, double-quoted with any embedded quote doubled. A dot is
+/// part of the name, never a separator: `"a.b"` is a column literally named
+/// `a.b`, and splitting it would silently read a different column.
 pub fn quote_ident(name: &str) -> String {
-    name.split('.')
-        .map(|part| format!("\"{}\"", part.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(".")
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// A table reference: a catalog name is either bare (`tickets`, in the
+/// `public` schema) or `schema.table`, which is where the split belongs.
+pub fn quote_table(name: &str) -> String {
+    match name.split_once('.') {
+        Some((schema, table)) => format!("{}.{}", quote_ident(schema), quote_ident(table)),
+        None => quote_ident(name),
+    }
 }
 
 /// The filter tree as a boolean expression in `scope`.
@@ -520,7 +526,7 @@ fn literal(value: &Value) -> String {
         // A time is written as itself, not as arithmetic from midnight:
         // Postgres keeps `24:00:00` distinct from `00:00:00`, and midnight
         // plus a day's microseconds wraps back to `00:00:00`.
-        Value::Time(time) => format!("TIME '{}'", time_of_day(time.0)),
+        Value::Time(time) => format!("TIME '{}'", time.text()),
         Value::Bytes(bytes) => {
             use std::fmt::Write as _;
             let mut hex = String::with_capacity(bytes.len() * 2);
@@ -537,25 +543,6 @@ fn literal(value: &Value) -> String {
 /// A single-quoted string literal, quotes doubled.
 pub fn quote_literal(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
-}
-
-/// A `time`'s microseconds as Postgres's `HH:MM:SS[.ffffff]`, hours counted
-/// past 24 when the value carries them: `24:00:00` is a distinct `time` in
-/// Postgres, so it is written as itself and never wrapped to midnight.
-fn time_of_day(micros: i64) -> String {
-    let seconds = micros.div_euclid(1_000_000);
-    let fraction = micros.rem_euclid(1_000_000);
-    let whole = format!(
-        "{:02}:{:02}:{:02}",
-        seconds.div_euclid(3600),
-        seconds.div_euclid(60) % 60,
-        seconds % 60
-    );
-    if fraction == 0 {
-        return whole;
-    }
-    let digits = format!("{fraction:06}");
-    format!("{whole}.{}", digits.trim_end_matches('0'))
 }
 
 #[cfg(test)]

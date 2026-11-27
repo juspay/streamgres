@@ -27,7 +27,11 @@ pub fn raw_text(type_oid: u32, bytes: &[u8], money_scale: u8) -> Option<String> 
         MACADDR => macaddr(bytes),
         TSVECTOR => tsvector(bytes),
         MONEY => money(bytes, money_scale),
-        _ => None,
+        // `hstore`'s OID is assigned by the extension and differs per
+        // database, so it is recognized by its exact binary shape rather
+        // than an OID. The bytes stay authoritative for equality and
+        // identity; only the client's text projection comes from here.
+        _ => hstore(bytes),
     }
 }
 
@@ -140,8 +144,7 @@ fn inet(bytes: &[u8], cidr: bool) -> Option<String> {
 
 /// A `tsvector`: its lexemes in order, each quoted, with its positions
 /// and their weights (`A`, `B`, `C`; `D` is written as none).
-fn tsvector(bytes: &[u8]) -> Option<String> {
-    let count = usize::try_from(i32_at(bytes, 0)?).ok()?;
+fn tsvector(bytes: &[u8]) -> Option<String> {    let count = usize::try_from(i32_at(bytes, 0)?).ok()?;
     let mut at = 4;
     let mut lexemes = Vec::with_capacity(count);
     for _ in 0..count {
@@ -166,6 +169,58 @@ fn tsvector(bytes: &[u8]) -> Option<String> {
         lexemes.push(text);
     }
     (at == bytes.len()).then(|| lexemes.join(" "))
+}
+
+/// An `hstore` as Postgres's own output writes it: `"key"=>"value"` pairs
+/// joined by `, `. Its binary form is a count, then each pair's length-
+/// prefixed key and value (`-1` for a NULL value). The OID is assigned by
+/// the extension, so the caller matches on the type name, not the OID.
+pub(crate) fn hstore(bytes: &[u8]) -> Option<String> {
+    let count = usize::try_from(i32_at(bytes, 0)?).ok()?;
+    let mut at = 4;
+    let mut pairs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key_len = i32_at(bytes, at)?;
+        at += 4;
+        let key = bytes.get(at..at + usize::try_from(key_len).ok()?)?;
+        at += usize::try_from(key_len).ok()?;
+        let value_len = i32_at(bytes, at)?;
+        at += 4;
+        let key = std::str::from_utf8(key).ok()?;
+        let pair = if value_len < 0 {
+            format!("{}=>NULL", hstore_token(key))
+        } else {
+            let value = bytes.get(at..at + usize::try_from(value_len).ok()?)?;
+            at += usize::try_from(value_len).ok()?;
+            let value = std::str::from_utf8(value).ok()?;
+            format!("{}=>{}", hstore_token(key), hstore_token(value))
+        };
+        pairs.push(pair);
+    }
+    (at == bytes.len()).then(|| pairs.join(", "))
+}
+
+/// An `hstore` key or value as its output writes it: bare unless it holds
+/// whitespace, a comma, a quote or a backslash, in which case it is
+/// double-quoted with `"` and `\` escaped.
+fn hstore_token(text: &str) -> String {
+    let needs_quotes = text.is_empty()
+        || text
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, ',' | '"' | '\\' | '='));
+    if !needs_quotes {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for character in text.chars() {
+        if matches!(character, '"' | '\\') {
+            out.push('\\');
+        }
+        out.push(character);
+    }
+    out.push('"');
+    out
 }
 
 /// A `money` amount in the currency's units, with as many fraction
@@ -214,6 +269,48 @@ mod tests {
             &months.to_be_bytes(),
         ]
         .concat()
+    }
+
+    /// An `hstore` is recognized by its count-prefixed layout and written
+    /// as Postgres writes it, quoting only where output needs it. Bytes
+    /// that are not exactly that shape render nothing, so no other raw type
+    /// is misread as a map.
+    #[test]
+    fn an_hstore_reads_as_postgres_writes_it() {
+        let pair = |key: &str, value: Option<&str>| {
+            let mut out = Vec::new();
+            out.extend_from_slice(&(key.len() as i32).to_be_bytes());
+            out.extend_from_slice(key.as_bytes());
+            match value {
+                Some(value) => {
+                    out.extend_from_slice(&(value.len() as i32).to_be_bytes());
+                    out.extend_from_slice(value.as_bytes());
+                }
+                None => out.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+            out
+        };
+        let map = |pairs: &[(&str, Option<&str>)]| {
+            let mut out = (pairs.len() as i32).to_be_bytes().to_vec();
+            for (key, value) in pairs {
+                out.extend_from_slice(&pair(key, *value));
+            }
+            out
+        };
+        assert_eq!(
+            hstore(&map(&[("foo", Some("bar"))])).as_deref(),
+            Some("foo=>bar")
+        );
+        assert_eq!(
+            hstore(&map(&[("a", Some("1")), ("c", Some("x y")), ("d", None)])).as_deref(),
+            Some("a=>1, c=>\"x y\", d=>NULL")
+        );
+        // Not that layout: a UUID and a zeroed point must not become maps.
+        assert_eq!(hstore(&[0u8; 16]), None);
+        assert_eq!(
+            hstore(&0x0000_0001_0000_0000_0000_0003_0000_0000u128.to_be_bytes()),
+            None
+        );
     }
 
     #[test]

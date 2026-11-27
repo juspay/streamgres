@@ -539,11 +539,6 @@ fn simple(op: &str, left: &Operand, right: &Operand, table: &DbTable) -> Result<
     let column = table
         .column(name)
         .ok_or_else(|| format!("unknown column `{}.{name}`", table.name))?;
-    if !crate::model::supports(crate::model::Capability::Filter, &column.r#type) {
-        return Err(format!(
-            "`{name}` has a type the server does not compare; it can be read, not filtered on"
-        ));
-    }
     let literal = match right {
         Operand::Literal { value } => value,
         Operand::Static { .. } => {
@@ -555,6 +550,20 @@ fn simple(op: &str, left: &Operand, right: &Operand, table: &DbTable) -> Result<
             return Err("column-to-column comparisons are not supported".to_owned());
         }
     };
+    // A null check compares presence, not value, so it works for every
+    // column — including a list, which has no value comparison here.
+    if matches!(op, "IS" | "IS NOT") && literal.is_null() {
+        return Ok(if op == "IS" {
+            Where::is_null(name.as_str())
+        } else {
+            Where::is_not_null(name.as_str())
+        });
+    }
+    if !crate::model::supports(crate::model::Capability::Filter, &column.r#type) {
+        return Err(format!(
+            "`{name}` has a type the server does not compare; it can be read, not filtered on"
+        ));
+    }
     let operator = match op {
         "=" => EQ,
         "!=" => NEQ,
@@ -565,18 +574,18 @@ fn simple(op: &str, left: &Operand, right: &Operand, table: &DbTable) -> Result<
         "IN" => IN,
         "NOT IN" => NOT_IN,
         "IS" => {
-            return Ok(if literal.is_null() {
-                Where::is_null(name.as_str())
-            } else {
-                Where::condition(name.as_str(), EQ, literal_value(literal, &column.r#type)?)
-            });
+            return Ok(Where::condition(
+                name.as_str(),
+                EQ,
+                literal_value(literal, &column.r#type)?,
+            ));
         }
         "IS NOT" => {
-            return Ok(if literal.is_null() {
-                Where::is_not_null(name.as_str())
-            } else {
-                Where::condition(name.as_str(), NEQ, literal_value(literal, &column.r#type)?)
-            });
+            return Ok(Where::condition(
+                name.as_str(),
+                NEQ,
+                literal_value(literal, &column.r#type)?,
+            ));
         }
         "LIKE" | "ILIKE" | "NOT LIKE" | "NOT ILIKE" => {
             return Err(format!("{op} is not supported (a condition on `{name}`)"));
@@ -1160,6 +1169,24 @@ mod tests {
         .unwrap();
         let error = translate(&ast, &catalog()).expect_err("a list is not a membership target");
         assert!(error.contains("does not compare"), "{error}");
+
+        // A null check compares presence, not value, and stays available.
+        for (op, expected) in [
+            ("IS", Where::is_null("labels")),
+            ("IS NOT", Where::is_not_null("labels")),
+        ] {
+            let ast: Ast = serde_json::from_value(serde_json::json!({
+                "table": "messages",
+                "where": {"type": "simple", "op": op, "left": {"type": "column", "name": "labels"},
+                          "right": {"type": "literal", "value": null}},
+            }))
+            .unwrap();
+            assert_eq!(
+                translate(&ast, &catalog()).unwrap().query.main_table.filter,
+                expected,
+                "`labels {op} NULL` is still supported"
+            );
+        }
     }
 
     /// A numeric literal holds only the decoder's forms: a JSON number is

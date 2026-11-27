@@ -1873,12 +1873,13 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
                 "DROP SCHEMA IF EXISTS live_exact CASCADE;
                  CREATE SCHEMA live_exact;
                  CREATE TYPE live_exact.mood AS ENUM ('calm', 'busy');
+                 CREATE EXTENSION IF NOT EXISTS hstore;
                  CREATE TABLE {table} (
                    id int8 PRIMARY KEY, i2 int2, i4 int4, f4 real, f8 float8,
                    n numeric(30, 4), b bool, t text, vc varchar(10), ch char(3), u uuid,
                    j json, jb jsonb, ts timestamp, tz timestamptz, d date, tm time,
                    by bytea, iv interval, ints int4[], texts text[], mood live_exact.mood,
-                   moods live_exact.mood[],
+                   moods live_exact.mood[], nm name, hst hstore,
                    addr inet, tv tsvector, cash money);
                  CREATE PUBLICATION \"{publication}\" FOR TABLE {table};"
             ))
@@ -1908,11 +1909,12 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
                     '00010203-0405-0607-0809-0a0b0c0d0e0f', '{{ \"b\":1.50, \"a\":2 }}',
                     '{{\"a\": 1.50}}', '2026-09-11 10:00:00.123456', '2026-09-11 10:00:00.5+05:30',
                     '2026-09-11', '23:59:59.999999', '\\x00ff10', '1 year 2 days 03:04:05',
-                    '{{1,NULL,3}}', '{{\"a b\",c}}', 'busy', '{{calm,busy}}', '10.0.0.1/8',
+                    '{{1,NULL,3}}', '{{\"a b\",c}}', 'busy', '{{calm,busy}}', 'alice',
+                    'foo=>bar', '10.0.0.1/8',
                     'a fat cat:3A sat:5,7B it''s', '-1234.56'),
                    (2, NULL, NULL, 'NaN', '-Infinity', 'NaN', NULL, NULL, NULL, NULL, NULL,
                     NULL, NULL, 'infinity', '-infinity', 'infinity', NULL, '\\x', NULL,
-                    '{{}}', NULL, NULL, '{{}}', NULL, NULL, NULL);"
+                    '{{}}', NULL, NULL, '{{}}', NULL, NULL, NULL, NULL, NULL);"
             ))
             .await
             .expect("insert");
@@ -2003,6 +2005,18 @@ fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
             cell("moods"),
             Value::List(vec![Value::from("calm"), Value::from("busy")]),
             "an enum array keeps its labels"
+        );
+        // `name` carries a nonzero `typelem` but is a scalar, not an array.
+        assert_eq!(cell("nm"), Value::from("alice"));
+        // A type the engine keeps raw still shows Postgres's own text, as
+        // it did before binary decoding; it is no longer a bare `null`.
+        let Value::Raw(hstore) = cell("hst") else {
+            panic!("hstore is raw");
+        };
+        assert_eq!(
+            hstore.client_text.as_deref(),
+            Some("foo=>bar"),
+            "a raw user type keeps a readable projection"
         );
         assert_eq!(
             cell("ints"),
@@ -2232,11 +2246,22 @@ fn a_fresh_connection_reads_a_large_known_domain_without_prepare() {
         .expect("a known scalar domain must not wait on a mid-stream type lookup")
         .expect("the domain read is served");
         assert_eq!(read.rows.len(), 100);
-        for (index, (_, row)) in read.rows.iter().enumerate() {
+        // The unlimited read carries no ORDER BY, so look each row up by
+        // its key rather than relying on the order the rows arrive in.
+        let by_id: BTreeMap<i64, &DataFrameRow> = read
+            .rows
+            .iter()
+            .filter_map(|(key, row)| match key.pkey_value.get(&ColumnName::from("id")) {
+                Some(Value::Int(id)) => Some((*id, row)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(by_id.len(), 100, "every id is present");
+        for (id, row) in &by_id {
             assert_eq!(
                 row.data.get("amount"),
-                Some(&Value::Int(index as i64 * 100)),
-                "the domain keeps its exact bigint value"
+                Some(&Value::Int(id * 100)),
+                "the domain keeps its exact bigint value for id {id}"
             );
         }
 

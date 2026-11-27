@@ -1075,27 +1075,47 @@ impl Pool {
                     }
                 }
             };
-            let outcome = tokio::try_join!(
-                async {
-                    client
-                        .batch_execute(&setup)
-                        .await
-                        .map_err(|error| self.read_error(what, error))
-                },
-                self.read_rows(&client, what, sql, statement.as_ref()),
-                async {
-                    client
-                        .batch_execute("COMMIT")
-                        .await
-                        .map_err(|error| self.read_error(what, error))
-                },
-            );
-            match outcome {
-                Ok((_, rows, _)) => {
+            // The three are pipelined, so they race. `try_join!` would
+            // report whichever failed first — when the statement timeout
+            // fires, `COMMIT` often reports "current transaction is aborted"
+            // before the read surfaces its cancellation, hiding the reason.
+            // Awaiting all three and keeping the read's own error preserves
+            // the timeout refusal that the caller was told to give.
+            let setup = async {
+                client
+                    .batch_execute(&setup)
+                    .await
+                    .map_err(|error| self.read_error(what, error))
+            };
+            let rows = self.read_rows(&client, what, sql, statement.as_ref());
+            let commit = async {
+                client
+                    .batch_execute("COMMIT")
+                    .await
+                    .map_err(|error| self.read_error(what, error))
+            };
+            let (setup, rows, commit) = tokio::join!(setup, rows, commit);
+            match (setup, rows, commit) {
+                (Ok(()), Ok(rows), Ok(())) => {
                     self.release(client);
                     Ok(rows)
                 }
-                Err(error) => Err(error),
+                (setup, rows, commit) => {
+                    // The read's failure is the cause; the aborted transaction
+                    // it left behind only repeats it. A refusal is always the
+                    // cause: when the setup runs out of time its refusal is
+                    // what the caller is owed, and the read and the commit
+                    // only echo it.
+                    let mut errors = [rows.err(), setup.err(), commit.err()]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    let at = errors
+                        .iter()
+                        .position(|error| error.refusal().is_some())
+                        .unwrap_or(0);
+                    Err(errors.swap_remove(at))
+                }
             }
         };
         match limit {

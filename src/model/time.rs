@@ -96,9 +96,47 @@ impl Day {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Time(pub i64);
 
+impl Time {
+    /// This time as PostgreSQL writes it: `HH:MM:SS`, then the fraction
+    /// without trailing zeros when there is one.
+    ///
+    /// The hour is never wrapped onto a single day: `24:00:00` is its own
+    /// value in PostgreSQL, distinct from `00:00:00` and ordering after it,
+    /// so it is written as the hour the value actually carries. Both the
+    /// SQL literal and the client's text come from here, so the two cannot
+    /// disagree about end of day.
+    pub fn text(self) -> String {
+        let seconds = self.0.div_euclid(1_000_000);
+        let fraction = self.0.rem_euclid(1_000_000);
+        let whole = format!(
+            "{:02}:{:02}:{:02}",
+            seconds.div_euclid(3600),
+            seconds.div_euclid(60) % 60,
+            seconds % 60
+        );
+        if fraction == 0 {
+            return whole;
+        }
+        let digits = format!("{fraction:06}");
+        format!("{whole}.{}", digits.trim_end_matches('0'))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One formatter serves both the SQL literal and the client's text, so
+    /// end of day stays distinct from midnight in both. PostgreSQL keeps
+    /// `24:00:00` as its own value, ordering after `00:00:00`.
+    #[test]
+    fn a_time_keeps_its_own_hour() {
+        assert_eq!(Time(0).text(), "00:00:00");
+        assert_eq!(Time(86_400_000_000).text(), "24:00:00");
+        assert_eq!(Time(86_399_999_999).text(), "23:59:59.999999");
+        assert_eq!(Time(1_500_000).text(), "00:00:01.5");
+        assert_ne!(Time(0).text(), Time(86_400_000_000).text());
+    }
 
     #[test]
     fn the_epochs_line_up() {

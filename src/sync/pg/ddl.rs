@@ -93,6 +93,10 @@ pub struct PublishedColumn {
     pub base_type_oid: Option<i64>,
     #[serde(rename = "basePgTypeClass", default)]
     pub base_pg_type_class: Option<String>,
+    #[serde(rename = "baseSendsText", default)]
+    pub base_sends_text: Option<bool>,
+    #[serde(rename = "baseElemSendsText", default)]
+    pub base_elem_sends_text: Option<bool>,
     #[serde(rename = "baseType", default)]
     pub base_type: Option<String>,
     #[serde(rename = "elementOID", default)]
@@ -121,13 +125,24 @@ impl PublishedColumn {
                 .as_deref()
                 .or(self.pg_type_class.as_deref())
                 .unwrap_or(""),
+            base_sends_text: self.base_sends_text.unwrap_or(false),
             base_oid: self.base_type_oid.map_or(declared_oid, oid),
+            // An array's element name comes from the base type's `typname`
+            // (`_int8` → `int8`), which the trigger supplies. Falling back
+            // to stripping `[]` from the declared name breaks a domain over
+            // an array: `data_type` is then the domain's own name, with no
+            // `[]` to strip, so a domain over `text[]` would lose its
+            // element and classify as `List(Raw)`.
             element_name: if is_array {
-                self.data_type.trim_end_matches("[]")
+                self.base_type
+                    .as_deref()
+                    .map(|base| base.strip_prefix('_').unwrap_or(base))
+                    .unwrap_or_else(|| self.data_type.trim_end_matches("[]"))
             } else {
                 ""
             },
             element_class: self.base_elem_type_class.as_deref().unwrap_or(""),
+            element_sends_text: self.base_elem_sends_text.unwrap_or(false),
             element_oid: self.element_oid.map_or_else(
                 || super::binary::array_element(declared_oid).unwrap_or(0),
                 oid,
@@ -138,7 +153,7 @@ impl PublishedColumn {
     }
 
     /// Both ingestion paths construct a complete column from the shared mapper.
-    pub fn to_db_column(&self, name: &str, _type: ValueType) -> DbColumn {
+    pub fn to_db_column(&self, name: &str) -> DbColumn {
         self.pg_type().to_db_column(name)
     }
 }
@@ -177,27 +192,19 @@ impl PublishedTable {
         }
         let mut columns = Vec::with_capacity(self.columns.len());
         for (name, column) in &self.columns {
-            match column_type(column) {
-                Some(r#type)
-                    if self.primary_key.iter().any(|key| key == name)
-                        && !super::catalog::keyable(&r#type) =>
-                {
-                    return Err(format!(
-                        "{}: key column `{name}` has a type the engine cannot key by, {}",
-                        self.catalog_name(),
-                        column.data_type
-                    ));
-                }
-                Some(r#type) => columns.push(column.to_db_column(name.as_str(), r#type)),
-                None if self.primary_key.iter().any(|key| key == name) => {
-                    return Err(format!(
-                        "{}: key column `{name}` has an uncarried type {}",
-                        self.catalog_name(),
-                        column.data_type
-                    ));
-                }
-                None => {}
+            // Build the column once; its type is then the one both the key
+            // check and the catalog use.
+            let column = column.to_db_column(name);
+            if self.primary_key.iter().any(|key| key == name)
+                && !super::catalog::keyable(&column.r#type)
+            {
+                return Err(format!(
+                    "{}: key column `{name}` has a type the engine cannot key by, {}",
+                    self.catalog_name(),
+                    self.columns[name].data_type
+                ));
             }
+            columns.push(column);
         }
         Ok(DbTable::new(
             self.catalog_name(),
@@ -205,14 +212,6 @@ impl PublishedTable {
             columns,
         ))
     }
-}
-
-/// The engine's type for a published column, mapped as the startup
-/// catalog maps `information_schema`: an array is a list of its element's
-/// type, an enum is a string, a type the engine does not interpret is
-/// raw.
-pub fn column_type(column: &PublishedColumn) -> Option<ValueType> {
-    Some(column.pg_type().value_type())
 }
 
 /// The value every existing row holds for a column added with default
@@ -467,8 +466,8 @@ fn column_changes(held: &DbTable, published: &PublishedTable) -> Result<Vec<Sche
                 ));
             }
             Some(after) => {
-                let now = column_type(after);
-                if now.as_ref() != Some(&column.r#type) {
+                let now = after.to_db_column(column_name.as_str()).r#type;
+                if now != column.r#type {
                     return Err(format!(
                         "column `{column_name}` of `{name}` changed type to {} ({:?} from {:?})",
                         after.data_type, now, column.r#type
@@ -485,14 +484,8 @@ fn column_changes(held: &DbTable, published: &PublishedTable) -> Result<Vec<Sche
     added.sort_by(|a, b| a.0.cmp(b.0));
     let mut changes = Vec::new();
     for (column_name, column) in added {
-        let Some(r#type) = column_type(column) else {
-            crate::log::log_warn!(
-                "new column `{column_name}` of `{name}` is not carried: {}",
-                column.data_type
-            );
-            continue;
-        };
-        let Some(value) = parse_default(column.dflt.as_deref(), &r#type) else {
+        let mapped = column.to_db_column(column_name);
+        let Some(value) = parse_default(column.dflt.as_deref(), &mapped.r#type) else {
             return Err(format!(
                 "column `{column_name}` of `{name}` was added with an expression default ({})",
                 column.dflt.as_deref().unwrap_or("")
@@ -500,7 +493,7 @@ fn column_changes(held: &DbTable, published: &PublishedTable) -> Result<Vec<Sche
         };
         changes.push(SchemaChange::ColumnAdded {
             table: TableName::from(name.as_str()),
-            column: column.to_db_column(column_name.as_str(), r#type),
+            column: mapped,
             value,
             schema: held.row_schema().clone(),
         });
@@ -620,11 +613,31 @@ mod tests {
             "dflt": null
         }"#)
         .unwrap();
-        assert_eq!(column_type(&column), Some(ValueType::Int));
-        let column = column.to_db_column("id", ValueType::Raw);
+        assert_eq!(column.to_db_column("c").r#type, ValueType::Int);
+        let column = column.to_db_column("id");
         assert_eq!(column.type_oid, 20);
         assert_eq!(column.element_oid, 0);
         assert!(column.is_domain);
+    }
+
+    /// A domain over an array has no `[]` in its declared name, so its
+    /// element comes from the base `typname`; it must classify the same way
+    /// startup does rather than falling back to a raw element.
+    #[test]
+    fn a_domain_over_an_array_keeps_its_element_type() {
+        let column: PublishedColumn = serde_json::from_str(r#"{
+            "dataType": "tags", "pgTypeClass": "d", "typeOID": 50010,
+            "baseTypeOID": 1009, "baseType": "_text", "basePgTypeClass": "b",
+            "isArray": true, "elementOID": 25, "baseElemTypeClass": "b",
+            "dflt": null
+        }"#)
+        .unwrap();
+        assert_eq!(
+            column.to_db_column("c").r#type,
+            ValueType::List(Box::new(ValueType::String)),
+            "a domain over text[] stays a list of strings"
+        );
+        assert!(column.to_db_column("c").is_domain);
     }
 
     const TICKETS: &[(&str, &str, Option<&str>)] =
@@ -717,29 +730,31 @@ mod tests {
             pg_type_class: Some(class.to_owned()),
             base_type_oid: None,
             base_pg_type_class: None,
+            base_sends_text: None,
+            base_elem_sends_text: None,
             base_type: None,
             element_oid: None,
             base_elem_type_class: None,
             is_array: false,
             dflt: None,
         };
-        assert_eq!(column_type(&column("int8", "b")), Some(ValueType::Int));
+        assert_eq!(column("int8", "b").to_db_column("c").r#type, ValueType::Int);
         assert_eq!(
-            column_type(&column("timestamptz", "b")),
-            Some(ValueType::Timestamp)
+            column("timestamptz", "b").to_db_column("c").r#type,
+            ValueType::Timestamp
         );
-        assert_eq!(column_type(&column("jsonb", "b")), Some(ValueType::Json));
+        assert_eq!(column("jsonb", "b").to_db_column("c").r#type, ValueType::Json);
         assert_eq!(
-            column_type(&column("TicketStatus", "e")),
-            Some(ValueType::String)
+            column("TicketStatus", "e").to_db_column("c").r#type,
+            ValueType::String
         );
         assert_eq!(
-            column_type(&column("text[]", "b")),
-            Some(ValueType::List(Box::new(ValueType::String)))
+            column("text[]", "b").to_db_column("c").r#type,
+            ValueType::List(Box::new(ValueType::String))
         );
-        assert_eq!(column_type(&column("bytea", "b")), Some(ValueType::Bytes));
-        assert_eq!(column_type(&column("numeric", "b")), Some(ValueType::Numeric));
-        assert_eq!(column_type(&column("money", "b")), Some(ValueType::Raw));
+        assert_eq!(column("bytea", "b").to_db_column("c").r#type, ValueType::Bytes);
+        assert_eq!(column("numeric", "b").to_db_column("c").r#type, ValueType::Numeric);
+        assert_eq!(column("money", "b").to_db_column("c").r#type, ValueType::Raw);
     }
 
     /// A column added with a constant default, a table added, both
