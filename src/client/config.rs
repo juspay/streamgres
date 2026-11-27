@@ -188,6 +188,80 @@ pub struct Config {
     pub admin_endpoints: bool,
 }
 
+/// A variable's value from `lookup`, as every setting reads it: an empty
+/// value is unset, and a `STREAMGRES_*` name falls back to its
+/// `STREAMGRES_SYNC_*` and `XYNE_SYNC_*` spellings.
+fn setting(lookup: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String> {
+    lookup(name)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            name.strip_prefix("STREAMGRES_")
+                .and_then(|suffix| lookup(&format!("STREAMGRES_SYNC_{suffix}")))
+                .filter(|value| !value.is_empty())
+        })
+        .or_else(|| {
+            name.strip_prefix("STREAMGRES_")
+                .and_then(|suffix| lookup(&format!("XYNE_SYNC_{suffix}")))
+                .filter(|value| !value.is_empty())
+        })
+}
+
+/// What the DDL trigger stack is installed for: the app and shard that
+/// name it, and the publication its schema describes. Read alone by
+/// `server print-ddl-triggers`, which needs nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TriggerIdentity {
+    /// `STREAMGRES_APP_ID` (or `ZERO_APP_ID`), default `zero`.
+    pub app_id: String,
+    /// `STREAMGRES_SHARD` (or `ZERO_SHARD_NUM`), default 0.
+    pub shard: u32,
+    /// `STREAMGRES_PUBLICATION`, default `xyne_sync_pub`.
+    pub publication: String,
+}
+
+impl TriggerIdentity {
+    /// The identity the environment describes.
+    pub fn from_env() -> Result<TriggerIdentity, String> {
+        Self::from_lookup(&|name: &str| std::env::var(name).ok())
+    }
+
+    /// The identity `lookup` describes, with the server's defaults.
+    pub fn from_lookup(
+        lookup: &impl Fn(&str) -> Option<String>,
+    ) -> Result<TriggerIdentity, String> {
+        let first = |names: &[&str]| names.iter().find_map(|name| setting(lookup, name));
+        let app_id =
+            first(&["STREAMGRES_APP_ID", "ZERO_APP_ID"]).unwrap_or_else(|| "zero".to_owned());
+        if !app_id
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            return Err(format!(
+                "STREAMGRES_APP_ID must consist of lowercase letters, digits and `_`, as in Zero, got `{app_id}`"
+            ));
+        }
+        let shard = match first(&["STREAMGRES_SHARD", "ZERO_SHARD_NUM"]) {
+            Some(text) => text
+                .parse::<u32>()
+                .map_err(|_| format!("STREAMGRES_SHARD must be a number, got `{text}`"))?,
+            None => 0,
+        };
+        let publication =
+            first(&["STREAMGRES_PUBLICATION"]).unwrap_or_else(|| "xyne_sync_pub".to_owned());
+        Ok(TriggerIdentity {
+            app_id,
+            shard,
+            publication,
+        })
+    }
+
+    /// The DDL trigger stack setup installs for this identity, as SQL that
+    /// can be run by hand on the primary to install or replace it.
+    pub fn trigger_stack_sql(&self) -> String {
+        super::ddl_triggers::trigger_stack_sql(&self.app_id, self.shard, &[&self.publication])
+    }
+}
+
 impl Config {
     /// Read the configuration; an error names the missing or malformed
     /// variable.
@@ -198,21 +272,7 @@ impl Config {
     /// The configuration `lookup` describes (the environment's, or a
     /// test's): an unset or empty variable takes its default.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Config, String> {
-        let value = |name: &str| {
-            lookup(name)
-                .filter(|value| !value.is_empty())
-                .or_else(|| {
-                    name.strip_prefix("STREAMGRES_")
-                        .and_then(|suffix| lookup(&format!("STREAMGRES_SYNC_{suffix}")))
-                        .filter(|value| !value.is_empty())
-                })
-                .or_else(|| {
-                    name.strip_prefix("STREAMGRES_")
-                        .and_then(|suffix| lookup(&format!("XYNE_SYNC_{suffix}")))
-                        .filter(|value| !value.is_empty())
-                })
-        };
-        let first = |names: &[&str]| names.iter().find_map(|name| value(name));
+        let first = |names: &[&str]| names.iter().find_map(|name| setting(&lookup, name));
         let millis = |name: &str, default: u64| -> Result<Duration, String> {
             match first(&[name]) {
                 Some(text) => text
@@ -231,14 +291,11 @@ impl Config {
             .ok_or("STREAMGRES_QUERY_URL (or ZERO_QUERY_URL) must name the query endpoint")?;
         let mutate_url = first(&["STREAMGRES_MUTATE_URL", "ZERO_MUTATE_URL"])
             .ok_or("STREAMGRES_MUTATE_URL (or ZERO_MUTATE_URL) must name the mutate endpoint")?;
-        let app_id =
-            first(&["STREAMGRES_APP_ID", "ZERO_APP_ID"]).unwrap_or_else(|| "zero".to_owned());
-        let shard = match first(&["STREAMGRES_SHARD", "ZERO_SHARD_NUM"]) {
-            Some(text) => text
-                .parse::<u32>()
-                .map_err(|_| format!("STREAMGRES_SHARD must be a number, got `{text}`"))?,
-            None => 0,
-        };
+        let TriggerIdentity {
+            app_id,
+            shard,
+            publication,
+        } = TriggerIdentity::from_lookup(&lookup)?;
         let ddl_trigger = format!("{app_id}_ddl_end_{shard}");
         let ddl_prefix = format!("{app_id}/{shard}/ddl");
         let schemas = match first(&["STREAMGRES_SCHEMAS"]) {
@@ -320,8 +377,7 @@ impl Config {
             schemas,
             slot: threads::slot_name(),
             slot_cleanup_age: millis("STREAMGRES_SLOT_CLEANUP_AGE_MS", 0)?,
-            publication: first(&["STREAMGRES_PUBLICATION"])
-                .unwrap_or_else(|| "xyne_sync_pub".to_owned()),
+            publication,
             ddl_trigger,
             ddl_prefix,
             snapshot_rotation: millis("STREAMGRES_SNAPSHOT_ROTATION_MS", 1_000)?,
@@ -462,16 +518,18 @@ impl Config {
     }
 
     /// The catalog name of the table holding each client's last mutation
-    /// id, `<upstream schema>.clients`.
-    pub fn clients_table(&self) -> String {
-        format!("{}.clients", self.upstream_schema())
+    /// id, `<upstream schema>.clients`, built the way the catalog names
+    /// every table, so the feed's writes to it match.
+    pub fn clients_table(&self) -> TableName {
+        TableName::of(&self.upstream_schema(), "clients")
     }
 
     /// The catalog name of the table the application server records the
     /// result of a failed mutation in, until its client has received it,
-    /// `<upstream schema>.mutations`.
-    pub fn mutations_table(&self) -> String {
-        format!("{}.mutations", self.upstream_schema())
+    /// `<upstream schema>.mutations`, built the way the catalog names
+    /// every table.
+    pub fn mutations_table(&self) -> TableName {
+        TableName::of(&self.upstream_schema(), "mutations")
     }
 
     /// What the engine side needs: the database to follow and read, and
@@ -496,10 +554,7 @@ impl Config {
                 interval: self.pg_keepalive_interval,
                 retries: self.pg_keepalive_retries,
             },
-            watched: vec![
-                TableName::from(self.clients_table().as_str()),
-                TableName::from(self.mutations_table().as_str()),
-            ],
+            watched: vec![self.clients_table(), self.mutations_table()],
             ddl_trigger: self.ddl_trigger.clone(),
             ddl_prefix: self.ddl_prefix.clone(),
         }
@@ -523,6 +578,39 @@ mod tests {
                 .find(|(key, _)| *key == name)
                 .map(|(_, value)| (*value).to_owned()),
         })
+    }
+
+    /// The mutation tables are watched under the names the catalog gives
+    /// them.
+    #[test]
+    fn the_mutation_tables_are_watched_under_their_catalog_names() {
+        let config = config(&[("STREAMGRES_APP_ID", "zero"), ("STREAMGRES_SHARD", "2")]).unwrap();
+        assert_eq!(config.clients_table().as_str(), "zero_2.clients");
+        assert_eq!(config.mutations_table().as_str(), "zero_2.mutations");
+        assert_eq!(
+            config.engine_settings().watched,
+            vec![
+                TableName::of("zero_2", "clients"),
+                TableName::of("zero_2", "mutations")
+            ]
+        );
+    }
+
+    /// The app id names schemas, triggers and the WAL message prefix, so
+    /// it takes only what Zero allows: lowercase letters, digits and `_`.
+    #[test]
+    fn an_app_id_outside_zeros_alphabet_is_refused() {
+        for app_id in ["my.app", "My_App", "my-app", "my app", "a\"b"] {
+            let error = config(&[("STREAMGRES_APP_ID", app_id)]).unwrap_err();
+            assert!(error.contains("STREAMGRES_APP_ID"), "{error}");
+            assert!(error.contains(app_id), "{error}");
+        }
+        for app_id in ["zero", "my_app_2", "_x"] {
+            assert_eq!(
+                config(&[("STREAMGRES_APP_ID", app_id)]).unwrap().app_id,
+                app_id
+            );
+        }
     }
 
     #[test]

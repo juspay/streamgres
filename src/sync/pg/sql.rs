@@ -20,7 +20,7 @@ use std::fmt::Write;
 
 use crate::model::{
     Catalog, ComparisonOperator, Condition, DbTable, MultiTableReadQuery, Order,
-    SingleTableReadQuery, Value, ValueType, Where,
+    SingleTableReadQuery, TableName, Value, ValueType, Where,
 };
 
 /// The `SELECT` for `query` over `table`'s declared columns, in the
@@ -38,7 +38,7 @@ pub fn select_sql(query: &SingleTableReadQuery, table: &DbTable) -> String {
     let _ = write!(
         sql,
         " FROM {} WHERE {}",
-        quote_ident(query.table.as_str()),
+        quote_table(query.table.as_str()),
         render_where(&query.filter, &Scope::plain(table))
     );
     if query.limit != u32::MAX {
@@ -90,7 +90,7 @@ pub fn count_sql(
         .ok_or_else(|| format!("table `{}` is not in the catalog", query.main_table.table))?;
     Ok(format!(
         "SELECT count(*) FROM (SELECT 1 FROM {} AS {} WHERE {} LIMIT {cap}) AS capped",
-        quote_ident(query.main_table.table.as_str()),
+        quote_table(query.main_table.table.as_str()),
         scope.alias,
         scope.render_node()
     ))
@@ -103,7 +103,7 @@ pub fn count_sql(
 pub fn explain_sql(name: &str, table: &DbTable, filter: &Where) -> String {
     format!(
         "EXPLAIN (FORMAT JSON) SELECT 1 FROM {} WHERE {}",
-        quote_ident(name),
+        quote_table(name),
         render_where(filter, &Scope::plain(table))
     )
 }
@@ -222,7 +222,7 @@ impl<'a> Scope<'a> {
             .collect();
         format!(
             "EXISTS (SELECT 1 FROM {} AS {} WHERE ({} AND {}))",
-            quote_ident(join.sub.main_table.table.as_str()),
+            quote_table(join.sub.main_table.table.as_str()),
             sub.alias,
             pairs.join(" AND "),
             sub.render_node()
@@ -319,10 +319,17 @@ fn literal_as(value: &Value, declared: Option<&ValueType>) -> String {
     format!("(TIMESTAMP 'epoch' + {millis} * INTERVAL '1 millisecond')")
 }
 
-/// A double-quoted identifier.
-pub fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+/// A table as SQL names it from its catalog name, always with its schema
+/// (`"public"."orders"`, `"billing"."invoices"`), so the session's
+/// `search_path` never decides which table is read.
+pub fn quote_table(name: &str) -> String {
+    let name = TableName::from(name);
+    let (schema, table) = name.source();
+    format!("{}.{}", quote_ident(&schema), quote_ident(&table))
 }
+
+/// A double-quoted identifier, by the same rule [`TableName`] quotes with.
+pub use crate::model::schema::quote_ident;
 
 /// The filter tree as a boolean expression in `scope`.
 fn render_where(filter: &Where, scope: &Scope<'_>) -> String {
@@ -686,8 +693,8 @@ mod tests {
         let count = count_sql(&query, &catalog, 50).expect("known");
         assert_eq!(
             count,
-            "SELECT count(*) FROM (SELECT 1 FROM \"tickets\" AS t0 WHERE (t0.\"status\" = 'OPEN' AND \
-             EXISTS (SELECT 1 FROM \"comments\" AS t1 WHERE (t1.\"ticket\" = t0.\"points\" AND t1.\"org\" = t0.\"id\" AND TRUE))\
+            "SELECT count(*) FROM (SELECT 1 FROM \"public\".\"tickets\" AS t0 WHERE (t0.\"status\" = 'OPEN' AND \
+             EXISTS (SELECT 1 FROM \"public\".\"comments\" AS t1 WHERE (t1.\"ticket\" = t0.\"points\" AND t1.\"org\" = t0.\"id\" AND TRUE))\
              ) LIMIT 50) AS capped"
         );
     }
@@ -711,7 +718,7 @@ mod tests {
         let count = count_sql(&query, &catalog, 50).expect("known");
         assert_eq!(
             count,
-            "SELECT count(*) FROM (SELECT 1 FROM \"tickets\" AS t0 WHERE (TRUE AND FALSE) LIMIT 50) AS capped"
+            "SELECT count(*) FROM (SELECT 1 FROM \"public\".\"tickets\" AS t0 WHERE (TRUE AND FALSE) LIMIT 50) AS capped"
         );
     }
 
@@ -737,8 +744,8 @@ mod tests {
         let count = count_sql(&query, &catalog, 50).expect("known");
         assert_eq!(
             count,
-            "SELECT count(*) FROM (SELECT 1 FROM \"tickets\" AS t0 WHERE (t0.\"status\" = 'OPEN' AND \
-             EXISTS (SELECT 1 FROM \"comments\" AS t1 WHERE (t1.\"ticket\" = t0.\"points\" AND t1.\"org\" = t0.\"id\" AND TRUE))\
+            "SELECT count(*) FROM (SELECT 1 FROM \"public\".\"tickets\" AS t0 WHERE (t0.\"status\" = 'OPEN' AND \
+             EXISTS (SELECT 1 FROM \"public\".\"comments\" AS t1 WHERE (t1.\"ticket\" = t0.\"points\" AND t1.\"org\" = t0.\"id\" AND TRUE))\
              ) LIMIT 50) AS capped"
         );
     }
@@ -758,7 +765,7 @@ mod tests {
         );
         assert_eq!(
             select_sql(&query, &tickets()),
-            "SELECT \"id\"::int8, \"points\"::int8, \"status\"::text FROM \"tickets\" WHERE (\"status\" = 'it''s open' AND \"points\" >= 8)"
+            "SELECT \"id\"::int8, \"points\"::int8, \"status\"::text FROM \"public\".\"tickets\" WHERE (\"status\" = 'it''s open' AND \"points\" >= 8)"
         );
     }
 
@@ -800,7 +807,7 @@ mod tests {
         let count = count_sql(&MultiTableReadQuery::single(alone), &catalog, 100).expect("known");
         assert_eq!(
             count,
-            "SELECT count(*) FROM (SELECT 1 FROM \"tickets\" AS t0 WHERE (t0.\"status\" = 'OPEN') LIMIT 100) AS capped"
+            "SELECT count(*) FROM (SELECT 1 FROM \"public\".\"tickets\" AS t0 WHERE (t0.\"status\" = 'OPEN') LIMIT 100) AS capped"
         );
     }
 
@@ -881,11 +888,11 @@ mod tests {
         let count = count_sql(&query, &catalog, 50).expect("known");
         assert_eq!(
             count,
-            "SELECT count(*) FROM (SELECT 1 FROM \"tickets\" AS t0 WHERE (\
+            "SELECT count(*) FROM (SELECT 1 FROM \"public\".\"tickets\" AS t0 WHERE (\
              (t0.\"status\" = 'OPEN' OR \
-             EXISTS (SELECT 1 FROM \"teams\" AS t1 WHERE (t1.\"id\" = t0.\"id\" AND \
-             EXISTS (SELECT 1 FROM \"members\" AS t2 WHERE (t2.\"teamId\" = t1.\"id\" AND t2.\"userId\" = 'me'))))) AND \
-             EXISTS (SELECT 1 FROM \"ticket_teams\" AS t3 WHERE (t3.\"ticketId\" = t0.\"id\" AND t3.\"teamId\" > 0))\
+             EXISTS (SELECT 1 FROM \"public\".\"teams\" AS t1 WHERE (t1.\"id\" = t0.\"id\" AND \
+             EXISTS (SELECT 1 FROM \"public\".\"members\" AS t2 WHERE (t2.\"teamId\" = t1.\"id\" AND t2.\"userId\" = 'me'))))) AND \
+             EXISTS (SELECT 1 FROM \"public\".\"ticket_teams\" AS t3 WHERE (t3.\"ticketId\" = t0.\"id\" AND t3.\"teamId\" > 0))\
              ) LIMIT 50) AS capped"
         );
         let unknown = MultiTableReadQuery::new(
@@ -1059,5 +1066,20 @@ mod tests {
         let catalog = Catalog::new([values]);
         let count = count_sql(&MultiTableReadQuery::single(query), &catalog, 100).expect("known");
         assert!(count.contains("'\"high\"'::jsonb"), "{count}");
+    }
+
+    /// A table is named with its schema, `public` included, so the
+    /// session's `search_path` never decides which table is read; a
+    /// dot or quote in a name stays inside its part.
+    #[test]
+    fn a_table_is_named_with_its_schema() {
+        assert_eq!(quote_table("orders"), "\"public\".\"orders\"");
+        assert_eq!(quote_table("billing.invoices"), "\"billing\".\"invoices\"");
+        assert_eq!(quote_table("\"public\".\"a.b\""), "\"public\".\"a.b\"");
+        assert_eq!(quote_table("\"a.b\".\"x\""), "\"a.b\".\"x\"");
+        assert_eq!(
+            quote_table("\"billing\".\"say\"\"hi\""),
+            "\"billing\".\"say\"\"hi\""
+        );
     }
 }

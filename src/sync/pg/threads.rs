@@ -132,20 +132,28 @@ pub struct FeedHandle {
 /// keep listening.
 pub type ServiceTask = tokio::task::JoinHandle<Runtime<MultiTableIVM>>;
 
-/// Load the catalog of `schemas` over a connection of its own.
-pub async fn load_catalog_at(dsn: &str, schemas: &[String]) -> Result<Catalog, String> {
+/// Load the catalog of the tables `publication` streams in `schemas`,
+/// over a connection of its own.
+pub async fn load_catalog_at(
+    dsn: &str,
+    publication: &str,
+    schemas: &[String],
+) -> Result<Catalog, String> {
     let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
         .await
         .map_err(|error| format!("connecting to the database: {error}"))?;
     let handle = tokio::spawn(async move {
         let _ = connection.await;
     });
-    let (catalog, notes) = load_catalog(&client, schemas)
+    let (catalog, notes) = load_catalog(&client, publication, schemas)
         .await
         .map_err(|error| format!("reading the catalog: {error}"))?;
     drop(client);
     let _ = handle.await;
-    for note in &notes {
+    for note in &notes.warnings {
+        log_warn!("catalog: {note}");
+    }
+    for note in &notes.info {
         log_info!("catalog: {note}");
     }
     log_info!(

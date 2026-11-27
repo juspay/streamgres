@@ -110,8 +110,22 @@ idle. PgBouncer's own pool settings control the PostgreSQL backend connections.
 `STREAMGRES_MASTER_PG_DSN` connects to the writable primary. On first startup,
 Streamgres creates the `<app>_<shard>` mutation schema, publication, DDL
 functions, and event triggers. Existing objects are validated without
-replacement; mismatches stop startup. The master role must be a PostgreSQL
-superuser to create the publication and event triggers. Choose
+replacement; mismatches stop startup. A missing publication is created as
+`FOR TABLES IN SCHEMA` the `STREAMGRES_SCHEMAS` schemas, with
+`publish_via_partition_root = true`. An existing one may have any shape:
+`FOR ALL TABLES`, schemas, tables listed one by one, or a mix. Startup
+requires only that it publishes inserts, updates, deletes and truncates, sets
+`publish_via_partition_root = true`, and sends every column of a served table
+with no row filter (a column list must name every column but generated ones);
+otherwise it stops, before changing anything, and says what to fix. The server confirms mutations by following
+`<app>_<shard>.clients` and `<app>_<shard>.mutations`, which setup creates, so
+setup adds them to the publication when it lacks them. Change an existing publication with `ALTER
+PUBLICATION`: the DDL triggers do not hear `DROP` or `CREATE PUBLICATION`, so
+recreating it leaves the stored schema snapshot stale, and startup refuses
+until `server print-ddl-triggers` is run again. The master role must be a PostgreSQL
+superuser to create the publication and event triggers. `server
+print-ddl-triggers` prints the trigger SQL setup installs for the configured
+app, shard and publication, for installing or replacing it by hand. Choose
 `STREAMGRES_PUBLICATION` and `STREAMGRES_SCHEMAS` for the publication scope.
 Trigger names and the WAL message prefix come from `STREAMGRES_APP_ID` and
 `STREAMGRES_SHARD`; the triggers record the published schema before and after
@@ -157,8 +171,27 @@ DDL in that transaction's WAL.
 
 ### What is served
 
-- Tables without a primary key are skipped. So are columns of types the wire
-  format cannot carry (`bytea`). The startup log lists both.
+- A table is served when it is in a `STREAMGRES_SCHEMAS` schema **and** the
+  publication streams it. A table it does not stream would be read once and
+  never updated, so it is left out with a startup warning. That covers
+  unlogged tables, which PostgreSQL never publishes.
+- Partitioned tables are served through their root: the publication sets
+  `publish_via_partition_root = true`, and the partitions themselves are not
+  served.
+- Generated columns are left out with a warning: PostgreSQL does not send
+  them in the change feed.
+- A served table that the publication streams with a row filter, or with a
+  column list that leaves out a column, stops startup: its rows or columns
+  could not be kept up to date. A list naming every column is fine.
+- Tables without a primary key are skipped with a startup warning. Columns of
+  types the wire format cannot carry (`bytea`) are skipped too, and the
+  startup log lists them.
+- Clients name a table bare in `public` (`tickets`) and as `schema.table`
+  elsewhere (`billing.invoices`). When the schema or table name contains a
+  `.` or `"`, both parts are double-quoted as in SQL: `public."a.b"` is
+  named `"public"."a.b"`, and table `x` of schema `a.b` is `"a.b"."x"`. No
+  two tables share a name, so `public."a.b"` and table `b` of schema `a`
+  (named `a.b`) are both served.
 - Tables with large TOASTed columns need `REPLICA IDENTITY FULL`.
 
 ### Schema changes
@@ -176,6 +209,16 @@ naming the change. That includes dropping or renaming a column or table,
 changing a type or key, and adding a column with an expression default such as
 `now()`. Once restarted, the server loads the schema as it then is, and every
 client starts over. Plan those migrations as a restart.
+
+**A publication change that would leave served tables stale also stops the
+server**: turning off one of its change types or
+`publish_via_partition_root`, adding a row filter to a served table, or
+leaving one of its columns out. A column is left out by narrowing a table's
+column list, by adding a table with a list that leaves one out, or by adding a
+column to a table whose list does not name it, so with a column list,
+`ALTER TABLE ... ADD COLUMN` also needs the column added to the list. The
+log line says how to restore it; until then, startup refuses the publication
+for the same reason. Changes to other publications are ignored.
 
 A client whose schema names a table or column the database does not have yet
 is refused with `SchemaVersionNotSupported`. Migrate the database before
@@ -227,7 +270,7 @@ depend on what the defaults happen to be:
 | variable | example | meaning |
 |---|---|---|
 | `STREAMGRES_BASE_PATH` | `/sync` | URL path prefix clients connect under. A client's server URL ends in it |
-| `STREAMGRES_APP_ID` | `xyne` | app id. With the shard, it names the `<app>_<shard>` schema of the mutation tables, the event trigger and its message prefix |
+| `STREAMGRES_APP_ID` | `zero` | app id: lowercase letters, digits and `_`, as in Zero. With the shard, it names the `<app>_<shard>` schema of the mutation tables, the event trigger and its message prefix |
 | `STREAMGRES_SHARD` | `0` | shard number |
 
 ### Recommended for production
@@ -249,7 +292,7 @@ depend on what the defaults happen to be:
 | variable | default | meaning |
 |---|---|---|
 | `STREAMGRES_ADDR` | `0.0.0.0:4848` | listen address |
-| `STREAMGRES_SCHEMAS` | `public,<app>_<shard>` | schemas whose tables are served |
+| `STREAMGRES_SCHEMAS` | `public,<app>_<shard>` | schemas whose published tables are served |
 | `STREAMGRES_PUBLICATION` | `xyne_sync_pub` | the publication the change feed streams |
 | `STREAMGRES_FORWARD_COOKIES` | `true` | forward the connection's cookies to the application server |
 | `STREAMGRES_SNAPSHOT_ROTATION_MS` | `1000` | how often a fresh read snapshot is created |

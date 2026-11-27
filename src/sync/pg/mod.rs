@@ -52,6 +52,7 @@ pub mod catalog;
 pub mod ddl;
 pub mod estimate;
 pub mod estimate_cache;
+pub mod publication;
 pub mod replication;
 pub mod sql;
 pub mod stream;
@@ -692,7 +693,8 @@ impl Storage for PgStorage {
                 match pool.run("reading the tables' sizes", estimate_cache::SIZES_SQL).await {
                     Ok(rows) => cache.sizes(rows.iter().map(|row| {
                         let field = |index: usize| row.get(index).unwrap_or_default().to_owned();
-                        (field(0), field(1), field(2))
+                        let table = crate::model::TableName::of(&field(0), &field(1));
+                        (table.as_str().to_owned(), field(2), field(3))
                     })),
                     Err(error) => log_warn!("reading the tables' sizes failed: {error}"),
                 }

@@ -7,9 +7,13 @@ use tokio_postgres::{NoTls, Transaction};
 
 use super::Config;
 use super::ddl_triggers::{self, FunctionSpec};
+use crate::sync::pg::publication::{PublicationShape, When};
 use crate::sync::pg::sql::quote_ident;
 
 const SETUP_LOCK: i64 = 0x5354_524d_4752_4553;
+
+/// How to replace a DDL trigger stack setup refuses, and when not to.
+const REINSTALL: &str = "To install the stack this Streamgres version expects, run once on the primary and restart: `server print-ddl-triggers | psql \"$STREAMGRES_MASTER_PG_DSN\"`. If another deployment on this database uses the same STREAMGRES_APP_ID and STREAMGRES_SHARD, give this one its own instead: reinstalling would break the other.";
 
 pub async fn ensure(master_dsn: &str, config: &Config) -> Result<(), String> {
     let schema = config.upstream_schema();
@@ -120,49 +124,40 @@ async fn ensure_locked(tx: &Transaction<'_>, config: &Config, schema: &str) -> R
     }
 
     let publication = &config.publication;
-    let existing = tx
-        .query_opt(
-            "SELECT puballtables, pubinsert, pubupdate, pubdelete, pubtruncate, pubviaroot
-             FROM pg_publication WHERE pubname = $1",
-            &[publication],
-        )
+    let existing = PublicationShape::read(tx, publication, &config.schemas)
         .await
         .map_err(|error| format!("checking publication `{publication}`: {error}"))?;
-    if let Some(row) = existing {
-        let flags = [
-            row.get::<_, bool>(0),
-            row.get::<_, bool>(1),
-            row.get::<_, bool>(2),
-            row.get::<_, bool>(3),
-            row.get::<_, bool>(4),
-            row.get::<_, bool>(5),
-        ];
-        let actual = tx
+    if let Some(shape) = existing {
+        shape.check(When::Startup)?;
+        let published = tx
             .query(
-                "SELECT n.nspname FROM pg_publication_namespace pn
-                 JOIN pg_namespace n ON n.oid = pn.pnnspid
-                 WHERE pn.pnpubid = (SELECT oid FROM pg_publication WHERE pubname = $1)",
-                &[publication],
-            )
-            .await
-            .map_err(|error| format!("checking publication `{publication}` schemas: {error}"))?
-            .into_iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect::<std::collections::BTreeSet<_>>();
-        let wanted = config.schemas.iter().cloned().collect();
-        let explicit: i64 = tx
-            .query_one(
-                "SELECT count(*) FROM pg_publication_rel
-                 WHERE prpubid = (SELECT oid FROM pg_publication WHERE pubname = $1)",
-                &[publication],
+                "SELECT tablename FROM pg_publication_tables
+                 WHERE pubname = $1 AND schemaname = $2",
+                &[publication, &schema],
             )
             .await
             .map_err(|error| format!("checking publication `{publication}` tables: {error}"))?
-            .get(0);
-        if flags != [false, true, true, true, true, false] || actual != wanted || explicit != 0 {
-            return Err(format!(
-                "publication `{publication}` differs: expected schema scopes {wanted:?}, all change types, no explicit tables; found scopes {actual:?}, flags {flags:?}, {explicit} explicit tables"
-            ));
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<std::collections::BTreeSet<_>>();
+        let unpublished: Vec<String> = ["clients", "mutations"]
+            .into_iter()
+            .filter(|table| !published.contains(*table))
+            .map(|table| format!("{}.{}", quote_ident(schema), quote_ident(table)))
+            .collect();
+        if !unpublished.is_empty() {
+            tx.batch_execute(&format!(
+                "ALTER PUBLICATION {} ADD TABLE {}",
+                quote_ident(publication),
+                unpublished.join(", ")
+            ))
+            .await
+            .map_err(|error| {
+                format!(
+                    "adding {} to publication `{publication}`, which the server follows to confirm mutations: {error}",
+                    unpublished.join(", ")
+                )
+            })?;
         }
     } else {
         let schemas = config
@@ -172,7 +167,8 @@ async fn ensure_locked(tx: &Transaction<'_>, config: &Config, schema: &str) -> R
             .collect::<Vec<_>>()
             .join(", ");
         tx.batch_execute(&format!(
-            "CREATE PUBLICATION {} FOR TABLES IN SCHEMA {schemas}",
+            "CREATE PUBLICATION {} FOR TABLES IN SCHEMA {schemas}
+             WITH (publish_via_partition_root = true)",
             quote_ident(publication)
         ))
         .await
@@ -235,7 +231,7 @@ async fn ensure_triggers(
             .is_some_and(|row| row.get(0));
         if snapshot_populated {
             return Err(format!(
-                "schema `{schema}` has a published schema snapshot but no DDL trigger stack; refusing to replace the snapshot"
+                "schema `{schema}` has a published schema snapshot but no DDL trigger stack; refusing to replace the snapshot. {REINSTALL}"
             ));
         }
         tx.batch_execute(&ddl_triggers::trigger_stack_sql(
@@ -278,7 +274,9 @@ async fn validate_triggers(
             )
             .await
             .map_err(|error| format!("validating DDL function `{signature}`: {error}"))?
-            .ok_or_else(|| format!("DDL trigger stack is incomplete: missing `{signature}`"))?;
+            .ok_or_else(|| {
+                format!("DDL trigger stack is incomplete: missing `{signature}`. {REINSTALL}")
+            })?;
         let result = match spec.name.as_str() {
             "get_trigger_context" => "record",
             "notice_ignore" | "update_schemas" => "void",
@@ -297,7 +295,7 @@ async fn validate_triggers(
             || row.get::<_, String>(3) != result
         {
             return Err(format!(
-                "DDL function `{signature}` differs from the expected Streamgres definition"
+                "DDL function `{signature}` differs from what this Streamgres version installs. {REINSTALL}"
             ));
         }
     }
@@ -346,7 +344,9 @@ async fn validate_triggers(
             )
             .await
             .map_err(|error| format!("validating DDL event trigger `{name}`: {error}"))?
-            .ok_or_else(|| format!("DDL trigger stack is incomplete: missing `{name}`"))?;
+            .ok_or_else(|| {
+                format!("DDL trigger stack is incomplete: missing `{name}`. {REINSTALL}")
+            })?;
         let mut actual_tags = row.get::<_, Option<Vec<String>>>(2).unwrap_or_default();
         actual_tags.sort();
         if row.get::<_, String>(0) != event
@@ -361,7 +361,7 @@ async fn validate_triggers(
             || !row.get::<_, bool>(5)
         {
             return Err(format!(
-                "DDL event trigger `{name}` differs from the expected Streamgres definition"
+                "DDL event trigger `{name}` differs from what this Streamgres version installs. {REINSTALL}"
             ));
         }
     }
@@ -392,7 +392,7 @@ async fn validate_triggers(
     };
     if !matches {
         return Err(format!(
-            "schema `{schema}` has a missing or stale published schema snapshot"
+            "schema `{schema}` has a missing or stale published schema snapshot: the schema or the publication changed without the DDL triggers seeing it. Dropping and recreating the publication does this, since the triggers only hear ALTER PUBLICATION. {REINSTALL}"
         ));
     }
     Ok(())
@@ -466,8 +466,12 @@ fn schema_snapshots_match(current: &str, expected: &str) -> Result<bool, String>
         .map_err(|error| format!("unreadable stored schema snapshot: {error}"))?;
     let mut expected: SchemaSnapshot = serde_json::from_str(expected)
         .map_err(|error| format!("unreadable current schema snapshot: {error}"))?;
-    current.tables.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
-    expected.tables.sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
+    current
+        .tables
+        .sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
+    expected
+        .tables
+        .sort_by(|a, b| (&a.schema, &a.name).cmp(&(&b.schema, &b.name)));
     current.indexes.sort_by(|a, b| {
         (&a.schema, &a.table_name, &a.name).cmp(&(&b.schema, &b.table_name, &b.name))
     });
@@ -627,11 +631,179 @@ mod tests {
         assert!(!schema_snapshots_match(stored, reordered_index_columns).unwrap());
     }
 
+    /// Held by each test that installs a DDL trigger stack: the triggers
+    /// fire on every DDL in the database, so two such tests at once
+    /// deadlock on each other's tables.
+    static DATABASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A first start against a publication made beforehand, in any shape,
+    /// succeeds and adds the mutation tables to it when it lacks them.
+    #[tokio::test]
+    async fn first_setup_accepts_any_publication_shape_and_adds_the_mutation_tables() {
+        let Ok(dsn) = std::env::var("STREAMGRES_SETUP_TEST_DSN") else {
+            return;
+        };
+        let _alone = DATABASE.lock().await;
+        let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        let connection = tokio::spawn(connection);
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let extra = format!("sgextra{tag}");
+        let probe = format!("public.{}", quote_ident(&format!("sgprobe{tag}")));
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {}; CREATE TABLE {probe} (id bigint PRIMARY KEY)",
+                quote_ident(&extra)
+            ))
+            .await
+            .unwrap();
+        for (index, shape) in [
+            "FOR ALL TABLES".to_owned(),
+            format!("FOR TABLES IN SCHEMA public, {}", quote_ident(&extra)),
+            format!("FOR TABLE {probe}"),
+            format!(
+                "FOR TABLES IN SCHEMA {}, TABLE {probe}",
+                quote_ident(&extra)
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let app = format!("sgshape{index}{tag}");
+            let schema = format!("{app}_0");
+            let publication = format!("{app}_pub");
+            let schemas = format!("public,{schema}");
+            client
+                .batch_execute(&format!(
+                    "CREATE PUBLICATION {} {shape} WITH (publish_via_partition_root = true)",
+                    quote_ident(&publication)
+                ))
+                .await
+                .unwrap();
+            let config = Config::from_lookup(|name| match name {
+                "STREAMGRES_PG_DSN" | "STREAMGRES_MASTER_PG_DSN" => Some(dsn.clone()),
+                "STREAMGRES_QUERY_URL" => Some("http://localhost/query".to_owned()),
+                "STREAMGRES_MUTATE_URL" => Some("http://localhost/push".to_owned()),
+                "STREAMGRES_APP_ID" => Some(app.clone()),
+                "STREAMGRES_SCHEMAS" => Some(schemas.clone()),
+                "STREAMGRES_PUBLICATION" => Some(publication.clone()),
+                _ => None,
+            })
+            .unwrap();
+            ensure(&dsn, &config)
+                .await
+                .unwrap_or_else(|error| panic!("{shape}: {error}"));
+            ensure(&dsn, &config)
+                .await
+                .unwrap_or_else(|error| panic!("{shape}, again: {error}"));
+            let published: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM pg_publication_tables
+                     WHERE pubname = $1 AND schemaname = $2
+                       AND tablename IN ('clients', 'mutations')",
+                    &[&publication, &schema],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(published, 2, "{shape}");
+            client
+                .batch_execute(&format!(
+                    "DROP PUBLICATION {}; DROP SCHEMA {} CASCADE",
+                    quote_ident(&publication),
+                    quote_ident(&schema)
+                ))
+                .await
+                .unwrap();
+        }
+        client
+            .batch_execute(&format!(
+                "DROP TABLE {probe}; DROP SCHEMA {}",
+                quote_ident(&extra)
+            ))
+            .await
+            .unwrap();
+        drop(client);
+        connection.await.unwrap().unwrap();
+    }
+
+    /// Setup refuses a publication that breaks a publication rule before
+    /// it changes anything: a row filter on a served table, here. The
+    /// publication is left as it was, without the mutation tables, and
+    /// the mutation schema is not created.
+    #[tokio::test]
+    async fn setup_refuses_a_row_filter_on_a_served_table_and_changes_nothing() {
+        let Ok(dsn) = std::env::var("STREAMGRES_SETUP_TEST_DSN") else {
+            return;
+        };
+        let _alone = DATABASE.lock().await;
+        let (client, connection) = tokio_postgres::connect(&dsn, NoTls).await.unwrap();
+        let connection = tokio::spawn(connection);
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let app = format!("sgfilter{tag}");
+        let schema = format!("{app}_0");
+        let publication = format!("{app}_pub");
+        let table = format!("sgfiltered{tag}");
+        client
+            .batch_execute(&format!(
+                "CREATE TABLE public.{t} (id bigint PRIMARY KEY);
+                 CREATE PUBLICATION {p} FOR TABLE public.{t} WHERE (id > 0)
+                   WITH (publish_via_partition_root = true)",
+                t = quote_ident(&table),
+                p = quote_ident(&publication)
+            ))
+            .await
+            .unwrap();
+        let config = Config::from_lookup(|name| match name {
+            "STREAMGRES_PG_DSN" | "STREAMGRES_MASTER_PG_DSN" => Some(dsn.clone()),
+            "STREAMGRES_QUERY_URL" => Some("http://localhost/query".to_owned()),
+            "STREAMGRES_MUTATE_URL" => Some("http://localhost/push".to_owned()),
+            "STREAMGRES_APP_ID" => Some(app.clone()),
+            "STREAMGRES_SCHEMAS" => Some(format!("public,{schema}")),
+            "STREAMGRES_PUBLICATION" => Some(publication.clone()),
+            _ => None,
+        })
+        .unwrap();
+        let outcome = ensure(&dsn, &config).await;
+        let published: i64 = client
+            .query_one(
+                "SELECT count(*) FROM pg_publication_tables WHERE pubname = $1",
+                &[&publication],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let created = client
+            .query_opt("SELECT 1 FROM pg_namespace WHERE nspname = $1", &[&schema])
+            .await
+            .unwrap()
+            .is_some();
+        client
+            .batch_execute(&format!(
+                "DROP PUBLICATION {}; DROP TABLE public.{}; DROP SCHEMA IF EXISTS {} CASCADE",
+                quote_ident(&publication),
+                quote_ident(&table),
+                quote_ident(&schema)
+            ))
+            .await
+            .unwrap();
+        drop(client);
+        connection.await.unwrap().unwrap();
+
+        let error = outcome.unwrap_err();
+        assert!(
+            error.contains(&format!("has a row filter on `{table}` (id > 0)")),
+            "{error}"
+        );
+        assert_eq!(published, 1, "the mutation tables were not added");
+        assert!(!created, "the mutation schema was not created");
+    }
+
     #[tokio::test]
     async fn fresh_setup_is_repeatable_and_existing_tables_are_validated() {
         let Ok(dsn) = std::env::var("STREAMGRES_SETUP_TEST_DSN") else {
             return;
         };
+        let _alone = DATABASE.lock().await;
         let app = format!("sgtest{}", uuid::Uuid::new_v4().simple());
         let schema = format!("{app}_0");
         let publication = format!("{app}_pub");
@@ -659,7 +831,8 @@ mod tests {
                    'indexes', (SELECT COALESCE(json_agg(item ORDER BY item->>'schema' DESC, item->>'tableName' DESC, item->>'name' DESC), '[]'::json)
                               FROM json_array_elements(current->'indexes') AS i(item)),
                    'tables', (SELECT COALESCE(json_agg(item ORDER BY item->>'schema' DESC, item->>'name' DESC), '[]'::json)
-                              FROM json_array_elements(current->'tables') AS t(item))
+                              FROM json_array_elements(current->'tables') AS t(item)),
+                   'publications', current->'publications'
                  )",
                 quote_ident(&schema)
             ))
@@ -694,7 +867,9 @@ mod tests {
         assert!(added);
         let index = format!("{}.ddl_probe_idx", quote_ident(&schema));
         client
-            .batch_execute(&format!("CREATE INDEX ddl_probe_idx ON {probe} (probe_added)"))
+            .batch_execute(&format!(
+                "CREATE INDEX ddl_probe_idx ON {probe} (probe_added)"
+            ))
             .await
             .unwrap();
         let index_added: bool = client
@@ -738,26 +913,74 @@ mod tests {
             ))
             .await
             .unwrap();
-        let mut conflicting = config.clone();
-        conflicting.app_id.push('x');
-        let other_schema = conflicting.upstream_schema();
-        conflicting.schemas = vec!["public".to_owned(), other_schema.clone()];
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION {} SET (publish_via_partition_root = false)",
+                quote_ident(&publication)
+            ))
+            .await
+            .unwrap();
         assert!(
-            ensure(&dsn, &conflicting)
+            ensure(&dsn, &config)
                 .await
                 .unwrap_err()
-                .contains("publication")
+                .contains("publish_via_partition_root = true")
         );
-        assert!(
-            client
-                .query_opt(
-                    "SELECT 1 FROM pg_namespace WHERE nspname = $1",
-                    &[&other_schema]
-                )
-                .await
-                .unwrap()
-                .is_none()
-        );
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION {} SET (publish_via_partition_root = true)",
+                quote_ident(&publication)
+            ))
+            .await
+            .unwrap();
+        ensure(&dsn, &config).await.unwrap();
+
+        // A stack that differs (here, a function edited by hand; after an
+        // upgrade, an older version's) is refused with the command that
+        // replaces it, and what that command prints, run by hand, is
+        // accepted.
+        client
+            .batch_execute(&format!(
+                "CREATE OR REPLACE FUNCTION {}.get_trigger_context()
+                 RETURNS record AS $$
+                 DECLARE result record;
+                 BEGIN SELECT 'edited' AS \"query\" INTO result; RETURN result; END
+                 $$ LANGUAGE plpgsql",
+                quote_ident(&schema)
+            ))
+            .await
+            .unwrap();
+        let refused = ensure(&dsn, &config).await.unwrap_err();
+        assert!(refused.contains("get_trigger_context"), "{refused}");
+        assert!(refused.contains("server print-ddl-triggers"), "{refused}");
+        let identity = crate::client::TriggerIdentity::from_lookup(&|name: &str| match name {
+            "STREAMGRES_APP_ID" => Some(app.clone()),
+            "STREAMGRES_PUBLICATION" => Some(publication.clone()),
+            _ => None,
+        })
+        .unwrap();
+        client
+            .batch_execute(&identity.trigger_stack_sql())
+            .await
+            .unwrap();
+        ensure(&dsn, &config).await.unwrap();
+
+        // A second deployment, with its own app ID, can share the
+        // publication: its mutation tables are added, and the first
+        // deployment's setup still validates.
+        let mut sharing = config.clone();
+        sharing.app_id.push('x');
+        let other_schema = sharing.upstream_schema();
+        sharing.schemas = vec!["public".to_owned(), other_schema.clone()];
+        ensure(&dsn, &sharing).await.unwrap();
+        ensure(&dsn, &config).await.unwrap();
+        client
+            .batch_execute(&format!(
+                "DROP SCHEMA {} CASCADE",
+                quote_ident(&other_schema)
+            ))
+            .await
+            .unwrap();
         client
             .batch_execute(&format!(
                 "ALTER TABLE {}.\"clients\" ADD COLUMN extra text",

@@ -70,7 +70,7 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use tokio::sync::mpsc;
 
-pub use config::Config;
+pub use config::{Config, TriggerIdentity};
 
 use crate::log::{self, log_error, log_info, log_warn};
 use crate::shutdown::Shutdown;
@@ -129,7 +129,11 @@ pub fn serve(mut config: Config) -> Result<(), String> {
     let cleanup_settings = settings.clone();
     let _profiler = crate::profile::start(crate::profile::Config::from_env()?)?;
     let catalog = Arc::new(CatalogHandle::new(
-        server.block_on(threads::load_catalog_at(&settings.dsn, &settings.schemas))?,
+        server.block_on(threads::load_catalog_at(
+            &settings.dsn,
+            &settings.publication,
+            &settings.schemas,
+        ))?,
     ));
     server.block_on(threads::require_ddl_trigger(
         &settings.dsn,

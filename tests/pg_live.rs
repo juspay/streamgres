@@ -20,7 +20,7 @@ use streamgres::model::*;
 use streamgres::client::ddl_triggers::trigger_stack_sql;
 use streamgres::sync::pg::ddl::DdlSource;
 use streamgres::sync::pg::estimate_cache::EstimateCache;
-use streamgres::sync::pg::{PgStorage, PgStream};
+use streamgres::sync::pg::{PgStorage, PgStream, Transport};
 use streamgres::sync::{
     CatalogHandle, Command, Event, Lsn, Runtime, Service, Sources, Storage, SubId, Transaction,
 };
@@ -35,8 +35,28 @@ fn dsn() -> Option<String> {
 }
 
 /// Run `body` on a current-thread runtime with a local task set (the
-/// engine and its storage are single-threaded).
+/// engine and its storage are single-threaded), beside the other
+/// scenarios but never beside one that installs event triggers
+/// ([`block_on_alone`]).
 fn block_on<F: std::future::Future>(body: F) -> F::Output {
+    let _shared = SCENARIOS.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    run(body)
+}
+
+/// Run `body` as [`block_on`] does, with no other scenario running: for a
+/// scenario that installs DDL event triggers, which fire on every other
+/// scenario's DDL in the same database while they exist.
+fn block_on_alone<F: std::future::Future>(body: F) -> F::Output {
+    let _alone = SCENARIOS.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    run(body)
+}
+
+/// What keeps a scenario that installs event triggers apart from the
+/// others.
+static SCENARIOS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// `body` on a fresh current-thread runtime with a local task set.
+fn run<F: std::future::Future>(body: F) -> F::Output {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -134,7 +154,7 @@ async fn prepare(dsn: &str, names: &Names) -> Client {
             "DROP TABLE IF EXISTS {t}; DROP TABLE IF EXISTS {u}; DROP TABLE IF EXISTS {e};
              CREATE TABLE {t} (id int8 PRIMARY KEY, status text, assigned_to int8, points int8);
              CREATE TABLE {u} (id int8 PRIMARY KEY, name text);
-             CREATE PUBLICATION \"{p}\" FOR ALL TABLES;
+             CREATE PUBLICATION \"{p}\" FOR ALL TABLES WITH (publish_via_partition_root = true);
              INSERT INTO {u} VALUES (7, 'meera'), (8, 'arjun');
              INSERT INTO {t} VALUES (1, 'OPEN', 7, 1), (2, 'OPEN', 7, 2), (3, 'OPEN', 8, 3);",
             t = names.tickets,
@@ -1017,7 +1037,7 @@ fn a_json_column_is_filtered_by_value() {
             .batch_execute(&format!(
                 "DROP TABLE IF EXISTS {table};
                  CREATE TABLE {table} (id int8 PRIMARY KEY, fixed jsonb, loose json);
-                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;
+                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES WITH (publish_via_partition_root = true);
                  INSERT INTO {table} VALUES
                    (1, '\"high\"', '\"high\"'), (2, '5', '5'), (3, 'true', 'true'),
                    (4, '{{\"b\": [1, 2], \"a\": \"x\"}}', '{{\"b\":[1,2],   \"a\":\"x\"}}'), (5, NULL, NULL),
@@ -1179,7 +1199,7 @@ fn a_compound_key_is_served_by_postgres() {
                 "DROP TABLE IF EXISTS {parents}; DROP TABLE IF EXISTS {children};
                  CREATE TABLE {parents} (id int8 PRIMARY KEY, org uuid, ticket int8);
                  CREATE TABLE {children} (id int8 PRIMARY KEY, org uuid, ticket int8);
-                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES;
+                 CREATE PUBLICATION \"{publication}\" FOR ALL TABLES WITH (publish_via_partition_root = true);
                  INSERT INTO {parents} VALUES {};
                  INSERT INTO {children} VALUES {};",
                 parent_rows.join(", "),
@@ -1472,7 +1492,7 @@ fn owners_added(events: &[Event], table: &str) -> BTreeMap<i64, Option<Value>> {
 #[test]
 fn schema_changes_follow_the_trigger() {
     let Some(dsn) = dsn() else { return };
-    block_on(async {
+    block_on_alone(async {
         let names = Names::new("ddl");
         let client = prepare(&dsn, &names).await;
         let catalog = Arc::new(names.catalog());
@@ -1844,6 +1864,590 @@ fn unchanged_out_of_line_values_are_never_lost() {
             runtime.stats().rows_completed >= 1,
             "the held-open read completed the reply"
         );
+        cleanup(&dsn, &client, &names).await;
+    });
+}
+
+/// A table outside `public` is read, counted, joined and estimated under
+/// its own schema, whatever the session's `search_path`: `public` holds a
+/// table of the same name with other rows, which a name left to the
+/// `search_path` would read instead.
+#[test]
+fn a_table_outside_public_is_read_under_its_schema() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let schema = "live_billing";
+        let invoices = "live_schema_invoices";
+        let customers = "live_schema_customers";
+        let slot = "xyne_sync_live_schema";
+        let publication = "xyne_sync_live_schema_pub";
+        let client = admin(&dsn).await;
+        PgStream::drop_slot(&dsn, slot, publication)
+            .await
+            .expect("drop slot");
+        // One statement per transaction: a multi-statement batch is one
+        // transaction, and DDL in it would hold the locks of any event
+        // trigger another scenario installs until the whole batch ends.
+        for statement in [
+            format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+            format!("DROP TABLE IF EXISTS {invoices}"),
+            format!("DROP TABLE IF EXISTS {customers}"),
+            format!("CREATE SCHEMA {schema}"),
+            format!(
+                "CREATE TABLE {schema}.{invoices} (id int8 PRIMARY KEY, customer int8, status text)"
+            ),
+            format!("CREATE TABLE {invoices} (id int8 PRIMARY KEY, customer int8, status text)"),
+            format!("CREATE TABLE {customers} (id int8 PRIMARY KEY, name text)"),
+            format!(
+                "CREATE PUBLICATION \"{publication}\" FOR ALL TABLES WITH (publish_via_partition_root = true)"
+            ),
+            format!("INSERT INTO {customers} VALUES (1, 'meera'), (2, 'arjun')"),
+            format!(
+                "INSERT INTO {schema}.{invoices}
+                   SELECT g, 1 + g % 2, CASE WHEN g % 4 = 0 THEN 'DUE' ELSE 'PAID' END
+                   FROM generate_series(1, 400) g"
+            ),
+            format!("INSERT INTO {invoices} VALUES (9001, 1, 'DUE')"),
+            format!("ANALYZE {schema}.{invoices}"),
+            format!("ANALYZE {customers}"),
+            format!("ANALYZE {invoices}"),
+        ] {
+            client.batch_execute(&statement).await.expect(&statement);
+        }
+        let qualified = format!("{schema}.{invoices}");
+        let catalog = Arc::new(Catalog::new(vec![
+            DbTable::new(
+                qualified.as_str(),
+                ["id"],
+                vec![
+                    DbColumn::new("id", ValueType::Int),
+                    DbColumn::new("customer", ValueType::Int),
+                    DbColumn::new("status", ValueType::String),
+                ],
+            ),
+            DbTable::new(
+                customers,
+                ["id"],
+                vec![
+                    DbColumn::new("id", ValueType::Int),
+                    DbColumn::new("name", ValueType::String),
+                ],
+            ),
+        ]));
+        let mut stream = PgStream::open(&dsn, slot, publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+
+        let due = SingleTableReadQuery::new(
+            qualified.as_str(),
+            Where::condition("status", ComparisonOperator::EQ, "DUE"),
+            OrderBy::new("id", Order::ASC),
+            u32::MAX,
+        );
+        let read = storage.select(&due).await.expect("the read is served");
+        assert_eq!(read.rows.len(), 100, "the schema's own rows, not public's");
+        assert!(
+            read.rows
+                .iter()
+                .all(|(key, _)| key.pkey_value.get(&ColumnName::from("id"))
+                    != Some(&Value::Int(9001))),
+            "public's table of the same name is not read"
+        );
+
+        let of_meera = MultiTableReadQuery::new(
+            due.clone(),
+            vec![Join::inner(
+                MultiTableReadQuery::single(SingleTableReadQuery::new(
+                    customers,
+                    Where::condition("name", ComparisonOperator::EQ, "meera"),
+                    OrderBy::new("id", Order::ASC),
+                    u32::MAX,
+                )),
+                "customer",
+                "id",
+            )],
+        );
+        let counted = storage.count(&of_meera, 100_000).await.expect("count");
+        assert_eq!(counted, 100, "DUE invoices (even ids) all belong to customer 1, meera");
+        let all_due = MultiTableReadQuery::single(due);
+        assert_eq!(storage.count(&all_due, 100_000).await.expect("count"), 100);
+        storage
+            .estimate(&of_meera, 100_000)
+            .await
+            .expect("the join column's statistics are found under the schema");
+
+        for statement in [
+            format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+            format!("DROP TABLE IF EXISTS {invoices}"),
+            format!("DROP TABLE IF EXISTS {customers}"),
+        ] {
+            let _ = client.batch_execute(&statement).await;
+        }
+        let _ = PgStream::drop_slot(&dsn, slot, publication).await;
+    });
+}
+
+/// Tables whose names would read alike as one string, `public."a.b"`,
+/// `a.b` (schema `a`) and `"a.b".x`, are all carried, each read from
+/// its own table, and each write reaches the catalog as its own table's.
+#[test]
+fn tables_with_dots_in_their_names_are_each_their_own() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let slot = "xyne_sync_live_dots";
+        let publication = "xyne_sync_live_dots_pub";
+        let client = admin(&dsn).await;
+        PgStream::drop_slot(&dsn, slot, publication)
+            .await
+            .expect("drop slot");
+        let sources = [
+            ("public", "live.dots", "\"public\".\"live.dots\""),
+            ("live", "dots", "live.dots"),
+            ("live.dots", "x", "\"live.dots\".\"x\""),
+        ];
+        // One statement per transaction, as in the other scenarios.
+        let mut statements = vec![
+            "DROP TABLE IF EXISTS public.\"live.dots\"".to_owned(),
+            "DROP SCHEMA IF EXISTS live CASCADE".to_owned(),
+            "DROP SCHEMA IF EXISTS \"live.dots\" CASCADE".to_owned(),
+            "CREATE SCHEMA live".to_owned(),
+            "CREATE SCHEMA \"live.dots\"".to_owned(),
+        ];
+        for (index, (schema, table, _)) in sources.iter().enumerate() {
+            let quoted = format!("\"{schema}\".\"{table}\"");
+            statements.push(format!("CREATE TABLE {quoted} (id int8 PRIMARY KEY, origin text)"));
+            statements.push(format!("INSERT INTO {quoted} VALUES ({}, '{schema}/{table}')", index + 1));
+        }
+        statements.push(format!(
+            "CREATE PUBLICATION \"{publication}\" FOR TABLE public.\"live.dots\", live.dots, \"live.dots\".x WITH (publish_via_partition_root = true)"
+        ));
+        for statement in &statements {
+            client.batch_execute(statement).await.expect(statement);
+        }
+
+        let schemas = ["public".to_owned(), "live".to_owned(), "live.dots".to_owned()];
+        let (catalog, _) = streamgres::sync::pg::load_catalog(&client, publication, &schemas)
+            .await
+            .expect("the catalog loads");
+        for (schema, table, name) in sources {
+            let carried = catalog
+                .table_by_source(schema, table)
+                .unwrap_or_else(|| panic!("{schema}/{table} is carried"));
+            assert_eq!(carried.name.as_str(), name);
+        }
+        let catalog = Arc::new(catalog);
+        let mut stream = PgStream::open(&dsn, slot, publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+
+        for (index, (schema, table, name)) in sources.iter().enumerate() {
+            let whole = SingleTableReadQuery::new(
+                *name,
+                Where::AND(vec![]),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            );
+            let read = storage.select(&whole).await.expect("the table is read");
+            assert_eq!(read.rows.len(), 1, "{name}");
+            let (key, row) = &read.rows[0];
+            assert_eq!(
+                key.pkey_value.get(&ColumnName::from("id")),
+                Some(&Value::Int(index as i64 + 1)),
+                "{name} is read from its own table"
+            );
+            assert_eq!(
+                row.data.get(&ColumnName::from("origin")),
+                Some(&Value::from(format!("{schema}/{table}").as_str())),
+                "{name}"
+            );
+        }
+
+        for (index, (schema, table, _)) in sources.iter().enumerate() {
+            client
+                .batch_execute(&format!(
+                    "INSERT INTO \"{schema}\".\"{table}\" VALUES ({}, 'fed')",
+                    100 + index
+                ))
+                .await
+                .expect("insert");
+        }
+        let fed = stream.poll().await.expect("poll");
+        let mut routed: Vec<(String, Option<Value>)> = fed
+            .writes
+            .iter()
+            .map(|(write, _)| {
+                (
+                    write.table().as_str().to_owned(),
+                    write.pkey_value().pkey_value.get(&ColumnName::from("id")).cloned(),
+                )
+            })
+            .collect();
+        routed.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut expected: Vec<(String, Option<Value>)> = sources
+            .iter()
+            .enumerate()
+            .map(|(index, (_, _, name))| ((*name).to_owned(), Some(Value::Int(100 + index as i64))))
+            .collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(routed, expected, "each write reaches its own table");
+
+        for statement in [
+            "DROP TABLE IF EXISTS public.\"live.dots\"",
+            "DROP SCHEMA IF EXISTS live CASCADE",
+            "DROP SCHEMA IF EXISTS \"live.dots\" CASCADE",
+        ] {
+            let _ = client.batch_execute(statement).await;
+        }
+        let _ = PgStream::drop_slot(&dsn, slot, publication).await;
+    });
+}
+
+/// A change to what the publication sends reaches the feed through the
+/// trigger and stops it when the feed could no longer follow the served
+/// tables: turning off updates and deletes, or adding a row filter to a
+/// served table. A change to another publication does not touch it.
+#[test]
+fn a_publication_change_that_breaks_the_feed_stops_it() {
+    let Some(dsn) = dsn() else { return };
+    block_on_alone(async {
+        let names = Names::new("pubchange");
+        let other = "xyne_sync_live_pubchange_other";
+        let client = prepare(&dsn, &names).await;
+        client
+            .batch_execute(&format!(
+                "DROP PUBLICATION \"{p}\";
+                 CREATE PUBLICATION \"{p}\" FOR TABLE {t}, {u}
+                   WITH (publish_via_partition_root = true);
+                 DROP PUBLICATION IF EXISTS \"{other}\";
+                 CREATE PUBLICATION \"{other}\" FOR TABLE {u};
+                 DROP SCHEMA IF EXISTS xspub_0 CASCADE;",
+                p = names.publication,
+                t = names.tickets,
+                u = names.users,
+            ))
+            .await
+            .expect("publications");
+        client
+            .batch_execute(&trigger_stack_sql("xspub", 0, &[names.publication.as_str()]))
+            .await
+            .expect("install the schema-change trigger stack");
+        let open = || async {
+            let stream = PgStream::open_with(
+                &dsn,
+                &names.slot,
+                &names.publication,
+                Arc::new(names.catalog()),
+                DdlSource {
+                    prefix: "xspub/0/ddl".to_owned(),
+                    schemas: vec!["public".to_owned()],
+                },
+            )
+            .await
+            .expect("open stream");
+            let (transport, mut feed) = stream.split();
+            let (out, transactions) = mpsc::channel(64);
+            let streaming = spawn_local(async move {
+                transport
+                    .stream(Duration::from_millis(50), &mut feed, &[], out)
+                    .await
+            });
+            (streaming, transactions)
+        };
+
+        let (streaming, mut transactions) = open().await;
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{other}\" SET (publish = 'insert');
+                 INSERT INTO {t} VALUES (40, 'OPEN', 7, 40);",
+                t = names.tickets
+            ))
+            .await
+            .expect("another publication changes");
+        tokio::time::timeout(Duration::from_secs(10), transactions.recv())
+            .await
+            .expect("the feed goes on past another publication's change")
+            .expect("a transaction");
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{}\" SET (publish = 'insert')",
+                names.publication
+            ))
+            .await
+            .expect("turn off updates and deletes");
+        let error = tokio::time::timeout(Duration::from_secs(10), streaming)
+            .await
+            .expect("the feed stops")
+            .expect("the feed task")
+            .expect_err("updates and deletes turned off stop the feed");
+        assert!(error.0.contains("no longer publishes update, delete"), "{error}");
+        assert!(error.0.contains("ALTER PUBLICATION"), "{error}");
+
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{}\" SET (publish = 'insert, update, delete, truncate')",
+                names.publication
+            ))
+            .await
+            .expect("restore the publication");
+        Transport::drop_slot_only(&dsn, &names.slot)
+            .await
+            .expect("drop the stopped feed's slot");
+        let (streaming, _transactions) = open().await;
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{p}\" SET TABLE {t} WHERE (points > 0), {u}",
+                p = names.publication,
+                t = names.tickets,
+                u = names.users,
+            ))
+            .await
+            .expect("add a row filter");
+        let error = tokio::time::timeout(Duration::from_secs(10), streaming)
+            .await
+            .expect("the feed stops")
+            .expect("the feed task")
+            .expect_err("a row filter on a served table stops the feed");
+        assert!(error.0.contains("row filter"), "{error}");
+        assert!(error.0.contains(&format!("`{}`", names.tickets)), "{error}");
+
+        let _ = client
+            .batch_execute(&format!(
+                "DROP EVENT TRIGGER IF EXISTS xspub_ddl_start_0;
+                 DROP EVENT TRIGGER IF EXISTS xspub_ddl_end_0;
+                 DROP SCHEMA IF EXISTS xspub_0 CASCADE;
+                 DROP PUBLICATION IF EXISTS \"{other}\";"
+            ))
+            .await;
+        cleanup(&dsn, &client, &names).await;
+    });
+}
+
+/// A column list that names every column of a served table is followed,
+/// and the feed stops once the publication leaves one out, each way it can
+/// come to: a column added to the table that the list does not name, the
+/// list narrowed, a table added with a list that leaves one out.
+#[test]
+fn a_column_left_out_of_a_served_table_stops_the_feed() {
+    let Some(dsn) = dsn() else { return };
+    block_on_alone(async {
+        let names = Names::new("collist");
+        let client = prepare(&dsn, &names).await;
+        let whole = format!(
+            "{t} (id, status, assigned_to, points), {u}",
+            t = names.tickets,
+            u = names.users
+        );
+        client
+            .batch_execute(&format!(
+                "DROP PUBLICATION \"{p}\";
+                 CREATE PUBLICATION \"{p}\" FOR TABLE {whole}
+                   WITH (publish_via_partition_root = true);
+                 CREATE TABLE {e} (id int8 PRIMARY KEY, note text);
+                 DROP SCHEMA IF EXISTS xscol_0 CASCADE;",
+                p = names.publication,
+                e = names.extra,
+            ))
+            .await
+            .expect("a publication listing every column");
+        client
+            .batch_execute(&trigger_stack_sql("xscol", 0, &[names.publication.as_str()]))
+            .await
+            .expect("install the schema-change trigger stack");
+        let open = || async {
+            Transport::drop_slot_only(&dsn, &names.slot)
+                .await
+                .expect("drop the last feed's slot");
+            let stream = PgStream::open_with(
+                &dsn,
+                &names.slot,
+                &names.publication,
+                Arc::new(names.catalog()),
+                DdlSource {
+                    prefix: "xscol/0/ddl".to_owned(),
+                    schemas: vec!["public".to_owned()],
+                },
+            )
+            .await
+            .expect("open stream");
+            let (transport, mut feed) = stream.split();
+            let (out, transactions) = mpsc::channel(64);
+            let streaming = spawn_local(async move {
+                transport
+                    .stream(Duration::from_millis(50), &mut feed, &[], out)
+                    .await
+            });
+            (streaming, transactions)
+        };
+        async fn stopped(
+            streaming: tokio::task::JoinHandle<Result<(), streamgres::sync::StorageError>>,
+            what: &str,
+        ) -> String {
+            tokio::time::timeout(Duration::from_secs(10), streaming)
+                .await
+                .expect("the feed stops")
+                .expect("the feed task")
+                .expect_err(what)
+                .0
+        }
+
+        let (streaming, mut transactions) = open().await;
+        client
+            .batch_execute(&format!("INSERT INTO {} VALUES (40, 'OPEN', 7, 40)", names.tickets))
+            .await
+            .expect("insert");
+        tokio::time::timeout(Duration::from_secs(10), transactions.recv())
+            .await
+            .expect("a list naming every column is followed")
+            .expect("a transaction");
+        client
+            .batch_execute(&format!("ALTER TABLE {} ADD COLUMN priority int8", names.tickets))
+            .await
+            .expect("add a column the list does not name");
+        let error = stopped(streaming, "a column added outside the list").await;
+        assert!(
+            error.contains(&format!("now leaves out columns of `{}` (priority)", names.tickets)),
+            "{error}"
+        );
+
+        client
+            .batch_execute(&format!("ALTER TABLE {} DROP COLUMN priority", names.tickets))
+            .await
+            .expect("drop the column again");
+        let (streaming, _transactions) = open().await;
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{p}\" SET TABLE {t} (id, status), {u}",
+                p = names.publication,
+                t = names.tickets,
+                u = names.users,
+            ))
+            .await
+            .expect("narrow the list");
+        let error = stopped(streaming, "a narrowed list").await;
+        assert!(
+            error.contains(&format!(
+                "now leaves out columns of `{}` (assigned_to, points)",
+                names.tickets
+            )),
+            "{error}"
+        );
+
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{}\" SET TABLE {whole}",
+                names.publication
+            ))
+            .await
+            .expect("restore the list");
+        let (streaming, _transactions) = open().await;
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{}\" ADD TABLE {} (id)",
+                names.publication, names.extra
+            ))
+            .await
+            .expect("add a table with a narrow list");
+        let error = stopped(streaming, "a table added with a narrow list").await;
+        assert!(
+            error.contains(&format!("now leaves out columns of `{}` (note)", names.extra)),
+            "{error}"
+        );
+
+        let _ = client
+            .batch_execute(
+                "DROP EVENT TRIGGER IF EXISTS xscol_ddl_start_0;
+                 DROP EVENT TRIGGER IF EXISTS xscol_ddl_end_0;
+                 DROP SCHEMA IF EXISTS xscol_0 CASCADE;",
+            )
+            .await;
+        cleanup(&dsn, &client, &names).await;
+    });
+}
+
+/// A publication whose name needs quoting (`xyne_sync_live_Quoted-Pub`)
+/// is followed under its exact name, not the lowercased one PostgreSQL
+/// reads from an unquoted name, and the trigger recognizes a change to it
+/// by the object, not by how PostgreSQL spells it (`"xyne_sync_live_Quoted-Pub"`):
+/// turning off updates still stops the feed.
+#[test]
+fn a_change_to_a_publication_with_a_quoted_name_reaches_the_feed() {
+    let Some(dsn) = dsn() else { return };
+    block_on_alone(async {
+        let mut names = Names::new("quotedpub");
+        names.publication = "xyne_sync_live_Quoted-Pub".to_owned();
+        let client = prepare(&dsn, &names).await;
+        client
+            .batch_execute("DROP SCHEMA IF EXISTS xsquoted_0 CASCADE;")
+            .await
+            .expect("no leftover stack");
+        client
+            .batch_execute(&trigger_stack_sql(
+                "xsquoted",
+                0,
+                &[names.publication.as_str()],
+            ))
+            .await
+            .expect("install the schema-change trigger stack");
+        let stream = PgStream::open_with(
+            &dsn,
+            &names.slot,
+            &names.publication,
+            Arc::new(names.catalog()),
+            DdlSource {
+                prefix: "xsquoted/0/ddl".to_owned(),
+                schemas: vec!["public".to_owned()],
+            },
+        )
+        .await
+        .expect("open stream");
+        let (transport, mut feed) = stream.split();
+        let (out, _transactions) = mpsc::channel(64);
+        let streaming = spawn_local(async move {
+            transport
+                .stream(Duration::from_millis(50), &mut feed, &[], out)
+                .await
+        });
+
+        client
+            .batch_execute(&format!(
+                "ALTER PUBLICATION \"{}\" SET (publish = 'insert')",
+                names.publication
+            ))
+            .await
+            .expect("turn off updates and deletes");
+        let error = tokio::time::timeout(Duration::from_secs(10), streaming)
+            .await
+            .expect("the feed stops")
+            .expect("the feed task")
+            .expect_err("updates and deletes turned off stop the feed");
+        assert!(
+            error.0.contains("no longer publishes update, delete"),
+            "{error}"
+        );
+
+        let _ = client
+            .batch_execute(
+                "DROP EVENT TRIGGER IF EXISTS xsquoted_ddl_start_0;
+                 DROP EVENT TRIGGER IF EXISTS xsquoted_ddl_end_0;
+                 DROP SCHEMA IF EXISTS xsquoted_0 CASCADE;",
+            )
+            .await;
+        let _ = client
+            .batch_execute(&format!(
+                "DROP PUBLICATION IF EXISTS \"{}\"",
+                names.publication
+            ))
+            .await;
         cleanup(&dsn, &client, &names).await;
     });
 }

@@ -7,6 +7,11 @@
 //! Configured by `STREAMGRES_*` environment variables (see `.env.example`);
 //! a `.env` file in the working directory is read first, without
 //! overriding variables already set.
+//!
+//! `server print-ddl-triggers` prints the DDL trigger stack setup installs
+//! for `STREAMGRES_APP_ID`, `STREAMGRES_SHARD` and `STREAMGRES_PUBLICATION`
+//! and exits, without connecting to anything: the SQL to run by hand on
+//! the primary when setup refuses an installed stack that differs.
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -21,6 +26,24 @@ unsafe impl Sync for MallocConf {}
 
 fn main() {
     load_dotenv(".env");
+    let mut args = std::env::args().skip(1);
+    match (args.next().as_deref(), args.next()) {
+        (None, _) => {}
+        (Some("print-ddl-triggers"), None) => {
+            match streamgres::client::TriggerIdentity::from_env() {
+                Ok(identity) => print!("{}", identity.trigger_stack_sql()),
+                Err(error) => {
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        _ => {
+            eprintln!("usage: server [print-ddl-triggers]");
+            std::process::exit(2);
+        }
+    }
     raise_file_limit();
     let outcome = streamgres::client::Config::from_env().and_then(streamgres::client::serve);
     if let Err(error) = outcome {

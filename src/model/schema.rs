@@ -32,6 +32,82 @@ impl TableName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The name of table `table` in PostgreSQL schema `schema`: bare in
+    /// `public` (`tickets`), `schema.table` elsewhere
+    /// (`billing.invoices`), and both double-quoted as SQL quotes them
+    /// when either holds a `.` or a `"` (`"public"."a.b"`). No two
+    /// tables share a name: a quoted name starts with `"`, which the
+    /// others never hold, and a bare name has no dot where
+    /// `schema.table` has one. [`TableName::source`] is its inverse.
+    pub fn of(schema: &str, table: &str) -> TableName {
+        let plain = |name: &str| !name.contains(['.', '"']);
+        let name = if !plain(schema) || !plain(table) {
+            format!("{}.{}", quote_ident(schema), quote_ident(table))
+        } else if schema == "public" {
+            table.to_owned()
+        } else {
+            format!("{schema}.{table}")
+        };
+        TableName::from(name)
+    }
+
+    /// The PostgreSQL schema and table this name stands for: the exact
+    /// inverse of [`TableName::of`].
+    ///
+    /// - `tickets` → (`public`, `tickets`)
+    /// - `billing.invoices` → (`billing`, `invoices`)
+    /// - `"public"."a.b"` → (`public`, `a.b`)
+    ///
+    /// A name built by hand rather than by [`TableName::of`] still gets an
+    /// answer: unquoted, it splits at the first dot (`a.b.c` → (`a`, `b.c`));
+    /// starting with a quote it never closes, it is a bare name in `public`.
+    pub fn source(&self) -> (Cow<'_, str>, Cow<'_, str>) {
+        if let Some((schema, table)) = unquoted_pair(&self.0) {
+            return (Cow::Owned(schema), Cow::Owned(table));
+        }
+        match self.0.split_once('.') {
+            Some((schema, table)) if !self.0.starts_with('"') => {
+                (Cow::Borrowed(schema), Cow::Borrowed(table))
+            }
+            _ => (Cow::Borrowed("public"), Cow::Borrowed(&self.0)),
+        }
+    }
+}
+
+/// `name` double-quoted, with each `"` in it doubled: an SQL identifier,
+/// and each part of a [`TableName`] that needs quoting. The one quoting
+/// rule, so table names and the SQL built from them always agree.
+pub fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// The schema and table of a name of the form `"schema"."table"`.
+fn unquoted_pair(name: &str) -> Option<(String, String)> {
+    let (schema, rest) = unquoted(name)?;
+    let (table, rest) = unquoted(rest.strip_prefix('.')?)?;
+    rest.is_empty().then_some((schema, table))
+}
+
+/// The identifier a double-quoted `text` starts with, and what follows
+/// its closing quote.
+fn unquoted(text: &str) -> Option<(String, &str)> {
+    let mut chars = text.strip_prefix('"')?.char_indices();
+    let mut name = String::new();
+    while let Some((index, c)) = chars.next() {
+        if c != '"' {
+            name.push(c);
+            continue;
+        }
+        let after = &text[index + 2..];
+        if after.starts_with('"') {
+            name.push('"');
+            chars.next();
+        } else {
+            return Some((name, after));
+        }
+    }
+    None
 }
 
 impl From<&str> for TableName {
@@ -351,6 +427,14 @@ impl Catalog {
         self.tables.get(name)
     }
 
+    /// The table PostgreSQL knows as `table` in schema `schema`, if the
+    /// catalog contains it: for a caller that has the two apart, such as
+    /// the change feed or a client naming tables by schema and table,
+    /// and never needs [`TableName::of`]'s single-string form.
+    pub fn table_by_source(&self, schema: &str, table: &str) -> Option<&DbTable> {
+        self.tables.get(TableName::of(schema, table).as_str())
+    }
+
     /// Every table, in no particular order.
     pub fn tables(&self) -> impl Iterator<Item = &DbTable> {
         self.tables.values()
@@ -482,6 +566,60 @@ impl DbTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plain names keep today's form, a dot or quote in either part
+    /// quotes both, no two sources share a name, and each name reads
+    /// back as its source.
+    #[test]
+    fn a_table_name_is_unique_per_source_and_reads_back() {
+        let cases = [
+            ("public", "tickets", "tickets"),
+            ("billing", "invoices", "billing.invoices"),
+            ("public", "a.b", "\"public\".\"a.b\""),
+            ("a", "b", "a.b"),
+            ("a.b", "x", "\"a.b\".\"x\""),
+            ("public", "say\"hi", "\"public\".\"say\"\"hi\""),
+            ("we\"ird", "t.x", "\"we\"\"ird\".\"t.x\""),
+            ("Billing", "Invoices", "Billing.Invoices"),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for (schema, table, name) in cases {
+            let made = TableName::of(schema, table);
+            assert_eq!(made.as_str(), name);
+            assert!(seen.insert(made.clone()), "{name} made twice");
+            let (back_schema, back_table) = made.source();
+            assert_eq!((&*back_schema, &*back_table), (schema, table), "{name}");
+        }
+        assert_eq!(
+            TableName::from("\"open").source(),
+            ("public".into(), "\"open".into())
+        );
+    }
+
+    /// The catalog finds a table by its schema and table apart, dots
+    /// included, and does not confuse `public."a.b"` with `a.b`.
+    #[test]
+    fn the_catalog_finds_a_table_by_its_source() {
+        let table =
+            |name: TableName| DbTable::new(name, ["id"], vec![DbColumn::new("id", ValueType::Int)]);
+        let catalog = Catalog::new([
+            table(TableName::of("public", "a.b")),
+            table(TableName::of("a", "b")),
+        ]);
+        assert_eq!(
+            catalog
+                .table_by_source("public", "a.b")
+                .unwrap()
+                .name
+                .as_str(),
+            "\"public\".\"a.b\""
+        );
+        assert_eq!(
+            catalog.table_by_source("a", "b").unwrap().name.as_str(),
+            "a.b"
+        );
+        assert!(catalog.table_by_source("public", "b").is_none());
+    }
 
     /// A table's log line names its key and lists every column with its
     /// type, the key first and the rest by name.

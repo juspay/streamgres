@@ -69,6 +69,7 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::types::PgLsn;
 
 use super::ddl::{self, DdlSource};
+use super::sql::quote_ident;
 use crate::ivm::SchemaChange;
 use crate::log::{log_info, log_warn};
 use crate::model::{
@@ -294,12 +295,9 @@ impl Decoder {
             return Ok(());
         };
         if let BaseEvent::Relation(relation) = &event {
-            let qualified = format!("{}.{}", relation.relation_namespace, relation.name);
-            let declared = self.catalog.table(&qualified).or_else(|| {
-                (relation.relation_namespace == "public")
-                    .then(|| self.catalog.table(&relation.name))
-                    .flatten()
-            });
+            let declared = self
+                .catalog
+                .table_by_source(&relation.relation_namespace, &relation.name);
             self.relations.insert(
                 relation.oid,
                 Relation {
@@ -390,10 +388,25 @@ impl Decoder {
                     pkey_value: key_of(&image(table, columns, old)?, table),
                 })])
             }
-            BaseEvent::Truncate(_) => Err(StorageError(
-                "TRUNCATE on a published table is not supported: the frames cannot follow it"
-                    .to_owned(),
-            )),
+            BaseEvent::Truncate(truncate) => {
+                let served: Vec<&str> = truncate
+                    .oids
+                    .iter()
+                    .filter_map(|oid| self.declared(*oid))
+                    .map(|(table, _)| table.name.as_str())
+                    .collect();
+                if served.is_empty() {
+                    return Ok(Vec::new());
+                }
+                Err(StorageError(format!(
+                    "TRUNCATE of {} is not supported: the frames cannot follow it",
+                    served
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )))
+            }
             BaseEvent::Relation(_)
             | BaseEvent::Begin(_)
             | BaseEvent::Commit(_)
@@ -782,7 +795,8 @@ async fn prepare_slot(
         .is_some();
     if !published {
         return Err(StorageError(format!(
-            "publication `{publication}` does not exist; create it before starting streamgres (for example, on the primary: CREATE PUBLICATION \"{publication}\" FOR ALL TABLES)"
+            "publication `{publication}` does not exist; create it before starting streamgres (for example, on the primary: CREATE PUBLICATION {} FOR ALL TABLES WITH (publish_via_partition_root = true))",
+            quote_ident(publication)
         )));
     }
     let exists = client
@@ -983,7 +997,10 @@ impl PgStream {
         let config: tokio_postgres::Config = dsn.parse()?;
         let client = super::open(&config, &tokio::runtime::Handle::current()).await?;
         client
-            .batch_execute(&format!("DROP PUBLICATION IF EXISTS \"{publication}\""))
+            .batch_execute(&format!(
+                "DROP PUBLICATION IF EXISTS {}",
+                quote_ident(publication)
+            ))
             .await?;
         Ok(())
     }
@@ -1098,10 +1115,17 @@ fn replication_config(
         .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
         .unwrap_or_default();
     let database = config.get_dbname().unwrap_or(user);
-    ReplicationConfig::new(host, user, password, database, slot, publication)
-        .with_port(port)
-        .with_tls(TlsConfig::disabled())
-        .with_status_interval(Duration::from_secs(1))
+    ReplicationConfig::new(
+        host,
+        user,
+        password,
+        database,
+        slot,
+        quote_ident(publication),
+    )
+    .with_port(port)
+    .with_tls(TlsConfig::disabled())
+    .with_status_interval(Duration::from_secs(1))
 }
 
 /// The primary key of a decoded row image, laid out on the table's
@@ -1619,6 +1643,35 @@ mod tests {
     /// an undeclared table; and a transaction that carried only a logical
     /// message, which is a transaction with no writes. Each transaction
     /// lands at the end of its commit record.
+    /// A TRUNCATE stops the feed only when it empties a table the catalog
+    /// serves: one of a table the publication carries but the catalog
+    /// leaves out (`probe_other`) changes nothing clients see.
+    #[test]
+    fn a_truncate_stops_the_feed_only_for_a_served_table() {
+        let relations = [
+            "52000043477075626c69630070726f62655f74006400080169640000000014ffffffff006e616d650000000019ffffffff00706f696e74730000000014ffffffff00666c61670000000010ffffffff0064000000043affffffff007473000000045affffffff00616d6f756e7400000002bdffffffff007461670000000413ffffffff",
+            "520000434e7075626c69630070726f62655f6f74686572006400010169640000000014ffffffff",
+        ];
+        let mut decoder = Decoder::new(catalog());
+        decoder.absorb(begin()).unwrap();
+        for relation in relations {
+            decoder.absorb(xlog(relation)).unwrap();
+        }
+        decoder.absorb(xlog("5400000001000000434e")).unwrap();
+        let transaction = decoder.absorb(commit("0/3EFF460")).unwrap().unwrap();
+        assert!(transaction.writes.is_empty(), "{transaction:?}");
+
+        let mut decoder = Decoder::new(catalog());
+        decoder.absorb(begin()).unwrap();
+        for relation in relations {
+            decoder.absorb(xlog(relation)).unwrap();
+        }
+        let refused = decoder
+            .absorb(xlog("5400000002000000434e00004347"))
+            .unwrap_err();
+        assert!(refused.0.contains("TRUNCATE of `probe_t`"), "{refused:?}");
+    }
+
     #[test]
     fn decodes_a_recorded_session() {
         let mut decoder = Decoder::new(catalog());

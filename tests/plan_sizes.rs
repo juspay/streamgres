@@ -19,7 +19,10 @@
 //! `STREAMGRES_PLAN_BENCH_DSN=postgres://… cargo test --release --test
 //! plan_sizes -- --ignored --nocapture`. The database must be analyzed
 //! (`ANALYZE`), have `wal_level = logical` (the storage reads on exported
-//! snapshots) and a `public` schema of the application's tables.
+//! snapshots) and a `public` schema of the application's tables, which the
+//! publication `STREAMGRES_PLAN_BENCH_PUBLICATION` (default
+//! `xyne_sync_pub`, the server's own default) streams: the catalog is what
+//! the publication streams, as the server loads it.
 
 #[path = "streamgres_queries/catalog.rs"]
 #[allow(dead_code)]
@@ -278,6 +281,17 @@ fn shown(hold: Option<u64>) -> String {
     hold.map_or("over".to_owned(), |rows| rows.to_string())
 }
 
+/// The catalog of `public` as the server loads it, through the publication
+/// the run names.
+async fn public_catalog(client: &tokio_postgres::Client) -> Catalog {
+    let publication = std::env::var("STREAMGRES_PLAN_BENCH_PUBLICATION")
+        .unwrap_or_else(|_| "xyne_sync_pub".to_owned());
+    let (catalog, _) = load_catalog(client, &publication, &["public".to_owned()])
+        .await
+        .expect("catalog");
+    catalog
+}
+
 /// Text of the one row one column `sql` returns.
 async fn one(client: &tokio_postgres::Client, sql: &str) -> String {
     let rows = client.simple_query(sql).await.expect(sql);
@@ -353,9 +367,7 @@ fn counted_against_estimated() {
             .await
             .expect("connect");
         tokio::spawn(connection);
-        let (catalog, _) = load_catalog(&client, &["public".to_owned()])
-            .await
-            .expect("catalog");
+        let catalog = public_catalog(&client).await;
         let workspace = one(&client, r#"SELECT "workspaceId" FROM channels LIMIT 1"#).await;
         let catalog: Arc<Catalog> = Arc::new(catalog);
         let storage = PgStorage::connect(&dsn, catalog.clone())
@@ -538,9 +550,7 @@ fn planning_every_argument() {
             .await
             .expect("connect");
         tokio::spawn(connection);
-        let (catalog, _) = load_catalog(&client, &["public".to_owned()])
-            .await
-            .expect("catalog");
+        let catalog = public_catalog(&client).await;
         let workspace = one(&client, r#"SELECT "workspaceId" FROM channels LIMIT 1"#).await;
         let catalog: Arc<Catalog> = Arc::new(catalog);
         let storage = PgStorage::connect(&dsn, catalog.clone())
