@@ -24,7 +24,8 @@
 //!   key and nothing else, since every comparison is false for it.
 //! - **Ranges** (`>`, `>=`, `<`, `<=`): ordered maps from threshold to
 //!   conditions, one per comparison class (numeric, string, bool, date,
-//!   datetime) so incomparable types never fall inside a range; the
+//!   datetime, timestamp, day, time, bytes) so incomparable types
+//!   never fall inside a range; the
 //!   matches for a value are one ordered-map range scan, with the strict
 //!   operators dropped at a tying threshold.
 //!
@@ -439,10 +440,20 @@ fn class_of(value: &Value) -> Option<u8> {
     match value {
         Value::Int(_) => Some(1),
         Value::Float(f) if !f.is_nan() => Some(1),
+        Value::Numeric(_) => Some(1),
         Value::String(_) => Some(2),
         Value::Bool(_) => Some(3),
         Value::Date(_) => Some(4),
         Value::Datetime(_) => Some(5),
+        Value::Timestamp(_) => Some(6),
+        Value::Day(_) => Some(7),
+        Value::Time(_) => Some(8),
+        Value::Bytes(_) => Some(9),
+        // `Json` is deliberately absent: its `compare` is lexicographic on
+        // canonical text, which does not match Postgres's `jsonb` ordering
+        // (`10 > 2` is true there and false here). Range conditions on JSON
+        // are refused at the query seam; this keeps a programmatically
+        // built query from filing one anyway.
         _ => None,
     }
 }
@@ -507,5 +518,38 @@ mod tests {
         index.unfile(&large_in);
         index.unfile(&small_not_in);
         assert!(index.is_empty());
+    }
+
+    /// A range on a timestamp or a day reaches the written value it bounds.
+    #[test]
+    fn time_ranges_reach_their_written_values() {
+        let at = |millis| {
+            Value::Timestamp(crate::model::Timestamp::from_unix_millis(millis).unwrap())
+        };
+        let day = |days| Value::Day(crate::model::Day(days));
+        let cond = |operator, value| {
+            CondRef(Rc::new(Condition {
+                column: "at".into(),
+                comparison_operator: operator,
+                value,
+            }))
+        };
+        let mut index = ColumnIndex::default();
+        let past = cond(ComparisonOperator::GT, at(1_000));
+        let before = cond(ComparisonOperator::LT, day(5));
+        index.file(&past);
+        index.file(&before);
+        let mut out = Vec::new();
+        index.candidates(&at(2_000), &mut out);
+        assert!(out.contains(&past), "a later timestamp passes a lower bound");
+        out.clear();
+        index.candidates(&at(500), &mut out);
+        assert!(!out.contains(&past), "an earlier one does not");
+        out.clear();
+        index.candidates(&day(3), &mut out);
+        assert!(out.contains(&before), "an earlier day passes an upper bound");
+        out.clear();
+        index.candidates(&day(5), &mut out);
+        assert!(!out.contains(&before), "a tying day does not under LT");
     }
 }

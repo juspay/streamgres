@@ -48,10 +48,12 @@
 //! end of its commit record, the same scale the aliases' consistent
 //! points are on.
 
+pub mod binary;
 pub mod catalog;
 pub mod ddl;
 pub mod estimate;
 pub mod estimate_cache;
+pub mod pgoutput;
 pub mod replication;
 pub mod sql;
 pub mod stream;
@@ -66,13 +68,14 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore};
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{Client, Config, NoTls, SimpleQueryMessage, SimpleQueryRow};
+use tokio_postgres::types::{FromSql, Type};
+use tokio_postgres::{Client, Config, NoTls, Row, SimpleQueryMessage, SimpleQueryRow};
 
 use super::storage::{Storage, StorageError};
 use crate::log::{log_info, log_warn};
 use crate::model::{
     Catalog, DataFrameKey, DataFrameRow, DbTable, Lsn, MultiTableReadQuery, RowData,
-    SingleTableReadQuery, Snapshot, Value, ValueType,
+    SingleTableReadQuery, Snapshot, Value,
 };
 use replication::ReplicationConnection;
 
@@ -620,7 +623,9 @@ impl Storage for PgStorage {
                 sql.push_str(&format!(" LIMIT {}", row_limit + 1));
             }
             let what = format!("a read on `{}`", query.table);
-            let rows = pool.read(&alias, &what, &sql, delay).await?;
+            let rows = pool
+                .read(&alias, &what, &sql, delay, driver_knows(table))
+                .await?;
             if rows.len() > row_limit {
                 log_warn!(
                     "read on `{}` returned more than {} rows; refused",
@@ -640,7 +645,7 @@ impl Storage for PgStorage {
             }
             let rows = rows
                 .iter()
-                .map(|row| decode_row(row, table))
+                .map(|row| decode_row(row, table, catalog.money_scale()))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(Snapshot {
                 rows,
@@ -660,15 +665,13 @@ impl Storage for PgStorage {
             let (alias, catalog) = pool.current_alias()?;
             let sql = sql::count_sql(&query, &catalog, cap).map_err(StorageError)?;
             let what = format!("counting the rows of `{}`", query.main_table.table);
-            let rows = pool.read(&alias, &what, &sql, None).await?;
-            let text = rows
+            let rows = pool.read(&alias, &what, &sql, None, true).await?;
+            let count: i64 = rows
                 .first()
-                .and_then(|row| row.get(0))
-                .ok_or_else(|| StorageError("the count returned no row".to_owned()))?;
-            let count: i64 = text
-                .parse()
-                .map_err(|_| StorageError(format!("`{text}` is not a count")))?;
-            Ok(count.max(0) as u64)
+                .ok_or_else(|| StorageError("the count returned no row".to_owned()))?
+                .try_get(0)
+                .map_err(|error| StorageError(format!("the count is unreadable: {error}")))?;
+            Ok(u64::try_from(count).unwrap_or(0))
         })
         .await
     }
@@ -967,35 +970,161 @@ impl Pool {
         }
     }
 
-    /// Run one positioned statement as a single simple-query batch: the
-    /// read-only transaction opened, the alias's exported snapshot
-    /// imported as its first statement, `sql` run against it, and the
-    /// transaction committed, all in one round trip ([`Pool::run`]); the
-    /// rows of `sql` come back as text.
+    /// Preserve permanent timeout refusals through the streaming path.
+    fn read_error(&self, what: &str, error: tokio_postgres::Error) -> StorageError {
+        match self.timeout() {
+            Some(limit) if error.code() == Some(&SqlState::QUERY_CANCELED) => {
+                timed_out(what, limit)
+            }
+            _ => error.into(),
+        }
+    }
+
+    /// Collect incrementally so an oversized result cannot be buffered
+    /// whole before the row budget is checked. Dropping a failed read
+    /// closes its connection; a partial transaction is never reused.
+    ///
+    /// `statement` is `Some` when the caller resolved the result types
+    /// with a `prepare` first; `None` streams through the driver's
+    /// known-type table, which never looks a type up mid-stream.
+    async fn read_rows(
+        &self,
+        client: &Client,
+        what: &str,
+        sql: &str,
+        statement: Option<&tokio_postgres::Statement>,
+    ) -> Result<Vec<Row>, StorageError> {
+        use futures_util::TryStreamExt;
+        let started = match statement {
+            Some(statement) => {
+                client
+                    .query_raw(statement, [] as [&(dyn tokio_postgres::types::ToSql + Sync); 0])
+                    .await
+            }
+            None => {
+                client
+                    .query_typed_raw(
+                        sql,
+                        [] as [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 0],
+                    )
+                    .await
+            }
+        };
+        let stream = started.map_err(|error| self.read_error(what, error))?;
+        let mut stream = std::pin::pin!(stream);
+        let row_limit = self.row_limit.load(Ordering::Relaxed);
+        let mut rows = Vec::new();
+        while let Some(row) = stream
+            .try_next()
+            .await
+            .map_err(|error| self.read_error(what, error))?
+        {
+            if rows.len() >= row_limit {
+                return Err(StorageError::refused("a snapshot exceeds its row budget"));
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    /// Run one positioned statement: the read-only transaction opened with
+    /// the alias's exported snapshot imported, `sql` run against it with
+    /// its rows in binary format, and the transaction committed. The three
+    /// are pipelined, so the read is one round trip.
+    ///
+    /// `driver_knows` says every result column is a type the Postgres
+    /// driver already recognises. When it is false the result types are
+    /// resolved first with `prepare`, because a lookup mid-stream can
+    /// queue behind the undrained result on a fresh connection and stall
+    /// the read. `prepare` has no DataRows pending, so the lookup runs
+    /// cleanly; `query_raw` then streams. When it is true the read skips
+    /// that extra round trip and streams through `query_typed_raw`.
     async fn read(
         &self,
         alias: &Alias,
         what: &str,
         sql: &str,
         delay: Option<Duration>,
-    ) -> Result<Vec<SimpleQueryRow>, StorageError> {
-        let mut batch = format!(
+        driver_knows: bool,
+    ) -> Result<Vec<Row>, StorageError> {
+        let mut setup = format!(
             "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY; SET TRANSACTION SNAPSHOT '{}';",
             alias.snapshot.replace('\'', "''")
         );
         if let Some(limit) = self.timeout() {
-            batch.push_str(&format!(
+            setup.push_str(&format!(
                 " SET LOCAL statement_timeout = {};",
                 limit.as_millis()
             ));
         }
         if let Some(delay) = delay {
-            batch.push_str(&format!(" SELECT pg_sleep({});", delay.as_secs_f64()));
+            setup.push_str(&format!(" SELECT pg_sleep({});", delay.as_secs_f64()));
         }
-        batch.push(' ');
-        batch.push_str(sql);
-        batch.push_str("; COMMIT");
-        self.run(what, &batch).await
+        let _permit = self.permit().await?;
+        let limit = self.timeout();
+        let work = async {
+            let client = self.acquire().await?;
+            let statement = if driver_knows {
+                None
+            } else {
+                match client.prepare(sql).await {
+                    Ok(statement) => Some(statement),
+                    Err(error) => {
+                        self.release(client);
+                        return Err(self.read_error(what, error));
+                    }
+                }
+            };
+            // The three are pipelined, so they race. `try_join!` would
+            // report whichever failed first — when the statement timeout
+            // fires, `COMMIT` often reports "current transaction is aborted"
+            // before the read surfaces its cancellation, hiding the reason.
+            // Awaiting all three and keeping the read's own error preserves
+            // the timeout refusal that the caller was told to give.
+            let setup = async {
+                client
+                    .batch_execute(&setup)
+                    .await
+                    .map_err(|error| self.read_error(what, error))
+            };
+            let rows = self.read_rows(&client, what, sql, statement.as_ref());
+            let commit = async {
+                client
+                    .batch_execute("COMMIT")
+                    .await
+                    .map_err(|error| self.read_error(what, error))
+            };
+            let (setup, rows, commit) = tokio::join!(setup, rows, commit);
+            match (setup, rows, commit) {
+                (Ok(()), Ok(rows), Ok(())) => {
+                    self.release(client);
+                    Ok(rows)
+                }
+                (setup, rows, commit) => {
+                    // The read's failure is the cause; the aborted transaction
+                    // it left behind only repeats it. A refusal is always the
+                    // cause: when the setup runs out of time its refusal is
+                    // what the caller is owed, and the read and the commit
+                    // only echo it.
+                    let mut errors = [rows.err(), setup.err(), commit.err()]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    let at = errors
+                        .iter()
+                        .position(|error| error.refusal().is_some())
+                        .unwrap_or(0);
+                    Err(errors.swap_remove(at))
+                }
+            }
+        };
+        match limit {
+            None => work.await,
+            Some(limit) => match tokio::time::timeout(limit, work).await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(timed_out(what, limit)),
+            },
+        }
     }
 }
 
@@ -1033,6 +1162,20 @@ fn table_of<'a>(
     catalog
         .table(query.table.as_str())
         .ok_or_else(|| StorageError(format!("table `{}` is not in the catalog", query.table)))
+}
+
+/// Whether the driver already knows every result type of a read on `table`.
+/// Postgres describes a domain by its base type, including the base array
+/// type for a domain over an array. The startup catalog keeps that base OID,
+/// so a known base's scalar and array element types all resolve locally.
+/// Custom bases (enums, extension types) and hand-declared columns without
+/// an OID still need `prepare` to resolve their result types before rows
+/// arrive, rather than looking them up while the result stream is pending.
+fn driver_knows(table: &DbTable) -> bool {
+    table
+        .columns
+        .values()
+        .all(|column| Type::from_oid(column.type_oid).is_some())
 }
 
 /// Keep minting aliases every rotation interval until the storage drops,
@@ -1083,16 +1226,26 @@ pub fn parse_lsn(text: &str) -> Result<Lsn, StorageError> {
 /// One result row, in [`sql::select_columns`] order, as the engine's
 /// (identity, image) pair; the names come from the catalog, so no name is
 /// allocated per row.
-fn decode_row(
-    row: &SimpleQueryRow,
-    table: &DbTable,
-) -> Result<(DataFrameKey, DataFrameRow), StorageError> {
+fn decode_row(row: &Row, table: &DbTable, money_scale: u8) -> Result<(DataFrameKey, DataFrameRow), StorageError> {
     let schema = table.row_schema().clone();
     let mut values = Vec::with_capacity(schema.len());
-    for (index, column) in schema.names().iter().enumerate() {
-        let declared = &table.columns[column].r#type;
-        let value = match row.get(index) {
-            Some(text) => decode_text(text, declared)?,
+    for (index, name) in schema.names().iter().enumerate() {
+        let column = &table.columns[name];
+        let cell: Option<RawCell<'_>> = row.try_get(index).map_err(|error| {
+            StorageError(format!("`{}`.`{name}` is unreadable: {error}", table.name))
+        })?;
+        let value = match cell {
+            Some(RawCell(bytes)) => {
+                let type_oid = match column.type_oid {
+                    0 => row
+                        .columns()
+                        .get(index)
+                        .map_or(0, |described| described.type_().oid()),
+                    known => known,
+                };
+                binary::decode_source(&column.r#type, type_oid, bytes, money_scale)
+                    .map_err(|error| StorageError(format!("`{}`.`{name}`: {error}", table.name)))?
+            }
             None => Value::Null,
         };
         values.push(value);
@@ -1109,41 +1262,23 @@ fn decode_row(
     Ok((key, DataFrameRow::from(data)))
 }
 
-/// One column of a result row in its text form, decoded by the cast its
-/// declared type was read with ([`sql::select_expr`]): a time column
-/// arrives as its epoch milliseconds, a JSON column as the text of its
-/// `jsonb` (kept in the standard form, [`text::standard_json`]), a list
-/// or map column as JSON text, the rest in Postgres's text form for the
-/// cast type.
-fn decode_text(text: &str, declared: &ValueType) -> Result<Value, StorageError> {
-    let unreadable = || StorageError(format!("`{text}` is not a {declared:?}"));
-    Ok(match declared {
-        ValueType::Int | ValueType::Timestamp => {
-            Value::Int(text.parse().map_err(|_| unreadable())?)
-        }
-        ValueType::Float => Value::Float(text.parse().map_err(|_| unreadable())?),
-        ValueType::Json => Value::String(text::standard_json(text).into_owned()),
-        ValueType::String | ValueType::Map(_, _) => Value::String(text.to_owned()),
-        ValueType::List(inner) => text::json_list(text, inner),
-        ValueType::Bool => Value::Bool(match text {
-            "t" | "true" => true,
-            "f" | "false" => false,
-            _ => return Err(unreadable()),
-        }),
-        ValueType::Date => Value::Date(
-            chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(|_| unreadable())?,
-        ),
-        ValueType::Datetime => Value::Datetime(
-            chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S"))
-                .map_err(|_| unreadable())?,
-        ),
-    })
+/// One cell of a binary result row, as the bytes Postgres sent.
+struct RawCell<'a>(&'a [u8]);
+
+impl<'a> FromSql<'a> for RawCell<'a> {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        Ok(RawCell(raw))
+    }
+
+    fn accepts(_: &Type) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ValueType;
 
     #[test]
     fn base36_keeps_any_snapshot_count_within_thirteen_digits() {
@@ -1151,6 +1286,52 @@ mod tests {
         assert_eq!(base36(35), "z");
         assert_eq!(base36(36), "10");
         assert_eq!(base36(u64::MAX).len(), 13);
+    }
+
+    /// A read streams without `prepare` when every result OID is in the
+    /// driver's table. A domain reports its base type, so known scalar and
+    /// array bases are eligible too; a custom base or absent OID is not.
+    #[test]
+    fn a_read_prepares_unless_every_result_type_is_the_drivers_own() {
+        use crate::model::{DbColumn, DbTable, ValueType};
+        let table = |columns: Vec<DbColumn>| DbTable::new("t", ["id"], columns);
+        let column = |name: &str, type_oid: u32| DbColumn::new(name, ValueType::Int).with_type_oid(type_oid);
+        let domain = |r#type, type_oid, element_oid| {
+            DbColumn::new("id", r#type)
+                .with_type_oid(type_oid)
+                .with_element_oid(element_oid)
+                .with_is_domain(true)
+        };
+
+        assert!(driver_knows(&table(vec![column("id", 23)])), "int4 is known");
+        assert!(
+            driver_knows(&table(vec![domain(ValueType::Int, 20, 0)])),
+            "Postgres describes a domain over bigint as bigint"
+        );
+        assert!(
+            driver_knows(&table(vec![domain(
+                ValueType::List(Box::new(ValueType::Int)),
+                1016,
+                20,
+            )])),
+            "a domain over a known array reports its base array"
+        );
+        assert!(
+            !driver_knows(&table(vec![domain(ValueType::String, 16_483, 0)])),
+            "a domain over an enum has a custom base OID"
+        );
+        assert!(
+            !driver_knows(&table(vec![column("id", 16_483)])),
+            "an enum's OID is not the driver's"
+        );
+        assert!(
+            !driver_knows(&table(vec![DbColumn::new("id", ValueType::Int)])),
+            "no OID needs prepare"
+        );
+        assert!(
+            !driver_knows(&table(vec![column("id", 23), column("extra", 16_483)])),
+            "one unknown column is enough"
+        );
     }
 
     #[test]
@@ -1299,44 +1480,5 @@ mod tests {
         assert_eq!(aliases.current.as_ref().map(|a| a.lsn), Some(Lsn(20)));
         assert!(Arc::ptr_eq(&aliases.catalog, &after));
         assert!(aliases.upcoming.is_empty());
-    }
-
-    /// The text forms the casts produce decode to the engine's values.
-    #[test]
-    fn text_columns_decode_by_declared_type() {
-        assert_eq!(decode_text("42", &ValueType::Int).unwrap(), Value::Int(42));
-        assert_eq!(
-            decode_text("1700000000123", &ValueType::Timestamp).unwrap(),
-            Value::Int(1_700_000_000_123)
-        );
-        assert_eq!(
-            decode_text("1.5", &ValueType::Float).unwrap(),
-            Value::Float(1.5)
-        );
-        assert!(
-            matches!(decode_text("NaN", &ValueType::Float).unwrap(), Value::Float(f) if f.is_nan())
-        );
-        assert_eq!(
-            decode_text("t", &ValueType::Bool).unwrap(),
-            Value::Bool(true)
-        );
-        assert_eq!(
-            decode_text("[1,2]", &ValueType::List(Box::new(ValueType::Int))).unwrap(),
-            Value::List(vec![Value::Int(1), Value::Int(2)])
-        );
-        assert_eq!(
-            decode_text("2026-09-11", &ValueType::Date).unwrap(),
-            Value::Date(chrono::NaiveDate::from_ymd_opt(2026, 9, 11).unwrap())
-        );
-        assert!(matches!(
-            decode_text("2026-09-11 10:00:00.5", &ValueType::Datetime).unwrap(),
-            Value::Datetime(_)
-        ));
-        assert_eq!(
-            decode_text("{\"a\": 1.50}", &ValueType::Json).unwrap(),
-            Value::String("{\"a\": 1.5}".into()),
-            "a JSON cell is kept in the standard form"
-        );
-        assert!(decode_text("x", &ValueType::Int).is_err());
     }
 }

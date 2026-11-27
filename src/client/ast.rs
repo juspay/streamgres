@@ -192,10 +192,16 @@ fn node(
     };
     let mut order = Vec::with_capacity(ast.order_by.len() + table.pkey.len());
     for (column, direction) in &ast.order_by {
-        if table.column(column).is_none() {
-            return Err(format!(
+        let declared = table.column(column).ok_or_else(|| {
+            format!(
                 "unknown column `{}.{column}` in ORDER BY",
                 ast.table
+            )
+        })?;
+        if !crate::model::supports(crate::model::Capability::Order, &declared.r#type) {
+            return Err(format!(
+                "`{column}` is `{}`; the server does not order it the way Postgres does, so ORDER BY is not supported on it",
+                declared.r#type.type_name()
             ));
         }
         let direction = match direction.as_str() {
@@ -544,6 +550,20 @@ fn simple(op: &str, left: &Operand, right: &Operand, table: &DbTable) -> Result<
             return Err("column-to-column comparisons are not supported".to_owned());
         }
     };
+    // A null check compares presence, not value, so it works for every
+    // column — including a list, which has no value comparison here.
+    if matches!(op, "IS" | "IS NOT") && literal.is_null() {
+        return Ok(if op == "IS" {
+            Where::is_null(name.as_str())
+        } else {
+            Where::is_not_null(name.as_str())
+        });
+    }
+    if !crate::model::supports(crate::model::Capability::Filter, &column.r#type) {
+        return Err(format!(
+            "`{name}` has a type the server does not compare; it can be read, not filtered on"
+        ));
+    }
     let operator = match op {
         "=" => EQ,
         "!=" => NEQ,
@@ -554,24 +574,32 @@ fn simple(op: &str, left: &Operand, right: &Operand, table: &DbTable) -> Result<
         "IN" => IN,
         "NOT IN" => NOT_IN,
         "IS" => {
-            return Ok(if literal.is_null() {
-                Where::is_null(name.as_str())
-            } else {
-                Where::condition(name.as_str(), EQ, literal_value(literal, &column.r#type)?)
-            });
+            return Ok(Where::condition(
+                name.as_str(),
+                EQ,
+                literal_value(literal, &column.r#type)?,
+            ));
         }
         "IS NOT" => {
-            return Ok(if literal.is_null() {
-                Where::is_not_null(name.as_str())
-            } else {
-                Where::condition(name.as_str(), NEQ, literal_value(literal, &column.r#type)?)
-            });
+            return Ok(Where::condition(
+                name.as_str(),
+                NEQ,
+                literal_value(literal, &column.r#type)?,
+            ));
         }
         "LIKE" | "ILIKE" | "NOT LIKE" | "NOT ILIKE" => {
             return Err(format!("{op} is not supported (a condition on `{name}`)"));
         }
         other => return Err(format!("unknown operator `{other}`")),
     };
+    if matches!(operator, LT | LTE | GT | GTE)
+        && !crate::model::supports(crate::model::Capability::Order, &column.r#type)
+    {
+        return Err(format!(
+            "`{name}` is `{}`; the server does not order it the way Postgres does, so range filters are not supported on it",
+            column.r#type.type_name()
+        ));
+    }
     let value = if matches!(
         operator,
         ComparisonOperator::IN | ComparisonOperator::NOT_IN
@@ -601,12 +629,55 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
         (Json::String(text), ValueType::Json) if text.contains('\0') => {
             return Err("a text value contains a NUL byte".to_owned());
         }
-        (_, ValueType::Json) => Value::String(crate::sync::pg::text::jsonb_text(literal)),
+        (_, ValueType::Json) => Value::Json(crate::model::JsonText::standard_only(
+            crate::sync::pg::text::jsonb_text(literal),
+        )),
         (Json::Bool(flag), _) => Value::Bool(*flag),
         (Json::Number(number), ValueType::Float) => {
             Value::Float(number.as_f64().unwrap_or(f64::NAN))
         }
+        (Json::Number(number), ValueType::Numeric) => {
+            let text = number.to_string();
+            crate::sync::pg::text::numeric_digits(&text)
+                .map(Value::Numeric)
+                .ok_or_else(|| format!("`{text}` is not a plain decimal number"))?
+        }
+        (Json::String(text), ValueType::Numeric) => {
+            crate::sync::pg::text::numeric_digits(text)
+                .map(Value::Numeric)
+                .ok_or_else(|| format!("`{text}` is not a number"))?
+        }
         (Json::Number(number), ValueType::String) => Value::String(number.to_string()),
+        // A time literal is milliseconds on the wire ([`crate::client::wire`]);
+        // the engine keeps microseconds, so the number is scaled here, once,
+        // at the boundary — every later comparison sees the engine's unit.
+        (Json::Number(number), ValueType::Timestamp) => {
+            let millis = if let Some(millis) = number.as_i64() {
+                millis
+            } else {
+                let millis = number.as_f64().filter(|millis| millis.is_finite()).ok_or_else(|| {
+                    format!("`{number}` is not a count of milliseconds")
+                })?;
+                millis as i64
+            };
+            crate::model::Timestamp::from_unix_millis(millis)
+                .map(Value::Timestamp)
+                .ok_or_else(|| format!("`{number}` is out of range for a timestamp"))?
+        }
+        // A day is shown as its midnight's milliseconds, so a number against
+        // one is that day; a string may also be the date Postgres writes.
+        (Json::Number(number), ValueType::Day) => {
+            let millis = number.as_i64().or_else(|| {
+                number
+                    .as_f64()
+                    .filter(|millis| millis.is_finite())
+                    .map(|millis| millis as i64)
+            });
+            let millis = millis.ok_or_else(|| format!("`{number}` is not a count of milliseconds"))?;
+            crate::model::Day::from_unix_millis(millis)
+                .map(Value::Day)
+                .ok_or_else(|| format!("`{number}` is out of range for a date"))?
+        }
         (Json::Number(number), _) => match number.as_i64() {
             Some(int) => Value::Int(int),
             None => Value::Float(number.as_f64().unwrap_or(f64::NAN)),
@@ -614,7 +685,16 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
         (Json::String(text), _) if text.contains('\0') => {
             return Err("a text value contains a NUL byte".to_owned());
         }
-        (Json::String(text), ValueType::Int | ValueType::Timestamp) => text
+        (Json::String(text), ValueType::Timestamp) => text
+            .parse::<i64>()
+            .ok()
+            .and_then(crate::model::Timestamp::from_unix_millis)
+            .map(Value::Timestamp)
+            .ok_or_else(|| format!("`{text}` is not a number"))?,
+        (Json::String(text), ValueType::Day) => crate::sync::pg::text::day(text)
+            .map(Value::Day)
+            .ok_or_else(|| format!("`{text}` is not a date"))?,
+        (Json::String(text), ValueType::Int) => text
             .parse::<i64>()
             .map(Value::Int)
             .map_err(|_| format!("`{text}` is not a number"))?,
@@ -622,6 +702,12 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
             .parse::<f64>()
             .map(Value::Float)
             .map_err(|_| format!("`{text}` is not a number"))?,
+        (Json::String(text), ValueType::Time) => {
+            Value::Time(time_of_day(text).ok_or_else(|| format!("`{text}` is not a time of day"))?)
+        }
+        (Json::String(text), ValueType::Bytes) => Value::Bytes(
+            hex_bytes(text).ok_or_else(|| format!("`{text}` is not bytea's hex text"))?,
+        ),
         (Json::String(text), _) => Value::String(text.clone()),
         (Json::Array(items), ValueType::List(inner)) => Value::List(
             items
@@ -637,6 +723,40 @@ fn literal_value(literal: &Json, declared: &ValueType) -> Result<Value, String> 
         ),
         (Json::Object(_), _) => return Err("an object literal in a comparison".to_owned()),
     })
+}
+
+/// A time of day as Postgres writes it (`HH:MM[:SS[.ffffff]]`).
+fn time_of_day(text: &str) -> Option<crate::model::Time> {
+    let mut parts = text.splitn(3, ':');
+    let hours: i64 = parts.next()?.parse().ok()?;
+    let minutes: i64 = parts.next()?.parse().ok()?;
+    let (seconds, fraction) = match parts.next() {
+        Some(rest) => match rest.split_once('.') {
+            Some((seconds, fraction)) => (seconds.parse::<i64>().ok()?, fraction),
+            None => (rest.parse::<i64>().ok()?, ""),
+        },
+        None => (0, ""),
+    };
+    if fraction.len() > 6 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let micros: i64 = format!("{fraction:0<6}").parse().ok()?;
+    let total = ((hours * 60 + minutes) * 60 + seconds) * 1_000_000 + micros;
+    ((0..=86_400_000_000).contains(&total) && minutes < 60 && seconds < 60)
+        .then_some(crate::model::Time(total))
+}
+
+/// The bytes of bytea's hex text (`\x0aff`).
+fn hex_bytes(text: &str) -> Option<bytes::Bytes> {
+    let digits = text.strip_prefix("\\x")?;
+    if digits.len() % 2 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(digits.len() / 2);
+    for index in (0..digits.len()).step_by(2) {
+        out.push(u8::from_str_radix(digits.get(index..index + 2)?, 16).ok()?);
+    }
+    Some(out.into())
 }
 
 /// The `WHERE` a keyset cursor means over `order`: one branch per sort
@@ -732,6 +852,7 @@ mod tests {
                     DbColumn::new("createdAt", ValueType::Timestamp),
                     DbColumn::new("visibleTo", ValueType::String),
                     DbColumn::new("metadata", ValueType::Json),
+                    DbColumn::new("labels", ValueType::List(Box::new(ValueType::String))),
                 ],
             ),
             DbTable::new(
@@ -967,13 +1088,16 @@ mod tests {
 
     /// A cursor that stops short of the appended primary key is compared
     /// on the columns it has; one that names no sort column is refused.
+    /// The cursor's time is the milliseconds the client received on the
+    /// wire, scaled to the engine's microseconds at the boundary.
     #[test]
     fn cursors_compare_on_their_prefix() {
+        let at = Value::Timestamp(crate::model::Timestamp::from_unix_millis(1_000).unwrap());
         let ast: Ast = serde_json::from_str(r#"{"table": "messages", "orderBy": [["createdAt", "desc"]], "start": {"row": {"createdAt": 1000}, "exclusive": true}, "limit": 5}"#).unwrap();
         let translated = translate(&ast, &catalog()).unwrap();
         assert_eq!(
             translated.query.main_table.filter,
-            Where::condition("createdAt", LT, Value::Int(1000))
+            Where::condition("createdAt", LT, at)
         );
         let empty: Ast = serde_json::from_str(r#"{"table": "messages", "orderBy": [["createdAt", "desc"]], "start": {"row": {"other": 1}, "exclusive": true}}"#).unwrap();
         assert!(
@@ -998,6 +1122,92 @@ mod tests {
         let turned = translate(&turned, &catalog()).unwrap();
         assert_ne!(turned.query, first.query, "the cursor is in the tree");
         assert_eq!(turned.uncursored, Some(first.query), "and not in its uncursored tree");
+    }
+
+    /// A row's time travels to the client as milliseconds; a filter the
+    /// client sends back in those milliseconds matches that same row
+    /// once the boundary scales them to the engine's microseconds.
+    #[test]
+    fn a_time_round_trips_from_the_wire_through_a_filter() {
+        let at = Value::Timestamp(crate::model::Timestamp::from_unix_micros(1_500_000).unwrap());
+        let millis = crate::client::wire::value_json(&at, Some(&ValueType::Timestamp));
+        assert_eq!(millis, serde_json::json!(1_500));
+        let ast: Ast = serde_json::from_value(serde_json::json!({
+            "table": "messages",
+            "where": {"type": "simple", "op": "=", "left": {"type": "column", "name": "createdAt"},
+                      "right": {"type": "literal", "value": millis}},
+        }))
+        .unwrap();
+        let translated = translate(&ast, &catalog()).unwrap();
+        assert_eq!(
+            translated.query.main_table.filter,
+            Where::condition("createdAt", EQ, at),
+            "the 1500ms the client saw is the same instant again"
+        );
+    }
+
+    /// A list column is readable but not filtered on: a list operand renders
+    /// as `NULL` in the snapshot SQL, so equality would select nothing where
+    /// the engine's own evaluation might match. Both paths must agree before
+    /// the filter is offered.
+    #[test]
+    fn a_list_column_is_readable_but_not_filtered_on() {
+        let ast: Ast = serde_json::from_value(serde_json::json!({
+            "table": "messages",
+            "where": {"type": "simple", "op": "=", "left": {"type": "column", "name": "labels"},
+                      "right": {"type": "literal", "value": ["a"]}},
+        }))
+        .unwrap();
+        let error = translate(&ast, &catalog()).expect_err("a list is not filtered on");
+        assert!(error.contains("does not compare"), "{error}");
+
+        let ast: Ast = serde_json::from_value(serde_json::json!({
+            "table": "messages",
+            "where": {"type": "simple", "op": "IN", "left": {"type": "column", "name": "labels"},
+                      "right": {"type": "literal", "value": [["a"], ["b"]]}},
+        }))
+        .unwrap();
+        let error = translate(&ast, &catalog()).expect_err("a list is not a membership target");
+        assert!(error.contains("does not compare"), "{error}");
+
+        // A null check compares presence, not value, and stays available.
+        for (op, expected) in [
+            ("IS", Where::is_null("labels")),
+            ("IS NOT", Where::is_not_null("labels")),
+        ] {
+            let ast: Ast = serde_json::from_value(serde_json::json!({
+                "table": "messages",
+                "where": {"type": "simple", "op": op, "left": {"type": "column", "name": "labels"},
+                          "right": {"type": "literal", "value": null}},
+            }))
+            .unwrap();
+            assert_eq!(
+                translate(&ast, &catalog()).unwrap().query.main_table.filter,
+                expected,
+                "`labels {op} NULL` is still supported"
+            );
+        }
+    }
+
+    /// A numeric literal holds only the decoder's forms: a JSON number is
+    /// accepted when it spells plain digits, and a spelling it does not
+    /// (`1e21`, which `to_string` writes as `1e+21`) is refused rather
+    /// than mangled.
+    #[test]
+    fn numeric_literals_hold_only_plain_digits() {
+        let n = |text: &str| crate::model::Numeric::parse(text).unwrap();
+        assert_eq!(
+            literal_value(&serde_json::json!(1.5), &ValueType::Numeric).unwrap(),
+            Value::Numeric(n("1.5"))
+        );
+        assert_eq!(
+            literal_value(&serde_json::json!("1.50"), &ValueType::Numeric).unwrap(),
+            Value::Numeric(n("1.50"))
+        );
+        assert!(
+            literal_value(&serde_json::json!(1e21), &ValueType::Numeric).is_err(),
+            "an exponent spelling is refused, not stripped into other digits"
+        );
     }
 
     /// What the engine cannot run is refused by name.
@@ -1174,12 +1384,13 @@ mod tests {
     fn a_literal_against_a_json_column_is_jsonb_text() {
         let json = ValueType::Json;
         let value = |literal: Json| literal_value(&literal, &json).expect("a value");
-        assert_eq!(value(serde_json::json!("high")), Value::from("\"high\""));
-        assert_eq!(value(serde_json::json!(5)), Value::from("5"));
-        assert_eq!(value(serde_json::json!(true)), Value::from("true"));
+        let j = |s: &str| Value::Json(crate::model::JsonText::standard_only(s.to_owned()));
+        assert_eq!(value(serde_json::json!("high")), j("\"high\""));
+        assert_eq!(value(serde_json::json!(5)), j("5"));
+        assert_eq!(value(serde_json::json!(true)), j("true"));
         assert_eq!(
             value(serde_json::json!({"b": [1, 2], "a": "x"})),
-            Value::from("{\"a\": \"x\", \"b\": [1, 2]}")
+            j("{\"a\": \"x\", \"b\": [1, 2]}")
         );
         assert_eq!(value(Json::Null), Value::Null);
         assert!(literal_value(&serde_json::json!("a\u{0}b"), &json).is_err());
@@ -1190,7 +1401,7 @@ mod tests {
         );
         assert_eq!(
             literal_value(&serde_json::json!(["a", 1]), &json).expect("a value"),
-            Value::from("[\"a\", 1]"),
+            j("[\"a\", 1]"),
             "an array against a JSON column is one JSON value, not a list of them"
         );
     }

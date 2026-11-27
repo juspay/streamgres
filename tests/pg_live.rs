@@ -620,6 +620,7 @@ fn mutation_results_travel_the_feed() {
         }
         let text = |row: &RowData, column: &str| match row.get(column) {
             Some(Value::String(text)) => text.clone(),
+            Some(Value::Json(json)) => json.text().to_owned(),
             other => panic!("{column}: {other:?}"),
         };
         let WriteQuery::INSERT(recorded) = &seen[0] else {
@@ -1051,7 +1052,9 @@ fn a_json_column_is_filtered_by_value() {
                 Where::condition(
                     column,
                     ComparisonOperator::EQ,
-                    streamgres::sync::pg::text::jsonb_text(&literal).as_str(),
+                    streamgres::model::Value::Json(streamgres::model::JsonText::standard_only(
+                        streamgres::sync::pg::text::jsonb_text(&literal),
+                    )),
                 ),
                 OrderBy::new("id", Order::ASC),
                 u32::MAX,
@@ -1085,9 +1088,9 @@ fn a_json_column_is_filtered_by_value() {
                 assert_eq!(storage.count(&alone, 10).await.expect("count"), 1);
                 assert_eq!(
                     read.rows[0].1.data.get(&ColumnName::from(column)),
-                    Some(&Value::from(
-                        streamgres::sync::pg::text::jsonb_text(&literal).as_str()
-                    )),
+                    Some(&Value::Json(JsonText::standard_only(
+                        streamgres::sync::pg::text::jsonb_text(&literal)
+                    ))),
                     "the {column} cell a read brings back is the text the literal was given"
                 );
             }
@@ -1108,7 +1111,9 @@ fn a_json_column_is_filtered_by_value() {
             .cloned();
         assert_eq!(
             cell,
-            Some(Value::from("{\"a\": \"x\", \"b\": [1, 2]}")),
+            Some(Value::Json(JsonText::standard_only(
+                "{\"a\": \"x\", \"b\": [1, 2]}".to_owned()
+            ))),
             "the cell a read brings back is the text the literal was given"
         );
         let whole = SingleTableReadQuery::new(
@@ -1845,5 +1850,488 @@ fn unchanged_out_of_line_values_are_never_lost() {
             "the held-open read completed the reply"
         );
         cleanup(&dsn, &client, &names).await;
+    });
+}
+
+/// Every column type reads the same from a snapshot as from the change
+/// feed, exactly: a numeric keeps its digits and scale, a time its
+/// microseconds and infinities, bytea its bytes, and a type the engine
+/// does not interpret its binary form.
+#[test]
+fn every_type_reads_the_same_from_a_snapshot_and_the_feed() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let table = "live_exact.values";
+        let slot = "xyne_sync_live_exact";
+        let publication = "xyne_sync_live_exact_pub";
+        let client = admin(&dsn).await;
+        PgStream::drop_slot(&dsn, slot, publication)
+            .await
+            .expect("drop slot");
+        client
+            .batch_execute(&format!(
+                "DROP SCHEMA IF EXISTS live_exact CASCADE;
+                 CREATE SCHEMA live_exact;
+                 CREATE TYPE live_exact.mood AS ENUM ('calm', 'busy');
+                 CREATE EXTENSION IF NOT EXISTS hstore;
+                 CREATE TABLE {table} (
+                   id int8 PRIMARY KEY, i2 int2, i4 int4, f4 real, f8 float8,
+                   n numeric(30, 4), b bool, t text, vc varchar(10), ch char(3), u uuid,
+                   j json, jb jsonb, ts timestamp, tz timestamptz, d date, tm time,
+                   by bytea, iv interval, ints int4[], texts text[], mood live_exact.mood,
+                   moods live_exact.mood[], nm name, hst hstore,
+                   addr inet, tv tsvector, cash money);
+                 CREATE PUBLICATION \"{publication}\" FOR TABLE {table};"
+            ))
+            .await
+            .expect("prepare");
+        let loaded =
+            streamgres::sync::pg::catalog::load_catalog(&client, &["live_exact".to_owned()])
+                .await
+                .expect("catalog")
+                .0;
+        let declared = loaded.table(table).expect("the table is carried").clone();
+        let catalog = Arc::new(Catalog::new(vec![declared]));
+        let mut stream = PgStream::open(&dsn, slot, publication, catalog.clone())
+            .await
+            .expect("open stream");
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        let mut runtime = Runtime::new(MultiTableIVM::new());
+        catch_up(&mut runtime, &mut stream, &[&storage]).await;
+
+        client
+            .batch_execute(&format!(
+                "SET TIME ZONE 'Asia/Kolkata';
+                 INSERT INTO {table} VALUES
+                   (1, -2, 7, 1.5, 0.1, 12345678901234567890.1230, true, 'it''s', 'v', 'ab',
+                    '00010203-0405-0607-0809-0a0b0c0d0e0f', '{{ \"b\":1.50, \"a\":2 }}',
+                    '{{\"a\": 1.50}}', '2026-09-11 10:00:00.123456', '2026-09-11 10:00:00.5+05:30',
+                    '2026-09-11', '23:59:59.999999', '\\x00ff10', '1 year 2 days 03:04:05',
+                    '{{1,NULL,3}}', '{{\"a b\",c}}', 'busy', '{{calm,busy}}', 'alice',
+                    'foo=>bar', '10.0.0.1/8',
+                    'a fat cat:3A sat:5,7B it''s', '-1234.56'),
+                   (2, NULL, NULL, 'NaN', '-Infinity', 'NaN', NULL, NULL, NULL, NULL, NULL,
+                    NULL, NULL, 'infinity', '-infinity', 'infinity', NULL, '\\x', NULL,
+                    '{{}}', NULL, NULL, '{{}}', NULL, NULL, NULL, NULL, NULL);"
+            ))
+            .await
+            .expect("insert");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut fed: HashMap<DataFrameKey, DataFrameRow> = HashMap::new();
+        let mut last = Lsn(0);
+        while fed.len() < 2 {
+            let batch = stream.poll().await.expect("poll");
+            for (write, at) in batch.writes {
+                if let WriteQuery::INSERT(insert) = write {
+                    fed.insert(insert.pkey_value, insert.record);
+                    last = at;
+                }
+            }
+            assert!(Instant::now() < deadline, "the inserts never arrived");
+        }
+        storage.mint_now();
+        loop {
+            let batch = stream.poll().await.expect("poll");
+            storage.advance(batch.progress);
+            if storage.alias_position().is_some_and(|alias| alias >= last) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no snapshot past the inserts");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let read = storage
+            .select(&SingleTableReadQuery::new(
+                table,
+                Where::AND(vec![]),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            ))
+            .await
+            .expect("the read is served");
+        assert_eq!(read.rows.len(), 2);
+        for (key, row) in &read.rows {
+            assert_eq!(
+                Some(&row.data),
+                fed.get(key).map(|fed| &fed.data),
+                "the snapshot and the feed agree on {key:?}"
+            );
+        }
+
+        let first = &read.rows[0].1.data;
+        let cell = |name: &str| {
+            first
+                .get(&ColumnName::from(name))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        assert!(
+            matches!(cell("n"), Value::Numeric(n) if n.to_string() == "12345678901234567890.1230")
+        );
+        assert_eq!(cell("f4"), Value::Float(1.5));
+        assert_eq!(
+            cell("u"),
+            Value::from("00010203-0405-0607-0809-0a0b0c0d0e0f")
+        );
+        assert_eq!(
+            cell("j"),
+            Value::Json(JsonText::standard_only("{\"a\": 2, \"b\": 1.5}".to_owned()))
+        );
+        assert!(matches!(cell("j"), Value::Json(json) if json.text() == "{ \"b\":1.50, \"a\":2 }"));
+        assert_eq!(
+            cell("jb"),
+            Value::Json(JsonText::standard_only("{\"a\": 1.5}".to_owned()))
+        );
+        assert!(matches!(cell("jb"), Value::Json(json) if json.text() == "{\"a\": 1.50}"));
+        let micros = |text: &str| {
+            let at = chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f").unwrap();
+            Value::Timestamp(Timestamp::from_unix_micros(at.and_utc().timestamp_micros()).unwrap())
+        };
+        assert_eq!(cell("ts"), micros("2026-09-11 10:00:00.123456"));
+        assert_eq!(cell("tz"), micros("2026-09-11 04:30:00.5"));
+        assert_eq!(cell("tm"), Value::Time(Time(86_399_999_999)));
+        assert_eq!(
+            cell("by"),
+            Value::Bytes(bytes::Bytes::from_static(&[0, 255, 16]))
+        );
+        assert!(
+            matches!(cell("iv"), Value::Raw(raw) if raw.type_oid == 1186 && raw.bytes.len() == 16)
+        );
+        assert!(matches!(cell("addr"), Value::Raw(raw) if raw.type_oid == 869));
+        assert_eq!(cell("mood"), Value::from("busy"));
+        assert_eq!(
+            cell("moods"),
+            Value::List(vec![Value::from("calm"), Value::from("busy")]),
+            "an enum array keeps its labels"
+        );
+        // `name` carries a nonzero `typelem` but is a scalar, not an array.
+        assert_eq!(cell("nm"), Value::from("alice"));
+        // A type the engine keeps raw still shows Postgres's own text, as
+        // it did before binary decoding; it is no longer a bare `null`.
+        let Value::Raw(hstore) = cell("hst") else {
+            panic!("hstore is raw");
+        };
+        assert_eq!(
+            hstore.client_text.as_deref(),
+            Some("foo=>bar"),
+            "a raw user type keeps a readable projection"
+        );
+        assert_eq!(
+            cell("ints"),
+            Value::List(vec![Value::Int(1), Value::Null, Value::Int(3)])
+        );
+        assert_eq!(cell("ch"), Value::from("ab "));
+        let expected = client
+            .query_one(
+                &format!(
+                    "SELECT iv::text, addr::text, tv::text, cash::numeric::text FROM {table} WHERE id = 1"
+                ),
+                &[],
+            )
+            .await
+            .expect("Postgres's text");
+        for (index, column) in ["iv", "addr", "tv", "cash"].into_iter().enumerate() {
+            let Value::Raw(raw) = cell(column) else {
+                panic!("{column} is raw");
+            };
+            let shown = raw.client_text.as_ref().map(|t| t.to_string());
+            let postgres: String = expected.get(index);
+            assert_eq!(shown.as_deref(), Some(postgres.as_str()), "{column}");
+        }
+
+        let second = &read.rows[1].1.data;
+        let cell = |name: &str| {
+            second
+                .get(&ColumnName::from(name))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        assert!(matches!(cell("n"), Value::Numeric(Numeric::NaN)));
+        assert_eq!(cell("ts"), Value::Timestamp(Timestamp::INFINITY));
+        assert_eq!(cell("tz"), Value::Timestamp(Timestamp::NEG_INFINITY));
+        assert_eq!(cell("d"), Value::Day(Day::INFINITY));
+        assert_eq!(cell("by"), Value::Bytes(bytes::Bytes::new()));
+        assert_eq!(cell("ints"), Value::List(Vec::new()));
+
+        drop(stream);
+        let _ = PgStream::drop_slot(&dsn, slot, publication).await;
+        let _ = client
+            .batch_execute(&format!(
+                "DROP PUBLICATION IF EXISTS \"{publication}\"; DROP SCHEMA IF EXISTS live_exact CASCADE;"
+            ))
+            .await;
+    });
+}
+
+/// A table with a nested domain and a timestamp domain absorbs an unrelated
+/// column: the catalog's final base classification and the trigger's column
+/// metadata agree, so the feed does not report either existing column as a
+/// changed type.
+#[test]
+fn a_nested_domain_survives_an_unrelated_add_column() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let table = "live_domain_mapper.probe";
+        let client = admin(&dsn).await;
+        client
+            .batch_execute(
+                "DROP SCHEMA IF EXISTS live_domain_mapper CASCADE;
+                 CREATE SCHEMA live_domain_mapper;
+                 CREATE DOMAIN live_domain_mapper.cents AS bigint;
+                 CREATE DOMAIN live_domain_mapper.account_id AS live_domain_mapper.cents;
+                 CREATE DOMAIN live_domain_mapper.local_at AS timestamp;
+                 CREATE TABLE live_domain_mapper.probe (
+                   id bigint PRIMARY KEY,
+                   cents live_domain_mapper.cents,
+                   account live_domain_mapper.account_id,
+                   at live_domain_mapper.local_at
+                 );
+                 INSERT INTO live_domain_mapper.probe
+                   VALUES (1, 50, 100, '2026-01-02 03:04:05');",
+            )
+            .await
+            .expect("create nested domains");
+        let loaded =
+            streamgres::sync::pg::catalog::load_catalog(&client, &["live_domain_mapper".to_owned()])
+                .await
+                .expect("catalog")
+                .0;
+        let table_info = loaded.table(table).expect("the table is carried");
+        assert_eq!(
+            table_info.column("cents").expect("cents").r#type,
+            ValueType::Int,
+            "a single-level domain maps to Int, not Raw"
+        );
+        assert_eq!(
+            table_info.column("account").expect("account").r#type,
+            ValueType::Int,
+            "domain over domain resolves to its final scalar base"
+        );
+        assert_eq!(
+            table_info.column("at").expect("at").r#type,
+            ValueType::Timestamp
+        );
+        let catalog = Arc::new(Catalog::new(vec![table_info.clone()]));
+        let storage = PgStorage::connect(&dsn, catalog.clone())
+            .await
+            .expect("connect");
+        storage.advance(storage.first_position());
+        client
+            .batch_execute(&format!(
+                "DROP PUBLICATION IF EXISTS domainmap_pub;
+                 CREATE PUBLICATION domainmap_pub FOR TABLE {table};"
+            ))
+            .await
+            .expect("create a scoped publication");
+        client
+            .batch_execute(&trigger_stack_sql("domainmap", 0, &["domainmap_pub"]))
+            .await
+            .expect("install the trigger stack");
+        let before: String = client
+            .query_one("SELECT \"domainmap_0\".schema_specs()::text", &[])
+            .await
+            .expect("schema before")
+            .get(0);
+        client
+            .batch_execute(&format!(
+                "ALTER TABLE {table} ADD COLUMN owner text DEFAULT 'nobody';"
+            ))
+            .await
+            .expect("unrelated add column");
+        let after: String = client
+            .query_one("SELECT \"domainmap_0\".schema_specs()::text", &[])
+            .await
+            .expect("schema after")
+            .get(0);
+        let message = streamgres::sync::pg::ddl::DdlMessage::parse(&format!(
+            r#"{{"type":"ddlUpdate","version":1,"event":{{"tag":"ALTER TABLE"}},"context":{{"query":"alter table"}},"previousSchema":{before},"schema":{after}}}"#
+        ))
+        .expect("the trigger's message parses");
+        let classified = streamgres::sync::pg::ddl::classify(
+            &catalog,
+            &["live_domain_mapper".to_owned()],
+            &message,
+        )
+        .expect("an unrelated column does not stop the feed");
+        assert_eq!(classified.changes.len(), 1, "{:?}", classified.changes);
+        let widened = classified.catalog.table(table).expect("the widened table");
+        assert_eq!(
+            widened.column("cents").expect("cents").r#type,
+            ValueType::Int,
+            "the classification agrees with startup: no Raw, no false type change"
+        );
+        assert_eq!(
+            widened.column("account").expect("account").r#type,
+            ValueType::Int,
+            "the nested domain's base survives the migration"
+        );
+        assert_eq!(
+            widened.column("at").expect("at").r#type,
+            ValueType::Timestamp
+        );
+        drop(storage);
+        let _ = client
+            .batch_execute(
+                "DROP PUBLICATION IF EXISTS domainmap_pub;
+                 DROP EVENT TRIGGER IF EXISTS domainmap_ddl_start_0;
+                 DROP EVENT TRIGGER IF EXISTS domainmap_ddl_end_0;
+                 DROP SCHEMA IF EXISTS domainmap_0 CASCADE;
+                 DROP SCHEMA IF EXISTS live_domain_mapper CASCADE;",
+            )
+            .await;
+    });
+}
+
+/// A scalar domain is described by its built-in base OID, so its read can
+/// stream without a separate prepare. A result large enough to pend data
+/// proves that the driver needs no type lookup while the rows are arriving.
+#[test]
+fn a_fresh_connection_reads_a_large_known_domain_without_prepare() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let table = "live_known_domain.probe";
+        let client = admin(&dsn).await;
+        client
+            .batch_execute(
+                "DROP SCHEMA IF EXISTS live_known_domain CASCADE;
+                 CREATE SCHEMA live_known_domain;
+                 CREATE DOMAIN live_known_domain.cents AS bigint;
+                 CREATE TABLE live_known_domain.probe (
+                   id bigint PRIMARY KEY,
+                   amount live_known_domain.cents,
+                   note text
+                 );",
+            )
+            .await
+            .expect("create domain and table");
+        let filler = "x".repeat(16 * 1024);
+        for batch in 0..10 {
+            let values: Vec<String> = (0..10)
+                .map(|i| {
+                    let id = batch * 10 + i;
+                    format!("({id}, {}, '{filler}')", id * 100)
+                })
+                .collect();
+            client
+                .batch_execute(&format!("INSERT INTO {table} VALUES {};", values.join(",")))
+                .await
+                .expect("insert domain values");
+        }
+        let loaded =
+            streamgres::sync::pg::catalog::load_catalog(&client, &["live_known_domain".to_owned()])
+                .await
+                .expect("catalog")
+                .0;
+        let table_info = loaded.table(table).expect("the table is carried");
+        let amount = table_info.column("amount").expect("the amount is carried");
+        assert_eq!(amount.type_oid, 20, "the catalog stores bigint's OID");
+        assert!(amount.is_domain);
+        let catalog = Arc::new(Catalog::new(vec![table_info.clone()]));
+        let storage = PgStorage::connect(&dsn, catalog)
+            .await
+            .expect("connect");
+        storage.advance(storage.first_position());
+        let read = tokio::time::timeout(
+            Duration::from_secs(15),
+            storage.select(&SingleTableReadQuery::new(
+                table,
+                Where::AND(vec![]),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            )),
+        )
+        .await
+        .expect("a known scalar domain must not wait on a mid-stream type lookup")
+        .expect("the domain read is served");
+        assert_eq!(read.rows.len(), 100);
+        // The unlimited read carries no ORDER BY, so look each row up by
+        // its key rather than relying on the order the rows arrive in.
+        let by_id: BTreeMap<i64, &DataFrameRow> = read
+            .rows
+            .iter()
+            .filter_map(|(key, row)| match key.pkey_value.get(&ColumnName::from("id")) {
+                Some(Value::Int(id)) => Some((*id, row)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(by_id.len(), 100, "every id is present");
+        for (id, row) in &by_id {
+            assert_eq!(
+                row.data.get("amount"),
+                Some(&Value::Int(id * 100)),
+                "the domain keeps its exact bigint value for id {id}"
+            );
+        }
+
+        drop(storage);
+        let _ = client
+            .batch_execute("DROP SCHEMA IF EXISTS live_known_domain CASCADE;")
+            .await;
+    });
+}
+
+/// A large result containing a custom type must not stall on a fresh
+/// connection: `query_typed_raw` resolves unknown OIDs mid-stream, and
+/// the typeinfo lookup can queue behind the undrained result, deadlocking
+/// the read. Preparing before streaming avoids the stall.
+#[test]
+fn a_fresh_connection_reads_a_large_enum_result_without_stalling() {
+    let Some(dsn) = dsn() else { return };
+    block_on(async {
+        let table = "live_stall.probe";
+        let client = admin(&dsn).await;
+        client
+            .batch_execute(
+                "DROP SCHEMA IF EXISTS live_stall CASCADE;
+                 CREATE SCHEMA live_stall;
+                 CREATE TYPE live_stall.status AS ENUM ('open', 'closed');
+                 CREATE TABLE live_stall.probe (
+                   id int8 PRIMARY KEY,
+                   s live_stall.status,
+                   t text
+                 );",
+            )
+            .await
+            .expect("prepare");
+        let filler = "x".repeat(16 * 1024);
+        for batch in 0..10 {
+            let values: Vec<String> = (0..10)
+                .map(|i| format!("({}, 'open', '{}')", batch * 10 + i, filler))
+                .collect();
+            client
+                .batch_execute(&format!("INSERT INTO {table} VALUES {};", values.join(",")))
+                .await
+                .expect("insert");
+        }
+        let loaded =
+            streamgres::sync::pg::catalog::load_catalog(&client, &["live_stall".to_owned()])
+                .await
+                .expect("catalog")
+                .0;
+        let declared = loaded.table(table).expect("the table is carried").clone();
+        let catalog = Arc::new(Catalog::new(vec![declared]));
+        let storage = PgStorage::connect(&dsn, catalog)
+            .await
+            .expect("connect");
+        storage.advance(storage.first_position());
+        let read = tokio::time::timeout(
+            Duration::from_secs(15),
+            storage.select(&SingleTableReadQuery::new(
+                table,
+                Where::AND(vec![]),
+                OrderBy::new("id", Order::ASC),
+                u32::MAX,
+            )),
+        )
+        .await
+        .expect("the read must not stall")
+        .expect("the read is served");
+        assert_eq!(read.rows.len(), 100);
+
+        let _ = client
+            .batch_execute("DROP SCHEMA IF EXISTS live_stall CASCADE;")
+            .await;
     });
 }

@@ -15,6 +15,7 @@
 //! runtime, the engine's rules, and both drivers are shared.
 
 pub mod catalog;
+pub mod codec;
 mod local;
 pub mod pg;
 mod runtime;
@@ -22,6 +23,7 @@ mod service;
 mod sources;
 mod storage;
 
+pub use codec::CellDecoder;
 pub use crate::model::SubId;
 pub use crate::model::{Lsn, Snapshot};
 pub use catalog::CatalogHandle;

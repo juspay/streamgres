@@ -63,6 +63,10 @@
 //! mirrored into storage *before* it is routed, and only the engine call
 //! is timed.
 
+// `Value` carries `bytes::Bytes`, whose refcount is interior-mutable.
+// Values used as map keys are never mutated through that refcount.
+#![allow(clippy::mutable_key_type)]
+
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};

@@ -40,7 +40,6 @@ uuid = { version = "1", features = ["v4"] }
 # row messages it carries, decoded. Apache-2.0 OR MIT and MIT respectively;
 # TLS is left off, as it is for tokio-postgres above.
 pgwire-replication = { version = "0.4", default-features = false, features = ["scram"] }
-pgoutput = "0.0.7"
 # The replication-protocol connection that mints exported snapshots
 # (`src/sync/pg/replication.rs`): tokio-postgres cannot open one, so the
 # startup, authentication and simple-query messages are spoken directly.
@@ -61,7 +60,7 @@ once_cell = "1"
 # The client side (`src/client`): message encoding, the
 # HTTP calls to the application server, and the WebSocket handshake.
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["raw_value", "arbitrary_precision"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 base64 = "0.22"
 percent-encoding = "2"

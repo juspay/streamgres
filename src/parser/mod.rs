@@ -508,6 +508,14 @@ impl Parser {
             let mut clauses = Vec::new();
             loop {
                 let column = self.column_name(table)?;
+                if table
+                    .column(column.as_str())
+                    .is_some_and(|c| !crate::model::supports(crate::model::Capability::Order, &c.r#type))
+                {
+                    return self.err(format!(
+                        "`{column}` has a type the server does not order the way Postgres does, so ORDER BY is not supported on it"
+                    ));
+                }
                 let direction = if self.eat_word("DESC") {
                     Order::DESC
                 } else {
@@ -719,7 +727,9 @@ impl Parser {
                     position: at,
                 });
             }
-            let value = coerce_to_column_type(value, table, &column, at)?;
+            // The filter already fitted the literal (and scaled a time);
+            // re-fitting would scale it twice, so this only proves it fits.
+            coerce_to_column_type(value.clone(), table, &column, at)?;
             if pkey_value.insert(column.clone(), value).is_some() {
                 return Err(ParseError {
                     message: format!("primary-key column `{column}` appears twice in WHERE"),
@@ -801,17 +811,19 @@ impl Parser {
         } else if self.eat_sym("<") {
             ComparisonOperator::LT
         } else if self.eat_word("IN") {
+            let value = self.value_list(table, &column)?;
             return Ok(Where::Condition(Condition {
                 column,
                 comparison_operator: ComparisonOperator::IN,
-                value: self.value_list()?,
+                value,
             }));
         } else if self.eat_word("NOT") {
             self.expect_word("IN")?;
+            let value = self.value_list(table, &column)?;
             return Ok(Where::Condition(Condition {
                 column,
                 comparison_operator: ComparisonOperator::NOT_IN,
-                value: self.value_list()?,
+                value,
             }));
         } else {
             return self.err(format!(
@@ -819,25 +831,52 @@ impl Parser {
                 self.describe()
             ));
         };
+        if matches!(
+            comparison_operator,
+            ComparisonOperator::GT | ComparisonOperator::GTE | ComparisonOperator::LT | ComparisonOperator::LTE
+        ) && table
+            .column(column.as_str())
+            .is_some_and(|c| !crate::model::supports(crate::model::Capability::Order, &c.r#type))
+        {
+            return self.err(format!(
+                "`{column}` has a type the server does not order the way Postgres does, so range filters are not supported on it"
+            ));
+        }
+        let value = self.condition_value(table, &column)?;
         Ok(Where::Condition(Condition {
             column,
             comparison_operator,
-            value: self.value()?,
+            value,
         }))
     }
 
-    /// The parenthesised value list of `IN` / `NOT IN`.
-    fn value_list(&mut self) -> Result<Value, ParseError> {
+    /// The parenthesised value list of `IN` / `NOT IN`, each item fitted to
+    /// the column the way a lone condition value is.
+    fn value_list(&mut self, table: &DbTable, column: &ColumnName) -> Result<Value, ParseError> {
         self.expect_sym("(")?;
         let mut items = Vec::new();
         if !self.is_sym(")") {
-            items.push(self.value()?);
+            items.push(self.condition_value(table, column)?);
             while self.eat_sym(",") {
-                items.push(self.value()?);
+                items.push(self.condition_value(table, column)?);
             }
         }
         self.expect_sym(")")?;
         Ok(Value::List(items))
+    }
+
+    /// One filter literal, fitted to `column`'s declared type the way a
+    /// write literal is (so a time literal lands in engine microseconds on
+    /// both sides), but kept as written when it does not fit — the engine
+    /// still compares an `Int` column against a `Float` literal.
+    fn condition_value(
+        &mut self,
+        table: &DbTable,
+        column: &ColumnName,
+    ) -> Result<Value, ParseError> {
+        let at = self.at();
+        let value = self.value()?;
+        Ok(coerce_to_column_type(value.clone(), table, column, at).unwrap_or(value))
     }
 
     /// One literal: `NULL`, `TRUE` / `FALSE`, a (possibly `-`-negated)
@@ -869,7 +908,10 @@ impl Parser {
                     number
                 };
                 let parsed = if text.contains('.') {
-                    text.parse::<f64>().map(Value::Float).ok()
+                    // A decimal literal keeps its digits: a `numeric` column
+                    // stores them exactly (`1.50` stays `1.50`), and coercion
+                    // fits the value to any other column's type.
+                    crate::model::Numeric::parse(&text).ok().map(Value::Numeric)
                 } else {
                     text.parse::<i64>().map(Value::Int).ok()
                 };
@@ -1011,6 +1053,16 @@ fn coerce_to_column_type(
     coerce_to_type(value, declared, column.as_str(), at)
 }
 
+/// The mismatch a `Numeric` literal that does not fit `declared` reports.
+fn numeric_mismatch(text: &str, declared: &ValueType, column: &str, at: usize) -> ParseError {
+    ParseError {
+        message: format!(
+            "column `{column}` is declared {declared:?} but the value is Numeric({text:?})"
+        ),
+        position: at,
+    }
+}
+
 /// Recursive worker for [`coerce_to_column_type`], matching a value (and
 /// list elements) against a declared [`ValueType`]. `NULL` fits any column
 /// here — primary-key columns reject it separately via
@@ -1025,11 +1077,65 @@ fn coerce_to_type(
         (Value::Null, _) => Value::Null,
         (value @ Value::Int(_), ValueType::Int) => value,
         (value @ Value::Float(_), ValueType::Float) => value,
+        (value @ Value::Numeric(_), ValueType::Numeric) => value,
         (value @ Value::String(_), ValueType::String) => value,
         (value @ Value::Bool(_), ValueType::Bool) => value,
-        (value @ Value::Int(_), ValueType::Timestamp) => value,
-        (value @ Value::String(_), ValueType::Json) => value,
+        // A time literal is milliseconds on the wire; the engine keeps
+        // microseconds, so the number is scaled at this boundary.
+        (Value::Int(millis), ValueType::Timestamp) => {
+            crate::model::Timestamp::from_unix_millis(millis)
+                .map(Value::Timestamp)
+                .ok_or_else(|| numeric_mismatch(&millis.to_string(), declared, column, at))?
+        }
+        (Value::Float(millis), ValueType::Timestamp) if millis.is_finite() => {
+            crate::model::Timestamp::from_unix_millis(millis as i64)
+                .map(Value::Timestamp)
+                .ok_or_else(|| numeric_mismatch(&millis.to_string(), declared, column, at))?
+        }
+        (Value::Numeric(number), ValueType::Timestamp) => {
+            let millis = number.to_i64().or_else(|| {
+                let f = number.to_f64();
+                f.is_finite().then_some(f as i64)
+            });
+            match millis.and_then(crate::model::Timestamp::from_unix_millis) {
+                Some(at) => Value::Timestamp(at),
+                None => {
+                    return Err(numeric_mismatch(
+                        &number.to_string(),
+                        declared,
+                        column,
+                        at,
+                    ))
+                }
+            }
+        }
+        (Value::String(text), ValueType::Json) => Value::Json(
+            crate::model::JsonText::standard_only(crate::sync::pg::text::json_as_jsonb(&text)),
+        ),
+        (value @ Value::Json(_), ValueType::Json) => value,
+        (value @ Value::Timestamp(_), ValueType::Timestamp) => value,
+        (value @ Value::Day(_), ValueType::Day) => value,
+        (value @ Value::Time(_), ValueType::Time) => value,
+        (value @ Value::Bytes(_), ValueType::Bytes) => value,
         (Value::Int(int), ValueType::Float) => Value::Float(int as f64),
+        (Value::Int(int), ValueType::Numeric) => Value::Numeric(crate::model::Numeric::from_i64(int)),
+        (Value::Numeric(number), ValueType::Float) => {
+            let float = number.to_f64();
+            if float.is_finite() {
+                Value::Float(float)
+            } else {
+                return Err(numeric_mismatch(&number.to_string(), declared, column, at));
+            }
+        }
+        (Value::Numeric(number), ValueType::Int) => {
+            // A whole decimal (`3000000000.0`) is the integer it names.
+            match number.to_i64() {
+                Some(int) => Value::Int(int),
+                None => {
+                    return Err(numeric_mismatch(&number.to_string(), declared, column, at))
+                }
+            }
+        }
         (Value::Float(float), ValueType::Int)
             if float.fract() == 0.0 && ((i64::MIN as f64)..(i64::MAX as f64)).contains(&float) =>
         {
@@ -1288,20 +1394,111 @@ mod tests {
         );
     }
 
-    /// Literals carry their spelled types: negative ints, floats, `NULL`,
-    /// and `''`-escaped strings.
+    /// Literals carry their spelled types: negative ints, decimals as the
+    /// exact digits they name (`1.50` keeps its scale), `NULL`, and
+    /// `''`-escaped strings.
     #[test]
     fn values_parse_with_types() {
         let q = read("SELECT * FROM tickets WHERE points = -3");
         assert!(matches!(&q.filter, Where::Condition(c) if c.value == Value::Int(-3)));
         let q = read("SELECT * FROM tickets WHERE points > 1.5");
-        assert!(matches!(&q.filter, Where::Condition(c) if c.value == Value::Float(1.5)));
+        assert_eq!(
+            q.filter,
+            Where::condition(
+                "points",
+                crate::model::ComparisonOperator::GT,
+                Value::Numeric(crate::model::Numeric::parse("1.5").unwrap())
+            )
+        );
         let q = read("SELECT * FROM tickets WHERE status = NULL");
         assert!(matches!(&q.filter, Where::Condition(c) if c.value == Value::Null));
         let q = read("SELECT * FROM tickets WHERE status = 'it''s'");
         assert!(
             matches!(&q.filter, Where::Condition(c) if c.value == Value::String("it's".into()))
         );
+    }
+
+    /// A decimal literal against a `numeric` column is the exact value it
+    /// names: `1.50` keeps its scale on the way in, and a `Float` column
+    /// still widens from one.
+    #[test]
+    fn decimal_literals_are_exact_numeric_values() {
+        let catalog = Catalog::new(vec![DbTable::new(
+            "amounts",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("n", ValueType::Numeric),
+                DbColumn::new("score", ValueType::Float),
+            ],
+        )]);
+        let n = |text: &str| crate::model::Numeric::parse(text).unwrap();
+        let read = parse_read("SELECT * FROM amounts WHERE n = 1.25", &catalog).expect("parses");
+        assert_eq!(
+            read.filter,
+            Where::condition("n", crate::model::ComparisonOperator::EQ, Value::Numeric(n("1.25"))),
+            "a decimal literal is exact for a numeric column"
+        );
+        let read = parse_read("SELECT * FROM amounts WHERE n = 1.50", &catalog).expect("parses");
+        assert_eq!(
+            read.filter,
+            Where::condition("n", crate::model::ComparisonOperator::EQ, Value::Numeric(n("1.50"))),
+            "scale survives into the engine"
+        );
+        let read = parse_read("SELECT * FROM amounts WHERE score = 1.50", &catalog).expect("parses");
+        assert!(
+            matches!(&read.filter, Where::Condition(c) if c.value == Value::Float(1.5)),
+            "a float column still widens a decimal literal"
+        );
+
+        let WriteQuery::INSERT(insert) =
+            parse_write("INSERT INTO amounts (id, n) VALUES (1, 1.25)", &catalog).expect("parses")
+        else {
+            panic!("expected an INSERT");
+        };
+        assert_eq!(insert.record.data["n"], Value::Numeric(n("1.25")));
+    }
+
+    /// A time literal is milliseconds on the wire and microseconds in the
+    /// engine: SELECT's WHERE scales it exactly as INSERT does, including
+    /// the items of an `IN` list.
+    #[test]
+    fn read_filters_scale_time_literals_like_writes() {
+        let catalog = Catalog::new(vec![DbTable::new(
+            "events",
+            ["id"],
+            vec![
+                DbColumn::new("id", ValueType::Int),
+                DbColumn::new("at", ValueType::Timestamp),
+            ],
+        )]);
+        let read = parse_read("SELECT * FROM events WHERE at > 1000", &catalog).expect("should parse");
+        let at = |millis: i64| Value::Timestamp(crate::model::Timestamp::from_unix_millis(millis).unwrap());
+        assert_eq!(
+            read.filter,
+            Where::condition("at", ComparisonOperator::GT, at(1_000))
+        );
+
+        let read = parse_read(
+            "SELECT * FROM events WHERE at IN (1000, 2500)",
+            &catalog,
+        )
+        .expect("should parse");
+        assert_eq!(
+            read.filter,
+            Where::condition(
+                "at",
+                ComparisonOperator::IN,
+                Value::List(vec![at(1_000), at(2_500)])
+            )
+        );
+
+        let WriteQuery::INSERT(insert) =
+            parse_write("INSERT INTO events (id, at) VALUES (1, 1000)", &catalog).expect("should parse")
+        else {
+            panic!("expected an INSERT");
+        };
+        assert_eq!(insert.record.data["at"], at(1_000));
     }
 
     /// INSERT extracts the pkey identity into `pkey_value` and carries the

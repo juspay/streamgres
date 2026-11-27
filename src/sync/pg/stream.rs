@@ -53,12 +53,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use pgoutput::events::base::event::BaseEvent;
-use pgoutput::events::base::tuple_data::{
-    OldDataOrPrimaryKeyTupleData, TupleData, TupleDataColumn,
-};
-use pgoutput::events::event::{Event, EventType};
-use pgoutput::options::{BinaryValueTraitOff, StreamingValueTraitOff};
 use pgwire_replication::{ReplicationClient, ReplicationConfig, ReplicationEvent, TlsConfig};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -68,28 +62,17 @@ use tokio_postgres::config::Host;
 use tokio_postgres::error::SqlState;
 use tokio_postgres::types::PgLsn;
 
+use super::binary;
 use super::ddl::{self, DdlSource};
+use super::pgoutput::{self, Cell, Message};
 use crate::ivm::SchemaChange;
 use crate::log::{log_info, log_warn};
 use crate::model::{
-    Catalog, ColumnName, DataFrameKey, DataFrameRow, DbTable, DeleteQuery, InsertQuery, Lsn,
-    RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
+    Catalog, ColumnName, DataFrameKey, DataFrameRow, DbColumn, DbTable, DeleteQuery, InsertQuery,
+    Lsn, RowData, TableName, UpdateQuery, Value, ValueType, WriteQuery,
 };
 use crate::sync::service::{Command, Transaction as Committed};
 use crate::sync::storage::StorageError;
-
-/// The message set the feed asks for: text values, whole transactions
-/// (no streaming of in-progress ones).
-type Decoded = Event<BinaryValueTraitOff, StreamingValueTraitOff>;
-
-/// One tuple as decoded: a value, `NULL`, or an unchanged TOAST marker per
-/// column, in the relation's column order.
-type Columns = TupleData<BinaryValueTraitOff>;
-
-/// The type of a `json` column as a relation message names it. Its cells
-/// arrive as the text that was stored, where a `jsonb` column's arrive as
-/// the one text `jsonb` writes.
-const JSON_OID: i32 = 114;
 
 /// How long a poll waits for the feed to reach the server's position
 /// before failing.
@@ -136,12 +119,11 @@ struct Relation {
     columns: Vec<Described>,
 }
 
-/// One column of a published table as the feed described it: its name,
-/// and whether it is a `json` column, whose cells are rewritten into the
-/// standard form as they are decoded.
+/// One column of a published table as the feed described it: its name
+/// and its type's OID.
 struct Described {
     name: ColumnName,
-    plain_json: bool,
+    type_oid: u32,
 }
 
 /// The mapping of decoded messages onto catalog writes: the catalog as
@@ -150,7 +132,7 @@ struct Described {
 /// relations announced so far and the transaction being collected.
 pub struct Decoder {
     catalog: Arc<Catalog>,
-    relations: HashMap<i32, Relation>,
+    relations: HashMap<u32, Relation>,
     pending: Vec<WriteQuery>,
     /// Where schema changes are heard, when they are heard at all.
     ddl: Option<DdlSource>,
@@ -284,19 +266,11 @@ impl Decoder {
 
     /// Map one `pgoutput` row message onto the pending transaction.
     fn decode(&mut self, data: &Bytes) -> Result<(), StorageError> {
-        let Some((&tag, body)) = data.split_first() else {
-            return Err(StorageError("empty pgoutput message".to_owned()));
-        };
-        let kind = EventType::from_char(tag)
-            .ok_or_else(|| StorageError(format!("unknown pgoutput message `{}`", tag as char)))?;
-        let event = Decoded::parse(&kind, body).map_err(StorageError)?;
-        let Event::Base(event) = event else {
-            return Ok(());
-        };
-        if let BaseEvent::Relation(relation) = &event {
-            let qualified = format!("{}.{}", relation.relation_namespace, relation.name);
+        let message = pgoutput::parse(data).map_err(|error| StorageError(error.to_string()))?;
+        if let Message::Relation(relation) = message {
+            let qualified = format!("{}.{}", relation.namespace, relation.name);
             let declared = self.catalog.table(&qualified).or_else(|| {
-                (relation.relation_namespace == "public")
+                (relation.namespace == "public")
                     .then(|| self.catalog.table(&relation.name))
                     .flatten()
             });
@@ -306,50 +280,45 @@ impl Decoder {
                     table: declared.map(|table| table.name.clone()),
                     columns: relation
                         .columns
-                        .iter()
+                        .into_iter()
                         .map(|column| Described {
                             name: ColumnName::from(column.name.as_str()),
-                            plain_json: column.oid == JSON_OID,
+                            type_oid: column.type_oid,
                         })
                         .collect(),
                 },
             );
             return Ok(());
         }
-        let writes = self.writes_of(&event)?;
+        let writes = self.writes_of(&message)?;
         self.pending.extend(writes);
         Ok(())
     }
 
     /// The catalog writes one row message stands for: none for a table
     /// the catalog does not declare, two for a primary-key change.
-    fn writes_of(
-        &self,
-        event: &BaseEvent<BinaryValueTraitOff, StreamingValueTraitOff>,
-    ) -> Result<Vec<WriteQuery>, StorageError> {
-        match event {
-            BaseEvent::Insert(insert) => {
-                let Some((table, columns)) = self.declared(insert.oid) else {
+    fn writes_of(&self, message: &Message<'_>) -> Result<Vec<WriteQuery>, StorageError> {
+        let scale = self.catalog.money_scale();
+        match message {
+            Message::Insert { relation, new } => {
+                let Some((table, columns)) = self.declared(*relation) else {
                     return Ok(Vec::new());
                 };
-                let row = image(table, columns, &insert.data)?;
+                let row = image(table, columns, new, scale)?;
                 Ok(vec![WriteQuery::INSERT(InsertQuery {
                     table: table.name.clone(),
                     pkey_value: key_of(&row, table),
                     record: row,
                 })])
             }
-            BaseEvent::Update(update) => {
-                let Some((table, columns)) = self.declared(update.oid) else {
+            Message::Update { relation, old, new } => {
+                let Some((table, columns)) = self.declared(*relation) else {
                     return Ok(Vec::new());
                 };
-                let new = image(table, columns, &update.data)?;
+                let new = image(table, columns, new, scale)?;
                 let new_key = key_of(&new, table);
-                let old_key = match &update.old_data_or_primary_key {
-                    Some(OldDataOrPrimaryKeyTupleData::PrimaryKeyTupleData(old))
-                    | Some(OldDataOrPrimaryKeyTupleData::OldTupleData(old)) => {
-                        Some(key_of(&image(table, columns, old)?, table))
-                    }
+                let old_key = match old {
+                    Some(old) => Some(key_of(&image(table, columns, old, scale)?, table)),
                     None => None,
                 };
                 match old_key.filter(|old_key| *old_key != new_key) {
@@ -371,39 +340,26 @@ impl Decoder {
                     })]),
                 }
             }
-            BaseEvent::Delete(delete) => {
-                let Some((table, columns)) = self.declared(delete.oid) else {
+            Message::Delete { relation, old } => {
+                let Some((table, columns)) = self.declared(*relation) else {
                     return Ok(Vec::new());
-                };
-                let old = match &delete.old_data_or_primary_key {
-                    Some(OldDataOrPrimaryKeyTupleData::PrimaryKeyTupleData(old))
-                    | Some(OldDataOrPrimaryKeyTupleData::OldTupleData(old)) => old,
-                    None => {
-                        return Err(StorageError(format!(
-                            "a DELETE on `{}` arrived without its key; the table needs a primary key or REPLICA IDENTITY",
-                            table.name
-                        )));
-                    }
                 };
                 Ok(vec![WriteQuery::DELETE(DeleteQuery {
                     table: table.name.clone(),
-                    pkey_value: key_of(&image(table, columns, old)?, table),
+                    pkey_value: key_of(&image(table, columns, old, scale)?, table),
                 })])
             }
-            BaseEvent::Truncate(_) => Err(StorageError(
+            Message::Truncate => Err(StorageError(
                 "TRUNCATE on a published table is not supported: the frames cannot follow it"
                     .to_owned(),
             )),
-            BaseEvent::Relation(_)
-            | BaseEvent::Begin(_)
-            | BaseEvent::Commit(_)
-            | BaseEvent::Type(_) => Ok(Vec::new()),
+            Message::Relation(_) | Message::Other => Ok(Vec::new()),
         }
     }
 
     /// The catalog table and column order of relation `oid`, if the feed
     /// announced it and the catalog declares it.
-    fn declared(&self, oid: i32) -> Option<(&DbTable, &[Described])> {
+    fn declared(&self, oid: u32) -> Option<(&DbTable, &[Described])> {
         let relation = self.relations.get(&oid)?;
         let table = self.catalog.table(relation.table.as_ref()?.as_str())?;
         Some((table, &relation.columns))
@@ -1102,6 +1058,7 @@ fn replication_config(
         .with_port(port)
         .with_tls(TlsConfig::disabled())
         .with_status_interval(Duration::from_secs(1))
+        .with_binary(true)
 }
 
 /// The primary key of a decoded row image, laid out on the table's
@@ -1128,32 +1085,38 @@ pub fn partial_images() -> u64 {
     PARTIAL_IMAGES.load(Ordering::Relaxed)
 }
 
-/// A decoded tuple as a row image of `table`: each value converted by the
-/// column's declared type (a `json` column's stored text rewritten into
-/// the standard form first), columns the catalog does not declare
-/// skipped, declared columns the relation lacks `NULL`, so every image
-/// carries every column. The one exception is a column PostgreSQL sent
-/// as unchanged (a large value an update did not touch): it is left out,
+/// A decoded tuple as a row image of `table`: each cell decoded by the
+/// column's declared type, columns the catalog does not declare skipped,
+/// declared columns the relation lacks `NULL`, so every image carries
+/// every column. The one exception is a column PostgreSQL sent as
+/// unchanged (a large value an update did not touch): it is left out,
 /// and the image is marked partial ([`RowData::partial`]) so that the
 /// engine never holds or sends it as the whole row.
 fn image(
     table: &DbTable,
     columns: &[Described],
-    tuple: &Columns,
+    tuple: &[Cell<'_>],
+    money_scale: u8,
 ) -> Result<DataFrameRow, StorageError> {
     let mut data = HashMap::new();
     let mut unchanged: Vec<ColumnName> = Vec::new();
-    for (described, column) in columns.iter().zip(tuple) {
+    for (described, cell) in columns.iter().zip(tuple) {
         let Some(declared) = table.column(described.name.as_str()) else {
             continue;
         };
-        let value = match column {
-            TupleDataColumn::PGNull => Value::Null,
-            TupleDataColumn::Value(text) if described.plain_json => {
-                Value::String(super::text::json_as_jsonb(text))
+        let value = match cell {
+            Cell::Null => Value::Null,
+            Cell::Binary(bytes) => {
+                let type_oid = match declared.type_oid {
+                    0 => described.type_oid,
+                    known => known,
+                };
+                binary::decode_source(&declared.r#type, type_oid, bytes, money_scale).map_err(|error| {
+                    StorageError(format!("`{}`.`{}`: {error}", table.name, declared.name))
+                })?
             }
-            TupleDataColumn::Value(text) => convert(text, &declared.r#type)?,
-            TupleDataColumn::PGUnchangedToastedValue => {
+            Cell::Text(bytes) => text_cell(table, declared, bytes)?,
+            Cell::Unchanged => {
                 unchanged.push(declared.name.clone());
                 continue;
             }
@@ -1179,31 +1142,22 @@ fn image(
     Ok(DataFrameRow::from(RowData::partial(data)))
 }
 
-/// Convert one text value by its declared type; a `jsonb` cell is kept in
-/// the standard form, as a read keeps it.
-fn convert(raw: &str, declared: &ValueType) -> Result<Value, StorageError> {
-    let unreadable = || StorageError(format!("`{raw}` is not a {declared:?}"));
-    Ok(match declared {
-        ValueType::Int => Value::Int(raw.parse().map_err(|_| unreadable())?),
-        ValueType::Float => Value::Float(raw.parse().map_err(|_| unreadable())?),
-        ValueType::Json => Value::String(super::text::standard_json(raw).into_owned()),
-        ValueType::String | ValueType::Map(_, _) => Value::String(raw.to_owned()),
-        ValueType::List(inner) => super::text::array_literal(raw, inner),
-        ValueType::Timestamp => Value::Int(super::text::epoch_millis(raw).ok_or_else(unreadable)?),
-        ValueType::Bool => Value::Bool(match raw {
-            "true" | "t" => true,
-            "false" | "f" => false,
-            _ => return Err(unreadable()),
-        }),
-        ValueType::Date => Value::Date(
-            chrono::NaiveDate::parse_from_str(raw, "%Y-%m-%d").map_err(|_| unreadable())?,
-        ),
-        ValueType::Datetime => Value::Datetime(
-            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S%.f")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S"))
-                .map_err(|_| unreadable())?,
-        ),
-    })
+/// A cell PostgreSQL sent as text, which it does for a type without a
+/// binary send function: kept when the column is declared as text, an
+/// error otherwise, since no other value can be read exactly from it.
+fn text_cell(table: &DbTable, declared: &DbColumn, bytes: &[u8]) -> Result<Value, StorageError> {
+    let unreadable = || {
+        StorageError(format!(
+            "`{}`.`{}` arrived as text, which its type {:?} is not read from",
+            table.name, declared.name, declared.r#type
+        ))
+    };
+    match declared.r#type {
+        ValueType::String => std::str::from_utf8(bytes)
+            .map(|text| Value::String(text.to_owned()))
+            .map_err(|_| unreadable()),
+        _ => Err(unreadable()),
+    }
 }
 
 #[cfg(test)]
@@ -1346,13 +1300,13 @@ mod tests {
         let events = vec![
             begin(),
             relation(7, "docs", &[("id", 20), ("title", 25)]),
-            insert(7, &["1", "first"]),
+            insert(7, &[int8(1), text("first")]),
             ddl(&before, &after),
             relation(7, "docs", &[("id", 20), ("title", 25), ("owner", 25)]),
-            insert(7, &["2", "second", "meera"]),
+            insert(7, &[int8(2), text("second"), text("meera")]),
             commit("0/10"),
             begin(),
-            insert(7, &["3", "third", "arjun"]),
+            insert(7, &[int8(3), text("third"), text("arjun")]),
             commit("0/20"),
         ];
         let transactions: Vec<Transaction> = events
@@ -1457,17 +1411,63 @@ mod tests {
         raw(data)
     }
 
-    /// An insert into relation `oid` of one row of text `values`.
-    fn insert(oid: i32, values: &[&str]) -> ReplicationEvent {
+    /// One cell of a tuple: `None` is `NULL`, `Some` its binary value.
+    type TestCell = Option<Vec<u8>>;
+
+    /// A text cell in binary format, which is its UTF-8 bytes.
+    fn text(value: &str) -> TestCell {
+        Some(value.as_bytes().to_vec())
+    }
+
+    /// An `int8` cell.
+    fn int8(value: i64) -> TestCell {
+        Some(value.to_be_bytes().to_vec())
+    }
+
+    /// A tuple of `cells`, `u` marking an unchanged one.
+    fn tuple(data: &mut Vec<u8>, cells: &[TestCell]) {
+        data.extend_from_slice(&u16::try_from(cells.len()).unwrap().to_be_bytes());
+        for cell in cells {
+            match cell {
+                None => data.push(b'n'),
+                Some(bytes) if bytes.as_slice() == b"<unchanged>" => data.push(b'u'),
+                Some(bytes) => {
+                    data.push(b'b');
+                    data.extend_from_slice(&u32::try_from(bytes.len()).unwrap().to_be_bytes());
+                    data.extend_from_slice(bytes);
+                }
+            }
+        }
+    }
+
+    /// An insert into relation `oid` of one row of binary `cells`.
+    fn insert(oid: i32, cells: &[TestCell]) -> ReplicationEvent {
         let mut data = vec![b'I'];
         data.extend_from_slice(&oid.to_be_bytes());
         data.push(b'N');
-        data.extend_from_slice(&(values.len() as i16).to_be_bytes());
-        for value in values {
-            data.push(b't');
-            data.extend_from_slice(&(value.len() as i32).to_be_bytes());
-            data.extend_from_slice(value.as_bytes());
+        tuple(&mut data, cells);
+        raw(data)
+    }
+
+    /// An update of relation `oid`, with the old key when it is given.
+    fn update(oid: i32, old: Option<&[TestCell]>, new: &[TestCell]) -> ReplicationEvent {
+        let mut data = vec![b'U'];
+        data.extend_from_slice(&oid.to_be_bytes());
+        if let Some(old) = old {
+            data.push(b'K');
+            tuple(&mut data, old);
         }
+        data.push(b'N');
+        tuple(&mut data, new);
+        raw(data)
+    }
+
+    /// A delete from relation `oid` of the row with key `old`.
+    fn delete(oid: i32, old: &[TestCell]) -> ReplicationEvent {
+        let mut data = vec![b'D'];
+        data.extend_from_slice(&oid.to_be_bytes());
+        data.push(b'K');
+        tuple(&mut data, old);
         raw(data)
     }
 
@@ -1527,6 +1527,11 @@ mod tests {
         assert_eq!(feed.progress(), Lsn::parse("0/2A8").unwrap());
     }
 
+    /// A `jsonb` cell in binary format: its version byte, then its text.
+    fn jsonb(value: &str) -> TestCell {
+        Some([&[1u8][..], value.as_bytes()].concat())
+    }
+
     /// A JSON cell is decoded into the standard form whichever kind of
     /// column holds it: a `jsonb` cell loses a padded fraction, a `json`
     /// cell is rewritten as its `jsonb` would read; both are then the text
@@ -1545,20 +1550,16 @@ mod tests {
         let mut decoder = Decoder::new(catalog);
         let events = vec![
             begin(),
-            relation(
-                7,
-                "docs",
-                &[("id", 20), ("binary", 3802), ("plain", JSON_OID)],
-            ),
+            relation(7, "docs", &[("id", 20), ("binary", 3802), ("plain", 114)]),
             insert(
                 7,
                 &[
-                    "1",
-                    "{\"a\": 1.50, \"bb\": \"1.0\"}",
-                    "{ \"bb\":\"1.0\",\"a\":1.50, \"a\":15e-1 }",
+                    int8(1),
+                    jsonb("{\"a\": 1.50, \"bb\": \"1.0\"}"),
+                    text("{ \"bb\":\"1.0\",\"a\":1.50, \"a\":15e-1 }"),
                 ],
             ),
-            insert(7, &["2", "2.0", "2.0"]),
+            insert(7, &[int8(2), jsonb("2.0"), text("2.0")]),
             commit("0/10"),
         ];
         let transactions: Vec<Transaction> = events
@@ -1570,11 +1571,23 @@ mod tests {
             .iter()
             .map(|write| write.new_row_image().unwrap())
             .collect();
-        let standard = Value::String("{\"a\": 1.5, \"bb\": \"1.0\"}".into());
+        let standard = Value::Json(crate::model::JsonText::standard_only(
+            "{\"a\": 1.5, \"bb\": \"1.0\"}".into(),
+        ));
         assert_eq!(rows[0].data["binary"], standard);
         assert_eq!(rows[0].data["plain"], standard);
-        assert_eq!(rows[1].data["binary"], Value::String("2".into()));
-        assert_eq!(rows[1].data["plain"], Value::String("2".into()));
+        assert_eq!(
+            rows[1].data["binary"],
+            Value::Json(crate::model::JsonText::standard_only("2".into()))
+        );
+        assert_eq!(
+            rows[1].data["plain"],
+            Value::Json(crate::model::JsonText::standard_only("2".into()))
+        );
+        assert!(
+            matches!(&rows[1].data["plain"], Value::Json(json) if json.text() == "2.0"),
+            "the text Postgres has is kept beside the standard form"
+        );
     }
 
     /// An `UPDATE` whose `name` PostgreSQL sent as unchanged (a large
@@ -1589,9 +1602,7 @@ mod tests {
             xlog(
                 "52000043477075626c69630070726f62655f74006400080169640000000014ffffffff006e616d650000000019ffffffff00706f696e74730000000014ffffffff00666c61670000000010ffffffff0064000000043affffffff007473000000045affffffff00616d6f756e7400000002bdffffffff007461670000000413ffffffff",
             ),
-            xlog(
-                "55000043474e000874000000013175740000000134740000000174740000000a323032362d30392d31317400000015323032362d30392d31312031303a30303a30302e357400000003312e357400000003612062",
-            ),
+            update(0x4347, None, &probe_row(1, Some(b"<unchanged>".to_vec()))),
             commit("0/3EFF508"),
         ];
         let before = partial_images();
@@ -1613,8 +1624,35 @@ mod tests {
         assert_eq!(image.data["tag"], Value::String("a b".into()));
     }
 
+    /// A row of `probe_t` in binary format with `name` as given: points 4
+    /// (3 in the key-only rows below), flag true, a date, a timestamp, an
+    /// amount of 1.5 and the tag `a b`.
+    fn probe_row(id: i64, name: TestCell) -> Vec<TestCell> {
+        let day = (chrono::NaiveDate::from_ymd_opt(2026, 9, 11).unwrap()
+            - chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap())
+        .num_days();
+        let micros = day * 86_400_000_000 + 36_000_500_000;
+        vec![
+            int8(id),
+            name,
+            int8(4),
+            Some(vec![1]),
+            Some(i32::try_from(day).unwrap().to_be_bytes().to_vec()),
+            Some(micros.to_be_bytes().to_vec()),
+            Some(1.5f64.to_be_bytes().to_vec()),
+            text("a b"),
+        ]
+    }
+
+    /// A row of `probe_t` with only its key set.
+    fn key_only(id: i64) -> Vec<TestCell> {
+        let mut row = vec![int8(id)];
+        row.resize(8, None);
+        row
+    }
+
     /// A recorded `pgoutput` session (PostgreSQL 15, `proto_version 1`,
-    /// text values): two inserts with quoting, nulls and every scalar
+    /// binary values): two inserts with quoting, nulls and every scalar
     /// type; an update; a primary-key change, a delete and an insert on
     /// an undeclared table; and a transaction that carried only a logical
     /// message, which is a transaction with no writes. Each transaction
@@ -1627,21 +1665,17 @@ mod tests {
             xlog(
                 "52000043477075626c69630070726f62655f74006400080169640000000014ffffffff006e616d650000000019ffffffff00706f696e74730000000014ffffffff00666c61670000000010ffffffff0064000000043affffffff007473000000045affffffff00616d6f756e7400000002bdffffffff007461670000000413ffffffff",
             ),
-            xlog(
-                "49000043474e00087400000001317400000006697427732078740000000133740000000174740000000a323032362d30392d31317400000015323032362d30392d31312031303a30303a30302e357400000003312e357400000003612062",
-            ),
-            xlog("49000043474e00087400000001326e6e6e6e6e6e6e"),
+            insert(0x4347, &probe_row(1, text("it's x"))),
+            insert(0x4347, &key_only(2)),
             commit("0/3EFF460"),
             begin(),
-            xlog(
-                "55000043474e0008740000000131740000000772656e616d6564740000000134740000000174740000000a323032362d30392d31317400000015323032362d30392d31312031303a30303a30302e357400000003312e357400000003612062",
-            ),
+            update(0x4347, None, &probe_row(1, text("renamed"))),
             commit("0/3EFF508"),
             begin(),
-            xlog("55000043474b00087400000001326e6e6e6e6e6e6e4e00087400000001336e6e6e6e6e6e6e"),
-            xlog("44000043474b00087400000001316e6e6e6e6e6e6e"),
+            update(0x4347, Some(&key_only(2)), &key_only(3)),
+            delete(0x4347, &key_only(1)),
             xlog("520000434e7075626c69630070726f62655f6f74686572006400010169640000000014ffffffff"),
-            xlog("490000434e4e0001740000000139"),
+            insert(0x434e, &[int8(9)]),
             commit("0/3EFF6F8"),
             begin(),
             message("7"),

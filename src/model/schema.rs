@@ -238,6 +238,15 @@ pub struct DbColumn {
     pub table: TableName,
     pub name: ColumnName,
     pub r#type: ValueType,
+    /// The OID of the column's type at the source, its base type for a
+    /// domain; 0 when the column was declared by hand.
+    pub type_oid: u32,
+    /// For an array column, the OID of its element type; 0 otherwise or
+    /// when it is not known.
+    pub element_oid: u32,
+    /// Whether the column's declared type is a domain. Postgres reports its
+    /// base type in a result description, matching `type_oid` above.
+    pub is_domain: bool,
 }
 
 /// A table: its name, its columns resolvable by name, and the names of the
@@ -333,6 +342,7 @@ fn json_string(out: &mut Vec<u8>, text: &str) {
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     tables: HashMap<TableName, DbTable>,
+    money_scale: u8,
 }
 
 impl Catalog {
@@ -343,7 +353,19 @@ impl Catalog {
                 .into_iter()
                 .map(|table| (table.name.clone(), table))
                 .collect(),
+            money_scale: 2,
         }
+    }
+
+    /// The `lc_monetary` fraction digits of the source database.
+    pub fn money_scale(&self) -> u8 {
+        self.money_scale
+    }
+
+    /// This catalog with the source's money scale.
+    pub fn with_money_scale(mut self, scale: u8) -> Self {
+        self.money_scale = scale;
+        self
     }
 
     /// The schema of table `name`, if the catalog contains it.
@@ -364,7 +386,28 @@ impl DbColumn {
             table: TableName::from(""),
             name: name.into(),
             r#type,
+            type_oid: 0,
+            element_oid: 0,
+            is_domain: false,
         }
+    }
+
+    /// This column with its source type's OID.
+    pub fn with_type_oid(mut self, type_oid: u32) -> Self {
+        self.type_oid = type_oid;
+        self
+    }
+
+    /// This column with its array element type's OID.
+    pub fn with_element_oid(mut self, element_oid: u32) -> Self {
+        self.element_oid = element_oid;
+        self
+    }
+
+    /// This column flagged as a domain over its base type.
+    pub fn with_is_domain(mut self, is_domain: bool) -> Self {
+        self.is_domain = is_domain;
+        self
     }
 }
 

@@ -1642,7 +1642,12 @@ fn result_entry(write: &WriteQuery) -> Option<(String, Json)> {
     let entry = match write {
         WriteQuery::DELETE(_) => protocol::result_del(&client, id),
         _ => {
-            let result: Json = serde_json::from_str(&text("result")?).ok()?;
+            let result_text = match row.get("result") {
+                Some(Value::String(text)) => Some(text.clone()),
+                Some(Value::Json(json)) => Some(json.text().to_owned()),
+                _ => None,
+            };
+            let result: Json = serde_json::from_str(&result_text?).ok()?;
             protocol::result_put(&client, id, result)
         }
     };
@@ -1726,7 +1731,12 @@ fn build_poke(
             Patch::Del(table, key) => {
                 dels += 1;
                 let mut bytes = Vec::with_capacity(64);
-                wire::write_del(&mut bytes, table.as_str(), key);
+                match catalog.table(table.as_str()) {
+                    Some(declared) => wire::write_del(&mut bytes, declared, key),
+                    // A table the catalog no longer holds: the delete still
+                    // goes out, written without declared types as before.
+                    None => wire::write_del_untyped(&mut bytes, table.as_str(), key),
+                }
                 Bytes::from(bytes)
             }
         };
@@ -1836,7 +1846,7 @@ fn coalesce(rows: Vec<RowOp>) -> Vec<RowOp> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ColumnName;
+    use crate::model::{ColumnName, JsonText};
 
     /// A holder of a row: subscription `sub`, main part.
     fn holder(sub: u64) -> IdSet<(SubId, QueryPart)> {
@@ -2219,7 +2229,10 @@ mod tests {
         ];
         let key = DataFrameKey::from(columns.iter().cloned().collect::<HashMap<_, _>>());
         if let Some(result) = result {
-            columns.push((ColumnName::from("result"), Value::from(result)));
+            columns.push((
+                ColumnName::from("result"),
+                Value::Json(JsonText::standard_only(result.to_owned())),
+            ));
         }
         (
             key,

@@ -60,6 +60,10 @@
 //! 10. Batching of one write's narrowed reads, parser `JOIN` syntax,
 //!     table sharding of the engine across threads
 
+// `Value` carries `bytes::Bytes`, whose refcount is interior-mutable.
+// Values used as map keys are never mutated through that refcount.
+#![allow(clippy::mutable_key_type)]
+
 pub mod client;
 pub mod ivm;
 pub mod log;

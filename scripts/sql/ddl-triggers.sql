@@ -24,7 +24,16 @@ CREATE FUNCTION "xyne_0".schema_specs()
 RETURNS JSON
 STABLE
 AS $$
-WITH published_columns AS (SELECT
+WITH RECURSIVE type_base(oid, base_oid, typtype, typbasetype, depth) AS (
+  SELECT oid, oid, typtype, typbasetype, 0 FROM pg_type
+  UNION ALL
+  SELECT r.oid, base.oid, base.typtype, base.typbasetype, r.depth + 1
+  FROM type_base r JOIN pg_type base ON base.oid = r.typbasetype
+  WHERE r.typtype = 'd' AND r.depth < 64
+), resolved_types AS (
+  SELECT DISTINCT ON (oid) oid, base_oid
+  FROM type_base WHERE typtype != 'd' ORDER BY oid, depth DESC
+), published_columns AS (SELECT
   pc.oid::int8 AS "oid",
   nspname AS "schema",
   pc.relnamespace::int8 AS "schemaOID" ,
@@ -36,6 +45,14 @@ WITH published_columns AS (SELECT
   atttypid::int8 AS "typeOID",
   pt.typtype,
   elem_pt.typtype AS "elemTyptype",
+  base.oid::int8 AS "baseTypeOID",
+  base.typname AS "baseType",
+  base.typtype AS "baseTyptype",
+  base.typelem::int8 AS "baseElementOID",
+  base.typelem <> 0 AND base.typlen = -1 AS "baseIsArray",
+  (base.typsend = 'textsend'::regproc) AS "baseSendsText",
+  element_pt.typtype AS "baseElemTyptype",
+  (element_pt.typsend = 'textsend'::regproc) AS "baseElemSendsText",
   coll.collisdeterministic AS "collationIsDeterministic",
   NULLIF(atttypmod, -1) AS "maxLen",
   attndims "arrayDims",
@@ -48,6 +65,9 @@ FROM pg_attribute
 JOIN pg_class pc ON pc.oid = attrelid
 JOIN pg_namespace pns ON pns.oid = relnamespace
 JOIN pg_type pt ON atttypid = pt.oid
+JOIN resolved_types resolved ON resolved.oid = pt.oid
+JOIN pg_type base ON base.oid = resolved.base_oid
+LEFT JOIN pg_type element_pt ON element_pt.oid = base.typelem
 LEFT JOIN pg_type elem_pt ON elem_pt.oid = pt.typelem
 LEFT JOIN pg_collation coll ON coll.oid = pg_attribute.attcollation
 JOIN pg_publication_tables as pb ON
@@ -76,6 +96,14 @@ tables AS (SELECT json_build_object(
                        ELSE substring("type" from 2) || repeat('[]', "arrayDims") END,
       'pgTypeClass', "typtype",
       'elemPgTypeClass', "elemTyptype",
+      'baseTypeOID', "baseTypeOID",
+      'baseType', "baseType",
+      'basePgTypeClass', "baseTyptype",
+      'baseSendsText', "baseSendsText",
+      'elementOID', "baseElementOID",
+      'baseElemTypeClass', "baseElemTyptype",
+      'baseElemSendsText', "baseElemSendsText",
+      'isArray', "baseIsArray",
       'typeOID', "typeOID",
       'collationIsDeterministic', "collationIsDeterministic",
       'characterMaximumLength', CASE WHEN "typeOID" = 1043 OR "typeOID" = 1042
